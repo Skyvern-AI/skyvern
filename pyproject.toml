@@ -1,0 +1,92 @@
+[tool.poetry]
+name = "skyvern"
+version = "0.1.0"
+description = ""
+authors = ["Skyvern AI <info@skyvern.com>"]
+readme = "README.md"
+packages = [{ include = "skyvern" }]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+python-dotenv = "^1.0.0"
+openai = "<1.8"
+tenacity = "^8.2.2"
+sqlalchemy = "^2.0.23"
+aiohttp = "^3.8.5"
+colorlog = "^6.7.0"
+chromadb = "^0.4.10"
+python-multipart = "^0.0.6"
+toml = "^0.10.2"
+jinja2 = "^3.1.2"
+uvicorn = {extras = ["standard"], version = "^0.24.0.post1"}
+litellm = "^1.0.0"
+duckduckgo-search = "^3.8.0"
+selenium = "^4.13.0"
+bs4 = "^0.0.1"
+webdriver-manager = "^4.0.1"
+playwright = "^1.39.0"
+pre-commit = "^3.5.0"
+pillow = "^10.1.0"
+starlette-context = "^0.3.6"
+sqlalchemy-stubs = "^0.4"
+ddtrace = "^2.3.2"
+pydantic = "^2.5.2"
+pydantic-settings = "^2.1.0"
+fastapi = "^0.104.1"
+psycopg = {extras = ["binary", "pool"], version = "^3.1.13"}
+alembic = "^1.12.1"
+python-jose = {extras = ["cryptography"], version = "^3.3.0"}
+cachetools = "^5.3.2"
+aioboto3 = "^12.0.0"
+commentjson = "^0.9.0"
+asyncache = "^0.3.1"
+orjson = "^3.9.10"
+structlog = "^23.2.0"
+plotly = "^5.18.0"
+
+
+[tool.poetry.group.dev.dependencies]
+isort = "^5.12.0"
+black = "^23.3.0"
+pre-commit = "^3.3.3"
+mypy = "^1.4.1"
+flake8 = "^6.0.0"
+types-requests = "^2.31.0.2"
+pytest = "^7.4.0"
+pytest-asyncio = "^0.21.1"
+watchdog = "^3.0.0"
+mock = "^5.1.0"
+autoflake = "^2.2.0"
+pydevd-pycharm = "^233.6745.319"
+ipython = "^8.17.2"
+streamlit = "^1.28.1"
+typer = "^0.9.0"
+ipykernel = "^6.26.0"
+notebook = "^7.0.6"
+freezegun = "^1.2.2"
+snoop = "^0.4.3"
+rich = {extras = ["jupyter"], version = "^13.7.0"}
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 120
+target-version = ['py311']
+include = '\.pyi?$'
+packages = []
+extend-exclude = '(/dist|/.venv|/venv|/build)/'
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+line_length = 120
+sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
+skip_glob = [".tox", "__pycache__", "*.pyc", "venv*/*", "reports", "venv", "env", "node_modules", ".env", ".venv", "dist"]
+skip = ["webeye/actions/__init__.py", "forge/sdk/__init__.py"]

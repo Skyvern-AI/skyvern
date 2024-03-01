@@ -1,0 +1,316 @@
+import asyncio
+import copy
+
+import structlog
+from playwright.async_api import Page
+from pydantic import BaseModel
+
+from skyvern.constants import SKYVERN_DIR, SKYVERN_ID_ATTR
+from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.webeye.browser_factory import BrowserState
+
+LOG = structlog.get_logger()
+
+RESERVED_ATTRIBUTES = {
+    "accept",  # for input file
+    "alt",
+    "aria-checked",  # for option tag
+    "aria-current",
+    "aria-label",
+    "aria-required",
+    "aria-role",
+    "aria-selected",  # for option tag
+    "checked",
+    "data-ui",
+    "for",
+    "href",  # For a tags
+    "maxlength",
+    "name",
+    "pattern",
+    "placeholder",
+    "readonly",
+    "required",
+    "selected",  # for option tag
+    "src",  # do we need this?
+    "text-value",
+    "title",
+    "type",
+    "value",
+}
+
+
+def load_js_script() -> str:
+    # TODO: Handle file location better. This is a hacky way to find the file location.
+    path = f"{SKYVERN_DIR}/webeye/scraper/domUtils.js"
+    try:
+        # TODO: Implement TS of domUtils.js and use the complied JS file instead of the raw JS file.
+        # This will allow our code to be type safe.
+        with open(path, "r") as f:
+            return f.read()
+    except FileNotFoundError as e:
+        LOG.exception("Failed to load the JS script", exc_info=True, path=path)
+        raise e
+
+
+JS_FUNCTION_DEFS = load_js_script()
+
+
+class ScrapedPage(BaseModel):
+    """
+    Scraped response from a webpage, including:
+    1. List of elements
+    2. ID to xpath map
+    3. The element tree of the page (list of dicts). Each element has children and attributes.
+    4. The screenshot (base64 encoded)
+    5. The URL of the page
+    6. The HTML of the page
+    7. The extracted text from the page
+    """
+
+    elements: list[dict]
+    id_to_xpath_dict: dict[int, str]
+    element_tree: list[dict]
+    element_tree_trimmed: list[dict]
+    screenshots: list[bytes]
+    url: str
+    html: str
+    extracted_text: str | None = None
+
+
+async def scrape_website(
+    browser_state: BrowserState,
+    url: str,
+    num_retry: int = 0,
+) -> ScrapedPage:
+    """
+    ************************************************************************************************
+    ************ NOTE: MAX_SCRAPING_RETRIES is set to 0 in both staging and production *************
+    ************************************************************************************************
+    High-level asynchronous function to scrape a web page. It sets up the Playwright environment, handles browser and
+    page initialization, and calls the safe scraping function. This function is ideal for general use where initial
+    setup and safety measures are required.
+
+    Asynchronous function that safely scrapes a web page. It handles exceptions and retries scraping up to a maximum
+    number of attempts. This function should be used when reliability and error handling are crucial, such as in
+    automated scraping tasks.
+
+    :param browser_context: BrowserContext instance used for scraping.
+    :param url: URL of the web page to be scraped.
+    :param page: Optional Page instance for scraping, a new page is created if None.
+    :param num_retry: Tracks number of retries if scraping fails, defaults to 0.
+
+    :return: Tuple containing Page instance, base64 encoded screenshot, and page elements.
+
+    :raises Exception: When scraping fails after maximum retries.
+    """
+    try:
+        num_retry += 1
+        return await scrape_web_unsafe(browser_state, url)
+    except Exception:
+        # NOTE: MAX_SCRAPING_RETRIES is set to 0 in both staging and production
+        if num_retry > SettingsManager.get_settings().MAX_SCRAPING_RETRIES:
+            LOG.error(
+                "Scraping failed after max retries, aborting.",
+                max_retries=SettingsManager.get_settings().MAX_SCRAPING_RETRIES,
+                url=url,
+                exc_info=True,
+            )
+            raise Exception("Scraping failed.")
+        LOG.info("Scraping failed, will retry", num_retry=num_retry, url=url)
+        return await scrape_website(
+            browser_state,
+            url,
+            num_retry=num_retry,
+        )
+
+
+async def get_all_visible_text(page: Page) -> str:
+    """
+    Get all the visible text on the page.
+    :param page: Page instance to get the text from.
+    :return: All the visible text on the page.
+    """
+    js_script = "() => document.body.innerText"
+    return await page.evaluate(js_script)
+
+
+async def scrape_web_unsafe(
+    browser_state: BrowserState,
+    url: str,
+) -> ScrapedPage:
+    """
+    Asynchronous function that performs web scraping without any built-in error handling. This function is intended
+    for use cases where the caller handles exceptions or in controlled environments. It directly scrapes the provided
+    URL or continues on the given page.
+
+    :param browser_context: BrowserContext instance used for scraping.
+    :param url: URL of the web page to be scraped. Used only when creating a new page.
+    :param page: Optional Page instance for scraping, a new page is created if None.
+    :return: Tuple containing Page instance, base64 encoded screenshot, and page elements.
+    :note: This function does not handle exceptions. Ensure proper error handling in the calling context.
+    """
+    # We only create a new page if one does not exist. This is to allow keeping the same page since we want to
+    # continue working on the same page that we're taking actions on.
+    # *This also means URL is only used when creating a new page, and not when using an existing page.
+    page = await browser_state.get_or_create_page(url)
+    # Take screenshots of the page with the bounding boxes. We will remove the bounding boxes later.
+    # Scroll to the top of the page and take a screenshot.
+    # Scroll to the next page and take a screenshot until we reach the end of the page.
+    # We check if the scroll_y_px_old is the same as scroll_y_px to determine if we have reached the end of the page.
+    # This also solves the issue where we can't scroll due to a popup.(e.g. geico first popup on the homepage after
+    # clicking start my quote)
+
+    LOG.info("Waiting for 5 seconds before scraping the website.")
+    await asyncio.sleep(5)
+
+    screenshots: list[bytes] = []
+    scroll_y_px_old = -1.0
+    scroll_y_px = await scroll_to_top(page, drow_boxes=True)
+    # Checking max number of screenshots to prevent infinite loop
+    while scroll_y_px_old != scroll_y_px and len(screenshots) < SettingsManager.get_settings().MAX_NUM_SCREENSHOTS:
+        screenshot = await page.screenshot(full_page=False)
+        screenshots.append(screenshot)
+        scroll_y_px_old = scroll_y_px
+        LOG.info("Scrolling to next page", url=url, num_screenshots=len(screenshots))
+        scroll_y_px = await scroll_to_next_page(page, drow_boxes=True)
+        LOG.info("Scrolled to next page", scroll_y_px=scroll_y_px, scroll_y_px_old=scroll_y_px_old)
+    await remove_bounding_boxes(page)
+    await scroll_to_top(page, drow_boxes=False)
+
+    elements, element_tree = await get_interactable_element_tree(page)
+    element_tree = cleanup_elements(copy.deepcopy(element_tree))
+
+    id_to_xpath_dict = {}
+    for element in elements:
+        element_id = element["id"]
+        # get_interactable_element_tree marks each interactable element with a unique_id attribute
+        id_to_xpath_dict[element_id] = f"//*[@{SKYVERN_ID_ATTR}='{element_id}']"
+
+    text_content = await get_all_visible_text(page)
+    return ScrapedPage(
+        elements=elements,
+        id_to_xpath_dict=id_to_xpath_dict,
+        element_tree=element_tree,
+        element_tree_trimmed=trim_element_tree(copy.deepcopy(element_tree)),
+        screenshots=screenshots,
+        url=page.url,
+        html=await page.content(),
+        extracted_text=text_content,
+    )
+
+
+async def get_interactable_element_tree(page: Page) -> tuple[list[dict], list[dict]]:
+    """
+    Get the element tree of the page, including all the elements that are interactable.
+    :param page: Page instance to get the element tree from.
+    :return: Tuple containing the element tree and a map of element IDs to elements.
+    """
+    await page.evaluate(JS_FUNCTION_DEFS)
+    js_script = "() => buildTreeFromBody()"
+    elements, element_tree = await page.evaluate(js_script)
+    return elements, element_tree
+
+
+async def scroll_to_top(page: Page, drow_boxes: bool) -> float:
+    """
+    Scroll to the top of the page and take a screenshot.
+    :param drow_boxes: If True, draw bounding boxes around the elements.
+    :param page: Page instance to take the screenshot from.
+    :return: Screenshot of the page.
+    """
+    await page.evaluate(JS_FUNCTION_DEFS)
+    js_script = f"() => scrollToTop({str(drow_boxes).lower()})"
+    scroll_y_px = await page.evaluate(js_script)
+    return scroll_y_px
+
+
+async def scroll_to_next_page(page: Page, drow_boxes: bool) -> bool:
+    """
+    Scroll to the next page and take a screenshot.
+    :param drow_boxes: If True, draw bounding boxes around the elements.
+    :param page: Page instance to take the screenshot from.
+    :return: Screenshot of the page.
+    """
+    await page.evaluate(JS_FUNCTION_DEFS)
+    js_script = f"() => scrollToNextPage({str(drow_boxes).lower()})"
+    scroll_y_px = await page.evaluate(js_script)
+    return scroll_y_px
+
+
+async def remove_bounding_boxes(page: Page) -> None:
+    """
+    Remove the bounding boxes from the page.
+    :param page: Page instance to remove the bounding boxes from.
+    """
+    js_script = "() => removeBoundingBoxes()"
+    await page.evaluate(js_script)
+
+
+def cleanup_elements(elements: list[dict]) -> list[dict]:
+    """
+    Remove rect and attribute.unique_id from the elements.
+    The reason we're doing it is to
+    1. reduce unnecessary data so that llm get less distrction
+    # TODO later: 2. reduce tokens sent to llm to save money
+    :param elements: List of elements to remove xpaths from.
+    :return: List of elements without xpaths.
+    """
+    queue = []
+    for element in elements:
+        queue.append(element)
+    while queue:
+        queue_ele = queue.pop(0)
+        _remove_rect(queue_ele)
+        # TODO: we can come back to test removing the unique_id
+        # from element attributes to make sure this won't increase hallucination
+        # _remove_unique_id(queue_ele)
+        if "children" in queue_ele:
+            queue.extend(queue_ele["children"])
+    return elements
+
+
+def trim_element_tree(elements: list[dict]) -> list[dict]:
+    queue = []
+    for element in elements:
+        queue.append(element)
+    while queue:
+        queue_ele = queue.pop(0)
+        if "attributes" in queue_ele:
+            tag_name = queue_ele["tagName"] if "tagName" in queue_ele else ""
+            new_attributes = _trimmed_attributes(tag_name, queue_ele["attributes"])
+            if new_attributes:
+                queue_ele["attributes"] = new_attributes
+            else:
+                del queue_ele["attributes"]
+        if "children" in queue_ele:
+            queue.extend(queue_ele["children"])
+            if not queue_ele["children"]:
+                del queue_ele["children"]
+        if "text" in queue_ele:
+            element_text = str(queue_ele["text"]).strip()
+            if not element_text:
+                del queue_ele["text"]
+    return elements
+
+
+def _trimmed_attributes(tag_name: str, attributes: dict) -> dict:
+    new_attributes: dict = {}
+    for key in attributes:
+        if key == "id" and tag_name in ["input", "textarea", "select"]:
+            # We don't want to remove the id attribute any of these elements in case there's a label for it
+            new_attributes[key] = attributes[key]
+        if key in RESERVED_ATTRIBUTES:
+            new_attributes[key] = attributes[key]
+    return new_attributes
+
+
+def _remove_rect(element: dict) -> None:
+    if "rect" in element:
+        del element["rect"]
+
+
+def _remove_unique_id(element: dict) -> None:
+    if "attributes" not in element:
+        return
+    if SKYVERN_ID_ATTR in element["attributes"]:
+        del element["attributes"][SKYVERN_ID_ATTR]
