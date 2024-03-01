@@ -218,6 +218,36 @@ async def get_task(
     )
 
 
+@base_router.post(
+    "/tasks/{task_id}/retry_webhook",
+    tags=["agent"],
+    response_model=TaskResponse,
+)
+async def retry_webhook(
+    request: Request,
+    task_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> TaskResponse:
+    agent = request["agent"]
+    task_obj = await agent.db.get_task(task_id, organization_id=current_org.organization_id)
+    if not task_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task not found {task_id}",
+        )
+
+    # get latest step
+    latest_step = await agent.db.get_latest_step(task_id, organization_id=current_org.organization_id)
+    if not latest_step:
+        return task_obj.to_task_response()
+
+    # retry the webhook
+    await agent.execute_task_webhook(task=task_obj, last_step=latest_step, api_key=x_api_key)
+
+    return task_obj.to_task_response()
+
+
 @base_router.get("/internal/tasks/{task_id}", response_model=list[Task])
 async def get_task_internal(
     request: Request,

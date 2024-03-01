@@ -692,16 +692,19 @@ class ForgeAgent(Agent):
         # Wait for all tasks to complete before generating the links for the artifacts
         await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks_for_task(task.task_id)
 
-        if not task.webhook_callback_url:
+        await self.execute_task_webhook(task=task, last_step=last_step, api_key=api_key)
+
+    async def execute_task_webhook(self, task: Task, last_step: Step, api_key: str | None) -> None:
+        if not api_key:
             LOG.warning(
-                "Task has no webhook callback url. Not sending task response",
+                "Request has no api key. Not sending task response",
                 task_id=task.task_id,
             )
             return
 
-        if not api_key:
+        if not task.webhook_callback_url:
             LOG.warning(
-                "Request has no api key. Not sending task response",
+                "Task has no webhook callback url. Not sending task response",
                 task_id=task.task_id,
             )
             return
@@ -732,6 +735,7 @@ class ForgeAgent(Agent):
         if not task_from_db:
             LOG.error("Failed to get task from db when sending task response")
             raise TaskNotFound(task_id=task.task_id)
+
         task = task_from_db
         if not task.webhook_callback_url:
             LOG.info("Task has no webhook callback url. Not sending task response")
