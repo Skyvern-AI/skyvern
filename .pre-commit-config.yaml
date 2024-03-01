@@ -1,0 +1,87 @@
+default_language_version:
+  python: python3.11
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: check-added-large-files
+        args: ['--maxkb=5000']
+        exclude: |
+          (?x)(
+            inputs.*
+          )
+      - id: check-byte-order-marker
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: debug-statements
+      - id: detect-private-key
+
+  - repo: https://github.com/pycqa/isort
+    rev: 5.12.0
+    hooks:
+      - id: isort
+        language_version: python3.11
+
+  - repo: https://github.com/psf/black
+    rev: 23.11.0
+    hooks:
+      - id: black
+        language_version: python3.11
+
+  - repo: https://github.com/pre-commit/pygrep-hooks
+    rev: v1.10.0
+    hooks:
+      - id: python-check-blanket-noqa
+      - id: python-check-mock-methods
+      - id: python-no-log-warn
+      - id: python-use-type-annotations
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.7.0
+    hooks:
+      - id: mypy
+        args: [--show-error-codes, --warn-unused-configs, --disallow-untyped-calls, --disallow-untyped-defs, --disallow-incomplete-defs, --check-untyped-defs, --python-version=3.11]
+        additional_dependencies:
+          - requests
+          - types-requests
+          - types-cachetools
+          - alembic
+        exclude: |
+          (?x)(
+            ^tests.*|
+            ^streamlit_app.*|
+            ^alembic.*
+          )
+
+  - repo: https://github.com/PyCQA/autoflake
+    rev: v2.2.1
+    hooks:
+      - id: autoflake
+        name: autoflake
+        entry: autoflake --in-place --remove-all-unused-imports --recursive --ignore-init-module-imports
+        language: python
+        types: [ python ]
+      # Mono repo has bronken this TODO: fix
+      # - id: pytest-check
+      #   name: pytest-check
+      #   entry: pytest
+      #   language: system
+      #   pass_filenames: false
+      #   always_run: true
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: "v3.1.0" # Use the sha or tag you want to point at
+    hooks:
+      - id: prettier
+        types: [javascript]
+  - repo: https://github.com/thlorenz/doctoc
+    rev: v2.2.0
+    hooks:
+      - id: doctoc
+  - repo: local
+    hooks:
+      - id: alembic-check
+        name: Alembic Check
+        entry: ./run_alembic_check.sh
+        language: script
+        stages: [ commit ]

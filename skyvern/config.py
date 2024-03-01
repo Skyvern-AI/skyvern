@@ -1,0 +1,61 @@
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from skyvern.constants import SKYVERN_DIR
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=(".env", ".env.staging", ".env.prod"), extra="ignore")
+
+    ADDITIONAL_MODULES: list[str] = []
+
+    BROWSER_TYPE: str = "chromium-headful"
+    MAX_SCRAPING_RETRIES: int = 0
+    VIDEO_PATH: str | None = None
+    HAR_PATH: str | None = "./har"
+    BROWSER_ACTION_TIMEOUT_MS: int = 5000
+    MAX_STEPS_PER_RUN: int = 75
+    MAX_NUM_SCREENSHOTS: int = 6
+    # Ratio should be between 0 and 1.
+    # If the task has been running for more steps than this ratio of the max steps per run, then we'll log a warning.
+    LONG_RUNNING_TASK_WARNING_RATIO: float = 0.95
+    MAX_RETRIES_PER_STEP: int = 5
+    DEBUG_MODE: bool = False
+    DATABASE_STRING: str = "postgresql+psycopg://skyvern@localhost/skyvern"
+    PROMPT_ACTION_HISTORY_WINDOW: int = 5
+
+    OPENAI_API_KEYS: list[str] = []
+    ENV: str = "local"
+    EXECUTE_ALL_STEPS: bool = True
+    JSON_LOGGING: bool = False
+    PORT: int = 8000
+
+    SECRET_KEY: str = "RX1NvhujcJqBPi8O78-7aSfJEWuT86-fll4CzKc_uek"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # one week
+
+    SKYVERN_API_KEY: str = "SKYVERN_API_KEY"
+
+    # Artifact storage settings
+    ARTIFACT_STORAGE_PATH: str = f"{SKYVERN_DIR}/artifacts"
+
+    ASYNC_ENABLED: bool = False
+
+    def is_cloud_environment(self) -> bool:
+        """
+        :return: True if env is not local, else False
+        """
+        return self.ENV != "local"
+
+    def execute_all_steps(self) -> bool:
+        """
+        This provides the functionality to execute steps one by one through the Streamlit UI.
+        ***Value is always True if ENV is not local.***
+
+        :return: True if env is not local, else the value of EXECUTE_ALL_STEPS
+        """
+        if self.is_cloud_environment():
+            return True
+        else:
+            return self.EXECUTE_ALL_STEPS
+
+
+settings = Settings()

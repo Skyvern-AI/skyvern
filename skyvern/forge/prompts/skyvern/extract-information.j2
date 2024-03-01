@@ -1,0 +1,16 @@
+You are given a screenshot, user data extraction goal, the JSON schema for the output data format, and the current URL.
+
+Your task is to extract the requested information from the screenshot and {% if extracted_information_schema %}output it in the specified JSON schema format:
+{{ extracted_information_schema }} {% else %}output in strictly JSON format {% endif %}
+
+Add as much details as possible to the output JSON object while conforming to the output JSON schema.
+
+Do not ever include anything other than the JSON object in your output, and do not ever include any additional fields in the JSON object.
+
+If you are unable to extract the requested information for a specific field in the json schema, please output a null value for that field.
+
+User Data Extraction Goal: {{ data_extraction_goal }}
+
+Current URL: {{ current_url }}
+
+Text extracted from the webpage: {{ extracted_text }}
