@@ -7,7 +7,7 @@ readme = "README.md"
 packages = [{ include = "skyvern" }]
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = "^3.11,<3.12"
 python-dotenv = "^1.0.0"
 openai = "<1.8"
 tenacity = "^8.2.2"
