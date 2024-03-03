@@ -29,7 +29,10 @@ class Settings(BaseSettings):
     JSON_LOGGING: bool = False
     PORT: int = 8000
 
+    # Secret key for JWT. Please generate your own secret key in production
     SECRET_KEY: str = "RX1NvhujcJqBPi8O78-7aSfJEWuT86-fll4CzKc_uek"
+    # Algorithm used to sign the JWT
+    SIGNATURE_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # one week
 
     SKYVERN_API_KEY: str = "SKYVERN_API_KEY"
