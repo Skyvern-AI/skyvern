@@ -1,20 +1,21 @@
-import json
+from pydantic import BaseModel
 
 
-def get_sample_url() -> str:
-    return "https://www.geico.com"
+class SampleData(BaseModel):
+    name: str
+    url: str
+    navigation_goal: str
+    data_extraction_goal: str
+    navigation_payload: dict
+    extracted_information_schema: dict
 
 
-def get_sample_navigation_goal() -> str:
-    return "Navigate through the website until you generate an auto insurance quote. Do not generate a home insurance quote. If this page contains an auto insurance quote, consider the goal achieved"
-
-
-def get_sample_data_extraction_goal() -> str:
-    return "Extract all quote information in JSON format including the premium amount, the timeframe for the quote."
-
-
-def get_sample_navigation_payload() -> str:
-    navigation_payload = {
+geico_sample_data = SampleData(
+    name="Geico",
+    url="https://www.geico.com",
+    navigation_goal="Navigate through the website until you generate an auto insurance quote. Do not generate a home insurance quote. If this page contains an auto insurance quote, consider the goal achieved",
+    data_extraction_goal="Extract all quote information in JSON format including the premium amount, the timeframe for the quote.",
+    navigation_payload={
         "licensed_at_age": 19,
         "education_level": "HIGH_SCHOOL",
         "phone_number": "8042221111",
@@ -97,13 +98,8 @@ def get_sample_navigation_payload() -> str:
         "spouse_education_level": "MASTERS",
         "spouse_email": "amy.stake@abc.com",
         "spouse_added_to_auto_policy": True,
-    }
-
-    return json.dumps(navigation_payload)
-
-
-def get_sample_extracted_information_schema() -> str:
-    extracted_information_schema = {
+    },
+    extracted_information_schema={
         "additionalProperties": False,
         "properties": {
             "quotes": {
@@ -181,5 +177,7 @@ def get_sample_extracted_information_schema() -> str:
             }
         },
         "type": "object",
-    }
-    return json.dumps(extracted_information_schema)
+    },
+)
+
+supported_examples = [geico_sample_data]
