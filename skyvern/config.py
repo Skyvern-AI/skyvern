@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     # Artifact storage settings
     ARTIFACT_STORAGE_PATH: str = f"{SKYVERN_DIR}/artifacts"
 
-    ASYNC_ENABLED: bool = False
+    DISABLE_TELEMETRY: bool = False
 
     def is_cloud_environment(self) -> bool:
         """

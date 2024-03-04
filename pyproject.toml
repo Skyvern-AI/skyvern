@@ -43,6 +43,7 @@ asyncache = "^0.3.1"
 orjson = "^3.9.10"
 structlog = "^23.2.0"
 plotly = "^5.18.0"
+typer = "^0.9.0"
 
 
 [tool.poetry.group.dev.dependencies]

@@ -1,5 +1,12 @@
 #!/bin/bash
 
+# Call function to send telemetry event
+log_event() {
+    if [ -n $1 ]; then
+        python scripts/tracking.py $1
+    fi
+}
+
 # Function to check if a command exists
 command_exists() {
     command -v "$1" &> /dev/null
@@ -35,6 +42,7 @@ activate_poetry_env() {
 }
 
 install_dependencies_after_poetry_env() {
+    echo "Installing playwright dependencies..."
     playwright install
 }
 
@@ -51,8 +59,8 @@ setup_postgresql() {
             echo "Error: brew is not installed, please install homebrew and re-run the script or install postgresql manually." >&2
             exit 1
         fi
+        brew install postgresql@14
     fi
-    brew install postgresql@14
     brew services start postgresql@14
 
     if psql skyvern-open-source -U skyvern-open-source -c '\q'; then
@@ -100,6 +108,7 @@ main() {
     install_dependencies_after_poetry_env
     run_alembic_upgrade
     create_organization
+    log_event "skyvern-oss-setup-complete"
     echo "Setup completed successfully."
 }
 
