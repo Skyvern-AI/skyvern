@@ -2,7 +2,7 @@
  <a href="https://www.skyvern.com">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="images/skyvern_logo.png"/>
-    <img height="120" src="images/skyvern_logo-blackbg.png"/>
+    <img height="120" src="images/skyvern_logo_blackbg.png"/>
   </picture>
  </a>
  <br />
