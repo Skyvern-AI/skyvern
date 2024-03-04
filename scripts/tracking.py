@@ -39,7 +39,8 @@ def capture(
     event: str,
     data: dict[str, Any] | None = None,
 ) -> None:
-    if SettingsManager.get_settings().DISABLE_TELEMETRY:
+    # If telemetry is disabled, don't send any data
+    if not SettingsManager.get_settings().SKYVERN_TELEMETRY:
         return
 
     payload: dict[str, Any] = data or {}
