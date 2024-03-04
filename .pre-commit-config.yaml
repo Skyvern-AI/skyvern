@@ -78,6 +78,7 @@ repos:
     rev: v2.2.0
     hooks:
       - id: doctoc
+        exclude: 'README.md'
   - repo: local
     hooks:
       - id: alembic-check
