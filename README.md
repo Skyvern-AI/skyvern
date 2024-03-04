@@ -50,7 +50,7 @@ Before you begin, make sure you have the following installed:
     ```bash
     ./setup.sh
     ```
-1. Create the `.env` file by copying the `.env.example` file and fill in the necessary environment variables
+1. Create the `.env` file by copying the `.env.example` file and fill in the necessary environment variables (such as your OpenAI API key, etc.)
     ```bash
     cp .env.example .env
     ```
@@ -70,8 +70,24 @@ If you're looking to contribute to Skyvern, you'll need to install the pre-commi
 pre-commit install
 ```
 
+# How it works
+Skyvern was inspired by the Task-Driven autonomous agent design popularized by [BabyAGI](https://github.com/yoheinakajima/babyagi) and [AutoGPT](https://github.com/Significant-Gravitas/AutoGPT) -- with one major difference: we give Skyvern the ability to interact with websites using browser automation libraries like [Playwright](https://playwright.dev/).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/skyvern-system-diagram.png"/>
+  <img src="images/skyvern-system-diagram.png"/>
+</picture>
+
+<!-- > TODO (suchintan): 
+Expand the diagram above to go deeper into how:
+1. We draw bounding boxes
+2. We parse the HTML + extract the image to generate an interactable element map
+-->
 
 # Real-world examples of Skyvern
+<!-- > TODO (suchintan):
+Preload these examples inside of our UI so that users can see them in action
+Provide a way to run these examples in the UI (via the commandline?) -->
 We love to see how Skyvern is being used in the wild. Here are some examples of how Skyvern is being used to automate workflows in the real world. Please open PRs to add your own examples!
 
 
