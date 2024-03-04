@@ -1,3 +1,4 @@
+import clipboard
 import pandas as pd
 import streamlit as st
 
@@ -104,6 +105,11 @@ st.markdown("# **:dragon: Skyvern :dragon:**")
 st.markdown(f"### **{select_env} - {select_org}**")
 execute_tab, visualizer_tab = st.tabs(["Execute", "Visualizer"])
 
+
+def copy_curl_to_clipboard(task_request_body: TaskRequest) -> None:
+    clipboard.copy(client.copy_curl(task_request_body=task_request_body))
+
+
 with execute_tab:
     example_tabs = st.tabs([supported_example.name for supported_example in supported_examples])
 
@@ -111,8 +117,14 @@ with execute_tab:
         with example_tab:
             create_column, explanation_column = st.columns([1, 2])
             with create_column:
+                run_task, copy_curl = st.columns([3, 1])
+                task_request_body = supported_examples[i]
+                copy_curl.button(
+                    "Copy cURL", on_click=lambda: copy_curl_to_clipboard(task_request_body=task_request_body)
+                )
                 with st.form("task_form"):
-                    st.markdown("## Run a task")
+                    run_task.markdown("## Run a task")
+
                     example = supported_examples[i]
                     # Create all the fields to create a TaskRequest object
                     st_url = st.text_input("URL*", value=example.url, key="url")

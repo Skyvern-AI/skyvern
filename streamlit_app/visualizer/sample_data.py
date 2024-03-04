@@ -1,16 +1,11 @@
-from pydantic import BaseModel
+from skyvern.forge.sdk.schemas.tasks import TaskRequest
 
 
-class SampleData(BaseModel):
+class SampleTaskRequest(TaskRequest):
     name: str
-    url: str
-    navigation_goal: str
-    data_extraction_goal: str
-    navigation_payload: dict
-    extracted_information_schema: dict
 
 
-geico_sample_data = SampleData(
+geico_sample_data = SampleTaskRequest(
     name="Geico",
     url="https://www.geico.com",
     navigation_goal="Navigate through the website until you generate an auto insurance quote. Do not generate a home insurance quote. If this page contains an auto insurance quote, consider the goal achieved",

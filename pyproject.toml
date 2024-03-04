@@ -43,6 +43,8 @@ asyncache = "^0.3.1"
 orjson = "^3.9.10"
 structlog = "^23.2.0"
 plotly = "^5.18.0"
+clipboard = "^0.0.4"
+curlify = "^2.2.1"
 
 
 [tool.poetry.group.dev.dependencies]
@@ -66,6 +68,7 @@ notebook = "^7.0.6"
 freezegun = "^1.2.2"
 snoop = "^0.4.3"
 rich = {extras = ["jupyter"], version = "^13.7.0"}
+clipboard = "^0.0.4"
 
 
 [build-system]
