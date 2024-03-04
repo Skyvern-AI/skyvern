@@ -44,16 +44,16 @@ setup_postgresql() {
     if ! command_exists psql; then
         echo "`postgresql` is not installed."
         if [[ "$OSTYPE" != "darwin"* ]]; then
-            echo "Error: Please install postgresql manually and re-run the script." >&2
+            echo "Error: Please install postgresql and start the service manually and re-run the script." >&2
             exit 1
         fi
         if ! command_exists brew; then
             echo "Error: brew is not installed, please install homebrew and re-run the script or install postgresql manually." >&2
             exit 1
         fi
+        brew install postgresql@14
+        brew services start postgresql@14
     fi
-    brew install postgresql@14
-    brew services start postgresql@14
 
     if psql skyvern -U skyvern -c '\q'; then
         echo "Connection successful. Database and user exist."
