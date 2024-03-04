@@ -6,7 +6,7 @@ command_exists() {
 }
 
 # Ensure required commands are available
-for cmd in poetry pre-commit brew python; do
+for cmd in poetry python3.11; do
     if ! command_exists "$cmd"; then
         echo "Error: $cmd is not installed." >&2
         exit 1
@@ -28,16 +28,30 @@ remove_poetry_env() {
 # Function to install dependencies
 install_dependencies() {
     poetry install
-    pre-commit install
 }
 
 activate_poetry_env() {
     source "$(poetry env info --path)/bin/activate"
 }
 
+install_dependencies_after_poetry_env() {
+    playwright install
+}
+
 # Function to setup PostgreSQL
 setup_postgresql() {
     echo "Installing postgresql using brew"
+    if ! command_exists psql; then
+        echo "`postgresql` is not installed."
+        if [[ "$OSTYPE" != "darwin"* ]]; then
+            echo "Error: Please install postgresql manually and re-run the script." >&2
+            exit 1
+        fi
+        if ! command_exists brew; then
+            echo "Error: brew is not installed, please install homebrew and re-run the script or install postgresql manually." >&2
+            exit 1
+        fi
+    fi
     brew install postgresql@14
     brew services start postgresql@14
 
@@ -83,6 +97,7 @@ main() {
     install_dependencies
     setup_postgresql
     activate_poetry_env
+    install_dependencies_after_poetry_env
     run_alembic_upgrade
     create_organization
     echo "Setup completed successfully."

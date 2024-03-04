@@ -31,7 +31,40 @@ Want to see more examples of Skyvern in action? Click [here](#real-world-example
 
 
 ## Quickstart
-<< TODO >>
+This quickstart guide will walk you through getting Skyvern up and running on your local machine. 
+
+### Prerequisites
+Before you begin, make sure you have the following installed:
+
+- [Python 3.11](https://www.python.org/downloads/)
+- [Poetry](https://python-poetry.org/docs/#installation)
+- [PostgreSQL 14](https://www.postgresql.org/download/) (if you're on a Mac, setup script will install it for you if you have homebrew installed)
+
+### Setup
+1. Clone the repository and navigate to the root directory
+2. Run the setup script to install the necessary dependencies and setup your environment
+```bash
+./setup.sh
+```
+3. Create the `.env` file by copying the `.env.example` file and fill in the necessary environment variables
+```bash
+cp .env.example .env
+```
+4. Start the server
+```bash
+./run.sh
+```
+5. You can start sending requests to the server, but we built a simple UI to help you get started. To start the UI, run the following command:
+```bash
+./run_streamlit.sh
+```
+6. Navigate to `http://localhost:8501` in your browser to start using the UI
+
+### Additional Setup for Contributors
+If you're looking to contribute to Skyvern, you'll need to install the pre-commit hooks to ensure code quality and consistency. You can do this by running the following command:
+```bash
+pre-commit install
+```
 
 ## Documentation
 
