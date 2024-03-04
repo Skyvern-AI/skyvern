@@ -2,7 +2,7 @@
  <a href="https://www.skyvern.com">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="images/skyvern_logo.png"/>
-    <img height="120" src="images/skyvern_logo.png"/>
+    <img height="120" src="images/skyvern_logo-blackbg.png"/>
   </picture>
  </a>
  <br />
@@ -74,8 +74,8 @@ pre-commit install
 Skyvern was inspired by the Task-Driven autonomous agent design popularized by [BabyAGI](https://github.com/yoheinakajima/babyagi) and [AutoGPT](https://github.com/Significant-Gravitas/AutoGPT) -- with one major difference: we give Skyvern the ability to interact with websites using browser automation libraries like [Playwright](https://playwright.dev/).
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="images/Skyvern-system-diagram.png"/>
-  <img src="images/Skyvern-system-diagram.png"/>
+  <source media="(prefers-color-scheme: dark)" srcset="images/skyvern-system-diagram-dark.png"/>
+  <img src="images/skyvern-system-diagram-light.png"/>
 </picture>
 
 <!-- > TODO (suchintan): 
