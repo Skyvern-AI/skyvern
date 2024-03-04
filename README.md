@@ -70,6 +70,9 @@ If you're looking to contribute to Skyvern, you'll need to install the pre-commi
 pre-commit install
 ```
 
+## Running your first automation
+
+
 # How it works
 Skyvern was inspired by the Task-Driven autonomous agent design popularized by [BabyAGI](https://github.com/yoheinakajima/babyagi) and [AutoGPT](https://github.com/Significant-Gravitas/AutoGPT) -- with one major difference: we give Skyvern the ability to interact with websites using browser automation libraries like [Playwright](https://playwright.dev/).
 
