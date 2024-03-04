@@ -63,7 +63,12 @@ class SkyvernClient:
         response = requests.get(url, params=params, headers=headers)
         steps = response.json()
         for step in steps:
-            if "output" in step and "actions_and_results" in step["output"]:
+            if (
+                "output" in step
+                and step["output"] is not None
+                and "actions_and_results" in step["output"]
+                and step["output"]["actions_and_results"] is not None
+            ):
                 step["output"]["actions_and_results"] = json.dumps(step["output"]["actions_and_results"])
         return steps
 
