@@ -20,8 +20,8 @@ jobs:
         image: postgres
         # Provide the password for postgres
         env:
-          POSTGRES_USER: skyvern-open-source
-          POSTGRES_DATABASE: skyvern-open-source
+          POSTGRES_USER: skyvern
+          POSTGRES_DATABASE: skyvern
           POSTGRES_HOST_AUTH_METHOD: trust
         # Set health checks to wait until postgres has started
         options: >-

@@ -55,11 +55,11 @@ setup_postgresql() {
     brew install postgresql@14
     brew services start postgresql@14
 
-    if psql skyvern-open-source -U skyvern-open-source -c '\q'; then
+    if psql skyvern -U skyvern -c '\q'; then
         echo "Connection successful. Database and user exist."
     else
-        createuser skyvern-open-source
-        createdb skyvern-open-source -O skyvern-open-source
+        createuser skyvern
+        createdb skyvern -O skyvern
         echo "Database and user created successfully."
     fi
 }
@@ -87,7 +87,7 @@ create_organization() {
     fi
 
     # Update the secrets-open-source.toml file
-    echo -e "[skyvern]\nconfigs = [\n    {\"env\" = \"local\", \"host\" = \"http://0.0.0.0:8000/api/v1\", \"orgs\" = [{name=\"Skyvern-Open-Source\", cred=\"$api_token\"}]}\n]" > .streamlit/secrets.toml
+    echo -e "[skyvern]\nconfigs = [\n    {\"env\" = \"local\", \"host\" = \"http://0.0.0.0:8000/api/v1\", \"orgs\" = [{name=\"Skyvern\", cred=\"$api_token\"}]}\n]" > .streamlit/secrets.toml
     echo ".streamlit/secrets.toml file updated with organization details."
 }
 
