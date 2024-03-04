@@ -27,7 +27,7 @@
   <img src="images/geico_shu_recording_cropped.gif"/>
 </p>
 
-Want to see more examples of Skyvern in action? Click [here](#real-world-examples-of-skyvern-in-action)!
+Want to see more examples of Skyvern in action? Click [here](#real-world-examples-of-skyvern)!
 
 
 # Quickstart
