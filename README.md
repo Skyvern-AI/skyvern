@@ -38,30 +38,30 @@ Before you begin, make sure you have the following installed:
 
 - [Brew (if you're on a Mac)](https://brew.sh/)
 - [Poetry](https://python-poetry.org/docs/#installation)
-  - `brew install poetry`
+    - `brew install poetry`
 - [Python 3.11](https://www.python.org/downloads/)
-  - `poetry env use 3.11`
+    - `poetry env use 3.11`
 - [PostgreSQL 14](https://www.postgresql.org/download/) (if you're on a Mac, setup script will install it for you if you have homebrew installed)
-  - `brew install postgresql`
+    - `brew install postgresql`
 
 ### Setup
 1. Clone the repository and navigate to the root directory
 1. Run the setup script to install the necessary dependencies and setup your environment
-```bash
-./setup.sh
-```
+    ```bash
+    ./setup.sh
+    ```
 1. Create the `.env` file by copying the `.env.example` file and fill in the necessary environment variables
-```bash
-cp .env.example .env
-```
+    ```bash
+    cp .env.example .env
+    ```
 1. Start the server
-```bash
-./run.sh
-```
+    ```bash
+    ./run.sh
+    ```
 1. You can start sending requests to the server, but we built a simple UI to help you get started. To start the UI, run the following command:
-```bash
-./run_streamlit.sh
-```
+    ```bash
+    ./run_ui.sh
+    ```
 1. Navigate to `http://localhost:8501` in your browser to start using the UI
 
 ### Additional Setup for Contributors
@@ -79,8 +79,6 @@ More extensive documentation can be found on our [documentation website](https:/
 ## Frequently Asked Questions (FAQs)
 ### What gets us excited about Skyvern?
 
-<details>
-<summary> Click to expand </summary>
 Our focus is bringing stability to browser-based workflows. We leverage LLMs to create an AI Agent capable of interacting with websites like you or I would — all via a simple API call.
 
 Traditional approaches required writing custom scripts for websites, often relying on DOM parsing and XPath-based interactions which would break whenever the website layouts changed.
@@ -91,12 +89,10 @@ This approach gives us a few advantages:
 
 1. Skyvern can operate on websites it’s never seen before, as it’s able to map visual elements to actions necessary to complete a workflow, without any customized code
 1. Skyvern is resistant to website layout changes, as there are no pre-determined XPaths or other selectors our system is looking for while trying to navigate
-1. We’re able to circumvent or navigate through many bot detection methods as many of them rely on allowing people to access the websites
-1. We rely on LLMs to reason through interactions to ensure we can cover complex situations. Examples include:
-1. If you wanted to get an auto insurance quote from Geico, the answer to a common question “Were you eligible to drive at 18?” could be inferred from the driver receiving their license at age 16
-1. If you were doing competitor analysis, it’s understanding that an Arnold Palmer 22 oz can at 7/11 is almost definitely the same product as a 23 oz can at Gopuff (even though the sizes are slightly different, which could be a rounding error!)
-
-</details>
+1. Skyvern is able to circumvent or navigate through many bot detection methods as many of them rely on allowing people to access the websites
+1. Skyvern leverages LLMs to reason through interactions to ensure we can cover complex situations. Examples include:
+    1. If you wanted to get an auto insurance quote from Geico, the answer to a common question “Were you eligible to drive at 18?” could be inferred from the driver receiving their license at age 16
+    1. If you were doing competitor analysis, it’s understanding that an Arnold Palmer 22 oz can at 7/11 is almost definitely the same product as a 23 oz can at Gopuff (even though the sizes are slightly different, which could be a rounding error!)
 
 
 ## Feature Roadmap
@@ -120,21 +116,18 @@ We welcome PRs and suggestions! Don't hesitate to open a PR/issue or to reach ou
 Please have a look at our [contribution guide](CONTRIBUTING.md) and
 ["Help Wanted" issues](https://github.com/skyvern-ai/skyvern/issues?q=is%3Aopen+is%3Aissue+label%3A%22help+wanted%22) to get started!
 
-## Usage and Feedback
-
-We are delighted to work with the community to help shape the roadmap of our product. Please don't hesitate to reach out via [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3) if you have any product suggestions or feedback.
-
 ### Telemetry
 
 By Default, Skyvern collects basic usage statistics to help us understand how Skyvern is being used. If you would like to opt-out of telemetry, please set the `SKYVERN_TELEMETRY` environment variable to `false`.
 
 ## License
+Skyvern's open source repository is supported via a managed cloud. All of the core logic powering Skyvern is available in this open source repository licensed under the [AGPL-3.0 License](LICENSE), with the exception of anti-bot measures available in our managed cloud offering. 
 
-The majority of Skyvern is open source. The current license can be found in the  [LICENSE](LICENSE) file. If there are any questions or concerns around licensing, please [contact us](mailto:founders@skyvern.com) and we would be happy to help.
+If you have any questions or concerns around licensing, please [contact us](mailto:founders@skyvern.com) and we would be happy to help.
 
 
 ## Real-world examples of Skyvern in action
-We love to see how Skyvern is being used in the wild! Here are some examples of how Skyvern is being used to automate workflows in the real world. Please open PRs to add your own examples!
+We love to see how Skyvern is being used in the wild. Here are some examples of how Skyvern is being used to automate workflows in the real world. Please open PRs to add your own examples!
 
 
 ### Automate materials procurement for a manufacturing company
