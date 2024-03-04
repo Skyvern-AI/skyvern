@@ -108,6 +108,17 @@ Once you have the UI running, you can start an automation by filling out the fie
 
 ### Executing tasks (cURL)
 
+```
+curl -X POST -H 'Content-Type: application/json' -H 'x-api-key: {Your local API key}' -d '{
+    "url": "https://www.geico.com",
+    "webhook_callback_url": "",
+    "navigation_goal": "Navigate through the website until you generate an auto insurance quote. Do not generate a home insurance quote. If this page contains an auto insurance quote, consider the goal achieved",
+    "data_extraction_goal": "Extract all quote information in JSON format including the premium amount, the timeframe for the quote.",
+    "navigation_payload": "{Your data here}",
+    "proxy_location": "NONE"
+}' http://0.0.0.0:8000/api/v1/tasks
+```
+
 
 # Real-world examples of Skyvern
 <!-- > TODO (suchintan):
