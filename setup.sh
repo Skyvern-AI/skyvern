@@ -52,8 +52,8 @@ setup_postgresql() {
             exit 1
         fi
         brew install postgresql@14
-        brew services start postgresql@14
     fi
+    brew services start postgresql@14
 
     if psql skyvern -U skyvern -c '\q'; then
         echo "Connection successful. Database and user exist."
