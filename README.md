@@ -8,7 +8,7 @@
  <br />
 </h1>
 <p align="center">
-🐉 Automate Browser-based workflows with AI 🐉
+🐉 Automate Browser-based workflows using LLMs and Computer Vision 🐉
 </p>
 <p align="center">
   <a href="https://www.skyvern.com/"><img src="https://img.shields.io/badge/Website-blue?logo=googlechrome&logoColor=black"></a>
@@ -36,29 +36,33 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
 ### Prerequisites
 Before you begin, make sure you have the following installed:
 
-- [Python 3.11](https://www.python.org/downloads/)
+- [Brew (if you're on a Mac)](https://brew.sh/)
 - [Poetry](https://python-poetry.org/docs/#installation)
+  - `brew install poetry`
+- [Python 3.11](https://www.python.org/downloads/)
+  - `poetry env use 3.11`
 - [PostgreSQL 14](https://www.postgresql.org/download/) (if you're on a Mac, setup script will install it for you if you have homebrew installed)
+  - `brew install postgresql`
 
 ### Setup
 1. Clone the repository and navigate to the root directory
-2. Run the setup script to install the necessary dependencies and setup your environment
+1. Run the setup script to install the necessary dependencies and setup your environment
 ```bash
 ./setup.sh
 ```
-3. Create the `.env` file by copying the `.env.example` file and fill in the necessary environment variables
+1. Create the `.env` file by copying the `.env.example` file and fill in the necessary environment variables
 ```bash
 cp .env.example .env
 ```
-4. Start the server
+1. Start the server
 ```bash
 ./run.sh
 ```
-5. You can start sending requests to the server, but we built a simple UI to help you get started. To start the UI, run the following command:
+1. You can start sending requests to the server, but we built a simple UI to help you get started. To start the UI, run the following command:
 ```bash
 ./run_streamlit.sh
 ```
-6. Navigate to `http://localhost:8501` in your browser to start using the UI
+1. Navigate to `http://localhost:8501` in your browser to start using the UI
 
 ### Additional Setup for Contributors
 If you're looking to contribute to Skyvern, you'll need to install the pre-commit hooks to ensure code quality and consistency. You can do this by running the following command:
@@ -66,10 +70,9 @@ If you're looking to contribute to Skyvern, you'll need to install the pre-commi
 pre-commit install
 ```
 
-## Documentation
+[//]: # ## Documentation
 
-More extensive documentation can be found on our [documentation website](https://docs.skyvern.ai). Please let us know if something is unclear or missing by opening an issue or reaching out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
-
+[//]: #More extensive documentation can be found on our [documentation website](https://docs.skyvern.ai). Please let us know if something is unclear or missing by opening an issue or reaching out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
 
 
 ## Frequently Asked Questions (FAQs)
