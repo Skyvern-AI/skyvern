@@ -83,7 +83,7 @@ Before you begin, make sure you have the following installed:
     ```
 1. Start the server
     ```bash
-    ./run.sh
+    ./run_skyvern.sh
     ```
 1. You can start sending requests to the server, but we built a simple UI to help you get started. To start the UI, run the following command:
     ```bash
