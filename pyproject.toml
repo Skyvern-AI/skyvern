@@ -45,6 +45,7 @@ structlog = "^23.2.0"
 plotly = "^5.18.0"
 clipboard = "^0.0.4"
 curlify = "^2.2.1"
+typer = "^0.9.0"
 
 
 [tool.poetry.group.dev.dependencies]
