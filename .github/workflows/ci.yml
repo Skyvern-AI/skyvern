@@ -1,0 +1,94 @@
+name: Run tests and pre-commit
+
+# Run this job on pushes to `main`, and for pull requests. If you don't specify
+# `branches: [main], then this actions runs _twice_ on pull requests, which is
+# annoying.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # Service containers to run with `container-job`
+    services:
+      # Label used to access the service container
+      postgres:
+        # Docker Hub image
+        image: postgres
+        # Provide the password for postgres
+        env:
+          POSTGRES_USER: skyvern-open-source
+          POSTGRES_DATABASE: skyvern-open-source
+          POSTGRES_HOST_AUTH_METHOD: trust
+        # Set health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          # Maps tcp port 5432 on service container to the host
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v3
+
+      # If you wanted to use multiple Python versions, you'd have specify a matrix in the job and
+      # reference the matrixe python version here.
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      # Cache the installation of Poetry itself, e.g. the next step. This prevents the workflow
+      # from installing Poetry every time, which can be slow. Note the use of the Poetry version
+      # number in the cache key, and the "-0" suffix: this allows you to invalidate the cache
+      # manually if/when you want to upgrade Poetry, or if something goes wrong. This could be
+      # mildly cleaner by using an environment variable, but I don't really care.
+      - name: cache poetry install
+        uses: actions/cache@v3
+        with:
+          path: ~/.local
+          key: poetry-1.7.1
+
+      # Install Poetry. You could do this manually, or there are several actions that do this.
+      # `snok/install-poetry` seems to be minimal yet complete, and really just calls out to
+      # Poetry's default install script, which feels correct. I pin the Poetry version here
+      # because Poetry does occasionally change APIs between versions and I don't want my
+      # actions to break if it does.
+      #
+      # The key configuration value here is `virtualenvs-in-project: true`: this creates the
+      # venv as a `.venv` in your testing directory, which allows the next step to easily
+      # cache it.
+      - uses: snok/install-poetry@v1
+        with:
+          version: 1.7.1
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      # Cache your dependencies (i.e. all the stuff in your `pyproject.toml`). Note the cache
+      # key: if you're using multiple Python versions, or multiple OSes, you'd need to include
+      # them in the cache key. I'm not, so it can be simple and just depend on the poetry.lock.
+      - name: cache deps
+        id: cache-deps
+        uses: actions/cache@v3
+        with:
+          path: .venv
+          key: pydeps-${{ hashFiles('**/poetry.lock') }}
+
+      # Install dependencies. `--no-root` means "install all dependencies but not the project
+      # itself", which is what you want to avoid caching _your_ code. The `if` statement
+      # ensures this only runs on a cache miss.
+      - run: poetry install --no-interaction --no-root
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+
+      # Now install _your_ project. This isn't necessary for many types of projects -- particularly
+      # things like Django apps don't need this. But it's a good idea since it fully-exercises the
+      # pyproject.toml and makes that if you add things like console-scripts at some point that
+      # they'll be installed and working.
+      - run: poetry install --no-interaction
+
+      # Finally, run pre-commit.
+      - uses: pre-commit/action@v3.0.0
