@@ -664,7 +664,16 @@ class ForgeAgent(Agent):
         send the task response to the webhook callback url
         """
         # refresh the task from the db to get the latest status
-        task = await app.DATABASE.get_task(task_id=task.task_id, organization_id=task.organization_id)
+        try:
+            refreshed_task = await app.DATABASE.get_task(task_id=task.task_id, organization_id=task.organization_id)
+            if not refreshed_task:
+                LOG.error("Failed to get task from db when sending task response")
+                raise TaskNotFound(task_id=task.task_id)
+        except Exception as e:
+            LOG.error("Failed to get task from db when sending task response", task_id=task.task_id, error=e)
+            raise TaskNotFound(task_id=task.task_id) from e
+        task = refreshed_task
+        # log the task status as an event
         tracking.capture("skyvern-oss-agent-task-status", {"status": task.status})
         # Take one last screenshot and create an artifact before closing the browser to see the final state
         browser_state: BrowserState = await app.BROWSER_MANAGER.get_or_create_for_task(task)
