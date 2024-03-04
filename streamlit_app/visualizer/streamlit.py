@@ -1,3 +1,4 @@
+import clipboard
 import pandas as pd
 import streamlit as st
 
@@ -10,13 +11,7 @@ from streamlit_app.visualizer.artifact_loader import (
     streamlit_show_recording,
 )
 from streamlit_app.visualizer.repository import TaskRepository
-from streamlit_app.visualizer.sample_data import (
-    get_sample_data_extraction_goal,
-    get_sample_extracted_information_schema,
-    get_sample_navigation_goal,
-    get_sample_navigation_payload,
-    get_sample_url,
-)
+from streamlit_app.visualizer.sample_data import supported_examples
 
 # Streamlit UI Configuration
 st.set_page_config(layout="wide")
@@ -110,71 +105,93 @@ st.markdown("# **:dragon: Skyvern :dragon:**")
 st.markdown(f"### **{select_env} - {select_org}**")
 execute_tab, visualizer_tab = st.tabs(["Execute", "Visualizer"])
 
-with execute_tab:
-    create_column, explanation_column = st.columns([1, 2])
-    with create_column:
-        with st.form("task_form"):
-            st.markdown("## Run a task")
-            # Create all the fields to create a TaskRequest object
-            st_url = st.text_input("URL*", value=get_sample_url(), key="url")
-            st_webhook_callback_url = st.text_input("Webhook Callback URL", key="webhook", placeholder="Optional")
-            st_navigation_goal = st.text_input(
-                "Navigation Goal",
-                key="nav_goal",
-                placeholder="Describe the navigation goal",
-                value=get_sample_navigation_goal(),
-            )
-            st_data_extraction_goal = st.text_input(
-                "Data Extraction Goal",
-                key="data_goal",
-                placeholder="Describe the data extraction goal",
-                value=get_sample_data_extraction_goal(),
-            )
-            st_navigation_payload = st.text_area(
-                "Navigation Payload JSON",
-                key="nav_payload",
-                placeholder='{"name": "John Doe", "email": "abc@123.com"}',
-                value=get_sample_navigation_payload(),
-            )
-            st_extracted_information_schema = st.text_area(
-                "Extracted Information Schema",
-                key="extracted_info_schema",
-                placeholder='{"quote_price": "float"}',
-                value=get_sample_extracted_information_schema(),
-            )
-            # Create a TaskRequest object from the form fields
-            task_request_body = TaskRequest(
-                url=st_url,
-                webhook_callback_url=st_webhook_callback_url,
-                navigation_goal=st_navigation_goal,
-                data_extraction_goal=st_data_extraction_goal,
-                proxy_location=ProxyLocation.NONE,
-                navigation_payload=st_navigation_payload,
-                extracted_information_schema=st_extracted_information_schema,
-            )
-            # Submit the form
-            if st.form_submit_button("Execute Task", use_container_width=True):
-                # Call the API to create a task
-                task_id = client.create_task(task_request_body)
-                if not task_id:
-                    st.error("Failed to create task!")
-                else:
-                    st.success("Task created successfully, task_id: " + task_id)
 
-    with explanation_column:
-        st.markdown("### **Task Request**")
-        st.markdown("#### **URL**")
-        st.markdown("The starting URL for the task.")
-        st.markdown("#### **Webhook Callback URL**")
-        st.markdown("The URL to call with the results when the task is completed.")
-        st.markdown("#### **Navigation Goal**")
-        st.markdown("The user's goal for the task. Nullable if the task is only for data extraction.")
-        st.markdown("#### **Data Extraction Goal**")
-        st.markdown("The user's goal for data extraction. Nullable if the task is only for navigation.")
-        st.markdown("#### **Navigation Payload**")
-        st.markdown("The user's details needed to achieve the task. AI will use this information as needed.")
-        st.markdown("#### **Extracted Information Schema**")
-        st.markdown("The requested schema of the extracted information for data extraction goal.")
+def copy_curl_to_clipboard(task_request_body: TaskRequest) -> None:
+    clipboard.copy(client.copy_curl(task_request_body=task_request_body))
+
+
+with execute_tab:
+    example_tabs = st.tabs([supported_example.name for supported_example in supported_examples])
+
+    for i, example_tab in enumerate(example_tabs):
+        with example_tab:
+            create_column, explanation_column = st.columns([1, 2])
+            with create_column:
+                run_task, copy_curl = st.columns([3, 1])
+                task_request_body = supported_examples[i]
+                copy_curl.button(
+                    "Copy cURL", on_click=lambda: copy_curl_to_clipboard(task_request_body=task_request_body)
+                )
+                with st.form("task_form"):
+                    run_task.markdown("## Run a task")
+
+                    example = supported_examples[i]
+                    # Create all the fields to create a TaskRequest object
+                    st_url = st.text_input("URL*", value=example.url, key="url")
+                    st_webhook_callback_url = st.text_input(
+                        "Webhook Callback URL", key="webhook", placeholder="Optional"
+                    )
+                    st_navigation_goal = st.text_input(
+                        "Navigation Goal",
+                        key="nav_goal",
+                        placeholder="Describe the navigation goal",
+                        value=example.navigation_goal,
+                    )
+                    st_data_extraction_goal = st.text_input(
+                        "Data Extraction Goal",
+                        key="data_goal",
+                        placeholder="Describe the data extraction goal",
+                        value=example.data_extraction_goal,
+                    )
+                    st_navigation_payload = st.text_area(
+                        "Navigation Payload JSON",
+                        key="nav_payload",
+                        placeholder='{"name": "John Doe", "email": "abc@123.com"}',
+                        value=example.navigation_payload,
+                    )
+                    st_extracted_information_schema = st.text_area(
+                        "Extracted Information Schema",
+                        key="extracted_info_schema",
+                        placeholder='{"quote_price": "float"}',
+                        value=example.extracted_information_schema,
+                    )
+                    # Create a TaskRequest object from the form fields
+                    task_request_body = TaskRequest(
+                        url=st_url,
+                        webhook_callback_url=st_webhook_callback_url,
+                        navigation_goal=st_navigation_goal,
+                        data_extraction_goal=st_data_extraction_goal,
+                        proxy_location=ProxyLocation.NONE,
+                        navigation_payload=st_navigation_payload,
+                        extracted_information_schema=st_extracted_information_schema,
+                    )
+                    # Submit the form
+                    if st.form_submit_button("Execute Task", use_container_width=True):
+                        # Call the API to create a task
+                        task_id = client.create_task(task_request_body)
+                        if not task_id:
+                            st.error("Failed to create task!")
+                        else:
+                            st.success("Task created successfully, task_id: " + task_id)
+
+            with explanation_column:
+                st.markdown("### **Task Request**")
+                st.markdown("#### **URL**")
+                st.markdown("The starting URL for the task.")
+                st.markdown("#### **Webhook Callback URL**")
+                st.markdown("The URL to call with the results when the task is completed.")
+                st.markdown("#### **Navigation Goal**")
+                st.markdown("The user's goal for the task. Nullable if the task is only for data extraction.")
+                st.markdown("#### **Data Extraction Goal**")
+                st.markdown("The user's goal for data extraction. Nullable if the task is only for navigation.")
+                st.markdown("#### **Navigation Payload**")
+                st.markdown(
+                    "The user's details needed to achieve the task. This is an unstructured field, and information can be passed in in any format you desire. Skyvern will map this information to the questions on the screen in real-time"
+                )
+                st.markdown("#### **Extracted Information Schema**")
+                st.markdown(
+                    "(Optional) The requested schema of the extracted information for data extraction goal. This is a JSON object with keys as the field names and values as the data types. The data types can be any of the following: string, number, boolean, date, datetime, time, float, integer, object, array, null. If the schema is not provided, Skyvern will infer the schema from the extracted data."
+                )
 
 
 with visualizer_tab:

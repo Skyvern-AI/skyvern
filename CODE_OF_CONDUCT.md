@@ -1,3 +1,22 @@
+<!-- START doctoc generated TOC please keep comment here to allow auto update -->
+<!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
+**Table of Contents**  *generated with [DocToc](https://github.com/thlorenz/doctoc)*
+
+- [Code of Conduct - Skyvern](#code-of-conduct---skyvern)
+  - [Our Pledge](#our-pledge)
+  - [Our Standards](#our-standards)
+  - [Our Responsibilities](#our-responsibilities)
+  - [Scope](#scope)
+  - [Enforcement](#enforcement)
+  - [Enforcement Guidelines](#enforcement-guidelines)
+    - [1. Correction](#1-correction)
+    - [2. Warning](#2-warning)
+    - [3. Temporary Ban](#3-temporary-ban)
+    - [4. Permanent Ban](#4-permanent-ban)
+  - [Attribution](#attribution)
+
+<!-- END doctoc generated TOC please keep comment here to allow auto update -->
+
 # Code of Conduct - Skyvern
 
 ## Our Pledge

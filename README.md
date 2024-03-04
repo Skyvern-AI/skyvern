@@ -2,7 +2,7 @@
  <a href="https://www.skyvern.com">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="images/skyvern_logo.png"/>
-    <img height="120" src="images/skyvern_logo.png"/>
+    <img height="120" src="images/skyvern_logo_blackbg.png"/>
   </picture>
  </a>
  <br />
@@ -27,8 +27,35 @@
   <img src="images/geico_shu_recording_cropped.gif"/>
 </p>
 
-Want to see more examples of Skyvern in action? Click [here](#real-world-examples-of-skyvern)!
+Traditional approaches to browser automations required writing custom scripts for websites, often relying on DOM parsing and XPath-based interactions which would break whenever the website layouts changed.
 
+Instead of only relying on code-defined XPath interactions, Skyvern adds computer vision and LLMs to the mix to parse items in the viewport in real-time, create a plan for interaction and interact with them.
+
+This approach gives us a few advantages:
+
+1. Skyvern can operate on websites it’s never seen before, as it’s able to map visual elements to actions necessary to complete a workflow, without any customized code
+1. Skyvern is resistant to website layout changes, as there are no pre-determined XPaths or other selectors our system is looking for while trying to navigate
+1. Skyvern leverages LLMs to reason through interactions to ensure we can cover complex situations. Examples include:
+    1. If you wanted to get an auto insurance quote from Geico, the answer to a common question “Were you eligible to drive at 18?” could be inferred from the driver receiving their license at age 16
+    1. If you were doing competitor analysis, it’s understanding that an Arnold Palmer 22 oz can at 7/11 is almost definitely the same product as a 23 oz can at Gopuff (even though the sizes are slightly different, which could be a rounding error!)
+
+
+Want to see examples of Skyvern in action? Jump to [#real-world-examples-of-skyvern](#real-world-examples-of-skyvern)
+
+
+# How it works
+Skyvern was inspired by the Task-Driven autonomous agent design popularized by [BabyAGI](https://github.com/yoheinakajima/babyagi) and [AutoGPT](https://github.com/Significant-Gravitas/AutoGPT) -- with one major bonus: we give Skyvern the ability to interact with websites using browser automation libraries like [Playwright](https://playwright.dev/).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/skyvern-system-diagram-dark.png" />
+  <img src="images/skyvern-system-diagram-light.png" />
+</picture>
+
+<!-- TODO (suchintan): 
+Expand the diagram above to go deeper into how:
+1. We draw bounding boxes
+2. We parse the HTML + extract the image to generate an interactable element map
+-->
 
 # Quickstart
 This quickstart guide will walk you through getting Skyvern up and running on your local machine. 
@@ -56,7 +83,7 @@ Before you begin, make sure you have the following installed:
     ```
 1. Start the server
     ```bash
-    ./run.sh
+    ./run_skyvern.sh
     ```
 1. You can start sending requests to the server, but we built a simple UI to help you get started. To start the UI, run the following command:
     ```bash
@@ -70,19 +97,28 @@ If you're looking to contribute to Skyvern, you'll need to install the pre-commi
 pre-commit install
 ```
 
-# How it works
-Skyvern was inspired by the Task-Driven autonomous agent design popularized by [BabyAGI](https://github.com/yoheinakajima/babyagi) and [AutoGPT](https://github.com/Significant-Gravitas/AutoGPT) -- with one major difference: we give Skyvern the ability to interact with websites using browser automation libraries like [Playwright](https://playwright.dev/).
+## Running your first automation
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="images/Skyvern-system-diagram.png"/>
-  <img src="images/Skyvern-system-diagram.png"/>
-</picture>
+### Executing tasks (UI)
+Once you have the UI running, you can start an automation by filling out the fields shown in the UI and clicking "Execute" 
 
-<!-- > TODO (suchintan): 
-Expand the diagram above to go deeper into how:
-1. We draw bounding boxes
-2. We parse the HTML + extract the image to generate an interactable element map
--->
+<p align="center">
+  <img src="images/skyvern_visualizer_run_task.png"/>
+</p>
+
+### Executing tasks (cURL)
+
+```
+curl -X POST -H 'Content-Type: application/json' -H 'x-api-key: {Your local API key}' -d '{
+    "url": "https://www.geico.com",
+    "webhook_callback_url": "",
+    "navigation_goal": "Navigate through the website until you generate an auto insurance quote. Do not generate a home insurance quote. If this page contains an auto insurance quote, consider the goal achieved",
+    "data_extraction_goal": "Extract all quote information in JSON format including the premium amount, the timeframe for the quote.",
+    "navigation_payload": "{Your data here}",
+    "proxy_location": "NONE"
+}' http://0.0.0.0:8000/api/v1/tasks
+```
+
 
 # Real-world examples of Skyvern
 <!-- > TODO (suchintan):
@@ -120,18 +156,6 @@ More extensive documentation can be found on our [documentation website](https:/
 
 Our focus is bringing stability to browser-based workflows. We leverage LLMs to create an AI Agent capable of interacting with websites like you or I would — all via a simple API call.
 
-Traditional approaches required writing custom scripts for websites, often relying on DOM parsing and XPath-based interactions which would break whenever the website layouts changed.
-
-Skyvern operates like a human — increasing reliability by not relying on fragile scripts, instead relying on computer vision to parse items in the viewport and interact with them the way a human would.
-
-This approach gives us a few advantages:
-
-1. Skyvern can operate on websites it’s never seen before, as it’s able to map visual elements to actions necessary to complete a workflow, without any customized code
-1. Skyvern is resistant to website layout changes, as there are no pre-determined XPaths or other selectors our system is looking for while trying to navigate
-1. Skyvern is able to circumvent or navigate through many bot detection methods as many of them rely on allowing people to access the websites
-1. Skyvern leverages LLMs to reason through interactions to ensure we can cover complex situations. Examples include:
-    1. If you wanted to get an auto insurance quote from Geico, the answer to a common question “Were you eligible to drive at 18?” could be inferred from the driver receiving their license at age 16
-    1. If you were doing competitor analysis, it’s understanding that an Arnold Palmer 22 oz can at 7/11 is almost definitely the same product as a 23 oz can at Gopuff (even though the sizes are slightly different, which could be a rounding error!)
 
 
 # Feature Roadmap

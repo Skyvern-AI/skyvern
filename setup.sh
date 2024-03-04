@@ -52,7 +52,7 @@ setup_postgresql() {
     if ! command_exists psql; then
         echo "`postgresql` is not installed."
         if [[ "$OSTYPE" != "darwin"* ]]; then
-            echo "Error: Please install postgresql manually and re-run the script." >&2
+            echo "Error: Please install postgresql and start the service manually and re-run the script." >&2
             exit 1
         fi
         if ! command_exists brew; then
@@ -63,11 +63,11 @@ setup_postgresql() {
     fi
     brew services start postgresql@14
 
-    if psql skyvern-open-source -U skyvern-open-source -c '\q'; then
+    if psql skyvern -U skyvern -c '\q'; then
         echo "Connection successful. Database and user exist."
     else
-        createuser skyvern-open-source
-        createdb skyvern-open-source -O skyvern-open-source
+        createuser skyvern
+        createdb skyvern -O skyvern
         echo "Database and user created successfully."
     fi
 }
@@ -95,7 +95,7 @@ create_organization() {
     fi
 
     # Update the secrets-open-source.toml file
-    echo -e "[skyvern]\nconfigs = [\n    {\"env\" = \"local\", \"host\" = \"http://0.0.0.0:8000/api/v1\", \"orgs\" = [{name=\"Skyvern-Open-Source\", cred=\"$api_token\"}]}\n]" > .streamlit/secrets.toml
+    echo -e "[skyvern]\nconfigs = [\n    {\"env\" = \"local\", \"host\" = \"http://0.0.0.0:8000/api/v1\", \"orgs\" = [{name=\"Skyvern\", cred=\"$api_token\"}]}\n]" > .streamlit/secrets.toml
     echo ".streamlit/secrets.toml file updated with organization details."
 }
 

@@ -1,7 +1,9 @@
 import json
 from typing import Any
 
+import curlify
 import requests
+from requests import PreparedRequest
 
 from skyvern.forge.sdk.schemas.tasks import TaskRequest
 
@@ -11,7 +13,7 @@ class SkyvernClient:
         self.base_url = base_url
         self.credentials = credentials
 
-    def create_task(self, task_request_body: TaskRequest) -> str | None:
+    def generate_curl_params(self, task_request_body: TaskRequest) -> PreparedRequest:
         url = f"{self.base_url}/tasks"
         payload = task_request_body.model_dump()
         headers = {
@@ -19,10 +21,22 @@ class SkyvernClient:
             "x-api-key": self.credentials,
         }
 
+        return url, payload, headers
+
+    def create_task(self, task_request_body: TaskRequest) -> str | None:
+        url, payload, headers = self.generate_curl_params(task_request_body)
+
         response = requests.post(url, headers=headers, data=json.dumps(payload))
         if "task_id" not in response.json():
             return None
         return response.json()["task_id"]
+
+    def copy_curl(self, task_request_body: TaskRequest) -> str:
+        url, payload, headers = self.generate_curl_params(task_request_body)
+
+        req = requests.Request("POST", url, headers=headers, data=json.dumps(payload, indent=4))
+
+        return curlify.to_curl(req.prepare())
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         """Get a task by id."""
@@ -49,7 +63,13 @@ class SkyvernClient:
         response = requests.get(url, params=params, headers=headers)
         steps = response.json()
         for step in steps:
-            step["output"]["actions_and_results"] = json.dumps(step["output"]["actions_and_results"])
+            if (
+                "output" in step
+                and step["output"] is not None
+                and "actions_and_results" in step["output"]
+                and step["output"]["actions_and_results"] is not None
+            ):
+                step["output"]["actions_and_results"] = json.dumps(step["output"]["actions_and_results"])
         return steps
 
     def get_agent_task_video_artifact(self, task_id: str) -> dict[str, Any] | None:
