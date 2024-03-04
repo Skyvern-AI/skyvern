@@ -70,8 +70,8 @@ If you're looking to contribute to Skyvern, you'll need to install the pre-commi
 pre-commit install
 ```
 
-<---
-## Documentation
+<!---
+[## Documentation]
 
 More extensive documentation can be found on our [documentation website](https://docs.skyvern.ai). Please let us know if something is unclear or missing by opening an issue or reaching out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
 --->
