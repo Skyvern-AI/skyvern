@@ -6,7 +6,7 @@ from datetime import datetime
 import requests
 import structlog
 
-from scripts import tracking
+from skyvern import tracking
 from skyvern.exceptions import (
     FailedToSendWebhook,
     MissingValueForParameter,

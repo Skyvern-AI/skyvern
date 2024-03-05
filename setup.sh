@@ -3,7 +3,7 @@
 # Call function to send telemetry event
 log_event() {
     if [ -n $1 ]; then
-        python scripts/tracking.py $1
+        python skyvern/tracking.py $1
     fi
 }
 

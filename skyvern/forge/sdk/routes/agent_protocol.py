@@ -5,7 +5,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, 
 from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel
 
-from scripts import tracking
+from skyvern import tracking
 from skyvern.exceptions import StepNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
