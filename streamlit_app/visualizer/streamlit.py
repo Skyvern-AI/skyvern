@@ -119,39 +119,43 @@ with execute_tab:
             with create_column:
                 run_task, copy_curl = st.columns([3, 1])
                 task_request_body = supported_examples[i]
+
+                unique_key = f"{task_request_body.name}"
                 copy_curl.button(
-                    "Copy cURL", on_click=lambda: copy_curl_to_clipboard(task_request_body=task_request_body)
+                    "Copy cURL",
+                    key=f"copy_curl_{unique_key}",
+                    on_click=lambda: copy_curl_to_clipboard(task_request_body=task_request_body),
                 )
-                with st.form("task_form"):
+                with st.form(f"task_form_{unique_key}"):
                     run_task.markdown("## Run a task")
 
                     example = supported_examples[i]
                     # Create all the fields to create a TaskRequest object
-                    st_url = st.text_input("URL*", value=example.url, key="url")
+                    st_url = st.text_input("URL*", value=example.url, key=f"url_{unique_key}")
                     st_webhook_callback_url = st.text_input(
-                        "Webhook Callback URL", key="webhook", placeholder="Optional"
+                        "Webhook Callback URL", key=f"webhook_{unique_key}", placeholder="Optional"
                     )
                     st_navigation_goal = st.text_input(
                         "Navigation Goal",
-                        key="nav_goal",
+                        key=f"nav_goal_{unique_key}",
                         placeholder="Describe the navigation goal",
                         value=example.navigation_goal,
                     )
                     st_data_extraction_goal = st.text_input(
                         "Data Extraction Goal",
-                        key="data_goal",
+                        key=f"data_goal_{unique_key}",
                         placeholder="Describe the data extraction goal",
                         value=example.data_extraction_goal,
                     )
                     st_navigation_payload = st.text_area(
                         "Navigation Payload JSON",
-                        key="nav_payload",
+                        key=f"nav_payload_{unique_key}",
                         placeholder='{"name": "John Doe", "email": "abc@123.com"}',
                         value=example.navigation_payload,
                     )
                     st_extracted_information_schema = st.text_area(
                         "Extracted Information Schema",
-                        key="extracted_info_schema",
+                        key=f"extracted_info_schema_{unique_key}",
                         placeholder='{"quote_price": "float"}',
                         value=example.extracted_information_schema,
                     )

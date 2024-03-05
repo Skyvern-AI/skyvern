@@ -119,6 +119,27 @@ curl -X POST -H 'Content-Type: application/json' -H 'x-api-key: {Your local API 
 }' http://0.0.0.0:8000/api/v1/tasks
 ```
 
+## Debugging Skyvern
+Skyvern's visualizer allows you to debug every interaction Skyvern takes on the web.
+
+### Tasks, Steps, and Actions
+Each API request you sent to Skyvern is called a "task". Each task is made up of "steps" which are the individual actions Skyvern takes to complete the task. Each step is made up of "actions" which are the individual interactions Skyvern takes on a particular website.
+
+Every time you call the API, you will be given a task_id you can use to find a task within the visualizer. Within each task, you'll be able to interact with each step, and see the specific actions Skyvern took to complete the task.
+
+In the screenshot below, we're navigating to finditparts.com and searching for a truck part. You'll see each action it took listed there, alongside the reasoning behind each action.
+<p align="center">
+  <img src="images/skyvern_visualizer_debug_llm_response.png"/>
+</p>
+
+
+In addition to the actions suggested by the LLM in text form, Skyvern's visualizer also shows the state of the screen at the time of the action, with a 1:1 action to screenshot mapping. This allows you to see exactly what Skyvern saw when it made a decision, and debug any issues that may have arisen. 
+
+<p align="center">
+  <img src="images/skyvern_visualizer_debug_action_screenshot.png"/>
+</p>
+
+
 
 # Real-world examples of Skyvern
 <!-- > TODO (suchintan):

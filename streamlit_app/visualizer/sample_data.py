@@ -5,6 +5,17 @@ class SampleTaskRequest(TaskRequest):
     name: str
 
 
+finditparts_sample_data = SampleTaskRequest(
+    name="Finditparts",
+    url="https://www.finditparts.com",
+    navigation_goal="Search for the specified product id, add it to cart and then navigate to the cart page",
+    data_extraction_goal="Extract all product quantity information from the cart page",
+    navigation_payload={
+        "product_id": "W01-377-8537",
+    },
+)
+
+
 geico_sample_data = SampleTaskRequest(
     name="Geico",
     url="https://www.geico.com",
@@ -175,4 +186,5 @@ geico_sample_data = SampleTaskRequest(
     },
 )
 
-supported_examples = [geico_sample_data]
+
+supported_examples = [geico_sample_data, finditparts_sample_data]
