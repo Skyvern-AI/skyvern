@@ -193,6 +193,7 @@ This is our planned roadmap for the next few months. If you have any suggestions
 - [ ] **Integrate LLM Observability tools** - Integrate LLM Observability tools to allow back-testing prompt changes with specific data sets + visualize the performance of Skyvern over time
 - [ ] **Integrate public datasets** - Integrate Skyvern with public benchmark tests to track the quality our models over time
 - [ ] **Workflow UI Builder** - Introduce a UI to allow users to build and analyze workflows visually
+- [ ] **Langchain Integration** - Create langchain integration in langchain_community to use Skyvern as a "tool".
 
 # Contributing
 
