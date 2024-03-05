@@ -147,8 +147,16 @@ Preload these examples inside of our UI so that users can see them in action
 Provide a way to run these examples in the UI (via the commandline?) -->
 We love to see how Skyvern is being used in the wild. Here are some examples of how Skyvern is being used to automate workflows in the real world. Please open PRs to add your own examples!
 
+You'll need to have Skyvern running locally if you want to try these examples out. Please run the following command after going through the quickstart guide:
+```
+./run_skyvern.sh
+```
 
 ## Automate materials procurement for a manufacturing company
+💡 See it in action
+```
+./run_ui.sh finditparts
+```
 <p align="center">
   <img src="images/finditparts_recording_crop.gif"/>
 </p>
@@ -162,6 +170,11 @@ We love to see how Skyvern is being used in the wild. Here are some examples of 
 <p align="center">
   <img src="images/bci_seguros_recording.gif"/>
 </p>
+
+💡 See it in action
+```
+./run_ui.sh geico
+```
 <p align="center">
   <img src="images/geico_shu_recording_cropped.gif"/>
 </p>

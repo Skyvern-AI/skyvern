@@ -1,3 +1,5 @@
+import sys
+
 import clipboard
 import pandas as pd
 import streamlit as st
@@ -19,6 +21,8 @@ st.set_page_config(layout="wide")
 # Apply styles
 st.markdown(styles.page_font_style, unsafe_allow_html=True)
 st.markdown(styles.button_style, unsafe_allow_html=True)
+
+tab_name = sys.argv[1] if len(sys.argv) > 1 else ""
 
 
 # Configuration
@@ -111,14 +115,18 @@ def copy_curl_to_clipboard(task_request_body: TaskRequest) -> None:
 
 
 with execute_tab:
-    example_tabs = st.tabs([supported_example.name for supported_example in supported_examples])
+    # Streamlit doesn't support "focusing" on a tab, so this is a workaround to make the requested tab be the "first" tab
+    sorted_supported_examples = sorted(
+        supported_examples, key=lambda x: (-1 if x.name.lower() == tab_name.lower() else 0)
+    )
+    example_tabs = st.tabs([supported_example.name for supported_example in sorted_supported_examples])
 
     for i, example_tab in enumerate(example_tabs):
         with example_tab:
             create_column, explanation_column = st.columns([1, 2])
             with create_column:
                 run_task, copy_curl = st.columns([3, 1])
-                task_request_body = supported_examples[i]
+                task_request_body = sorted_supported_examples[i]
 
                 unique_key = f"{task_request_body.name}"
                 copy_curl.button(
@@ -129,7 +137,7 @@ with execute_tab:
                 with st.form(f"task_form_{unique_key}"):
                     run_task.markdown("## Run a task")
 
-                    example = supported_examples[i]
+                    example = sorted_supported_examples[i]
                     # Create all the fields to create a TaskRequest object
                     st_url = st.text_input("URL*", value=example.url, key=f"url_{unique_key}")
                     st_webhook_callback_url = st.text_input(
