@@ -167,6 +167,3 @@ har/
 
 # Streamlit ignores
 **/secrets*.toml
-
-# poetry lock
-poetry.lock
