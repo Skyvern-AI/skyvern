@@ -43,9 +43,11 @@ def capture(
     if not SettingsManager.get_settings().SKYVERN_TELEMETRY:
         return
 
+    distinct_id = SettingsManager.get_settings().ANALYTICS_ID
+
     payload: dict[str, Any] = data or {}
     try:
-        posthog.capture(distinct_id=DISTINCT_ID, event=event, properties=payload)
+        posthog.capture(distinct_id=distinct_id, event=event, properties=payload)
     except Exception as e:
         payload.update(
             {
@@ -53,7 +55,7 @@ def capture(
             }
         )
         posthog.capture(
-            distinct_id=DISTINCT_ID,
+            distinct_id=distinct_id,
             event="failure",
             properties=payload,
         )

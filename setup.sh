@@ -20,6 +20,31 @@ for cmd in poetry python3.11; do
     fi
 done
 
+# Function to initialize .env file
+initialize_env_file() {
+    if [ -f ".env" ]; then
+        echo ".env file already exists, skipping initialization."
+        return
+    fi
+
+    echo "Initializing .env file..."
+    cp .env.example .env
+
+    # Ask for OpenAI API key
+    read -p "Please enter your OpenAI API key for GPT4V (this will be stored only in your local .env file): " openai_api_key
+    awk -v key="$openai_api_key" '{gsub(/OPENAI_API_KEYS=\["abc","def","ghi"\]/, "OPENAI_API_KEYS=[\"" key "\"]"); print}' .env > .env.tmp && mv .env.tmp .env
+
+
+    # Ask for email or generate UUID
+    read -p "Please enter your email for analytics tracking (press enter to skip): " analytics_id
+    if [ -z "$analytics_id" ]; then
+        analytics_id=$(uuidgen)
+    fi
+    awk -v id="$analytics_id" '{gsub(/ANALYTICS_ID="anonymous"/, "ANALYTICS_ID=\"" id "\""); print}' .env > .env.tmp && mv .env.tmp .env
+
+    echo ".env file has been initialized."
+}
+
 # Function to remove Poetry environment
 remove_poetry_env() {
     local env_path
@@ -102,6 +127,7 @@ create_organization() {
 
 # Main function
 main() {
+    initialize_env_file
     remove_poetry_env
     install_dependencies
     setup_postgresql
