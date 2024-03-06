@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     ARTIFACT_STORAGE_PATH: str = f"{SKYVERN_DIR}/artifacts"
 
     SKYVERN_TELEMETRY: bool = True
+    ANALYTICS_ID: str = "anonymous"
 
     def is_cloud_environment(self) -> bool:
         """

@@ -81,10 +81,6 @@ Note: Our setup script does these two for you, but they are here for reference.
     ```bash
     ./setup.sh
     ```
-1. Create the `.env` file by copying the `.env.example` file and fill in the necessary environment variables (such as your OpenAI API key, etc.)
-    ```bash
-    cp .env.example .env
-    ```
 1. Start the server
     ```bash
     ./run_skyvern.sh
