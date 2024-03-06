@@ -30,6 +30,7 @@ remove_poetry_env() {
     else
         echo "No poetry environment found."
     fi
+    poetry env use python3.11
 }
 
 # Function to install dependencies
