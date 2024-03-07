@@ -8,5 +8,4 @@ if [ ! -f .env ]; then
 fi
 source "$(poetry env info --path)/bin/activate"
 ./run_alembic_check.sh
-python skyvern/analytics.py skyvern-oss-run-server
 poetry run python -m skyvern.forge
