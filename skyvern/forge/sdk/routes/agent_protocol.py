@@ -236,7 +236,7 @@ async def retry_webhook(
 ) -> TaskResponse:
     analytics.capture("skyvern-oss-agent-task-retry-webhook")
     agent = request["agent"]
-    task_obj = await agent.db.get_task(task_id, organization_id=current_org.organization_id)
+    task_obj = await app.DATABASE.get_task(task_id, organization_id=current_org.organization_id)
     if not task_obj:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -244,7 +244,7 @@ async def retry_webhook(
         )
 
     # get latest step
-    latest_step = await agent.db.get_latest_step(task_id, organization_id=current_org.organization_id)
+    latest_step = await app.DATABASE.get_latest_step(task_id, organization_id=current_org.organization_id)
     if not latest_step:
         return task_obj.to_task_response()
 
