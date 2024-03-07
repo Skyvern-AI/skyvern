@@ -162,11 +162,20 @@ You'll need to have Skyvern running locally if you want to try these examples ou
 </p>
 
 ## Navigating to government websites to register accounts or fill out forms 
+💡 See it in action
+```
+./run_ui.sh california_edd 
+```
 <p align="center">
   <img src="images/edd_services.gif"/>
 </p>
+<!-- Add example of delaware entity lookups x2 -->
 
 ## Retrieving insurance quotes from insurance providers in any language
+💡 See it in action
+```
+./run_ui.sh bci_seguros
+```
 <p align="center">
   <img src="images/bci_seguros_recording.gif"/>
 </p>

@@ -5,6 +5,44 @@ class SampleTaskRequest(TaskRequest):
     name: str
 
 
+bci_seguros_sample_data = SampleTaskRequest(
+    name="bci_seguros",
+    url="https://www.bciseguros.cl/nuestros_seguros/personas/seguro-automotriz/",
+    navigation_goal="Generate an auto insurance quote. A quote has been generated when there's a table of coverages shown on the website.",
+    data_extraction_goal="Extract ALL quote information in JSON format, with one entry per plan visible on the page. The output should include: the selected UF coverage value (3), auto plan name, the online price",
+    navigation_payload={
+        "Rut": "7.250.199-3",
+        "Sexo": "Masculino",
+        "Fecha de Nacimiento": "03-02-2000",
+        "Telefono": "96908116",
+        "Comuna": "Lo Barnachea",
+        "e-mail": "notarealemail@gmail.com",
+        "estado": "Usado",
+        "patente": "HZZV68",
+        "marca": "Subaru",
+        "modelo": "XV",
+        "ano": "2016",
+        "tipo de combustible": "Bencina",
+        "km approx a recorrer": "28,000",
+    },
+)
+
+
+california_edd_sample_data = SampleTaskRequest(
+    name="California_EDD",
+    url="https://eddservices.edd.ca.gov/acctservices/AccountManagement/AccountServlet?Command=NEW_SIGN_UP",
+    navigation_goal="Navigate through the employer services online enrollment form. Terminate when the form is completed",
+    navigation_payload={
+        "username": "isthisreal1",
+        "password": "Password123!",
+        "first_name": "John",
+        "last_name": "Doe",
+        "pin": "1234",
+        "email": "isthisreal1@gmail.com",
+        "phone_number": "412-444-1234",
+    },
+)
+
 finditparts_sample_data = SampleTaskRequest(
     name="Finditparts",
     url="https://www.finditparts.com",
@@ -187,4 +225,4 @@ geico_sample_data = SampleTaskRequest(
 )
 
 
-supported_examples = [geico_sample_data, finditparts_sample_data]
+supported_examples = [geico_sample_data, finditparts_sample_data, california_edd_sample_data, bci_seguros_sample_data]
