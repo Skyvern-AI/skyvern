@@ -3,7 +3,7 @@
 # Call function to send telemetry event
 log_event() {
     if [ -n $1 ]; then
-        python scripts/tracking.py $1
+        python skyvern/analytics.py $1
     fi
 }
 
@@ -36,7 +36,7 @@ initialize_env_file() {
 
 
     # Ask for email or generate UUID
-    read -p "Please enter your email for analytics tracking (press enter to skip): " analytics_id
+    read -p "Please enter your email for analytics (press enter to skip): " analytics_id
     if [ -z "$analytics_id" ]; then
         analytics_id=$(uuidgen)
     fi

@@ -8,7 +8,7 @@ import requests
 import structlog
 from playwright._impl._errors import TargetClosedError
 
-from scripts import tracking
+from skyvern import analytics
 from skyvern.exceptions import (
     BrowserStateMissingPage,
     FailedToSendWebhook,
@@ -195,7 +195,7 @@ class ForgeAgent(Agent):
             await self.validate_step_execution(task, step)
             step, browser_state, detailed_output = await self._initialize_execution_state(task, step, workflow_run)
             step, detailed_output = await self.agent_step(task, step, browser_state, organization=organization)
-            tracking.capture("skyvern-oss-agent-step-status", {"status": step.status})
+            analytics.capture("skyvern-oss-agent-step-status", {"status": step.status})
             retry = False
 
             # If the step failed, mark the step as failed and retry
@@ -674,7 +674,7 @@ class ForgeAgent(Agent):
             raise TaskNotFound(task_id=task.task_id) from e
         task = refreshed_task
         # log the task status as an event
-        tracking.capture("skyvern-oss-agent-task-status", {"status": task.status})
+        analytics.capture("skyvern-oss-agent-task-status", {"status": task.status})
         # Take one last screenshot and create an artifact before closing the browser to see the final state
         browser_state: BrowserState = await app.BROWSER_MANAGER.get_or_create_for_task(task)
         page = await browser_state.get_or_create_page()

@@ -4,6 +4,7 @@ import clipboard
 import pandas as pd
 import streamlit as st
 
+from skyvern import analytics
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, TaskRequest
 from streamlit_app.visualizer import styles
 from streamlit_app.visualizer.api import SkyvernClient
@@ -14,6 +15,8 @@ from streamlit_app.visualizer.artifact_loader import (
 )
 from streamlit_app.visualizer.repository import TaskRepository
 from streamlit_app.visualizer.sample_data import supported_examples
+
+analytics.capture("skyvern-oss-run-ui")
 
 # Streamlit UI Configuration
 st.set_page_config(layout="wide")
