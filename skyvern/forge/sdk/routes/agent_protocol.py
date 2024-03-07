@@ -5,7 +5,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, 
 from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel
 
-from skyvern import tracking
+from skyvern import analytics
 from skyvern.exceptions import StepNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
@@ -32,7 +32,7 @@ async def webhook(
     x_skyvern_signature: Annotated[str | None, Header()] = None,
     x_skyvern_timestamp: Annotated[str | None, Header()] = None,
 ) -> Response:
-    tracking.capture("skyvern-oss-agent-webhook-received")
+    analytics.capture("skyvern-oss-agent-webhook-received")
     payload = await request.body()
 
     if not x_skyvern_signature or not x_skyvern_timestamp:
@@ -77,7 +77,7 @@ async def create_agent_task(
     x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
 ) -> CreateTaskResponse:
-    tracking.capture("skyvern-oss-agent-task-create", data={"url": task.url})
+    analytics.capture("skyvern-oss-agent-task-create", data={"url": task.url})
     agent = request["agent"]
 
     created_task = await agent.create_task(task, current_org.organization_id)
@@ -111,7 +111,7 @@ async def execute_agent_task_step(
     step_id: str | None = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Response:
-    tracking.capture("skyvern-oss-agent-task-step-execute")
+    analytics.capture("skyvern-oss-agent-task-step-execute")
     agent = request["agent"]
     task = await app.DATABASE.get_task(task_id, organization_id=current_org.organization_id)
     if not task:
@@ -170,7 +170,7 @@ async def get_task(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> TaskResponse:
-    tracking.capture("skyvern-oss-agent-task-get")
+    analytics.capture("skyvern-oss-agent-task-get")
     request["agent"]
     task_obj = await app.DATABASE.get_task(task_id, organization_id=current_org.organization_id)
     if not task_obj:
@@ -234,7 +234,7 @@ async def retry_webhook(
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> TaskResponse:
-    tracking.capture("skyvern-oss-agent-task-retry-webhook")
+    analytics.capture("skyvern-oss-agent-task-retry-webhook")
     agent = request["agent"]
     task_obj = await agent.db.get_task(task_id, organization_id=current_org.organization_id)
     if not task_obj:
@@ -268,7 +268,7 @@ async def get_task_internal(
     :return: List of tasks with pagination without steps populated. Steps can be populated by calling the
         get_agent_task endpoint.
     """
-    tracking.capture("skyvern-oss-agent-task-get-internal")
+    analytics.capture("skyvern-oss-agent-task-get-internal")
     task = await app.DATABASE.get_task(task_id, organization_id=current_org.organization_id)
     if not task:
         raise HTTPException(
@@ -293,7 +293,7 @@ async def get_agent_tasks(
     :return: List of tasks with pagination without steps populated. Steps can be populated by calling the
         get_agent_task endpoint.
     """
-    tracking.capture("skyvern-oss-agent-tasks-get")
+    analytics.capture("skyvern-oss-agent-tasks-get")
     request["agent"]
     tasks = await app.DATABASE.get_tasks(page, page_size, organization_id=current_org.organization_id)
     return ORJSONResponse([task.to_task_response().model_dump() for task in tasks])
@@ -314,7 +314,7 @@ async def get_agent_tasks_internal(
     :return: List of tasks with pagination without steps populated. Steps can be populated by calling the
         get_agent_task endpoint.
     """
-    tracking.capture("skyvern-oss-agent-tasks-get-internal")
+    analytics.capture("skyvern-oss-agent-tasks-get-internal")
     request["agent"]
     tasks = await app.DATABASE.get_tasks(page, page_size, organization_id=current_org.organization_id)
     return ORJSONResponse([task.model_dump() for task in tasks])
@@ -332,7 +332,7 @@ async def get_agent_task_steps(
     :param task_id:
     :return: List of steps for a task with pagination.
     """
-    tracking.capture("skyvern-oss-agent-task-steps-get")
+    analytics.capture("skyvern-oss-agent-task-steps-get")
     request["agent"]
     steps = await app.DATABASE.get_task_steps(task_id, organization_id=current_org.organization_id)
     return ORJSONResponse([step.model_dump() for step in steps])
@@ -352,7 +352,7 @@ async def get_agent_task_step_artifacts(
     :param step_id:
     :return: List of artifacts for a list of steps.
     """
-    tracking.capture("skyvern-oss-agent-task-step-artifacts-get")
+    analytics.capture("skyvern-oss-agent-task-step-artifacts-get")
     request["agent"]
     artifacts = await app.DATABASE.get_artifacts_for_task_step(
         task_id,
@@ -375,7 +375,7 @@ async def get_task_actions(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[ActionResultTmp]:
-    tracking.capture("skyvern-oss-agent-task-actions-get")
+    analytics.capture("skyvern-oss-agent-task-actions-get")
     request["agent"]
     steps = await app.DATABASE.get_task_step_models(task_id, organization_id=current_org.organization_id)
     results: list[ActionResultTmp] = []
@@ -397,7 +397,7 @@ async def execute_workflow(
     x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
 ) -> RunWorkflowResponse:
-    tracking.capture("skyvern-oss-agent-workflow-execute")
+    analytics.capture("skyvern-oss-agent-workflow-execute")
     LOG.info(
         f"Running workflow {workflow_id}",
         workflow_id=workflow_id,
@@ -434,7 +434,7 @@ async def get_workflow_run(
     workflow_run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> WorkflowRunStatusResponse:
-    tracking.capture("skyvern-oss-agent-workflow-run-get")
+    analytics.capture("skyvern-oss-agent-workflow-run-get")
     request["agent"]
     return await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
         workflow_id=workflow_id, workflow_run_id=workflow_run_id, organization_id=current_org.organization_id

@@ -6,7 +6,7 @@ from datetime import datetime
 import requests
 import structlog
 
-from skyvern import tracking
+from skyvern import analytics
 from skyvern.exceptions import (
     FailedToSendWebhook,
     MissingValueForParameter,
@@ -375,7 +375,7 @@ class WorkflowService:
         api_key: str | None = None,
         close_browser_on_completion: bool = True,
     ) -> None:
-        tracking.capture("skyvern-oss-agent-workflow-status", {"status": workflow_run.status})
+        analytics.capture("skyvern-oss-agent-workflow-status", {"status": workflow_run.status})
         browser_state = await app.BROWSER_MANAGER.cleanup_for_workflow_run(
             workflow_run.workflow_run_id, close_browser_on_completion
         )
