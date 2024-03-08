@@ -61,7 +61,7 @@ Expand the diagram above to go deeper into how:
 
 # Demo
 <p align="center" >
-  <video src="images/skyvern_demo_video.mp4"></video>
+https://raw.githubusercontent.com/Skyvern-AI/skyvern/main/images/skyvern_demo_video.mp4
 </p>
 
 # Quickstart
