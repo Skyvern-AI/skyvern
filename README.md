@@ -59,6 +59,11 @@ Expand the diagram above to go deeper into how:
 2. We parse the HTML + extract the image to generate an interactable element map
 -->
 
+# Demo
+<p align="center" >
+  <video src="images/skyvern_demo_video.mp4"></video>
+</p>
+
 # Quickstart
 This quickstart guide will walk you through getting Skyvern up and running on your local machine. 
 
@@ -102,7 +107,7 @@ pre-commit install
 ### Executing tasks (UI)
 Once you have the UI running, you can start an automation by filling out the fields shown in the UI and clicking "Execute" 
 
-<p align="center">
+<p align="center" >
   <img src="images/skyvern_visualizer_run_task.png"/>
 </p>
 
