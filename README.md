@@ -60,9 +60,8 @@ Expand the diagram above to go deeper into how:
 -->
 
 # Demo
-<p align="center" >
-  <video src="images/skyvern_demo_video.mp4"></video>
-</p>
+https://github.com/Skyvern-AI/skyvern/assets/3853670/4fd87a66-39a1-4c3b-b9ac-64c165da6336
+
 
 # Quickstart
 This quickstart guide will walk you through getting Skyvern up and running on your local machine. 
