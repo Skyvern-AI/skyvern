@@ -126,6 +126,9 @@ curl -X POST -H 'Content-Type: application/json' -H 'x-api-key: {Your local API 
 ## Debugging Skyvern
 Skyvern's visualizer allows you to debug every interaction Skyvern takes on the web.
 
+https://github.com/Skyvern-AI/skyvern/assets/3853670/99827aaf-6818-420e-a90a-edc1593ff71e
+
+
 ### Tasks, Steps, and Actions
 Each API request you sent to Skyvern is called a "task". Each task is made up of "steps" which are the individual actions Skyvern takes to complete the task. Each step is made up of "actions" which are the individual interactions Skyvern takes on a particular website.
 
