@@ -6,7 +6,7 @@ repos:
     hooks:
       - id: check-added-large-files
         args: ['--maxkb=5000']
-        exclude: 'inputs.*|skyvern_demo_video\.mp4'
+        exclude: 'inputs.*|skyvern_demo_video\.mp4|demo_visualizer.mp4'
       - id: check-byte-order-marker
       - id: check-case-conflict
       - id: check-merge-conflict
