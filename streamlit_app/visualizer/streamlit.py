@@ -1,3 +1,4 @@
+import json
 import sys
 
 import clipboard
@@ -50,6 +51,18 @@ st.sidebar.markdown("#### **Settings**")
 select_env = st.sidebar.selectbox("Environment", list(SETTINGS.keys()), on_change=reset_session_state)
 select_org = st.sidebar.selectbox(
     "Organization", list(SETTINGS[select_env]["orgs"].keys()), on_change=reset_session_state
+)
+
+# Hack the sidebar size to be a little bit smaller
+st.markdown(
+    f"""
+        <style>
+            .sidebar .sidebar-content {{
+                width: 375px;
+            }}
+        </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 # Initialize session state
@@ -126,7 +139,7 @@ with execute_tab:
 
     for i, example_tab in enumerate(example_tabs):
         with example_tab:
-            create_column, explanation_column = st.columns([1, 2])
+            create_column, explanation_column = st.columns([2, 3])
             with create_column:
                 run_task, copy_curl = st.columns([3, 1])
                 task_request_body = sorted_supported_examples[i]
@@ -146,23 +159,26 @@ with execute_tab:
                     st_webhook_callback_url = st.text_input(
                         "Webhook Callback URL", key=f"webhook_{unique_key}", placeholder="Optional"
                     )
-                    st_navigation_goal = st.text_input(
+                    st_navigation_goal = st.text_area(
                         "Navigation Goal",
                         key=f"nav_goal_{unique_key}",
                         placeholder="Describe the navigation goal",
                         value=example.navigation_goal,
+                        height=120,
                     )
-                    st_data_extraction_goal = st.text_input(
+                    st_data_extraction_goal = st.text_area(
                         "Data Extraction Goal",
                         key=f"data_goal_{unique_key}",
                         placeholder="Describe the data extraction goal",
                         value=example.data_extraction_goal,
+                        height=120,
                     )
                     st_navigation_payload = st.text_area(
                         "Navigation Payload JSON",
                         key=f"nav_payload_{unique_key}",
                         placeholder='{"name": "John Doe", "email": "abc@123.com"}',
-                        value=example.navigation_payload,
+                        value=json.dumps(example.navigation_payload, indent=2),
+                        height=200,
                     )
                     st_extracted_information_schema = st.text_area(
                         "Extracted Information Schema",
@@ -191,18 +207,28 @@ with execute_tab:
 
             with explanation_column:
                 st.markdown("### **Task Request**")
+                st.markdown("\n")
                 st.markdown("#### **URL**")
                 st.markdown("The starting URL for the task.")
+                st.markdown("\n")
                 st.markdown("#### **Webhook Callback URL**")
                 st.markdown("The URL to call with the results when the task is completed.")
+                st.markdown("\n")
                 st.markdown("#### **Navigation Goal**")
                 st.markdown("The user's goal for the task. Nullable if the task is only for data extraction.")
+                st.markdown("\n")
+                st.markdown("\n")
                 st.markdown("#### **Data Extraction Goal**")
                 st.markdown("The user's goal for data extraction. Nullable if the task is only for navigation.")
+                st.markdown("\n")
+                st.markdown("\n")
                 st.markdown("#### **Navigation Payload**")
                 st.markdown(
                     "The user's details needed to achieve the task. This is an unstructured field, and information can be passed in in any format you desire. Skyvern will map this information to the questions on the screen in real-time"
                 )
+                st.markdown("\n")
+                st.markdown("\n")
+                st.markdown("\n")
                 st.markdown("#### **Extracted Information Schema**")
                 st.markdown(
                     "(Optional) The requested schema of the extracted information for data extraction goal. This is a JSON object with keys as the field names and values as the data types. The data types can be any of the following: string, number, boolean, date, datetime, time, float, integer, object, array, null. If the schema is not provided, Skyvern will infer the schema from the extracted data."
