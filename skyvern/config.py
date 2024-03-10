@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     SKYVERN_TELEMETRY: bool = True
     ANALYTICS_ID: str = "anonymous"
 
+    # browser settings
+    BROWSER_LOCALE: str = "en-US"
+    BROWSER_TIMEZONE: str = "America/New_York"
+
     def is_cloud_environment(self) -> bool:
         """
         :return: True if env is not local, else False

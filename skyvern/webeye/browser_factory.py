@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 import uuid
 from datetime import datetime
 from typing import Any, Awaitable, Protocol
@@ -39,6 +40,16 @@ class BrowserContextFactory:
         video_dir = f"{SettingsManager.get_settings().VIDEO_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}"
         har_dir = f"{SettingsManager.get_settings().HAR_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{BrowserContextFactory.get_subdir()}.har"
         return {
+            "user_data_dir": tempfile.mkdtemp(prefix="skyvern_browser_"),
+            "locale": SettingsManager.get_settings().BROWSER_LOCALE,
+            "timezone_id": SettingsManager.get_settings().BROWSER_TIMEZONE,
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--disk-cache-size=1",
+            ],
+            "ignore_default_args": [
+                "--enable-automation",
+            ],
             "record_har_path": har_dir,
             "record_video_dir": video_dir,
             "viewport": {"width": 1920, "height": 1080},
@@ -77,18 +88,21 @@ class BrowserArtifacts(BaseModel):
 
 
 async def _create_headless_chromium(playwright: Playwright, **kwargs: dict) -> tuple[BrowserContext, BrowserArtifacts]:
-    browser = await playwright.chromium.launch(headless=True)
     browser_args = BrowserContextFactory.build_browser_args()
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(har_path=browser_args["record_har_path"])
-    browser_context = await browser.new_context(**browser_args)
+    browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
     return browser_context, browser_artifacts
 
 
 async def _create_headful_chromium(playwright: Playwright, **kwargs: dict) -> tuple[BrowserContext, BrowserArtifacts]:
-    browser = await playwright.chromium.launch(headless=False)
     browser_args = BrowserContextFactory.build_browser_args()
+    browser_args.update(
+        {
+            "headless": False,
+        }
+    )
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(har_path=browser_args["record_har_path"])
-    browser_context = await browser.new_context(**browser_args)
+    browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
     return browser_context, browser_artifacts
 
 
