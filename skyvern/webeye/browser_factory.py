@@ -46,6 +46,7 @@ class BrowserContextFactory:
             "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--disk-cache-size=1",
+                "--start-maximized",
             ],
             "ignore_default_args": [
                 "--enable-automation",
