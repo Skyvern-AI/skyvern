@@ -171,6 +171,13 @@ class OpenAIClientManager:
                 screenshots=screenshots,
                 prompt=prompt,
             )
+        except openai.OpenAIError as e:
+            LOG.error("OpenAI error", exc_info=True)
+            raise e
+        except Exception as e:
+            LOG.error("Unknown error for chat completion", error_message=str(e), error_type=type(e))
+            raise e
+
         # TODO: https://platform.openai.com/docs/guides/rate-limits/rate-limits-in-headers
         # use other headers, x-ratelimit-limit-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-tokens
         # x-ratelimit-reset-requests, x-ratelimit-reset-tokens to write a more accurate algorithm for managing api keys
