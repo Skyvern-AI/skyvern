@@ -5,7 +5,6 @@ from typing import Any, Union
 
 from jose import jwt
 
-from skyvern.config import settings
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
 
@@ -23,7 +22,7 @@ def create_access_token(
     encoded_jwt = jwt.encode(
         to_encode,
         SettingsManager.get_settings().SECRET_KEY,
-        algorithm=settings.SIGNATURE_ALGORITHM,
+        algorithm=SettingsManager.get_settings().SIGNATURE_ALGORITHM,
     )
     return encoded_jwt
 

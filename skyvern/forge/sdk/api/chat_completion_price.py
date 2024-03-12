@@ -5,8 +5,10 @@ from pydantic import BaseModel
 openai_model_to_price_lambdas = {
     "gpt-4-vision-preview": (0.01, 0.03),
     "gpt-4-1106-preview": (0.01, 0.03),
+    "gpt-4-0125-preview": (0.01, 0.03),
     "gpt-3.5-turbo": (0.001, 0.002),
     "gpt-3.5-turbo-1106": (0.001, 0.002),
+    "gpt-3.5-turbo-0125": (0.0005, 0.0015),
 }
 
 
