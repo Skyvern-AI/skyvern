@@ -28,7 +28,7 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import ContextManager
 from skyvern.forge.sdk.workflow.models.block import TaskBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun
-from skyvern.webeye.actions.actions import Action, ActionType, CompleteAction, parse_actions
+from skyvern.webeye.actions.actions import Action, ActionType, CompleteAction, WebAction, parse_actions
 from skyvern.webeye.actions.handler import ActionHandler
 from skyvern.webeye.actions.models import AgentStepOutput, DetailedAgentStepOutput
 from skyvern.webeye.actions.responses import ActionResult
@@ -381,7 +381,14 @@ class ForgeAgent(Agent):
             # of an exception, we can still see all the actions
             detailed_agent_step_output.actions_and_results = [(action, []) for action in actions]
 
+            web_action_element_ids = set()
             for action_idx, action in enumerate(actions):
+                if isinstance(action, WebAction):
+                    if action.element_id in web_action_element_ids:
+                        LOG.error("Duplicate action element id. Action handling stops", action=action)
+                        break
+                    web_action_element_ids.add(action.element_id)
+
                 results = await ActionHandler.handle_action(scraped_page, task, step, browser_state, action)
                 detailed_agent_step_output.actions_and_results[action_idx] = (action, results)
                 # wait random time between actions to avoid detection
@@ -408,7 +415,9 @@ class ForgeAgent(Agent):
                     # for now, we're being optimistic and assuming that
                     # js call doesn't have impact on the following actions
                     if results[-1].javascript_triggered:
-                        LOG.info("Action triggered javascript, ", action=action)
+                        LOG.info("Action triggered javascript. Stop executing reamaining actions.", action=action)
+                        # stop executing the rest actions
+                        break
                 else:
                     LOG.warning(
                         "Action failed, marking step as failed",
