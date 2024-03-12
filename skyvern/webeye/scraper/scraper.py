@@ -1,5 +1,6 @@
 import asyncio
 import copy
+from collections import defaultdict
 
 import structlog
 from playwright.async_api import Page
@@ -68,6 +69,7 @@ class ScrapedPage(BaseModel):
     """
 
     elements: list[dict]
+    id_to_element_dict: dict[int, dict] = {}
     id_to_xpath_dict: dict[int, str]
     element_tree: list[dict]
     element_tree_trimmed: list[dict]
@@ -180,16 +182,21 @@ async def scrape_web_unsafe(
     elements, element_tree = await get_interactable_element_tree(page)
     element_tree = cleanup_elements(copy.deepcopy(element_tree))
 
+    _build_element_links(elements)
+
     id_to_xpath_dict = {}
+    id_to_element_dict = {}
     for element in elements:
         element_id = element["id"]
         # get_interactable_element_tree marks each interactable element with a unique_id attribute
         id_to_xpath_dict[element_id] = f"//*[@{SKYVERN_ID_ATTR}='{element_id}']"
+        id_to_element_dict[element_id] = element
 
     text_content = await get_all_visible_text(page)
     return ScrapedPage(
         elements=elements,
         id_to_xpath_dict=id_to_xpath_dict,
+        id_to_element_dict=id_to_element_dict,
         element_tree=element_tree,
         element_tree_trimmed=trim_element_tree(copy.deepcopy(element_tree)),
         screenshots=screenshots,
@@ -299,6 +306,8 @@ def _trimmed_attributes(tag_name: str, attributes: dict) -> dict:
         if key == "id" and tag_name in ["input", "textarea", "select"]:
             # We don't want to remove the id attribute any of these elements in case there's a label for it
             new_attributes[key] = attributes[key]
+        if key == "role" and attributes[key] in ["listbox", "option"]:
+            new_attributes[key] = attributes[key]
         if key in RESERVED_ATTRIBUTES:
             new_attributes[key] = attributes[key]
     return new_attributes
@@ -314,3 +323,59 @@ def _remove_unique_id(element: dict) -> None:
         return
     if SKYVERN_ID_ATTR in element["attributes"]:
         del element["attributes"][SKYVERN_ID_ATTR]
+
+
+def _build_element_links(elements: list[dict]) -> None:
+    """
+    Build the links for listbox. A listbox could be mapped back to another element if:
+        1. The listbox element's text matches context or text of an element
+    """
+    # first, build mapping between text/context and elements
+    text_to_elements_map: dict[str, list[dict]] = defaultdict(list)
+    context_to_elements_map: dict[str, list[dict]] = defaultdict(list)
+    for element in elements:
+        if "text" in element:
+            text_to_elements_map[element["text"]].append(element)
+        if "context" in element:
+            context_to_elements_map[element["context"]].append(element)
+
+    # then, build the links from element to listbox elements
+    for element in elements:
+        if not (
+            "attributes" in element and "role" in element["attributes"] and "listbox" == element["attributes"]["role"]
+        ):
+            continue
+        listbox_text = element["text"] if "text" in element else ""
+
+        # WARNING: If a listbox has really little commont content (yes/no, etc.),
+        #   it might have conflict and will connect to wrong element. If so, code should be added to prevent that:
+        # if len(listbox_text) < 10:
+        #     # do not support small listbox text as it's error proning. larger text match is more reliable
+        #     continue
+
+        for text, linked_elements in text_to_elements_map.items():
+            if listbox_text in text:
+                for linked_element in linked_elements:
+                    if linked_element["id"] != element["id"]:
+                        LOG.info(
+                            "Match listbox to target element text",
+                            listbox_text=listbox_text,
+                            text=text,
+                            listbox_id=element["id"],
+                            linked_element_id=linked_element["id"],
+                        )
+                        linked_element["linked_element"] = element["id"]
+
+        for context, linked_elements in context_to_elements_map.items():
+            if listbox_text in context:
+                for linked_element in linked_elements:
+                    # if _ensure_nearby_rects(element["rect"], linked_element["rect"]):
+                    if linked_element["id"] != element["id"]:
+                        LOG.info(
+                            "Match listbox to target element context",
+                            listbox_text=listbox_text,
+                            context=context,
+                            listbox_id=element["id"],
+                            linked_element_id=linked_element["id"],
+                        )
+                        linked_element["linked_element"] = element["id"]

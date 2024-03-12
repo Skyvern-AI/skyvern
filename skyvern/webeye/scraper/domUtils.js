@@ -358,6 +358,22 @@ function isInteractable(element) {
     return hasPointer || hasCursor;
   }
 
+  // support listbox and options underneath it
+  if (
+    (tagName === "ul" || tagName === "div") &&
+    element.hasAttribute("role") &&
+    element.getAttribute("role").toLowerCase() === "listbox"
+  ) {
+    return true;
+  }
+  if (
+    (tagName === "li" || tagName === "div") &&
+    element.hasAttribute("role") &&
+    element.getAttribute("role").toLowerCase() === "option"
+  ) {
+    return true;
+  }
+
   return false;
 }
 
@@ -463,6 +479,20 @@ function getSelectOptions(element) {
   return selectOptions;
 }
 
+function getListboxOptions(element) {
+  // get all the elements with role="option" under the element
+  var optionElements = element.querySelectorAll('[role="option"]');
+  let selectOptions = [];
+  for (var i = 0; i < optionElements.length; i++) {
+    var ele = optionElements[i];
+    selectOptions.push({
+      optionIndex: i,
+      text: removeMultipleSpaces(ele.textContent),
+    });
+  }
+  return selectOptions;
+}
+
 function buildTreeFromBody() {
   var elements = [];
   var resultArray = [];
@@ -512,6 +542,9 @@ function buildTreeFromBody() {
     let selectOptions = null;
     if (elementTagNameLower === "select") {
       selectOptions = getSelectOptions(element);
+    } else if (attrs["role"] && attrs["role"].toLowerCase() === "listbox") {
+      // if "role" key is inside attrs, then get all the elements with role "option" and get their text
+      selectOptions = getListboxOptions(element);
     }
     if (selectOptions) {
       elementObj.options = selectOptions;
@@ -786,6 +819,7 @@ function removeBoundingBoxes() {
 function scrollToTop(draw_boxes) {
   removeBoundingBoxes();
   window.scrollTo(0, 0);
+  scrollDownAndUp();
   if (draw_boxes) {
     var elementsAndResultArray = buildTreeFromBody();
     drawBoundingBoxes(elementsAndResultArray[0]);
@@ -798,9 +832,39 @@ function scrollToNextPage(draw_boxes) {
   // return true if there is a next page, false otherwise
   removeBoundingBoxes();
   window.scrollBy(0, window.innerHeight - 200);
+  scrollUpAndDown();
   if (draw_boxes) {
     var elementsAndResultArray = buildTreeFromBody();
     drawBoundingBoxes(elementsAndResultArray[0]);
   }
   return window.scrollY;
+}
+
+function scrollUpAndDown() {
+  // remove select2-drop-above class to prevent dropdown from being rendered on top of the box
+  // then scroll up by 1 and scroll down by 1
+  removeSelect2DropAbove();
+  window.scrollBy(0, -1);
+  removeSelect2DropAbove();
+  window.scrollBy(0, 1);
+}
+
+function scrollDownAndUp() {
+  // remove select2-drop-above class to prevent dropdown from being rendered on top of the box
+  // then scroll up by 1 and scroll down by 1
+  removeSelect2DropAbove();
+  window.scrollBy(0, 1);
+  removeSelect2DropAbove();
+  window.scrollBy(0, -1);
+}
+
+function removeSelect2DropAbove() {
+  var select2DropAbove = document.getElementsByClassName("select2-drop-above");
+  var allElements = [];
+  for (var i = 0; i < select2DropAbove.length; i++) {
+    allElements.push(select2DropAbove[i]);
+  }
+  allElements.forEach((ele) => {
+    ele.classList.remove("select2-drop-above");
+  });
 }

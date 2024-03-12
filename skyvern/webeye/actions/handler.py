@@ -155,6 +155,92 @@ async def handle_select_option_action(
 ) -> list[ActionResult]:
     xpath = await validate_actions_in_dom(action, page, scraped_page)
 
+    locator = page.locator(f"xpath={xpath}")
+    tag_name = await get_tag_name_lowercase(locator)
+    element_dict = scraped_page.id_to_element_dict[action.element_id]
+    LOG.info("SelectOptionAction", action=action, tag_name=tag_name, element_dict=element_dict)
+
+    # if element is not a select option, prioritize clicking the linked element if any
+    if tag_name != "select" and "linked_element" in element_dict:
+        LOG.info(
+            "SelectOptionAction is not on a select tag and found a linked element",
+            action=action,
+            linked_element=element_dict["linked_element"],
+        )
+        listbox_click_success = await click_listbox_option(scraped_page, page, action, element_dict["linked_element"])
+        if listbox_click_success:
+            LOG.info(
+                "Successfully clicked linked element",
+                action=action,
+                linked_element=element_dict["linked_element"],
+            )
+            return [ActionSuccess()]
+        LOG.warning("Failed to click linked element", action=action, linked_element=element_dict["linked_element"])
+
+    # check if the element is an a tag first. If yes, click it instead of selecting the option
+    if tag_name == "label":
+        # TODO: this is a hack to handle the case where the label is the only thing that's clickable
+        # it's a label, look for the anchor tag
+        child_anchor_xpath = get_anchor_to_click(scraped_page, action.element_id)
+        if child_anchor_xpath:
+            LOG.info(
+                "SelectOptionAction is a label tag. Clicking the anchor tag instead of selecting the option",
+                action=action,
+                child_anchor_xpath=child_anchor_xpath,
+            )
+            click_action = ClickAction(element_id=action.element_id)
+            return await chain_click(page, click_action, child_anchor_xpath)
+        return [ActionFailure(Exception("No anchor tag found for the label for SelectOptionAction"))]
+    elif tag_name == "a":
+        # turn the SelectOptionAction into a ClickAction
+        LOG.info(
+            "SelectOptionAction is an anchor tag. Clicking it instead of selecting the option",
+            action=action,
+        )
+        click_action = ClickAction(element_id=action.element_id)
+        action_result = await chain_click(page, click_action, xpath)
+        return action_result
+    elif tag_name == "ul" or tag_name == "div" or tag_name == "li":
+        # if the role is listbox, find the option with the "label" or "value" and click that option element
+        # references:
+        # https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Roles/listbox_role
+        # https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Roles/option_role
+        role_attribute = await locator.get_attribute("role")
+        if role_attribute == "listbox":
+            LOG.info(
+                "SelectOptionAction on a listbox element. Searching for the option and click it",
+                action=action,
+            )
+            # use playwright to click the option
+            # clickOption is defined in domUtils.js
+            option_locator = locator.locator('[role="option"]')
+            option_num = await option_locator.count()
+            if action.option.index and action.option.index < option_num:
+                try:
+                    await option_locator.nth(action.option.index).click(timeout=2000)
+                    return [ActionSuccess()]
+                except Exception as e:
+                    LOG.error(
+                        "Failed to click option",
+                        action=action,
+                        exception=e,
+                    )
+                    return [ActionFailure(e)]
+            return [ActionFailure(Exception(f"SelectOption option index is missing"))]
+        elif role_attribute == "option":
+            LOG.info(
+                "SelectOptionAction on an option element. Clicking the option",
+                action=action,
+            )
+            # click the option element
+            click_action = ClickAction(element_id=action.element_id)
+            return await chain_click(page, click_action, xpath)
+        else:
+            LOG.error(
+                "SelectOptionAction on a non-listbox element. Cannot handle this action",
+            )
+            return [ActionFailure(Exception(f"Cannot handle SelectOptionAction on a non-listbox element"))]
+
     try:
         # First click by label (if it matches)
         await page.click(f"xpath={xpath}", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
@@ -354,6 +440,20 @@ async def chain_click(
         page.remove_listener("filechooser", fc_func)
 
 
+def get_anchor_to_click(scraped_page: ScrapedPage, element_id: int) -> str | None:
+    """
+    Get the anchor tag under the label to click
+    """
+    LOG.info("Getting anchor tag to click", element_id=element_id)
+    element_id = int(element_id)
+    for ele in scraped_page.elements:
+        if "id" in ele and ele["id"] == element_id:
+            for child in ele["children"]:
+                if "tagName" in child and child["tagName"] == "a":
+                    return scraped_page.id_to_xpath_dict[child["id"]]
+    return None
+
+
 async def is_javascript_triggered(page: Page, xpath: str) -> bool:
     locator = page.locator(f"xpath={xpath}")
     element = locator.first
@@ -364,6 +464,14 @@ async def is_javascript_triggered(page: Page, xpath: str) -> bool:
             LOG.info("Found javascript call in anchor tag, marking step as completed. Dropping remaining actions")
             return True
     return False
+
+
+async def get_tag_name_lowercase(locator: Locator) -> str | None:
+    element = locator.first
+    if element:
+        tag_name = await element.evaluate("e => e.tagName")
+        return tag_name.lower()
+    return None
 
 
 async def is_file_input_element(locator: Locator) -> bool:
@@ -443,3 +551,39 @@ async def extract_information_for_navigation_goal(
     return ScrapeResult(
         scraped_data=json_response,
     )
+
+
+async def click_listbox_option(
+    scraped_page: ScrapedPage,
+    page: Page,
+    action: actions.SelectOptionAction,
+    listbox_element_id: int,
+) -> bool:
+    listbox_element = scraped_page.id_to_element_dict[listbox_element_id]
+    # this is a listbox element, get all the children
+    if "children" not in listbox_element:
+        return False
+
+    LOG.info("starting bfs", listbox_element_id=listbox_element_id)
+    bfs_queue = [child for child in listbox_element["children"]]
+    while bfs_queue:
+        child = bfs_queue.pop(0)
+        LOG.info("popped child", element_id=child["id"])
+        if "attributes" in child and "role" in child["attributes"] and child["attributes"]["role"] == "option":
+            LOG.info("found option", element_id=child["id"])
+            text = child["text"] if "text" in child else ""
+            if text and (text == action.option.label or text == action.option.value):
+                option_xpath = scraped_page.id_to_xpath_dict[child["id"]]
+                try:
+                    await page.click(f"xpath={option_xpath}", timeout=1000)
+                    return True
+                except Exception as e:
+                    LOG.error(
+                        "Failed to click on the option",
+                        action=action,
+                        option_xpath=option_xpath,
+                        exception=e,
+                    )
+        if "children" in child:
+            bfs_queue.extend(child["children"])
+    return False
