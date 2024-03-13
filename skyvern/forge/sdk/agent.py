@@ -13,6 +13,7 @@ from starlette_context.plugins.base import Plugin
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.routes.agent_protocol import base_router
+from skyvern.scheduler import SCHEDULER
 
 LOG = structlog.get_logger()
 
@@ -57,6 +58,12 @@ class Agent:
                 # UserAgentPlugin(),
             ),
         )
+
+        # Register the scheduler on startup so that we can schedule jobs dynamically
+        @app.on_event("startup")
+        def start_scheduler() -> None:
+            LOG.info("Starting the skyvern scheduler.")
+            SCHEDULER.start()
 
         @app.exception_handler(Exception)
         async def unexpected_exception(request: Request, exc: Exception) -> JSONResponse:

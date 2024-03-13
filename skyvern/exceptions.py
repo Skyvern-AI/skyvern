@@ -179,3 +179,13 @@ class OrganizationNotFound(SkyvernException):
 class StepNotFound(SkyvernException):
     def __init__(self, organization_id: str, task_id: str, step_id: str | None = None) -> None:
         super().__init__(f"Step {step_id or 'latest'} not found. organization_id={organization_id} task_id={task_id}")
+
+
+class FailedToTakeScreenshot(SkyvernException):
+    def __init__(self, error_message: str) -> None:
+        super().__init__(f"Failed to take screenshot. Error message: {error_message}")
+
+
+class WorkflowRunContextNotInitialized(SkyvernException):
+    def __init__(self, workflow_run_id: str) -> None:
+        super().__init__("WorkflowRunContext not initialized for workflow run {workflow_run_id}")

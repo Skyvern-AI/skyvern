@@ -72,3 +72,4 @@ class WorkflowRunStatusResponse(BaseModel):
     parameters: dict[str, Any]
     screenshot_urls: list[str] | None = None
     recording_url: str | None = None
+    payload: dict[str, Any] | None = None

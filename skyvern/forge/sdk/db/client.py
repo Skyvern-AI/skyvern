@@ -55,6 +55,7 @@ class AgentDB:
     async def create_task(
         self,
         url: str,
+        title: str | None,
         navigation_goal: str | None,
         data_extraction_goal: str | None,
         navigation_payload: dict[str, Any] | list | str | None,
@@ -65,12 +66,14 @@ class AgentDB:
         workflow_run_id: str | None = None,
         order: int | None = None,
         retry: int | None = None,
+        error_code_mapping: dict[str, str] | None = None,
     ) -> Task:
         try:
             with self.Session() as session:
                 new_task = TaskModel(
                     status="created",
                     url=url,
+                    title=title,
                     webhook_callback_url=webhook_callback_url,
                     navigation_goal=navigation_goal,
                     data_extraction_goal=data_extraction_goal,
@@ -81,6 +84,7 @@ class AgentDB:
                     workflow_run_id=workflow_run_id,
                     order=order,
                     retry=retry,
+                    error_code_mapping=error_code_mapping,
                 )
                 session.add(new_task)
                 session.commit()
@@ -312,11 +316,16 @@ class AgentDB:
     async def update_task(
         self,
         task_id: str,
-        status: TaskStatus,
+        status: TaskStatus | None = None,
         extracted_information: dict[str, Any] | list | str | None = None,
         failure_reason: str | None = None,
+        errors: list[dict[str, Any]] | None = None,
         organization_id: str | None = None,
     ) -> Task:
+        if status is None and extracted_information is None and failure_reason is None and errors is None:
+            raise ValueError(
+                "At least one of status, extracted_information, or failure_reason must be provided to update the task"
+            )
         try:
             with self.Session() as session:
                 if (
@@ -325,11 +334,14 @@ class AgentDB:
                     .filter_by(organization_id=organization_id)
                     .first()
                 ):
-                    task.status = status
+                    if status is not None:
+                        task.status = status
                     if extracted_information is not None:
                         task.extracted_information = extracted_information
                     if failure_reason is not None:
                         task.failure_reason = failure_reason
+                    if errors is not None:
+                        task.errors = errors
                     session.commit()
                     updated_task = await self.get_task(task_id, organization_id=organization_id)
                     if not updated_task:

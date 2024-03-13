@@ -11,8 +11,16 @@ from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
+from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Organization, Step
-from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskRequest, TaskResponse, TaskStatus
+from skyvern.forge.sdk.schemas.tasks import (
+    CreateTaskResponse,
+    ProxyLocation,
+    Task,
+    TaskRequest,
+    TaskResponse,
+    TaskStatus,
+)
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.models.workflow import (
@@ -80,10 +88,13 @@ async def create_agent_task(
     analytics.capture("skyvern-oss-agent-task-create", data={"url": task.url})
     agent = request["agent"]
 
+    if current_org and current_org.organization_name == "CoverageCat":
+        task.proxy_location = ProxyLocation.RESIDENTIAL
+
     created_task = await agent.create_task(task, current_org.organization_id)
     if x_max_steps_override:
         LOG.info("Overriding max steps per run", max_steps_override=x_max_steps_override)
-    await app.ASYNC_EXECUTOR.execute_task(
+    await AsyncExecutorFactory.get_executor().execute_task(
         background_tasks=background_tasks,
         task=created_task,
         organization=current_org,
@@ -398,10 +409,6 @@ async def execute_workflow(
     x_max_steps_override: Annotated[int | None, Header()] = None,
 ) -> RunWorkflowResponse:
     analytics.capture("skyvern-oss-agent-workflow-execute")
-    LOG.info(
-        f"Running workflow {workflow_id}",
-        workflow_id=workflow_id,
-    )
     context = skyvern_context.ensure_context()
     request_id = context.request_id
     workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
@@ -413,7 +420,7 @@ async def execute_workflow(
     )
     if x_max_steps_override:
         LOG.info("Overriding max steps per run", max_steps_override=x_max_steps_override)
-    await app.ASYNC_EXECUTOR.execute_workflow(
+    await AsyncExecutorFactory.get_executor().execute_workflow(
         background_tasks=background_tasks,
         organization=current_org,
         workflow_id=workflow_id,

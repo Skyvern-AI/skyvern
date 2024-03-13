@@ -1,5 +1,6 @@
 import abc
 
+import structlog
 from fastapi import BackgroundTasks
 
 from skyvern.forge import app
@@ -7,6 +8,8 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+
+LOG = structlog.get_logger()
 
 
 class AsyncExecutor(abc.ABC):
@@ -43,6 +46,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         max_steps_override: int | None,
         api_key: str | None,
     ) -> None:
+        LOG.info("Executing task using background task executor", task_id=task.task_id)
         step = await app.DATABASE.create_step(
             task.task_id,
             order=0,
@@ -52,7 +56,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
 
         task = await app.DATABASE.update_task(
             task.task_id,
-            TaskStatus.running,
+            status=TaskStatus.running,
             organization_id=organization.organization_id,
         )
 
@@ -78,6 +82,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         max_steps_override: int | None,
         api_key: str | None,
     ) -> None:
+        LOG.info("Executing workflow using background task executor", workflow_run_id=workflow_run_id)
         background_tasks.add_task(
             app.WORKFLOW_SERVICE.execute_workflow,
             workflow_run_id=workflow_run_id,

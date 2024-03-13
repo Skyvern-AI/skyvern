@@ -50,6 +50,8 @@ class BrowserManager:
         await browser_state.get_or_create_page(task.url)
 
         self.pages[task.task_id] = browser_state
+        if task.workflow_run_id:
+            self.pages[task.workflow_run_id] = browser_state
         return browser_state
 
     async def get_or_create_for_workflow_run(self, workflow_run: WorkflowRun, url: str | None = None) -> BrowserState:
@@ -95,8 +97,11 @@ class BrowserManager:
         if browser_state:
             path = browser_state.browser_artifacts.video_path
             if path:
-                with open(path, "rb") as f:
-                    return f.read()
+                try:
+                    with open(path, "rb") as f:
+                        return f.read()
+                except FileNotFoundError:
+                    pass
         LOG.warning(
             "Video data not found for task", task_id=task_id, workflow_id=workflow_id, workflow_run_id=workflow_run_id
         )
@@ -135,18 +140,32 @@ class BrowserManager:
         LOG.info("Cleaning up for task")
         browser_state_to_close = self.pages.pop(task_id, None)
         if browser_state_to_close:
+            # Stop tracing before closing the browser if tracing is enabled
+            if browser_state_to_close.browser_context and browser_state_to_close.browser_artifacts.traces_dir:
+                trace_path = f"{browser_state_to_close.browser_artifacts.traces_dir}/{task_id}.zip"
+                await browser_state_to_close.browser_context.tracing.stop(path=trace_path)
+                LOG.info("Stopped tracing", trace_path=trace_path)
+
             await browser_state_to_close.close(close_browser_on_completion=close_browser_on_completion)
         LOG.info("Task is cleaned up")
 
         return browser_state_to_close
 
     async def cleanup_for_workflow_run(
-        self, workflow_run_id: str, close_browser_on_completion: bool = True
+        self, workflow_run_id: str, task_ids: list[str], close_browser_on_completion: bool = True
     ) -> BrowserState | None:
         LOG.info("Cleaning up for workflow run")
         browser_state_to_close = self.pages.pop(workflow_run_id, None)
         if browser_state_to_close:
+            # Stop tracing before closing the browser if tracing is enabled
+            if browser_state_to_close.browser_context and browser_state_to_close.browser_artifacts.traces_dir:
+                trace_path = f"{browser_state_to_close.browser_artifacts.traces_dir}/{workflow_run_id}.zip"
+                await browser_state_to_close.browser_context.tracing.stop(path=trace_path)
+                LOG.info("Stopped tracing", trace_path=trace_path)
+
             await browser_state_to_close.close(close_browser_on_completion=close_browser_on_completion)
+        for task_id in task_ids:
+            self.pages.pop(task_id, None)
         LOG.info("Workflow run is cleaned up")
 
         return browser_state_to_close

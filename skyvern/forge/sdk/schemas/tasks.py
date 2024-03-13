@@ -18,6 +18,11 @@ class ProxyLocation(StrEnum):
 
 
 class TaskRequest(BaseModel):
+    title: str | None = Field(
+        default=None,
+        description="The title of the task.",
+        examples=["Get a quote for car insurance"],
+    )
     url: str = Field(
         ...,
         min_length=1,
@@ -41,17 +46,27 @@ class TaskRequest(BaseModel):
         examples=["Extract the quote price"],
     )
     navigation_payload: dict[str, Any] | list | str | None = Field(
-        None,
+        default=None,
         description="The user's details needed to achieve the task.",
         examples=[{"name": "John Doe", "email": "john@doe.com"}],
     )
+    error_code_mapping: dict[str, str] | None = Field(
+        default=None,
+        description="The mapping of error codes and their descriptions.",
+        examples=[
+            {
+                "out_of_stock": "Return this error when the product is out of stock",
+                "not_found": "Return this error when the product is not found",
+            }
+        ],
+    )
     proxy_location: ProxyLocation | None = Field(
-        None,
+        default=None,
         description="The location of the proxy to use for the task.",
         examples=["US-WA", "US-CA", "US-FL", "US-NY", "US-TX"],
     )
     extracted_information_schema: dict[str, Any] | list | str | None = Field(
-        None,
+        default=None,
         description="The requested schema of the extracted information.",
     )
 
@@ -122,6 +137,7 @@ class Task(TaskRequest):
     workflow_run_id: str | None = None
     order: int | None = None
     retry: int | None = None
+    errors: list[dict[str, Any]] = []
 
     def validate_update(
         self,
@@ -162,6 +178,7 @@ class Task(TaskRequest):
             failure_reason=failure_reason or self.failure_reason,
             screenshot_url=screenshot_url,
             recording_url=recording_url,
+            errors=self.errors,
         )
 
 
@@ -175,6 +192,7 @@ class TaskResponse(BaseModel):
     screenshot_url: str | None = None
     recording_url: str | None = None
     failure_reason: str | None = None
+    errors: list[dict[str, Any]] = []
 
 
 class CreateTaskResponse(BaseModel):

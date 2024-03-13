@@ -3,7 +3,7 @@ from enum import StrEnum
 from typing import Any, Dict, List
 
 import structlog
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from skyvern.forge.sdk.schemas.tasks import Task
 
@@ -32,6 +32,16 @@ class Action(BaseModel):
 
 class WebAction(Action, abc.ABC):
     element_id: int
+
+
+class UserDefinedError(BaseModel):
+    error_code: str
+    reasoning: str
+    confidence_float: float = Field(..., ge=0, le=1)
+
+
+class DecisiveAction(Action, abc.ABC):
+    errors: List[UserDefinedError] = []
 
 
 class ClickAction(WebAction):
@@ -102,11 +112,11 @@ class WaitAction(Action):
     action_type: ActionType = ActionType.WAIT
 
 
-class TerminateAction(Action):
+class TerminateAction(DecisiveAction):
     action_type: ActionType = ActionType.TERMINATE
 
 
-class CompleteAction(Action):
+class CompleteAction(DecisiveAction):
     action_type: ActionType = ActionType.COMPLETE
     data_extraction_goal: str | None = None
 
@@ -129,7 +139,7 @@ def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Actio
                 reasoning=reasoning,
                 actions=actions,
             )
-            actions.append(TerminateAction(reasoning=reasoning))
+            actions.append(TerminateAction(reasoning=reasoning, errors=action["errors"] if "errors" in action else []))
         elif action_type == ActionType.CLICK:
             file_url = action["file_url"] if "file_url" in action else None
             actions.append(ClickAction(element_id=element_id, reasoning=reasoning, file_url=file_url))
@@ -165,7 +175,13 @@ def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Actio
                     actions=actions,
                     llm_response=json_response,
                 )
-            return [CompleteAction(reasoning=reasoning, data_extraction_goal=task.data_extraction_goal)]
+            return [
+                CompleteAction(
+                    reasoning=reasoning,
+                    data_extraction_goal=task.data_extraction_goal,
+                    errors=action["errors"] if "errors" in action else [],
+                )
+            ]
         elif action_type == "null":
             actions.append(NullAction(reasoning=reasoning))
         elif action_type == ActionType.SOLVE_CAPTCHA:

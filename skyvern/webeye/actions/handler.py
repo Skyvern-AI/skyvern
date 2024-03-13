@@ -1,6 +1,7 @@
 import asyncio
+import json
 import re
-from typing import Awaitable, Callable, List
+from typing import Any, Awaitable, Callable, List
 
 import structlog
 from playwright.async_api import Locator, Page
@@ -82,7 +83,9 @@ async def handle_click_action(
 ) -> list[ActionResult]:
     xpath = await validate_actions_in_dom(action, page, scraped_page)
     await asyncio.sleep(0.3)
-    return await chain_click(page, action, xpath, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+    return await chain_click(
+        task, page, action, xpath, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    )
 
 
 async def handle_input_text_action(
@@ -91,7 +94,8 @@ async def handle_input_text_action(
     xpath = await validate_actions_in_dom(action, page, scraped_page)
     locator = page.locator(f"xpath={xpath}")
     await locator.clear()
-    await locator.fill(action.text, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+    text = get_actual_value_of_parameter_if_secret(task, action.text)
+    await locator.fill(text, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
 
     # This is a hack that gets dropdowns to select the "best" option based on what's typed
     # Fixes situations like tsk_228671423990405776 where the location isn't being autocompleted
@@ -100,7 +104,7 @@ async def handle_input_text_action(
     if not input_value:
         LOG.info("Failed to input the text, trying to press sequentially with an enter click", action=action)
         await locator.clear()
-        await locator.press_sequentially(action.text, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+        await locator.press_sequentially(text, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
         await locator.press("Enter", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
         input_value = await locator.input_value(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
         LOG.info("Input value", input_value=input_value, action=action)
@@ -114,7 +118,12 @@ async def handle_upload_file_action(
     if not action.file_url:
         LOG.warning("InputFileAction has no file_url", action=action)
         return [ActionFailure(MissingFileUrl())]
-    if action.file_url not in str(task.navigation_payload):
+    # ************************************************************************************************************** #
+    # After this point if the file_url is a secret, it will be replaced with the actual value
+    # In order to make sure we don't log the secret value, we log the action with the original value action.file_url
+    # ************************************************************************************************************** #
+    file_url = get_actual_value_of_parameter_if_secret(task, action.file_url)
+    if file_url not in str(task.navigation_payload):
         LOG.warning(
             "LLM might be imagining the file url, which is not in navigation payload",
             action=action,
@@ -122,7 +131,7 @@ async def handle_upload_file_action(
         )
         return [ActionFailure(ImaginaryFileUrl(action.file_url))]
     xpath = await validate_actions_in_dom(action, page, scraped_page)
-    file_path = download_file(action.file_url)
+    file_path = download_file(file_url)
     locator = page.locator(f"xpath={xpath}")
     is_file_input = await is_file_input_element(locator)
     if is_file_input:
@@ -141,7 +150,9 @@ async def handle_upload_file_action(
         LOG.info("Taking UploadFileAction. Found non file input tag", action=action)
         # treat it as a click action
         action.is_upload_file_tag = False
-        return await chain_click(page, action, xpath, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+        return await chain_click(
+            task, page, action, xpath, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+        )
 
 
 async def handle_null_action(
@@ -189,7 +200,7 @@ async def handle_select_option_action(
                 child_anchor_xpath=child_anchor_xpath,
             )
             click_action = ClickAction(element_id=action.element_id)
-            return await chain_click(page, click_action, child_anchor_xpath)
+            return await chain_click(task, page, click_action, child_anchor_xpath)
         return [ActionFailure(Exception("No anchor tag found for the label for SelectOptionAction"))]
     elif tag_name == "a":
         # turn the SelectOptionAction into a ClickAction
@@ -198,7 +209,7 @@ async def handle_select_option_action(
             action=action,
         )
         click_action = ClickAction(element_id=action.element_id)
-        action_result = await chain_click(page, click_action, xpath)
+        action_result = await chain_click(task, page, click_action, xpath)
         return action_result
     elif tag_name == "ul" or tag_name == "div" or tag_name == "li":
         # if the role is listbox, find the option with the "label" or "value" and click that option element
@@ -234,7 +245,7 @@ async def handle_select_option_action(
             )
             # click the option element
             click_action = ClickAction(element_id=action.element_id)
-            return await chain_click(page, click_action, xpath)
+            return await chain_click(task, page, click_action, xpath)
         else:
             LOG.error(
                 "SelectOptionAction on a non-listbox element. Cannot handle this action",
@@ -349,6 +360,22 @@ ActionHandler.register_action_type(ActionType.TERMINATE, handle_terminate_action
 ActionHandler.register_action_type(ActionType.COMPLETE, handle_complete_action)
 
 
+def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) -> Any:
+    """
+    Get the actual value of a parameter if it's a secret. If it's not a secret, return the parameter value as is.
+
+    Just return the parameter value if the task isn't a workflow's task.
+
+    This is only used for InputTextAction, UploadFileAction, and ClickAction (if it has a file_url).
+    """
+    if task.workflow_run_id is None:
+        return parameter
+
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
+    secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
+    return secret_value if secret_value is not None else parameter
+
+
 async def validate_actions_in_dom(action: WebAction, page: Page, scraped_page: ScrapedPage) -> str:
     xpath = scraped_page.id_to_xpath_dict[action.element_id]
     locator = page.locator(xpath)
@@ -371,6 +398,7 @@ async def validate_actions_in_dom(action: WebAction, page: Page, scraped_page: S
 
 
 async def chain_click(
+    task: Task,
     page: Page,
     action: ClickAction | UploadFileAction,
     xpath: str,
@@ -384,7 +412,8 @@ async def chain_click(
     LOG.info("Chain click starts", action=action, xpath=xpath)
     file: list[str] | str = []
     if action.file_url:
-        file = download_file(action.file_url) or []
+        file_url = get_actual_value_of_parameter_if_secret(task, action.file_url)
+        file = download_file(file_url) or []
 
     fc_func = lambda fc: fc.set_files(files=file)
     page.on("filechooser", fc_func)
@@ -535,11 +564,13 @@ async def extract_information_for_navigation_goal(
     extract_information_prompt = prompt_engine.load_prompt(
         prompt_template,
         navigation_goal=task.navigation_goal,
+        navigation_payload=task.navigation_payload,
         elements=scraped_page.element_tree,
         data_extraction_goal=task.data_extraction_goal,
         extracted_information_schema=task.extracted_information_schema,
         current_url=scraped_page.url,
         extracted_text=scraped_page.extracted_text,
+        error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else None,
     )
 
     json_response = await app.OPENAI_CLIENT.chat_completion(

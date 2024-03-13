@@ -6,10 +6,17 @@ from datetime import datetime
 from typing import Any, Awaitable, Protocol
 
 import structlog
+from playwright._impl._errors import TimeoutError
 from playwright.async_api import BrowserContext, Error, Page, Playwright, async_playwright
 from pydantic import BaseModel
 
-from skyvern.exceptions import FailedToNavigateToUrl, UnknownBrowserType, UnknownErrorWhileCreatingBrowserContext
+from skyvern.exceptions import (
+    FailedToNavigateToUrl,
+    FailedToTakeScreenshot,
+    MissingBrowserStatePage,
+    UnknownBrowserType,
+    UnknownErrorWhileCreatingBrowserContext,
+)
 from skyvern.forge.sdk.core.skyvern_context import current
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
@@ -58,9 +65,14 @@ class BrowserContextFactory:
 
     @staticmethod
     def build_browser_artifacts(
-        video_path: str | None = None, har_path: str | None = None, video_artifact_id: str | None = None
+        video_path: str | None = None,
+        har_path: str | None = None,
+        video_artifact_id: str | None = None,
+        traces_dir: str | None = None,
     ) -> BrowserArtifacts:
-        return BrowserArtifacts(video_path=video_path, har_path=har_path, video_artifact_id=video_artifact_id)
+        return BrowserArtifacts(
+            video_path=video_path, har_path=har_path, video_artifact_id=video_artifact_id, traces_dir=traces_dir
+        )
 
     @classmethod
     def register_type(cls, browser_type: str, creator: BrowserContextCreator) -> None:
@@ -86,6 +98,7 @@ class BrowserArtifacts(BaseModel):
     video_path: str | None = None
     video_artifact_id: str | None = None
     har_path: str | None = None
+    traces_dir: str | None = None
 
 
 async def _create_headless_chromium(playwright: Playwright, **kwargs: dict) -> tuple[BrowserContext, BrowserArtifacts]:
@@ -180,3 +193,26 @@ class BrowserState:
             LOG.info("Stopping playwright")
             await self.pw.stop()
             LOG.info("Playwright is stopped")
+
+    async def take_screenshot(self, full_page: bool = False, file_path: str | None = None) -> bytes:
+        if not self.page:
+            LOG.error("BrowserState has no page")
+            raise MissingBrowserStatePage()
+        try:
+            if file_path:
+                return await self.page.screenshot(
+                    path=file_path,
+                    full_page=full_page,
+                    timeout=SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
+                )
+            return await self.page.screenshot(
+                full_page=full_page,
+                timeout=SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
+                animations="disabled",
+            )
+        except TimeoutError as e:
+            LOG.exception(f"Timeout error while taking screenshot: {str(e)}", exc_info=True)
+            raise FailedToTakeScreenshot(error_message=str(e)) from e
+        except Exception as e:
+            LOG.exception(f"Unknown error while taking screenshot: {str(e)}", exc_info=True)
+            raise FailedToTakeScreenshot(error_message=str(e)) from e
