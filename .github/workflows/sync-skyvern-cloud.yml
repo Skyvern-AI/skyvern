@@ -1,0 +1,34 @@
+name: Sync to skyvern-cloud
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@master
+      - name: Run GitHub File Sync
+        uses: BetaHuhn/repo-file-sync-action@v1
+        with:
+          GH_PAT: ${{ secrets.SKYVERN_CLOUD_GH_PAT }}
+      - uses: actions/checkout@master
+        with:
+          token: ${{ secrets.SKYVERN_CLOUD_GH_PAT }}
+          repository: Skyvern-AI/skyvern-cloud
+      - name: Create PR in skyvern-cloud
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.SKYVERN_CLOUD_GH_PAT }}
+          commit-message: Sync from open source skyvern
+          title: Sync from open source skyvern
+          branch: sync-oss
+          base: main
+          body: |
+            This PR was automatically created by the sync-skyvern-cloud.yml workflow.
+            It syncs the main branch of the skyvern repository to the main branch of the skyvern-cloud repository.
+            Please review and merge this PR if it looks good.
+          labels: sync
+          draft: false

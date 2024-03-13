@@ -1,0 +1,5 @@
+Skyvern-AI/skyvern-cloud@sync-oss:
+  - source: skyvern/
+    dest: skyvern/
+  - source: streamlit_app/
+    dest: streamlit_app/
