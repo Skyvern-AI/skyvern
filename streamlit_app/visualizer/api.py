@@ -3,9 +3,12 @@ from typing import Any
 
 import curlify
 import requests
+import structlog
 from requests import PreparedRequest
 
 from skyvern.forge.sdk.schemas.tasks import TaskRequest
+
+LOG = structlog.get_logger()
 
 
 class SkyvernClient:
@@ -28,6 +31,7 @@ class SkyvernClient:
 
         response = requests.post(url, headers=headers, data=json.dumps(payload))
         if "task_id" not in response.json():
+            LOG.info(f"Failed to create task: {response.text}")
             return None
         return response.json()["task_id"]
 
