@@ -170,7 +170,7 @@ async def scrape_web_unsafe(
     scroll_y_px = await scroll_to_top(page, drow_boxes=True)
     # Checking max number of screenshots to prevent infinite loop
     while scroll_y_px_old != scroll_y_px and len(screenshots) < SettingsManager.get_settings().MAX_NUM_SCREENSHOTS:
-        screenshot = await page.screenshot(full_page=False)
+        screenshot = await browser_state.take_screenshot(full_page=False)
         screenshots.append(screenshot)
         scroll_y_px_old = scroll_y_px
         LOG.info("Scrolling to next page", url=url, num_screenshots=len(screenshots))
@@ -348,9 +348,10 @@ def _build_element_links(elements: list[dict]) -> None:
         listbox_text = element["text"] if "text" in element else ""
 
         # WARNING: If a listbox has really little commont content (yes/no, etc.),
-        #   it might have conflict and will connect to wrong element. If so, code should be added to prevent that:
+        #   it might have conflict and will connect to wrong element
         # if len(listbox_text) < 10:
-        #     # do not support small listbox text as it's error proning. larger text match is more reliable
+        #     # do not support small listbox text for now as it's error proning. larger text match is more reliable
+        #     LOG.info("Skip because too short listbox text", listbox_text=listbox_text)
         #     continue
 
         for text, linked_elements in text_to_elements_map.items():
@@ -369,7 +370,6 @@ def _build_element_links(elements: list[dict]) -> None:
         for context, linked_elements in context_to_elements_map.items():
             if listbox_text in context:
                 for linked_element in linked_elements:
-                    # if _ensure_nearby_rects(element["rect"], linked_element["rect"]):
                     if linked_element["id"] != element["id"]:
                         LOG.info(
                             "Match listbox to target element context",

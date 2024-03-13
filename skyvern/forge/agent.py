@@ -25,10 +25,17 @@ from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.models import Organization, Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskStatus
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.workflow.context_manager import ContextManager
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import TaskBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun
-from skyvern.webeye.actions.actions import Action, ActionType, CompleteAction, WebAction, parse_actions
+from skyvern.webeye.actions.actions import (
+    Action,
+    ActionType,
+    CompleteAction,
+    UserDefinedError,
+    WebAction,
+    parse_actions,
+)
 from skyvern.webeye.actions.handler import ActionHandler
 from skyvern.webeye.actions.models import AgentStepOutput, DetailedAgentStepOutput
 from skyvern.webeye.actions.responses import ActionResult
@@ -40,6 +47,11 @@ LOG = structlog.get_logger()
 
 class ForgeAgent(Agent):
     def __init__(self) -> None:
+        if SettingsManager.get_settings().ADDITIONAL_MODULES:
+            for module in SettingsManager.get_settings().ADDITIONAL_MODULES:
+                LOG.info("Loading additional module", module=module)
+                __import__(module)
+            LOG.info("Additional modules loaded", modules=SettingsManager.get_settings().ADDITIONAL_MODULES)
         LOG.info(
             "Initializing ForgeAgent",
             env=SettingsManager.get_settings().ENV,
@@ -52,11 +64,6 @@ class ForgeAgent(Agent):
             long_running_task_warning_ratio=SettingsManager.get_settings().LONG_RUNNING_TASK_WARNING_RATIO,
             debug_mode=SettingsManager.get_settings().DEBUG_MODE,
         )
-        if SettingsManager.get_settings().ADDITIONAL_MODULES:
-            for module in SettingsManager.get_settings().ADDITIONAL_MODULES:
-                LOG.info("Loading additional module", module=module)
-                __import__(module)
-            LOG.info("Additional modules loaded", modules=SettingsManager.get_settings().ADDITIONAL_MODULES)
 
     async def validate_step_execution(
         self,
@@ -91,14 +98,14 @@ class ForgeAgent(Agent):
         task_block: TaskBlock,
         workflow: Workflow,
         workflow_run: WorkflowRun,
-        context_manager: ContextManager,
+        workflow_run_context: WorkflowRunContext,
         task_order: int,
         task_retry: int,
     ) -> tuple[Task, Step]:
         task_block_parameters = task_block.parameters
         navigation_payload = {}
         for parameter in task_block_parameters:
-            navigation_payload[parameter.key] = context_manager.get_value(parameter.key)
+            navigation_payload[parameter.key] = workflow_run_context.get_value(parameter.key)
 
         task_url = task_block.url
         if task_url is None:
@@ -114,6 +121,7 @@ class ForgeAgent(Agent):
 
         task = await app.DATABASE.create_task(
             url=task_url,
+            title=task_block.title,
             webhook_callback_url=None,
             navigation_goal=task_block.navigation_goal,
             data_extraction_goal=task_block.data_extraction_goal,
@@ -124,6 +132,7 @@ class ForgeAgent(Agent):
             workflow_run_id=workflow_run.workflow_run_id,
             order=task_order,
             retry=task_retry,
+            error_code_mapping=task_block.error_code_mapping,
         )
         LOG.info(
             "Created new task for workflow run",
@@ -131,8 +140,10 @@ class ForgeAgent(Agent):
             workflow_run_id=workflow_run.workflow_run_id,
             task_id=task.task_id,
             url=task.url,
+            title=task.title,
             nav_goal=task.navigation_goal,
             data_goal=task.data_extraction_goal,
+            error_code_mapping=task.error_code_mapping,
             proxy_location=task.proxy_location,
             task_order=task_order,
             task_retry=task_retry,
@@ -161,6 +172,7 @@ class ForgeAgent(Agent):
     async def create_task(self, task_request: TaskRequest, organization_id: str | None = None) -> Task:
         task = await app.DATABASE.create_task(
             url=task_request.url,
+            title=task_request.title,
             webhook_callback_url=task_request.webhook_callback_url,
             navigation_goal=task_request.navigation_goal,
             data_extraction_goal=task_request.data_extraction_goal,
@@ -168,10 +180,12 @@ class ForgeAgent(Agent):
             organization_id=organization_id,
             proxy_location=task_request.proxy_location,
             extracted_information_schema=task_request.extracted_information_schema,
+            error_code_mapping=task_request.error_code_mapping,
         )
         LOG.info(
             "Created new task",
             task_id=task.task_id,
+            title=task.title,
             url=task.url,
             nav_goal=task.navigation_goal,
             data_goal=task.data_extraction_goal,
@@ -195,7 +209,7 @@ class ForgeAgent(Agent):
             await self.validate_step_execution(task, step)
             step, browser_state, detailed_output = await self._initialize_execution_state(task, step, workflow_run)
             step, detailed_output = await self.agent_step(task, step, browser_state, organization=organization)
-            analytics.capture("skyvern-oss-agent-step-status", {"status": step.status})
+            task = await self.update_task_errors_from_detailed_output(task, detailed_output)
             retry = False
 
             # If the step failed, mark the step as failed and retry
@@ -466,7 +480,7 @@ class ForgeAgent(Agent):
         if not browser_state.page:
             raise BrowserStateMissingPage()
         try:
-            screenshot = await browser_state.page.screenshot(full_page=True)
+            screenshot = await browser_state.take_screenshot(full_page=True)
             await app.ARTIFACT_MANAGER.create_artifact(
                 step=step,
                 artifact_type=ArtifactType.SCREENSHOT_ACTION,
@@ -582,6 +596,7 @@ class ForgeAgent(Agent):
             elements=scraped_page.element_tree_trimmed,  # scraped_page.element_tree,
             data_extraction_goal=task.data_extraction_goal,
             action_history=action_results_str,
+            error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else None,
             utc_datetime=datetime.utcnow(),
         )
 
@@ -686,9 +701,9 @@ class ForgeAgent(Agent):
         analytics.capture("skyvern-oss-agent-task-status", {"status": task.status})
         # Take one last screenshot and create an artifact before closing the browser to see the final state
         browser_state: BrowserState = await app.BROWSER_MANAGER.get_or_create_for_task(task)
-        page = await browser_state.get_or_create_page()
+        await browser_state.get_or_create_page()
         try:
-            screenshot = await page.screenshot(full_page=True)
+            screenshot = await browser_state.take_screenshot(full_page=True)
             await app.ARTIFACT_MANAGER.create_artifact(
                 step=last_step,
                 artifact_type=ArtifactType.SCREENSHOT_FINAL,
@@ -828,6 +843,14 @@ class ForgeAgent(Agent):
                     step=last_step,
                     artifact_type=ArtifactType.HAR,
                     data=har_data,
+                )
+
+            if browser_state.browser_context and browser_state.browser_artifacts.traces_dir:
+                trace_path = f"{browser_state.browser_artifacts.traces_dir}/{task.task_id}.zip"
+                await app.ARTIFACT_MANAGER.create_artifact(
+                    step=last_step,
+                    artifact_type=ArtifactType.TRACE,
+                    path=trace_path,
                 )
         else:
             LOG.warning(
@@ -1010,3 +1033,25 @@ class ForgeAgent(Agent):
                     warning_ratio=SettingsManager.get_settings().LONG_RUNNING_TASK_WARNING_RATIO,
                 )
             return None, None, next_step
+
+    @staticmethod
+    async def get_task_errors(task: Task) -> list[UserDefinedError]:
+        steps = await app.DATABASE.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
+        errors = []
+        for step in steps:
+            if step.output and step.output.errors:
+                errors.extend(step.output.errors)
+
+        return errors
+
+    @staticmethod
+    async def update_task_errors_from_detailed_output(
+        task: Task, detailed_step_output: DetailedAgentStepOutput
+    ) -> Task:
+        task_errors = task.errors
+        step_errors = detailed_step_output.extract_errors() or []
+        task_errors.extend([error.model_dump() for error in step_errors])
+
+        return await app.DATABASE.update_task(
+            task_id=task.task_id, organization_id=task.organization_id, errors=task_errors
+        )

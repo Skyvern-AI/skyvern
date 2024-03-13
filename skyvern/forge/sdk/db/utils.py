@@ -48,6 +48,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False) -> Task:
         status=TaskStatus(task_obj.status),
         created_at=task_obj.created_at,
         modified_at=task_obj.modified_at,
+        title=task_obj.title,
         url=task_obj.url,
         webhook_callback_url=task_obj.webhook_callback_url,
         navigation_goal=task_obj.navigation_goal,
@@ -61,6 +62,8 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False) -> Task:
         workflow_run_id=task_obj.workflow_run_id,
         order=task_obj.order,
         retry=task_obj.retry,
+        error_code_mapping=task_obj.error_code_mapping,
+        errors=task_obj.errors,
     )
     return task
 

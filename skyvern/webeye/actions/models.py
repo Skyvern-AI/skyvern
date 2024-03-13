@@ -5,7 +5,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.webeye.actions.actions import Action, ActionTypeUnion
+from skyvern.webeye.actions.actions import Action, ActionTypeUnion, DecisiveAction, UserDefinedError
 from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.scraper.scraper import ScrapedPage
 
@@ -19,6 +19,7 @@ class AgentStepOutput(BaseModel):
     action_results: list[ActionResult] | None = None
     # Nullable for backwards compatibility, once backfill is done, this won't be nullable anymore
     actions_and_results: list[tuple[ActionTypeUnion, list[ActionResult]]] | None = None
+    errors: list[UserDefinedError] = []
 
     def __repr__(self) -> str:
         return f"AgentStepOutput({self.model_dump()})"
@@ -51,8 +52,17 @@ class DetailedAgentStepOutput(BaseModel):
     def __str__(self) -> str:
         return self.__repr__()
 
+    def extract_errors(self) -> list[UserDefinedError]:
+        errors = []
+        if self.actions_and_results:
+            for action, action_results in self.actions_and_results:
+                if isinstance(action, DecisiveAction):
+                    errors.extend(action.errors)
+        return errors
+
     def to_agent_step_output(self) -> AgentStepOutput:
         return AgentStepOutput(
             action_results=self.action_results if self.action_results else [],
             actions_and_results=self.actions_and_results if self.actions_and_results else [],
+            errors=self.extract_errors(),
         )

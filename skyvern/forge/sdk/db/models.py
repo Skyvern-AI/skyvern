@@ -29,6 +29,7 @@ class TaskModel(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
     status = Column(String)
     webhook_callback_url = Column(String)
+    title = Column(String)
     url = Column(String)
     navigation_goal = Column(String)
     data_extraction_goal = Column(String)
@@ -40,6 +41,8 @@ class TaskModel(Base):
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"))
     order = Column(Integer, nullable=True)
     retry = Column(Integer, nullable=True)
+    error_code_mapping = Column(JSON, nullable=True)
+    errors = Column(JSON, default=[], nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
