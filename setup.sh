@@ -134,7 +134,7 @@ create_organization() {
 main() {
     initialize_env_file
     choose_python_version_or_fail
-    deactivate_and_remove_poetry_env
+    remove_poetry_env
     install_dependencies
     setup_postgresql
     activate_poetry_env
