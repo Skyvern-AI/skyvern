@@ -188,4 +188,4 @@ class FailedToTakeScreenshot(SkyvernException):
 
 class WorkflowRunContextNotInitialized(SkyvernException):
     def __init__(self, workflow_run_id: str) -> None:
-        super().__init__("WorkflowRunContext not initialized for workflow run {workflow_run_id}")
+        super().__init__(f"WorkflowRunContext not initialized for workflow run {workflow_run_id}")
