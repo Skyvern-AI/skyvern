@@ -72,6 +72,8 @@ Skyvern Cloud is currently in private beta. If you're interested in using Skyver
 This quickstart guide will walk you through getting Skyvern up and running on your local machine. 
 
 ## Prerequisites
+
+### :warning: :warning: MAKE SURE YOU ARE USING PYTHON 3.11 :warning: :warning:
 Before you begin, make sure you have the following installed:
 
 - [Brew (if you're on a Mac)](https://brew.sh/)
