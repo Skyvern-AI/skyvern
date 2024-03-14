@@ -46,14 +46,10 @@ initialize_env_file() {
 }
 
 # Function to remove Poetry environment
-deactivate_and_remove_poetry_env() {
+remove_poetry_env() {
     local env_path
     env_path=$(poetry env info --path)
     if [ -d "$env_path" ]; then
-        # deactivate the environment if it is active
-        if [ -n "$VIRTUAL_ENV" ]; then
-            deactivate
-        fi
         rm -rf "$env_path"
         echo "Removed the poetry environment at $env_path."
     else
@@ -63,8 +59,9 @@ deactivate_and_remove_poetry_env() {
 
 # Choose python version
 choose_python_version_or_fail() {
-  poetry env use python3.11 || echo "Error: Python 3.11 is not installed."; exit 1
+  poetry env use python3.11 || { echo "Error: Python 3.11 is not installed."; exit 1; }
 }
+
 
 # Function to install dependencies
 install_dependencies() {
