@@ -146,7 +146,7 @@ class UnexpectedTaskStatus(SkyvernException):
 
 class InvalidWorkflowTaskURLState(SkyvernException):
     def __init__(self, workflow_run_id: str) -> None:
-        super().__init__(f"No Valid URL found in the first task")
+        super().__init__(f"No Valid URL found in the first task of workflow run {workflow_run_id}")
 
 
 class DisabledFeature(SkyvernException):
