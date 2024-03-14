@@ -3,3 +3,7 @@ Skyvern-AI/skyvern-cloud:
     dest: skyvern/
   - source: streamlit_app/
     dest: streamlit_app/
+  - source: pyproject.toml
+    dest: pyproject.toml
+  - source: poetry.lock
+    dest: poetry.lock
