@@ -46,6 +46,8 @@ plotly = "^5.18.0"
 clipboard = "^0.0.4"
 curlify = "^2.2.1"
 typer = "^0.9.0"
+types-toml = "^0.10.8.7"
+apscheduler = "^3.10.4"
 
 
 [tool.poetry.group.dev.dependencies]
