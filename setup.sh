@@ -57,9 +57,14 @@ remove_poetry_env() {
     fi
 }
 
+# Choose python version
+choose_python_version_or_fail() {
+  poetry env use python3.11 || { echo "Error: Python 3.11 is not installed."; exit 1; }
+}
+
+
 # Function to install dependencies
 install_dependencies() {
-    poetry env use python3.11
     poetry install
 }
 
@@ -128,6 +133,7 @@ create_organization() {
 # Main function
 main() {
     initialize_env_file
+    choose_python_version_or_fail
     remove_poetry_env
     install_dependencies
     setup_postgresql
