@@ -96,8 +96,8 @@ async def create_agent_task(
         LOG.info("Overriding max steps per run", max_steps_override=x_max_steps_override)
     await AsyncExecutorFactory.get_executor().execute_task(
         background_tasks=background_tasks,
-        task=created_task,
-        organization=current_org,
+        task_id=created_task.task_id,
+        organization_id=current_org.organization_id,
         max_steps_override=x_max_steps_override,
         api_key=x_api_key,
     )
@@ -422,7 +422,7 @@ async def execute_workflow(
         LOG.info("Overriding max steps per run", max_steps_override=x_max_steps_override)
     await AsyncExecutorFactory.get_executor().execute_workflow(
         background_tasks=background_tasks,
-        organization=current_org,
+        organization_id=current_org.organization_id,
         workflow_id=workflow_id,
         workflow_run_id=workflow_run.workflow_run_id,
         max_steps_override=x_max_steps_override,
