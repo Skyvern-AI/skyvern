@@ -5,7 +5,7 @@ class SkyvernException(Exception):
 
 
 class NoAvailableOpenAIClients(SkyvernException):
-    def __init__(self, message: str | None = None):
+    def __init__(self) -> None:
         super().__init__("No available OpenAI API clients found.")
 
 
