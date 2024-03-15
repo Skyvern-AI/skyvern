@@ -27,6 +27,6 @@ jobs:
         uses: Skyvern-AI/repo-file-sync-action@main
         with:
           GH_PAT: ${{ secrets.SKYVERN_CLOUD_GH_PAT }}
-          BRANCH_NAME: ${{ steps.pr_details.outputs.BRANCH_NAME }}
+          BRANCH_NAME: repo-sync/${{ steps.pr_details.outputs.BRANCH_NAME }}
           PR_BODY: ${{ steps.pr_details.outputs.PR_BODY }}
           PR_TITLE: ${{ steps.pr_details.outputs.PR_TITLE }}
