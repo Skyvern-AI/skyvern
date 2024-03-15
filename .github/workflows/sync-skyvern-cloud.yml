@@ -10,7 +10,23 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@master
+      - name: Fetch PR details
+        id: pr_details
+        run: |
+          PR_NUMBER=$(gh pr list --state merged --base main --limit 1 --json number --jq .[0].number)
+          echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_OUTPUT
+          BRANCH_NAME=$(gh pr view $PR_NUMBER --json headRefName --jq .headRefName)
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          PR_BODY=$(gh pr view $PR_NUMBER --json body --jq .body)
+          echo "PR_BODY=$PR_BODY" >> $GITHUB_OUTPUT
+          PR_TITLE=$(gh pr view $PR_NUMBER --json title --jq .title)
+          echo "PR_TITLE=$PR_TITLE" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Run GitHub File Sync
-        uses: BetaHuhn/repo-file-sync-action@v1
+        uses: Skyvern-AI/repo-file-sync-action@main
         with:
           GH_PAT: ${{ secrets.SKYVERN_CLOUD_GH_PAT }}
+          BRANCH_NAME: ${{ steps.pr_details.outputs.BRANCH_NAME }}
+          PR_BODY: ${{ steps.pr_details.outputs.PR_BODY }}
+          PR_TITLE: ${{ steps.pr_details.outputs.PR_TITLE }}
