@@ -80,25 +80,56 @@ install_dependencies_after_poetry_env() {
 # Function to setup PostgreSQL
 setup_postgresql() {
     echo "Installing postgresql using brew"
-    if ! command_exists psql; then
-        echo "`postgresql` is not installed."
-        if [[ "$OSTYPE" != "darwin"* ]]; then
-            echo "Error: Please install postgresql and start the service manually and re-run the script." >&2
-            exit 1
-        fi
-        if ! command_exists brew; then
-            echo "Error: brew is not installed, please install homebrew and re-run the script or install postgresql manually." >&2
-            exit 1
-        fi
-        brew install postgresql@14
-    fi
-    brew services start postgresql@14
 
-    if psql skyvern -U skyvern -c '\q'; then
-        echo "Connection successful. Database and user exist."
+    # Attempt to connect to the default PostgreSQL service if it's already running via psql
+    if command_exists psql; then
+        if pg_isready; then
+            echo "PostgreSQL is already running locally."
+            # Assuming the local PostgreSQL setup is ready for use
+            if psql skyvern -U skyvern -c '\q'; then
+                echo "Connection successful. Database and user exist."
+            else
+                createuser skyvern
+                createdb skyvern -O skyvern
+                echo "Database and user created successfully."
+            fi
+            return 0
+        fi
+    fi
+    
+    # Check if Docker is installed and running
+    if ! command_exists docker || ! docker info > /dev/null 2>&1; then
+        echo "Docker is not running or not installed. Please install or start Docker and try again."
+        exit 1
+    fi
+
+    # Check if PostgreSQL is already running in a Docker container
+    if docker ps | grep -q postgresql-container; then
+        echo "PostgreSQL is already running in a Docker container."
+    else 
+        # Attempt to install and start PostgreSQL using Docker
+        echo "Attempting to install PostgreSQL via Docker..."
+        docker run --name postgresql-container -e POSTGRES_HOST_AUTH_METHOD=trust -d -p 5432:5432 postgres:14
+        echo "PostgreSQL has been installed and started using Docker."
+
+        # Wait for PostgreSQL to start
+        echo "Waiting for PostgreSQL to start..."
+        sleep 20  # Adjust sleep time as necessary
+    fi
+
+    # Assuming docker exec works directly since we've checked Docker's status before
+    if docker exec postgresql-container psql -U postgres -c "\du" | grep -q skyvern; then
+        echo "Database user exists."
     else
-        createuser skyvern
-        createdb skyvern -O skyvern
+        echo "Creating database user..."
+        docker exec postgresql-container createuser -U postgres skyvern
+    fi
+
+    if docker exec postgresql-container psql -U postgres -lqt | cut -d \| -f 1 | grep -qw skyvern; then
+        echo "Database exists."
+    else
+        echo "Creating database..."
+        docker exec postgresql-container createdb -U postgres skyvern -O skyvern
         echo "Database and user created successfully."
     fi
 }
