@@ -63,7 +63,7 @@ https://github.com/Skyvern-AI/skyvern/assets/3853670/4fd87a66-39a1-4c3b-b9ac-64c
 
 
 # Skyvern Cloud
-We offer a managed cloud version of Skyvern that allows you to run Skyvern without having to manage the infrastructure. It allows to you run multiple Skyvern instances in parallel to automate your workflows at scale. In addition, Skyvern cloud comes bundled with a anti-bot detection mechanisms, proxy network, and CAPTCHA solving to allow you to complete more complicated workflows.
+We offer a managed cloud version of Skyvern that allows you to run Skyvern without having to manage the infrastructure. It allows to you run multiple Skyvern instances in parallel to automate your workflows at scale. In addition, Skyvern cloud comes bundled with an anti-bot detection mechanisms, proxy network, and CAPTCHA solving to allow you to complete more complicated workflows.
 
 Skyvern Cloud is currently in private beta. If you're interested in using Skyvern Cloud, please reach out to us [via email](mailto:suchintan@skyvern.com) 
 
