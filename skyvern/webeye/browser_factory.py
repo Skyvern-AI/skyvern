@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import uuid
 from datetime import datetime
@@ -164,10 +165,12 @@ class BrowserState:
         if self.page is None:
             LOG.info("Creating a new page")
             self.page = await self.browser_context.new_page()
+
             await self._close_all_other_pages()
             LOG.info("A new page is created")
             if url:
-                LOG.info(f"Navigating page to {url} and waiting for 5 seconds")
+                LOG.info(f"Navigating page to {url} and waiting for 3 seconds")
+                await asyncio.sleep(3)
                 try:
                     await self.page.goto(url)
                 except Error as playright_error:
