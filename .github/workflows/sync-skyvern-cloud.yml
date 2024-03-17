@@ -18,7 +18,8 @@ jobs:
           BRANCH_NAME=$(gh pr view $PR_NUMBER --json headRefName --jq .headRefName)
           echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_OUTPUT
           PR_BODY=$(gh pr view $PR_NUMBER --json body --jq .body)
-          echo "PR_BODY=$PR_BODY" >> $GITHUB_OUTPUT
+          PR_BODY_ESCAPED=$(echo "$PR_BODY" | jq -aRs .)
+          echo "PR_BODY=$PR_BODY_ESCAPED" >> $GITHUB_OUTPUT
           PR_TITLE=$(gh pr view $PR_NUMBER --json title --jq .title)
           echo "PR_TITLE=$PR_TITLE" >> $GITHUB_OUTPUT
         env:
