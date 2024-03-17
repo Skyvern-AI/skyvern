@@ -7,6 +7,11 @@ log_event() {
     fi
 }
 
+fail() {
+  read -rp "Press enter to continue"
+  exit 1
+}
+
 # Function to check if a command exists
 command_exists() {
     command -v "$1" &> /dev/null
@@ -16,7 +21,7 @@ command_exists() {
 for cmd in poetry python3.11; do
     if ! command_exists "$cmd"; then
         echo "Error: $cmd is not installed." >&2
-        exit 1
+        fail
     fi
 done
 
@@ -152,7 +157,7 @@ remove_poetry_env() {
 
 # Choose python version
 choose_python_version_or_fail() {
-  poetry env use python3.11 || { echo "Error: Python 3.11 is not installed."; exit 1; }
+  poetry env use python3.11 || { echo "Error: Python 3.11 is not installed."; fail; }
 }
 
 
@@ -193,7 +198,7 @@ setup_postgresql() {
     # Check if Docker is installed and running
     if ! command_exists docker || ! docker info > /dev/null 2>&1; then
         echo "Docker is not running or not installed. Please install or start Docker and try again."
-        exit 1
+        fail
     fi
 
     # Check if PostgreSQL is already running in a Docker container
