@@ -3,7 +3,7 @@
 # Call function to send telemetry event
 log_event() {
     if [ -n $1 ]; then
-        python skyvern/analytics.py $1
+        poetry run python skyvern/analytics.py $1
     fi
 }
 
@@ -237,7 +237,7 @@ run_alembic_upgrade() {
 create_organization() {
     echo "Creating organization and API token..."
     local org_output api_token
-    org_output=$(python scripts/create_organization.py Skyvern-Open-Source)
+    org_output=$(poetry run python scripts/create_organization.py Skyvern-Open-Source)
     api_token=$(echo "$org_output" | awk '/token=/{gsub(/.*token='\''|'\''.*/, ""); print}')
 
     # Ensure .streamlit directory exists
