@@ -20,28 +20,98 @@ for cmd in poetry python3.11; do
     fi
 done
 
+# Function to update or add environment variable in .env file
+update_or_add_env_var() {
+    local key=$1
+    local value=$2
+    if grep -q "^$key=" .env; then
+        # Update existing variable
+        sed -i.bak "s/^$key=.*/$key=$value/" .env && rm -f .env.bak
+    else
+        # Add new variable
+        echo "$key=$value" >> .env
+    fi
+}
+
+# Function to set up LLM provider environment variables
+setup_llm_providers() {
+    echo "Configuring Large Language Model (LLM) Providers..."
+    echo "Note: All information provided here will be stored only on your local machine."
+
+    # OpenAI Configuration
+    echo "To enable OpenAI, you must have an OpenAI API key."
+    read -p "Do you want to enable OpenAI (y/n)? " enable_openai
+    if [[ "$enable_openai" == "y" ]]; then
+        read -p "Enter your OpenAI API key: " openai_api_key
+        update_or_add_env_var "OPENAI_API_KEY" "$openai_api_key"
+        update_or_add_env_var "ENABLE_OPENAI" "true"
+    else
+        update_or_add_env_var "ENABLE_OPENAI" "false"
+    fi
+
+    # Anthropic Configuration
+    echo "To enable Anthropic, you must have an Anthropic API key."
+    read -p "Do you want to enable Anthropic (y/n)? " enable_anthropic
+    if [[ "$enable_anthropic" == "y" ]]; then
+        read -p "Enter your Anthropic API key: " anthropic_api_key
+        if [ -z "$anthropic_api_key" ]; then
+            echo "Error: Anthropic API key is required."
+            echo "Anthropic will not be enabled."
+        else
+            update_or_add_env_var "ANTHROPIC_API_KEY" "$anthropic_api_key"
+            update_or_add_env_var "ENABLE_ANTHROPIC" "true"
+        fi
+    else
+        update_or_add_env_var "ENABLE_ANTHROPIC" "false"
+    fi
+
+    # Azure Configuration
+    echo "To enable Azure, you must have an Azure deployment name, API key, base URL, and API version."
+    read -p "Do you want to enable Azure (y/n)? " enable_azure
+    if [[ "$enable_azure" == "y" ]]; then
+        read -p "Enter your Azure deployment name: " azure_deployment
+        read -p "Enter your Azure API key: " azure_api_key
+        read -p "Enter your Azure API base URL: " azure_api_base
+        read -p "Enter your Azure API version: " azure_api_version
+        if [ -z "$azure_deployment" ] || [ -z "$azure_api_key" ] || [ -z "$azure_api_base" ] || [ -z "$azure_api_version" ]; then
+            echo "Error: All Azure fields must be populated."
+            echo "Azure will not be enabled."
+        else
+            update_or_add_env_var "AZURE_DEPLOYMENT" "$azure_deployment"
+            update_or_add_env_var "AZURE_API_KEY" "$azure_api_key"
+            update_or_add_env_var "AZURE_API_BASE" "$azure_api_base"
+            update_or_add_env_var "AZURE_API_VERSION" "$azure_api_version"
+            update_or_add_env_var "ENABLE_AZURE" "true"
+        fi
+    else
+        update_or_add_env_var "ENABLE_AZURE" "false"
+    fi
+
+    echo "LLM provider configurations updated in .env."
+}
+
+
 # Function to initialize .env file
 initialize_env_file() {
     if [ -f ".env" ]; then
         echo ".env file already exists, skipping initialization."
+        read -p "Do you want to go through LLM provider setup again (y/n)? " redo_llm_setup
+        if [[ "$redo_llm_setup" == "y" ]]; then
+            setup_llm_providers
+        fi
         return
     fi
 
     echo "Initializing .env file..."
     cp .env.example .env
-
-    # Ask for OpenAI API key
-    read -p "Please enter your OpenAI API key for GPT4V (this will be stored only in your local .env file): " openai_api_key
-    awk -v key="$openai_api_key" '{gsub(/OPENAI_API_KEYS=\["abc","def","ghi"\]/, "OPENAI_API_KEYS=[\"" key "\"]"); print}' .env > .env.tmp && mv .env.tmp .env
-
+    setup_llm_providers
 
     # Ask for email or generate UUID
     read -p "Please enter your email for analytics (press enter to skip): " analytics_id
     if [ -z "$analytics_id" ]; then
         analytics_id=$(uuidgen)
     fi
-    awk -v id="$analytics_id" '{gsub(/ANALYTICS_ID="anonymous"/, "ANALYTICS_ID=\"" id "\""); print}' .env > .env.tmp && mv .env.tmp .env
-
+    update_or_add_env_var "ANALYTICS_ID" "$analytics_id"
     echo ".env file has been initialized."
 }
 
