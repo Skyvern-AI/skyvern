@@ -7,7 +7,6 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 from skyvern.exceptions import WorkflowParameterNotFound
-from skyvern.forge.sdk.api.chat_completion_price import ChatCompletionPrice
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -264,7 +263,7 @@ class AgentDB:
         is_last: bool | None = None,
         retry_index: int | None = None,
         organization_id: str | None = None,
-        chat_completion_price: ChatCompletionPrice | None = None,
+        incremental_cost: float | None = None,
     ) -> Step:
         try:
             with self.Session() as session:
@@ -283,18 +282,8 @@ class AgentDB:
                         step.is_last = is_last
                     if retry_index is not None:
                         step.retry_index = retry_index
-                    if chat_completion_price is not None:
-                        if step.input_token_count is None:
-                            step.input_token_count = 0
-
-                        if step.output_token_count is None:
-                            step.output_token_count = 0
-
-                        step.input_token_count += chat_completion_price.input_token_count
-                        step.output_token_count += chat_completion_price.output_token_count
-                        step.step_cost = chat_completion_price.openai_model_to_price_lambda(
-                            step.input_token_count, step.output_token_count
-                        )
+                    if incremental_cost is not None:
+                        step.step_cost = incremental_cost + float(step.step_cost or 0)
 
                     session.commit()
                     updated_step = await self.get_step(task_id, step_id, organization_id)
