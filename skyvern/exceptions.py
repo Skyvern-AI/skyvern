@@ -4,19 +4,9 @@ class SkyvernException(Exception):
         super().__init__(message)
 
 
-class NoAvailableOpenAIClients(SkyvernException):
-    def __init__(self) -> None:
-        super().__init__("No available OpenAI API clients found.")
-
-
 class InvalidOpenAIResponseFormat(SkyvernException):
     def __init__(self, message: str | None = None):
         super().__init__(f"Invalid response format: {message}")
-
-
-class OpenAIRequestTooBigError(SkyvernException):
-    def __init__(self, message: str | None = None):
-        super().__init__(f"OpenAI request 429 error: {message}")
 
 
 class FailedToSendWebhook(SkyvernException):

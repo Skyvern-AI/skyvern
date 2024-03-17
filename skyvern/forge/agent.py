@@ -332,9 +332,9 @@ class ForgeAgent(Agent):
             json_response = None
             actions: list[Action]
             if task.navigation_goal:
-                json_response = await app.OPENAI_CLIENT.chat_completion(
-                    step=step,
+                json_response = await app.LLM_API_HANDLER(
                     prompt=extract_action_prompt,
+                    step=step,
                     screenshots=scraped_page.screenshots,
                 )
                 detailed_agent_step_output.llm_response = json_response

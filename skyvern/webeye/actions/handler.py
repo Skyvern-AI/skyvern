@@ -573,9 +573,9 @@ async def extract_information_for_navigation_goal(
         error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else None,
     )
 
-    json_response = await app.OPENAI_CLIENT.chat_completion(
-        step=step,
+    json_response = await app.LLM_API_HANDLER(
         prompt=extract_information_prompt,
+        step=step,
         screenshots=scraped_page.screenshots,
     )
 

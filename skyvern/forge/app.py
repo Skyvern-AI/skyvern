@@ -2,7 +2,7 @@ from ddtrace import tracer
 from ddtrace.filters import FilterRequestsOnUrl
 
 from skyvern.forge.agent import ForgeAgent
-from skyvern.forge.sdk.api.open_ai import OpenAIClientManager
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.storage.factory import StorageFactory
 from skyvern.forge.sdk.db.client import AgentDB
@@ -28,7 +28,7 @@ DATABASE = AgentDB(
 STORAGE = StorageFactory.get_storage()
 ARTIFACT_MANAGER = ArtifactManager()
 BROWSER_MANAGER = BrowserManager()
-OPENAI_CLIENT = OpenAIClientManager()
+LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(SettingsManager.get_settings().LLM_KEY)
 WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
 WORKFLOW_SERVICE = WorkflowService()
 agent = ForgeAgent()

@@ -24,7 +24,6 @@ class Settings(BaseSettings):
     DATABASE_STRING: str = "postgresql+psycopg://skyvern@localhost/skyvern"
     PROMPT_ACTION_HISTORY_WINDOW: int = 5
 
-    OPENAI_API_KEYS: list[str] = []
     ENV: str = "local"
     EXECUTE_ALL_STEPS: bool = True
     JSON_LOGGING: bool = False
@@ -47,6 +46,28 @@ class Settings(BaseSettings):
     # browser settings
     BROWSER_LOCALE: str = "en-US"
     BROWSER_TIMEZONE: str = "America/New_York"
+
+    #####################
+    # LLM Configuration #
+    #####################
+    # ACTIVE LLM PROVIDER
+    LLM_KEY: str = "OPENAI_GPT4V"
+    # COMMON
+    LLM_CONFIG_MAX_TOKENS: int = 4096
+    LLM_CONFIG_TEMPERATURE: float = 0
+    # LLM PROVIDER SPECIFIC
+    ENABLE_OPENAI: bool = True
+    ENABLE_ANTHROPIC: bool = False
+    ENABLE_AZURE: bool = False
+    # OPENAI
+    OPENAI_API_KEY: str | None = None
+    # ANTHROPIC
+    ANTHROPIC_API_KEY: str | None = None
+    # AZURE
+    AZURE_DEPLOYMENT: str | None = None
+    AZURE_API_KEY: str | None = None
+    AZURE_API_BASE: str | None = None
+    AZURE_API_VERSION: str | None = None
 
     def is_cloud_environment(self) -> bool:
         """
