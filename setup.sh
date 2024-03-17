@@ -37,14 +37,21 @@ update_or_add_env_var() {
 setup_llm_providers() {
     echo "Configuring Large Language Model (LLM) Providers..."
     echo "Note: All information provided here will be stored only on your local machine."
+    local model_options=()
 
     # OpenAI Configuration
     echo "To enable OpenAI, you must have an OpenAI API key."
     read -p "Do you want to enable OpenAI (y/n)? " enable_openai
     if [[ "$enable_openai" == "y" ]]; then
         read -p "Enter your OpenAI API key: " openai_api_key
-        update_or_add_env_var "OPENAI_API_KEY" "$openai_api_key"
-        update_or_add_env_var "ENABLE_OPENAI" "true"
+        if [ -z "$openai_api_key" ]; then
+            echo "Error: OpenAI API key is required."
+            echo "OpenAI will not be enabled."
+        else
+            update_or_add_env_var "OPENAI_API_KEY" "$openai_api_key"
+            update_or_add_env_var "ENABLE_OPENAI" "true"
+            model_options+=("OPENAI_GPT4_TURBO" "OPENAI_GPT4V")
+        fi
     else
         update_or_add_env_var "ENABLE_OPENAI" "false"
     fi
@@ -60,6 +67,7 @@ setup_llm_providers() {
         else
             update_or_add_env_var "ANTHROPIC_API_KEY" "$anthropic_api_key"
             update_or_add_env_var "ENABLE_ANTHROPIC" "true"
+            model_options+=("ANTHROPIC_CLAUDE3")
         fi
     else
         update_or_add_env_var "ENABLE_ANTHROPIC" "false"
@@ -82,9 +90,24 @@ setup_llm_providers() {
             update_or_add_env_var "AZURE_API_BASE" "$azure_api_base"
             update_or_add_env_var "AZURE_API_VERSION" "$azure_api_version"
             update_or_add_env_var "ENABLE_AZURE" "true"
+            model_options+=("AZURE_OPENAI_GPT4V")
         fi
     else
         update_or_add_env_var "ENABLE_AZURE" "false"
+    fi
+
+    # Model Selection
+    if [ ${#model_options[@]} -eq 0 ]; then
+        echo "No LLM providers enabled. You won't be able to run Skyvern unless you enable at least one provider. You can re-run this script to enable providers or manually update the .env file."
+    else
+        echo "Available LLM models based on your selections:"
+        for i in "${!model_options[@]}"; do
+            echo "$((i+1)). ${model_options[$i]}"
+        done
+        read -p "Choose a model by number (e.g., 1 for ${model_options[0]}): " model_choice
+        chosen_model=${model_options[$((model_choice-1))]}
+        echo "Chosen LLM Model: $chosen_model"
+        update_or_add_env_var "LLM_MODEL" "$chosen_model"
     fi
 
     echo "LLM provider configurations updated in .env."
