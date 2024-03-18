@@ -136,7 +136,7 @@ setup_llm_providers() {
         read -p "Choose a model by number (e.g., 1 for ${model_options[0]}): " model_choice
         chosen_model=${model_options[$((model_choice-1))]}
         echo "Chosen LLM Model: $chosen_model"
-        if ! update_or_add_env_var "LLM_MODEL" "$chosen_model"; then
+        if ! update_or_add_env_var "LLM_KEY" "$chosen_model"; then
             failed=true
         fi
     fi
