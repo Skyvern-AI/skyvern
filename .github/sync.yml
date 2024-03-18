@@ -7,3 +7,13 @@ Skyvern-AI/skyvern-cloud:
     dest: pyproject.toml
   - source: poetry.lock
     dest: poetry.lock
+  - source: setup.sh
+    dest: setup.sh
+  - source: .env.example
+    dest: .env.example
+  - source: run_ui.sh
+    dest: run_ui.sh
+  - source: run_skyvern.sh
+    dest: run_skyvern.sh
+  - source: run_alembic_check.sh
+    dest: run_alembic_check.sh
