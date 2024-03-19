@@ -1,6 +1,6 @@
-## Skyvern Frontend
+# Skyvern Frontend
 
-# Development
+## Development
 
 ```sh
 npm run dev
@@ -8,7 +8,7 @@ npm run dev
 
 This will start the development server with hot module replacement.
 
-# Build for production
+## Build for production
 
 ```sh
 npm run build
@@ -16,7 +16,7 @@ npm run build
 
 This will make a production build in the `dist` directory, ready to be served.
 
-# Preview the production build locally
+## Preview the production build locally
 
 ```sh
 npm run preview
