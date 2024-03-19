@@ -11,6 +11,7 @@ from playwright._impl._errors import TimeoutError
 from playwright.async_api import BrowserContext, Error, Page, Playwright, async_playwright
 from pydantic import BaseModel
 
+from skyvern.config import settings
 from skyvern.exceptions import (
     FailedToNavigateToUrl,
     FailedToTakeScreenshot,
@@ -61,7 +62,7 @@ class BrowserContextFactory:
             ],
             "record_har_path": har_dir,
             "record_video_dir": video_dir,
-            "viewport": {"width": 1920, "height": 1080},
+            "viewport": {"width": settings.BROWSER_WIDTH, "height": settings.BROWSER_HEIGHT},
         }
 
     @staticmethod
