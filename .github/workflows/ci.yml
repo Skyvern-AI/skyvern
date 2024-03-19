@@ -92,3 +92,26 @@ jobs:
 
       # Finally, run pre-commit.
       - uses: pre-commit/action@v3.0.0
+  
+  fe-lint-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./skyvern-frontend
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Run linter
+        run: npm run lint
+      
+      - name: Run build
+        run: npm run build
