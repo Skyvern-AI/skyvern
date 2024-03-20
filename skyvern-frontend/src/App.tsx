@@ -3,7 +3,7 @@ import { ThemeProvider } from "@/components/ThemeProvider";
 
 function App() {
   return (
-    <ThemeProvider defaultTheme="dark" storageKey="vite-ui-theme">
+    <ThemeProvider defaultTheme="dark" storageKey="skyvern-theme">
       <Button variant={"destructive"}>Hello Shadcn button!</Button>
     </ThemeProvider>
   );
