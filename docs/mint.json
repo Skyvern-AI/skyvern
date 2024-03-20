@@ -1,11 +1,11 @@
 {
   "$schema": "https://mintlify.com/schema.json",
-  "name": "Starter Kit",
+  "name": "Skyvern",
   "logo": {
-    "dark": "/logo/dark.svg",
-    "light": "/logo/light.svg"
+    "dark": "/images/skyvern_logo.png",
+    "light": "/images/skyvern_logo_blackbg.png"
   },
-  "favicon": "/favicon.svg",
+  "favicon": "/images/skyvern_favicon.png",
   "colors": {
     "primary": "#0D9373",
     "light": "#07C983",
@@ -17,35 +17,29 @@
   },
   "topbarLinks": [
     {
-      "name": "Support",
-      "url": "mailto:hi@mintlify.com"
+      "name": "Discord",
+      "url": "https://skyvern.com/pricing"
     }
   ],
   "topbarCtaButton": {
-    "name": "Dashboard",
-    "url": "https://dashboard.mintlify.com"
+    "name": "Github",
+    "url": "https://github.com/Skyvern-AI/Skyvern/"
   },
-  "tabs": [
-    {
-      "name": "API Reference",
-      "url": "api-reference"
-    }
-  ],
   "anchors": [
     {
       "name": "Documentation",
       "icon": "book-open-cover",
-      "url": "https://mintlify.com/docs"
+      "url": "https://docs.skyvern.com"
     },
     {
       "name": "Community",
-      "icon": "slack",
-      "url": "https://mintlify.com/community"
+      "icon": "discord",
+      "url": "https://discord.gg/fG2XXEuQX3"
     },
     {
-      "name": "Blog",
-      "icon": "newspaper",
-      "url": "https://mintlify.com/blog"
+      "name": "Github",
+      "icon": "github",
+      "url": "https://github.com/Skyvern-AI/Skyvern/"
     }
   ],
   "navigation": [
@@ -53,39 +47,40 @@
       "group": "Get Started",
       "pages": [
         "introduction",
-        "quickstart",
-        "development"
+        "getting-started"
       ]
     },
     {
-      "group": "Essentials",
+      "group": "Running Tasks",
       "pages": [
-        "essentials/markdown",
-        "essentials/code",
-        "essentials/images",
-        "essentials/settings",
-        "essentials/navigation",
-        "essentials/reusable-snippets"
+        "running-tasks/introduction",
+        "running-tasks/advanced-features",
+        "running-tasks/api-spec",
+        "running-tasks/prompting-tips",
+        "running-tasks/faq"
       ]
     },
     {
-      "group": "API Documentation",
+      "group": "Visualizer",
       "pages": [
-        "api-reference/introduction"
+        "visualizer/set-up",
+        "visualizer/tasks-and-steps",
+        "visualizer/debugging-a-step",
+        "visualizer/faq"
       ]
     },
     {
-      "group": "Endpoint Examples",
+      "group": "Workflows",
       "pages": [
-        "api-reference/endpoint/get",
-        "api-reference/endpoint/create",
-        "api-reference/endpoint/delete"
+        "workflows/introduction",
+        "workflows/components",
+        "workflows/faq"
       ]
     }
   ],
   "footerSocials": {
-    "twitter": "https://twitter.com/mintlify",
-    "github": "https://github.com/mintlify",
-    "linkedin": "https://www.linkedin.com/company/mintsearch"
+    "twitter": "https://twitter.com/skyvernai",
+    "github": "https://github.com/skyvern-ai/skyvern/",
+    "linkedin": "https://www.linkedin.com/company/skyvern"
   }
 }
