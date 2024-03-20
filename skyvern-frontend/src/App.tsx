@@ -4,7 +4,9 @@ import { ThemeProvider } from "@/components/ThemeProvider";
 function App() {
   return (
     <ThemeProvider defaultTheme="dark" storageKey="skyvern-theme">
-      <Button variant={"destructive"}>Hello Shadcn button!</Button>
+      <div className="h-screen w-screen flex items-center justify-center">
+        <Button>Hello Skyvern!</Button>
+      </div>
     </ThemeProvider>
   );
 }
