@@ -89,8 +89,7 @@ class BrowserContextFactory:
             creator = cls._creators.get(browser_type)
             if not creator:
                 raise UnknownBrowserType(browser_type)
-            else:
-                return await creator(playwright, **kwargs)
+            return await creator(playwright, **kwargs)
         except UnknownBrowserType as e:
             raise e
         except Exception as e:
