@@ -167,3 +167,6 @@ har/
 
 # Streamlit ignores
 **/secrets*.toml
+
+## Frontend
+node_modules

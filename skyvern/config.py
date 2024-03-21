@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     # browser settings
     BROWSER_LOCALE: str = "en-US"
     BROWSER_TIMEZONE: str = "America/New_York"
+    BROWSER_WIDTH: int = 1920
+    BROWSER_HEIGHT: int = 1080
 
     #####################
     # LLM Configuration #

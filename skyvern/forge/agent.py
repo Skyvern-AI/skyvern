@@ -7,6 +7,7 @@ from typing import Any, Tuple
 import requests
 import structlog
 from playwright._impl._errors import TargetClosedError
+from playwright.async_api import Page
 
 from skyvern import analytics
 from skyvern.exceptions import (
@@ -17,6 +18,7 @@ from skyvern.exceptions import (
     TaskNotFound,
 )
 from skyvern.forge import app
+from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.agent import Agent
 from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -64,6 +66,7 @@ class ForgeAgent(Agent):
             long_running_task_warning_ratio=SettingsManager.get_settings().LONG_RUNNING_TASK_WARNING_RATIO,
             debug_mode=SettingsManager.get_settings().DEBUG_MODE,
         )
+        self.async_operation_pool = AsyncOperationPool()
 
     async def validate_step_execution(
         self,
@@ -193,6 +196,12 @@ class ForgeAgent(Agent):
         )
         return task
 
+    def register_async_operations(self, organization: Organization, task: Task, page: Page) -> None:
+        if not app.generate_async_operations:
+            return
+        operations = app.generate_async_operations(organization, task, page)
+        self.async_operation_pool.add_operations(task.task_id, operations)
+
     async def execute_step(
         self,
         organization: Organization,
@@ -208,6 +217,10 @@ class ForgeAgent(Agent):
             # Check some conditions before executing the step, throw an exception if the step can't be executed
             await self.validate_step_execution(task, step)
             step, browser_state, detailed_output = await self._initialize_execution_state(task, step, workflow_run)
+
+            if browser_state.page:
+                self.register_async_operations(organization, task, browser_state.page)
+
             step, detailed_output = await self.agent_step(task, step, browser_state, organization=organization)
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)
             retry = False
@@ -226,6 +239,7 @@ class ForgeAgent(Agent):
                         api_key=api_key,
                         close_browser_on_completion=close_browser_on_completion,
                     )
+                    await self.async_operation_pool.remove_task(task.task_id)
                     return step, detailed_output, None
             elif step.status == StepStatus.completed:
                 # TODO (kerem): keep the task object uptodate at all times so that send_task_response can just use it
@@ -332,6 +346,7 @@ class ForgeAgent(Agent):
             json_response = None
             actions: list[Action]
             if task.navigation_goal:
+                self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)
                 json_response = await app.LLM_API_HANDLER(
                     prompt=extract_action_prompt,
                     step=step,
@@ -403,6 +418,7 @@ class ForgeAgent(Agent):
                         break
                     web_action_element_ids.add(action.element_id)
 
+                self.async_operation_pool.run_operation(task.task_id, AgentPhase.action)
                 results = await ActionHandler.handle_action(scraped_page, task, step, browser_state, action)
                 detailed_agent_step_output.actions_and_results[action_idx] = (action, results)
                 # wait random time between actions to avoid detection
@@ -559,6 +575,9 @@ class ForgeAgent(Agent):
         step: Step,
         browser_state: BrowserState,
     ) -> tuple[ScrapedPage, str]:
+        # start the async tasks while running scrape_website
+        self.async_operation_pool.run_operation(task.task_id, AgentPhase.scrape)
+
         # Scrape the web page and get the screenshot and the elements
         scraped_page = await scrape_website(
             browser_state,
