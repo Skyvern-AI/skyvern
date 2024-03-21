@@ -91,7 +91,6 @@ class BrowserContextFactory:
                 raise UnknownBrowserType(browser_type)
             else:
                 return await creator(playwright, **kwargs)
-
         except UnknownBrowserType as e:
             raise e
         except Exception as e:
