@@ -89,10 +89,6 @@ class BrowserContextFactory:
             creator = cls._creators.get(browser_type)
             if not creator:
                 raise UnknownBrowserType(browser_type)
-            if browser_type == "chromium-attached":
-                # Pass the WebSocket endpoint to the creator function
-                ws_endpoint = SettingsManager.get_settings().WS_ENDPOINT
-                return await creator(playwright, ws_endpoint=ws_endpoint, **kwargs)
             else:
                 return await creator(playwright, **kwargs)
 
@@ -128,7 +124,8 @@ async def _create_headful_chromium(playwright: Playwright, **kwargs: dict) -> tu
     return browser_context, browser_artifacts
 
 
-async def _create_attached_chromium(playwright: Playwright, ws_endpoint: str, **kwargs: dict) -> tuple[BrowserContext, BrowserArtifacts]:
+async def _create_attached_chromium(playwright: Playwright, **kwargs: dict) -> tuple[BrowserContext, BrowserArtifacts]:
+    ws_endpoint = SettingsManager.get_settings().WS_ENDPOINT
     browser = await playwright.chromium.connect_over_cdp(ws_endpoint)
     browser_args = BrowserContextFactory.build_browser_args()
     browser_args.update(
@@ -145,6 +142,7 @@ async def _create_attached_chromium(playwright: Playwright, ws_endpoint: str, **
 
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(har_path=browser_args["record_har_path"])
     return browser_context, browser_artifacts
+
 
 BrowserContextFactory.register_type("chromium-headless", _create_headless_chromium)
 BrowserContextFactory.register_type("chromium-headful", _create_headful_chromium)
