@@ -164,6 +164,14 @@ class TaskBlock(Block):
             if not updated_task.status.is_final():
                 raise UnexpectedTaskStatus(task_id=updated_task.task_id, status=updated_task.status)
             if updated_task.status == TaskStatus.completed:
+                will_retry = False
+                LOG.info(
+                    f"Task completed",
+                    task_id=updated_task.task_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_id=workflow.workflow_id,
+                    organization_id=workflow.organization_id,
+                )
                 if self.output_parameter:
                     await workflow_run_context.register_output_parameter_value_post_execution(
                         parameter=self.output_parameter,
@@ -173,6 +181,14 @@ class TaskBlock(Block):
                         workflow_run_id=workflow_run_id,
                         output_parameter_id=self.output_parameter.output_parameter_id,
                         value=updated_task.extracted_information,
+                    )
+                    LOG.info(
+                        f"Registered output parameter value",
+                        output_parameter_id=self.output_parameter.output_parameter_id,
+                        value=updated_task.extracted_information,
+                        workflow_run_id=workflow_run_id,
+                        workflow_id=workflow.workflow_id,
+                        task_id=updated_task.task_id,
                     )
                     return self.output_parameter
             else:
