@@ -5,11 +5,17 @@ import structlog
 
 from skyvern.exceptions import WorkflowRunContextNotInitialized
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
-from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, Parameter, ParameterType, WorkflowParameter
+from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
+from skyvern.forge.sdk.workflow.models.parameter import (
+    PARAMETER_TYPE,
+    OutputParameter,
+    Parameter,
+    ParameterType,
+    WorkflowParameter,
+)
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunParameter
-
 
 LOG = structlog.get_logger()
 
@@ -19,7 +25,11 @@ class WorkflowRunContext:
     values: dict[str, Any]
     secrets: dict[str, Any]
 
-    def __init__(self, workflow_parameter_tuples: list[tuple[WorkflowParameter, "WorkflowRunParameter"]]) -> None:
+    def __init__(
+        self,
+        workflow_parameter_tuples: list[tuple[WorkflowParameter, "WorkflowRunParameter"]],
+        workflow_output_parameters: list[OutputParameter],
+    ) -> None:
         self.parameters = {}
         self.values = {}
         self.secrets = {}
@@ -33,6 +43,11 @@ class WorkflowRunContext:
 
             self.parameters[parameter.key] = parameter
             self.values[parameter.key] = run_parameter.value
+
+        for output_parameter in workflow_output_parameters:
+            if output_parameter.key in self.parameters:
+                raise OutputParameterKeyCollisionError(output_parameter.key)
+            self.parameters[output_parameter.key] = output_parameter
 
     def get_parameter(self, key: str) -> Parameter:
         return self.parameters[key]
@@ -48,11 +63,23 @@ class WorkflowRunContext:
     def set_value(self, key: str, value: Any) -> None:
         self.values[key] = value
 
-    def get_original_secret_value_or_none(self, secret_id: str) -> Any:
+    def get_original_secret_value_or_none(self, secret_id_or_value: Any) -> Any:
         """
         Get the original secret value from the secrets dict. If the secret id is not found, return None.
+
+        This function can be called with any possible parameter value, not just the random secret id.
+
+        All the obfuscated secret values are strings, so if the parameter value is a string, we'll assume it's a
+        parameter value and return it.
+
+        If the parameter value is a string, it could be a random secret id or an actual parameter value. We'll check if
+        the parameter value is a key in the secrets dict. If it is, we'll return the secret value. If it's not, we'll
+        assume it's an actual parameter value and return it.
+
         """
-        return self.secrets.get(secret_id)
+        if type(secret_id_or_value) is str:
+            return self.secrets.get(secret_id_or_value)
+        return None
 
     @staticmethod
     def generate_random_secret_id() -> str:
@@ -68,6 +95,9 @@ class WorkflowRunContext:
             raise ValueError(
                 f"Workflow parameters are set while initializing context manager. Parameter key: {parameter.key}"
             )
+        elif parameter.parameter_type == ParameterType.OUTPUT:
+            LOG.error(f"Output parameters are set after each block execution. Parameter key: {parameter.key}")
+            raise ValueError(f"Output parameters are set after each block execution. Parameter key: {parameter.key}")
         elif parameter.parameter_type == ParameterType.AWS_SECRET:
             # If the parameter is an AWS secret, fetch the secret value and store it in the secrets dict
             # The value of the parameter will be the random secret id with format `secret_<uuid>`.
@@ -77,9 +107,20 @@ class WorkflowRunContext:
                 random_secret_id = self.generate_random_secret_id()
                 self.secrets[random_secret_id] = secret_value
                 self.values[parameter.key] = random_secret_id
-        else:
+        elif parameter.parameter_type == ParameterType.CONTEXT:
             # ContextParameter values will be set within the blocks
-            return None
+            return
+        else:
+            raise ValueError(f"Unknown parameter type: {parameter.parameter_type}")
+
+    async def register_output_parameter_value_post_execution(
+        self, parameter: OutputParameter, value: dict[str, Any] | list | str | None
+    ) -> None:
+        if parameter.key in self.values:
+            LOG.error(f"Output parameter {parameter.output_parameter_id} already has a registered value")
+            return
+
+        self.values[parameter.key] = value
 
     async def register_block_parameters(
         self,
@@ -97,6 +138,13 @@ class WorkflowRunContext:
                 )
                 raise ValueError(
                     f"Workflow parameter {parameter.key} should have already been set through workflow run parameters"
+                )
+            elif parameter.parameter_type == ParameterType.OUTPUT:
+                LOG.error(
+                    f"Output parameter {parameter.key} should have already been set through workflow run context init"
+                )
+                raise ValueError(
+                    f"Output parameter {parameter.key} should have already been set through workflow run context init"
                 )
 
             self.parameters[parameter.key] = parameter
@@ -121,9 +169,12 @@ class WorkflowContextManager:
             raise WorkflowRunContextNotInitialized(workflow_run_id=workflow_run_id)
 
     def initialize_workflow_run_context(
-        self, workflow_run_id: str, workflow_parameter_tuples: list[tuple[WorkflowParameter, "WorkflowRunParameter"]]
+        self,
+        workflow_run_id: str,
+        workflow_parameter_tuples: list[tuple[WorkflowParameter, "WorkflowRunParameter"]],
+        workflow_output_parameters: list[OutputParameter],
     ) -> WorkflowRunContext:
-        workflow_run_context = WorkflowRunContext(workflow_parameter_tuples)
+        workflow_run_context = WorkflowRunContext(workflow_parameter_tuples, workflow_output_parameters)
         self.workflow_run_contexts[workflow_run_id] = workflow_run_context
         return workflow_run_context
 

@@ -9,6 +9,7 @@ from skyvern.forge.sdk.db.id import (
     generate_aws_secret_parameter_id,
     generate_org_id,
     generate_organization_auth_token_id,
+    generate_output_parameter_id,
     generate_step_id,
     generate_task_id,
     generate_workflow_id,
@@ -150,6 +151,18 @@ class WorkflowParameterModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
+class OutputParameterModel(Base):
+    __tablename__ = "output_parameters"
+
+    output_parameter_id = Column(String, primary_key=True, index=True, default=generate_output_parameter_id)
+    key = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), index=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)
+
+
 class AWSSecretParameterModel(Base):
     __tablename__ = "aws_secret_parameters"
 
@@ -172,4 +185,15 @@ class WorkflowRunParameterModel(Base):
     )
     # Can be bool | int | float | str | dict | list depending on the workflow parameter type
     value = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+
+class WorkflowRunOutputParameterModel(Base):
+    __tablename__ = "workflow_run_output_parameters"
+
+    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), primary_key=True, index=True)
+    output_parameter_id = Column(
+        String, ForeignKey("output_parameters.output_parameter_id"), primary_key=True, index=True
+    )
+    value = Column(JSON, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)

@@ -20,12 +20,18 @@ from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
-from skyvern.forge.sdk.workflow.models.parameter import AWSSecretParameter, WorkflowParameter, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.parameter import (
+    AWSSecretParameter,
+    OutputParameter,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
 from skyvern.forge.sdk.workflow.models.workflow import (
     Workflow,
     WorkflowDefinition,
     WorkflowRequestBody,
     WorkflowRun,
+    WorkflowRunOutputParameter,
     WorkflowRunParameter,
     WorkflowRunStatus,
     WorkflowRunStatusResponse,
@@ -124,7 +130,10 @@ class WorkflowService:
 
         # Get all <workflow parameter, workflow run parameter> tuples
         wp_wps_tuples = await self.get_workflow_run_parameter_tuples(workflow_run_id=workflow_run.workflow_run_id)
-        app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(workflow_run_id, wp_wps_tuples)
+        workflow_output_parameters = await self.get_workflow_output_parameters(workflow_id=workflow.workflow_id)
+        app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
+            workflow_run_id, wp_wps_tuples, workflow_output_parameters
+        )
         # Execute workflow blocks
         blocks = workflow.workflow_definition.blocks
         try:
@@ -148,15 +157,27 @@ class WorkflowService:
             )
 
         tasks = await self.get_tasks_by_workflow_run_id(workflow_run.workflow_run_id)
-        if not tasks:
-            LOG.warning(
-                f"No tasks found for workflow run {workflow_run.workflow_run_id}, not sending webhook, marking as failed",
-                workflow_run_id=workflow_run.workflow_run_id,
-            )
-            await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
-            return workflow_run
 
-        workflow_run = await self.handle_workflow_status(workflow_run=workflow_run, tasks=tasks)
+        if tasks:
+            workflow_run = await self.handle_workflow_status(workflow_run=workflow_run, tasks=tasks)
+        else:
+            # Check if the workflow run has any workflow run output parameters
+            # if it does, mark the workflow run as completed, else mark it as failed
+            workflow_run_output_parameters = await self.get_workflow_run_output_parameters(
+                workflow_run_id=workflow_run.workflow_run_id
+            )
+            if workflow_run_output_parameters:
+                LOG.info(
+                    f"Workflow run {workflow_run.workflow_run_id} has output parameters, marking as completed",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
+                await self.mark_workflow_run_as_completed(workflow_run_id=workflow_run.workflow_run_id)
+            else:
+                LOG.error(
+                    f"Workflow run {workflow_run.workflow_run_id} has no tasks or output parameters, marking as failed",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
+                await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
         await self.send_workflow_response(
             workflow=workflow,
             workflow_run=workflow_run,
@@ -232,6 +253,8 @@ class WorkflowService:
         description: str | None = None,
         workflow_definition: WorkflowDefinition | None = None,
     ) -> Workflow | None:
+        if workflow_definition:
+            workflow_definition.validate()
         return await app.DATABASE.update_workflow(
             workflow_id=workflow_id,
             title=title,
@@ -314,6 +337,11 @@ class WorkflowService:
             workflow_id=workflow_id, aws_key=aws_key, key=key, description=description
         )
 
+    async def create_output_parameter(
+        self, workflow_id: str, key: str, description: str | None = None
+    ) -> OutputParameter:
+        return await app.DATABASE.create_output_parameter(workflow_id=workflow_id, key=key, description=description)
+
     async def get_workflow_parameters(self, workflow_id: str) -> list[WorkflowParameter]:
         return await app.DATABASE.get_workflow_parameters(workflow_id=workflow_id)
 
@@ -333,6 +361,33 @@ class WorkflowService:
         self, workflow_run_id: str
     ) -> list[tuple[WorkflowParameter, WorkflowRunParameter]]:
         return await app.DATABASE.get_workflow_run_parameters(workflow_run_id=workflow_run_id)
+
+    @staticmethod
+    async def get_workflow_output_parameters(workflow_id: str) -> list[OutputParameter]:
+        return await app.DATABASE.get_workflow_output_parameters(workflow_id=workflow_id)
+
+    @staticmethod
+    async def get_workflow_run_output_parameters(
+        workflow_run_id: str,
+    ) -> list[WorkflowRunOutputParameter]:
+        return await app.DATABASE.get_workflow_run_output_parameters(workflow_run_id=workflow_run_id)
+
+    @staticmethod
+    async def get_output_parameter_workflow_run_output_parameter_tuples(
+        workflow_id: str,
+        workflow_run_id: str,
+    ) -> list[tuple[OutputParameter, WorkflowRunOutputParameter]]:
+        workflow_run_output_parameters = await app.DATABASE.get_workflow_run_output_parameters(
+            workflow_run_id=workflow_run_id
+        )
+        output_parameters = await app.DATABASE.get_workflow_output_parameters(workflow_id=workflow_id)
+
+        return [
+            (output_parameter, workflow_run_output_parameter)
+            for output_parameter in output_parameters
+            for workflow_run_output_parameter in workflow_run_output_parameters
+            if output_parameter.output_parameter_id == workflow_run_output_parameter.output_parameter_id
+        ]
 
     async def get_last_task_for_workflow_run(self, workflow_run_id: str) -> Task | None:
         return await app.DATABASE.get_last_task_for_workflow_run(workflow_run_id=workflow_run_id)
@@ -377,15 +432,27 @@ class WorkflowService:
 
         workflow_parameter_tuples = await app.DATABASE.get_workflow_run_parameters(workflow_run_id=workflow_run_id)
         parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
-        payload = {
-            task.task_id: {
-                "title": task.title,
-                "extracted_information": task.extracted_information,
-                "navigation_payload": task.navigation_payload,
-                "errors": await app.agent.get_task_errors(task=task),
+        output_parameter_tuples: list[
+            tuple[OutputParameter, WorkflowRunOutputParameter]
+        ] = await self.get_output_parameter_workflow_run_output_parameter_tuples(
+            workflow_id=workflow_id, workflow_run_id=workflow_run_id
+        )
+        if output_parameter_tuples:
+            payload = {
+                output_parameter.key: wfrp.value
+                for output_parameter, wfrp in output_parameter_tuples
+                if wfrp.value is not None
             }
-            for task in workflow_run_tasks
-        }
+        else:
+            payload = {
+                task.task_id: {
+                    "title": task.title,
+                    "extracted_information": task.extracted_information,
+                    "navigation_payload": task.navigation_payload,
+                    "errors": await app.agent.get_task_errors(task=task),
+                }
+                for task in workflow_run_tasks
+            }
         return WorkflowRunStatusResponse(
             workflow_id=workflow_id,
             workflow_run_id=workflow_run_id,
@@ -419,6 +486,13 @@ class WorkflowService:
 
         await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks_for_tasks(all_workflow_task_ids)
 
+        workflow_run_status_response = await self.build_workflow_run_status_response(
+            workflow_id=workflow.workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=workflow.organization_id,
+        )
+        LOG.info("Built workflow run status response", workflow_run_status_response=workflow_run_status_response)
+
         if not workflow_run.webhook_callback_url:
             LOG.warning(
                 "Workflow has no webhook callback url. Not sending workflow response",
@@ -435,11 +509,6 @@ class WorkflowService:
             )
             return
 
-        workflow_run_status_response = await self.build_workflow_run_status_response(
-            workflow_id=workflow.workflow_id,
-            workflow_run_id=workflow_run.workflow_run_id,
-            organization_id=workflow.organization_id,
-        )
         # send task_response to the webhook callback url
         # TODO: use async requests (httpx)
         timestamp = str(int(datetime.utcnow().timestamp()))
