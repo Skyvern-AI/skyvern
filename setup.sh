@@ -12,13 +12,15 @@ command_exists() {
     command -v "$1" &> /dev/null
 }
 
-# Ensure required commands are available
-for cmd in poetry python3.11; do
-    if ! command_exists "$cmd"; then
-        echo "Error: $cmd is not installed." >&2
-        exit 1
-    fi
-done
+ensure_required_commands() {
+    # Ensure required commands are available
+    for cmd in poetry do
+        if ! command_exists "$cmd"; then
+            echo "Error: $cmd is not installed." >&2
+            exit 1
+        fi
+    done
+}
 
 # Function to update or add environment variable in .env file
 update_or_add_env_var() {
@@ -152,7 +154,11 @@ remove_poetry_env() {
 
 # Choose python version
 choose_python_version_or_fail() {
-  poetry env use python3.11 || { echo "Error: Python 3.11 is not installed."; exit 1; }
+  # https://github.com/python-poetry/poetry/issues/2117
+  # Py --list-paths 
+    # This will output which paths are being used for Python 3.11
+  # Windows users need to poetry env use {{ Py --list-paths with 3.11}}
+  poetry env use python3.11 || { echo "Error: Python 3.11 is not installed. If you're on Windows, check out https://github.com/python-poetry/poetry/issues/2117 to unblock yourself"; exit 1; }
 }
 
 
@@ -256,6 +262,7 @@ create_organization() {
 
 # Main function
 main() {
+    ensure_required_commands
     initialize_env_file
     choose_python_version_or_fail
     remove_poetry_env
