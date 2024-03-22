@@ -254,20 +254,48 @@ create_organization() {
     echo ".streamlit/secrets.toml file updated with organization details."
 }
 
-# Main function
-main() {
+init_env() {
     initialize_env_file
+}
+
+init_dev_dependencies() {
     choose_python_version_or_fail
     remove_poetry_env
     install_dependencies
-    setup_postgresql
     activate_poetry_env
     install_dependencies_after_poetry_env
+}
+
+init_database() {
+    setup_postgresql
     run_alembic_upgrade
     create_organization
-    log_event "skyvern-oss-setup-complete"
-    echo "Setup completed successfully."
+}
+
+# Main function
+main() {
+    case $1 in
+        "env")
+            init_env
+            echo "Setup env dependencies successfully."
+            ;;
+        "dev")
+            init_dev_dependencies
+            echo "Setup dev dependencies successfully."
+            ;;
+        "database")
+            init_database
+            echo "Setup database successfully."
+            ;;
+        *)
+            init_env
+            init_dev_dependencies
+            init_database
+            log_event "skyvern-oss-setup-complete"
+            echo "Setup completed successfully."
+           ;;
+    esac
 }
 
 # Execute main function
-main
+main $@
