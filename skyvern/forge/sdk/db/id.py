@@ -37,6 +37,7 @@ WORKFLOW_PREFIX = "w"
 WORKFLOW_RUN_PREFIX = "wr"
 WORKFLOW_PARAMETER_PREFIX = "wp"
 AWS_SECRET_PARAMETER_PREFIX = "asp"
+OUTPUT_PARAMETER_PREFIX = "op"
 
 
 def generate_workflow_id() -> str:
@@ -57,6 +58,11 @@ def generate_aws_secret_parameter_id() -> str:
 def generate_workflow_parameter_id() -> str:
     int_id = generate_id()
     return f"{WORKFLOW_PARAMETER_PREFIX}_{int_id}"
+
+
+def generate_output_parameter_id() -> str:
+    int_id = generate_id()
+    return f"{OUTPUT_PARAMETER_PREFIX}_{int_id}"
 
 
 def generate_organization_auth_token_id() -> str:

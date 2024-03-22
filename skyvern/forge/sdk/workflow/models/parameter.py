@@ -11,6 +11,7 @@ class ParameterType(StrEnum):
     WORKFLOW = "workflow"
     CONTEXT = "context"
     AWS_SECRET = "aws_secret"
+    OUTPUT = "output"
 
 
 class Parameter(BaseModel, abc.ABC):
@@ -80,5 +81,16 @@ class ContextParameter(Parameter):
     value: str | int | float | bool | dict | list | None = None
 
 
-ParameterSubclasses = Union[WorkflowParameter, ContextParameter, AWSSecretParameter]
+class OutputParameter(Parameter):
+    parameter_type: Literal[ParameterType.OUTPUT] = ParameterType.OUTPUT
+
+    output_parameter_id: str
+    workflow_id: str
+
+    created_at: datetime
+    modified_at: datetime
+    deleted_at: datetime | None = None
+
+
+ParameterSubclasses = Union[WorkflowParameter, ContextParameter, AWSSecretParameter, OutputParameter]
 PARAMETER_TYPE = Annotated[ParameterSubclasses, Field(discriminator="parameter_type")]

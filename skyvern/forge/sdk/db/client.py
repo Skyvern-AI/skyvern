@@ -15,11 +15,13 @@ from skyvern.forge.sdk.db.models import (
     AWSSecretParameterModel,
     OrganizationAuthTokenModel,
     OrganizationModel,
+    OutputParameterModel,
     StepModel,
     TaskModel,
     WorkflowModel,
     WorkflowParameterModel,
     WorkflowRunModel,
+    WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
 )
 from skyvern.forge.sdk.db.utils import (
@@ -28,17 +30,30 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_aws_secret_parameter,
     convert_to_organization,
     convert_to_organization_auth_token,
+    convert_to_output_parameter,
     convert_to_step,
     convert_to_task,
     convert_to_workflow,
     convert_to_workflow_parameter,
     convert_to_workflow_run,
+    convert_to_workflow_run_output_parameter,
     convert_to_workflow_run_parameter,
 )
 from skyvern.forge.sdk.models import Organization, OrganizationAuthToken, Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskStatus
-from skyvern.forge.sdk.workflow.models.parameter import AWSSecretParameter, WorkflowParameter, WorkflowParameterType
-from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunParameter, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.parameter import (
+    AWSSecretParameter,
+    OutputParameter,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
+from skyvern.forge.sdk.workflow.models.workflow import (
+    Workflow,
+    WorkflowRun,
+    WorkflowRunOutputParameter,
+    WorkflowRunParameter,
+    WorkflowRunStatus,
+)
 from skyvern.webeye.actions.models import AgentStepOutput
 
 LOG = structlog.get_logger()
@@ -776,6 +791,68 @@ class AgentDB:
             session.commit()
             session.refresh(aws_secret_parameter)
             return convert_to_aws_secret_parameter(aws_secret_parameter)
+
+    async def create_output_parameter(
+        self,
+        workflow_id: str,
+        key: str,
+        description: str | None = None,
+    ) -> OutputParameter:
+        with self.Session() as session:
+            output_parameter = OutputParameterModel(
+                key=key,
+                description=description,
+                workflow_id=workflow_id,
+            )
+            session.add(output_parameter)
+            session.commit()
+            session.refresh(output_parameter)
+            return convert_to_output_parameter(output_parameter)
+
+    async def get_workflow_output_parameters(self, workflow_id: str) -> list[OutputParameter]:
+        try:
+            with self.Session() as session:
+                output_parameters = session.query(OutputParameterModel).filter_by(workflow_id=workflow_id).all()
+                return [convert_to_output_parameter(parameter) for parameter in output_parameters]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_workflow_run_output_parameters(self, workflow_run_id: str) -> list[WorkflowRunOutputParameter]:
+        try:
+            with self.Session() as session:
+                workflow_run_output_parameters = (
+                    session.query(WorkflowRunOutputParameterModel)
+                    .filter_by(workflow_run_id=workflow_run_id)
+                    .order_by(WorkflowRunOutputParameterModel.created_at)
+                    .all()
+                )
+                return [
+                    convert_to_workflow_run_output_parameter(parameter, self.debug_enabled)
+                    for parameter in workflow_run_output_parameters
+                ]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def create_workflow_run_output_parameter(
+        self, workflow_run_id: str, output_parameter_id: str, value: dict[str, Any] | list | str | None
+    ) -> WorkflowRunOutputParameter:
+        try:
+            with self.Session() as session:
+                workflow_run_output_parameter = WorkflowRunOutputParameterModel(
+                    workflow_run_id=workflow_run_id,
+                    output_parameter_id=output_parameter_id,
+                    value=value,
+                )
+                session.add(workflow_run_output_parameter)
+                session.commit()
+                session.refresh(workflow_run_output_parameter)
+                return convert_to_workflow_run_output_parameter(workflow_run_output_parameter, self.debug_enabled)
+
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
 
     async def get_workflow_parameters(self, workflow_id: str) -> list[WorkflowParameter]:
         try:

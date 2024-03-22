@@ -5,6 +5,7 @@ from typing import Any, List
 from pydantic import BaseModel
 
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
+from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicateBlockLabels
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 
 
@@ -21,6 +22,18 @@ class RunWorkflowResponse(BaseModel):
 
 class WorkflowDefinition(BaseModel):
     blocks: List[BlockTypeVar]
+
+    def validate(self) -> None:
+        labels: set[str] = set()
+        duplicate_labels: set[str] = set()
+        for block in self.blocks:
+            if block.label in labels:
+                duplicate_labels.add(block.label)
+            else:
+                labels.add(block.label)
+
+        if duplicate_labels:
+            raise WorkflowDefinitionHasDuplicateBlockLabels(duplicate_labels)
 
 
 class Workflow(BaseModel):
@@ -58,6 +71,13 @@ class WorkflowRunParameter(BaseModel):
     workflow_run_id: str
     workflow_parameter_id: str
     value: bool | int | float | str | dict | list
+    created_at: datetime
+
+
+class WorkflowRunOutputParameter(BaseModel):
+    workflow_run_id: str
+    output_parameter_id: str
+    value: dict[str, Any] | list | str | None
     created_at: datetime
 
 

@@ -11,20 +11,28 @@ from skyvern.forge.sdk.db.models import (
     AWSSecretParameterModel,
     OrganizationAuthTokenModel,
     OrganizationModel,
+    OutputParameterModel,
     StepModel,
     TaskModel,
     WorkflowModel,
     WorkflowParameterModel,
     WorkflowRunModel,
+    WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
 )
 from skyvern.forge.sdk.models import Organization, OrganizationAuthToken, Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskStatus
-from skyvern.forge.sdk.workflow.models.parameter import AWSSecretParameter, WorkflowParameter, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.parameter import (
+    AWSSecretParameter,
+    OutputParameter,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
 from skyvern.forge.sdk.workflow.models.workflow import (
     Workflow,
     WorkflowDefinition,
     WorkflowRun,
+    WorkflowRunOutputParameter,
     WorkflowRunParameter,
     WorkflowRunStatus,
 )
@@ -188,7 +196,7 @@ def convert_to_aws_secret_parameter(
     if debug_enabled:
         LOG.debug(
             "Converting AWSSecretParameterModel to AWSSecretParameter",
-            aws_secret_parameter_id=aws_secret_parameter_model.id,
+            aws_secret_parameter_id=aws_secret_parameter_model.aws_secret_parameter_id,
         )
 
     return AWSSecretParameter(
@@ -200,6 +208,45 @@ def convert_to_aws_secret_parameter(
         created_at=aws_secret_parameter_model.created_at,
         modified_at=aws_secret_parameter_model.modified_at,
         deleted_at=aws_secret_parameter_model.deleted_at,
+    )
+
+
+def convert_to_output_parameter(
+    output_parameter_model: OutputParameterModel, debug_enabled: bool = False
+) -> OutputParameter:
+    if debug_enabled:
+        LOG.debug(
+            "Converting OutputParameterModel to OutputParameter",
+            output_parameter_id=output_parameter_model.output_parameter_id,
+        )
+
+    return OutputParameter(
+        output_parameter_id=output_parameter_model.output_parameter_id,
+        key=output_parameter_model.key,
+        description=output_parameter_model.description,
+        workflow_id=output_parameter_model.workflow_id,
+        created_at=output_parameter_model.created_at,
+        modified_at=output_parameter_model.modified_at,
+        deleted_at=output_parameter_model.deleted_at,
+    )
+
+
+def convert_to_workflow_run_output_parameter(
+    workflow_run_output_parameter_model: WorkflowRunOutputParameterModel,
+    debug_enabled: bool = False,
+) -> WorkflowRunOutputParameter:
+    if debug_enabled:
+        LOG.debug(
+            "Converting WorkflowRunOutputParameterModel to WorkflowRunOutputParameter",
+            workflow_run_id=workflow_run_output_parameter_model.workflow_run_id,
+            output_parameter_id=workflow_run_output_parameter_model.output_parameter_id,
+        )
+
+    return WorkflowRunOutputParameter(
+        workflow_run_id=workflow_run_output_parameter_model.workflow_run_id,
+        output_parameter_id=workflow_run_output_parameter_model.output_parameter_id,
+        value=workflow_run_output_parameter_model.value,
+        created_at=workflow_run_output_parameter_model.created_at,
     )
 
 
