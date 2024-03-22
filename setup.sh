@@ -12,13 +12,15 @@ command_exists() {
     command -v "$1" &> /dev/null
 }
 
-# Ensure required commands are available
-for cmd in poetry python3.11; do
-    if ! command_exists "$cmd"; then
-        echo "Error: $cmd is not installed." >&2
-        exit 1
-    fi
-done
+ensure_required_commands() {
+    # Ensure required commands are available
+    for cmd in poetry python3.11; do
+        if ! command_exists "$cmd"; then
+            echo "Error: $cmd is not installed." >&2
+            exit 1
+        fi
+    done
+}
 
 # Function to update or add environment variable in .env file
 update_or_add_env_var() {
@@ -256,6 +258,7 @@ create_organization() {
 
 # Main function
 main() {
+    ensure_required_commands
     initialize_env_file
     choose_python_version_or_fail
     remove_poetry_env
