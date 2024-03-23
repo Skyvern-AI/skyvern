@@ -1,13 +1,16 @@
-import { Button } from "./components/ui/Button";
+import { RouterProvider } from "react-router-dom";
 import { ThemeProvider } from "@/components/ThemeProvider";
+import { router } from "./router";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { queryClient } from "./api/QueryClient";
 
 function App() {
   return (
-    <ThemeProvider defaultTheme="dark" storageKey="skyvern-theme">
-      <div className="h-screen w-screen flex items-center justify-center">
-        <Button>Hello Skyvern!</Button>
-      </div>
-    </ThemeProvider>
+    <QueryClientProvider client={queryClient}>
+      <ThemeProvider defaultTheme="dark" storageKey="skyvern-theme">
+        <RouterProvider router={router} />
+      </ThemeProvider>
+    </QueryClientProvider>
   );
 }
 
