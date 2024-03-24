@@ -11,7 +11,7 @@ python = "^3.11,<3.12"
 python-dotenv = "^1.0.0"
 openai = "<1.8"
 tenacity = "^8.2.2"
-sqlalchemy = "^2.0.23"
+sqlalchemy = {extras = ["mypy"], version = "^2.0.29"}
 aiohttp = "^3.8.5"
 colorlog = "^6.7.0"
 chromadb = "^0.4.10"
@@ -28,7 +28,6 @@ playwright = "^1.39.0"
 pre-commit = "^3.5.0"
 pillow = "^10.1.0"
 starlette-context = "^0.3.6"
-sqlalchemy-stubs = "^0.4"
 ddtrace = "^2.3.2"
 pydantic = "^2.5.2"
 pydantic-settings = "^2.1.0"
@@ -96,3 +95,6 @@ line_length = 120
 sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
 skip_glob = [".tox", "__pycache__", "*.pyc", "venv*/*", "reports", "venv", "env", "node_modules", ".env", ".venv", "dist"]
 skip = ["webeye/actions/__init__.py", "forge/sdk/__init__.py"]
+
+[tool.mypy]
+plugins = "sqlalchemy.ext.mypy.plugin"
