@@ -3,6 +3,8 @@ import { RootLayout } from "./routes/root/RootLayout";
 import { TasksPageLayout } from "./routes/tasks/TasksPageLayout";
 import { CreateNewTask } from "./routes/tasks/CreateNewTask";
 import { TaskList } from "./routes/tasks/TaskList";
+import { Settings } from "./routes/settings/Settings";
+import { SettingsPageLayout } from "./routes/settings/SettingsPageLayout";
 
 const router = createBrowserRouter([
   {
@@ -22,8 +24,18 @@ const router = createBrowserRouter([
             element: <TaskList />,
           },
           {
-            path: "new",
+            path: "create",
             element: <CreateNewTask />,
+          },
+        ],
+      },
+      {
+        path: "settings",
+        element: <SettingsPageLayout />,
+        children: [
+          {
+            index: true,
+            element: <Settings />,
           },
         ],
       },

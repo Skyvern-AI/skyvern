@@ -17,10 +17,8 @@ import {
   PaginationNext,
   PaginationPrevious,
 } from "@/components/ui/pagination";
-import { Link, useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router-dom";
 import { TaskListSkeleton } from "./TaskListSkeleton";
-import { Button } from "@/components/ui/button";
-import { PlusIcon } from "@radix-ui/react-icons";
 
 function TaskList() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -54,14 +52,7 @@ function TaskList() {
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex justify-between">
-        <h1>Tasks</h1>
-        <Button asChild>
-          <Link to="new">
-            <PlusIcon className="mr-2" /> New Task
-          </Link>
-        </Button>
-      </div>
+      <h1>Task History</h1>
       <Table>
         <TableHeader>
           <TableRow>

@@ -5,7 +5,6 @@ import { Button } from "@/components/ui/button";
 import {
   Form,
   FormControl,
-  FormDescription,
   FormField,
   FormItem,
   FormLabel,
@@ -24,6 +23,13 @@ import { Textarea } from "@/components/ui/textarea";
 import { useMutation } from "@tanstack/react-query";
 import { client } from "@/api/AxiosClient";
 import { useToast } from "@/components/ui/use-toast";
+import { InfoCircledIcon } from "@radix-ui/react-icons";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 const createNewTaskFormSchema = z.object({
   url: z.string().url({
@@ -97,11 +103,24 @@ function CreateNewTaskForm({ initialValues }: Props) {
           name="url"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>URL*</FormLabel>
+              <FormLabel>
+                <div className="flex gap-2">
+                  URL*
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <InfoCircledIcon />
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-[250px]">
+                        <p>{urlDescription}</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+              </FormLabel>
               <FormControl>
                 <Input placeholder="example.com" {...field} />
               </FormControl>
-              <FormDescription>{urlDescription}</FormDescription>
               <FormMessage />
             </FormItem>
           )}
@@ -111,11 +130,24 @@ function CreateNewTaskForm({ initialValues }: Props) {
           name="webhookCallbackUrl"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>Webhook Callback URL</FormLabel>
+              <FormLabel>
+                <div className="flex gap-2">
+                  Webhook Callback URL
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <InfoCircledIcon />
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-[250px]">
+                        <p>{webhookCallbackUrlDescription}</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+              </FormLabel>
               <FormControl>
                 <Input placeholder="example.com" {...field} />
               </FormControl>
-              <FormDescription>{webhookCallbackUrlDescription}</FormDescription>
               <FormMessage />
             </FormItem>
           )}
@@ -125,11 +157,24 @@ function CreateNewTaskForm({ initialValues }: Props) {
           name="navigationGoal"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>Navigation Goal</FormLabel>
+              <FormLabel>
+                <div className="flex gap-2">
+                  Navigation Goal
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <InfoCircledIcon />
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-[250px]">
+                        <p>{navigationGoalDescription}</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+              </FormLabel>
               <FormControl>
                 <Textarea rows={5} placeholder="Navigation Goal" {...field} />
               </FormControl>
-              <FormDescription>{navigationGoalDescription}</FormDescription>
               <FormMessage />
             </FormItem>
           )}
@@ -139,7 +184,21 @@ function CreateNewTaskForm({ initialValues }: Props) {
           name="dataExtractionGoal"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>Data Extraction Goal</FormLabel>
+              <FormLabel>
+                <div className="flex gap-2">
+                  Data Extraction Goal
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <InfoCircledIcon />
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-[250px]">
+                        <p>{dataExtractionGoalDescription}</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+              </FormLabel>
               <FormControl>
                 <Textarea
                   rows={5}
@@ -147,7 +206,6 @@ function CreateNewTaskForm({ initialValues }: Props) {
                   {...field}
                 />
               </FormControl>
-              <FormDescription>{dataExtractionGoalDescription}</FormDescription>
               <FormMessage />
             </FormItem>
           )}
@@ -157,7 +215,21 @@ function CreateNewTaskForm({ initialValues }: Props) {
           name="navigationPayload"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>Navigation Payload</FormLabel>
+              <FormLabel>
+                <div className="flex gap-2">
+                  Navigation Payload
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <InfoCircledIcon />
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-[250px]">
+                        <p>{navigationPayloadDescription}</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+              </FormLabel>
               <FormControl>
                 <Textarea
                   rows={5}
@@ -165,7 +237,6 @@ function CreateNewTaskForm({ initialValues }: Props) {
                   {...field}
                 />
               </FormControl>
-              <FormDescription>{navigationPayloadDescription}</FormDescription>
               <FormMessage />
             </FormItem>
           )}
@@ -175,7 +246,21 @@ function CreateNewTaskForm({ initialValues }: Props) {
           name="extractedInformationSchema"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>Extracted Information Schema</FormLabel>
+              <FormLabel>
+                <div className="flex gap-2">
+                  Extracted Information Schema
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <InfoCircledIcon />
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-[250px]">
+                        <p>{extractedInformationSchemaDescription}</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+              </FormLabel>
               <FormControl>
                 <Textarea
                   placeholder="Extracted Information Schema"
@@ -183,16 +268,13 @@ function CreateNewTaskForm({ initialValues }: Props) {
                   {...field}
                 />
               </FormControl>
-              <FormDescription>
-                {extractedInformationSchemaDescription}
-              </FormDescription>
               <FormMessage />
             </FormItem>
           )}
         />
         <div className="flex justify-end gap-3">
           <Button variant="outline">Copy cURL</Button>
-          <Button type="submit">Create New Task</Button>
+          <Button type="submit">Create</Button>
         </div>
       </form>
     </Form>

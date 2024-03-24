@@ -20,23 +20,27 @@ function Settings() {
       <h1>Settings</h1>
       <div className="flex flex-col gap-4">
         <Label htmlFor={environmentInputId}>Environment</Label>
-        <Select value={environment} onValueChange={setEnvironment}>
-          <SelectTrigger className="w-full">
-            <SelectValue placeholder="Environment" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="local">local</SelectItem>
-          </SelectContent>
-        </Select>
+        <div className="w-72">
+          <Select value={environment} onValueChange={setEnvironment}>
+            <SelectTrigger>
+              <SelectValue placeholder="Environment" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="local">local</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
         <Label htmlFor={organizationInputId}>Organization</Label>
-        <Select value={organization} onValueChange={setOrganization}>
-          <SelectTrigger className="w-full">
-            <SelectValue placeholder="Organization" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="skyvern">Skyvern</SelectItem>
-          </SelectContent>
-        </Select>
+        <div className="w-72">
+          <Select value={organization} onValueChange={setOrganization}>
+            <SelectTrigger>
+              <SelectValue placeholder="Organization" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="skyvern">Skyvern</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
       </div>
     </div>
   );
