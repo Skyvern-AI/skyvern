@@ -1,6 +1,7 @@
 import datetime
 
 from sqlalchemy import JSON, Boolean, Column, DateTime, Enum, ForeignKey, Integer, Numeric, String, UnicodeText
+from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase
 
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
@@ -19,7 +20,7 @@ from skyvern.forge.sdk.db.id import (
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 
 
-class Base(DeclarativeBase):
+class Base(AsyncAttrs, DeclarativeBase):
     pass
 
 
