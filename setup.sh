@@ -14,7 +14,7 @@ command_exists() {
 
 ensure_required_commands() {
     # Ensure required commands are available
-    for cmd in poetry do
+    for cmd in poetry; do
         if ! command_exists "$cmd"; then
             echo "Error: $cmd is not installed." >&2
             exit 1
