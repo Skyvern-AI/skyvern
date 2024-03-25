@@ -1,6 +1,7 @@
 from typing import Annotated, Any
 
 import structlog
+import yaml
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel
@@ -25,9 +26,11 @@ from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.models.workflow import (
     RunWorkflowResponse,
+    Workflow,
     WorkflowRequestBody,
     WorkflowRunStatusResponse,
 )
+from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
 
 base_router = APIRouter()
 
@@ -445,4 +448,31 @@ async def get_workflow_run(
     request["agent"]
     return await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
         workflow_id=workflow_id, workflow_run_id=workflow_run_id, organization_id=current_org.organization_id
+    )
+
+
+@base_router.post(
+    "/workflows",
+    openapi_extra={
+        "requestBody": {
+            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
+            "required": True,
+        },
+    },
+    response_model=Workflow,
+)
+async def create_workflow(
+    request: Request,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Workflow:
+    analytics.capture("skyvern-oss-agent-workflow-create")
+    raw_yaml = await request.body()
+    try:
+        workflow_yaml = yaml.safe_load(raw_yaml)
+    except yaml.YAMLError:
+        raise HTTPException(status_code=422, detail="Invalid YAML")
+
+    workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
+    return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+        organization_id=current_org.organization_id, request=workflow_create_request
     )
