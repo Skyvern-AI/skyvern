@@ -20,7 +20,7 @@ import {
   webhookCallbackUrlDescription,
 } from "./descriptionHelperContent";
 import { Textarea } from "@/components/ui/textarea";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { client } from "@/api/AxiosClient";
 import { useToast } from "@/components/ui/use-toast";
 import { InfoCircledIcon } from "@radix-ui/react-icons";
@@ -61,6 +61,7 @@ function createTaskRequestObject(formValues: CreateNewTaskFormValues) {
 }
 
 function CreateNewTaskForm({ initialValues }: Props) {
+  const queryClient = useQueryClient();
   const { toast } = useToast();
 
   const form = useForm<CreateNewTaskFormValues>({
@@ -87,6 +88,9 @@ function CreateNewTaskForm({ initialValues }: Props) {
       toast({
         title: "Task Created",
         description: `${response.data.task_id} created successfully.`,
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["tasks"],
       });
     },
   });

@@ -2,7 +2,7 @@ import { Outlet } from "react-router-dom";
 
 function SettingsPageLayout() {
   return (
-    <div className="p-6 flex grow flex-col gap-4">
+    <div className="flex flex-col gap-4 px-6">
       <main>
         <Outlet />
       </main>

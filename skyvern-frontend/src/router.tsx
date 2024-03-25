@@ -23,11 +23,11 @@ const router = createBrowserRouter([
             index: true,
             element: <TaskList />,
           },
-          {
-            path: "create",
-            element: <CreateNewTask />,
-          },
         ],
+      },
+      {
+        path: "create",
+        element: <CreateNewTask />,
       },
       {
         path: "settings",

@@ -20,7 +20,7 @@ function Settings() {
       <h1>Settings</h1>
       <div className="flex flex-col gap-4">
         <Label htmlFor={environmentInputId}>Environment</Label>
-        <div className="w-72">
+        <div>
           <Select value={environment} onValueChange={setEnvironment}>
             <SelectTrigger>
               <SelectValue placeholder="Environment" />
@@ -31,7 +31,7 @@ function Settings() {
           </Select>
         </div>
         <Label htmlFor={organizationInputId}>Organization</Label>
-        <div className="w-72">
+        <div>
           <Select value={organization} onValueChange={setOrganization}>
             <SelectTrigger>
               <SelectValue placeholder="Organization" />
