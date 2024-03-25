@@ -692,7 +692,9 @@ class AgentDB:
     ) -> Workflow:
         try:
             async with self.Session() as session:
-                if workflow := await session.scalars(select(WorkflowModel).filter_by(workflow_id=workflow_id).first()):
+                if workflow := (
+                    await session.scalars(select(WorkflowModel).filter_by(workflow_id=workflow_id))
+                ).first():
                     if title:
                         workflow.title = title
                     if description:

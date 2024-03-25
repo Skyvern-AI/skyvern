@@ -21,7 +21,14 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicateParameterKeys
-from skyvern.forge.sdk.workflow.models.block import BlockType, BlockTypeVar, CodeBlock, ForLoopBlock, TaskBlock
+from skyvern.forge.sdk.workflow.models.block import (
+    BlockType,
+    BlockTypeVar,
+    CodeBlock,
+    ForLoopBlock,
+    TaskBlock,
+    TextPromptBlock,
+)
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     OutputParameter,
@@ -712,6 +719,17 @@ class WorkflowService:
                 parameters=[parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
                 if block_yaml.parameter_keys
                 else [],
+                output_parameter=output_parameter,
+            )
+        elif block_yaml.block_type == BlockType.TEXT_PROMPT:
+            return TextPromptBlock(
+                label=block_yaml.label,
+                llm_key=block_yaml.llm_key,
+                prompt=block_yaml.prompt,
+                parameters=[parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                if block_yaml.parameter_keys
+                else [],
+                json_schema=block_yaml.json_schema,
                 output_parameter=output_parameter,
             )
         raise ValueError(f"Invalid block type {block_yaml.block_type}")
