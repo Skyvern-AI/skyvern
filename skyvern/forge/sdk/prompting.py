@@ -96,3 +96,21 @@ class PromptEngine:
         except Exception:
             LOG.error("Failed to load prompt.", template=template, kwargs_keys=kwargs.keys(), exc_info=True)
             raise
+
+    def load_prompt_from_string(self, template: str, **kwargs: Any) -> str:
+        """
+        Load and populate the specified template from a string.
+
+        Args:
+            template (str): The template string to load.
+            **kwargs: The arguments to populate the template with.
+
+        Returns:
+            str: The populated template.
+        """
+        try:
+            jinja_template = self.env.from_string(template)
+            return jinja_template.render(**kwargs)
+        except Exception:
+            LOG.error("Failed to load prompt from string.", template=template, kwargs_keys=kwargs.keys(), exc_info=True)
+            raise

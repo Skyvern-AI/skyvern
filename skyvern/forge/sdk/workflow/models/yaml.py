@@ -94,10 +94,23 @@ class CodeBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
 
 
+class TextPromptBlockYAML(BlockYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the BlockType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    block_type: Literal[BlockType.TEXT_PROMPT] = BlockType.TEXT_PROMPT  # type: ignore
+
+    llm_key: str
+    prompt: str
+    parameter_keys: list[str] | None = None
+    json_schema: dict[str, Any] | None = None
+
+
 PARAMETER_YAML_SUBCLASSES = AWSSecretParameterYAML | WorkflowParameterYAML | ContextParameterYAML | OutputParameterYAML
 PARAMETER_YAML_TYPES = Annotated[PARAMETER_YAML_SUBCLASSES, Field(discriminator="parameter_type")]
 
-BLOCK_YAML_SUBCLASSES = TaskBlockYAML | ForLoopBlockYAML | CodeBlockYAML
+BLOCK_YAML_SUBCLASSES = TaskBlockYAML | ForLoopBlockYAML | CodeBlockYAML | TextPromptBlockYAML
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 
 
