@@ -689,21 +689,31 @@ class AgentDB:
         title: str | None = None,
         description: str | None = None,
         workflow_definition: dict[str, Any] | None = None,
-    ) -> Workflow | None:
-        async with self.Session() as session:
-            workflow = (await session.scalars(select(WorkflowModel).filter_by(workflow_id=workflow_id))).first()
-            if workflow:
-                if title:
-                    workflow.title = title
-                if description:
-                    workflow.description = description
-                if workflow_definition:
-                    workflow.workflow_definition = workflow_definition
-                await session.commit()
-                await session.refresh(workflow)
-                return convert_to_workflow(workflow, self.debug_enabled)
-            LOG.error("Workflow not found, nothing to update", workflow_id=workflow_id)
-            return None
+    ) -> Workflow:
+        try:
+            async with self.Session() as session:
+                if workflow := await session.scalars(select(WorkflowModel).filter_by(workflow_id=workflow_id).first()):
+                    if title:
+                        workflow.title = title
+                    if description:
+                        workflow.description = description
+                    if workflow_definition:
+                        workflow.workflow_definition = workflow_definition
+                    await session.commit()
+                    await session.refresh(workflow)
+                    return convert_to_workflow(workflow, self.debug_enabled)
+                else:
+                    raise NotFoundError("Workflow not found")
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except NotFoundError:
+            LOG.error("No workflow found to update", workflow_id=workflow_id)
+            LOG.error("NotFoundError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
 
     async def create_workflow_run(
         self, workflow_id: str, proxy_location: ProxyLocation | None = None, webhook_callback_url: str | None = None

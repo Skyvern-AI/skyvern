@@ -21,3 +21,11 @@ class OutputParameterKeyCollisionError(BaseWorkflowException):
         elif retry_count == 0:
             message += " Max duplicate retries reached, aborting."
         super().__init__(message)
+
+
+class WorkflowDefinitionHasDuplicateParameterKeys(BaseWorkflowException):
+    def __init__(self, duplicate_keys: set[str]) -> None:
+        super().__init__(
+            f"WorkflowDefinition has parameters with duplicate keys. Each parameter needs to have a unique "
+            f"key. Duplicate key(s): {','.join(duplicate_keys)}"
+        )

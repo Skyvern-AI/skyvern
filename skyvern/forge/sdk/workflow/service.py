@@ -20,9 +20,13 @@ from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicateParameterKeys
+from skyvern.forge.sdk.workflow.models.block import BlockType, BlockTypeVar, CodeBlock, ForLoopBlock, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     OutputParameter,
+    Parameter,
+    ParameterType,
     WorkflowParameter,
     WorkflowParameterType,
 )
@@ -36,6 +40,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowRunStatusResponse,
 )
+from skyvern.forge.sdk.workflow.models.yaml import BLOCK_YAML_TYPES, WorkflowCreateYAMLRequest
 from skyvern.webeye.browser_factory import BrowserState
 
 LOG = structlog.get_logger()
@@ -252,7 +257,7 @@ class WorkflowService:
         title: str | None = None,
         description: str | None = None,
         workflow_definition: WorkflowDefinition | None = None,
-    ) -> Workflow | None:
+    ) -> Workflow:
         if workflow_definition:
             workflow_definition.validate()
         return await app.DATABASE.update_workflow(
@@ -604,3 +609,109 @@ class WorkflowService:
 
         await self.persist_har_data(browser_state, last_step, workflow, workflow_run)
         await self.persist_tracing_data(browser_state, last_step, workflow_run)
+
+    async def create_workflow_from_request(self, organization_id: str, request: WorkflowCreateYAMLRequest) -> Workflow:
+        LOG.info("Creating workflow from request", organization_id=organization_id, title=request.title)
+        try:
+            workflow = await self.create_workflow(
+                organization_id=organization_id,
+                title=request.title,
+                description=request.description,
+                workflow_definition=WorkflowDefinition(blocks=[]),
+            )
+            # Create parameters from the request
+            parameters = {}
+            duplicate_parameter_keys = set()
+            for parameter in request.workflow_definition.parameters:
+                if parameter.key in parameters:
+                    LOG.error(f"Duplicate parameter key {parameter.key}")
+                    duplicate_parameter_keys.add(parameter.key)
+                    continue
+                if parameter.parameter_type == ParameterType.AWS_SECRET:
+                    parameters[parameter.key] = await self.create_aws_secret_parameter(
+                        workflow_id=workflow.workflow_id,
+                        aws_key=parameter.aws_key,
+                        key=parameter.key,
+                        description=parameter.description,
+                    )
+                elif parameter.parameter_type == ParameterType.WORKFLOW:
+                    parameters[parameter.key] = await self.create_workflow_parameter(
+                        workflow_id=workflow.workflow_id,
+                        workflow_parameter_type=parameter.workflow_parameter_type,
+                        key=parameter.key,
+                        default_value=parameter.default_value,
+                        description=parameter.description,
+                    )
+                elif parameter.parameter_type == ParameterType.OUTPUT:
+                    parameters[parameter.key] = await self.create_output_parameter(
+                        workflow_id=workflow.workflow_id,
+                        key=parameter.key,
+                        description=parameter.description,
+                    )
+            if duplicate_parameter_keys:
+                raise WorkflowDefinitionHasDuplicateParameterKeys(duplicate_keys=duplicate_parameter_keys)
+            # Create blocks from the request
+            block_label_mapping = {}
+            blocks = []
+            for block_yaml in request.workflow_definition.blocks:
+                block = await self.block_yaml_to_block(block_yaml, parameters)
+                blocks.append(block)
+                block_label_mapping[block.label] = block
+
+            # Set the blocks for the workflow definition
+            workflow_definition = WorkflowDefinition(blocks=blocks)
+            workflow = await self.update_workflow(
+                workflow_id=workflow.workflow_id,
+                workflow_definition=workflow_definition,
+            )
+            LOG.info(
+                f"Created workflow from request, title: {request.title}",
+                parameter_keys=[parameter.key for parameter in parameters.values()],
+                block_labels=[block.label for block in blocks],
+                organization_id=organization_id,
+                title=request.title,
+                workflow_id=workflow.workflow_id,
+            )
+            return workflow
+        except Exception as e:
+            LOG.exception(f"Failed to create workflow from request, title: {request.title}")
+            raise e
+
+    @staticmethod
+    async def block_yaml_to_block(block_yaml: BLOCK_YAML_TYPES, parameters: dict[str, Parameter]) -> BlockTypeVar:
+        output_parameter = parameters.get(block_yaml.output_parameter_key) if block_yaml.output_parameter_key else None
+        if block_yaml.block_type == BlockType.TASK:
+            task_block_parameters = (
+                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                if block_yaml.parameter_keys
+                else []
+            )
+            return TaskBlock(
+                label=block_yaml.label,
+                url=block_yaml.url,
+                title=block_yaml.title,
+                parameters=task_block_parameters,
+                output_parameter=output_parameter,
+                navigation_goal=block_yaml.navigation_goal,
+                data_extraction_goal=block_yaml.data_extraction_goal,
+                data_schema=block_yaml.data_schema,
+                error_code_mapping=block_yaml.error_code_mapping,
+                max_retries=block_yaml.max_retries,
+            )
+        elif block_yaml.block_type == BlockType.FOR_LOOP:
+            return ForLoopBlock(
+                label=block_yaml.label,
+                loop_over_parameter_key=parameters[block_yaml.loop_over_parameter_key],
+                loop_block=WorkflowService.block_yaml_to_block(block_yaml.loop_block, parameters),
+                output_parameter=output_parameter,
+            )
+        elif block_yaml.block_type == BlockType.CODE:
+            return CodeBlock(
+                label=block_yaml.label,
+                code=block_yaml.code,
+                parameters=[parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                if block_yaml.parameter_keys
+                else [],
+                output_parameter=output_parameter,
+            )
+        raise ValueError(f"Invalid block type {block_yaml.block_type}")

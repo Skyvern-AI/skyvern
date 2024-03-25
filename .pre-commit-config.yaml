@@ -44,6 +44,8 @@ repos:
           - types-requests
           - types-cachetools
           - alembic
+          - "sqlalchemy[mypy]"
+          - types-PyYAML
         exclude: |
           (?x)(
             ^tests.*|

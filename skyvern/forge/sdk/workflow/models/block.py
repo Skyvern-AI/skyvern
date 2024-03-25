@@ -110,6 +110,17 @@ class TaskBlock(Block):
         will_retry = True
         workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(workflow_run_id=workflow_run_id)
         workflow = await app.WORKFLOW_SERVICE.get_workflow(workflow_id=workflow_run.workflow_id)
+        # if the task url is parameterized, we need to get the value from the workflow run context
+        if self.url and workflow_run_context.has_parameter(self.url) and workflow_run_context.has_value(self.url):
+            task_url_parameter_value = workflow_run_context.get_value(self.url)
+            if task_url_parameter_value:
+                LOG.info(
+                    "Task URL is parameterized, using parameter value",
+                    task_url_parameter_value=task_url_parameter_value,
+                    task_url_parameter_key=self.url,
+                )
+                self.url = task_url_parameter_value
+
         # TODO (kerem) we should always retry on terminated. We should make a distinction between retriable and
         # non-retryable terminations
         while will_retry:

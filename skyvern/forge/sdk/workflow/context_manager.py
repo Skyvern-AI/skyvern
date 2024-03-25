@@ -60,6 +60,12 @@ class WorkflowRunContext:
         """
         return self.values[key]
 
+    def has_parameter(self, key: str) -> bool:
+        return key in self.parameters
+
+    def has_value(self, key: str) -> bool:
+        return key in self.values
+
     def set_value(self, key: str, value: Any) -> None:
         self.values[key] = value
 
