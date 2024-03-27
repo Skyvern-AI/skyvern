@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Awaitable, Protocol
+from typing import Any, Awaitable, Literal, Protocol
 
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -19,6 +19,33 @@ class LLMConfig:
                 missing_env_vars.append(env_var)
 
         return missing_env_vars
+
+
+@dataclass(frozen=True)
+class LLMRouterModelConfig:
+    model_name: str
+    # https://litellm.vercel.app/docs/routing
+    litellm_params: dict[str, Any]
+    tpm: int | None = None
+    rpm: int | None = None
+
+
+@dataclass(frozen=True)
+class LLMRouterConfig(LLMConfig):
+    model_list: list[LLMRouterModelConfig]
+    redis_host: str
+    redis_port: int
+    main_model_group: str
+    fallback_model_group: str | None = None
+    routing_strategy: Literal[
+        "simple-shuffle",
+        "least-busy",
+        "usage-based-routing",
+        "latency-based-routing",
+    ] = "usage-based-routing"
+    num_retries: int = 2
+    retry_delay_seconds: int = 15
+    set_verbose: bool = True
 
 
 class LLMAPIHandler(Protocol):
