@@ -1,3 +1,4 @@
+import dataclasses
 import json
 from typing import Any
 
@@ -7,8 +8,12 @@ import structlog
 
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
-from skyvern.forge.sdk.api.llm.exceptions import DuplicateCustomLLMProviderError, LLMProviderError
-from skyvern.forge.sdk.api.llm.models import LLMAPIHandler
+from skyvern.forge.sdk.api.llm.exceptions import (
+    DuplicateCustomLLMProviderError,
+    InvalidLLMConfigError,
+    LLMProviderError,
+)
+from skyvern.forge.sdk.api.llm.models import LLMAPIHandler, LLMRouterConfig
 from skyvern.forge.sdk.api.llm.utils import llm_messages_builder, parse_api_response
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.models import Step
@@ -21,8 +26,110 @@ class LLMAPIHandlerFactory:
     _custom_handlers: dict[str, LLMAPIHandler] = {}
 
     @staticmethod
+    def get_llm_api_handler_with_router(llm_key: str) -> LLMAPIHandler:
+        llm_config = LLMConfigRegistry.get_config(llm_key)
+        if not isinstance(llm_config, LLMRouterConfig):
+            raise InvalidLLMConfigError(llm_key)
+
+        router = litellm.Router(
+            model_list=[dataclasses.asdict(model) for model in llm_config.model_list],
+            redis_host=llm_config.redis_host,
+            redis_port=llm_config.redis_port,
+            routing_strategy=llm_config.routing_strategy,
+            fallbacks=[{llm_config.main_model_group: llm_config.fallback_model_group}]
+            if llm_config.fallback_model_group
+            else [],
+            num_retries=llm_config.num_retries,
+            retry_after=llm_config.retry_delay_seconds,
+            set_verbose=False if SettingsManager.get_settings().is_cloud_environment() else llm_config.set_verbose,
+        )
+        main_model_group = llm_config.main_model_group
+
+        async def llm_api_handler_with_router_and_fallback(
+            prompt: str,
+            step: Step | None = None,
+            screenshots: list[bytes] | None = None,
+            parameters: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            """
+            Custom LLM API handler that utilizes the LiteLLM router and fallbacks to OpenAI GPT-4 Vision.
+
+            Args:
+                prompt: The prompt to generate completions for.
+                step: The step object associated with the prompt.
+                screenshots: The screenshots associated with the prompt.
+                parameters: Additional parameters to be passed to the LLM router.
+
+            Returns:
+                The response from the LLM router.
+            """
+            if parameters is None:
+                parameters = LLMAPIHandlerFactory.get_api_parameters()
+
+            if step:
+                await app.ARTIFACT_MANAGER.create_artifact(
+                    step=step,
+                    artifact_type=ArtifactType.LLM_PROMPT,
+                    data=prompt.encode("utf-8"),
+                )
+                for screenshot in screenshots or []:
+                    await app.ARTIFACT_MANAGER.create_artifact(
+                        step=step,
+                        artifact_type=ArtifactType.SCREENSHOT_LLM,
+                        data=screenshot,
+                    )
+
+            messages = await llm_messages_builder(prompt, screenshots)
+            if step:
+                await app.ARTIFACT_MANAGER.create_artifact(
+                    step=step,
+                    artifact_type=ArtifactType.LLM_REQUEST,
+                    data=json.dumps(
+                        {
+                            "model": llm_key,
+                            "messages": messages,
+                            **parameters,
+                        }
+                    ).encode("utf-8"),
+                )
+            try:
+                response = await router.acompletion(model=main_model_group, messages=messages, **parameters)
+            except openai.OpenAIError as e:
+                raise LLMProviderError(llm_key) from e
+            except Exception as e:
+                LOG.exception("LLM request failed unexpectedly", llm_key=llm_key)
+                raise LLMProviderError(llm_key) from e
+
+            if step:
+                await app.ARTIFACT_MANAGER.create_artifact(
+                    step=step,
+                    artifact_type=ArtifactType.LLM_RESPONSE,
+                    data=response.model_dump_json(indent=2).encode("utf-8"),
+                )
+                llm_cost = litellm.completion_cost(completion_response=response)
+                await app.DATABASE.update_step(
+                    task_id=step.task_id,
+                    step_id=step.step_id,
+                    organization_id=step.organization_id,
+                    incremental_cost=llm_cost,
+                )
+            parsed_response = parse_api_response(response)
+            if step:
+                await app.ARTIFACT_MANAGER.create_artifact(
+                    step=step,
+                    artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
+                    data=json.dumps(parsed_response, indent=2).encode("utf-8"),
+                )
+            return parsed_response
+
+        return llm_api_handler_with_router_and_fallback
+
+    @staticmethod
     def get_llm_api_handler(llm_key: str) -> LLMAPIHandler:
         llm_config = LLMConfigRegistry.get_config(llm_key)
+
+        if LLMConfigRegistry.is_router_config(llm_key):
+            return LLMAPIHandlerFactory.get_llm_api_handler_with_router(llm_key)
 
         async def llm_api_handler(
             prompt: str,
