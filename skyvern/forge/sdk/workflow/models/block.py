@@ -1,8 +1,12 @@
 import abc
 import json
+import os
+import uuid
 from enum import StrEnum
+from tempfile import NamedTemporaryFile
 from typing import Annotated, Any, Literal, Union
 
+import aiohttp
 import structlog
 from pydantic import BaseModel, Field
 
@@ -14,9 +18,12 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.exceptions import DownloadFileMaxSizeExceeded
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     ContextParameter,
@@ -32,6 +39,7 @@ class BlockType(StrEnum):
     FOR_LOOP = "for_loop"
     CODE = "code"
     TEXT_PROMPT = "text_prompt"
+    DOWNLOAD_TO_S3 = "download_to_s3"
 
 
 class Block(BaseModel, abc.ABC):
@@ -47,6 +55,10 @@ class Block(BaseModel, abc.ABC):
     @staticmethod
     def get_workflow_run_context(workflow_run_id: str) -> WorkflowRunContext:
         return app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+
+    @staticmethod
+    def get_async_aws_client() -> AsyncAWSClient:
+        return app.WORKFLOW_CONTEXT_MANAGER.aws_client
 
     @abc.abstractmethod
     async def execute(self, workflow_run_id: str, **kwargs: dict) -> OutputParameter | None:
@@ -417,5 +429,92 @@ class TextPromptBlock(Block):
         return None
 
 
-BlockSubclasses = Union[ForLoopBlock, TaskBlock, CodeBlock, TextPromptBlock]
+class DownloadToS3Block(Block):
+    block_type: Literal[BlockType.DOWNLOAD_TO_S3] = BlockType.DOWNLOAD_TO_S3
+
+    url: str
+
+    def get_all_parameters(
+        self,
+    ) -> list[PARAMETER_TYPE]:
+        return []
+
+    async def _download_file(self, max_size_mb: int = 5) -> str:
+        async with aiohttp.ClientSession() as session:
+            LOG.info("Downloading file", url=self.url)
+            async with session.get(self.url) as response:
+                # Check the content length if available
+                if response.content_length and response.content_length > max_size_mb * 1024 * 1024:
+                    raise DownloadFileMaxSizeExceeded(max_size_mb)
+
+                # Don't forget to delete the temporary file after we're done with it
+                temp_file = NamedTemporaryFile(delete=False)
+
+                total_bytes_downloaded = 0
+                async for chunk in response.content.iter_chunked(8192):
+                    temp_file.write(chunk)
+                    total_bytes_downloaded += len(chunk)
+                    if total_bytes_downloaded > max_size_mb * 1024 * 1024:
+                        raise DownloadFileMaxSizeExceeded(max_size_mb)
+
+                # Seek back to the start of the file
+                temp_file.seek(0)
+
+                return temp_file.name
+
+    async def _upload_file_to_s3(self, uri: str, file_path: str) -> None:
+        try:
+            client = self.get_async_aws_client()
+            await client.upload_file_from_path(uri=uri, file_path=file_path)
+        finally:
+            # Clean up the temporary file since it's created with delete=False
+            os.unlink(file_path)
+
+    async def execute(self, workflow_run_id: str, **kwargs: dict) -> OutputParameter | None:
+        # get workflow run context
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        # get all parameters into a dictionary
+        if self.url and workflow_run_context.has_parameter(self.url) and workflow_run_context.has_value(self.url):
+            task_url_parameter_value = workflow_run_context.get_value(self.url)
+            if task_url_parameter_value:
+                LOG.info(
+                    "DownloadToS3Block: Task URL is parameterized, using parameter value",
+                    task_url_parameter_value=task_url_parameter_value,
+                    task_url_parameter_key=self.url,
+                )
+                self.url = task_url_parameter_value
+
+        try:
+            file_path = await self._download_file()
+        except Exception as e:
+            LOG.error("DownloadToS3Block: Failed to download file", url=self.url, error=str(e))
+            raise e
+
+        uri = None
+        try:
+            uri = f"s3://{SettingsManager.get_settings().AWS_S3_BUCKET_DOWNLOADS}/{SettingsManager.get_settings().ENV}/{workflow_run_id}/{uuid.uuid4()}"
+            await self._upload_file_to_s3(uri, file_path)
+        except Exception as e:
+            LOG.error("DownloadToS3Block: Failed to upload file to S3", uri=uri, error=str(e))
+            raise e
+
+        LOG.info("DownloadToS3Block: File downloaded and uploaded to S3", uri=uri)
+        if self.output_parameter:
+            LOG.info("DownloadToS3Block: Output parameter defined, registering output parameter value")
+            await workflow_run_context.register_output_parameter_value_post_execution(
+                parameter=self.output_parameter,
+                value=uri,
+            )
+            await app.DATABASE.create_workflow_run_output_parameter(
+                workflow_run_id=workflow_run_id,
+                output_parameter_id=self.output_parameter.output_parameter_id,
+                value=uri,
+            )
+            return self.output_parameter
+
+        LOG.info("DownloadToS3Block: No output parameter defined, returning None")
+        return None
+
+
+BlockSubclasses = Union[ForLoopBlock, TaskBlock, CodeBlock, TextPromptBlock, DownloadToS3Block]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]

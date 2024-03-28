@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     # Artifact storage settings
     ARTIFACT_STORAGE_PATH: str = f"{SKYVERN_DIR}/artifacts"
 
+    # S3 bucket settings
+    AWS_REGION: str = "us-east-1"
+    AWS_S3_BUCKET_DOWNLOADS: str = "skyvern-downloads"
+
     SKYVERN_TELEMETRY: bool = True
     ANALYTICS_ID: str = "anonymous"
 
