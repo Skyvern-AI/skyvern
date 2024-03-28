@@ -29,3 +29,8 @@ class WorkflowDefinitionHasDuplicateParameterKeys(BaseWorkflowException):
             f"WorkflowDefinition has parameters with duplicate keys. Each parameter needs to have a unique "
             f"key. Duplicate key(s): {','.join(duplicate_keys)}"
         )
+
+
+class DownloadFileMaxSizeExceeded(BaseWorkflowException):
+    def __init__(self, max_size: int) -> None:
+        super().__init__(f"Download file size exceeded the maximum allowed size of {max_size} MB.")

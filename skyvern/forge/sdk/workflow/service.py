@@ -25,6 +25,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     BlockType,
     BlockTypeVar,
     CodeBlock,
+    DownloadToS3Block,
     ForLoopBlock,
     TaskBlock,
     TextPromptBlock,
@@ -731,5 +732,11 @@ class WorkflowService:
                 else [],
                 json_schema=block_yaml.json_schema,
                 output_parameter=output_parameter,
+            )
+        elif block_yaml.block_type == BlockType.DOWNLOAD_TO_S3:
+            return DownloadToS3Block(
+                label=block_yaml.label,
+                output_parameter=output_parameter,
+                url=block_yaml.url,
             )
         raise ValueError(f"Invalid block type {block_yaml.block_type}")
