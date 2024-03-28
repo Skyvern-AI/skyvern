@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, List
 
 import structlog
 from sqlalchemy import and_, delete, select
@@ -403,6 +403,25 @@ class AgentDB:
                     return convert_to_organization(organization)
                 else:
                     return None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_organizations_by_name(self, organization_name: str) -> List[Organization]:
+        try:
+            with self.Session() as session:
+                orgs: List[Organization] = list()
+
+                if organizations := (
+                    session.query(OrganizationModel).filter_by(organization_name=organization_name).all()
+                ):
+                    for org in organizations:
+                        orgs.append(convert_to_organization(org))
+
+                return orgs
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
