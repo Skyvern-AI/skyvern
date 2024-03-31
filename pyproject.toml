@@ -48,6 +48,7 @@ typer = "^0.9.0"
 types-toml = "^0.10.8.7"
 apscheduler = "^3.10.4"
 httpx = "^0.27.0"
+filetype = "^1.2.0"
 
 
 [tool.poetry.group.dev.dependencies]
