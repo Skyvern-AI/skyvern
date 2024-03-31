@@ -31,6 +31,6 @@ class WorkflowDefinitionHasDuplicateParameterKeys(BaseWorkflowException):
         )
 
 
-class DownloadFileMaxSizeExceeded(BaseWorkflowException):
-    def __init__(self, max_size: int) -> None:
-        super().__init__(f"Download file size exceeded the maximum allowed size of {max_size} MB.")
+class InvalidEmailClientConfiguration(BaseWorkflowException):
+    def __init__(self, problems: list[str]) -> None:
+        super().__init__(f"Email client configuration is invalid. These parameters are missing or invalid: {problems}")

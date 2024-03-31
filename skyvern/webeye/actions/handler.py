@@ -131,7 +131,7 @@ async def handle_upload_file_action(
         )
         return [ActionFailure(ImaginaryFileUrl(action.file_url))]
     xpath = await validate_actions_in_dom(action, page, scraped_page)
-    file_path = download_file(file_url)
+    file_path = await download_file(file_url)
     locator = page.locator(f"xpath={xpath}")
     is_file_input = await is_file_input_element(locator)
     if is_file_input:
@@ -413,7 +413,11 @@ async def chain_click(
     file: list[str] | str = []
     if action.file_url:
         file_url = get_actual_value_of_parameter_if_secret(task, action.file_url)
-        file = download_file(file_url) or []
+        try:
+            file = await download_file(file_url)
+        except Exception:
+            LOG.exception("Failed to download file, continuing without it", action=action, file_url=file_url)
+            file = []
 
     fc_func = lambda fc: fc.set_files(files=file)
     page.on("filechooser", fc_func)

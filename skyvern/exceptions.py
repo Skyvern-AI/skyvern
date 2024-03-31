@@ -179,3 +179,9 @@ class FailedToTakeScreenshot(SkyvernException):
 class WorkflowRunContextNotInitialized(SkyvernException):
     def __init__(self, workflow_run_id: str) -> None:
         super().__init__(f"WorkflowRunContext not initialized for workflow run {workflow_run_id}")
+
+
+class DownloadFileMaxSizeExceeded(SkyvernException):
+    def __init__(self, max_size: int) -> None:
+        self.max_size = max_size
+        super().__init__(f"Download file size exceeded the maximum allowed size of {max_size} MB.")
