@@ -117,10 +117,30 @@ class DownloadToS3BlockYAML(BlockYAML):
     url: str
 
 
+class SendEmailBlockYAML(BlockYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the BlockType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    block_type: Literal[BlockType.SEND_EMAIL] = BlockType.SEND_EMAIL  # type: ignore
+
+    smtp_host_secret_parameter_key: str
+    smtp_port_secret_parameter_key: str
+    smtp_username_secret_parameter_key: str
+    smtp_password_secret_parameter_key: str
+    sender: str
+    recipients: list[str]
+    subject: str
+    body: str
+    file_attachments: list[str] | None = None
+
+
 PARAMETER_YAML_SUBCLASSES = AWSSecretParameterYAML | WorkflowParameterYAML | ContextParameterYAML | OutputParameterYAML
 PARAMETER_YAML_TYPES = Annotated[PARAMETER_YAML_SUBCLASSES, Field(discriminator="parameter_type")]
 
-BLOCK_YAML_SUBCLASSES = TaskBlockYAML | ForLoopBlockYAML | CodeBlockYAML | TextPromptBlockYAML | DownloadToS3BlockYAML
+BLOCK_YAML_SUBCLASSES = (
+    TaskBlockYAML | ForLoopBlockYAML | CodeBlockYAML | TextPromptBlockYAML | DownloadToS3BlockYAML | SendEmailBlockYAML
+)
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 
 

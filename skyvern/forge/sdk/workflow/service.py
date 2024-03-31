@@ -27,6 +27,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     CodeBlock,
     DownloadToS3Block,
     ForLoopBlock,
+    SendEmailBlock,
     TaskBlock,
     TextPromptBlock,
 )
@@ -738,5 +739,19 @@ class WorkflowService:
                 label=block_yaml.label,
                 output_parameter=output_parameter,
                 url=block_yaml.url,
+            )
+        elif block_yaml.block_type == BlockType.SEND_EMAIL:
+            return SendEmailBlock(
+                label=block_yaml.label,
+                output_parameter=output_parameter,
+                smtp_host=parameters[block_yaml.smtp_host_secret_parameter_key],
+                smtp_port=parameters[block_yaml.smtp_port_secret_parameter_key],
+                smtp_username=parameters[block_yaml.smtp_username_secret_parameter_key],
+                smtp_password=parameters[block_yaml.smtp_password_secret_parameter_key],
+                sender=block_yaml.sender,
+                recipients=block_yaml.recipients,
+                subject=block_yaml.subject,
+                body=block_yaml.body,
+                file_attachments=block_yaml.file_attachments or [],
             )
         raise ValueError(f"Invalid block type {block_yaml.block_type}")
