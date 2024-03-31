@@ -1,14 +1,5 @@
 import { client } from "@/api/AxiosClient";
-import { TaskApiResponse } from "@/api/types";
-import { useQuery } from "@tanstack/react-query";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+import { StepApiResponse } from "@/api/types";
 import {
   Pagination,
   PaginationContent,
@@ -17,23 +8,35 @@ import {
   PaginationNext,
   PaginationPrevious,
 } from "@/components/ui/pagination";
-import { useSearchParams } from "react-router-dom";
-import { TaskListSkeleton } from "./TaskListSkeleton";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { useQuery } from "@tanstack/react-query";
+import { useParams, useSearchParams } from "react-router-dom";
+import { StepListSkeleton } from "./StepListSkeleton";
+import { TaskStatusBadge } from "@/components/TaskStatusBadge";
+import { basicTimeFormat } from "@/util/timeFormat";
 
-function TaskList() {
+function StepList() {
+  const { taskId } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
 
   const {
-    data: tasks,
-    isPending,
+    data: steps,
+    isFetching,
     isError,
     error,
-  } = useQuery<Array<TaskApiResponse>>({
-    queryKey: ["tasks", page],
+  } = useQuery<Array<StepApiResponse>>({
+    queryKey: ["task", taskId, "steps", page],
     queryFn: async () => {
       return client
-        .get("/internal/tasks", {
+        .get(`/tasks/${taskId}/steps`, {
           params: {
             page,
           },
@@ -42,51 +45,43 @@ function TaskList() {
     },
   });
 
-  if (isPending) {
-    return <TaskListSkeleton />;
+  if (isFetching) {
+    return <StepListSkeleton />;
   }
 
   if (isError) {
     return <div>Error: {error?.message}</div>;
   }
 
+  if (!steps) {
+    return <div>No steps found</div>;
+  }
+
   return (
-    <div className="flex flex-col gap-2">
-      <h1>Task History</h1>
+    <>
       <Table>
         <TableHeader>
           <TableRow>
-            <TableHead>URL</TableHead>
-            <TableHead>Status</TableHead>
-            <TableHead>Created At</TableHead>
+            <TableHead className="w-1/3">Order</TableHead>
+            <TableHead className="w-1/3">Status</TableHead>
+            <TableHead className="w-1/3">Created At</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          {tasks.length === 0 ? (
+          {steps.length === 0 ? (
             <TableRow>
               <TableCell colSpan={3}>No tasks found</TableCell>
             </TableRow>
           ) : (
-            tasks.map((task) => {
-              const date = new Date(task.created_at);
-              const dateString = date.toLocaleDateString("en-us", {
-                weekday: "long",
-                year: "numeric",
-                month: "short",
-                day: "numeric",
-              });
-              const timeString = date.toLocaleTimeString("en-us");
-
+            steps.map((step) => {
               return (
-                <TableRow
-                  key={task.task_id}
-                  className="cursor-pointer w-4"
-                  onClick={() => console.log(task)}
-                >
-                  <TableCell>{task.url}</TableCell>
-                  <TableCell>{task.status}</TableCell>
-                  <TableCell>
-                    {dateString} at {timeString}
+                <TableRow key={step.step_id} className="cursor-pointer w-4">
+                  <TableCell className="w-1/3">{step.order}</TableCell>
+                  <TableCell className="w-1/3">
+                    <TaskStatusBadge status={step.status} />
+                  </TableCell>
+                  <TableCell className="w-1/3">
+                    {basicTimeFormat(step.created_at)}
                   </TableCell>
                 </TableRow>
               );
@@ -121,8 +116,8 @@ function TaskList() {
           </PaginationItem>
         </PaginationContent>
       </Pagination>
-    </div>
+    </>
   );
 }
 
-export { TaskList };
+export { StepList };

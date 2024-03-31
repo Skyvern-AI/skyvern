@@ -7,8 +7,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { SampleCase } from "./types";
-import { getSampleForInitialFormValues } from "./sampleTaskData";
+import { SampleCase } from "../types";
+import { getSampleForInitialFormValues } from "../data/sampleTaskData";
 import { Label } from "@/components/ui/label";
 
 function CreateNewTask() {

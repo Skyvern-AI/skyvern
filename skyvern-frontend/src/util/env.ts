@@ -16,4 +16,10 @@ if (!credential) {
   console.error("credential environment variable was not set");
 }
 
-export { apiBaseUrl, environment, credential };
+const artifactApiBaseUrl = import.meta.env.VITE_ARTIFACT_API_BASE_URL as string;
+
+if (!artifactApiBaseUrl) {
+  console.error("artifactApiBaseUrl environment variable was not set");
+}
+
+export { apiBaseUrl, environment, credential, artifactApiBaseUrl };

@@ -1,4 +1,4 @@
-import { SampleCase } from "./types";
+import { SampleCase } from "../types";
 
 export const bci_seguros = {
   url: "https://www.bciseguros.cl/nuestros_seguros/personas/seguro-automotriz/",

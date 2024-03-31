@@ -18,7 +18,7 @@ import {
   navigationPayloadDescription,
   urlDescription,
   webhookCallbackUrlDescription,
-} from "./descriptionHelperContent";
+} from "../data/descriptionHelperContent";
 import { Textarea } from "@/components/ui/textarea";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { client } from "@/api/AxiosClient";
@@ -30,6 +30,8 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { ToastAction } from "@radix-ui/react-toast";
+import { Link } from "react-router-dom";
 
 const createNewTaskFormSchema = z.object({
   url: z.string().url({
@@ -88,6 +90,13 @@ function CreateNewTaskForm({ initialValues }: Props) {
       toast({
         title: "Task Created",
         description: `${response.data.task_id} created successfully.`,
+        action: (
+          <ToastAction altText="View">
+            <Button asChild>
+              <Link to={`/tasks/${response.data.task_id}`}>View</Link>
+            </Button>
+          </ToastAction>
+        ),
       });
       queryClient.invalidateQueries({
         queryKey: ["tasks"],
