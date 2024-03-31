@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 10000
     MAX_STEPS_PER_RUN: int = 75
-    MAX_NUM_SCREENSHOTS: int = 6
+    MAX_NUM_SCREENSHOTS: int = 10
     # Ratio should be between 0 and 1.
     # If the task has been running for more steps than this ratio of the max steps per run, then we'll log a warning.
     LONG_RUNNING_TASK_WARNING_RATIO: float = 0.95
