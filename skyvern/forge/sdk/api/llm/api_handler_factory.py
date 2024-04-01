@@ -35,6 +35,7 @@ class LLMAPIHandlerFactory:
             model_list=[dataclasses.asdict(model) for model in llm_config.model_list],
             redis_host=llm_config.redis_host,
             redis_port=llm_config.redis_port,
+            redis_password=llm_config.redis_password,
             routing_strategy=llm_config.routing_strategy,
             fallbacks=[{llm_config.main_model_group: llm_config.fallback_model_group}]
             if llm_config.fallback_model_group

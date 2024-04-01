@@ -33,8 +33,10 @@ class LLMRouterModelConfig:
 @dataclass(frozen=True)
 class LLMRouterConfig(LLMConfig):
     model_list: list[LLMRouterModelConfig]
+    # All three redis parameters are required. Even if there isn't a password, it should be an empty string.
     redis_host: str
     redis_port: int
+    redis_password: str
     main_model_group: str
     fallback_model_group: str | None = None
     routing_strategy: Literal[
@@ -45,7 +47,7 @@ class LLMRouterConfig(LLMConfig):
     ] = "usage-based-routing"
     num_retries: int = 2
     retry_delay_seconds: int = 15
-    set_verbose: bool = True
+    set_verbose: bool = False
 
 
 class LLMAPIHandler(Protocol):
