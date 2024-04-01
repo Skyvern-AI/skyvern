@@ -256,186 +256,202 @@ with visualizer_tab:
     col_steps.markdown(f"#### Steps")
     col_artifacts.markdown("#### Artifacts")
     tasks_response = repository.get_tasks(task_page_number)
-    if "error" in tasks_response:
-        st.write(tasks_response)
-
-    # Display tasks in sidebar for selection
-    tasks = {task["task_id"]: task for task in tasks_response}
-    task_id_buttons = {
-        task_id: col_tasks.button(
-            f"{task_id}",
-            on_click=select_task,
-            args=(task,),
-            use_container_width=True,
-            type="primary" if selected_task and task_id == selected_task["task_id"] else "secondary",
-        )
-        for task_id, task in tasks.items()
-    }
-
-    # Display pagination buttons
-    task_page_prev, _, show_task_page_number, _, task_page_next = col_tasks.columns([1, 1, 1, 1, 1])
-    show_task_page_number.button(str(task_page_number), disabled=True)
-    if task_page_next.button("\>"):
-        st.session_state.task_page_number += 1
-    if task_page_prev.button("\<", disabled=task_page_number == 1):
-        st.session_state.task_page_number = max(1, st.session_state.task_page_number - 1)
-
-    (
-        tab_task,
-        tab_step,
-        tab_recording,
-        tab_screenshot,
-        tab_post_action_screenshot,
-        tab_id_to_xpath,
-        tab_element_tree,
-        tab_element_tree_trimmed,
-        tab_llm_prompt,
-        tab_llm_request,
-        tab_llm_response_parsed,
-        tab_llm_response_raw,
-        tab_html,
-    ) = col_artifacts.tabs(
-        [
-            ":green[Task]",
-            ":blue[Step]",
-            ":violet[Recording]",
-            ":rainbow[Screenshot]",
-            ":rainbow[Action Screenshots]",
-            ":red[ID -> XPath]",
-            ":orange[Element Tree]",
-            ":blue[Element Tree (Trimmed)]",
-            ":yellow[LLM Prompt]",
-            ":green[LLM Request]",
-            ":blue[LLM Response (Parsed)]",
-            ":violet[LLM Response (Raw)]",
-            ":rainbow[Html (Raw)]",
-        ]
-    )
-
-    tab_task_details, tab_task_steps, tab_task_action_results = tab_task.tabs(["Details", "Steps", "Action Results"])
-
-    if selected_task:
-        tab_task_details.json(selected_task)
-        if selected_task_recording_uri:
-            streamlit_show_recording(tab_recording, selected_task_recording_uri)
-
-        if task_steps:
-            col_steps_prev, _, col_steps_next = col_steps.columns([3, 1, 3])
-            col_steps_prev.button(
-                "prev", on_click=go_to_previous_step, key="previous_step_button", use_container_width=True
+    if type(tasks_response) is not list:
+        st.error("Failed to fetch tasks.")
+        st.error(tasks_response)
+        if "Organization not found" in str(tasks_response) or "Could not validate credentials" in str(tasks_response):
+            st.error("Please check the organization credentials in .streamlit/secrets.toml.")
+            st.error(
+                "You can validate the credentials against the postgresql credentials by running\n\n"
+                '`psql -U skyvern -h localhost -d skyvern -c "SELECT o.organization_id, o.organization_name, token FROM organizations o JOIN organization_auth_tokens oat ON oat.organization_id = o.organization_id;"`.'
+                "\n\n NOTE: There might be multiple organizations -- each run of ./setup.sh creates a new one. Pick your favourite!"
             )
-            col_steps_next.button("next", on_click=go_to_next_step, key="next_step_button", use_container_width=True)
 
-        step_id_buttons = {
-            step["step_id"]: col_steps.button(
-                f"{step['order']} - {step['retry_index']} - {step['step_id']}",
-                on_click=select_step,
-                args=(step,),
+    else:
+        # Display tasks in sidebar for selection
+        tasks = {task["task_id"]: task for task in tasks_response}
+        task_id_buttons = {
+            task_id: col_tasks.button(
+                f"{task_id}",
+                on_click=select_task,
+                args=(task,),
                 use_container_width=True,
-                type="primary" if selected_step and step["step_id"] == selected_step["step_id"] else "secondary",
+                type="primary" if selected_task and task_id == selected_task["task_id"] else "secondary",
             )
-            for step in task_steps
+            for task_id, task in tasks.items()
         }
 
-        df = pd.json_normalize(task_steps)
-        tab_task_steps.dataframe(df, use_container_width=True, height=1000)
+        # Display pagination buttons
+        task_page_prev, _, show_task_page_number, _, task_page_next = col_tasks.columns([1, 1, 1, 1, 1])
+        show_task_page_number.button(str(task_page_number), disabled=True)
+        if task_page_next.button("\>"):
+            st.session_state.task_page_number += 1
+        if task_page_prev.button("\<", disabled=task_page_number == 1):
+            st.session_state.task_page_number = max(1, st.session_state.task_page_number - 1)
 
-        task_action_results = []
-        for step in task_steps:
-            output = step.get("output")
-            step_id = step["step_id"]
-            if output:
-                step_action_results = output.get("action_results", [])
-                for action_result in step_action_results:
-                    task_action_results.append(
-                        {
-                            "step_id": step_id,
-                            "order": step["order"],
-                            "retry_index": step["retry_index"],
-                            **action_result,
-                        }
-                    )
-        df = pd.json_normalize(task_action_results)
-        df = df.reindex(sorted(df.columns), axis=1)
-        tab_task_action_results.dataframe(df, use_container_width=True, height=1000)
+        (
+            tab_task,
+            tab_step,
+            tab_recording,
+            tab_screenshot,
+            tab_post_action_screenshot,
+            tab_id_to_xpath,
+            tab_element_tree,
+            tab_element_tree_trimmed,
+            tab_llm_prompt,
+            tab_llm_request,
+            tab_llm_response_parsed,
+            tab_llm_response_raw,
+            tab_html,
+        ) = col_artifacts.tabs(
+            [
+                ":green[Task]",
+                ":blue[Step]",
+                ":violet[Recording]",
+                ":rainbow[Screenshot]",
+                ":rainbow[Action Screenshots]",
+                ":red[ID -> XPath]",
+                ":orange[Element Tree]",
+                ":blue[Element Tree (Trimmed)]",
+                ":yellow[LLM Prompt]",
+                ":green[LLM Request]",
+                ":blue[LLM Response (Parsed)]",
+                ":violet[LLM Response (Raw)]",
+                ":rainbow[Html (Raw)]",
+            ]
+        )
 
-        if selected_step:
-            tab_step.json(selected_step)
+        tab_task_details, tab_task_steps, tab_task_action_results = tab_task.tabs(
+            ["Details", "Steps", "Action Results"]
+        )
 
-            artifacts_response = repository.get_artifacts(selected_task["task_id"], selected_step["step_id"])
-            split_artifact_uris = [artifact["uri"].split("/") for artifact in artifacts_response]
-            file_name_to_uris = {split_uri[-1]: "/".join(split_uri) for split_uri in split_artifact_uris}
+        if selected_task:
+            tab_task_details.json(selected_task)
+            if selected_task_recording_uri:
+                streamlit_show_recording(tab_recording, selected_task_recording_uri)
 
-            for file_name, uri in file_name_to_uris.items():
-                file_name = file_name.lower()
-                if file_name.endswith("screenshot_llm.png") or file_name.endswith("screenshot.png"):
-                    streamlit_content_safe(
-                        tab_screenshot,
-                        tab_screenshot.image,
-                        read_artifact_safe(uri, is_image=True),
-                        "No screenshot available.",
-                        use_column_width=True,
-                    )
-                elif file_name.endswith("screenshot_action.png"):
-                    streamlit_content_safe(
-                        tab_post_action_screenshot,
-                        tab_post_action_screenshot.image,
-                        read_artifact_safe(uri, is_image=True),
-                        "No action screenshot available.",
-                        use_column_width=True,
-                    )
-                elif file_name.endswith("id_xpath_map.json"):
-                    streamlit_content_safe(
-                        tab_id_to_xpath, tab_id_to_xpath.json, read_artifact_safe(uri), "No ID -> XPath map available."
-                    )
-                elif file_name.endswith("tree.json"):
-                    streamlit_content_safe(
-                        tab_element_tree,
-                        tab_element_tree.json,
-                        read_artifact_safe(uri),
-                        "No element tree available.",
-                    )
-                elif file_name.endswith("tree_trimmed.json"):
-                    streamlit_content_safe(
-                        tab_element_tree_trimmed,
-                        tab_element_tree_trimmed.json,
-                        read_artifact_safe(uri),
-                        "No element tree trimmed available.",
-                    )
-                elif file_name.endswith("llm_prompt.txt"):
-                    content = read_artifact_safe(uri)
-                    # this is a hacky way to call this generic method to get it working with st.text_area
-                    streamlit_content_safe(
-                        tab_llm_prompt,
-                        tab_llm_prompt.text_area,
-                        content,
-                        "No LLM prompt available.",
-                        value=content,
-                        height=1000,
-                        label_visibility="collapsed",
-                    )
-                    # tab_llm_prompt.text_area("collapsed", value=content, label_visibility="collapsed", height=1000)
-                elif file_name.endswith("llm_request.json"):
-                    streamlit_content_safe(
-                        tab_llm_request, tab_llm_request.json, read_artifact_safe(uri), "No LLM request available."
-                    )
-                elif file_name.endswith("llm_response_parsed.json"):
-                    streamlit_content_safe(
-                        tab_llm_response_parsed,
-                        tab_llm_response_parsed.json,
-                        read_artifact_safe(uri),
-                        "No parsed LLM response available.",
-                    )
-                elif file_name.endswith("llm_response.json"):
-                    streamlit_content_safe(
-                        tab_llm_response_raw,
-                        tab_llm_response_raw.json,
-                        read_artifact_safe(uri),
-                        "No raw LLM response available.",
-                    )
-                elif file_name.endswith("html_scrape.html"):
-                    streamlit_content_safe(tab_html, tab_html.text, read_artifact_safe(uri), "No html available.")
-                elif file_name.endswith("html_action.html"):
-                    streamlit_content_safe(tab_html, tab_html.text, read_artifact_safe(uri), "No html available.")
-                else:
-                    st.write(f"Artifact {file_name} not supported.")
+            if task_steps:
+                col_steps_prev, _, col_steps_next = col_steps.columns([3, 1, 3])
+                col_steps_prev.button(
+                    "prev", on_click=go_to_previous_step, key="previous_step_button", use_container_width=True
+                )
+                col_steps_next.button(
+                    "next", on_click=go_to_next_step, key="next_step_button", use_container_width=True
+                )
+
+            step_id_buttons = {
+                step["step_id"]: col_steps.button(
+                    f"{step['order']} - {step['retry_index']} - {step['step_id']}",
+                    on_click=select_step,
+                    args=(step,),
+                    use_container_width=True,
+                    type="primary" if selected_step and step["step_id"] == selected_step["step_id"] else "secondary",
+                )
+                for step in task_steps
+            }
+
+            df = pd.json_normalize(task_steps)
+            tab_task_steps.dataframe(df, use_container_width=True, height=1000)
+
+            task_action_results = []
+            for step in task_steps:
+                output = step.get("output")
+                step_id = step["step_id"]
+                if output:
+                    step_action_results = output.get("action_results", [])
+                    for action_result in step_action_results:
+                        task_action_results.append(
+                            {
+                                "step_id": step_id,
+                                "order": step["order"],
+                                "retry_index": step["retry_index"],
+                                **action_result,
+                            }
+                        )
+            df = pd.json_normalize(task_action_results)
+            df = df.reindex(sorted(df.columns), axis=1)
+            tab_task_action_results.dataframe(df, use_container_width=True, height=1000)
+
+            if selected_step:
+                tab_step.json(selected_step)
+
+                artifacts_response = repository.get_artifacts(selected_task["task_id"], selected_step["step_id"])
+                split_artifact_uris = [artifact["uri"].split("/") for artifact in artifacts_response]
+                file_name_to_uris = {split_uri[-1]: "/".join(split_uri) for split_uri in split_artifact_uris}
+
+                for file_name, uri in file_name_to_uris.items():
+                    file_name = file_name.lower()
+                    if file_name.endswith("screenshot_llm.png") or file_name.endswith("screenshot.png"):
+                        streamlit_content_safe(
+                            tab_screenshot,
+                            tab_screenshot.image,
+                            read_artifact_safe(uri, is_image=True),
+                            "No screenshot available.",
+                            use_column_width=True,
+                        )
+                    elif file_name.endswith("screenshot_action.png"):
+                        streamlit_content_safe(
+                            tab_post_action_screenshot,
+                            tab_post_action_screenshot.image,
+                            read_artifact_safe(uri, is_image=True),
+                            "No action screenshot available.",
+                            use_column_width=True,
+                        )
+                    elif file_name.endswith("id_xpath_map.json"):
+                        streamlit_content_safe(
+                            tab_id_to_xpath,
+                            tab_id_to_xpath.json,
+                            read_artifact_safe(uri),
+                            "No ID -> XPath map available.",
+                        )
+                    elif file_name.endswith("tree.json"):
+                        streamlit_content_safe(
+                            tab_element_tree,
+                            tab_element_tree.json,
+                            read_artifact_safe(uri),
+                            "No element tree available.",
+                        )
+                    elif file_name.endswith("tree_trimmed.json"):
+                        streamlit_content_safe(
+                            tab_element_tree_trimmed,
+                            tab_element_tree_trimmed.json,
+                            read_artifact_safe(uri),
+                            "No element tree trimmed available.",
+                        )
+                    elif file_name.endswith("llm_prompt.txt"):
+                        content = read_artifact_safe(uri)
+                        # this is a hacky way to call this generic method to get it working with st.text_area
+                        streamlit_content_safe(
+                            tab_llm_prompt,
+                            tab_llm_prompt.text_area,
+                            content,
+                            "No LLM prompt available.",
+                            value=content,
+                            height=1000,
+                            label_visibility="collapsed",
+                        )
+                        # tab_llm_prompt.text_area("collapsed", value=content, label_visibility="collapsed", height=1000)
+                    elif file_name.endswith("llm_request.json"):
+                        streamlit_content_safe(
+                            tab_llm_request, tab_llm_request.json, read_artifact_safe(uri), "No LLM request available."
+                        )
+                    elif file_name.endswith("llm_response_parsed.json"):
+                        streamlit_content_safe(
+                            tab_llm_response_parsed,
+                            tab_llm_response_parsed.json,
+                            read_artifact_safe(uri),
+                            "No parsed LLM response available.",
+                        )
+                    elif file_name.endswith("llm_response.json"):
+                        streamlit_content_safe(
+                            tab_llm_response_raw,
+                            tab_llm_response_raw.json,
+                            read_artifact_safe(uri),
+                            "No raw LLM response available.",
+                        )
+                    elif file_name.endswith("html_scrape.html"):
+                        streamlit_content_safe(tab_html, tab_html.text, read_artifact_safe(uri), "No html available.")
+                    elif file_name.endswith("html_action.html"):
+                        streamlit_content_safe(tab_html, tab_html.text, read_artifact_safe(uri), "No html available.")
+                    else:
+                        st.write(f"Artifact {file_name} not supported.")
