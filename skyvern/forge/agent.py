@@ -787,7 +787,7 @@ class ForgeAgent(Agent):
         if recording_artifact:
             recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
-        # get the artifact of the last  screenshot and get the screenshot_url
+        # get the artifact of the last TASK_RESPONSE_ACTION_SCREENSHOT_COUNT screenshots and get the screenshot_url
         latest_action_screenshot_artifacts = await app.DATABASE.get_latest_n_artifacts(
             task_id=task.task_id,
             organization_id=task.organization_id,
