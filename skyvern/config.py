@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     DEBUG_MODE: bool = False
     DATABASE_STRING: str = "postgresql+psycopg://skyvern@localhost/skyvern"
     PROMPT_ACTION_HISTORY_WINDOW: int = 5
+    TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
     ENV: str = "local"
     EXECUTE_ALL_STEPS: bool = True

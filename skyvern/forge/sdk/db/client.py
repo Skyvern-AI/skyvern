@@ -613,6 +613,32 @@ class AgentDB:
         organization_id: str | None = None,
     ) -> Artifact | None:
         try:
+            artifacts = await self.get_latest_n_artifacts(
+                task_id=task_id,
+                step_id=step_id,
+                artifact_types=artifact_types,
+                organization_id=organization_id,
+                n=1,
+            )
+            if artifacts:
+                return artifacts[0]
+            return None
+        except SQLAlchemyError:
+            LOG.exception("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.exception("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_latest_n_artifacts(
+        self,
+        task_id: str,
+        step_id: str | None = None,
+        artifact_types: list[ArtifactType] | None = None,
+        organization_id: str | None = None,
+        n: int = 1,
+    ) -> list[Artifact] | None:
+        try:
             async with self.Session() as session:
                 artifact_query = select(ArtifactModel).filter_by(task_id=task_id)
                 if step_id:
@@ -622,9 +648,11 @@ class AgentDB:
                 if artifact_types:
                     artifact_query = artifact_query.filter(ArtifactModel.artifact_type.in_(artifact_types))
 
-                artifact = (await session.scalars(artifact_query.order_by(ArtifactModel.created_at.desc()))).first()
-                if artifact:
-                    return convert_to_artifact(artifact, self.debug_enabled)
+                artifacts = (await session.scalars(artifact_query.order_by(ArtifactModel.created_at.desc()))).fetchmany(
+                    n
+                )
+                if artifacts:
+                    return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifacts]
                 return None
         except SQLAlchemyError:
             LOG.exception("SQLAlchemyError", exc_info=True)
