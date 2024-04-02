@@ -787,6 +787,27 @@ class ForgeAgent(Agent):
         if recording_artifact:
             recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
+        # get the artifact of the last  screenshot and get the screenshot_url
+        latest_action_screenshot_artifacts = await app.DATABASE.get_latest_n_artifacts(
+            task_id=task.task_id,
+            organization_id=task.organization_id,
+            artifact_types=[ArtifactType.SCREENSHOT_ACTION],
+            n=SettingsManager.get_settings().TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
+        )
+        latest_action_screenshot_urls = []
+        if latest_action_screenshot_artifacts:
+            for artifact in latest_action_screenshot_artifacts:
+                screenshot_url = await app.ARTIFACT_MANAGER.get_share_link(artifact)
+                if screenshot_url:
+                    latest_action_screenshot_urls.append(screenshot_url)
+                else:
+                    LOG.error(
+                        "Failed to get share link for action screenshot",
+                        artifact_id=artifact.artifact_id,
+                    )
+        else:
+            LOG.error("Failed to get latest action screenshots")
+
         # get the latest task from the db to get the latest status, extracted_information, and failure_reason
         task_from_db = await app.DATABASE.get_task(task_id=task.task_id, organization_id=task.organization_id)
         if not task_from_db:
@@ -798,7 +819,11 @@ class ForgeAgent(Agent):
             LOG.info("Task has no webhook callback url. Not sending task response")
             return
 
-        task_response = task.to_task_response(screenshot_url=screenshot_url, recording_url=recording_url)
+        task_response = task.to_task_response(
+            action_screenshot_urls=latest_action_screenshot_urls,
+            screenshot_url=screenshot_url,
+            recording_url=recording_url,
+        )
 
         # send task_response to the webhook callback url
         # TODO: use async requests (httpx)
