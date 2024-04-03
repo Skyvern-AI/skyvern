@@ -8,6 +8,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.id import (
     generate_artifact_id,
     generate_aws_secret_parameter_id,
+    generate_bitwarden_login_credential_parameter_id,
     generate_org_id,
     generate_organization_auth_token_id,
     generate_output_parameter_id,
@@ -172,6 +173,24 @@ class AWSSecretParameterModel(Base):
     key = Column(String, nullable=False)
     description = Column(String, nullable=True)
     aws_key = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class BitwardenLoginCredentialParameterModel(Base):
+    __tablename__ = "bitwarden_login_credential_parameters"
+
+    bitwarden_login_credential_parameter_id = Column(
+        String, primary_key=True, index=True, default=generate_bitwarden_login_credential_parameter_id
+    )
+    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), index=True, nullable=False)
+    key = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    bitwarden_client_id_aws_secret_key = Column(String, nullable=False)
+    bitwarden_client_secret_aws_secret_key = Column(String, nullable=False)
+    bitwarden_master_password_aws_secret_key = Column(String, nullable=False)
+    url_parameter_key = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)

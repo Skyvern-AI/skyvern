@@ -11,6 +11,7 @@ class ParameterType(StrEnum):
     WORKFLOW = "workflow"
     CONTEXT = "context"
     AWS_SECRET = "aws_secret"
+    BITWARDEN_LOGIN_CREDENTIAL = "bitwarden_login_credential"
     OUTPUT = "output"
 
 
@@ -31,6 +32,23 @@ class AWSSecretParameter(Parameter):
     aws_secret_parameter_id: str
     workflow_id: str
     aws_key: str
+
+    created_at: datetime
+    modified_at: datetime
+    deleted_at: datetime | None = None
+
+
+class BitwardenLoginCredentialParameter(Parameter):
+    parameter_type: Literal[ParameterType.BITWARDEN_LOGIN_CREDENTIAL] = ParameterType.BITWARDEN_LOGIN_CREDENTIAL
+    # parameter fields
+    bitwarden_login_credential_parameter_id: str
+    workflow_id: str
+    # bitwarden cli required fields
+    bitwarden_client_id_aws_secret_key: str
+    bitwarden_client_secret_aws_secret_key: str
+    bitwarden_master_password_aws_secret_key: str
+    # url to request the login credentials from bitwarden
+    url_parameter_key: str
 
     created_at: datetime
     modified_at: datetime
@@ -92,5 +110,7 @@ class OutputParameter(Parameter):
     deleted_at: datetime | None = None
 
 
-ParameterSubclasses = Union[WorkflowParameter, ContextParameter, AWSSecretParameter, OutputParameter]
+ParameterSubclasses = Union[
+    WorkflowParameter, ContextParameter, AWSSecretParameter, BitwardenLoginCredentialParameter, OutputParameter
+]
 PARAMETER_TYPE = Annotated[ParameterSubclasses, Field(discriminator="parameter_type")]

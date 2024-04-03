@@ -351,6 +351,26 @@ class WorkflowService:
             workflow_id=workflow_id, aws_key=aws_key, key=key, description=description
         )
 
+    async def create_bitwarden_login_credential_parameter(
+        self,
+        workflow_id: str,
+        bitwarden_client_id_aws_secret_key: str,
+        bitwarden_client_secret_aws_secret_key: str,
+        bitwarden_master_password_aws_secret_key: str,
+        url_parameter_key: str,
+        key: str,
+        description: str | None = None,
+    ) -> Parameter:
+        return await app.DATABASE.create_bitwarden_login_credential_parameter(
+            workflow_id=workflow_id,
+            bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
+            bitwarden_client_secret_aws_secret_key=bitwarden_client_secret_aws_secret_key,
+            bitwarden_master_password_aws_secret_key=bitwarden_master_password_aws_secret_key,
+            url_parameter_key=url_parameter_key,
+            key=key,
+            description=description,
+        )
+
     async def create_output_parameter(
         self, workflow_id: str, key: str, description: str | None = None
     ) -> OutputParameter:
@@ -643,6 +663,16 @@ class WorkflowService:
                         key=parameter.key,
                         description=parameter.description,
                     )
+                elif parameter.parameter_type == ParameterType.BITWARDEN_LOGIN_CREDENTIAL:
+                    parameters[parameter.key] = await self.create_bitwarden_login_credential_parameter(
+                        workflow_id=workflow.workflow_id,
+                        bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
+                        bitwarden_client_secret_aws_secret_key=parameter.bitwarden_client_secret_aws_secret_key,
+                        bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
+                        url_parameter_key=parameter.url_parameter_key,
+                        key=parameter.key,
+                        description=parameter.description,
+                    )
                 elif parameter.parameter_type == ParameterType.WORKFLOW:
                     parameters[parameter.key] = await self.create_workflow_parameter(
                         workflow_id=workflow.workflow_id,
@@ -708,10 +738,12 @@ class WorkflowService:
                 max_retries=block_yaml.max_retries,
             )
         elif block_yaml.block_type == BlockType.FOR_LOOP:
+            loop_block = await WorkflowService.block_yaml_to_block(block_yaml.loop_block, parameters)
+            loop_over_parameter = parameters[block_yaml.loop_over_parameter_key]
             return ForLoopBlock(
                 label=block_yaml.label,
-                loop_over_parameter_key=parameters[block_yaml.loop_over_parameter_key],
-                loop_block=WorkflowService.block_yaml_to_block(block_yaml.loop_block, parameters),
+                loop_over=loop_over_parameter,
+                loop_block=loop_block,
                 output_parameter=output_parameter,
             )
         elif block_yaml.block_type == BlockType.CODE:
