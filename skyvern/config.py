@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     ENABLE_OPENAI: bool = True
     ENABLE_ANTHROPIC: bool = False
     ENABLE_AZURE: bool = False
+    ENABLE_GEMINI: bool = False
     # OPENAI
     OPENAI_API_KEY: str | None = None
     # ANTHROPIC
@@ -70,6 +71,8 @@ class Settings(BaseSettings):
     AZURE_API_KEY: str | None = None
     AZURE_API_BASE: str | None = None
     AZURE_API_VERSION: str | None = None
+    #Gemini
+    GEMINI_API_KEY: str | None = None
 
     def is_cloud_environment(self) -> bool:
         """

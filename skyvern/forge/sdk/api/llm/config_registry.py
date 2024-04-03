@@ -1,5 +1,5 @@
 import structlog
-
+import litellm
 from skyvern.forge.sdk.api.llm.exceptions import (
     DuplicateLLMConfigError,
     InvalidLLMConfigError,
@@ -72,3 +72,11 @@ if SettingsManager.get_settings().ENABLE_AZURE:
             True,
         ),
     )
+if SettingsManager.get_settings().ENABLE_GEMINI:
+    LLMConfigRegistry.register_config(
+        "GEMINI_GPT4V", 
+        litellm.completion("gpt-4-vision-preview",
+                   ["GEMINI_API_KEY"],
+                     True,                    
+                )
+           )
