@@ -275,7 +275,7 @@ class ForLoopBlock(Block):
         return context_parameters
 
     def get_loop_over_parameter_values(self, workflow_run_context: WorkflowRunContext) -> list[Any]:
-        if isinstance(self.loop_over, WorkflowParameter):
+        if isinstance(self.loop_over, WorkflowParameter) or isinstance(self.loop_over, OutputParameter):
             parameter_value = workflow_run_context.get_value(self.loop_over.key)
             if isinstance(parameter_value, list):
                 return parameter_value
@@ -284,7 +284,6 @@ class ForLoopBlock(Block):
                 return [parameter_value]
         else:
             # TODO (kerem): Implement this for context parameters
-            # TODO (kerem): Implement this for output parameters
             raise NotImplementedError
 
     async def execute(self, workflow_run_id: str, **kwargs: dict) -> OutputParameter | None:
