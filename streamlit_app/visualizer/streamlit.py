@@ -259,13 +259,19 @@ with visualizer_tab:
     if type(tasks_response) is not list:
         st.error("Failed to fetch tasks.")
         st.error(tasks_response)
-        if "Organization not found" in str(tasks_response) or "Could not validate credentials" in str(tasks_response):
-            st.error("Please check the organization credentials in .streamlit/secrets.toml.")
-            st.error(
-                "You can validate the credentials against the postgresql credentials by running\n\n"
-                '`psql -U skyvern -h localhost -d skyvern -c "SELECT o.organization_id, o.organization_name, token FROM organizations o JOIN organization_auth_tokens oat ON oat.organization_id = o.organization_id;"`.'
-                "\n\n NOTE: There might be multiple organizations -- each run of ./setup.sh creates a new one. Pick your favourite!"
-            )
+        st.error(
+            "#1 -- Make sure you have both the server (./run_skyvern.sh) and client (./run_ui.sh) running at the same time in different terminals."
+        )
+        st.error(
+            "#2 -- If you're getting a credentials error, Make sure you have the correct organization credentials in .streamlit/secrets.toml."
+        )
+        st.error(
+            "You can validate the credentials against the postgresql credentials by running\n\n"
+            '`psql -U skyvern -h localhost -d skyvern -c "SELECT o.organization_id, o.organization_name, token FROM organizations o JOIN organization_auth_tokens oat ON oat.organization_id = o.organization_id;"`.'
+            "\n\n NOTE: There might be multiple organizations -- each run of ./setup.sh creates a new one. Pick your favourite!"
+            "\n\n If you're running postgres via Docker, please make sure you wrap it in a docker exec command. "
+            "`docker exec postgresql-container psql -U skyvern -h localhost -d skyvern -c 'SELECT o.organization_id, o.organization_name, token FROM organizations o JOIN organization_auth_tokens oat ON oat.organization_id = o.organization_id;'`"
+        )
 
     else:
         # Display tasks in sidebar for selection
