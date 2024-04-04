@@ -78,7 +78,8 @@ Before you begin, make sure you have the following installed:
 - [Brew (if you're on a Mac)](https://brew.sh/)
 - [Poetry](https://python-poetry.org/docs/#installation)
     - `brew install poetry`
-
+- [Docker](https://docs.docker.com/engine/install/)
+  
 Note: Our setup script does these two for you, but they are here for reference.
 - [Python 3.11](https://www.python.org/downloads/)
     - `poetry env use 3.11`
@@ -91,6 +92,10 @@ Note: Our setup script does these two for you, but they are here for reference.
     ```bash
     ./setup.sh
     ```
+1. Run docker
+   ```bash
+   docker start [options] [container_name/container_id]
+   ```
 1. Start the server
     ```bash
     ./run_skyvern.sh
