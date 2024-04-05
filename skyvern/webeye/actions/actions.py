@@ -14,7 +14,6 @@ class ActionType(StrEnum):
     CLICK = "click"
     INPUT_TEXT = "input_text"
     UPLOAD_FILE = "upload_file"
-    DOWNLOAD_FILE = "download_file"
     SELECT_OPTION = "select_option"
     CHECKBOX = "checkbox"
     WAIT = "wait"
@@ -68,14 +67,6 @@ class UploadFileAction(WebAction):
 
     def __repr__(self) -> str:
         return f"UploadFileAction(element_id={self.element_id}, file={self.file_url}, is_upload_file_tag={self.is_upload_file_tag})"
-
-
-class DownloadFileAction(WebAction):
-    action_type: ActionType = ActionType.DOWNLOAD_FILE
-    file_name: str
-
-    def __repr__(self) -> str:
-        return f"DownloadFileAction(element_id={self.element_id}, file_name={self.file_name})"
 
 
 class NullAction(Action):
@@ -158,10 +149,6 @@ def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Actio
             # TODO: see if the element is a file input element. if it's not, convert this action into a click action
 
             actions.append(UploadFileAction(element_id=element_id, file_url=action["file_url"], reasoning=reasoning))
-        elif action_type == ActionType.DOWNLOAD_FILE:
-            actions.append(
-                DownloadFileAction(element_id=element_id, file_name=action["file_name"], reasoning=reasoning)
-            )
         elif action_type == ActionType.SELECT_OPTION:
             actions.append(
                 SelectOptionAction(
@@ -179,13 +166,22 @@ def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Actio
         elif action_type == ActionType.WAIT:
             actions.append(WaitAction(reasoning=reasoning))
         elif action_type == ActionType.COMPLETE:
-            actions.append(
+            if actions:
+                LOG.info(
+                    "Navigation goal achieved, creating complete action and discarding all other actions except "
+                    "complete action",
+                    task_id=task.task_id,
+                    nav_goal=task.navigation_goal,
+                    actions=actions,
+                    llm_response=json_response,
+                )
+            return [
                 CompleteAction(
                     reasoning=reasoning,
                     data_extraction_goal=task.data_extraction_goal,
                     errors=action["errors"] if "errors" in action else [],
                 )
-            )
+            ]
         elif action_type == "null":
             actions.append(NullAction(reasoning=reasoning))
         elif action_type == ActionType.SOLVE_CAPTCHA:
@@ -214,7 +210,6 @@ ActionTypeUnion = (
     ClickAction
     | InputTextAction
     | UploadFileAction
-    | DownloadFileAction
     | SelectOptionAction
     | CheckboxAction
     | WaitAction
