@@ -92,10 +92,7 @@ Note: Our setup script does these two for you, but they are here for reference.
     ```bash
     ./setup.sh
     ```
-1. Run docker
-   ```bash
-   docker start [options] [container_name/container_id]
-   ```
+1. Open Docker Desktop (Works for Windows, macOS, and Linux) or run Docker Daemon
 1. Start the server
     ```bash
     ./run_skyvern.sh
