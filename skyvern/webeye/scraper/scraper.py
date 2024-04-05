@@ -169,7 +169,12 @@ async def scrape_web_unsafe(
     scroll_y_px_old = -1.0
     scroll_y_px = await scroll_to_top(page, drow_boxes=True)
     # Checking max number of screenshots to prevent infinite loop
-    while scroll_y_px_old != scroll_y_px and len(screenshots) < SettingsManager.get_settings().MAX_NUM_SCREENSHOTS:
+    # We are checking the difference between the old and new scroll_y_px to determine if we have reached the end of the
+    # page. If the difference is less than 25, we assume we have reached the end of the page.
+    while (
+        abs(scroll_y_px_old - scroll_y_px) > 25
+        and len(screenshots) < SettingsManager.get_settings().MAX_NUM_SCREENSHOTS
+    ):
         screenshot = await browser_state.take_screenshot(full_page=False)
         screenshots.append(screenshot)
         scroll_y_px_old = scroll_y_px

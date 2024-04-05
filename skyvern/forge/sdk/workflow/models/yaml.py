@@ -132,6 +132,12 @@ class DownloadToS3BlockYAML(BlockYAML):
     url: str
 
 
+class UploadToS3BlockYAML(BlockYAML):
+    block_type: Literal[BlockType.UPLOAD_TO_S3] = BlockType.UPLOAD_TO_S3  # type: ignore
+
+    path: str | None = None
+
+
 class SendEmailBlockYAML(BlockYAML):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -160,7 +166,13 @@ PARAMETER_YAML_SUBCLASSES = (
 PARAMETER_YAML_TYPES = Annotated[PARAMETER_YAML_SUBCLASSES, Field(discriminator="parameter_type")]
 
 BLOCK_YAML_SUBCLASSES = (
-    TaskBlockYAML | ForLoopBlockYAML | CodeBlockYAML | TextPromptBlockYAML | DownloadToS3BlockYAML | SendEmailBlockYAML
+    TaskBlockYAML
+    | ForLoopBlockYAML
+    | CodeBlockYAML
+    | TextPromptBlockYAML
+    | DownloadToS3BlockYAML
+    | UploadToS3BlockYAML
+    | SendEmailBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 

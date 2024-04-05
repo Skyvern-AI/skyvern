@@ -1,11 +1,14 @@
 import asyncio
 import json
+import os
 import re
+import uuid
 from typing import Any, Awaitable, Callable, List
 
 import structlog
 from playwright.async_api import Locator, Page
 
+from skyvern.constants import SKYVERN_DIR
 from skyvern.exceptions import ImaginaryFileUrl, MissingElement, MissingFileUrl, MultipleElementsFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -152,6 +155,34 @@ async def handle_upload_file_action(
         return await chain_click(
             task, page, action, xpath, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
         )
+
+
+async def handle_download_file_action(
+    action: actions.DownloadFileAction, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+) -> list[ActionResult]:
+    xpath = await validate_actions_in_dom(action, page, scraped_page)
+    file_name = f"{action.file_name or uuid.uuid4()}"
+    full_file_path = f"{SKYVERN_DIR}/downloads/{task.workflow_run_id or task.task_id}/{file_name}"
+    try:
+        # Start waiting for the download
+        async with page.expect_download() as download_info:
+            await asyncio.sleep(0.3)
+            await page.click(f"xpath={xpath}", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+
+        download = await download_info.value
+
+        # Create download folders if they don't exist
+        download_folder = f"{SKYVERN_DIR}/downloads/{task.workflow_run_id or task.task_id}"
+        os.makedirs(download_folder, exist_ok=True)
+        # Wait for the download process to complete and save the downloaded file
+        await download.save_as(full_file_path)
+    except Exception as e:
+        LOG.exception(
+            "DownloadFileAction: Failed to download file", action=action, full_file_path=full_file_path, exc_info=True
+        )
+        return [ActionFailure(e)]
+
+    return [ActionSuccess(data={"file_path": full_file_path})]
 
 
 async def handle_null_action(
@@ -348,6 +379,7 @@ ActionHandler.register_action_type(ActionType.SOLVE_CAPTCHA, handle_solve_captch
 ActionHandler.register_action_type(ActionType.CLICK, handle_click_action)
 ActionHandler.register_action_type(ActionType.INPUT_TEXT, handle_input_text_action)
 ActionHandler.register_action_type(ActionType.UPLOAD_FILE, handle_upload_file_action)
+ActionHandler.register_action_type(ActionType.DOWNLOAD_FILE, handle_download_file_action)
 ActionHandler.register_action_type(ActionType.NULL_ACTION, handle_null_action)
 ActionHandler.register_action_type(ActionType.SELECT_OPTION, handle_select_option_action)
 ActionHandler.register_action_type(ActionType.WAIT, handle_wait_action)
