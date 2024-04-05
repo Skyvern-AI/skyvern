@@ -1,11 +1,13 @@
 import os
 import tempfile
 import zipfile
+from pathlib import Path
 from urllib.parse import urlparse
 
 import aiohttp
 import structlog
 
+from skyvern.constants import SKYVERN_DIR
 from skyvern.exceptions import DownloadFileMaxSizeExceeded
 
 LOG = structlog.get_logger()
@@ -62,3 +64,7 @@ def zip_files(files_path: str, zip_file_path: str) -> str:
                 zipf.write(file_path, arcname)
 
     return zip_file_path
+
+
+def get_path_for_workflow_download_directory(workflow_run_id: str) -> Path:
+    return Path(f"{SKYVERN_DIR}/downloads/{workflow_run_id}/")

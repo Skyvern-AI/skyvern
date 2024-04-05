@@ -43,7 +43,7 @@ class Settings(BaseSettings):
 
     # S3 bucket settings
     AWS_REGION: str = "us-east-1"
-    AWS_S3_BUCKET_DOWNLOADS: str = "skyvern-downloads"
+    AWS_S3_BUCKET_UPLOADS: str = "skyvern-uploads"
 
     SKYVERN_TELEMETRY: bool = True
     ANALYTICS_ID: str = "anonymous"
@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     BROWSER_TIMEZONE: str = "America/New_York"
     BROWSER_WIDTH: int = 1920
     BROWSER_HEIGHT: int = 1080
+
+    # Workflow constant parameters
+    WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY: str = "SKYVERN_DOWNLOAD_DIRECTORY"
 
     #####################
     # LLM Configuration #
