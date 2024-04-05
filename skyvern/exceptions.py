@@ -210,3 +210,20 @@ class BitwardenListItemsError(BitwardenBaseError):
 class BitwardenLogoutError(BitwardenBaseError):
     def __init__(self, message: str) -> None:
         super().__init__(f"Error logging out of Bitwarden: {message}")
+
+
+class FailedToFindAutoCompleteResults(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("No results found in the auto-complete. Try to re-enter the information.")
+
+
+class SelectedLocationNotFoundAmongOptions(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__(
+            "Matched option is not found among the provided options, please try again to choose a right one"
+        )
+
+
+class MissingLocationIDInLLMResponse(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("Missing location ID in reponse, please try again")
