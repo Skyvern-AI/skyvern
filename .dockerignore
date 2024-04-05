@@ -1,0 +1,16 @@
+**/videos
+**/artifacts
+**/traces
+**/inputs
+**/.git
+**/.github
+**/.mypy_cache
+**/.venv
+**/.vscode
+*.env*
+# Streamlit ignores
+**/secrets*.toml
+
+.dockerignore
+.gitignore
+Dockerfile

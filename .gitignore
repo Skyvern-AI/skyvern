@@ -164,6 +164,7 @@ artifacts/
 traces/
 *.pkl
 har/
+postgres-data
 
 # Streamlit ignores
 **/secrets*.toml
