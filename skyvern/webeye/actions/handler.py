@@ -59,11 +59,10 @@ class ActionHandler:
             LOG.exception(
                 "Cannot handle multiple elements with the same xpath in one action.",
                 action=action,
-                exception=e,
             )
             return [ActionFailure(e)]
         except Exception as e:
-            LOG.exception("Unhandled exception in action handler", action=action, exception=e)
+            LOG.exception("Unhandled exception in action handler", action=action)
             return [ActionFailure(e)]
 
 
@@ -231,11 +230,7 @@ async def handle_select_option_action(
                     await option_locator.nth(action.option.index).click(timeout=2000)
                     return [ActionSuccess()]
                 except Exception as e:
-                    LOG.error(
-                        "Failed to click option",
-                        action=action,
-                        exception=e,
-                    )
+                    LOG.error("Failed to click option", action=action, exc_info=True)
                     return [ActionFailure(e)]
             return [ActionFailure(Exception(f"SelectOption option index is missing"))]
         elif role_attribute == "option":
@@ -298,7 +293,7 @@ async def handle_select_option_action(
             await page.click(f"xpath={xpath}", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
         return [ActionSuccess()]
     except Exception as e:
-        LOG.warning("Failed to click on the option by index", exception=e, action=action)
+        LOG.warning("Failed to click on the option by index", action=action, exc_info=True)
         return [ActionFailure(e)]
 
 
@@ -612,13 +607,8 @@ async def click_listbox_option(
                 try:
                     await page.click(f"xpath={option_xpath}", timeout=1000)
                     return True
-                except Exception as e:
-                    LOG.error(
-                        "Failed to click on the option",
-                        action=action,
-                        option_xpath=option_xpath,
-                        exception=e,
-                    )
+                except Exception:
+                    LOG.error("Failed to click on the option", action=action, option_xpath=option_xpath, exc_info=True)
         if "children" in child:
             bfs_queue.extend(child["children"])
     return False
