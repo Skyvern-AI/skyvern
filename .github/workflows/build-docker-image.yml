@@ -11,14 +11,15 @@ env:
   REGISTRY_ALIAS: t6d4b5t4 # skyvern
 
 jobs:
+  run-ci:
+    uses: ./.github/workflows/ci.yml
+
   build-docker-image:
     runs-on: ubuntu-latest
+    needs: [ run-ci ]
     steps:
       - name: Check out Git repository
         uses: actions/checkout@v4
-        
-      - name: Run ci.yml Workflow
-        uses: ./.github/workflows/ci.yml
       
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
