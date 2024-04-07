@@ -96,33 +96,7 @@ jobs:
 
       # Finally, run pre-commit.
       - uses: pre-commit/action@v3.0.0
-  
-  fe-lint-build:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./skyvern-frontend
-    steps:
-      - name: Check out Git repository
-        uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install Node.js dependencies
-        run: npm ci
-
-      - name: Run linter
-        run: npm run lint
-      
-      - name: Run build
-        run: npm run build
-
-  build-docker-image:
-    runs-on: ubuntu-latest
-    steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v1
         with:
@@ -149,3 +123,26 @@ jobs:
           tag: |
             ${{ env.ECR_REGISTRY}}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
             ${{ env.ECR_REGISTRY}}/${{ env.ECR_REPOSITORY }}:latest
+  
+  fe-lint-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./skyvern-frontend
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Run linter
+        run: npm run lint
+      
+      - name: Run build
+        run: npm run build
