@@ -1,9 +1,8 @@
 name: Build Docker Image and Push to ECR
 
 on:
-  pull_request:
-  push:
-    branches: [main]
+  release:
+    types: [ published ]
 
 env:
   AWS_REGION: us-east-1
@@ -42,7 +41,6 @@ jobs:
         uses: docker/build-push-action@v2
         env:
           ECR_REGISTRY: ${{ steps.login-ecr-public.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
         with:
           context: .
           platforms: |
@@ -50,5 +48,6 @@ jobs:
             linux/arm64
           push: true
           tags: |
-            ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+            ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_REPOSITORY }}:${{ github.event.release.tag_name }}
             ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_REPOSITORY }}:latest
