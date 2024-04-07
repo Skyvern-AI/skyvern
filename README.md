@@ -103,7 +103,7 @@ Note: Our setup script does these two for you, but they are here for reference.
 
 ## Docker Compose setup
 
-1. Fill in the LLM provider key on the docker-compose.yml
+1. Fill in the LLM provider key on the [docker-compose.yml](./docker-compose.yml)
 2. Run the following command:
    ```bash
     docker compsoe up -d

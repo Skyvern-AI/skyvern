@@ -15,7 +15,7 @@ services:
       - POSTGRES_POSTGRES_DB=skyvern
 
   skyvern:
-    build: .
+    image: public.ecr.aws/t6d4b5t4/skyvern:latest
     restart: on-failure
     # comment out if you want to externally call skyvern API
     # ports:
@@ -41,7 +41,7 @@ services:
       - postgres
   
   streamlit:
-    build: .
+    image: public.ecr.aws/t6d4b5t4/skyvern:latest
     restart: on-failure
     ports:
       - 8501:8501
