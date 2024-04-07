@@ -17,8 +17,8 @@ jobs:
       - name: Check out Git repository
         uses: actions/checkout@v4
         
-      - name: "Run ci.yml Workflow"
-        uses: "./.github/workflows/ci.yml"
+      - name: Run ci.yml Workflow
+        run: ./.github/workflows/ci.yml
       
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
