@@ -1,6 +1,14 @@
 export const ArtifactType = {
   Recording: "recording",
   ActionScreenshot: "screenshot_action",
+  LLMScreenshot: "screenshot_llm",
+  LLMResponseRaw: "llm_response",
+  LLMResponseParsed: "llm_response_parsed",
+  VisibleElementsTree: "visible_elements_tree",
+  VisibleElementsTreeTrimmed: "visible_elements_tree_trimmed",
+  LLMPrompt: "llm_prompt",
+  LLMRequest: "llm_request",
+  HTMLScrape: "html_scrape",
 } as const;
 
 export const Status = {
