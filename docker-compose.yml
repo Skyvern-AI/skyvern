@@ -30,7 +30,9 @@ services:
       - BROWSER_TYPE=chromium-headful
       - ENABLE_OPENAI=true
       - OPENAI_API_KEY=<your_openai_key>
-      # If you want to use other LLM provide, like azure or anthropic
+      # If you want to use other LLM provider, like azure and anthropic:
+      # - ENABLE_ANTHROPIC=true
+      # - ANTHROPIC_API_KEY=<your_anthropic_key>
       # - ENABLE_AZURE=true
       # - LLM_KEY=AZURE_OPENAI_GPT4V
       # - AZURE_DEPLOYMENT=<your_azure_deployment>

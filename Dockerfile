@@ -2,8 +2,6 @@ FROM python:3.11 as requirements-stage
 
 WORKDIR /tmp
 RUN pip install poetry
-# Use following command, if you have network problem
-# RUN pip install poetry -i https://pypi.tuna.tsinghua.edu.cn/simple
 COPY ./pyproject.toml /tmp/pyproject.toml
 COPY ./poetry.lock /tmp/poetry.lock
 RUN poetry export -f requirements.txt --output requirements.txt --without-hashes
@@ -13,10 +11,6 @@ WORKDIR /app
 COPY --from=requirements-stage /tmp/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
 RUN pip install --no-cache-dir streamlit
-# Use following command, if you have network problem
-# RUN sed -i s@/deb.debian.org/@/mirrors.aliyun.com/@g /etc/apt/sources.list.d/debian.sources
-# RUN pip install --no-cache-dir --upgrade -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-# RUN pip install --no-cache-dir streamlit -i https://pypi.tuna.tsinghua.edu.cn/simple
 RUN playwright install-deps
 RUN playwright install
 RUN apt-get install -y xauth && apt-get clean
