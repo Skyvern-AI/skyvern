@@ -166,7 +166,11 @@ class Task(TaskRequest):
             raise ValueError(f"cant_override_failure_reason({self.task_id})")
 
     def to_task_response(
-        self, screenshot_url: str | None = None, recording_url: str | None = None, failure_reason: str | None = None
+        self,
+        action_screenshot_urls: list[str] | None = None,
+        screenshot_url: str | None = None,
+        recording_url: str | None = None,
+        failure_reason: str | None = None,
     ) -> TaskResponse:
         return TaskResponse(
             request=self,
@@ -176,6 +180,7 @@ class Task(TaskRequest):
             modified_at=self.modified_at,
             extracted_information=self.extracted_information,
             failure_reason=failure_reason or self.failure_reason,
+            action_screenshot_urls=action_screenshot_urls,
             screenshot_url=screenshot_url,
             recording_url=recording_url,
             errors=self.errors,
@@ -189,6 +194,7 @@ class TaskResponse(BaseModel):
     created_at: datetime
     modified_at: datetime
     extracted_information: list | dict[str, Any] | str | None = None
+    action_screenshot_urls: list[str] | None = None
     screenshot_url: str | None = None
     recording_url: str | None = None
     failure_reason: str | None = None

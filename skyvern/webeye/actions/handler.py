@@ -1,11 +1,14 @@
 import asyncio
 import json
+import os
 import re
+import uuid
 from typing import Any, Awaitable, Callable, List
 
 import structlog
 from playwright.async_api import Locator, Page
 
+from skyvern.constants import SKYVERN_DIR
 from skyvern.exceptions import ImaginaryFileUrl, MissingElement, MissingFileUrl, MultipleElementsFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -27,6 +30,14 @@ class ActionHandler:
         ActionType, Callable[[Action, Page, ScrapedPage, Task, Step], Awaitable[list[ActionResult]]]
     ] = {}
 
+    _setup_action_types: dict[
+        ActionType, Callable[[Action, Page, ScrapedPage, Task, Step], Awaitable[list[ActionResult]]]
+    ] = {}
+
+    _teardown_action_types: dict[
+        ActionType, Callable[[Action, Page, ScrapedPage, Task, Step], Awaitable[list[ActionResult]]]
+    ] = {}
+
     @classmethod
     def register_action_type(
         cls,
@@ -34,6 +45,22 @@ class ActionHandler:
         handler: Callable[[Action, Page, ScrapedPage, Task, Step], Awaitable[list[ActionResult]]],
     ) -> None:
         cls._handled_action_types[action_type] = handler
+
+    @classmethod
+    def register_setup_for_action_type(
+        cls,
+        action_type: ActionType,
+        handler: Callable[[Action, Page, ScrapedPage, Task, Step], Awaitable[list[ActionResult]]],
+    ) -> None:
+        cls._setup_action_types[action_type] = handler
+
+    @classmethod
+    def register_teardown_for_action_type(
+        cls,
+        action_type: ActionType,
+        handler: Callable[[Action, Page, ScrapedPage, Task, Step], Awaitable[list[ActionResult]]],
+    ) -> None:
+        cls._teardown_action_types[action_type] = handler
 
     @staticmethod
     async def handle_action(
@@ -47,8 +74,31 @@ class ActionHandler:
         page = await browser_state.get_or_create_page()
         try:
             if action.action_type in ActionHandler._handled_action_types:
+                actions_result: list[ActionResult] = []
+
+                # do setup before action handler
+                if setup := ActionHandler._setup_action_types.get(action.action_type):
+                    results = await setup(action, page, scraped_page, task, step)
+                    actions_result.extend(results)
+                    if results and results[-1] != ActionSuccess:
+                        return actions_result
+
+                # do the handler
                 handler = ActionHandler._handled_action_types[action.action_type]
-                return await handler(action, page, scraped_page, task, step)
+                results = await handler(action, page, scraped_page, task, step)
+                actions_result.extend(results)
+                if not results or type(actions_result[-1]) != ActionSuccess:
+                    return actions_result
+
+                # do the teardown
+                teardown = ActionHandler._teardown_action_types.get(action.action_type)
+                if not teardown:
+                    return actions_result
+
+                results = await teardown(action, page, scraped_page, task, step)
+                actions_result.extend(results)
+                return actions_result
+
             else:
                 LOG.error("Unsupported action type in handler", action=action, type=type(action))
                 return [ActionFailure(Exception(f"Unsupported action type: {type(action)}"))]
@@ -59,11 +109,10 @@ class ActionHandler:
             LOG.exception(
                 "Cannot handle multiple elements with the same xpath in one action.",
                 action=action,
-                exception=e,
             )
             return [ActionFailure(e)]
         except Exception as e:
-            LOG.exception("Unhandled exception in action handler", action=action, exception=e)
+            LOG.exception("Unhandled exception in action handler", action=action)
             return [ActionFailure(e)]
 
 
@@ -96,19 +145,6 @@ async def handle_input_text_action(
     await locator.clear()
     text = get_actual_value_of_parameter_if_secret(task, action.text)
     await locator.fill(text, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
-
-    # This is a hack that gets dropdowns to select the "best" option based on what's typed
-    # Fixes situations like tsk_228671423990405776 where the location isn't being autocompleted
-    await locator.press("Tab", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
-    input_value = await locator.input_value(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
-    if not input_value:
-        LOG.info("Failed to input the text, trying to press sequentially with an enter click", action=action)
-        await locator.clear()
-        await locator.press_sequentially(text, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
-        await locator.press("Enter", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
-        input_value = await locator.input_value(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
-        LOG.info("Input value", input_value=input_value, action=action)
-
     return [ActionSuccess()]
 
 
@@ -131,7 +167,7 @@ async def handle_upload_file_action(
         )
         return [ActionFailure(ImaginaryFileUrl(action.file_url))]
     xpath = await validate_actions_in_dom(action, page, scraped_page)
-    file_path = download_file(file_url)
+    file_path = await download_file(file_url)
     locator = page.locator(f"xpath={xpath}")
     is_file_input = await is_file_input_element(locator)
     if is_file_input:
@@ -153,6 +189,34 @@ async def handle_upload_file_action(
         return await chain_click(
             task, page, action, xpath, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
         )
+
+
+async def handle_download_file_action(
+    action: actions.DownloadFileAction, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+) -> list[ActionResult]:
+    xpath = await validate_actions_in_dom(action, page, scraped_page)
+    file_name = f"{action.file_name or uuid.uuid4()}"
+    full_file_path = f"{SKYVERN_DIR}/downloads/{task.workflow_run_id or task.task_id}/{file_name}"
+    try:
+        # Start waiting for the download
+        async with page.expect_download() as download_info:
+            await asyncio.sleep(0.3)
+            await page.click(f"xpath={xpath}", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+
+        download = await download_info.value
+
+        # Create download folders if they don't exist
+        download_folder = f"{SKYVERN_DIR}/downloads/{task.workflow_run_id or task.task_id}"
+        os.makedirs(download_folder, exist_ok=True)
+        # Wait for the download process to complete and save the downloaded file
+        await download.save_as(full_file_path)
+    except Exception as e:
+        LOG.exception(
+            "DownloadFileAction: Failed to download file", action=action, full_file_path=full_file_path, exc_info=True
+        )
+        return [ActionFailure(e)]
+
+    return [ActionSuccess(data={"file_path": full_file_path})]
 
 
 async def handle_null_action(
@@ -231,11 +295,7 @@ async def handle_select_option_action(
                     await option_locator.nth(action.option.index).click(timeout=2000)
                     return [ActionSuccess()]
                 except Exception as e:
-                    LOG.error(
-                        "Failed to click option",
-                        action=action,
-                        exception=e,
-                    )
+                    LOG.error("Failed to click option", action=action, exc_info=True)
                     return [ActionFailure(e)]
             return [ActionFailure(Exception(f"SelectOption option index is missing"))]
         elif role_attribute == "option":
@@ -298,7 +358,7 @@ async def handle_select_option_action(
             await page.click(f"xpath={xpath}", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
         return [ActionSuccess()]
     except Exception as e:
-        LOG.warning("Failed to click on the option by index", exception=e, action=action)
+        LOG.warning("Failed to click on the option by index", action=action, exc_info=True)
         return [ActionFailure(e)]
 
 
@@ -353,6 +413,7 @@ ActionHandler.register_action_type(ActionType.SOLVE_CAPTCHA, handle_solve_captch
 ActionHandler.register_action_type(ActionType.CLICK, handle_click_action)
 ActionHandler.register_action_type(ActionType.INPUT_TEXT, handle_input_text_action)
 ActionHandler.register_action_type(ActionType.UPLOAD_FILE, handle_upload_file_action)
+ActionHandler.register_action_type(ActionType.DOWNLOAD_FILE, handle_download_file_action)
 ActionHandler.register_action_type(ActionType.NULL_ACTION, handle_null_action)
 ActionHandler.register_action_type(ActionType.SELECT_OPTION, handle_select_option_action)
 ActionHandler.register_action_type(ActionType.WAIT, handle_wait_action)
@@ -413,7 +474,11 @@ async def chain_click(
     file: list[str] | str = []
     if action.file_url:
         file_url = get_actual_value_of_parameter_if_secret(task, action.file_url)
-        file = download_file(file_url) or []
+        try:
+            file = await download_file(file_url)
+        except Exception:
+            LOG.exception("Failed to download file, continuing without it", action=action, file_url=file_url)
+            file = []
 
     fc_func = lambda fc: fc.set_files(files=file)
     page.on("filechooser", fc_func)
@@ -608,13 +673,8 @@ async def click_listbox_option(
                 try:
                     await page.click(f"xpath={option_xpath}", timeout=1000)
                     return True
-                except Exception as e:
-                    LOG.error(
-                        "Failed to click on the option",
-                        action=action,
-                        option_xpath=option_xpath,
-                        exception=e,
-                    )
+                except Exception:
+                    LOG.error("Failed to click on the option", action=action, option_xpath=option_xpath, exc_info=True)
         if "children" in child:
             bfs_queue.extend(child["children"])
     return False

@@ -22,6 +22,21 @@ class AWSSecretParameterYAML(ParameterYAML):
     aws_key: str
 
 
+class BitwardenLoginCredentialParameterYAML(ParameterYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the ParameterType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    parameter_type: Literal[ParameterType.BITWARDEN_LOGIN_CREDENTIAL] = ParameterType.BITWARDEN_LOGIN_CREDENTIAL  # type: ignore
+
+    # bitwarden cli required fields
+    bitwarden_client_id_aws_secret_key: str
+    bitwarden_client_secret_aws_secret_key: str
+    bitwarden_master_password_aws_secret_key: str
+    # parameter key for the url to request the login credentials from bitwarden
+    url_parameter_key: str
+
+
 class WorkflowParameterYAML(ParameterYAML):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -80,7 +95,7 @@ class ForLoopBlockYAML(BlockYAML):
     block_type: Literal[BlockType.FOR_LOOP] = BlockType.FOR_LOOP  # type: ignore
 
     loop_over_parameter_key: str
-    loop_block: BlockYAML
+    loop_block: "BLOCK_YAML_SUBCLASSES"
 
 
 class CodeBlockYAML(BlockYAML):
@@ -107,10 +122,58 @@ class TextPromptBlockYAML(BlockYAML):
     json_schema: dict[str, Any] | None = None
 
 
-PARAMETER_YAML_SUBCLASSES = AWSSecretParameterYAML | WorkflowParameterYAML | ContextParameterYAML | OutputParameterYAML
+class DownloadToS3BlockYAML(BlockYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the BlockType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    block_type: Literal[BlockType.DOWNLOAD_TO_S3] = BlockType.DOWNLOAD_TO_S3  # type: ignore
+
+    url: str
+
+
+class UploadToS3BlockYAML(BlockYAML):
+    block_type: Literal[BlockType.UPLOAD_TO_S3] = BlockType.UPLOAD_TO_S3  # type: ignore
+
+    path: str | None = None
+
+
+class SendEmailBlockYAML(BlockYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the BlockType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    block_type: Literal[BlockType.SEND_EMAIL] = BlockType.SEND_EMAIL  # type: ignore
+
+    smtp_host_secret_parameter_key: str
+    smtp_port_secret_parameter_key: str
+    smtp_username_secret_parameter_key: str
+    smtp_password_secret_parameter_key: str
+    sender: str
+    recipients: list[str]
+    subject: str
+    body: str
+    file_attachments: list[str] | None = None
+
+
+PARAMETER_YAML_SUBCLASSES = (
+    AWSSecretParameterYAML
+    | BitwardenLoginCredentialParameterYAML
+    | WorkflowParameterYAML
+    | ContextParameterYAML
+    | OutputParameterYAML
+)
 PARAMETER_YAML_TYPES = Annotated[PARAMETER_YAML_SUBCLASSES, Field(discriminator="parameter_type")]
 
-BLOCK_YAML_SUBCLASSES = TaskBlockYAML | ForLoopBlockYAML | CodeBlockYAML | TextPromptBlockYAML
+BLOCK_YAML_SUBCLASSES = (
+    TaskBlockYAML
+    | ForLoopBlockYAML
+    | CodeBlockYAML
+    | TextPromptBlockYAML
+    | DownloadToS3BlockYAML
+    | UploadToS3BlockYAML
+    | SendEmailBlockYAML
+)
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 
 

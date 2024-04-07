@@ -497,6 +497,44 @@ function buildTreeFromBody() {
   var elements = [];
   var resultArray = [];
 
+  const checkSelect2 = () => {
+    // according to select2(https://select2.org/getting-started/basic-usage)
+    // select2-container seems to be the most common class in select2,
+    // and the invisible select seems to be the sibling to the "select2-container" element.
+    const selectContainers = document.querySelectorAll(".select2-container");
+
+    selectContainers.forEach((element) => {
+      // hide the select2 container
+      element.style.display = "none";
+
+      // search select in previous
+      let _pre = element.previousElementSibling;
+      while (_pre) {
+        if (
+          _pre.tagName.toLowerCase() === "select" &&
+          _pre.style.display === "none"
+        ) {
+          _pre.style.removeProperty("display");
+          return;
+        }
+        _pre = _pre.previousElementSibling;
+      }
+
+      // search select in next
+      let _next = element.nextElementSibling;
+      while (_next) {
+        if (
+          _next.tagName.toLowerCase() === "select" &&
+          _next.style.display === "none"
+        ) {
+          _next.style.removeProperty("display");
+          return;
+        }
+        _next = _next.nextElementSibling;
+      }
+    });
+  };
+
   function buildElementObject(element) {
     var element_id = elements.length;
     var elementTagNameLower = element.tagName.toLowerCase();
@@ -593,7 +631,8 @@ function buildTreeFromBody() {
   }
 
   // TODO: Handle iframes
-
+  // setup before parsing the dom
+  checkSelect2();
   // Clear all the unique_id attributes so that there are no conflicts
   removeAllUniqueIdAttributes();
   processElement(document.body, null);

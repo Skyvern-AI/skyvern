@@ -22,7 +22,7 @@ def execute_with_async_client(client_type: AWSClientType) -> Callable:
             self = args[0]
             assert isinstance(self, AsyncAWSClient)
             session = aioboto3.Session()
-            async with session.client(client_type) as client:
+            async with session.client(client_type, region_name=SettingsManager.get_settings().AWS_REGION) as client:
                 return await f(*args, client=client, **kwargs)
 
         return wrapper

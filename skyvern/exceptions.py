@@ -179,3 +179,34 @@ class FailedToTakeScreenshot(SkyvernException):
 class WorkflowRunContextNotInitialized(SkyvernException):
     def __init__(self, workflow_run_id: str) -> None:
         super().__init__(f"WorkflowRunContext not initialized for workflow run {workflow_run_id}")
+
+
+class DownloadFileMaxSizeExceeded(SkyvernException):
+    def __init__(self, max_size: int) -> None:
+        self.max_size = max_size
+        super().__init__(f"Download file size exceeded the maximum allowed size of {max_size} MB.")
+
+
+class BitwardenBaseError(SkyvernException):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Bitwarden error: {message}")
+
+
+class BitwardenLoginError(BitwardenBaseError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Error logging in to Bitwarden: {message}")
+
+
+class BitwardenUnlockError(BitwardenBaseError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Error unlocking Bitwarden: {message}")
+
+
+class BitwardenListItemsError(BitwardenBaseError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Error listing items in Bitwarden: {message}")
+
+
+class BitwardenLogoutError(BitwardenBaseError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Error logging out of Bitwarden: {message}")

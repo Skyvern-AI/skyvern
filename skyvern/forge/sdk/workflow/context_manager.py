@@ -3,8 +3,9 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from skyvern.exceptions import WorkflowRunContextNotInitialized
+from skyvern.exceptions import BitwardenBaseError, WorkflowRunContextNotInitialized
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
+from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -113,6 +114,46 @@ class WorkflowRunContext:
                 random_secret_id = self.generate_random_secret_id()
                 self.secrets[random_secret_id] = secret_value
                 self.values[parameter.key] = random_secret_id
+        elif parameter.parameter_type == ParameterType.BITWARDEN_LOGIN_CREDENTIAL:
+            try:
+                # Get the Bitwarden login credentials from AWS secrets
+                client_id = await aws_client.get_secret(parameter.bitwarden_client_id_aws_secret_key)
+                client_secret = await aws_client.get_secret(parameter.bitwarden_client_secret_aws_secret_key)
+                master_password = await aws_client.get_secret(parameter.bitwarden_master_password_aws_secret_key)
+            except Exception as e:
+                LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
+                raise e
+
+            if self.has_parameter(parameter.url_parameter_key) and self.has_value(parameter.url_parameter_key):
+                url = self.values[parameter.url_parameter_key]
+            else:
+                LOG.error(f"URL parameter {parameter.url_parameter_key} not found or has no value")
+                raise ValueError(f"URL parameter for Bitwarden login credentials not found or has no value")
+
+            try:
+                secret_credentials = BitwardenService.get_secret_value_from_url(
+                    client_id,
+                    client_secret,
+                    master_password,
+                    url,
+                )
+                if secret_credentials:
+                    random_secret_id = self.generate_random_secret_id()
+                    # username secret
+                    username_secret_id = f"{random_secret_id}_username"
+                    self.secrets[username_secret_id] = secret_credentials["username"]
+                    # password secret
+                    password_secret_id = f"{random_secret_id}_password"
+                    self.secrets[password_secret_id] = secret_credentials["password"]
+
+                    self.values[parameter.key] = {
+                        "username": username_secret_id,
+                        "password": password_secret_id,
+                    }
+            except BitwardenBaseError as e:
+                BitwardenService.logout()
+                LOG.error(f"Failed to get secret from Bitwarden. Error: {e}")
+                raise e
         elif parameter.parameter_type == ParameterType.CONTEXT:
             # ContextParameter values will be set within the blocks
             return
@@ -133,6 +174,9 @@ class WorkflowRunContext:
         aws_client: AsyncAWSClient,
         parameters: list[PARAMETER_TYPE],
     ) -> None:
+        # BitwardenLoginCredentialParameter should be processed last since it requires the URL parameter to be set
+        parameters.sort(key=lambda x: x.parameter_type != ParameterType.BITWARDEN_LOGIN_CREDENTIAL)
+
         for parameter in parameters:
             if parameter.key in self.parameters:
                 LOG.debug(f"Parameter {parameter.key} already registered, skipping")

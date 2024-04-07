@@ -29,3 +29,8 @@ class WorkflowDefinitionHasDuplicateParameterKeys(BaseWorkflowException):
             f"WorkflowDefinition has parameters with duplicate keys. Each parameter needs to have a unique "
             f"key. Duplicate key(s): {','.join(duplicate_keys)}"
         )
+
+
+class InvalidEmailClientConfiguration(BaseWorkflowException):
+    def __init__(self, problems: list[str]) -> None:
+        super().__init__(f"Email client configuration is invalid. These parameters are missing or invalid: {problems}")

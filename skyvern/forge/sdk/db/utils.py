@@ -9,6 +9,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.models import (
     ArtifactModel,
     AWSSecretParameterModel,
+    BitwardenLoginCredentialParameterModel,
     OrganizationAuthTokenModel,
     OrganizationModel,
     OutputParameterModel,
@@ -24,6 +25,7 @@ from skyvern.forge.sdk.models import Organization, OrganizationAuthToken, Step, 
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskStatus
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
+    BitwardenLoginCredentialParameter,
     OutputParameter,
     WorkflowParameter,
     WorkflowParameterType,
@@ -208,6 +210,30 @@ def convert_to_aws_secret_parameter(
         created_at=aws_secret_parameter_model.created_at,
         modified_at=aws_secret_parameter_model.modified_at,
         deleted_at=aws_secret_parameter_model.deleted_at,
+    )
+
+
+def convert_to_bitwarden_login_credential_parameter(
+    bitwarden_login_credential_parameter_model: BitwardenLoginCredentialParameterModel, debug_enabled: bool = False
+) -> BitwardenLoginCredentialParameter:
+    if debug_enabled:
+        LOG.debug(
+            "Converting BitwardenLoginCredentialParameterModel to BitwardenLoginCredentialParameter",
+            bitwarden_login_credential_parameter_id=bitwarden_login_credential_parameter_model.bitwarden_login_credential_parameter_id,
+        )
+
+    return BitwardenLoginCredentialParameter(
+        bitwarden_login_credential_parameter_id=bitwarden_login_credential_parameter_model.bitwarden_login_credential_parameter_id,
+        workflow_id=bitwarden_login_credential_parameter_model.workflow_id,
+        key=bitwarden_login_credential_parameter_model.key,
+        description=bitwarden_login_credential_parameter_model.description,
+        bitwarden_client_id_aws_secret_key=bitwarden_login_credential_parameter_model.bitwarden_client_id_aws_secret_key,
+        bitwarden_client_secret_aws_secret_key=bitwarden_login_credential_parameter_model.bitwarden_client_secret_aws_secret_key,
+        bitwarden_master_password_aws_secret_key=bitwarden_login_credential_parameter_model.bitwarden_master_password_aws_secret_key,
+        url_parameter_key=bitwarden_login_credential_parameter_model.url_parameter_key,
+        created_at=bitwarden_login_credential_parameter_model.created_at,
+        modified_at=bitwarden_login_credential_parameter_model.modified_at,
+        deleted_at=bitwarden_login_credential_parameter_model.deleted_at,
     )
 
 
