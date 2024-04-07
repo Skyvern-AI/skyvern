@@ -22,7 +22,7 @@ import { TaskListSkeleton } from "./TaskListSkeleton";
 import { RunningTasks } from "../running/RunningTasks";
 import { cn } from "@/util/utils";
 import { PAGE_SIZE } from "../constants";
-import { TaskStatusBadge } from "@/components/TaskStatusBadge";
+import { StatusBadge } from "@/components/StatusBadge";
 import { basicTimeFormat } from "@/util/timeFormat";
 
 function TaskList() {
@@ -102,7 +102,7 @@ function TaskList() {
                 >
                   <TableCell className="w-1/3">{task.request.url}</TableCell>
                   <TableCell className="w-1/3">
-                    <TaskStatusBadge status={task.status} />
+                    <StatusBadge status={task.status} />
                   </TableCell>
                   <TableCell className="w-1/3">
                     {basicTimeFormat(task.created_at)}
