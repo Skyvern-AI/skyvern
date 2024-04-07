@@ -166,7 +166,7 @@ async def scrape_web_unsafe(
     await asyncio.sleep(5)
 
     screenshots: list[bytes] = []
-    scroll_y_px_old = -1.0
+    scroll_y_px_old = -30.0
     scroll_y_px = await scroll_to_top(page, drow_boxes=True)
     # Checking max number of screenshots to prevent infinite loop
     # We are checking the difference between the old and new scroll_y_px to determine if we have reached the end of the
