@@ -218,6 +218,27 @@ async def get_task(
     if recording_artifact:
         recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
+    # get the artifact of the last  screenshot and get the screenshot_url
+    latest_action_screenshot_artifacts = await app.DATABASE.get_latest_n_artifacts(
+        task_id=task_obj.task_id,
+        organization_id=task_obj.organization_id,
+        artifact_types=[ArtifactType.SCREENSHOT_ACTION],
+        n=SettingsManager.get_settings().TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
+    )
+    latest_action_screenshot_urls = []
+    if latest_action_screenshot_artifacts:
+        for artifact in latest_action_screenshot_artifacts:
+            screenshot_url = await app.ARTIFACT_MANAGER.get_share_link(artifact)
+            if screenshot_url:
+                latest_action_screenshot_urls.append(screenshot_url)
+            else:
+                LOG.error(
+                    "Failed to get share link for action screenshot",
+                    artifact_id=artifact.artifact_id,
+                )
+    else:
+        LOG.error("Failed to get latest action screenshots")
+
     failure_reason = None
     if task_obj.status == TaskStatus.failed and (latest_step.output or task_obj.failure_reason):
         failure_reason = ""
@@ -231,6 +252,7 @@ async def get_task(
             )
 
     return task_obj.to_task_response(
+        action_screenshot_urls=latest_action_screenshot_urls,
         screenshot_url=screenshot_url,
         recording_url=recording_url,
         failure_reason=failure_reason,
@@ -447,7 +469,10 @@ async def get_workflow_run(
     analytics.capture("skyvern-oss-agent-workflow-run-get")
     request["agent"]
     return await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
-        workflow_id=workflow_id, workflow_run_id=workflow_run_id, organization_id=current_org.organization_id
+        workflow_id=workflow_id,
+        workflow_run_id=workflow_run_id,
+        last_block_result=None,
+        organization_id=current_org.organization_id,
     )
 
 

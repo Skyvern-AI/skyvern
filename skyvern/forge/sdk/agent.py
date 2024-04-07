@@ -65,6 +65,8 @@ class Agent:
             LOG.info("Starting the skyvern scheduler.")
             SCHEDULER.start()
 
+            LOG.info("Server startup complete. Skyvern is now online")
+
         @app.exception_handler(Exception)
         async def unexpected_exception(request: Request, exc: Exception) -> JSONResponse:
             LOG.exception("Unexpected error in agent server.", exc_info=exc)

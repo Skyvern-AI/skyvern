@@ -38,6 +38,7 @@ WORKFLOW_RUN_PREFIX = "wr"
 WORKFLOW_PARAMETER_PREFIX = "wp"
 AWS_SECRET_PARAMETER_PREFIX = "asp"
 OUTPUT_PARAMETER_PREFIX = "op"
+BITWARDEN_LOGIN_CREDENTIAL_PARAMETER_PREFIX = "blc"
 
 
 def generate_workflow_id() -> str:
@@ -63,6 +64,11 @@ def generate_workflow_parameter_id() -> str:
 def generate_output_parameter_id() -> str:
     int_id = generate_id()
     return f"{OUTPUT_PARAMETER_PREFIX}_{int_id}"
+
+
+def generate_bitwarden_login_credential_parameter_id() -> str:
+    int_id = generate_id()
+    return f"{BITWARDEN_LOGIN_CREDENTIAL_PARAMETER_PREFIX}_{int_id}"
 
 
 def generate_organization_auth_token_id() -> str:

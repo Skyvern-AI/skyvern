@@ -22,12 +22,16 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicateParameterKeys
 from skyvern.forge.sdk.workflow.models.block import (
+    BlockResult,
     BlockType,
     BlockTypeVar,
     CodeBlock,
+    DownloadToS3Block,
     ForLoopBlock,
+    SendEmailBlock,
     TaskBlock,
     TextPromptBlock,
+    UploadToS3Block,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -148,9 +152,10 @@ class WorkflowService:
         )
         # Execute workflow blocks
         blocks = workflow.workflow_definition.blocks
-        try:
-            for block_idx, block in enumerate(blocks):
-                parameters = block.get_all_parameters()
+        block_result = None
+        for block_idx, block in enumerate(blocks):
+            try:
+                parameters = block.get_all_parameters(workflow_run_id)
                 await app.WORKFLOW_CONTEXT_MANAGER.register_block_parameters_for_workflow_run(
                     workflow_run_id, parameters
                 )
@@ -160,40 +165,36 @@ class WorkflowService:
                     workflow_run_id=workflow_run.workflow_run_id,
                     block_idx=block_idx,
                 )
-                await block.execute(workflow_run_id=workflow_run_id)
-        except Exception:
-            LOG.exception(
-                f"Error while executing workflow run {workflow_run.workflow_run_id}",
-                workflow_run_id=workflow_run.workflow_run_id,
-                exc_info=True,
-            )
+                block_result = await block.execute_safe(workflow_run_id=workflow_run_id)
+                if not block_result.success:
+                    LOG.error(
+                        f"Block with type {block.block_type} at index {block_idx} failed for workflow run {workflow_run_id}",
+                        block_type=block.block_type,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        block_idx=block_idx,
+                        block_result=block_result,
+                    )
+                    await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
+                    break
 
-        tasks = await self.get_tasks_by_workflow_run_id(workflow_run.workflow_run_id)
-
-        if tasks:
-            workflow_run = await self.handle_workflow_status(workflow_run=workflow_run, tasks=tasks)
-        else:
-            # Check if the workflow run has any workflow run output parameters
-            # if it does, mark the workflow run as completed, else mark it as failed
-            workflow_run_output_parameters = await self.get_workflow_run_output_parameters(
-                workflow_run_id=workflow_run.workflow_run_id
-            )
-            if workflow_run_output_parameters:
-                LOG.info(
-                    f"Workflow run {workflow_run.workflow_run_id} has output parameters, marking as completed",
+            except Exception as e:
+                LOG.exception(
+                    f"Error while executing workflow run {workflow_run.workflow_run_id}",
                     workflow_run_id=workflow_run.workflow_run_id,
-                )
-                await self.mark_workflow_run_as_completed(workflow_run_id=workflow_run.workflow_run_id)
-            else:
-                LOG.error(
-                    f"Workflow run {workflow_run.workflow_run_id} has no tasks or output parameters, marking as failed",
-                    workflow_run_id=workflow_run.workflow_run_id,
+                    exc_info=True,
                 )
                 await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
+                raise e
+
+        tasks = await self.get_tasks_by_workflow_run_id(workflow_run.workflow_run_id)
+        await self.mark_workflow_run_as_completed(workflow_run_id=workflow_run.workflow_run_id)
+
         await self.send_workflow_response(
             workflow=workflow,
             workflow_run=workflow_run,
             tasks=tasks,
+            # TODO: We don't persist the block result for now, but we should in the case the users want to get it later
+            last_block_result=block_result,
             api_key=api_key,
         )
         return workflow_run
@@ -349,6 +350,26 @@ class WorkflowService:
             workflow_id=workflow_id, aws_key=aws_key, key=key, description=description
         )
 
+    async def create_bitwarden_login_credential_parameter(
+        self,
+        workflow_id: str,
+        bitwarden_client_id_aws_secret_key: str,
+        bitwarden_client_secret_aws_secret_key: str,
+        bitwarden_master_password_aws_secret_key: str,
+        url_parameter_key: str,
+        key: str,
+        description: str | None = None,
+    ) -> Parameter:
+        return await app.DATABASE.create_bitwarden_login_credential_parameter(
+            workflow_id=workflow_id,
+            bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
+            bitwarden_client_secret_aws_secret_key=bitwarden_client_secret_aws_secret_key,
+            bitwarden_master_password_aws_secret_key=bitwarden_master_password_aws_secret_key,
+            url_parameter_key=url_parameter_key,
+            key=key,
+            description=description,
+        )
+
     async def create_output_parameter(
         self, workflow_id: str, key: str, description: str | None = None
     ) -> OutputParameter:
@@ -408,7 +429,7 @@ class WorkflowService:
         return await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
 
     async def build_workflow_run_status_response(
-        self, workflow_id: str, workflow_run_id: str, organization_id: str
+        self, workflow_id: str, workflow_run_id: str, last_block_result: BlockResult | None, organization_id: str
     ) -> WorkflowRunStatusResponse:
         workflow = await self.get_workflow(workflow_id=workflow_id)
         if workflow is None:
@@ -477,6 +498,7 @@ class WorkflowService:
             screenshot_urls=screenshot_urls,
             recording_url=recording_url,
             payload=payload,
+            output=last_block_result,
         )
 
     async def send_workflow_response(
@@ -484,6 +506,7 @@ class WorkflowService:
         workflow: Workflow,
         workflow_run: WorkflowRun,
         tasks: list[Task],
+        last_block_result: BlockResult | None,
         api_key: str | None = None,
         close_browser_on_completion: bool = True,
     ) -> None:
@@ -501,6 +524,7 @@ class WorkflowService:
         workflow_run_status_response = await self.build_workflow_run_status_response(
             workflow_id=workflow.workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
+            last_block_result=last_block_result,
             organization_id=workflow.organization_id,
         )
         LOG.info("Built workflow run status response", workflow_run_status_response=workflow_run_status_response)
@@ -641,6 +665,16 @@ class WorkflowService:
                         key=parameter.key,
                         description=parameter.description,
                     )
+                elif parameter.parameter_type == ParameterType.BITWARDEN_LOGIN_CREDENTIAL:
+                    parameters[parameter.key] = await self.create_bitwarden_login_credential_parameter(
+                        workflow_id=workflow.workflow_id,
+                        bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
+                        bitwarden_client_secret_aws_secret_key=parameter.bitwarden_client_secret_aws_secret_key,
+                        bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
+                        url_parameter_key=parameter.url_parameter_key,
+                        key=parameter.key,
+                        description=parameter.description,
+                    )
                 elif parameter.parameter_type == ParameterType.WORKFLOW:
                     parameters[parameter.key] = await self.create_workflow_parameter(
                         workflow_id=workflow.workflow_id,
@@ -706,10 +740,12 @@ class WorkflowService:
                 max_retries=block_yaml.max_retries,
             )
         elif block_yaml.block_type == BlockType.FOR_LOOP:
+            loop_block = await WorkflowService.block_yaml_to_block(block_yaml.loop_block, parameters)
+            loop_over_parameter = parameters[block_yaml.loop_over_parameter_key]
             return ForLoopBlock(
                 label=block_yaml.label,
-                loop_over_parameter_key=parameters[block_yaml.loop_over_parameter_key],
-                loop_block=WorkflowService.block_yaml_to_block(block_yaml.loop_block, parameters),
+                loop_over=loop_over_parameter,
+                loop_block=loop_block,
                 output_parameter=output_parameter,
             )
         elif block_yaml.block_type == BlockType.CODE:
@@ -731,5 +767,31 @@ class WorkflowService:
                 else [],
                 json_schema=block_yaml.json_schema,
                 output_parameter=output_parameter,
+            )
+        elif block_yaml.block_type == BlockType.DOWNLOAD_TO_S3:
+            return DownloadToS3Block(
+                label=block_yaml.label,
+                output_parameter=output_parameter,
+                url=block_yaml.url,
+            )
+        elif block_yaml.block_type == BlockType.UPLOAD_TO_S3:
+            return UploadToS3Block(
+                label=block_yaml.label,
+                output_parameter=output_parameter,
+                path=block_yaml.path,
+            )
+        elif block_yaml.block_type == BlockType.SEND_EMAIL:
+            return SendEmailBlock(
+                label=block_yaml.label,
+                output_parameter=output_parameter,
+                smtp_host=parameters[block_yaml.smtp_host_secret_parameter_key],
+                smtp_port=parameters[block_yaml.smtp_port_secret_parameter_key],
+                smtp_username=parameters[block_yaml.smtp_username_secret_parameter_key],
+                smtp_password=parameters[block_yaml.smtp_password_secret_parameter_key],
+                sender=block_yaml.sender,
+                recipients=block_yaml.recipients,
+                subject=block_yaml.subject,
+                body=block_yaml.body,
+                file_attachments=block_yaml.file_attachments or [],
             )
         raise ValueError(f"Invalid block type {block_yaml.block_type}")
