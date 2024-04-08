@@ -104,6 +104,7 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
         organization_name=org_model.organization_name,
         webhook_callback_url=org_model.webhook_callback_url,
         max_steps_per_run=org_model.max_steps_per_run,
+        max_retries_per_step=org_model.max_retries_per_step,
         created_at=org_model.created_at,
         modified_at=org_model.modified_at,
     )

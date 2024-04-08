@@ -74,7 +74,8 @@ class OrganizationModel(Base):
     organization_id = Column(String, primary_key=True, index=True, default=generate_org_id)
     organization_name = Column(String, nullable=False)
     webhook_callback_url = Column(UnicodeText)
-    max_steps_per_run = Column(Integer)
+    max_steps_per_run = Column(Integer, nullable=True)
+    max_retries_per_step = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime, nullable=False)
 
