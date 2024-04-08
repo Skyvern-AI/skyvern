@@ -227,7 +227,7 @@ class ForgeAgent(Agent):
 
             # If the step failed, mark the step as failed and retry
             if step.status == StepStatus.failed:
-                maybe_next_step = await self.handle_failed_step(task, step)
+                maybe_next_step = await self.handle_failed_step(organization, task, step)
                 # If there is no next step, it means that the task has failed
                 if maybe_next_step:
                     next_step = maybe_next_step
@@ -965,8 +965,14 @@ class ForgeAgent(Agent):
             **updates,
         )
 
-    async def handle_failed_step(self, task: Task, step: Step) -> Step | None:
-        if step.retry_index >= SettingsManager.get_settings().MAX_RETRIES_PER_STEP:
+    async def handle_failed_step(self, organization: Organization, task: Task, step: Step) -> Step | None:
+        max_retries_per_step = (
+            organization.max_retries_per_step
+            # we need to check by None because 0 is a valid value for max_retries_per_step
+            if organization.max_retries_per_step is not None
+            else SettingsManager.get_settings().MAX_RETRIES_PER_STEP
+        )
+        if step.retry_index >= max_retries_per_step:
             LOG.warning(
                 "Step failed after max retries, marking task as failed",
                 task_id=task.task_id,
@@ -978,7 +984,7 @@ class ForgeAgent(Agent):
             await self.update_task(
                 task,
                 TaskStatus.failed,
-                failure_reason=f"Max retries per step ({SettingsManager.get_settings().MAX_RETRIES_PER_STEP}) exceeded",
+                failure_reason=f"Max retries per step ({max_retries_per_step}) exceeded",
             )
             return None
         else:
