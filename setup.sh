@@ -97,6 +97,7 @@ setup_llm_providers() {
     else
         update_or_add_env_var "ENABLE_AZURE" "false"
     fi
+    
     #Gemini Configuartion
     echo "To enable Gemini, you must have an Gemini API key."
     read -p "Do you want to enable Gemini (y/n)? " enable_gemini
@@ -106,9 +107,9 @@ setup_llm_providers() {
             echo "Error: Gemini API key is required."
             echo "Gemini will not be enabled."
         else
-            update_or_add_env_var "GEMINI_API_KEY" "$openai_api_key"
+            update_or_add_env_var "GEMINI_API_KEY" "$gemini_api_key"
             update_or_add_env_var "ENABLE_GEMINI" "true"
-            model_options+=("gemini/gemini-pro")
+            model_options+=("GEMINI_PRO_VISION")
         fi
     else
         update_or_add_env_var "ENABLE_GEMINI" "false"

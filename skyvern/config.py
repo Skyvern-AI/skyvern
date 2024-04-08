@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     ENABLE_OPENAI: bool = False
     ENABLE_ANTHROPIC: bool = False
     ENABLE_AZURE: bool = False
-    ENABLE_GEMINI: bool = True
+    ENABLE_GEMINI: bool = False
     # OPENAI
     OPENAI_API_KEY: str | None = None
     # ANTHROPIC
