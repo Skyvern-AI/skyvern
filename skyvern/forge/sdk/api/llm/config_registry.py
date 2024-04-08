@@ -78,7 +78,7 @@ if SettingsManager.get_settings().ENABLE_GEMINI:
     LLMConfigRegistry.register_config(
         "GEMINI_GPT4V",
         litellm.completion(
-            "gpt-4-vision-preview",
+            "gemini/gemini-pro-vision",
             ["GEMINI_API_KEY"],
             True,
         ),
