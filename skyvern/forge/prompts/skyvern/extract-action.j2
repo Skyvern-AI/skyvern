@@ -6,6 +6,10 @@ Each element is tagged with an ID.
 If you see any information in red in the page screenshot, this means a condition wasn't satisfied. prioritize actions with the red information.
 If you see a popup in the page screenshot, prioritize actions on the popup.
 
+{% if "lever" in url %}
+DO NOT UPDATE ANY LOCATION FIELDS
+{% endif %}
+
 Reply in JSON format with the following keys:
 {
     "actions": array // An array of actions. Here's the format of each action:
