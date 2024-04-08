@@ -111,7 +111,7 @@ setup_llm_providers() {
             model_options+=("gemini/gemini-pro")
         fi
     else
-        update_or_add_env_var "ENABLE_OPENAI" "false"
+        update_or_add_env_var "ENABLE_GEMINI" "false"
     fi
 
     # Model Selection
