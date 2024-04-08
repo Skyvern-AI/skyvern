@@ -5,7 +5,7 @@ type Props = {
   status: Status;
 };
 
-function TaskStatusBadge({ status }: Props) {
+function StatusBadge({ status }: Props) {
   let variant: "default" | "success" | "destructive" | "warning" = "default";
   if (status === "completed") {
     variant = "success";
@@ -18,4 +18,4 @@ function TaskStatusBadge({ status }: Props) {
   return <Badge variant={variant}>{status}</Badge>;
 }
 
-export { TaskStatusBadge };
+export { StatusBadge };

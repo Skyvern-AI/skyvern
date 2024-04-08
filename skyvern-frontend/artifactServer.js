@@ -1,9 +1,12 @@
 import express from "express";
 import fs from "fs";
+import cors from "cors";
 
 const app = express();
 
-app.get("/artifact", (req, res) => {
+app.use(cors());
+
+app.get("/artifact/recording", (req, res) => {
   const range = req.headers.range;
   const path = req.query.path;
   const videoSize = fs.statSync(path).size;
@@ -23,6 +26,28 @@ app.get("/artifact", (req, res) => {
     end,
   });
   stream.pipe(res);
+});
+
+app.get("/artifact/image", (req, res) => {
+  const path = req.query.path;
+  res.sendFile(path);
+});
+
+app.get("/artifact/json", (req, res) => {
+  const path = req.query.path;
+  const contents = fs.readFileSync(path);
+  try {
+    const data = JSON.parse(contents);
+    res.json(data);
+  } catch (err) {
+    res.status(500).send(err);
+  }
+});
+
+app.get("/artifact/text", (req, res) => {
+  const path = req.query.path;
+  const contents = fs.readFileSync(path);
+  res.send(contents);
 });
 
 app.listen(9090);

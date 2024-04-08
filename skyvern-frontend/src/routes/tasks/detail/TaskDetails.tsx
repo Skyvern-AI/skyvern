@@ -2,20 +2,22 @@ import { client } from "@/api/AxiosClient";
 import { Status, TaskApiResponse } from "@/api/types";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { useParams } from "react-router-dom";
-import { StepList } from "./StepList";
 import {
   Accordion,
   AccordionContent,
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
-import { TaskStatusBadge } from "@/components/TaskStatusBadge";
+import { StatusBadge } from "@/components/StatusBadge";
 import { artifactApiBaseUrl } from "@/util/env";
 import { Button } from "@/components/ui/button";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { basicTimeFormat } from "@/util/timeFormat";
+import { StepArtifactsLayout } from "./StepArtifactsLayout";
+import Zoom from "react-medium-image-zoom";
+import { AspectRatio } from "@/components/ui/aspect-ratio";
 
 function TaskDetails() {
   const { taskId } = useParams();
@@ -27,11 +29,10 @@ function TaskDetails() {
     error: taskError,
     refetch,
   } = useQuery<TaskApiResponse>({
-    queryKey: ["task", taskId],
+    queryKey: ["task", taskId, "details"],
     queryFn: async () => {
       return client.get(`/tasks/${taskId}`).then((response) => response.data);
     },
-    placeholderData: keepPreviousData,
   });
 
   if (isTaskError) {
@@ -63,14 +64,14 @@ function TaskDetails() {
           <div className="flex">
             <Label className="w-32">Recording</Label>
             <video
-              src={`${artifactApiBaseUrl}/artifact?path=${task.recording_url.slice(7)}`}
+              src={`${artifactApiBaseUrl}/artifact/recording?path=${task.recording_url.slice(7)}`}
               controls
             />
           </div>
         ) : null}
         <div className="flex items-center">
           <Label className="w-32">Status</Label>
-          <TaskStatusBadge status={task.status} />
+          <StatusBadge status={task.status} />
         </div>
         {task.status === Status.Completed ? (
           <div className="flex items-center">
@@ -93,8 +94,8 @@ function TaskDetails() {
           </div>
         ) : null}
       </div>
-      <Accordion type="single" collapsible>
-        <AccordionItem value="task-details">
+      <Accordion type="multiple">
+        <AccordionItem value="task-parameters">
           <AccordionTrigger>
             <h1>Task Parameters</h1>
           </AccordionTrigger>
@@ -102,7 +103,9 @@ function TaskDetails() {
             <div>
               <p className="py-2">Task ID: {taskId}</p>
               <p className="py-2">URL: {task.request.url}</p>
-              <p className="py-2">{basicTimeFormat(task.created_at)}</p>
+              <p className="py-2">
+                Created: {basicTimeFormat(task.created_at)}
+              </p>
               <div className="py-2">
                 <Label>Navigation Goal</Label>
                 <Textarea
@@ -130,11 +133,36 @@ function TaskDetails() {
             </div>
           </AccordionContent>
         </AccordionItem>
+        <AccordionItem value="task-artifacts">
+          <AccordionTrigger>
+            <h1>Screenshot</h1>
+          </AccordionTrigger>
+          <AccordionContent>
+            <div className="max-w-sm mx-auto">
+              {task.screenshot_url ? (
+                <Zoom zoomMargin={16}>
+                  <AspectRatio ratio={16 / 9}>
+                    <img
+                      src={`${artifactApiBaseUrl}/artifact/image?path=${task.screenshot_url.slice(7)}`}
+                      alt="screenshot"
+                    />
+                  </AspectRatio>
+                </Zoom>
+              ) : (
+                <p>No screenshot</p>
+              )}
+            </div>
+          </AccordionContent>
+        </AccordionItem>
+        <AccordionItem value="task-steps">
+          <AccordionTrigger>
+            <h1>Task Steps</h1>
+          </AccordionTrigger>
+          <AccordionContent>
+            <StepArtifactsLayout />
+          </AccordionContent>
+        </AccordionItem>
       </Accordion>
-      <div className="py-2">
-        <h1>Task Steps</h1>
-        <StepList />
-      </div>
     </div>
   );
 }

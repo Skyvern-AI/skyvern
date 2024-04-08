@@ -78,7 +78,8 @@ Before you begin, make sure you have the following installed:
 - [Brew (if you're on a Mac)](https://brew.sh/)
 - [Poetry](https://python-poetry.org/docs/#installation)
     - `brew install poetry`
-
+- [Docker](https://docs.docker.com/engine/install/)
+  
 Note: Our setup script does these two for you, but they are here for reference.
 - [Python 3.11](https://www.python.org/downloads/)
     - `poetry env use 3.11`
@@ -87,6 +88,7 @@ Note: Our setup script does these two for you, but they are here for reference.
 
 ## Setup
 1. Clone the repository and navigate to the root directory
+1. Open Docker Desktop (Works for Windows, macOS, and Linux) or run Docker Daemon
 1. Run the setup script to install the necessary dependencies and setup your environment
     ```bash
     ./setup.sh

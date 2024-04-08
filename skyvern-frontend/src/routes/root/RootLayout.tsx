@@ -2,20 +2,21 @@ import { Link, Outlet } from "react-router-dom";
 import { Toaster } from "@/components/ui/toaster";
 import { SideNav } from "./SideNav";
 import { DiscordLogoIcon, GitHubLogoIcon } from "@radix-ui/react-icons";
+import { Logo } from "@/components/Logo";
+import { ThemeToggle } from "@/components/ThemeSwitch";
 
 function RootLayout() {
   return (
     <>
-      <div className="w-full h-full px-4 max-w-screen-2xl mx-auto">
+      <div className="w-full h-full px-4">
         <aside className="fixed w-72 px-6 shrink-0 min-h-screen">
           <Link
             to="https://skyvern.com"
             target="_blank"
             rel="noopener noreferrer"
           >
-            <div className="h-24 flex items-center justify-center">
-              <img src="/skyvern-logo.png" width={48} height={48} />
-              <img src="/skyvern-logo-text.png" height={48} width={192} />
+            <div className="h-24">
+              <Logo />
             </div>
           </Link>
           <SideNav />
@@ -26,20 +27,20 @@ function RootLayout() {
             target="_blank"
             rel="noopener noreferrer"
           >
-            <DiscordLogoIcon className="w-6 h-6 text-gray-400 hover:text-white" />
+            <DiscordLogoIcon className="w-6 h-6" />
           </Link>
           <Link
             to="https://github.com/Skyvern-AI/skyvern"
             target="_blank"
             rel="noopener noreferrer"
           >
-            <GitHubLogoIcon className="w-6 h-6 text-gray-400 hover:text-white" />
+            <GitHubLogoIcon className="w-6 h-6" />
           </Link>
+          <ThemeToggle />
         </div>
         <main className="pl-72">
           <Outlet />
         </main>
-        <aside className="w-72 shrink-0"></aside>
       </div>
       <Toaster />
     </>
