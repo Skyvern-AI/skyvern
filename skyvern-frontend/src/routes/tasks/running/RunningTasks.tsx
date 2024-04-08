@@ -11,20 +11,15 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { PAGE_SIZE } from "../constants";
-import { RunningTaskSkeleton } from "./RunningTaskSkeleton";
 import { basicTimeFormat } from "@/util/timeFormat";
+import { LatestScreenshot } from "./LatestScreenshot";
 
 function RunningTasks() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
 
-  const {
-    data: tasks,
-    isPending,
-    isError,
-    error,
-  } = useQuery<Array<TaskApiResponse>>({
+  const { data: tasks } = useQuery<Array<TaskApiResponse>>({
     queryKey: ["tasks", page],
     queryFn: async () => {
       return client
@@ -40,25 +35,13 @@ function RunningTasks() {
     placeholderData: keepPreviousData,
   });
 
-  if (isPending) {
-    return <RunningTaskSkeleton />;
-  }
+  const runningTasks = tasks?.filter((task) => task.status === Status.Running);
 
-  if (isError) {
-    return <div>Error: {error?.message}</div>;
-  }
-
-  if (!tasks) {
-    return null;
-  }
-
-  const runningTasks = tasks.filter((task) => task.status === Status.Running);
-
-  if (runningTasks.length === 0) {
+  if (runningTasks?.length === 0) {
     return <div>No running tasks</div>;
   }
 
-  return runningTasks.map((task) => {
+  return runningTasks?.map((task) => {
     return (
       <Card
         key={task.task_id}
@@ -68,10 +51,17 @@ function RunningTasks() {
         }}
       >
         <CardHeader>
-          <CardTitle>{task.request.url}</CardTitle>
-          <CardDescription></CardDescription>
+          <CardTitle>{task.task_id}</CardTitle>
+          <CardDescription className="whitespace-nowrap overflow-hidden text-ellipsis">
+            {task.request.url}
+          </CardDescription>
         </CardHeader>
-        <CardContent>Goal: {task.request.navigation_goal}</CardContent>
+        <CardContent>
+          Latest screenshot:
+          <div className="w-40 h-40 border-2">
+            <LatestScreenshot id={task.task_id} />
+          </div>
+        </CardContent>
         <CardFooter>Created: {basicTimeFormat(task.created_at)}</CardFooter>
       </Card>
     );

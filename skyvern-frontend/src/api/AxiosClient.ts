@@ -1,4 +1,4 @@
-import { apiBaseUrl, credential } from "@/util/env";
+import { apiBaseUrl, artifactApiBaseUrl, credential } from "@/util/env";
 import axios from "axios";
 
 const client = axios.create({
@@ -9,4 +9,8 @@ const client = axios.create({
   },
 });
 
-export { client };
+const artifactApiClient = axios.create({
+  baseURL: artifactApiBaseUrl,
+});
+
+export { client, artifactApiClient };
