@@ -13,6 +13,11 @@ services:
       - POSTGRES_USER=skyvern
       - POSTGRES_PASSWORD=skyvern
       - POSTGRES_POSTGRES_DB=skyvern
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U skyvern"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   skyvern:
     image: public.ecr.aws/t6d4b5t4/skyvern:latest
@@ -40,7 +45,8 @@ services:
       # - AZURE_API_BASE=<your_azure_api_base>
       # - AZURE_API_VERSION=<your_azure_api_version>
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
   
   streamlit:
     image: public.ecr.aws/t6d4b5t4/skyvern:latest
@@ -54,6 +60,5 @@ services:
       - ./.streamlit:/app/.streamlit
     command: ["/bin/bash", "entrypoint-streamlit.sh"]
     depends_on:
-      - postgres
       - skyvern
 
