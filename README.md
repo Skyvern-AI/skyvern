@@ -106,7 +106,7 @@ Note: Our setup script does these two for you, but they are here for reference.
 1. Fill in the LLM provider key on the [docker-compose.yml](./docker-compose.yml)
 2. Run the following command:
    ```bash
-    docker compsoe up -d
+    docker compose up -d
    ```
 3. Navigate to `http://localhost:8501` in your browser to start using the UI
 
