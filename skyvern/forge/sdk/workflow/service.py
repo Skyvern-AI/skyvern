@@ -35,6 +35,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
+    ContextParameter,
     OutputParameter,
     Parameter,
     ParameterType,
@@ -653,6 +654,10 @@ class WorkflowService:
             # Create parameters from the request
             parameters = {}
             duplicate_parameter_keys = set()
+
+            # We're going to process context parameters after other parameters since they depend on the other parameters
+            context_parameter_yamls = []
+
             for parameter in request.workflow_definition.parameters:
                 if parameter.key in parameters:
                     LOG.error(f"Duplicate parameter key {parameter.key}")
@@ -689,6 +694,21 @@ class WorkflowService:
                         key=parameter.key,
                         description=parameter.description,
                     )
+                elif parameter.parameter_type == ParameterType.CONTEXT:
+                    context_parameter_yamls.append(parameter)
+                else:
+                    LOG.error(f"Invalid parameter type {parameter.parameter_type}")
+
+            # Now we can process the context parameters since all other parameters have been created
+            for context_parameter in context_parameter_yamls:
+                parameters[context_parameter.key] = ContextParameter(
+                    key=context_parameter.key,
+                    description=context_parameter.description,
+                    source=parameters[context_parameter.source_workflow_parameter_key],
+                    # Context parameters don't have a default value, the value always depends on the source parameter
+                    value=None,
+                )
+
             if duplicate_parameter_keys:
                 raise WorkflowDefinitionHasDuplicateParameterKeys(duplicate_keys=duplicate_parameter_keys)
             # Create blocks from the request
