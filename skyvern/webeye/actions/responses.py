@@ -60,3 +60,18 @@ class ActionFailure(ActionResult):
             interacted_with_sibling=interacted_with_sibling,
             interacted_with_parent=interacted_with_parent,
         )
+
+
+class ActionAbort(ActionResult):
+    def __init__(
+        self,
+        javascript_triggered: bool = False,
+        interacted_with_sibling: bool = False,
+        interacted_with_parent: bool = False,
+    ):
+        super().__init__(
+            success=True, # TODO: set to true to be compatible in forge/agent.agent_step
+            javascript_triggered=javascript_triggered,
+            interacted_with_sibling=interacted_with_sibling,
+            interacted_with_parent=interacted_with_parent,
+        )
