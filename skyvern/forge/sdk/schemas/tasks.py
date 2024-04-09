@@ -73,19 +73,23 @@ class TaskRequest(BaseModel):
 
 class TaskStatus(StrEnum):
     created = "created"
+    queued = "queued"
     running = "running"
+    timed_out = "timed_out"
     failed = "failed"
     terminated = "terminated"
     completed = "completed"
 
     def is_final(self) -> bool:
-        return self in {TaskStatus.failed, TaskStatus.terminated, TaskStatus.completed}
+        return self in {TaskStatus.failed, TaskStatus.terminated, TaskStatus.completed, TaskStatus.timed_out}
 
     def can_update_to(self, new_status: TaskStatus) -> bool:
         allowed_transitions: dict[TaskStatus, set[TaskStatus]] = {
-            TaskStatus.created: {TaskStatus.running},
-            TaskStatus.running: {TaskStatus.completed, TaskStatus.failed, TaskStatus.terminated},
+            TaskStatus.created: {TaskStatus.queued, TaskStatus.running, TaskStatus.timed_out},
+            TaskStatus.queued: {TaskStatus.running, TaskStatus.timed_out},
+            TaskStatus.running: {TaskStatus.completed, TaskStatus.failed, TaskStatus.terminated, TaskStatus.timed_out},
             TaskStatus.failed: set(),
+            TaskStatus.terminated: set(),
             TaskStatus.completed: set(),
         }
         return new_status in allowed_transitions[self]
@@ -97,6 +101,7 @@ class TaskStatus(StrEnum):
     def cant_have_extracted_info(self) -> bool:
         status_cant_have_extracted_information = {
             TaskStatus.created,
+            TaskStatus.queued,
             TaskStatus.running,
             TaskStatus.failed,
             TaskStatus.terminated,

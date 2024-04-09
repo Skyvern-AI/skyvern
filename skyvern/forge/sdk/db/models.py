@@ -30,7 +30,7 @@ class TaskModel(Base):
 
     task_id = Column(String, primary_key=True, index=True, default=generate_task_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
-    status = Column(String)
+    status = Column(String, index=True)
     webhook_callback_url = Column(String)
     title = Column(String)
     url = Column(String)
@@ -46,8 +46,10 @@ class TaskModel(Base):
     retry = Column(Integer, nullable=True)
     error_code_mapping = Column(JSON, nullable=True)
     errors = Column(JSON, default=[], nullable=False)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
-    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
+    modified_at = Column(
+        DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False, index=True
+    )
 
 
 class StepModel(Base):
