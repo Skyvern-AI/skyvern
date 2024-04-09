@@ -60,3 +60,20 @@ class ActionFailure(ActionResult):
             interacted_with_sibling=interacted_with_sibling,
             interacted_with_parent=interacted_with_parent,
         )
+
+
+# TODO: action is aborted. but action chains need to be continued in forge/agent.agent_step
+# so set success to True for right now.
+class ActionAbort(ActionResult):
+    def __init__(
+        self,
+        javascript_triggered: bool = False,
+        interacted_with_sibling: bool = False,
+        interacted_with_parent: bool = False,
+    ):
+        super().__init__(
+            success=True,
+            javascript_triggered=javascript_triggered,
+            interacted_with_sibling=interacted_with_sibling,
+            interacted_with_parent=interacted_with_parent,
+        )
