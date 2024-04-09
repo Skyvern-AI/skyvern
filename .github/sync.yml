@@ -17,5 +17,5 @@ Skyvern-AI/skyvern-cloud:
     dest: run_skyvern.sh
   - source: run_alembic_check.sh
     dest: run_alembic_check.sh
-  - source: skyvern-frontend/
-    dest: skyvern-frontend/
+  - source: skyvern-frontend/src/
+    dest: skyvern-frontend/src/
