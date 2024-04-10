@@ -95,7 +95,7 @@ class ForLoopBlockYAML(BlockYAML):
     block_type: Literal[BlockType.FOR_LOOP] = BlockType.FOR_LOOP  # type: ignore
 
     loop_over_parameter_key: str
-    loop_block: "BLOCK_YAML_SUBCLASSES"
+    loop_blocks: list["BLOCK_YAML_SUBCLASSES"]
 
 
 class CodeBlockYAML(BlockYAML):

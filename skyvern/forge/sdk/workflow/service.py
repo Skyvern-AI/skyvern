@@ -760,12 +760,15 @@ class WorkflowService:
                 max_retries=block_yaml.max_retries,
             )
         elif block_yaml.block_type == BlockType.FOR_LOOP:
-            loop_block = await WorkflowService.block_yaml_to_block(block_yaml.loop_block, parameters)
+            loop_blocks = [
+                await WorkflowService.block_yaml_to_block(loop_block, parameters)
+                for loop_block in block_yaml.loop_blocks
+            ]
             loop_over_parameter = parameters[block_yaml.loop_over_parameter_key]
             return ForLoopBlock(
                 label=block_yaml.label,
                 loop_over=loop_over_parameter,
-                loop_block=loop_block,
+                loop_blocks=loop_blocks,
                 output_parameter=output_parameter,
             )
         elif block_yaml.block_type == BlockType.CODE:
