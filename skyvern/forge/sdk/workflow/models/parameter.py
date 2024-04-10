@@ -21,6 +21,9 @@ class Parameter(BaseModel, abc.ABC):
     key: str
     description: str | None = None
 
+    def __hash__(self) -> int:
+        return hash(self.key)
+
     @classmethod
     def get_subclasses(cls) -> tuple[type["Parameter"], ...]:
         return tuple(cls.__subclasses__())
