@@ -504,9 +504,6 @@ function buildTreeFromBody() {
     const selectContainers = document.querySelectorAll(".select2-container");
 
     selectContainers.forEach((element) => {
-      // hide the select2 container
-      element.style.display = "none";
-
       // search select in previous
       let _pre = element.previousElementSibling;
       while (_pre) {
@@ -515,6 +512,8 @@ function buildTreeFromBody() {
           _pre.style.display === "none"
         ) {
           _pre.style.removeProperty("display");
+          // only hide the select2 container when an alternative select found
+          element.style.display = "none";
           return;
         }
         _pre = _pre.previousElementSibling;
@@ -528,6 +527,8 @@ function buildTreeFromBody() {
           _next.style.display === "none"
         ) {
           _next.style.removeProperty("display");
+          // only hide the select2 container when an alternative select found
+          element.style.display = "none";
           return;
         }
         _next = _next.nextElementSibling;
