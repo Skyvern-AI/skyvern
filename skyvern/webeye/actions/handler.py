@@ -15,6 +15,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import download_file
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
+from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.actions import actions
 from skyvern.webeye.actions.actions import Action, ActionType, ClickAction, ScrapeResult, UploadFileAction, WebAction
@@ -434,6 +435,10 @@ def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) -> Any:
 
     workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
     secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
+
+    if secret_value == BitwardenConstants.TOTP:
+        secrets = workflow_run_context.get_secrets_from_password_manager()
+        secret_value = secrets[BitwardenConstants.TOTP]
     return secret_value if secret_value is not None else parameter
 
 
