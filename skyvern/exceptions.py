@@ -207,6 +207,11 @@ class BitwardenListItemsError(BitwardenBaseError):
         super().__init__(f"Error listing items in Bitwarden: {message}")
 
 
+class BitwardenTOTPError(BitwardenBaseError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Error generating TOTP in Bitwarden: {message}")
+
+
 class BitwardenLogoutError(BitwardenBaseError):
     def __init__(self, message: str) -> None:
         super().__init__(f"Error logging out of Bitwarden: {message}")

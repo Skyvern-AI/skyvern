@@ -1,12 +1,30 @@
 import json
 import os
 import subprocess
+from enum import StrEnum
 
 import structlog
 
-from skyvern.exceptions import BitwardenListItemsError, BitwardenLoginError, BitwardenLogoutError, BitwardenUnlockError
+from skyvern.exceptions import (
+    BitwardenListItemsError,
+    BitwardenLoginError,
+    BitwardenLogoutError,
+    BitwardenTOTPError,
+    BitwardenUnlockError,
+)
 
 LOG = structlog.get_logger()
+
+
+class BitwardenConstants(StrEnum):
+    CLIENT_ID = "BW_CLIENT_ID"
+    CLIENT_SECRET = "BW_CLIENT_SECRET"
+    MASTER_PASSWORD = "BW_MASTER_PASSWORD"
+    URL = "BW_URL"
+
+    USERNAME = "BW_USERNAME"
+    PASSWORD = "BW_PASSWORD"
+    TOTP = "BW_TOTP"
 
 
 class BitwardenService:
@@ -34,57 +52,72 @@ class BitwardenService:
         Get the secret value from the Bitwarden CLI.
         """
         # Step 1: Set up environment variables and log in
-        env = {"BW_CLIENTID": client_id, "BW_CLIENTSECRET": client_secret, "BW_PASSWORD": master_password}
-        login_command = ["bw", "login", "--apikey"]
-        login_result = BitwardenService.run_command(login_command, env)
-
-        # Print both stdout and stderr for debugging
-        if login_result.stderr:
-            raise BitwardenLoginError(login_result.stderr)
-
-        # Step 2: Unlock the vault
-        unlock_command = ["bw", "unlock", "--passwordenv", "BW_PASSWORD"]
-        unlock_result = BitwardenService.run_command(unlock_command, env)
-
-        if unlock_result.stderr:
-            raise BitwardenUnlockError(unlock_result.stderr)
-
-        # Extract session key
         try:
-            session_key = unlock_result.stdout.split('"')[1]
-        except IndexError:
-            raise BitwardenUnlockError("Unable to extract session key.")
+            env = {"BW_CLIENTID": client_id, "BW_CLIENTSECRET": client_secret, "BW_PASSWORD": master_password}
+            login_command = ["bw", "login", "--apikey"]
+            login_result = BitwardenService.run_command(login_command, env)
 
-        if not session_key:
-            raise BitwardenUnlockError("Session key is empty.")
+            # Print both stdout and stderr for debugging
+            if login_result.stderr:
+                raise BitwardenLoginError(login_result.stderr)
 
-        # Step 3: Retrieve the items
-        list_command = ["bw", "list", "items", "--url", url, "--session", session_key]
-        items_result = BitwardenService.run_command(list_command)
+            # Step 2: Unlock the vault
+            unlock_command = ["bw", "unlock", "--passwordenv", "BW_PASSWORD"]
+            unlock_result = BitwardenService.run_command(unlock_command, env)
 
-        if items_result.stderr:
-            raise BitwardenListItemsError(items_result.stderr)
+            # This is a part of Bitwarden's client-side telemetry
+            # TODO -- figure out how to disable this telemetry so we never get this error
+            # https://github.com/bitwarden/clients/blob/9d10825dbd891c0f41fe1b4c4dd3ca4171f63be5/libs/common/src/services/api.service.ts#L1473
+            if unlock_result.stderr and "Event post failed" not in unlock_result.stderr:
+                raise BitwardenUnlockError(unlock_result.stderr)
 
-        # Parse the items and extract credentials
-        try:
-            items = json.loads(items_result.stdout)
-        except json.JSONDecodeError:
-            raise BitwardenListItemsError("Failed to parse items JSON. Output: " + items_result.stdout)
+            # Extract session key
+            try:
+                session_key = unlock_result.stdout.split('"')[1]
+            except IndexError:
+                raise BitwardenUnlockError("Unable to extract session key.")
 
-        if not items:
-            raise BitwardenListItemsError("No items found in Bitwarden.")
+            if not session_key:
+                raise BitwardenUnlockError("Session key is empty.")
 
-        credentials = [
-            {"username": item["login"]["username"], "password": item["login"]["password"]}
-            for item in items
-            if "login" in item
-        ]
+            # Step 3: Retrieve the items
+            list_command = ["bw", "list", "items", "--url", url, "--session", session_key]
+            items_result = BitwardenService.run_command(list_command)
 
-        # Step 4: Log out
-        BitwardenService.logout()
+            if items_result.stderr and "Event post failed" not in items_result.stderr:
+                raise BitwardenListItemsError(items_result.stderr)
 
-        # Todo: Handle multiple credentials, for now just return the last one
-        return credentials[-1] if credentials else {}
+            # Parse the items and extract credentials
+            try:
+                items = json.loads(items_result.stdout)
+            except json.JSONDecodeError:
+                raise BitwardenListItemsError("Failed to parse items JSON. Output: " + items_result.stdout)
+
+            if not items:
+                raise BitwardenListItemsError("No items found in Bitwarden.")
+
+            totp_command = ["bw", "get", "totp", url, "--session", session_key]
+            totp_result = BitwardenService.run_command(totp_command)
+
+            if totp_result.stderr and "Event post failed" not in totp_result.stderr:
+                LOG.warning("Bitwarden TOTP Error", error=totp_result.stderr, e=BitwardenTOTPError(totp_result.stderr))
+            totp_code = totp_result.stdout
+
+            credentials: list[dict[str, str]] = [
+                {
+                    BitwardenConstants.USERNAME: item["login"]["username"],
+                    BitwardenConstants.PASSWORD: item["login"]["password"],
+                    BitwardenConstants.TOTP: totp_code,
+                }
+                for item in items
+                if "login" in item
+            ]
+
+            # Todo: Handle multiple credentials, for now just return the last one
+            return credentials[-1] if credentials else {}
+        finally:
+            # Step 4: Log out
+            BitwardenService.logout()
 
     @staticmethod
     def logout() -> None:
