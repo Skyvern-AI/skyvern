@@ -50,7 +50,7 @@ apscheduler = "^3.10.4"
 httpx = "^0.27.0"
 filetype = "^1.2.0"
 redis = "^5.0.3"
-
+onnxruntime = "<1.17"
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.12.0"
