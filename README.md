@@ -105,6 +105,16 @@ Note: Our setup script does these two for you, but they are here for reference.
     ```
 1. Navigate to `http://localhost:8501` in your browser to start using the UI
 
+## Docker Compose setup
+
+1. Fill in the LLM provider key on the [docker-compose.yml](./docker-compose.yml)
+2. Run the following command:
+   ```bash
+    docker compose up -d
+   ```
+3. Navigate to `http://localhost:8501` in your browser to start using the UI
+
+
 ## Additional Setup for Contributors
 If you're looking to contribute to Skyvern, you'll need to install the pre-commit hooks to ensure code quality and consistency. You can do this by running the following command:
 ```bash
