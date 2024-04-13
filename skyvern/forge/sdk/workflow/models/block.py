@@ -227,7 +227,7 @@ class TaskBlock(Block):
                 raise TaskNotFound(task.task_id)
             if not updated_task.status.is_final():
                 raise UnexpectedTaskStatus(task_id=updated_task.task_id, status=updated_task.status)
-            if updated_task.status == TaskStatus.completed:
+            if updated_task.status == TaskStatus.completed or updated_task.status == TaskStatus.terminated:
                 LOG.info(
                     f"Task completed",
                     task_id=updated_task.task_id,
