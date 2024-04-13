@@ -6,7 +6,7 @@ Each element is tagged with an ID.
 If you see any information in red in the page screenshot, this means a condition wasn't satisfied. prioritize actions with the red information.
 If you see a popup in the page screenshot, prioritize actions on the popup.
 
-{% if "lever" in url %}
+{% if "lever" in starting_url %}
 DO NOT UPDATE ANY LOCATION FIELDS
 {% endif %}
 
@@ -41,10 +41,12 @@ Reply in JSON format with the following keys:
 Consider the action history from the last step and the screenshot together, if actions from the last step don't yield positive impact, try other actions or other action combinations.
 {% endif %}
 
-Clickable elements from `{{ url }}`:
+Clickable elements from `{{ current_url }}`:
 ```
 {{ elements }}
 ```
+
+The URL of the page you're on right now is `{{ current_url }}`.
 
 User goal:
 ```
