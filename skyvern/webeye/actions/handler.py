@@ -143,11 +143,6 @@ async def handle_input_text_action(
 ) -> list[ActionResult]:
     xpath = await validate_actions_in_dom(action, page, scraped_page)
     locator = page.locator(f"xpath={xpath}")
-
-    current_text = await locator.input_value()
-    if current_text == action.text:
-        return [ActionSuccess()]
-
     await locator.clear()
     text = get_actual_value_of_parameter_if_secret(task, action.text)
     await locator.fill(text, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
@@ -318,9 +313,6 @@ async def handle_select_option_action(
             )
             return [ActionFailure(Exception(f"Cannot handle SelectOptionAction on a non-listbox element"))]
 
-    current_text = await locator.input_value()
-    if current_text == action.option.label:
-        return ActionSuccess()
     try:
         # First click by label (if it matches)
         await page.click(f"xpath={xpath}", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
