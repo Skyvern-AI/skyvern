@@ -608,12 +608,17 @@ class ForgeAgent(Agent):
         action_results_str = json.dumps([action_result.model_dump() for action_result in action_results])
         # Generate the extract action prompt
         navigation_goal = task.navigation_goal
+        starting_url = task.url
+        current_url = (
+            await browser_state.page.evaluate("() => document.location.href") if browser_state.page else starting_url
+        )
         extract_action_prompt = prompt_engine.load_prompt(
             "extract-action",
             navigation_goal=navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
-            url=task.url,
-            elements=scraped_page.element_tree_trimmed,  # scraped_page.element_tree,
+            starting_url=starting_url,
+            current_url=current_url,
+            elements=scraped_page.element_tree_trimmed,
             data_extraction_goal=task.data_extraction_goal,
             action_history=action_results_str,
             error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else None,
