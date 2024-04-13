@@ -33,6 +33,7 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun
 from skyvern.webeye.actions.actions import (
     Action,
     ActionType,
+    ActionTypeUnion,
     CompleteAction,
     UserDefinedError,
     WebAction,
@@ -227,7 +228,7 @@ class ForgeAgent(Agent):
 
             # If the step failed, mark the step as failed and retry
             if step.status == StepStatus.failed:
-                maybe_next_step = await self.handle_failed_step(task, step)
+                maybe_next_step = await self.handle_failed_step(organization, task, step)
                 # If there is no next step, it means that the task has failed
                 if maybe_next_step:
                     next_step = maybe_next_step
@@ -600,21 +601,32 @@ class ForgeAgent(Agent):
         # Get action results from the last app.SETTINGS.PROMPT_ACTION_HISTORY_WINDOW steps
         steps = await app.DATABASE.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
         window_steps = steps[-1 * SettingsManager.get_settings().PROMPT_ACTION_HISTORY_WINDOW :]
-        action_results: list[ActionResult] = []
+        actions_and_results: list[tuple[ActionTypeUnion, list[ActionResult]]] = []
         for window_step in window_steps:
-            if window_step.output and window_step.output.action_results:
-                action_results.extend(window_step.output.action_results)
-        action_results_str = json.dumps([action_result.model_dump() for action_result in action_results])
+            if window_step.output and window_step.output.actions_and_results:
+                actions_and_results.extend(window_step.output.actions_and_results)
+
+        actions_and_results_str = json.dumps(
+            [
+                {"action": action.model_dump(), "results": [result.model_dump() for result in results]}
+                for action, results in actions_and_results
+            ]
+        )
         # Generate the extract action prompt
         navigation_goal = task.navigation_goal
+        starting_url = task.url
+        current_url = (
+            await browser_state.page.evaluate("() => document.location.href") if browser_state.page else starting_url
+        )
         extract_action_prompt = prompt_engine.load_prompt(
             "extract-action",
             navigation_goal=navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
-            url=task.url,
-            elements=scraped_page.element_tree_trimmed,  # scraped_page.element_tree,
+            starting_url=starting_url,
+            current_url=current_url,
+            elements=scraped_page.element_tree_trimmed,
             data_extraction_goal=task.data_extraction_goal,
-            action_history=action_results_str,
+            action_history=actions_and_results_str,
             error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else None,
             utc_datetime=datetime.utcnow(),
         )
@@ -965,8 +977,14 @@ class ForgeAgent(Agent):
             **updates,
         )
 
-    async def handle_failed_step(self, task: Task, step: Step) -> Step | None:
-        if step.retry_index >= SettingsManager.get_settings().MAX_RETRIES_PER_STEP:
+    async def handle_failed_step(self, organization: Organization, task: Task, step: Step) -> Step | None:
+        max_retries_per_step = (
+            organization.max_retries_per_step
+            # we need to check by None because 0 is a valid value for max_retries_per_step
+            if organization.max_retries_per_step is not None
+            else SettingsManager.get_settings().MAX_RETRIES_PER_STEP
+        )
+        if step.retry_index >= max_retries_per_step:
             LOG.warning(
                 "Step failed after max retries, marking task as failed",
                 task_id=task.task_id,
@@ -978,7 +996,7 @@ class ForgeAgent(Agent):
             await self.update_task(
                 task,
                 TaskStatus.failed,
-                failure_reason=f"Max retries per step ({SettingsManager.get_settings().MAX_RETRIES_PER_STEP}) exceeded",
+                failure_reason=f"Max retries per step ({max_retries_per_step}) exceeded",
             )
             return None
         else:

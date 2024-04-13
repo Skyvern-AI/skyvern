@@ -1,4 +1,5 @@
 // Commands for manipulating rects.
+// Want to debug this? Run chromium, go to sources, and create a new snippet with the code in domUtils.js
 class Rect {
   // Create a rect given the top left and bottom right corners.
   static create(x1, y1, x2, y2) {
@@ -273,8 +274,8 @@ function hasWidgetRole(element) {
 
 function isInteractableInput(element) {
   const tagName = element.tagName.toLowerCase();
-  const type = element.getAttribute("type");
-  if (tagName !== "input" || !type) {
+  const type = element.getAttribute("type") ?? "text"; // Default is text: https://www.w3schools.com/html/html_form_input_types.asp
+  if (tagName !== "input") {
     // let other checks decide
     return false;
   }

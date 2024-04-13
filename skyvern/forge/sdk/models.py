@@ -117,6 +117,7 @@ class Organization(BaseModel):
     organization_name: str
     webhook_callback_url: str | None = None
     max_steps_per_run: int | None = None
+    max_retries_per_step: int | None = None
 
     created_at: datetime
     modified_at: datetime

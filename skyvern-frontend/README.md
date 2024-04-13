@@ -1,3 +1,14 @@
+<!-- START doctoc generated TOC please keep comment here to allow auto update -->
+<!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
+**Table of Contents**  *generated with [DocToc](https://github.com/thlorenz/doctoc)*
+
+- [Skyvern Frontend](#skyvern-frontend)
+  - [Development](#development)
+  - [Build for production](#build-for-production)
+  - [Preview the production build locally](#preview-the-production-build-locally)
+
+<!-- END doctoc generated TOC please keep comment here to allow auto update -->
+
 # Skyvern Frontend
 
 ## Development

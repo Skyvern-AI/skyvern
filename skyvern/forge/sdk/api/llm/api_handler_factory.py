@@ -43,6 +43,7 @@ class LLMAPIHandlerFactory:
             num_retries=llm_config.num_retries,
             retry_after=llm_config.retry_delay_seconds,
             set_verbose=False if SettingsManager.get_settings().is_cloud_environment() else llm_config.set_verbose,
+            enable_pre_call_checks=True,
         )
         main_model_group = llm_config.main_model_group
 

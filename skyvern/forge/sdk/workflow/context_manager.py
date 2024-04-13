@@ -5,7 +5,7 @@ import structlog
 
 from skyvern.exceptions import BitwardenBaseError, WorkflowRunContextNotInitialized
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
-from skyvern.forge.sdk.services.bitwarden import BitwardenService
+from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
 from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -88,6 +88,18 @@ class WorkflowRunContext:
             return self.secrets.get(secret_id_or_value)
         return None
 
+    def get_secrets_from_password_manager(self) -> dict[str, Any]:
+        """
+        Get the secrets from the password manager. The secrets dict will contain the actual secret values.
+        """
+        secret_credentials = BitwardenService.get_secret_value_from_url(
+            url=self.secrets[BitwardenConstants.URL],
+            client_secret=self.secrets[BitwardenConstants.CLIENT_SECRET],
+            client_id=self.secrets[BitwardenConstants.CLIENT_ID],
+            master_password=self.secrets[BitwardenConstants.MASTER_PASSWORD],
+        )
+        return secret_credentials
+
     @staticmethod
     def generate_random_secret_id() -> str:
         return f"secret_{uuid.uuid4()}"
@@ -138,17 +150,26 @@ class WorkflowRunContext:
                     url,
                 )
                 if secret_credentials:
+                    self.secrets[BitwardenConstants.URL] = url
+                    self.secrets[BitwardenConstants.CLIENT_SECRET] = client_secret
+                    self.secrets[BitwardenConstants.CLIENT_ID] = client_id
+                    self.secrets[BitwardenConstants.MASTER_PASSWORD] = master_password
+
                     random_secret_id = self.generate_random_secret_id()
                     # username secret
                     username_secret_id = f"{random_secret_id}_username"
-                    self.secrets[username_secret_id] = secret_credentials["username"]
+                    self.secrets[username_secret_id] = secret_credentials[BitwardenConstants.USERNAME]
                     # password secret
                     password_secret_id = f"{random_secret_id}_password"
-                    self.secrets[password_secret_id] = secret_credentials["password"]
+                    self.secrets[password_secret_id] = secret_credentials[BitwardenConstants.PASSWORD]
+
+                    totp_secret_id = f"{random_secret_id}_totp"
+                    self.secrets[totp_secret_id] = BitwardenConstants.TOTP
 
                     self.values[parameter.key] = {
                         "username": username_secret_id,
                         "password": password_secret_id,
+                        "totp": totp_secret_id,
                     }
             except BitwardenBaseError as e:
                 BitwardenService.logout()

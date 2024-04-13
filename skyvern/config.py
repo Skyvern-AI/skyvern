@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # Ratio should be between 0 and 1.
     # If the task has been running for more steps than this ratio of the max steps per run, then we'll log a warning.
     LONG_RUNNING_TASK_WARNING_RATIO: float = 0.95
-    MAX_RETRIES_PER_STEP: int = 2
+    MAX_RETRIES_PER_STEP: int = 5
     DEBUG_MODE: bool = False
     DATABASE_STRING: str = "postgresql+psycopg://skyvern@localhost/skyvern"
     PROMPT_ACTION_HISTORY_WINDOW: int = 5

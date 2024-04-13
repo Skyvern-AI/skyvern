@@ -227,7 +227,7 @@ class TaskBlock(Block):
                 raise TaskNotFound(task.task_id)
             if not updated_task.status.is_final():
                 raise UnexpectedTaskStatus(task_id=updated_task.task_id, status=updated_task.status)
-            if updated_task.status == TaskStatus.completed:
+            if updated_task.status == TaskStatus.completed or updated_task.status == TaskStatus.terminated:
                 LOG.info(
                     f"Task completed",
                     task_id=updated_task.task_id,
@@ -282,20 +282,25 @@ class ForLoopBlock(Block):
 
     # TODO (kerem): Add support for ContextParameter
     loop_over: PARAMETER_TYPE
-    loop_block: "BlockTypeVar"
+    loop_blocks: list["BlockTypeVar"]
 
     def get_all_parameters(
         self,
         workflow_run_id: str,
     ) -> list[PARAMETER_TYPE]:
-        return self.loop_block.get_all_parameters(workflow_run_id) + [self.loop_over]
+        parameters = {self.loop_over}
+
+        for loop_block in self.loop_blocks:
+            for parameter in loop_block.get_all_parameters(workflow_run_id):
+                parameters.add(parameter)
+        return list(parameters)
 
     def get_loop_block_context_parameters(self, workflow_run_id: str, loop_data: Any) -> list[ContextParameter]:
         if not isinstance(loop_data, dict):
             # TODO (kerem): Should we add support for other types?
-            raise ValueError("loop_data should be a dictionary")
+            raise ValueError("loop_data should be a dict")
 
-        loop_block_parameters = self.loop_block.get_all_parameters(workflow_run_id)
+        loop_block_parameters = self.get_all_parameters(workflow_run_id)
         context_parameters = [
             parameter for parameter in loop_block_parameters if isinstance(parameter, ContextParameter)
         ]
@@ -332,28 +337,37 @@ class ForLoopBlock(Block):
             num_loop_over_values=len(loop_over_values),
         )
         outputs_with_loop_values = []
-        block_outputs = []
         for loop_over_value in loop_over_values:
             context_parameters_with_value = self.get_loop_block_context_parameters(workflow_run_id, loop_over_value)
             for context_parameter in context_parameters_with_value:
                 workflow_run_context.set_value(context_parameter.key, context_parameter.value)
             try:
-                block_output = await self.loop_block.execute(workflow_run_id=workflow_run_id)
-                block_outputs.append(block_output)
+                block_outputs = [
+                    await loop_block.execute(workflow_run_id=workflow_run_id) for loop_block in self.loop_blocks
+                ]
             except Exception as e:
                 LOG.error("ForLoopBlock: Failed to execute loop block", exc_info=True)
                 raise e
-            if block_output.output_parameter:
-                outputs_with_loop_values.append(
+            outputs_with_loop_values.append(
+                [
                     {
                         "loop_value": loop_over_value,
                         "output_parameter": block_output.output_parameter,
                         "output_value": workflow_run_context.get_value(block_output.output_parameter.key),
                     }
-                )
+                    for block_output in block_outputs
+                    if block_output.output_parameter
+                ]
+            )
 
-        # If all block outputs are successful, the loop is successful
-        success = all([block_output.success for block_output in block_outputs])
+            # If all block outputs are successful, the loop is successful
+            success = all([block_output.success for block_output in block_outputs])
+            if not success:
+                LOG.info(
+                    "ForLoopBlock: Encountered an failure processing block, terminating early",
+                    block_outputs=block_outputs,
+                )
+                break
 
         if self.output_parameter:
             await workflow_run_context.register_output_parameter_value_post_execution(

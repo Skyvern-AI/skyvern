@@ -4,6 +4,7 @@ name: Run tests and pre-commit
 # `branches: [main], then this actions runs _twice_ on pull requests, which is
 # annoying.
 on:
+  workflow_call:
   pull_request:
   push:
     branches: [main]
