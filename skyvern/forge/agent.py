@@ -604,6 +604,7 @@ class ForgeAgent(Agent):
         for window_step in window_steps:
             if window_step.output and window_step.output.action_results:
                 action_results.extend(window_step.output.action_results)
+
         action_results_str = json.dumps([action_result.model_dump() for action_result in action_results])
         # Generate the extract action prompt
         navigation_goal = task.navigation_goal
