@@ -236,7 +236,7 @@ async def get_task(
                     "Failed to get share link for action screenshot",
                     artifact_id=artifact.artifact_id,
                 )
-    elif task_obj.status in [TaskStatus.failed, TaskStatus.completed]:
+    elif task_obj.status in [TaskStatus.terminated, TaskStatus.completed]:
         LOG.error(
             "Failed to get latest action screenshots in task response",
             task_id=task_id,
