@@ -399,6 +399,9 @@ async def get_agent_task_step_artifacts(
         step_id,
         organization_id=current_org.organization_id,
     )
+    if SettingsManager.get_settings().ENV != "local":
+        for artifact in artifacts:
+            artifact.signed_url = await app.ARTIFACT_MANAGER.get_share_link(artifact)
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
 
