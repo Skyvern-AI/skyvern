@@ -75,4 +75,5 @@ class Artifact(BaseModel):
         description="The URI of the artifact.",
         examples=["/Users/skyvern/hello/world.png"],
     )
+    signed_url: str | None = None
     organization_id: str | None = None
