@@ -1,3 +1,4 @@
+import asyncio
 from typing import Annotated, Any
 
 import structlog
@@ -400,8 +401,9 @@ async def get_agent_task_step_artifacts(
         organization_id=current_org.organization_id,
     )
     if SettingsManager.get_settings().ENV != "local":
-        for artifact in artifacts:
-            artifact.signed_url = await app.ARTIFACT_MANAGER.get_share_link(artifact)
+        signed_urls = await asyncio.gather(*[app.ARTIFACT_MANAGER.get_share_link(artifact) for artifact in artifacts])
+        for i, artifact in enumerate(artifacts):
+            artifact.signed_url = signed_urls[i]
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
 
