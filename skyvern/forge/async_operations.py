@@ -93,6 +93,9 @@ class AsyncOperationPool:
         """
         return [aio_task for aio_task in self._aio_tasks.get(task_id, {}).values() if not aio_task.done()]
 
+    def get_aio_task(self, task_id: str, operation_type: str) -> asyncio.Task | None:
+        return self._aio_tasks.get(task_id, {}).get(operation_type, None)
+
     def run_operation(self, task_id: str, agent_phase: AgentPhase) -> None:
         # get the operation from the pool
         operation = self._get_operation(task_id, agent_phase)
