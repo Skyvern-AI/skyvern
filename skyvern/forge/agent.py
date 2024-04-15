@@ -872,7 +872,6 @@ class ForgeAgent(Agent):
                     task_id=task.task_id,
                     resp=resp,
                     resp_code=resp.status_code,
-                    resp_json=resp.json(),
                     resp_text=resp.text,
                 )
         except Exception as e:
