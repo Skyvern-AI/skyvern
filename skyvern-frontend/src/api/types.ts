@@ -75,3 +75,7 @@ export type TaskApiResponse = {
   failure_reason: string | null;
   errors: unknown[];
 };
+
+export type User = {
+  name: string;
+};
