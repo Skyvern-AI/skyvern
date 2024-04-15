@@ -840,7 +840,7 @@ class ForgeAgent(Agent):
         # send task_response to the webhook callback url
         # TODO: use async requests (httpx)
         timestamp = str(int(datetime.utcnow().timestamp()))
-        payload = task_response.model_dump_json(exclude={"request": {"navigation_payload"}})
+        payload = task_response.model_dump_json(exclude={"request"})
         signature = generate_skyvern_signature(
             payload=payload,
             api_key=api_key,
