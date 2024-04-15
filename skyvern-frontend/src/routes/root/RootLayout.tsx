@@ -4,8 +4,17 @@ import { SideNav } from "./SideNav";
 import { DiscordLogoIcon, GitHubLogoIcon } from "@radix-ui/react-icons";
 import { Logo } from "@/components/Logo";
 import { ThemeToggle } from "@/components/ThemeSwitch";
+import { Profile } from "./Profile";
+import { useContext } from "react";
+import { UserContext } from "@/store/UserContext";
 
-function RootLayout() {
+type Props = {
+  onLogout?: () => void;
+};
+
+function RootLayout({ onLogout }: Props) {
+  const user = useContext(UserContext);
+
   return (
     <>
       <div className="w-full h-full px-4">
@@ -20,6 +29,11 @@ function RootLayout() {
             </div>
           </Link>
           <SideNav />
+          {user ? (
+            <div className="absolute bottom-2 left-0 w-72 px-6 shrink-0">
+              <Profile name={user.name} onLogout={onLogout} />
+            </div>
+          ) : null}
         </aside>
         <div className="pl-72 h-24 flex justify-end items-center px-6 gap-4">
           <Link
