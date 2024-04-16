@@ -1,23 +1,30 @@
 import { artifactApiClient } from "@/api/AxiosClient";
+import { ArtifactApiResponse } from "@/api/types";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { useQuery } from "@tanstack/react-query";
+import axios from "axios";
 
 type Props = {
-  uri: string;
+  artifact: ArtifactApiResponse;
 };
 
-function TextArtifact({ uri }: Props) {
+function TextArtifact({ artifact }: Props) {
   const { data, isFetching, isError, error } = useQuery<string>({
-    queryKey: ["artifact", uri],
+    queryKey: ["artifact", artifact.artifact_id],
     queryFn: async () => {
-      return artifactApiClient
-        .get(`/artifact/text`, {
-          params: {
-            path: uri.slice(7),
-          },
-        })
-        .then((response) => response.data);
+      if (artifact.uri.startsWith("file://")) {
+        return artifactApiClient
+          .get(`/artifact/text`, {
+            params: {
+              path: artifact.uri.slice(7),
+            },
+          })
+          .then((response) => response.data);
+      }
+      if (artifact.uri.startsWith("s3://") && artifact.signed_url) {
+        return axios.get(artifact.signed_url).then((response) => response.data);
+      }
     },
   });
 

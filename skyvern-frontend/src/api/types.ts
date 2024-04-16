@@ -31,6 +31,7 @@ export type ArtifactApiResponse = {
   step_id: string;
   artifact_type: ArtifactType;
   uri: string;
+  signed_url?: string | null;
   organization_id: string;
 };
 

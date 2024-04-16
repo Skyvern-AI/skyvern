@@ -11,13 +11,13 @@ import {
   AccordionTrigger,
 } from "@/components/ui/accordion";
 import { StatusBadge } from "@/components/StatusBadge";
-import { artifactApiBaseUrl } from "@/util/env";
 import { Button } from "@/components/ui/button";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { StepArtifactsLayout } from "./StepArtifactsLayout";
 import Zoom from "react-medium-image-zoom";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
+import { getRecordingURL, getScreenshotURL } from "./artifactUtils";
 
 function TaskDetails() {
   const { taskId } = useParams();
@@ -63,10 +63,7 @@ function TaskDetails() {
         {task.recording_url ? (
           <div className="flex">
             <Label className="w-32">Recording</Label>
-            <video
-              src={`${artifactApiBaseUrl}/artifact/recording?path=${task.recording_url.slice(7)}`}
-              controls
-            />
+            <video src={getRecordingURL(task)} controls />
           </div>
         ) : null}
         <div className="flex items-center">
@@ -142,10 +139,7 @@ function TaskDetails() {
               {task.screenshot_url ? (
                 <Zoom zoomMargin={16}>
                   <AspectRatio ratio={16 / 9}>
-                    <img
-                      src={`${artifactApiBaseUrl}/artifact/image?path=${task.screenshot_url.slice(7)}`}
-                      alt="screenshot"
-                    />
+                    <img src={getScreenshotURL(task)} alt="screenshot" />
                   </AspectRatio>
                 </Zoom>
               ) : (
