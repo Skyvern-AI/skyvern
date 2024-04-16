@@ -425,8 +425,11 @@ function getElementContext(element) {
   return fullContext;
 }
 
-function getElementContent(element) {
+function getElementContent(element, skipped_element = null) {
   // DFS to get all the text content from all the nodes under the element
+  if (skipped_element && element === skipped_element) {
+    return "";
+  }
 
   let textContent = element.textContent;
   let nodeContent = "";
@@ -441,7 +444,7 @@ function getElementContent(element) {
         nodeTextContentList.push(childText);
       } else if (child.nodeType === Node.ELEMENT_NODE) {
         // childText = child.textContent.trim();
-        childText = getElementContent(child);
+        childText = getElementContent(child, skipped_element);
       } else {
         console.log("Unhandled node type: ", child.nodeType);
       }
@@ -632,6 +635,89 @@ function buildTreeFromBody() {
     }
   }
 
+  const getContextByParent = (element) => {
+    // for most elements, we're going 10 layers up to see if we can find "label" as a parent
+    // if found, most likely the context under label is relevant to this element
+    let targetParentElements = new Set(["label", "fieldset"]);
+
+    // look up for 10 levels to find the most contextual parent element
+    let targetContextualParent = null;
+    let currentEle = document.querySelector(`[unique_id="${element.id}"]`);
+    let parentEle = currentEle;
+    for (var i = 0; i < 10; i++) {
+      parentEle = parentEle.parentElement;
+      if (parentEle) {
+        if (targetParentElements.has(parentEle.tagName.toLowerCase())) {
+          targetContextualParent = parentEle;
+        }
+      } else {
+        break;
+      }
+    }
+    if (!targetContextualParent) {
+      return "";
+    }
+
+    let context = "";
+    var lowerCaseTagName = targetContextualParent.tagName.toLowerCase();
+    if (lowerCaseTagName === "label") {
+      context = getElementContext(targetContextualParent);
+    } else if (lowerCaseTagName === "fieldset") {
+      // fieldset is usually within a form or another element that contains the whole context
+      targetContextualParent = targetContextualParent.parentElement;
+      if (targetContextualParent) {
+        context = getElementContext(targetContextualParent);
+      }
+    }
+    return context;
+  };
+
+  const getContextByLinked = (element) => {
+    let currentEle = document.querySelector(`[unique_id="${element.id}"]`);
+    // check labels pointed to this element
+    // 1. element id -> labels pointed to this id
+    // 2. by attr "aria-labelledby" -> only one label with this id
+    let linkedElements = new Array();
+    const elementId = currentEle.getAttribute("id");
+    if (elementId) {
+      linkedElements = [
+        ...document.querySelectorAll(`label[for="${elementId}"]`),
+      ];
+    }
+    const labelled = currentEle.getAttribute("aria-labelledby");
+    if (labelled) {
+      const label = document.getElementById(labelled);
+      if (label) {
+        linkedElements.push(label);
+      }
+    }
+    const described = currentEle.getAttribute("aria-describedby");
+    if (described) {
+      const describe = document.getElementById(described);
+      if (describe) {
+        linkedElements.push(describe);
+      }
+    }
+
+    const fullContext = new Array();
+    for (let i = 0; i < linkedElements.length; i++) {
+      const linked = linkedElements[i];
+      // if the element is a child of the label, we should stop to get context before the element
+      const content = getElementContent(linked, currentEle);
+      if (content) {
+        fullContext.push(content);
+      }
+    }
+
+    const context = fullContext.join(";");
+    const charLimit = 1000;
+    if (context.length > charLimit) {
+      return "";
+    }
+
+    return context;
+  };
+
   // TODO: Handle iframes
   // setup before parsing the dom
   checkSelect2();
@@ -653,39 +739,10 @@ function buildTreeFromBody() {
       );
     }
 
-    // for most elements, we're going 10 layers up to see if we can find "label" as a parent
-    // if found, most likely the context under label is relevant to this element
-    let targetParentElements = new Set(["label", "fieldset"]);
-
-    // look up for 10 levels to find the most contextual parent element
-    let targetContextualParent = null;
-    let currentEle = document.querySelector(`[unique_id="${element.id}"]`);
-    let parentEle = currentEle;
-    for (var i = 0; i < 10; i++) {
-      parentEle = parentEle.parentElement;
-      if (parentEle) {
-        if (targetParentElements.has(parentEle.tagName.toLowerCase())) {
-          targetContextualParent = parentEle;
-        }
-      } else {
-        break;
-      }
-    }
-    if (targetContextualParent) {
-      let context = "";
-      var lowerCaseTagName = targetContextualParent.tagName.toLowerCase();
-      if (lowerCaseTagName === "label") {
-        context = getElementContext(targetContextualParent);
-      } else if (lowerCaseTagName === "fieldset") {
-        // fieldset is usually within a form or another element that contains the whole context
-        targetContextualParent = targetContextualParent.parentElement;
-        if (targetContextualParent) {
-          context = getElementContext(targetContextualParent);
-        }
-      }
-      if (context.length > 0) {
-        element.context = context;
-      }
+    const context = getContextByLinked(element) + getContextByParent(element);
+    // const context = getContextByParent(element)
+    if (context && context.length <= 1000) {
+      element.context = context;
     }
   }
 
