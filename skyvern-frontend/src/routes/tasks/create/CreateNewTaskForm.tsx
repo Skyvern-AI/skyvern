@@ -32,6 +32,8 @@ import {
 } from "@/components/ui/tooltip";
 import { ToastAction } from "@radix-ui/react-toast";
 import { Link } from "react-router-dom";
+import fetchToCurl from "fetch-to-curl";
+import { apiBaseUrl, envCredential } from "@/util/env";
 
 const createNewTaskFormSchema = z.object({
   url: z.string().url({
@@ -57,6 +59,7 @@ function createTaskRequestObject(formValues: CreateNewTaskFormValues) {
     navigation_goal: formValues.navigationGoal ?? "",
     data_extraction_goal: formValues.dataExtractionGoal ?? "",
     proxy_location: "NONE",
+    error_code_mapping: null,
     navigation_payload: formValues.navigationPayload ?? "",
     extracted_information_schema: formValues.extractedInformationSchema ?? "",
   };
@@ -286,7 +289,28 @@ function CreateNewTaskForm({ initialValues }: Props) {
           )}
         />
         <div className="flex justify-end gap-3">
-          <Button variant="outline">Copy cURL</Button>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={async () => {
+              const curl = fetchToCurl({
+                method: "POST",
+                url: `${apiBaseUrl}/tasks`,
+                body: createTaskRequestObject(form.getValues()),
+                headers: {
+                  "Content-Type": "application/json",
+                  "x-api-key": envCredential ?? "",
+                },
+              });
+              await navigator.clipboard.writeText(curl);
+              toast({
+                title: "Copied cURL",
+                description: "cURL copied to clipboard",
+              });
+            }}
+          >
+            Copy cURL
+          </Button>
           <Button type="submit">Create</Button>
         </div>
       </form>
