@@ -34,3 +34,10 @@ class WorkflowDefinitionHasDuplicateParameterKeys(BaseWorkflowException):
 class InvalidEmailClientConfiguration(BaseWorkflowException):
     def __init__(self, problems: list[str]) -> None:
         super().__init__(f"Email client configuration is invalid. These parameters are missing or invalid: {problems}")
+
+
+class ContextParameterSourceNotDefined(BaseWorkflowException):
+    def __init__(self, context_parameter_key: str, source_key: str) -> None:
+        super().__init__(
+            f"Source parameter key {source_key} for context parameter {context_parameter_key} does not exist."
+        )

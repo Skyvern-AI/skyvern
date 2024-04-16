@@ -9,6 +9,8 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenSe
 from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
+    BitwardenLoginCredentialParameter,
+    ContextParameter,
     OutputParameter,
     Parameter,
     ParameterType,
@@ -30,6 +32,7 @@ class WorkflowRunContext:
         self,
         workflow_parameter_tuples: list[tuple[WorkflowParameter, "WorkflowRunParameter"]],
         workflow_output_parameters: list[OutputParameter],
+        context_parameters: list[ContextParameter],
     ) -> None:
         self.parameters = {}
         self.values = {}
@@ -49,6 +52,12 @@ class WorkflowRunContext:
             if output_parameter.key in self.parameters:
                 raise OutputParameterKeyCollisionError(output_parameter.key)
             self.parameters[output_parameter.key] = output_parameter
+
+        for context_parameter in context_parameters:
+            # All context parameters will be registered with the context manager during initialization but the values
+            # will be calculated and set before and after each block execution
+            # values sometimes will be overwritten by the block execution itself
+            self.parameters[context_parameter.key] = context_parameter
 
     def get_parameter(self, key: str) -> Parameter:
         return self.parameters[key]
@@ -175,9 +184,32 @@ class WorkflowRunContext:
                 BitwardenService.logout()
                 LOG.error(f"Failed to get secret from Bitwarden. Error: {e}")
                 raise e
-        elif parameter.parameter_type == ParameterType.CONTEXT:
-            # ContextParameter values will be set within the blocks
-            return
+        elif isinstance(parameter, ContextParameter):
+            if isinstance(parameter.source, WorkflowParameter):
+                # TODO (kerem): set this while initializing the context manager
+                workflow_parameter_value = self.get_value(parameter.source.key)
+                if not isinstance(workflow_parameter_value, dict):
+                    raise ValueError(f"ContextParameter source value is not a dict. Parameter key: {parameter.key}")
+                parameter.value = workflow_parameter_value.get(parameter.source.key)
+                self.parameters[parameter.key] = parameter
+                self.values[parameter.key] = parameter.value
+            elif isinstance(parameter.source, ContextParameter):
+                # TODO (kerem): update this anytime the source parameter value changes in values dict
+                context_parameter_value = self.get_value(parameter.source.key)
+                if not isinstance(context_parameter_value, dict):
+                    raise ValueError(f"ContextParameter source value is not a dict. Parameter key: {parameter.key}")
+                parameter.value = context_parameter_value.get(parameter.source.key)
+                self.parameters[parameter.key] = parameter
+                self.values[parameter.key] = parameter.value
+            elif isinstance(parameter.source, OutputParameter):
+                # We won't set the value of the ContextParameter if the source is an OutputParameter it'll be set in
+                # `register_output_parameter_value_post_execution` method
+                pass
+            else:
+                raise NotImplementedError(
+                    f"ContextParameter source has to be a WorkflowParameter, ContextParameter, or OutputParameter. "
+                    f"{parameter.source.parameter_type} is not supported."
+                )
         else:
             raise ValueError(f"Unknown parameter type: {parameter.parameter_type}")
 
@@ -189,28 +221,66 @@ class WorkflowRunContext:
             return
 
         self.values[parameter.key] = value
+        await self.set_parameter_values_for_output_parameter_dependent_blocks(parameter, value)
+
+    async def set_parameter_values_for_output_parameter_dependent_blocks(
+        self, output_parameter: OutputParameter, value: dict[str, Any] | list | str | None
+    ) -> None:
+        for key, parameter in self.parameters.items():
+            if (
+                isinstance(parameter, ContextParameter)
+                and isinstance(parameter.source, OutputParameter)
+                and parameter.source.key == output_parameter.key
+            ):
+                if parameter.value:
+                    LOG.warning(
+                        f"Context parameter {parameter.key} already has a value, overwriting",
+                        old_value=parameter.value,
+                        new_value=value,
+                    )
+                if not isinstance(value, dict):
+                    raise ValueError(
+                        f"ContextParameter can't depend on an OutputParameter with a non-dict value. "
+                        f"ContextParameter key: {parameter.key}, "
+                        f"OutputParameter key: {output_parameter.key}, "
+                        f"OutputParameter value: {value}"
+                    )
+                parameter.value = value.get(parameter.key)
+                self.parameters[parameter.key] = parameter
+                self.values[parameter.key] = parameter.value
 
     async def register_block_parameters(
         self,
         aws_client: AsyncAWSClient,
         parameters: list[PARAMETER_TYPE],
     ) -> None:
+        # Sort the parameters so that ContextParameter and BitwardenLoginCredentialParameter are processed last
+        # ContextParameter should be processed at the end since it requires the source parameter to be set
         # BitwardenLoginCredentialParameter should be processed last since it requires the URL parameter to be set
-        parameters.sort(key=lambda x: x.parameter_type != ParameterType.BITWARDEN_LOGIN_CREDENTIAL)
+        # Python's tuple comparison works lexicographically, so we can sort the parameters by their type in a tuple
+        parameters.sort(
+            key=lambda x: (
+                isinstance(x, ContextParameter),
+                # This makes sure that ContextParameters witha ContextParameter source are processed after all other
+                # ContextParameters
+                isinstance(x.source, ContextParameter) if isinstance(x, ContextParameter) else False,
+                isinstance(x, BitwardenLoginCredentialParameter),
+            )
+        )
 
         for parameter in parameters:
             if parameter.key in self.parameters:
                 LOG.debug(f"Parameter {parameter.key} already registered, skipping")
                 continue
 
-            if parameter.parameter_type == ParameterType.WORKFLOW:
+            if isinstance(parameter, WorkflowParameter):
                 LOG.error(
                     f"Workflow parameter {parameter.key} should have already been set through workflow run parameters"
                 )
                 raise ValueError(
                     f"Workflow parameter {parameter.key} should have already been set through workflow run parameters"
                 )
-            elif parameter.parameter_type == ParameterType.OUTPUT:
+            elif isinstance(parameter, OutputParameter):
                 LOG.error(
                     f"Output parameter {parameter.key} should have already been set through workflow run context init"
                 )
@@ -244,8 +314,11 @@ class WorkflowContextManager:
         workflow_run_id: str,
         workflow_parameter_tuples: list[tuple[WorkflowParameter, "WorkflowRunParameter"]],
         workflow_output_parameters: list[OutputParameter],
+        context_parameters: list[ContextParameter],
     ) -> WorkflowRunContext:
-        workflow_run_context = WorkflowRunContext(workflow_parameter_tuples, workflow_output_parameters)
+        workflow_run_context = WorkflowRunContext(
+            workflow_parameter_tuples, workflow_output_parameters, context_parameters
+        )
         self.workflow_run_contexts[workflow_run_id] = workflow_run_context
         return workflow_run_context
 

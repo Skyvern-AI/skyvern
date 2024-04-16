@@ -207,7 +207,9 @@ async def handle_download_file_action(
         # Start waiting for the download
         async with page.expect_download() as download_info:
             await asyncio.sleep(0.3)
-            await page.click(f"xpath={xpath}", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+            await page.click(
+                f"xpath={xpath}", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS, modifiers=["Alt"]
+            )
 
         download = await download_info.value
 

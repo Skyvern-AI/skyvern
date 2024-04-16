@@ -97,7 +97,7 @@ class WorkflowParameter(Parameter):
 class ContextParameter(Parameter):
     parameter_type: Literal[ParameterType.CONTEXT] = ParameterType.CONTEXT
 
-    source: WorkflowParameter
+    source: "ParameterSubclasses"
     # value will be populated by the context manager
     value: str | int | float | bool | dict | list | None = None
 
