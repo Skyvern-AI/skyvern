@@ -9,11 +9,11 @@ import { Label } from "@/components/ui/label";
 import { useQuery } from "@tanstack/react-query";
 import { useParams } from "react-router-dom";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { artifactApiBaseUrl } from "@/util/env";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { Skeleton } from "@/components/ui/skeleton";
 import { JSONArtifact } from "./JSONArtifact";
 import { TextArtifact } from "./TextArtifact";
+import { getImageURL } from "./artifactUtils";
 
 type Props = {
   id: string;
@@ -40,46 +40,42 @@ function StepArtifacts({ id, stepProps }: Props) {
     return <div>Error: {error?.message}</div>;
   }
 
-  const llmScreenshotUris = artifacts
-    ?.filter(
-      (artifact) => artifact.artifact_type === ArtifactType.LLMScreenshot,
-    )
-    .map((artifact) => artifact.uri);
+  const llmScreenshots = artifacts?.filter(
+    (artifact) => artifact.artifact_type === ArtifactType.LLMScreenshot,
+  );
 
-  const actionScreenshotUris = artifacts
-    ?.filter(
-      (artifact) => artifact.artifact_type === ArtifactType.ActionScreenshot,
-    )
-    .map((artifact) => artifact.uri);
+  const actionScreenshots = artifacts?.filter(
+    (artifact) => artifact.artifact_type === ArtifactType.ActionScreenshot,
+  );
 
-  const visibleElementsTreeUri = artifacts?.find(
+  const visibleElementsTree = artifacts?.find(
     (artifact) => artifact.artifact_type === ArtifactType.VisibleElementsTree,
-  )?.uri;
+  );
 
-  const visibleElementsTreeTrimmedUri = artifacts?.find(
+  const visibleElementsTreeTrimmed = artifacts?.find(
     (artifact) =>
       artifact.artifact_type === ArtifactType.VisibleElementsTreeTrimmed,
-  )?.uri;
+  );
 
-  const llmPromptUri = artifacts?.find(
+  const llmPrompt = artifacts?.find(
     (artifact) => artifact.artifact_type === ArtifactType.LLMPrompt,
-  )?.uri;
+  );
 
-  const llmRequestUri = artifacts?.find(
+  const llmRequest = artifacts?.find(
     (artifact) => artifact.artifact_type === ArtifactType.LLMRequest,
-  )?.uri;
+  );
 
-  const llmResponseRawUri = artifacts?.find(
+  const llmResponseRaw = artifacts?.find(
     (artifact) => artifact.artifact_type === ArtifactType.LLMResponseRaw,
-  )?.uri;
+  );
 
-  const llmResponseParsedUri = artifacts?.find(
+  const llmResponseParsed = artifacts?.find(
     (artifact) => artifact.artifact_type === ArtifactType.LLMResponseParsed,
-  )?.uri;
+  );
 
-  const htmlRawUri = artifacts?.find(
+  const htmlRaw = artifacts?.find(
     (artifact) => artifact.artifact_type === ArtifactType.HTMLScrape,
-  )?.uri;
+  );
 
   return (
     <Tabs defaultValue="info" className="w-full">
@@ -128,12 +124,12 @@ function StepArtifacts({ id, stepProps }: Props) {
         </div>
       </TabsContent>
       <TabsContent value="screenshot_llm">
-        {llmScreenshotUris && llmScreenshotUris.length > 0 ? (
+        {llmScreenshots && llmScreenshots.length > 0 ? (
           <div className="grid grid-cols-3 gap-4 p-4">
-            {llmScreenshotUris.map((uri, index) => (
+            {llmScreenshots.map((artifact, index) => (
               <ZoomableImage
                 key={index}
-                src={`${artifactApiBaseUrl}/artifact/image?path=${uri.slice(7)}`}
+                src={getImageURL(artifact)}
                 className="object-cover w-full h-full"
                 alt="action-screenshot"
               />
@@ -150,12 +146,12 @@ function StepArtifacts({ id, stepProps }: Props) {
         )}
       </TabsContent>
       <TabsContent value="screenshot_action">
-        {actionScreenshotUris && actionScreenshotUris.length > 0 ? (
+        {actionScreenshots && actionScreenshots.length > 0 ? (
           <div className="grid grid-cols-3 gap-4 p-4">
-            {actionScreenshotUris.map((uri, index) => (
+            {actionScreenshots.map((artifact, index) => (
               <ZoomableImage
                 key={index}
-                src={`${artifactApiBaseUrl}/artifact/image?path=${uri.slice(7)}`}
+                src={getImageURL(artifact)}
                 className="object-cover w-full h-full"
                 alt="action-screenshot"
               />
@@ -172,31 +168,31 @@ function StepArtifacts({ id, stepProps }: Props) {
         )}
       </TabsContent>
       <TabsContent value="element_tree">
-        {visibleElementsTreeUri ? (
-          <JSONArtifact uri={visibleElementsTreeUri} />
+        {visibleElementsTree ? (
+          <JSONArtifact artifact={visibleElementsTree} />
         ) : null}
       </TabsContent>
       <TabsContent value="element_tree_trimmed">
-        {visibleElementsTreeTrimmedUri ? (
-          <JSONArtifact uri={visibleElementsTreeTrimmedUri} />
+        {visibleElementsTreeTrimmed ? (
+          <JSONArtifact artifact={visibleElementsTreeTrimmed} />
         ) : null}
       </TabsContent>
       <TabsContent value="llm_prompt">
-        {llmPromptUri ? <TextArtifact uri={llmPromptUri} /> : null}
+        {llmPrompt ? <TextArtifact artifact={llmPrompt} /> : null}
       </TabsContent>
       <TabsContent value="llm_request">
-        {llmRequestUri ? <JSONArtifact uri={llmRequestUri} /> : null}
+        {llmRequest ? <JSONArtifact artifact={llmRequest} /> : null}
       </TabsContent>
       <TabsContent value="llm_response_raw">
-        {llmResponseRawUri ? <JSONArtifact uri={llmResponseRawUri} /> : null}
+        {llmResponseRaw ? <JSONArtifact artifact={llmResponseRaw} /> : null}
       </TabsContent>
       <TabsContent value="llm_response_parsed">
-        {llmResponseParsedUri ? (
-          <JSONArtifact uri={llmResponseParsedUri} />
+        {llmResponseParsed ? (
+          <JSONArtifact artifact={llmResponseParsed} />
         ) : null}
       </TabsContent>
       <TabsContent value="html_raw">
-        {htmlRawUri ? <TextArtifact uri={htmlRawUri} /> : null}
+        {htmlRaw ? <TextArtifact artifact={htmlRaw} /> : null}
       </TabsContent>
     </Tabs>
   );
