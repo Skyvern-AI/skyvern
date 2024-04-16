@@ -299,7 +299,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                 body: createTaskRequestObject(form.getValues()),
                 headers: {
                   "Content-Type": "application/json",
-                  "x-api-key": envCredential ?? "",
+                  "x-api-key": envCredential ?? "<your-api-key>",
                 },
               });
               await navigator.clipboard.writeText(curl);
