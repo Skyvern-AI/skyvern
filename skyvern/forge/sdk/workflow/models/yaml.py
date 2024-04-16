@@ -53,7 +53,7 @@ class ContextParameterYAML(ParameterYAML):
     # This pattern already works in block.py but since the ParameterType is not defined in this file, mypy is not able
     # to infer the type of the parameter_type attribute.
     parameter_type: Literal[ParameterType.CONTEXT] = ParameterType.CONTEXT  # type: ignore
-    source_workflow_parameter_key: str
+    source_parameter_key: str
 
 
 class OutputParameterYAML(ParameterYAML):

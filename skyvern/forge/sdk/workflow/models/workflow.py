@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicateBlockLabels
 from skyvern.forge.sdk.workflow.models.block import BlockResult, BlockTypeVar
+from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 
 
 class WorkflowRequestBody(BaseModel):
@@ -21,6 +22,7 @@ class RunWorkflowResponse(BaseModel):
 
 
 class WorkflowDefinition(BaseModel):
+    parameters: list[PARAMETER_TYPE]
     blocks: List[BlockTypeVar]
 
     def validate(self) -> None:

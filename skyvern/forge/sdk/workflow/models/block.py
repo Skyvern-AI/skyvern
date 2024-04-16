@@ -122,7 +122,17 @@ class TaskBlock(Block):
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
 
         if self.url and workflow_run_context.has_parameter(self.url):
-            parameters.append(workflow_run_context.get_parameter(self.url))
+            if workflow_run_context.has_value(self.url):
+                LOG.info(
+                    "Task URL is parameterized, using parameter value",
+                    task_url_parameter_value=workflow_run_context.get_value(self.url),
+                    task_url_parameter_key=self.url,
+                )
+                self.url = workflow_run_context.get_value(self.url)
+            else:
+                # if the parameter is not resolved yet, we'll add it to the list of parameters to resolve
+                # parameterization of the url would happen when the task is executed
+                parameters.append(workflow_run_context.get_parameter(self.url))
 
         return parameters
 
@@ -300,11 +310,18 @@ class ForLoopBlock(Block):
             # TODO (kerem): Should we add support for other types?
             raise ValueError("loop_data should be a dict")
 
-        loop_block_parameters = self.get_all_parameters(workflow_run_id)
-        context_parameters = [
-            parameter for parameter in loop_block_parameters if isinstance(parameter, ContextParameter)
-        ]
+        context_parameters = []
+        for loop_block in self.loop_blocks:
+            # todo: handle the case where the loop_block is a ForLoopBlock
+
+            all_parameters = loop_block.get_all_parameters(workflow_run_id)
+            for parameter in all_parameters:
+                if isinstance(parameter, ContextParameter):
+                    context_parameters.append(parameter)
+
         for context_parameter in context_parameters:
+            if context_parameter.source.key != self.loop_over.key:
+                continue
             if context_parameter.key not in loop_data:
                 raise ContextParameterValueNotFound(
                     parameter_key=context_parameter.key,
@@ -318,14 +335,22 @@ class ForLoopBlock(Block):
     def get_loop_over_parameter_values(self, workflow_run_context: WorkflowRunContext) -> list[Any]:
         if isinstance(self.loop_over, WorkflowParameter) or isinstance(self.loop_over, OutputParameter):
             parameter_value = workflow_run_context.get_value(self.loop_over.key)
-            if isinstance(parameter_value, list):
-                return parameter_value
-            else:
-                # TODO (kerem): Should we raise an error here?
-                return [parameter_value]
+        elif isinstance(self.loop_over, ContextParameter):
+            parameter_value = self.loop_over.value
+            if not parameter_value:
+                source_parameter_value = workflow_run_context.get_value(self.loop_over.source.key)
+                if isinstance(source_parameter_value, dict):
+                    parameter_value = source_parameter_value.get(self.loop_over.key)
+                else:
+                    raise ValueError("ContextParameter source value should be a dict")
         else:
-            # TODO (kerem): Implement this for context parameters
             raise NotImplementedError
+
+        if isinstance(parameter_value, list):
+            return parameter_value
+        else:
+            # TODO (kerem): Should we raise an error here?
+            return [parameter_value]
 
     async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
