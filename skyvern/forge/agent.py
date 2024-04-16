@@ -189,10 +189,7 @@ class ForgeAgent(Agent):
         LOG.info(
             "Created new task",
             task_id=task.task_id,
-            title=task.title,
             url=task.url,
-            nav_goal=task.navigation_goal,
-            data_goal=task.data_extraction_goal,
             proxy_location=task.proxy_location,
         )
         return task
