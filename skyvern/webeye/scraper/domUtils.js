@@ -502,6 +502,27 @@ function buildTreeFromBody() {
   var resultArray = [];
 
   const checkSelect2 = () => {
+    const showInvisible = (element) => {
+      if (element.style.display === "none") {
+        element.style.removeProperty("display");
+        return true;
+      }
+
+      const removedClass = []
+      for (let i=0; i < element.classList.length; i++) {
+        const className = element.classList[i]
+        if (className.includes("hidden")) {
+          removedClass.push(className)
+        }
+      }
+      if (removedClass.length !== 0) {
+        removedClass.forEach((className) => {
+          element.classList.remove(className)
+        })
+        return true;
+      }
+      return false;
+    }
     // according to select2(https://select2.org/getting-started/basic-usage)
     // select2-container seems to be the most common class in select2,
     // and the invisible select seems to be the sibling to the "select2-container" element.
@@ -513,9 +534,8 @@ function buildTreeFromBody() {
       while (_pre) {
         if (
           _pre.tagName.toLowerCase() === "select" &&
-          _pre.style.display === "none"
+          showInvisible(_pre)
         ) {
-          _pre.style.removeProperty("display");
           // only hide the select2 container when an alternative select found
           element.style.display = "none";
           return;
@@ -528,9 +548,8 @@ function buildTreeFromBody() {
       while (_next) {
         if (
           _next.tagName.toLowerCase() === "select" &&
-          _next.style.display === "none"
+          showInvisible(_next)
         ) {
-          _next.style.removeProperty("display");
           // only hide the select2 container when an alternative select found
           element.style.display = "none";
           return;
