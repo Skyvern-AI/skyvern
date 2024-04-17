@@ -164,23 +164,42 @@ class BrowserState:
         assert self.browser_context is not None
 
         if self.page is None:
-            LOG.info("Creating a new page")
-            self.page = await self.browser_context.new_page()
+            success = False
+            retries = 0
 
-            await self._close_all_other_pages()
-            LOG.info("A new page is created")
-            if url:
-                LOG.info(f"Navigating page to {url} and waiting for 3 seconds")
-                await asyncio.sleep(3)
+            while not success and retries < 3:
                 try:
-                    await self.page.goto(url)
-                except Error as playright_error:
-                    LOG.exception(f"Error while navigating to url: {str(playright_error)}", exc_info=True)
-                    raise FailedToNavigateToUrl(url=url, error_message=str(playright_error))
-                LOG.info(f"Successfully went to {url}")
+                    LOG.info("Creating a new page")
+                    self.page = await self.browser_context.new_page()
+                    await self._close_all_other_pages()
+                    LOG.info("A new page is created")
+                    if url:
+                        LOG.info(f"Navigating page to {url} and waiting for 3 seconds")
+                        try:
+                            await self.page.goto(url)
+                            await asyncio.sleep(3)
+                        except Error as playright_error:
+                            LOG.exception(f"Error while navigating to url: {str(playright_error)}", exc_info=True)
+                            raise FailedToNavigateToUrl(url=url, error_message=str(playright_error))
+                        success = True
+                        LOG.info(f"Successfully went to {url}")
+                    else:
+                        success = True
+                except Exception as e:
+                    LOG.exception(
+                        f"Error while creating or navigating to a new page. Waiting for 5 seconds. Error: {str(e)}",
+                        exc_info=True,
+                    )
+                    retries += 1
+                    # Wait for 5 seconds before retrying
+                    await asyncio.sleep(5)
+                    if retries >= 3:
+                        LOG.exception(f"Failed to create a new page after 3 retries: {str(e)}", exc_info=True)
+                        raise e
+                    LOG.info(f"Retrying to create a new page. Retry count: {retries}")
 
         if self.browser_artifacts.video_path is None:
-            self.browser_artifacts.video_path = await self.page.video.path()
+            self.browser_artifacts.video_path = await self.page.video.path() if self.page and self.page.video else None
 
     async def get_or_create_page(self, url: str | None = None) -> Page:
         await self.check_and_fix_state(url)
