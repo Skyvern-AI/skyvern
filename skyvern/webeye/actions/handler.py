@@ -321,7 +321,9 @@ async def handle_select_option_action(
             return [ActionFailure(Exception(f"Cannot handle SelectOptionAction on a non-listbox element"))]
 
     # TODO: double click will uncheck the checkbox
-    if tag_name == "input" and await locator.get_attribute("type", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) in ["radio", "checkbox"]:
+    if tag_name == "input" and await locator.get_attribute(
+        "type", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    ) in ["radio", "checkbox"]:
         click_action = ClickAction(element_id=action.element_id)
         return await chain_click(task, page, click_action, xpath)
 
