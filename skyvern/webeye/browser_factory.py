@@ -186,7 +186,10 @@ class BrowserState:
                     else:
                         success = True
                 except Exception as e:
-                    LOG.exception(f"Error while creating or navigating to a new page. Waiting for 5 seconds. Error: {str(e)}", exc_info=True)
+                    LOG.exception(
+                        f"Error while creating or navigating to a new page. Waiting for 5 seconds. Error: {str(e)}",
+                        exc_info=True,
+                    )
                     retries += 1
                     # Wait for 5 seconds before retrying
                     await asyncio.sleep(5)
