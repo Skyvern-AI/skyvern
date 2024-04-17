@@ -320,9 +320,14 @@ async def handle_select_option_action(
             )
             return [ActionFailure(Exception(f"Cannot handle SelectOptionAction on a non-listbox element"))]
 
+    # TODO: double click will uncheck the checkbox
+    if tag_name == "input" and await locator.get_attribute("type", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) in ["radio", "checkbox"]:
+        click_action = ClickAction(element_id=action.element_id)
+        return await chain_click(task, page, click_action, xpath)
+
     current_text = await locator.input_value()
     if current_text == action.option.label:
-        return ActionSuccess()
+        return [ActionSuccess()]
     try:
         # First click by label (if it matches)
         await page.click(f"xpath={xpath}", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
