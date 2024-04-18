@@ -378,6 +378,23 @@ function isInteractable(element) {
   return false;
 }
 
+const isComboboxDropdown = (element) => {
+  if (element.tagName.toLowerCase() !== "input") {
+    return false;
+  }
+  const role = element.getAttribute("role")
+    ? element.getAttribute("role").toLowerCase()
+    : "";
+  const haspopup = element.getAttribute("aria-haspopup")
+    ? element.getAttribute("aria-haspopup").toLowerCase()
+    : "";
+  const readonly =
+    element.getAttribute("readonly") &&
+    element.getAttribute("readonly").toLowerCase() !== "false";
+  const controls = element.hasAttribute("aria-controls");
+  return role && haspopup && controls && readonly;
+};
+
 function removeMultipleSpaces(str) {
   if (!str) {
     return str;
@@ -601,6 +618,21 @@ function buildTreeFromBody() {
     } else if (attrs["role"] && attrs["role"].toLowerCase() === "listbox") {
       // if "role" key is inside attrs, then get all the elements with role "option" and get their text
       selectOptions = getListboxOptions(element);
+    } else if (isComboboxDropdown(element)) {
+      // open combobox dropdown to get options
+      element.click();
+      const listBox = document.getElementById(
+        element.getAttribute("aria-controls"),
+      );
+      selectOptions = getListboxOptions(listBox);
+      // HACK: press Tab to close the dropdown
+      element.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          keyCode: 9,
+          bubbles: true,
+          key: "Tab",
+        }),
+      );
     }
     if (selectOptions) {
       elementObj.options = selectOptions;
