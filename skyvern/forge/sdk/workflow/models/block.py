@@ -805,7 +805,7 @@ class SendEmailBlock(Block):
                     path = filename
 
                 if not path:
-                    raise FileNotFoundError(f"File not found: {path}")
+                    raise FileNotFoundError(f"File not found: {filename}")
 
                 # Guess the content type based on the file's extension.  Encoding
                 # will be ignored, although we should check for simple things like
