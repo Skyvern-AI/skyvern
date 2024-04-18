@@ -408,13 +408,15 @@ function cleanupText(text) {
   ).trim();
 }
 
-function getElementContext(element) {
+function getElementContext(element, existingContext = "") {
   // dfs to collect the non unique_id context
   let fullContext = "";
   if (element.childNodes.length === 0) {
     return fullContext;
   }
   let childContextList = new Array();
+  // if the element already has a context, then add it to the list first
+  if (existingContext.length > 0) childContextList.push(existingContext);
   for (var child of element.childNodes) {
     let childContext = "";
     if (child.nodeType === Node.TEXT_NODE) {
@@ -790,6 +792,36 @@ function buildTreeFromBody() {
     // const context = getContextByParent(element)
     if (context && context.length <= 1000) {
       element.context = context;
+    }
+
+    // pass element's parent's context to the element for listed tags
+    let tagsWithDirectParentContext = new Set(["a"]);
+    // if the element is a child of a td, th, or tr, then pass the grandparent's context to the element
+    let parentTagsThatDelegateParentContext = new Set(["td", "th", "tr"]);
+    if (tagsWithDirectParentContext.has(element.tagName)) {
+      let parentElement = document.querySelector(
+        `[unique_id="${element.id}"]`,
+      ).parentElement;
+      if (!parentElement) {
+        continue;
+      }
+      if (
+        parentTagsThatDelegateParentContext.has(
+          parentElement.tagName.toLowerCase(),
+        )
+      ) {
+        let grandParentElement = parentElement.parentElement;
+        if (grandParentElement) {
+          let context = getElementContext(grandParentElement, element.context);
+          if (context.length > 0) {
+            element.context = context;
+          }
+        }
+      }
+      let context = getElementContext(parentElement, element.context);
+      if (context.length > 0) {
+        element.context = context;
+      }
     }
   }
 
