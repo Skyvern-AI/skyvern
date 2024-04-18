@@ -9,7 +9,6 @@ from enum import StrEnum
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Annotated, Any, Literal, Union
-from urllib.parse import urlparse
 
 import filetype
 import structlog
@@ -806,7 +805,7 @@ class SendEmailBlock(Block):
                     path = filename
 
                 if not path:
-                    raise FileNotFoundError(f"File not found: {filename}")
+                    raise FileNotFoundError(f"File not found: {path}")
 
                 # Guess the content type based on the file's extension.  Encoding
                 # will be ignored, although we should check for simple things like
@@ -822,10 +821,11 @@ class SendEmailBlock(Block):
                     extension = None
 
                 maintype, subtype = ctype.split("/", 1)
-                attachment_filename = urlparse(filename).path.replace("/", "_")
+                attachment_path = Path(path)
+                attachment_filename = attachment_path.name
 
                 # Check if the filename has an extension
-                if not Path(attachment_filename).suffix:
+                if not attachment_path.suffix:
                     # If no extension, guess it based on the MIME type
                     if extension:
                         attachment_filename += f".{extension}"
