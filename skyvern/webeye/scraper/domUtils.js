@@ -624,7 +624,9 @@ function buildTreeFromBody() {
       const listBox = document.getElementById(
         element.getAttribute("aria-controls"),
       );
-      selectOptions = getListboxOptions(listBox);
+      if (listBox) {
+        selectOptions = getListboxOptions(listBox);
+      }
       // HACK: press Tab to close the dropdown
       element.dispatchEvent(
         new KeyboardEvent("keydown", {
