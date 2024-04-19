@@ -322,6 +322,29 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def clear_task_failure_reason(self, task_id: str, organization_id: str) -> Task:
+        try:
+            async with self.Session() as session:
+                if task := (
+                    await session.scalars(
+                        select(TaskModel).filter_by(task_id=task_id).filter_by(organization_id=organization_id)
+                    )
+                ).first():
+                    task.failure_reason = None
+                    await session.commit()
+                    return convert_to_task(task, debug_enabled=self.debug_enabled)
+                else:
+                    raise NotFoundError("Task not found")
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except NotFoundError:
+            LOG.error("NotFoundError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def update_task(
         self,
         task_id: str,
