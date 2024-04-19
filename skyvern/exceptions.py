@@ -126,6 +126,8 @@ class WorkflowParameterNotFound(SkyvernException):
 
 class FailedToNavigateToUrl(SkyvernException):
     def __init__(self, url: str, error_message: str) -> None:
+        self.url = url
+        self.error_message = error_message
         super().__init__(f"Failed to navigate to url {url}. Error message: {error_message}")
 
 
