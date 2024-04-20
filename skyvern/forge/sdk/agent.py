@@ -47,8 +47,6 @@ class Agent:
 
         app.include_router(router, prefix="/api/v1")
 
-        app.add_middleware(AgentMiddleware, agent=self)
-
         app.add_middleware(
             RawContextMiddleware,
             plugins=(
@@ -83,20 +81,6 @@ class Agent:
                 skyvern_context.reset()
 
         return app
-
-
-class AgentMiddleware:
-    """
-    Middleware that injects the agent instance into the request scope.
-    """
-
-    def __init__(self, app: FastAPI, agent: Agent):
-        self.app = app
-        self.agent = agent
-
-    async def __call__(self, scope, receive, send):  # type: ignore
-        scope["agent"] = self.agent
-        await self.app(scope, receive, send)
 
 
 class ExecutionDatePlugin(Plugin):
