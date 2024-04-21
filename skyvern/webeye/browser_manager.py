@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import random
+
 import structlog
 from playwright.async_api import Browser, Playwright, async_playwright
 
@@ -23,13 +25,19 @@ class BrowserManager:
 
     @staticmethod
     async def _create_browser_state(
-        proxy_location: ProxyLocation | None = None, url: str | None = None
+        proxy_location: ProxyLocation | None = None, url: str | None = None, new_context_tree: bool = False
     ) -> BrowserState:
         pw = await async_playwright().start()
         browser_context, browser_artifacts = await BrowserContextFactory.create_browser_context(
             pw, proxy_location=proxy_location, url=url
         )
-        return BrowserState(pw=pw, browser_context=browser_context, page=None, browser_artifacts=browser_artifacts)
+        return BrowserState(
+            pw=pw,
+            browser_context=browser_context,
+            page=None,
+            browser_artifacts=browser_artifacts,
+            new_context_tree=new_context_tree,
+        )
 
     async def get_or_create_for_task(self, task: Task) -> BrowserState:
         if task.task_id in self.pages:
@@ -42,8 +50,11 @@ class BrowserManager:
             )
             self.pages[task.task_id] = self.pages[task.workflow_run_id]
             return self.pages[task.task_id]
-        LOG.info("Creating browser state for task", task_id=task.task_id)
-        browser_state = await self._create_browser_state(task.proxy_location, task.url)
+
+        # TODO: percentage to use new context tree, starting from 20%
+        new_ctx = random.choices([False, True], weights=[0.8, 0.2], k=1)[0]
+        LOG.info("Creating browser state for task", task_id=task.task_id, new_ctx=new_ctx)
+        browser_state = await self._create_browser_state(task.proxy_location, task.url, new_ctx)
 
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.

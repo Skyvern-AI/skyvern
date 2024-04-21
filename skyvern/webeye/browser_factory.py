@@ -135,11 +135,13 @@ class BrowserState:
         browser_context: BrowserContext | None = None,
         page: Page | None = None,
         browser_artifacts: BrowserArtifacts = BrowserArtifacts(),
+        new_context_tree: bool = False,
     ):
         self.pw = pw
         self.browser_context = browser_context
         self.page = page
         self.browser_artifacts = browser_artifacts
+        self.new_context_tree = new_context_tree
 
     async def _close_all_other_pages(self) -> None:
         if not self.browser_context or not self.page:
