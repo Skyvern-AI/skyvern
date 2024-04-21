@@ -4,7 +4,6 @@ from dotenv import load_dotenv
 
 import skyvern.forge.sdk.forge_log as forge_log
 from skyvern import analytics
-from skyvern.forge import app  # noqa
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.stdlib.get_logger()
