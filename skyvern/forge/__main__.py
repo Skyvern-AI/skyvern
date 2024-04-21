@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 
 import skyvern.forge.sdk.forge_log as forge_log
 from skyvern import analytics
+from skyvern.forge import app  # noqa
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.stdlib.get_logger()
@@ -17,4 +18,4 @@ if __name__ == "__main__":
     load_dotenv()
 
     reload = SettingsManager.get_settings().ENV == "local"
-    uvicorn.run("skyvern.forge.app:app", host="0.0.0.0", port=port, log_level="info", reload=reload)
+    uvicorn.run("skyvern.forge.api_app:app", host="0.0.0.0", port=port, log_level="info", reload=reload)
