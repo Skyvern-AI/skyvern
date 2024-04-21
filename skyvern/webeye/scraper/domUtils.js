@@ -395,6 +395,16 @@ const isComboboxDropdown = (element) => {
   return role && haspopup && controls && readonly;
 };
 
+const checkParentClass = (className) => {
+  const targetParentClasses = ["field", "entry"];
+  for (let i = 0; i < targetParentClasses.length; i++) {
+    if (className.includes(targetParentClasses[i])) {
+      return true;
+    }
+  }
+  return false;
+};
+
 function removeMultipleSpaces(str) {
   if (!str) {
     return str;
@@ -408,15 +418,43 @@ function cleanupText(text) {
   ).trim();
 }
 
-function getElementContext(element, existingContext = "") {
-  // dfs to collect the non unique_id context
-  let fullContext = "";
-  if (element.childNodes.length === 0) {
-    return fullContext;
+const checkStringIncludeRequire = (str) => {
+  return (
+    str.toLowerCase().includes("*") ||
+    str.toLowerCase().includes("✱") ||
+    str.toLowerCase().includes("require")
+  );
+};
+
+const checkRequiredFromStyle = (element) => {
+  const afterCustom = getElementComputedStyle(element, "::after")
+    .getPropertyValue("content")
+    .replace(/"/g, "");
+  if (checkStringIncludeRequire(afterCustom)) {
+    return true;
   }
-  let childContextList = new Array();
+
+  return element.className.toLowerCase().includes("require");
+};
+
+function getElementContext(element) {
+  // dfs to collect the non unique_id context
+  let fullContext = new Array();
+
+  // sometimes '*' shows as an after custom style
+  const afterCustom = getElementComputedStyle(element, "::after")
+    .getPropertyValue("content")
+    .replace(/"/g, "");
+  if (
+    afterCustom.toLowerCase().includes("*") ||
+    afterCustom.toLowerCase().includes("require")
+  ) {
+    fullContext.push(afterCustom);
+  }
+  if (element.childNodes.length === 0) {
+    return fullContext.join(";");
+  }
   // if the element already has a context, then add it to the list first
-  if (existingContext.length > 0) childContextList.push(existingContext);
   for (var child of element.childNodes) {
     let childContext = "";
     if (child.nodeType === Node.TEXT_NODE) {
@@ -429,19 +467,15 @@ function getElementContext(element, existingContext = "") {
       }
     }
     if (childContext.length > 0) {
-      childContextList.push(childContext);
-    }
-
-    if (childContextList.length > 0) {
-      fullContext = childContextList.join(";");
+      fullContext.push(childContext);
     }
 
     const charLimit = 1000;
-    if (fullContext.length > charLimit) {
-      fullContext = "";
+    if (fullContext.join(";").length > charLimit) {
+      fullContext = new Array();
     }
   }
-  return fullContext;
+  return fullContext.join(";");
 }
 
 function getElementContent(element, skipped_element = null) {
@@ -516,7 +550,7 @@ function getListboxOptions(element) {
   return selectOptions;
 }
 
-function buildTreeFromBody() {
+function buildTreeFromBody(new_ctx = false) {
   var elements = [];
   var resultArray = [];
 
@@ -596,10 +630,24 @@ function buildTreeFromBody() {
         attr.name === "readonly" ||
         attr.name === "aria-readonly"
       ) {
-        attrValue = true;
+        if (attrValue && attrValue.toLowerCase() === "false") {
+          attrValue = false;
+        } else {
+          attrValue = true;
+        }
       }
       attrs[attr.name] = attrValue;
     }
+
+    if (
+      new_ctx &&
+      checkRequiredFromStyle(element) &&
+      !attrs["required"] &&
+      !attrs["aria-required"]
+    ) {
+      attrs["required"] = true;
+    }
+
     if (elementTagNameLower === "input" || elementTagNameLower === "textarea") {
       attrs["value"] = element.value;
     }
@@ -669,6 +717,10 @@ function buildTreeFromBody() {
       else {
         elements[interactableParentId].children.push(elementObj);
       }
+      // options already added to the select.options, no need to add options anymore
+      if (new_ctx && elementObj.options && elementObj.options.length > 0) {
+        return elementObj;
+      }
       // Recursively process the children of the element
       getChildElements(element).forEach((child) => {
         processElement(child, elementObj.id);
@@ -684,7 +736,7 @@ function buildTreeFromBody() {
     }
   }
 
-  const getContextByParent = (element) => {
+  const getContextByParent = (element, ctx) => {
     // for most elements, we're going 10 layers up to see if we can find "label" as a parent
     // if found, most likely the context under label is relevant to this element
     let targetParentElements = new Set(["label", "fieldset"]);
@@ -696,7 +748,10 @@ function buildTreeFromBody() {
     for (var i = 0; i < 10; i++) {
       parentEle = parentEle.parentElement;
       if (parentEle) {
-        if (targetParentElements.has(parentEle.tagName.toLowerCase())) {
+        if (
+          targetParentElements.has(parentEle.tagName.toLowerCase()) ||
+          (new_ctx && checkParentClass(parentEle.className.toLowerCase()))
+        ) {
           targetContextualParent = parentEle;
         }
       } else {
@@ -704,24 +759,27 @@ function buildTreeFromBody() {
       }
     }
     if (!targetContextualParent) {
-      return "";
+      return ctx;
     }
 
     let context = "";
     var lowerCaseTagName = targetContextualParent.tagName.toLowerCase();
-    if (lowerCaseTagName === "label") {
-      context = getElementContext(targetContextualParent);
-    } else if (lowerCaseTagName === "fieldset") {
+    if (lowerCaseTagName === "fieldset") {
       // fieldset is usually within a form or another element that contains the whole context
       targetContextualParent = targetContextualParent.parentElement;
       if (targetContextualParent) {
         context = getElementContext(targetContextualParent);
       }
+    } else {
+      context = getElementContext(targetContextualParent);
     }
-    return context;
+    if (context.length > 0) {
+      ctx.push(context);
+    }
+    return ctx;
   };
 
-  const getContextByLinked = (element) => {
+  const getContextByLinked = (element, ctx) => {
     let currentEle = document.querySelector(`[unique_id="${element.id}"]`);
     // check labels pointed to this element
     // 1. element id -> labels pointed to this id
@@ -759,12 +817,102 @@ function buildTreeFromBody() {
     }
 
     const context = fullContext.join(";");
-    const charLimit = 1000;
-    if (context.length > charLimit) {
-      return "";
+    if (context.length > 0) {
+      ctx.push(context);
+    }
+    return ctx;
+  };
+
+  const getContextByTable = (element, ctx) => {
+    // pass element's parent's context to the element for listed tags
+    let tagsWithDirectParentContext = new Set(["a"]);
+    // if the element is a child of a td, th, or tr, then pass the grandparent's context to the element
+    let parentTagsThatDelegateParentContext = new Set(["td", "th", "tr"]);
+    if (tagsWithDirectParentContext.has(element.tagName)) {
+      let parentElement = document.querySelector(
+        `[unique_id="${element.id}"]`,
+      ).parentElement;
+      if (!parentElement) {
+        return ctx;
+      }
+      if (
+        parentTagsThatDelegateParentContext.has(
+          parentElement.tagName.toLowerCase(),
+        )
+      ) {
+        let grandParentElement = parentElement.parentElement;
+        if (grandParentElement) {
+          let context = getElementContext(grandParentElement, element.context);
+          if (context.length > 0) {
+            ctx.push(context);
+          }
+        }
+      }
+      let context = getElementContext(parentElement, element.context);
+      if (context.length > 0) {
+        ctx.push(context);
+      }
+    }
+    return ctx;
+  };
+
+  const trimDuplicatedText = (element) => {
+    if (element.children.length === 0 && !element.options) {
+      return;
     }
 
-    return context;
+    // if the element has options, text will be duplicated with the option text
+    if (element.options) {
+      element.options.forEach((option) => {
+        element.text = element.text.replace(option.text, "");
+      });
+    }
+
+    // BFS to delete duplicated text
+    element.children.forEach((child) => {
+      // delete duplicated text in the tree
+      element.text = element.text.replace(child.text, "");
+      trimDuplicatedText(child);
+    });
+
+    // trim multiple ";"
+    element.text = element.text.replace(/;+/g, ";");
+    // trimleft and trimright ";"
+    element.text = element.text.replace(new RegExp(`^;+|;+$`, "g"), "");
+  };
+
+  const trimDuplicatedContext = (element) => {
+    if (element.children.length === 0) {
+      return;
+    }
+
+    // DFS to delete duplicated context
+    element.children.forEach((child) => {
+      trimDuplicatedContext(child);
+      if (element.context === child.context) {
+        delete child.context;
+      }
+      if (child.context) {
+        child.context = child.context.replace(element.text, "");
+        if (!child.context) {
+          delete child.context;
+        }
+      }
+    });
+  };
+
+  // some elements without children should be removed out, such as <label>
+  const removeOrphanNode = (results) => {
+    const trimmedResults = [];
+    for (let i = 0; i < results.length; i++) {
+      const element = results[i];
+      element.children = removeOrphanNode(element.children);
+      if (element.tagName === "label" && element.children.length === 0) {
+        continue;
+      }
+      trimmedResults.push(element);
+    }
+    return trimmedResults;
   };
 
   // TODO: Handle iframes
@@ -788,42 +936,35 @@ function buildTreeFromBody() {
       );
     }
 
-    const context = getContextByLinked(element) + getContextByParent(element);
+    let ctxList = [];
+    ctxList = getContextByLinked(element, ctxList);
+    ctxList = getContextByParent(element, ctxList);
+    ctxList = getContextByTable(element, ctxList);
+    const context = ctxList.join(";");
     // const context = getContextByParent(element)
     if (context && context.length <= 1000) {
       element.context = context;
     }
 
-    // pass element's parent's context to the element for listed tags
-    let tagsWithDirectParentContext = new Set(["a"]);
-    // if the element is a child of a td, th, or tr, then pass the grandparent's context to the element
-    let parentTagsThatDelegateParentContext = new Set(["td", "th", "tr"]);
-    if (tagsWithDirectParentContext.has(element.tagName)) {
-      let parentElement = document.querySelector(
-        `[unique_id="${element.id}"]`,
-      ).parentElement;
-      if (!parentElement) {
-        continue;
-      }
+    if (new_ctx && checkStringIncludeRequire(context)) {
       if (
-        parentTagsThatDelegateParentContext.has(
-          parentElement.tagName.toLowerCase(),
-        )
+        !element.attributes["required"] &&
+        !element.attributes["aria-required"]
       ) {
-        let grandParentElement = parentElement.parentElement;
-        if (grandParentElement) {
-          let context = getElementContext(grandParentElement, element.context);
-          if (context.length > 0) {
-            element.context = context;
-          }
-        }
-      }
-      let context = getElementContext(parentElement, element.context);
-      if (context.length > 0) {
-        element.context = context;
+        element.attributes["required"] = true;
       }
     }
   }
+
+  if (!new_ctx) {
+    return [elements, resultArray];
+  }
+
+  resultArray = removeOrphanNode(resultArray);
+  resultArray.forEach((root) => {
+    trimDuplicatedText(root);
+    trimDuplicatedContext(root);
+  });
 
   return [elements, resultArray];
 }
