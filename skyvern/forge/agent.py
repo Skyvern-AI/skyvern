@@ -21,7 +21,6 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.agent import Agent
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
@@ -49,7 +48,7 @@ from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
 LOG = structlog.get_logger()
 
 
-class ForgeAgent(Agent):
+class ForgeAgent:
     def __init__(self) -> None:
         if SettingsManager.get_settings().ADDITIONAL_MODULES:
             for module in SettingsManager.get_settings().ADDITIONAL_MODULES:

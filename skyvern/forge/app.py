@@ -40,5 +40,3 @@ WORKFLOW_SERVICE = WorkflowService()
 generate_async_operations: Callable[[Organization, Task, Page], list[AsyncOperation]] | None = None
 
 agent = ForgeAgent()
-
-app = agent.get_agent_app()
