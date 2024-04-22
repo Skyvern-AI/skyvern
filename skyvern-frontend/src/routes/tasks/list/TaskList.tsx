@@ -24,6 +24,7 @@ import { cn } from "@/util/utils";
 import { PAGE_SIZE } from "../constants";
 import { StatusBadge } from "@/components/StatusBadge";
 import { basicTimeFormat } from "@/util/timeFormat";
+import { QueuedTasks } from "../running/QueuedTasks";
 
 function TaskList() {
   const navigate = useNavigate();
@@ -76,6 +77,8 @@ function TaskList() {
       <div className="grid grid-cols-4 gap-4">
         <RunningTasks />
       </div>
+      <h1 className="text-2xl py-2 border-b-2">Queued Tasks</h1>
+      <QueuedTasks />
       <h1 className="text-2xl py-2 border-b-2">Task History</h1>
       <Table>
         <TableHeader>

@@ -5,8 +5,8 @@ import {
   StepApiResponse,
 } from "@/api/types";
 import { Skeleton } from "@/components/ui/skeleton";
-import { artifactApiBaseUrl } from "@/util/env";
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { getImageURL } from "../detail/artifactUtils";
 
 type Props = {
   id: string;
@@ -14,10 +14,10 @@ type Props = {
 
 function LatestScreenshot({ id }: Props) {
   const {
-    data: screenshotUri,
+    data: artifact,
     isFetching,
     isError,
-  } = useQuery<string | undefined>({
+  } = useQuery<ArtifactApiResponse | undefined>({
     queryKey: ["task", id, "latestScreenshot"],
     queryFn: async () => {
       const steps: StepApiResponse[] = await client
@@ -38,43 +38,39 @@ function LatestScreenshot({ id }: Props) {
         .get(`/tasks/${id}/steps/${latestStep.step_id}/artifacts`)
         .then((response) => response.data);
 
-      const actionScreenshotUris = artifacts
-        ?.filter(
-          (artifact) =>
-            artifact.artifact_type === ArtifactType.ActionScreenshot,
-        )
-        .map((artifact) => artifact.uri);
+      const actionScreenshots = artifacts?.filter(
+        (artifact) => artifact.artifact_type === ArtifactType.ActionScreenshot,
+      );
 
-      if (actionScreenshotUris.length > 0) {
-        return actionScreenshotUris[0];
+      if (actionScreenshots.length > 0) {
+        return actionScreenshots[0];
       }
 
-      const llmScreenshotUris = artifacts
-        ?.filter(
-          (artifact) => artifact.artifact_type === ArtifactType.LLMScreenshot,
-        )
-        .map((artifact) => artifact.uri);
+      const llmScreenshots = artifacts?.filter(
+        (artifact) => artifact.artifact_type === ArtifactType.LLMScreenshot,
+      );
 
-      if (llmScreenshotUris.length > 0) {
-        return llmScreenshotUris[0];
+      if (llmScreenshots.length > 0) {
+        return llmScreenshots[0];
       }
 
       return Promise.reject("No screenshots found");
     },
     refetchInterval: 2000,
+    placeholderData: keepPreviousData,
   });
 
-  if (isFetching) {
+  if (isFetching && !artifact) {
     return <Skeleton className="w-full h-full" />;
   }
 
-  if (isError || !screenshotUri || typeof screenshotUri !== "string") {
+  if (isError || !artifact) {
     return null;
   }
 
   return (
     <img
-      src={`${artifactApiBaseUrl}/artifact/image?path=${screenshotUri.slice(7)}`}
+      src={getImageURL(artifact)}
       className="w-full h-full object-contain"
       alt="Latest screenshot"
     />
