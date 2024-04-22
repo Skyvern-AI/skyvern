@@ -1,7 +1,8 @@
-from typing import Callable
+from typing import Awaitable, Callable
 
 from ddtrace import tracer
 from ddtrace.filters import FilterRequestsOnUrl
+from fastapi import FastAPI
 from playwright.async_api import Page
 
 from skyvern.forge.agent import ForgeAgent
@@ -38,5 +39,7 @@ LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(SettingsManager.get_s
 WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
 WORKFLOW_SERVICE = WorkflowService()
 generate_async_operations: Callable[[Organization, Task, Page], list[AsyncOperation]] | None = None
+authentication_function: Callable[[str], Awaitable[Organization]] | None = None
+setup_api_app: Callable[[FastAPI], None] | None = None
 
 agent = ForgeAgent()
