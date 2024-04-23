@@ -20,8 +20,8 @@ function SideNav() {
           );
         }}
       >
-        <PlusCircledIcon className="mr-4" />
-        <span>New Task</span>
+        <PlusCircledIcon className="mr-4 w-6 h-6" />
+        <span className="text-lg">New Task</span>
       </NavLink>
       <NavLink
         to="tasks"
@@ -34,8 +34,8 @@ function SideNav() {
           );
         }}
       >
-        <ListBulletIcon className="mr-4" />
-        <span>Task History</span>
+        <ListBulletIcon className="mr-4 w-6 h-6" />
+        <span className="text-lg">Task History</span>
       </NavLink>
       <NavLink
         to="settings"
@@ -48,8 +48,8 @@ function SideNav() {
           );
         }}
       >
-        <GearIcon className="mr-4" />
-        <span>Settings</span>
+        <GearIcon className="mr-4 w-6 h-6" />
+        <span className="text-lg">Settings</span>
       </NavLink>
     </nav>
   );
