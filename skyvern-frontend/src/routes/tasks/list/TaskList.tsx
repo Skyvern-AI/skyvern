@@ -25,6 +25,13 @@ import { PAGE_SIZE } from "../constants";
 import { StatusBadge } from "@/components/StatusBadge";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { QueuedTasks } from "../running/QueuedTasks";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 
 function TaskList() {
   const navigate = useNavigate();
@@ -52,19 +59,11 @@ function TaskList() {
     placeholderData: keepPreviousData,
   });
 
-  if (isPending) {
-    return <TaskListSkeleton />;
-  }
-
   if (isError) {
     return <div>Error: {error?.message}</div>;
   }
 
-  if (!tasks) {
-    return null;
-  }
-
-  const resolvedTasks = tasks.filter(
+  const resolvedTasks = tasks?.filter(
     (task) =>
       task.status === "completed" ||
       task.status === "failed" ||
@@ -72,81 +71,110 @@ function TaskList() {
   );
 
   return (
-    <div className="flex flex-col gap-4">
-      <h1 className="text-2xl py-2 border-b-2">Running Tasks</h1>
-      <div className="grid grid-cols-4 gap-4">
-        <RunningTasks />
-      </div>
-      <h1 className="text-2xl py-2 border-b-2">Queued Tasks</h1>
-      <QueuedTasks />
-      <h1 className="text-2xl py-2 border-b-2">Task History</h1>
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead className="w-1/3">URL</TableHead>
-            <TableHead className="w-1/3">Status</TableHead>
-            <TableHead className="w-1/3">Created At</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {tasks.length === 0 ? (
-            <TableRow>
-              <TableCell colSpan={3}>No tasks found</TableCell>
-            </TableRow>
+    <div className="flex flex-col gap-8 max-w-5xl mx-auto">
+      <Card>
+        <CardHeader className="border-b-2">
+          <CardTitle className="text-xl">Running Tasks</CardTitle>
+          <CardDescription>Tasks that are currently running</CardDescription>
+        </CardHeader>
+        <CardContent className="p-4">
+          <div className="grid grid-cols-4 gap-4">
+            <RunningTasks />
+          </div>
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader className="border-b-2">
+          <CardTitle className="text-xl">Queued Tasks</CardTitle>
+          <CardDescription>Tasks that are waiting to run</CardDescription>
+        </CardHeader>
+        <CardContent className="p-4">
+          <QueuedTasks />
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader className="border-b-2">
+          <CardTitle className="text-xl">Task History</CardTitle>
+          <CardDescription>Tasks you have run previously</CardDescription>
+        </CardHeader>
+        <CardContent className="p-4">
+          {isPending ? (
+            <TaskListSkeleton />
           ) : (
-            resolvedTasks.map((task) => {
-              return (
-                <TableRow
-                  key={task.task_id}
-                  className="cursor-pointer w-4"
-                  onClick={() => {
-                    navigate(task.task_id);
-                  }}
-                >
-                  <TableCell className="w-1/3">{task.request.url}</TableCell>
-                  <TableCell className="w-1/3">
-                    <StatusBadge status={task.status} />
-                  </TableCell>
-                  <TableCell className="w-1/3">
-                    {basicTimeFormat(task.created_at)}
-                  </TableCell>
-                </TableRow>
-              );
-            })
+            <>
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="w-1/3">URL</TableHead>
+                    <TableHead className="w-1/3">Status</TableHead>
+                    <TableHead className="w-1/3">Created At</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {tasks.length === 0 ? (
+                    <TableRow>
+                      <TableCell colSpan={3}>No tasks found</TableCell>
+                    </TableRow>
+                  ) : (
+                    resolvedTasks?.map((task) => {
+                      return (
+                        <TableRow
+                          key={task.task_id}
+                          className="cursor-pointer w-4"
+                          onClick={() => {
+                            navigate(task.task_id);
+                          }}
+                        >
+                          <TableCell className="w-1/3">
+                            {task.request.url}
+                          </TableCell>
+                          <TableCell className="w-1/3">
+                            <StatusBadge status={task.status} />
+                          </TableCell>
+                          <TableCell className="w-1/3">
+                            {basicTimeFormat(task.created_at)}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })
+                  )}
+                </TableBody>
+              </Table>
+              <Pagination>
+                <PaginationContent>
+                  <PaginationItem>
+                    <PaginationPrevious
+                      href="#"
+                      className={cn({ "cursor-not-allowed": page === 1 })}
+                      onClick={() => {
+                        if (page === 1) {
+                          return;
+                        }
+                        const params = new URLSearchParams();
+                        params.set("page", String(Math.max(1, page - 1)));
+                        setSearchParams(params);
+                      }}
+                    />
+                  </PaginationItem>
+                  <PaginationItem>
+                    <PaginationLink href="#">{page}</PaginationLink>
+                  </PaginationItem>
+                  <PaginationItem>
+                    <PaginationNext
+                      href="#"
+                      onClick={() => {
+                        const params = new URLSearchParams();
+                        params.set("page", String(page + 1));
+                        setSearchParams(params);
+                      }}
+                    />
+                  </PaginationItem>
+                </PaginationContent>
+              </Pagination>
+            </>
           )}
-        </TableBody>
-      </Table>
-      <Pagination>
-        <PaginationContent>
-          <PaginationItem>
-            <PaginationPrevious
-              href="#"
-              className={cn({ "cursor-not-allowed": page === 1 })}
-              onClick={() => {
-                if (page === 1) {
-                  return;
-                }
-                const params = new URLSearchParams();
-                params.set("page", String(Math.max(1, page - 1)));
-                setSearchParams(params);
-              }}
-            />
-          </PaginationItem>
-          <PaginationItem>
-            <PaginationLink href="#">{page}</PaginationLink>
-          </PaginationItem>
-          <PaginationItem>
-            <PaginationNext
-              href="#"
-              onClick={() => {
-                const params = new URLSearchParams();
-                params.set("page", String(page + 1));
-                setSearchParams(params);
-              }}
-            />
-          </PaginationItem>
-        </PaginationContent>
-      </Pagination>
+        </CardContent>
+      </Card>
     </div>
   );
 }

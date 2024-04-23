@@ -8,7 +8,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 
-const pageSizeArray = new Array(15).fill(null); // doesn't matter the value
+const pageSizeArray = new Array(5).fill(null); // doesn't matter the value
 
 function TaskListSkeleton() {
   return (
@@ -26,13 +26,13 @@ function TaskListSkeleton() {
             return (
               <TableRow key={index}>
                 <TableCell className="w-1/3">
-                  <Skeleton className="w-full h-full" />
+                  <Skeleton className="w-full h-4" />
                 </TableCell>
                 <TableCell className="w-1/3">
-                  <Skeleton className="w-full h-full" />
+                  <Skeleton className="w-full h-4" />
                 </TableCell>
                 <TableCell className="w-1/3">
-                  <Skeleton className="w-full h-full" />
+                  <Skeleton className="w-full h-4" />
                 </TableCell>
               </TableRow>
             );
