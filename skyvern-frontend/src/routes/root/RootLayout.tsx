@@ -18,7 +18,7 @@ function RootLayout({ onLogout }: Props) {
   return (
     <>
       <div className="w-full h-full px-4">
-        <aside className="fixed w-72 px-6 shrink-0 min-h-screen">
+        <aside className="fixed w-72 px-6 shrink-0 min-h-screen border-r-2">
           <Link
             to="https://skyvern.com"
             target="_blank"
