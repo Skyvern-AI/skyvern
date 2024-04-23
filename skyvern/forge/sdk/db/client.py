@@ -436,12 +436,19 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_organization_by_domain(self, domain: str) -> Organization | None:
+        async with self.Session() as session:
+            if organization := (await session.scalars(select(OrganizationModel).filter_by(domain=domain))).first():
+                return convert_to_organization(organization)
+            return None
+
     async def create_organization(
         self,
         organization_name: str,
         webhook_callback_url: str | None = None,
         max_steps_per_run: int | None = None,
         max_retries_per_step: int | None = None,
+        domain: str | None = None,
     ) -> Organization:
         async with self.Session() as session:
             org = OrganizationModel(
@@ -449,6 +456,7 @@ class AgentDB:
                 webhook_callback_url=webhook_callback_url,
                 max_steps_per_run=max_steps_per_run,
                 max_retries_per_step=max_retries_per_step,
+                domain=domain,
             )
             session.add(org)
             await session.commit()

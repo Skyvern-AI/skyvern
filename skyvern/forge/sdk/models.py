@@ -118,6 +118,7 @@ class Organization(BaseModel):
     webhook_callback_url: str | None = None
     max_steps_per_run: int | None = None
     max_retries_per_step: int | None = None
+    domain: str | None = None
 
     created_at: datetime
     modified_at: datetime
