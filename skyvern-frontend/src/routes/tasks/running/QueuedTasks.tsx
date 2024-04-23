@@ -28,6 +28,10 @@ function QueuedTasks() {
     ?.filter((task) => task.status === Status.Queued)
     .slice(0, 10);
 
+  if (queuedTasks?.length === 0) {
+    return <div>No queued tasks</div>;
+  }
+
   return (
     <Table>
       <TableHeader>

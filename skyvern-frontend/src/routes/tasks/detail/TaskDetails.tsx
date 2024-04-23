@@ -18,6 +18,7 @@ import { StepArtifactsLayout } from "./StepArtifactsLayout";
 import Zoom from "react-medium-image-zoom";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
 import { getRecordingURL, getScreenshotURL } from "./artifactUtils";
+import { Skeleton } from "@/components/ui/skeleton";
 
 function TaskDetails() {
   const { taskId } = useParams();
@@ -39,14 +40,6 @@ function TaskDetails() {
     return <div>Error: {taskError?.message}</div>;
   }
 
-  if (isTaskFetching) {
-    return <div>Loading...</div>; // TODO: skeleton
-  }
-
-  if (!task) {
-    return <div>Task not found</div>;
-  }
-
   return (
     <div>
       <div className="flex flex-col gap-4 relative">
@@ -58,9 +51,9 @@ function TaskDetails() {
             refetch();
           }}
         >
-          <ReloadIcon />
+          <ReloadIcon className="w-4 h-4" />
         </Button>
-        {task.recording_url ? (
+        {task?.recording_url ? (
           <div className="flex">
             <Label className="w-32">Recording</Label>
             <video src={getRecordingURL(task)} controls />
@@ -68,9 +61,13 @@ function TaskDetails() {
         ) : null}
         <div className="flex items-center">
           <Label className="w-32">Status</Label>
-          <StatusBadge status={task.status} />
+          {isTaskFetching ? (
+            <Skeleton className="w-32 h-8" />
+          ) : task ? (
+            <StatusBadge status={task?.status} />
+          ) : null}
         </div>
-        {task.status === Status.Completed ? (
+        {task?.status === Status.Completed ? (
           <div className="flex items-center">
             <Label className="w-32 shrink-0">Extracted Information</Label>
             <Textarea
@@ -80,7 +77,8 @@ function TaskDetails() {
             />
           </div>
         ) : null}
-        {task.status === Status.Failed || task.status === Status.Terminated ? (
+        {task?.status === Status.Failed ||
+        task?.status === Status.Terminated ? (
           <div className="flex items-center">
             <Label className="w-32 shrink-0">Failure Reason</Label>
             <Textarea
@@ -97,55 +95,59 @@ function TaskDetails() {
             <h1>Task Parameters</h1>
           </AccordionTrigger>
           <AccordionContent>
-            <div>
-              <p className="py-2">Task ID: {taskId}</p>
-              <p className="py-2">URL: {task.request.url}</p>
-              <p className="py-2">
-                Created: {basicTimeFormat(task.created_at)}
-              </p>
-              <div className="py-2">
-                <Label>Navigation Goal</Label>
-                <Textarea
-                  rows={5}
-                  value={task.request.navigation_goal}
-                  readOnly
-                />
+            {task ? (
+              <div>
+                <p className="py-2">Task ID: {taskId}</p>
+                <p className="py-2">URL: {task.request.url}</p>
+                <p className="py-2">
+                  Created: {basicTimeFormat(task.created_at)}
+                </p>
+                <div className="py-2">
+                  <Label>Navigation Goal</Label>
+                  <Textarea
+                    rows={5}
+                    value={task.request.navigation_goal}
+                    readOnly
+                  />
+                </div>
+                <div className="py-2">
+                  <Label>Navigation Payload</Label>
+                  <Textarea
+                    rows={5}
+                    value={task.request.navigation_payload}
+                    readOnly
+                  />
+                </div>
+                <div className="py-2">
+                  <Label>Data Extraction Goal</Label>
+                  <Textarea
+                    rows={5}
+                    value={task.request.data_extraction_goal}
+                    readOnly
+                  />
+                </div>
               </div>
-              <div className="py-2">
-                <Label>Navigation Payload</Label>
-                <Textarea
-                  rows={5}
-                  value={task.request.navigation_payload}
-                  readOnly
-                />
-              </div>
-              <div className="py-2">
-                <Label>Data Extraction Goal</Label>
-                <Textarea
-                  rows={5}
-                  value={task.request.data_extraction_goal}
-                  readOnly
-                />
-              </div>
-            </div>
+            ) : null}
           </AccordionContent>
         </AccordionItem>
         <AccordionItem value="task-artifacts">
           <AccordionTrigger>
-            <h1>Screenshot</h1>
+            <h1>Final Screenshot</h1>
           </AccordionTrigger>
           <AccordionContent>
-            <div className="max-w-sm mx-auto">
-              {task.screenshot_url ? (
-                <Zoom zoomMargin={16}>
-                  <AspectRatio ratio={16 / 9}>
-                    <img src={getScreenshotURL(task)} alt="screenshot" />
-                  </AspectRatio>
-                </Zoom>
-              ) : (
-                <p>No screenshot</p>
-              )}
-            </div>
+            {task ? (
+              <div className="max-w-sm mx-auto">
+                {task.screenshot_url ? (
+                  <Zoom zoomMargin={16}>
+                    <AspectRatio ratio={16 / 9}>
+                      <img src={getScreenshotURL(task)} alt="screenshot" />
+                    </AspectRatio>
+                  </Zoom>
+                ) : (
+                  <p>No screenshot</p>
+                )}
+              </div>
+            ) : null}
           </AccordionContent>
         </AccordionItem>
         <AccordionItem value="task-steps">
