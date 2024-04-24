@@ -10,13 +10,20 @@ import {
 import { SampleCase } from "../types";
 import { getSampleForInitialFormValues } from "../data/sampleTaskData";
 import { Label } from "@/components/ui/label";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 
 function CreateNewTask() {
   const [selectedCase, setSelectedCase] = useState<SampleCase>("geico");
   const caseInputId = useId();
 
   return (
-    <div className="flex flex-col gap-6 px-6">
+    <div className="flex flex-col gap-8 max-w-5xl mx-auto">
       <div className="flex gap-4 items-center">
         <Label htmlFor={caseInputId} className="whitespace-nowrap">
           Select a sample:
@@ -38,10 +45,21 @@ function CreateNewTask() {
           </SelectContent>
         </Select>
       </div>
-      <CreateNewTaskForm
-        key={selectedCase}
-        initialValues={getSampleForInitialFormValues(selectedCase)}
-      />
+      <Card>
+        <CardHeader className="border-b-2">
+          <CardTitle className="text-lg">Create a new task</CardTitle>
+          <CardDescription>
+            Fill out the form below to create a new task. You can select a
+            sample from above to prefill the form with sample data.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <CreateNewTaskForm
+            key={selectedCase}
+            initialValues={getSampleForInitialFormValues(selectedCase)}
+          />
+        </CardContent>
+      </Card>
     </div>
   );
 }

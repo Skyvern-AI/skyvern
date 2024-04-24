@@ -1,4 +1,5 @@
-export const urlDescription = "The starting URL for the task.";
+export const urlDescription =
+  "The starting URL for the task. This field is required.";
 
 export const webhookCallbackUrlDescription =
   "The URL to call with the results when the task is completed.";
