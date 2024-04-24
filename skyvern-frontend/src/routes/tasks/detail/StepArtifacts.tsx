@@ -14,6 +14,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { JSONArtifact } from "./JSONArtifact";
 import { TextArtifact } from "./TextArtifact";
 import { getImageURL } from "./artifactUtils";
+import { Input } from "@/components/ui/input";
+import { basicTimeFormat } from "@/util/timeFormat";
 
 type Props = {
   id: string;
@@ -81,7 +83,7 @@ function StepArtifacts({ id, stepProps }: Props) {
     <Tabs defaultValue="info" className="w-full">
       <TabsList className="grid w-full h-16 grid-cols-5">
         <TabsTrigger value="info">Info</TabsTrigger>
-        <TabsTrigger value="screenshot_llm">LLM Screenshots</TabsTrigger>
+        <TabsTrigger value="screenshot_llm">Page Screenshots</TabsTrigger>
         <TabsTrigger value="screenshot_action">Action Screenshots</TabsTrigger>
         <TabsTrigger value="element_tree">Element Tree</TabsTrigger>
         <TabsTrigger value="element_tree_trimmed">
@@ -96,17 +98,17 @@ function StepArtifacts({ id, stepProps }: Props) {
         <TabsTrigger value="html_raw">HTML (Raw)</TabsTrigger>
       </TabsList>
       <TabsContent value="info">
-        <div className="flex flex-col gap-4 p-4">
+        <div className="flex flex-col gap-6 p-4">
           <div className="flex items-center">
-            <Label className="w-24">Step ID:</Label>
+            <Label className="w-32 shrink-0 text-xl">Step ID</Label>
             {isFetching ? (
               <Skeleton className="h-4 w-40" />
             ) : (
-              <span>{stepProps?.step_id}</span>
+              <Input value={stepProps?.step_id} readOnly />
             )}
           </div>
           <div className="flex items-center">
-            <Label className="w-24">Status:</Label>
+            <Label className="w-32 shrink-0 text-xl">Status</Label>
             {isFetching ? (
               <Skeleton className="h-4 w-40" />
             ) : stepProps ? (
@@ -114,11 +116,11 @@ function StepArtifacts({ id, stepProps }: Props) {
             ) : null}
           </div>
           <div className="flex items-center">
-            <Label className="w-24">Created At:</Label>
+            <Label className="w-32 shrink-0 text-xl">Created At</Label>
             {isFetching ? (
               <Skeleton className="h-4 w-40" />
             ) : stepProps ? (
-              <span>{stepProps.created_at}</span>
+              <Input value={basicTimeFormat(stepProps.created_at)} readOnly />
             ) : null}
           </div>
         </div>

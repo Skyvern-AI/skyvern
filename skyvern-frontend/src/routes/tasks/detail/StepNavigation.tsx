@@ -4,6 +4,7 @@ import { cn } from "@/util/utils";
 import { useQuery } from "@tanstack/react-query";
 import { useParams, useSearchParams } from "react-router-dom";
 import { PAGE_SIZE } from "../constants";
+import { CheckboxIcon, CrossCircledIcon } from "@radix-ui/react-icons";
 
 type Props = {
   activeIndex: number;
@@ -17,7 +18,6 @@ function StepNavigation({ activeIndex, onActiveIndexChange }: Props) {
 
   const {
     data: steps,
-    isFetching,
     isError,
     error,
   } = useQuery<Array<StepApiResponse>>({
@@ -34,10 +34,6 @@ function StepNavigation({ activeIndex, onActiveIndexChange }: Props) {
     },
   });
 
-  if (isFetching) {
-    return <div>Loading...</div>;
-  }
-
   if (isError) {
     return <div>Error: {error?.message}</div>;
   }
@@ -53,7 +49,7 @@ function StepNavigation({ activeIndex, onActiveIndexChange }: Props) {
         return (
           <div
             className={cn(
-              "flex justify-center items-center px-6 py-2 hover:bg-primary-foreground rounded-2xl cursor-pointer",
+              "flex items-center px-6 py-2 hover:bg-primary-foreground rounded-2xl cursor-pointer",
               {
                 "bg-primary-foreground": isActive,
               },
@@ -63,6 +59,12 @@ function StepNavigation({ activeIndex, onActiveIndexChange }: Props) {
               onActiveIndexChange(index);
             }}
           >
+            {step.status === "completed" && (
+              <CheckboxIcon className="w-6 h-6 mr-2 text-green-500" />
+            )}
+            {step.status === "failed" && (
+              <CrossCircledIcon className="w-6 h-6 mr-2 text-red-500" />
+            )}
             <span>
               {step.retry_index > 0
                 ? `Step ${step.order + 1} ( Retry ${step.retry_index} )`
