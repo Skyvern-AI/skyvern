@@ -322,7 +322,7 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def clear_task_failure_reason(self, task_id: str, organization_id: str) -> Task:
+    async def clear_task_failure_reason(self, organization_id: str, task_id: str) -> Task:
         try:
             async with self.Session() as session:
                 if task := (
