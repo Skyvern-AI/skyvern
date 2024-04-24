@@ -2,23 +2,24 @@ import { client } from "@/api/AxiosClient";
 import { Status, TaskApiResponse } from "@/api/types";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useParams } from "react-router-dom";
-import {
-  Accordion,
-  AccordionContent,
-  AccordionItem,
-  AccordionTrigger,
-} from "@/components/ui/accordion";
 import { StatusBadge } from "@/components/StatusBadge";
-import { Button } from "@/components/ui/button";
-import { ReloadIcon } from "@radix-ui/react-icons";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { StepArtifactsLayout } from "./StepArtifactsLayout";
-import Zoom from "react-medium-image-zoom";
-import { AspectRatio } from "@/components/ui/aspect-ratio";
 import { getRecordingURL, getScreenshotURL } from "./artifactUtils";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Input } from "@/components/ui/input";
+import { ZoomableImage } from "@/components/ZoomableImage";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Separator } from "@/components/ui/separator";
 
 function TaskDetails() {
   const { taskId } = useParams();
@@ -28,12 +29,21 @@ function TaskDetails() {
     isFetching: isTaskFetching,
     isError: isTaskError,
     error: taskError,
-    refetch,
   } = useQuery<TaskApiResponse>({
     queryKey: ["task", taskId, "details"],
     queryFn: async () => {
       return client.get(`/tasks/${taskId}`).then((response) => response.data);
     },
+    refetchInterval: (query) => {
+      if (
+        query.state.data?.status === Status.Running ||
+        query.state.data?.status === Status.Queued
+      ) {
+        return 3000;
+      }
+      return false;
+    },
+    placeholderData: keepPreviousData,
   });
 
   if (isTaskError) {
@@ -41,124 +51,143 @@ function TaskDetails() {
   }
 
   return (
-    <div>
-      <div className="flex flex-col gap-4 relative">
-        <Button
-          variant="ghost"
-          size="icon"
-          className="cursor-pointer absolute top-0 right-0"
-          onClick={() => {
-            refetch();
-          }}
-        >
-          <ReloadIcon className="w-4 h-4" />
-        </Button>
-        {task?.recording_url ? (
-          <div className="flex">
-            <Label className="w-32">Recording</Label>
-            <video src={getRecordingURL(task)} controls />
-          </div>
-        ) : null}
-        <div className="flex items-center">
-          <Label className="w-32">Status</Label>
-          {isTaskFetching ? (
-            <Skeleton className="w-32 h-8" />
-          ) : task ? (
-            <StatusBadge status={task?.status} />
-          ) : null}
-        </div>
-        {task?.status === Status.Completed ? (
-          <div className="flex items-center">
-            <Label className="w-32 shrink-0">Extracted Information</Label>
-            <Textarea
-              rows={5}
-              value={JSON.stringify(task.extracted_information, null, 2)}
-              readOnly
-            />
-          </div>
-        ) : null}
-        {task?.status === Status.Failed ||
-        task?.status === Status.Terminated ? (
-          <div className="flex items-center">
-            <Label className="w-32 shrink-0">Failure Reason</Label>
-            <Textarea
-              rows={5}
-              value={JSON.stringify(task.failure_reason)}
-              readOnly
-            />
-          </div>
+    <div className="flex flex-col gap-8">
+      <div className="flex items-center">
+        <Label className="w-32 shrink-0 text-lg">Task ID</Label>
+        <Input value={taskId} readOnly />
+      </div>
+      <div className="flex items-center">
+        <Label className="w-32 text-lg">Status</Label>
+        {isTaskFetching ? (
+          <Skeleton className="w-32 h-8" />
+        ) : task ? (
+          <StatusBadge status={task?.status} />
         ) : null}
       </div>
-      <Accordion type="multiple">
-        <AccordionItem value="task-parameters">
-          <AccordionTrigger>
-            <h1>Task Parameters</h1>
-          </AccordionTrigger>
-          <AccordionContent>
-            {task ? (
-              <div>
-                <p className="py-2">Task ID: {taskId}</p>
-                <p className="py-2">URL: {task.request.url}</p>
-                <p className="py-2">
-                  Created: {basicTimeFormat(task.created_at)}
-                </p>
-                <div className="py-2">
-                  <Label>Navigation Goal</Label>
-                  <Textarea
-                    rows={5}
-                    value={task.request.navigation_goal}
-                    readOnly
+      {task?.status === Status.Completed ? (
+        <div className="flex items-center">
+          <Label className="w-32 shrink-0 text-lg">Extracted Information</Label>
+          <Textarea
+            rows={5}
+            value={JSON.stringify(task.extracted_information, null, 2)}
+            readOnly
+          />
+        </div>
+      ) : null}
+      {task?.status === Status.Failed || task?.status === Status.Terminated ? (
+        <div className="flex items-center">
+          <Label className="w-32 shrink-0 text-lg">Failure Reason</Label>
+          <Textarea
+            rows={5}
+            value={JSON.stringify(task.failure_reason)}
+            readOnly
+          />
+        </div>
+      ) : null}
+      {task ? (
+        <Card>
+          <CardHeader className="border-b-2">
+            <CardTitle className="text-xl">Task Artifacts</CardTitle>
+            <CardDescription>
+              Recording and final screenshot of the task
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Tabs defaultValue="recording">
+              <TabsList>
+                <TabsTrigger value="recording">Recording</TabsTrigger>
+                <TabsTrigger value="final-screenshot">
+                  Final Screenshot
+                </TabsTrigger>
+              </TabsList>
+              <TabsContent value="recording">
+                {task.recording_url ? (
+                  <video
+                    width={800}
+                    height={450}
+                    src={getRecordingURL(task)}
+                    controls
                   />
-                </div>
-                <div className="py-2">
-                  <Label>Navigation Payload</Label>
-                  <Textarea
-                    rows={5}
-                    value={task.request.navigation_payload}
-                    readOnly
-                  />
-                </div>
-                <div className="py-2">
-                  <Label>Data Extraction Goal</Label>
-                  <Textarea
-                    rows={5}
-                    value={task.request.data_extraction_goal}
-                    readOnly
-                  />
-                </div>
-              </div>
-            ) : null}
-          </AccordionContent>
-        </AccordionItem>
-        <AccordionItem value="task-artifacts">
-          <AccordionTrigger>
-            <h1>Final Screenshot</h1>
-          </AccordionTrigger>
-          <AccordionContent>
-            {task ? (
-              <div className="max-w-sm mx-auto">
-                {task.screenshot_url ? (
-                  <Zoom zoomMargin={16}>
-                    <AspectRatio ratio={16 / 9}>
-                      <img src={getScreenshotURL(task)} alt="screenshot" />
-                    </AspectRatio>
-                  </Zoom>
                 ) : (
-                  <p>No screenshot</p>
+                  <div>No recording available</div>
                 )}
+              </TabsContent>
+              <TabsContent value="final-screenshot">
+                {task ? (
+                  <div className="h-[450px] w-[800px]">
+                    {task.screenshot_url ? (
+                      <ZoomableImage
+                        src={getScreenshotURL(task)}
+                        alt="screenshot"
+                        className="object-cover w-full h-full"
+                      />
+                    ) : (
+                      <p>No screenshot available</p>
+                    )}
+                  </div>
+                ) : null}
+              </TabsContent>
+            </Tabs>
+          </CardContent>
+        </Card>
+      ) : null}
+      <Card>
+        <CardHeader className="border-b-2">
+          <CardTitle className="text-xl">Parameters</CardTitle>
+          <CardDescription>Task URL and Input Parameters</CardDescription>
+        </CardHeader>
+        <CardContent className="py-8">
+          {task ? (
+            <div className="flex flex-col gap-8">
+              <div className="flex items-center">
+                <Label className="w-40 shrink-0">URL</Label>
+                <Input value={task.request.url} readOnly />
               </div>
-            ) : null}
-          </AccordionContent>
-        </AccordionItem>
-        <AccordionItem value="task-steps">
-          <AccordionTrigger>
-            <h1>Task Steps</h1>
-          </AccordionTrigger>
-          <AccordionContent>
-            <StepArtifactsLayout />
-          </AccordionContent>
-        </AccordionItem>
-      </Accordion>
+              <Separator />
+              <div className="flex items-center">
+                <Label className="w-40 shrink-0">Created at</Label>
+                <Input value={basicTimeFormat(task.created_at)} readOnly />
+              </div>
+              <Separator />
+              <div className="flex items-center">
+                <Label className="w-40 shrink-0">Navigation Goal</Label>
+                <Textarea
+                  rows={5}
+                  value={task.request.navigation_goal}
+                  readOnly
+                />
+              </div>
+              <Separator />
+              <div className="flex items-center">
+                <Label className="w-40 shrink-0">Navigation Payload</Label>
+                <Textarea
+                  rows={5}
+                  value={task.request.navigation_payload}
+                  readOnly
+                />
+              </div>
+              <Separator />
+              <div className="flex items-center">
+                <Label className="w-40 shrink-0">Data Extraction Goal</Label>
+                <Textarea
+                  rows={5}
+                  value={task.request.data_extraction_goal}
+                  readOnly
+                />
+              </div>
+            </div>
+          ) : null}
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader className="border-b-2">
+          <CardTitle className="text-lg">Steps</CardTitle>
+          <CardDescription>Task Steps and Step Artifacts</CardDescription>
+        </CardHeader>
+        <CardContent className="min-h-96">
+          <StepArtifactsLayout />
+        </CardContent>
+      </Card>
     </div>
   );
 }

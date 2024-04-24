@@ -12,7 +12,6 @@ function StepArtifactsLayout() {
 
   const {
     data: steps,
-    isFetching,
     isError,
     error,
   } = useQuery<Array<StepApiResponse>>({
@@ -23,10 +22,6 @@ function StepArtifactsLayout() {
         .then((response) => response.data);
     },
   });
-
-  if (isFetching) {
-    return <div>Loading...</div>;
-  }
 
   if (isError) {
     return <div>Error: {error?.message}</div>;
