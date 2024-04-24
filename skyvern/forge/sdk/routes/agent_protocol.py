@@ -313,6 +313,7 @@ async def get_task_internal(
 async def get_agent_tasks(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
+    task_status: TaskStatus | None = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Response:
     """
@@ -323,7 +324,9 @@ async def get_agent_tasks(
         get_agent_task endpoint.
     """
     analytics.capture("skyvern-oss-agent-tasks-get")
-    tasks = await app.DATABASE.get_tasks(page, page_size, organization_id=current_org.organization_id)
+    tasks = await app.DATABASE.get_tasks(
+        page, page_size, task_status=task_status, organization_id=current_org.organization_id
+    )
     return ORJSONResponse([task.to_task_response().model_dump() for task in tasks])
 
 
