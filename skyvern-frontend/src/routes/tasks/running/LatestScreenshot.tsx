@@ -56,7 +56,7 @@ function LatestScreenshot({ id }: Props) {
 
       return Promise.reject("No screenshots found");
     },
-    refetchInterval: 2000,
+    refetchInterval: 30000,
     placeholderData: keepPreviousData,
   });
 

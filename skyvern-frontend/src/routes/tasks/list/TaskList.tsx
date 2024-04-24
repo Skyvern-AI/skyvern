@@ -1,6 +1,6 @@
 import { client } from "@/api/AxiosClient";
 import { TaskApiResponse } from "@/api/types";
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import {
   Table,
   TableBody,
@@ -44,7 +44,7 @@ function TaskList() {
     isError,
     error,
   } = useQuery<Array<TaskApiResponse>>({
-    queryKey: ["tasks", page],
+    queryKey: ["tasks", "all", page],
     queryFn: async () => {
       return client
         .get("/tasks", {
@@ -55,8 +55,6 @@ function TaskList() {
         })
         .then((response) => response.data);
     },
-    refetchInterval: 3000,
-    placeholderData: keepPreviousData,
   });
 
   if (isError) {
