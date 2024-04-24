@@ -25,7 +25,7 @@ function RunningTasks() {
       return client
         .get("/tasks", {
           params: {
-            page,
+            page: 1,
             page_size: PAGE_SIZE,
           },
         })
