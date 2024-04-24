@@ -324,7 +324,9 @@ async def get_agent_tasks(
         get_agent_task endpoint.
     """
     analytics.capture("skyvern-oss-agent-tasks-get")
-    tasks = await app.DATABASE.get_tasks(page, page_size, task_status=task_status, organization_id=current_org.organization_id)
+    tasks = await app.DATABASE.get_tasks(
+        page, page_size, task_status=task_status, organization_id=current_org.organization_id
+    )
     return ORJSONResponse([task.to_task_response().model_dump() for task in tasks])
 
 
