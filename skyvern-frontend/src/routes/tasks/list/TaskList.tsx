@@ -46,12 +46,15 @@ function TaskList() {
   } = useQuery<Array<TaskApiResponse>>({
     queryKey: ["tasks", "all", page],
     queryFn: async () => {
+      const params = new URLSearchParams();
+      params.append("page", String(page));
+      params.append("page_size", String(PAGE_SIZE));
+      params.append("task_status", "completed");
+      params.append("task_status", "failed");
+      params.append("task_status", "terminated");
       return client
         .get("/tasks", {
-          params: {
-            page,
-            page_size: PAGE_SIZE,
-          },
+          params,
         })
         .then((response) => response.data);
     },
