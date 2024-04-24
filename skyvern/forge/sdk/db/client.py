@@ -394,7 +394,7 @@ class AgentDB:
         self,
         page: int = 1,
         page_size: int = 10,
-        task_status: TaskStatus | None = None,
+        task_status: list[TaskStatus] | None = None,
         organization_id: str | None = None,
     ) -> list[Task]:
         """
@@ -411,7 +411,7 @@ class AgentDB:
                 db_page = page - 1  # offset logic is 0 based
                 query = select(TaskModel).filter_by(organization_id=organization_id)
                 if task_status:
-                    query = query.filter_by(status=task_status)
+                    query = query.filter(TaskModel.status.in_(task_status))
                 query = query.order_by(TaskModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
                 tasks = (await session.scalars(query)).all()
                 return [convert_to_task(task, debug_enabled=self.debug_enabled) for task in tasks]

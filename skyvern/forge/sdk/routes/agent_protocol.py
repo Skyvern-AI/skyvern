@@ -313,7 +313,7 @@ async def get_task_internal(
 async def get_agent_tasks(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
-    task_status: TaskStatus | None = None,
+    task_status: Annotated[list[TaskStatus] | None, Query()] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Response:
     """
