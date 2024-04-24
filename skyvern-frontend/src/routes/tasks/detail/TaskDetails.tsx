@@ -51,7 +51,7 @@ function TaskDetails() {
   }
 
   return (
-    <div className="flex flex-col gap-8">
+    <div className="flex flex-col gap-8 max-w-5xl mx-auto">
       <div className="flex items-center">
         <Label className="w-32 shrink-0 text-lg">Task ID</Label>
         <Input value={taskId} readOnly />
@@ -133,6 +133,15 @@ function TaskDetails() {
       ) : null}
       <Card>
         <CardHeader className="border-b-2">
+          <CardTitle className="text-lg">Steps</CardTitle>
+          <CardDescription>Task Steps and Step Artifacts</CardDescription>
+        </CardHeader>
+        <CardContent className="min-h-96">
+          <StepArtifactsLayout />
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader className="border-b-2">
           <CardTitle className="text-xl">Parameters</CardTitle>
           <CardDescription>Task URL and Input Parameters</CardDescription>
         </CardHeader>
@@ -177,15 +186,6 @@ function TaskDetails() {
               </div>
             </div>
           ) : null}
-        </CardContent>
-      </Card>
-      <Card>
-        <CardHeader className="border-b-2">
-          <CardTitle className="text-lg">Steps</CardTitle>
-          <CardDescription>Task Steps and Step Artifacts</CardDescription>
-        </CardHeader>
-        <CardContent className="min-h-96">
-          <StepArtifactsLayout />
         </CardContent>
       </Card>
     </div>

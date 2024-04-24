@@ -50,10 +50,6 @@ function StepArtifacts({ id, stepProps }: Props) {
     (artifact) => artifact.artifact_type === ArtifactType.ActionScreenshot,
   );
 
-  const visibleElementsTree = artifacts?.find(
-    (artifact) => artifact.artifact_type === ArtifactType.VisibleElementsTree,
-  );
-
   const visibleElementsTreeTrimmed = artifacts?.find(
     (artifact) =>
       artifact.artifact_type === ArtifactType.VisibleElementsTreeTrimmed,
@@ -61,14 +57,6 @@ function StepArtifacts({ id, stepProps }: Props) {
 
   const llmPrompt = artifacts?.find(
     (artifact) => artifact.artifact_type === ArtifactType.LLMPrompt,
-  );
-
-  const llmRequest = artifacts?.find(
-    (artifact) => artifact.artifact_type === ArtifactType.LLMRequest,
-  );
-
-  const llmResponseRaw = artifacts?.find(
-    (artifact) => artifact.artifact_type === ArtifactType.LLMResponseRaw,
   );
 
   const llmResponseParsed = artifacts?.find(
@@ -81,26 +69,19 @@ function StepArtifacts({ id, stepProps }: Props) {
 
   return (
     <Tabs defaultValue="info" className="w-full">
-      <TabsList className="grid w-full h-16 grid-cols-5">
+      <TabsList className="grid w-full h-16 grid-cols-4">
         <TabsTrigger value="info">Info</TabsTrigger>
-        <TabsTrigger value="screenshot_llm">Page Screenshots</TabsTrigger>
+        <TabsTrigger value="screenshot_llm">Annotated Screenshots</TabsTrigger>
         <TabsTrigger value="screenshot_action">Action Screenshots</TabsTrigger>
-        <TabsTrigger value="element_tree">Element Tree</TabsTrigger>
-        <TabsTrigger value="element_tree_trimmed">
-          Element Tree (Trimmed)
-        </TabsTrigger>
-        <TabsTrigger value="llm_prompt">LLM Prompt</TabsTrigger>
-        <TabsTrigger value="llm_request">LLM Request</TabsTrigger>
-        <TabsTrigger value="llm_response_raw">LLM Response (Raw)</TabsTrigger>
-        <TabsTrigger value="llm_response_parsed">
-          LLM Response (Parsed)
-        </TabsTrigger>
+        <TabsTrigger value="element_tree_trimmed">Element Tree</TabsTrigger>
+        <TabsTrigger value="llm_prompt">Prompt</TabsTrigger>
+        <TabsTrigger value="llm_response_parsed">Action List</TabsTrigger>
         <TabsTrigger value="html_raw">HTML (Raw)</TabsTrigger>
       </TabsList>
       <TabsContent value="info">
         <div className="flex flex-col gap-6 p-4">
           <div className="flex items-center">
-            <Label className="w-32 shrink-0 text-xl">Step ID</Label>
+            <Label className="w-32 shrink-0">Step ID</Label>
             {isFetching ? (
               <Skeleton className="h-4 w-40" />
             ) : (
@@ -108,7 +89,7 @@ function StepArtifacts({ id, stepProps }: Props) {
             )}
           </div>
           <div className="flex items-center">
-            <Label className="w-32 shrink-0 text-xl">Status</Label>
+            <Label className="w-32 shrink-0">Status</Label>
             {isFetching ? (
               <Skeleton className="h-4 w-40" />
             ) : stepProps ? (
@@ -116,7 +97,7 @@ function StepArtifacts({ id, stepProps }: Props) {
             ) : null}
           </div>
           <div className="flex items-center">
-            <Label className="w-32 shrink-0 text-xl">Created At</Label>
+            <Label className="w-32 shrink-0">Created At</Label>
             {isFetching ? (
               <Skeleton className="h-4 w-40" />
             ) : stepProps ? (
@@ -169,11 +150,6 @@ function StepArtifacts({ id, stepProps }: Props) {
           <div>No screenshots found</div>
         )}
       </TabsContent>
-      <TabsContent value="element_tree">
-        {visibleElementsTree ? (
-          <JSONArtifact artifact={visibleElementsTree} />
-        ) : null}
-      </TabsContent>
       <TabsContent value="element_tree_trimmed">
         {visibleElementsTreeTrimmed ? (
           <JSONArtifact artifact={visibleElementsTreeTrimmed} />
@@ -181,12 +157,6 @@ function StepArtifacts({ id, stepProps }: Props) {
       </TabsContent>
       <TabsContent value="llm_prompt">
         {llmPrompt ? <TextArtifact artifact={llmPrompt} /> : null}
-      </TabsContent>
-      <TabsContent value="llm_request">
-        {llmRequest ? <JSONArtifact artifact={llmRequest} /> : null}
-      </TabsContent>
-      <TabsContent value="llm_response_raw">
-        {llmResponseRaw ? <JSONArtifact artifact={llmResponseRaw} /> : null}
       </TabsContent>
       <TabsContent value="llm_response_parsed">
         {llmResponseParsed ? (
