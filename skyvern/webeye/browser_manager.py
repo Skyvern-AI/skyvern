@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import random
-
 import structlog
 from playwright.async_api import Browser, Playwright, async_playwright
 
@@ -10,6 +8,9 @@ from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.webeye.browser_factory import BrowserContextFactory, BrowserState
+
+# import random
+
 
 LOG = structlog.get_logger()
 
@@ -52,7 +53,8 @@ class BrowserManager:
             return self.pages[task.task_id]
 
         # TODO: percentage to use new context tree, starting from 20%
-        new_ctx = random.choices([False, True], weights=[0.8, 0.2], k=1)[0]
+        # new_ctx = random.choices([False, True], weights=[0.8, 0.2], k=1)[0]
+        new_ctx = False
         LOG.info("Creating browser state for task", task_id=task.task_id, new_ctx=new_ctx)
         browser_state = await self._create_browser_state(task.proxy_location, task.url, new_ctx)
 
