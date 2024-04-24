@@ -39,7 +39,7 @@ function TaskDetails() {
         query.state.data?.status === Status.Running ||
         query.state.data?.status === Status.Queued
       ) {
-        return 3000;
+        return 30000;
       }
       return false;
     },

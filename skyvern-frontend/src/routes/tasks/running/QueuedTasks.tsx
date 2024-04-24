@@ -1,6 +1,6 @@
 import { client } from "@/api/AxiosClient";
 import { Status, TaskApiResponse } from "@/api/types";
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { basicTimeFormat } from "@/util/timeFormat";
 import {
   Table,
@@ -16,12 +16,16 @@ import { StatusBadge } from "@/components/StatusBadge";
 function QueuedTasks() {
   const navigate = useNavigate();
   const { data: tasks } = useQuery<Array<TaskApiResponse>>({
-    queryKey: ["tasks"],
+    queryKey: ["tasks", "queued"],
     queryFn: async () => {
-      return client.get("/tasks").then((response) => response.data);
+      return client
+        .get("/tasks", {
+          params: {
+            task_status: "queued",
+          },
+        })
+        .then((response) => response.data);
     },
-    refetchInterval: 3000,
-    placeholderData: keepPreviousData,
   });
 
   const queuedTasks = tasks

@@ -1,7 +1,7 @@
 import { client } from "@/api/AxiosClient";
-import { Status, TaskApiResponse } from "@/api/types";
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { TaskApiResponse } from "@/api/types";
+import { useQuery } from "@tanstack/react-query";
+import { useNavigate } from "react-router-dom";
 import {
   Card,
   CardContent,
@@ -10,32 +10,24 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { PAGE_SIZE } from "../constants";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { LatestScreenshot } from "./LatestScreenshot";
 
 function RunningTasks() {
   const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
-  const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
 
-  const { data: tasks } = useQuery<Array<TaskApiResponse>>({
-    queryKey: ["tasks", page],
+  const { data: runningTasks } = useQuery<Array<TaskApiResponse>>({
+    queryKey: ["tasks", "running"],
     queryFn: async () => {
       return client
         .get("/tasks", {
           params: {
-            page: 1,
-            page_size: PAGE_SIZE,
+            task_status: "running",
           },
         })
         .then((response) => response.data);
     },
-    refetchInterval: 3000,
-    placeholderData: keepPreviousData,
   });
-
-  const runningTasks = tasks?.filter((task) => task.status === Status.Running);
 
   if (runningTasks?.length === 0) {
     return <div>No running tasks</div>;
