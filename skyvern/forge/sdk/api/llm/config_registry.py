@@ -55,7 +55,7 @@ if not any(
 
 
 if SettingsManager.get_settings().ENABLE_OPENAI:
-    LLMConfigRegistry.register_config("OPENAI_GPT4_TURBO", LLMConfig("gpt-4-turbo-preview", ["OPENAI_API_KEY"], False))
+    LLMConfigRegistry.register_config("OPENAI_GPT4_TURBO", LLMConfig("gpt-4-turbo", ["OPENAI_API_KEY"], False))
     LLMConfigRegistry.register_config("OPENAI_GPT4V", LLMConfig("gpt-4-vision-preview", ["OPENAI_API_KEY"], True))
 
 if SettingsManager.get_settings().ENABLE_ANTHROPIC:
