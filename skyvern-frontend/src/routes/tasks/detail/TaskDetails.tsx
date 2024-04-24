@@ -171,7 +171,11 @@ function TaskDetails() {
                 <Label className="w-40 shrink-0">Navigation Payload</Label>
                 <Textarea
                   rows={5}
-                  value={task.request.navigation_payload}
+                  value={
+                    typeof task.request.navigation_payload === "object"
+                      ? JSON.stringify(task.request.navigation_payload, null, 2)
+                      : task.request.navigation_payload
+                  }
                   readOnly
                 />
               </div>
