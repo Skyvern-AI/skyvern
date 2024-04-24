@@ -18,11 +18,13 @@ function QueuedTasks() {
   const { data: tasks } = useQuery<Array<TaskApiResponse>>({
     queryKey: ["tasks", "queued"],
     queryFn: async () => {
-      return client.get("/tasks", {
-        params: {
-          task_status: "queued",
-        },
-      }).then((response) => response.data);
+      return client
+        .get("/tasks", {
+          params: {
+            task_status: "queued",
+          },
+        })
+        .then((response) => response.data);
     },
   });
 
