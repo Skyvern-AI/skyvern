@@ -469,11 +469,6 @@ function getElementContext(element) {
     if (childContext.length > 0) {
       fullContext.push(childContext);
     }
-
-    const charLimit = 1000;
-    if (fullContext.join(";").length > charLimit) {
-      fullContext = new Array();
-    }
   }
   return fullContext.join(";");
 }
@@ -509,10 +504,9 @@ function getElementContent(element, skipped_element = null) {
     nodeContent = cleanupText(nodeTextContentList.join(";"));
   }
   let finalTextContent = cleanupText(textContent);
-
   // Currently we don't support too much context. Character limit is 1000 per element.
   // we don't think element context has to be that big
-  const charLimit = 1000;
+  const charLimit = 5000;
   if (finalTextContent.length > charLimit) {
     if (nodeContent.length <= charLimit) {
       finalTextContent = nodeContent;
@@ -842,13 +836,13 @@ function buildTreeFromBody(new_ctx = false) {
       ) {
         let grandParentElement = parentElement.parentElement;
         if (grandParentElement) {
-          let context = getElementContext(grandParentElement, element.context);
+          let context = getElementContext(grandParentElement);
           if (context.length > 0) {
             ctx.push(context);
           }
         }
       }
-      let context = getElementContext(parentElement, element.context);
+      let context = getElementContext(parentElement);
       if (context.length > 0) {
         ctx.push(context);
       }
@@ -941,8 +935,7 @@ function buildTreeFromBody(new_ctx = false) {
     ctxList = getContextByParent(element, ctxList);
     ctxList = getContextByTable(element, ctxList);
     const context = ctxList.join(";");
-    // const context = getContextByParent(element)
-    if (context && context.length <= 1000) {
+    if (context && context.length <= 5000) {
       element.context = context;
     }
 
