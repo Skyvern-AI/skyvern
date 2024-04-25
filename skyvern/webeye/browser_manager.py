@@ -56,7 +56,6 @@ class BrowserManager:
 
         # TODO: percentage (50%) to use new context tree
         new_ctx = random.choices([False, True], weights=[0.5, 0.5], k=1)[0]
-        # new_ctx = False
         LOG.info("Creating browser state for task", task_id=task.task_id, new_ctx=new_ctx)
         browser_state = await self._create_browser_state(task.proxy_location, task.url, new_ctx)
 
