@@ -14,6 +14,7 @@ class ProxyLocation(StrEnum):
     US_FL = "US-FL"
     US_WA = "US-WA"
     RESIDENTIAL = "RESIDENTIAL"
+    RESIDENTIAL_ES = "RESIDENTIAL_ES"
     NONE = "NONE"
 
 
