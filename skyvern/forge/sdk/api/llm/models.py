@@ -34,10 +34,10 @@ class LLMRouterModelConfig:
 class LLMRouterConfig(LLMConfig):
     model_list: list[LLMRouterModelConfig]
     # All three redis parameters are required. Even if there isn't a password, it should be an empty string.
-    redis_host: str
-    redis_port: int
-    redis_password: str
     main_model_group: str
+    redis_host: str | None = None
+    redis_port: int | None = None
+    redis_password: str | None = None
     fallback_model_group: str | None = None
     routing_strategy: Literal[
         "simple-shuffle",
