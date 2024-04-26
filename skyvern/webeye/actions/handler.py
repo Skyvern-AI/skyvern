@@ -283,12 +283,12 @@ async def handle_select_option_action(
             return await chain_click(task, page, click_action, child_anchor_xpath)
 
         # handler the select action on <laebel>
-        select_element_id = get_select_in_label_children(scraped_page, action.element_id)
+        select_element_id = get_select_id_in_label_children(scraped_page, action.element_id)
         if select_element_id is not None:
             LOG.info(
                 "SelectOptionAction is on <label>. take the action on the real <select>",
                 action=action,
-                select_id=select_element_id,
+                select_element_id=select_element_id,
             )
             select_action = SelectOptionAction(element_id=select_element_id, option=action.option)
             return await handle_select_option_action(select_action, page, scraped_page, task, step)
@@ -589,7 +589,7 @@ def get_anchor_to_click(scraped_page: ScrapedPage, element_id: int) -> str | Non
     return None
 
 
-def get_select_in_label_children(scraped_page: ScrapedPage, element_id: int) -> int | None:
+def get_select_id_in_label_children(scraped_page: ScrapedPage, element_id: int) -> int | None:
     """
     search <select> in the children of <label>
     """
