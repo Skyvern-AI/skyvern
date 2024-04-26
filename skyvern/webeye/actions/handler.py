@@ -18,7 +18,15 @@ from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.actions import actions
-from skyvern.webeye.actions.actions import Action, ActionType, ClickAction, ScrapeResult, UploadFileAction, WebAction
+from skyvern.webeye.actions.actions import (
+    Action,
+    ActionType,
+    ClickAction,
+    ScrapeResult,
+    SelectOptionAction,
+    UploadFileAction,
+    WebAction,
+)
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage
@@ -273,7 +281,19 @@ async def handle_select_option_action(
             )
             click_action = ClickAction(element_id=action.element_id)
             return await chain_click(task, page, click_action, child_anchor_xpath)
-        return [ActionFailure(Exception("No anchor tag found for the label for SelectOptionAction"))]
+
+        # handler the select action on <laebel>
+        select_element_id = get_select_in_label_children(scraped_page, action.element_id)
+        if select_element_id is not None:
+            LOG.info(
+                "SelectOptionAction is on <label>. take the action on the real <select>",
+                action=action,
+                select_id=select_element_id,
+            )
+            select_action = SelectOptionAction(element_id=select_element_id, option=action.option)
+            return await handle_select_option_action(select_action, page, scraped_page, task, step)
+
+        return [ActionFailure(Exception("No anchor tag or select children found for the label for SelectOptionAction"))]
     elif tag_name == "a":
         # turn the SelectOptionAction into a ClickAction
         LOG.info(
@@ -566,6 +586,22 @@ def get_anchor_to_click(scraped_page: ScrapedPage, element_id: int) -> str | Non
             for child in ele["children"]:
                 if "tagName" in child and child["tagName"] == "a":
                     return scraped_page.id_to_xpath_dict[child["id"]]
+    return None
+
+
+def get_select_in_label_children(scraped_page: ScrapedPage, element_id: int) -> int | None:
+    """
+    search <select> in the children of <label>
+    """
+    LOG.info("Searching select in the label children", element_id=element_id)
+    element = scraped_page.id_to_element_dict.get(element_id, None)
+    if element is None:
+        return None
+
+    for child in element.get("children", []):
+        if child.get("tagName", "") == "select":
+            return child.get("id", None)
+
     return None
 
 
