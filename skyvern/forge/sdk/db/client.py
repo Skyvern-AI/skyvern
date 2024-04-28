@@ -679,10 +679,10 @@ class AgentDB:
         try:
             async with self.Session() as session:
                 artifact_query = select(ArtifactModel).filter_by(task_id=task_id)
-                if step_id:
-                    artifact_query = artifact_query.filter_by(step_id=step_id)
                 if organization_id:
                     artifact_query = artifact_query.filter_by(organization_id=organization_id)
+                if step_id:
+                    artifact_query = artifact_query.filter_by(step_id=step_id)
                 if artifact_types:
                     artifact_query = artifact_query.filter(ArtifactModel.artifact_type.in_(artifact_types))
 
