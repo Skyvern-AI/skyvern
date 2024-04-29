@@ -72,7 +72,7 @@ function TaskList() {
   );
 
   return (
-    <div className="flex flex-col gap-8 max-w-5xl mx-auto">
+    <div className="flex flex-col gap-8 max-w-5xl mx-auto p-8 pt-0">
       <Card>
         <CardHeader className="border-b-2">
           <CardTitle className="text-xl">Running Tasks</CardTitle>
