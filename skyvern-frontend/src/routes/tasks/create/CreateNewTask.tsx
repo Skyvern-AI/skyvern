@@ -23,7 +23,7 @@ function CreateNewTask() {
   const caseInputId = useId();
 
   return (
-    <div className="flex flex-col gap-8 max-w-5xl mx-auto">
+    <div className="flex flex-col gap-8 max-w-5xl mx-auto p-8 pt-0">
       <div className="flex gap-4 items-center">
         <Label htmlFor={caseInputId} className="whitespace-nowrap">
           Select a sample:
