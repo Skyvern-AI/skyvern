@@ -192,7 +192,6 @@ class WorkflowService:
                 LOG.exception(
                     f"Error while executing workflow run {workflow_run.workflow_run_id}",
                     workflow_run_id=workflow_run.workflow_run_id,
-                    exc_info=True,
                 )
                 await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
                 raise e

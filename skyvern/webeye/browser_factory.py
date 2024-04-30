@@ -181,7 +181,7 @@ class BrowserState:
                             await self.page.goto(url)
                             await asyncio.sleep(3)
                         except Error as playright_error:
-                            LOG.exception(f"Error while navigating to url: {str(playright_error)}", exc_info=True)
+                            LOG.exception(f"Error while navigating to url: {str(playright_error)}")
                             raise FailedToNavigateToUrl(url=url, error_message=str(playright_error))
                         success = True
                         LOG.info(f"Successfully went to {url}")
@@ -190,13 +190,12 @@ class BrowserState:
                 except Exception as e:
                     LOG.exception(
                         f"Error while creating or navigating to a new page. Waiting for 5 seconds. Error: {str(e)}",
-                        exc_info=True,
                     )
                     retries += 1
                     # Wait for 5 seconds before retrying
                     await asyncio.sleep(5)
                     if retries >= 3:
-                        LOG.exception(f"Failed to create a new page after 3 retries: {str(e)}", exc_info=True)
+                        LOG.exception(f"Failed to create a new page after 3 retries: {str(e)}")
                         raise e
                     LOG.info(f"Retrying to create a new page. Retry count: {retries}")
 
@@ -236,8 +235,8 @@ class BrowserState:
                 animations="disabled",
             )
         except TimeoutError as e:
-            LOG.exception(f"Timeout error while taking screenshot: {str(e)}", exc_info=True)
+            LOG.exception(f"Timeout error while taking screenshot: {str(e)}")
             raise FailedToTakeScreenshot(error_message=str(e)) from e
         except Exception as e:
-            LOG.exception(f"Unknown error while taking screenshot: {str(e)}", exc_info=True)
+            LOG.exception(f"Unknown error while taking screenshot: {str(e)}")
             raise FailedToTakeScreenshot(error_message=str(e)) from e
