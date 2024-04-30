@@ -49,7 +49,7 @@ def load_js_script() -> str:
         with open(path, "r") as f:
             return f.read()
     except FileNotFoundError as e:
-        LOG.exception("Failed to load the JS script", exc_info=True, path=path)
+        LOG.exception("Failed to load the JS script", path=path)
         raise e
 
 
