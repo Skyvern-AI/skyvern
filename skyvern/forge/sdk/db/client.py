@@ -165,10 +165,10 @@ class AgentDB:
                 await session.refresh(new_artifact)
                 return convert_to_artifact(new_artifact, self.debug_enabled)
         except SQLAlchemyError:
-            LOG.exception("SQLAlchemyError")
+            LOG.exception("SQLAlchemyError", exc_info=True)
             raise
         except Exception:
-            LOG.exception("UnexpectedError")
+            LOG.exception("UnexpectedError", exc_info=True)
             raise
 
     async def get_task(self, task_id: str, organization_id: str | None = None) -> Task | None:
@@ -580,10 +580,10 @@ class AgentDB:
                 else:
                     return None
         except SQLAlchemyError:
-            LOG.exception("SQLAlchemyError")
+            LOG.exception("SQLAlchemyError", exc_info=True)
             raise
         except Exception:
-            LOG.exception("UnexpectedError")
+            LOG.exception("UnexpectedError", exc_info=True)
             raise
 
     async def get_artifact(
@@ -662,10 +662,10 @@ class AgentDB:
                 return artifacts[0]
             return None
         except SQLAlchemyError:
-            LOG.exception("SQLAlchemyError")
+            LOG.exception("SQLAlchemyError", exc_info=True)
             raise
         except Exception:
-            LOG.exception("UnexpectedError")
+            LOG.exception("UnexpectedError", exc_info=True)
             raise
 
     async def get_latest_n_artifacts(
@@ -693,10 +693,10 @@ class AgentDB:
                     return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifacts]
                 return None
         except SQLAlchemyError:
-            LOG.exception("SQLAlchemyError")
+            LOG.exception("SQLAlchemyError", exc_info=True)
             raise
         except Exception:
-            LOG.exception("UnexpectedError")
+            LOG.exception("UnexpectedError", exc_info=True)
             raise
 
     async def get_latest_task_by_workflow_id(

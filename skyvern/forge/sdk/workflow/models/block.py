@@ -85,6 +85,7 @@ class Block(BaseModel, abc.ABC):
         except Exception:
             LOG.exception(
                 "Block execution failed",
+                exc_info=True,
                 workflow_run_id=workflow_run_id,
                 block_label=self.label,
                 block_type=self.block_type,
@@ -656,7 +657,7 @@ class UploadToS3Block(Block):
                     uri=self._get_s3_uri(workflow_run_id, self.path), file_path=self.path
                 )
         except Exception as e:
-            LOG.exception("UploadToS3Block: Failed to upload file to S3", file_path=self.path)
+            LOG.exception("UploadToS3Block: Failed to upload file to S3", file_path=self.path, exc_info=True)
             raise e
 
         LOG.info("UploadToS3Block: File(s) uploaded to S3", file_path=self.path)

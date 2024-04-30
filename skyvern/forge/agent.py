@@ -302,6 +302,7 @@ class ForgeAgent:
         except FailedToSendWebhook:
             LOG.exception(
                 "Failed to send webhook",
+                exc_info=True,
                 task_id=task.task_id,
                 step_id=step.step_id,
                 task=task,
@@ -616,20 +617,9 @@ class ForgeAgent:
             num_elements=len(scraped_page.elements),
             url=task.url,
         )
-        # Get action results from the last app.SETTINGS.PROMPT_ACTION_HISTORY_WINDOW steps
-        steps = await app.DATABASE.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
-        window_steps = steps[-1 * SettingsManager.get_settings().PROMPT_ACTION_HISTORY_WINDOW :]
-        actions_and_results: list[tuple[ActionTypeUnion, list[ActionResult]]] = []
-        for window_step in window_steps:
-            if window_step.output and window_step.output.actions_and_results:
-                actions_and_results.extend(window_step.output.actions_and_results)
 
-        actions_and_results_str = json.dumps(
-            [
-                {"action": action.model_dump(), "results": [result.model_dump() for result in results]}
-                for action, results in actions_and_results
-            ]
-        )
+        actions_and_results_str = await self._get_action_results(task)
+
         # Generate the extract action prompt
         navigation_goal = task.navigation_goal
         starting_url = task.url
@@ -666,6 +656,38 @@ class ForgeAgent:
         )
 
         return scraped_page, extract_action_prompt
+
+    async def _get_action_results(self, task: Task) -> str:
+        # Get action results from the last app.SETTINGS.PROMPT_ACTION_HISTORY_WINDOW steps
+        steps = await app.DATABASE.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
+        window_steps = steps[-1 * SettingsManager.get_settings().PROMPT_ACTION_HISTORY_WINDOW :]
+        actions_and_results: list[tuple[ActionTypeUnion, list[ActionResult]]] = []
+        for window_step in window_steps:
+            if window_step.output and window_step.output.actions_and_results:
+                actions_and_results.extend(window_step.output.actions_and_results)
+
+        # shall we exclude successful actions?
+        return json.dumps(
+            [
+                {
+                    "action": action.model_dump(exclude_none=True),
+                    "results": [
+                        result.model_dump(
+                            exclude_none=True,
+                            exclude={
+                                "javascript_triggered",
+                                "interacted_with_sibling",
+                                "interacted_with_parent",
+                                "step_retry_number",
+                                "step_order",
+                            },
+                        )
+                        for result in results
+                    ],
+                }
+                for action, results in actions_and_results
+            ]
+        )
 
     async def get_extracted_information_for_task(self, task: Task) -> dict[str, Any] | list | str | None:
         """

@@ -228,9 +228,7 @@ async def handle_download_file_action(
         await download.save_as(full_file_path)
     except Exception as e:
         LOG.exception(
-            "DownloadFileAction: Failed to download file",
-            action=action,
-            full_file_path=full_file_path,
+            "DownloadFileAction: Failed to download file", action=action, full_file_path=full_file_path, exc_info=True
         )
         return [ActionFailure(e)]
 
@@ -365,7 +363,7 @@ async def handle_select_option_action(
         if action.option.index is not None:
             LOG.warning(
                 "Failed to click on the option by label, trying by index",
-                exc_info=True,
+                exc_info=e,
                 action=action,
                 xpath=xpath,
             )
@@ -669,7 +667,7 @@ async def click_sibling_of_input(
             interacted_with_sibling=True,
         )
     except Exception as e:
-        LOG.warning("Failed to click sibling label of input element", exc_info=True)
+        LOG.warning("Failed to click sibling label of input element", exc_info=e)
         return ActionFailure(exception=e, javascript_triggered=javascript_triggered)
 
 

@@ -41,7 +41,7 @@ class AsyncAWSClient:
                 error_code = e.response["Error"]["Code"]  # type: ignore
             except Exception:
                 error_code = "failed-to-get-error-code"
-            LOG.exception("Failed to get secret.", secret_name=secret_name, error_code=error_code)
+            LOG.exception("Failed to get secret.", secret_name=secret_name, error_code=error_code, exc_info=True)
             return None
 
     @execute_with_async_client(client_type=AWSClientType.S3)
