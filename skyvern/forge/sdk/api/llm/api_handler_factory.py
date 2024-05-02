@@ -99,7 +99,7 @@ class LLMAPIHandlerFactory:
             except openai.OpenAIError as e:
                 raise LLMProviderError(llm_key) from e
             except Exception as e:
-                LOG.exception("LLM request failed unexpectedly", llm_key=llm_key)
+                LOG.exception("LLM request failed unexpectedly", llm_key=llm_key, model=main_model_group)
                 raise LLMProviderError(llm_key) from e
 
             if step:
