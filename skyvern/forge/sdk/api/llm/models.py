@@ -46,7 +46,7 @@ class LLMRouterConfig(LLMConfig):
         "usage-based-routing-v2",
         "latency-based-routing",
     ] = "usage-based-routing"
-    num_retries: int = 2
+    num_retries: int = 1
     retry_delay_seconds: int = 15
     set_verbose: bool = False
 

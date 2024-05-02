@@ -60,7 +60,29 @@ if SettingsManager.get_settings().ENABLE_OPENAI:
 
 if SettingsManager.get_settings().ENABLE_ANTHROPIC:
     LLMConfigRegistry.register_config(
-        "ANTHROPIC_CLAUDE3", LLMConfig("anthropic/claude-3-opus-20240229", ["ANTHROPIC_API_KEY"], True)
+        "ANTHROPIC_CLAUDE3_OPUS", LLMConfig("anthropic/claude-3-opus-20240229", ["ANTHROPIC_API_KEY"], True)
+    )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE3_SONNET", LLMConfig("anthropic/claude-3-sonnet-20240229", ["ANTHROPIC_API_KEY"], True)
+    )
+
+if SettingsManager.get_settings().ENABLE_BEDROCK:
+    # Supported through AWS IAM authentication
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE3_OPUS",
+        LLMConfig(
+            "bedrock/anthropic.claude-3-opus-20240229-v1:0",
+            ["AWS_REGION"],
+            True,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE3_SONNET",
+        LLMConfig(
+            "bedrock/anthropic.claude-3-sonnet-20240229-v1:0",
+            ["AWS_REGION"],
+            True,
+        ),
     )
 
 if SettingsManager.get_settings().ENABLE_AZURE:
