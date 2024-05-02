@@ -49,6 +49,7 @@ if not any(
         SettingsManager.get_settings().ENABLE_OPENAI,
         SettingsManager.get_settings().ENABLE_ANTHROPIC,
         SettingsManager.get_settings().ENABLE_AZURE,
+        SettingsManager.get_settings().ENABLE_GEMINI,
     ]
 ):
     raise NoProviderEnabledError()
@@ -69,6 +70,15 @@ if SettingsManager.get_settings().ENABLE_AZURE:
         LLMConfig(
             f"azure/{SettingsManager.get_settings().AZURE_DEPLOYMENT}",
             ["AZURE_DEPLOYMENT", "AZURE_API_KEY", "AZURE_API_BASE", "AZURE_API_VERSION"],
+            True,
+        ),
+    )
+if SettingsManager.get_settings().ENABLE_GEMINI:
+    LLMConfigRegistry.register_config(
+        "GEMINI_PRO_VISION",
+        LLMConfig(
+            "gemini/gemini-pro-vision",
+            ["GEMINI_API_KEY"],
             True,
         ),
     )
