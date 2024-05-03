@@ -69,7 +69,6 @@ class Settings(BaseSettings):
     ENABLE_OPENAI: bool = True
     ENABLE_ANTHROPIC: bool = False
     ENABLE_AZURE: bool = False
-    ENABLE_BEDROCK: bool = False
     # OPENAI
     OPENAI_API_KEY: str | None = None
     # ANTHROPIC

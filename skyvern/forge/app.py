@@ -11,7 +11,6 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.storage.factory import StorageFactory
 from skyvern.forge.sdk.db.client import AgentDB
-from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.forge_log import setup_logger
 from skyvern.forge.sdk.models import Organization
 from skyvern.forge.sdk.schemas.tasks import Task
@@ -36,7 +35,6 @@ DATABASE = AgentDB(
 STORAGE = StorageFactory.get_storage()
 ARTIFACT_MANAGER = ArtifactManager()
 BROWSER_MANAGER = BrowserManager()
-EXPERIMENTATION_PROVIDER: BaseExperimentationProvider = NoOpExperimentationProvider()
 LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(SettingsManager.get_settings().LLM_KEY)
 WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
 WORKFLOW_SERVICE = WorkflowService()
