@@ -28,11 +28,17 @@ class BrowserManager:
 
     @staticmethod
     async def _create_browser_state(
-        proxy_location: ProxyLocation | None = None, url: str | None = None, new_context_tree: bool = False
+        proxy_location: ProxyLocation | None = None,
+        url: str | None = None,
+        new_context_tree: bool = False,
+        task_id: str | None = None,
     ) -> BrowserState:
         pw = await async_playwright().start()
         browser_context, browser_artifacts = await BrowserContextFactory.create_browser_context(
-            pw, proxy_location=proxy_location, url=url
+            pw,
+            proxy_location=proxy_location,
+            url=url,
+            task_id=task_id,
         )
         return BrowserState(
             pw=pw,
@@ -57,7 +63,7 @@ class BrowserManager:
         # TODO: percentage (50%) to use new context tree
         new_ctx = random.choices([False, True], weights=[0.5, 0.5], k=1)[0]
         LOG.info("Creating browser state for task", task_id=task.task_id, new_ctx=new_ctx)
-        browser_state = await self._create_browser_state(task.proxy_location, task.url, new_ctx)
+        browser_state = await self._create_browser_state(task.proxy_location, task.url, new_ctx, task.task_id)
 
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.
