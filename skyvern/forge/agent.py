@@ -767,12 +767,17 @@ class ForgeAgent:
                 artifact_type=ArtifactType.SCREENSHOT_FINAL,
                 data=screenshot,
             )
-        except TargetClosedError as e:
+        except TargetClosedError:
             LOG.warning(
                 "Failed to take screenshot before sending task response, page is closed",
                 task_id=task.task_id,
                 step_id=last_step.step_id,
-                error=e,
+            )
+        except Exception:
+            LOG.exception(
+                "Failed to take screenshot before sending task response",
+                task_id=task.task_id,
+                step_id=last_step.step_id,
             )
 
         if task.workflow_run_id:
