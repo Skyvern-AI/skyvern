@@ -332,6 +332,7 @@ class AgentDB:
                 ).first():
                     task.failure_reason = None
                     await session.commit()
+                    await session.refresh(task)
                     return convert_to_task(task, debug_enabled=self.debug_enabled)
                 else:
                     raise NotFoundError("Task not found")
