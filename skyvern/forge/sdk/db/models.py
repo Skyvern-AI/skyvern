@@ -54,6 +54,7 @@ class TaskModel(Base):
 
 class StepModel(Base):
     __tablename__ = "steps"
+    __table_args__ = (Index("org_task_index", "organization_id", "task_id"),)
 
     step_id = Column(String, primary_key=True, index=True, default=generate_step_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
