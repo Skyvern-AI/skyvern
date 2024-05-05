@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     HAR_PATH: str | None = "./har"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 10000
-    BROWSER_LOADING_TIMEOUT_MS: int = 120000
+    BROWSER_LOADING_TIMEOUT_MS: int = 12000
     MAX_STEPS_PER_RUN: int = 75
     MAX_NUM_SCREENSHOTS: int = 10
     # Ratio should be between 0 and 1.
