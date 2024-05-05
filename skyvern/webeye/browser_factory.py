@@ -178,7 +178,7 @@ class BrowserState:
                     if url:
                         LOG.info(f"Navigating page to {url} and waiting for 3 seconds")
                         try:
-                            await self.page.goto(url)
+                            await self.page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
                             await asyncio.sleep(3)
                         except Error as playright_error:
                             LOG.exception(f"Error while navigating to url: {str(playright_error)}")
