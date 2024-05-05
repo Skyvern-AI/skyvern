@@ -39,6 +39,7 @@ LOG = structlog.get_logger()
 
 
 @base_router.post("/webhook", tags=["server"])
+@base_router.post("/webhook/", tags=["server"], include_in_schema=False)
 async def webhook(
     request: Request,
     x_skyvern_signature: Annotated[str | None, Header()] = None,
@@ -73,6 +74,7 @@ async def webhook(
 
 
 @base_router.get("/heartbeat", tags=["server"])
+@base_router.get("/heartbeat/", tags=["server"], include_in_schema=False)
 async def check_server_status() -> Response:
     """
     Check if the server is running.
@@ -81,6 +83,7 @@ async def check_server_status() -> Response:
 
 
 @base_router.post("/tasks", tags=["agent"], response_model=CreateTaskResponse)
+@base_router.post("/tasks/", tags=["agent"], response_model=CreateTaskResponse, include_in_schema=False)
 async def create_agent_task(
     background_tasks: BackgroundTasks,
     task: TaskRequest,
@@ -113,10 +116,24 @@ async def create_agent_task(
     summary="Executes a specific step",
 )
 @base_router.post(
+    "/tasks/{task_id}/steps/{step_id}/",
+    tags=["agent"],
+    response_model=Step,
+    summary="Executes a specific step",
+    include_in_schema=False,
+)
+@base_router.post(
+    "/tasks/{task_id}/steps",
+    tags=["agent"],
+    response_model=Step,
+    summary="Executes the next step",
+)
+@base_router.post(
     "/tasks/{task_id}/steps/",
     tags=["agent"],
     response_model=Step,
     summary="Executes the next step",
+    include_in_schema=False,
 )
 async def execute_agent_task_step(
     task_id: str,
@@ -176,6 +193,7 @@ async def execute_agent_task_step(
 
 
 @base_router.get("/tasks/{task_id}", response_model=TaskResponse)
+@base_router.get("/tasks/{task_id}/", response_model=TaskResponse, include_in_schema=False)
 async def get_task(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -263,6 +281,12 @@ async def get_task(
     tags=["agent"],
     response_model=TaskResponse,
 )
+@base_router.post(
+    "/tasks/{task_id}/retry_webhook/",
+    tags=["agent"],
+    response_model=TaskResponse,
+    include_in_schema=False,
+)
 async def retry_webhook(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -288,6 +312,7 @@ async def retry_webhook(
 
 
 @base_router.get("/internal/tasks/{task_id}", response_model=list[Task])
+@base_router.get("/internal/tasks/{task_id}/", response_model=list[Task], include_in_schema=False)
 async def get_task_internal(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -310,6 +335,7 @@ async def get_task_internal(
 
 
 @base_router.get("/tasks", tags=["agent"], response_model=list[Task])
+@base_router.get("/tasks/", tags=["agent"], response_model=list[Task], include_in_schema=False)
 async def get_agent_tasks(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
@@ -331,6 +357,7 @@ async def get_agent_tasks(
 
 
 @base_router.get("/internal/tasks", tags=["agent"], response_model=list[Task])
+@base_router.get("/internal/tasks/", tags=["agent"], response_model=list[Task], include_in_schema=False)
 async def get_agent_tasks_internal(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
@@ -349,6 +376,7 @@ async def get_agent_tasks_internal(
 
 
 @base_router.get("/tasks/{task_id}/steps", tags=["agent"], response_model=list[Step])
+@base_router.get("/tasks/{task_id}/steps/", tags=["agent"], response_model=list[Step], include_in_schema=False)
 async def get_agent_task_steps(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -364,6 +392,12 @@ async def get_agent_task_steps(
 
 
 @base_router.get("/tasks/{task_id}/steps/{step_id}/artifacts", tags=["agent"], response_model=list[Artifact])
+@base_router.get(
+    "/tasks/{task_id}/steps/{step_id}/artifacts/",
+    tags=["agent"],
+    response_model=list[Artifact],
+    include_in_schema=False,
+)
 async def get_agent_task_step_artifacts(
     task_id: str,
     step_id: str,
@@ -396,6 +430,7 @@ class ActionResultTmp(BaseModel):
 
 
 @base_router.get("/tasks/{task_id}/actions", response_model=list[ActionResultTmp])
+@base_router.get("/tasks/{task_id}/actions/", response_model=list[ActionResultTmp], include_in_schema=False)
 async def get_task_actions(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -412,6 +447,7 @@ async def get_task_actions(
 
 
 @base_router.post("/workflows/{workflow_id}/run", response_model=RunWorkflowResponse)
+@base_router.post("/workflows/{workflow_id}/run/", response_model=RunWorkflowResponse, include_in_schema=False)
 async def execute_workflow(
     background_tasks: BackgroundTasks,
     workflow_id: str,
@@ -447,6 +483,11 @@ async def execute_workflow(
 
 
 @base_router.get("/workflows/{workflow_id}/runs/{workflow_run_id}", response_model=WorkflowRunStatusResponse)
+@base_router.get(
+    "/workflows/{workflow_id}/runs/{workflow_run_id}/",
+    response_model=WorkflowRunStatusResponse,
+    include_in_schema=False,
+)
 async def get_workflow_run(
     workflow_id: str,
     workflow_run_id: str,
@@ -470,6 +511,17 @@ async def get_workflow_run(
         },
     },
     response_model=Workflow,
+)
+@base_router.post(
+    "/workflows/",
+    openapi_extra={
+        "requestBody": {
+            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
+            "required": True,
+        },
+    },
+    response_model=Workflow,
+    include_in_schema=False,
 )
 async def create_workflow(
     request: Request,
