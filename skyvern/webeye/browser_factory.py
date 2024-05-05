@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Awaitable, Protocol
@@ -178,8 +179,10 @@ class BrowserState:
                     if url:
                         LOG.info(f"Navigating page to {url} and waiting for 3 seconds")
                         try:
+                            start_time = time.time()
                             await self.page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-                            await asyncio.sleep(3)
+                            end_time = time.time()
+                            LOG.info(f"Page loading time", loading_time=end_time - start_time, url=url)
                         except Error as playright_error:
                             LOG.exception(f"Error while navigating to url: {str(playright_error)}")
                             raise FailedToNavigateToUrl(url=url, error_message=str(playright_error))
