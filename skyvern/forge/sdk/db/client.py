@@ -526,16 +526,16 @@ class AgentDB:
         token: str,
     ) -> OrganizationAuthToken:
         async with self.Session() as session:
-            token = OrganizationAuthTokenModel(
+            auth_token = OrganizationAuthTokenModel(
                 organization_id=organization_id,
                 token_type=token_type,
                 token=token,
             )
-            session.add(token)
+            session.add(auth_token)
             await session.commit()
-            await session.refresh(token)
+            await session.refresh(auth_token)
 
-        return convert_to_organization_auth_token(token)
+        return convert_to_organization_auth_token(auth_token)
 
     async def get_artifacts_for_task_step(
         self,
