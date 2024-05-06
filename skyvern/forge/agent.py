@@ -636,8 +636,14 @@ class ForgeAgent:
         current_url = (
             await browser_state.page.evaluate("() => document.location.href") if browser_state.page else starting_url
         )
+        prompt_template = "extract-action"
+        if app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            "USE_CLAUDE3_SONNET", task.workflow_run_id or task.task_id
+        ):
+            LOG.info("Using Claude3 Sonnet prompt template for action extraction")
+            prompt_template = "extract-action-claude3-sonnet"
         extract_action_prompt = prompt_engine.load_prompt(
-            "extract-action",
+            prompt_template,
             navigation_goal=navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
             starting_url=starting_url,
