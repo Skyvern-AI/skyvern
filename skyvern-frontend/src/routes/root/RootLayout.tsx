@@ -3,7 +3,6 @@ import { Toaster } from "@/components/ui/toaster";
 import { SideNav } from "./SideNav";
 import { DiscordLogoIcon, GitHubLogoIcon } from "@radix-ui/react-icons";
 import { Logo } from "@/components/Logo";
-import { ThemeToggle } from "@/components/ThemeSwitch";
 import { Profile } from "./Profile";
 import { useContext } from "react";
 import { UserContext } from "@/store/UserContext";
@@ -50,7 +49,6 @@ function RootLayout({ onLogout }: Props) {
           >
             <GitHubLogoIcon className="w-6 h-6" />
           </Link>
-          <ThemeToggle />
         </div>
         <main className="pl-72">
           <Outlet />
