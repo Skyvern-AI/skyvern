@@ -7,7 +7,7 @@ import { queryClient } from "./api/QueryClient";
 function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <ThemeProvider defaultTheme="dark" storageKey="skyvern-theme">
+      <ThemeProvider defaultTheme="dark">
         <RouterProvider router={router} />
       </ThemeProvider>
     </QueryClientProvider>
