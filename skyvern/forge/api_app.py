@@ -80,8 +80,12 @@ def get_agent_app(router: APIRouter = base_router) -> FastAPI:
 
     @app.middleware("http")
     async def request_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
-        request_id = str(uuid.uuid4())
-        skyvern_context.set(SkyvernContext(request_id=request_id))
+        curr_ctx = skyvern_context.current()
+        if not curr_ctx:
+            request_id = str(uuid.uuid4())
+            skyvern_context.set(SkyvernContext(request_id=request_id))
+        elif not curr_ctx.request_id:
+            curr_ctx.request_id = str(uuid.uuid4())
 
         try:
             return await call_next(request)
