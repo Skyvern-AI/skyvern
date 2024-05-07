@@ -1,4 +1,4 @@
-import { client } from "@/api/AxiosClient";
+import { getClient } from "@/api/AxiosClient";
 import {
   ArtifactApiResponse,
   ArtifactType,
@@ -16,6 +16,7 @@ import { TextArtifact } from "./TextArtifact";
 import { getImageURL } from "./artifactUtils";
 import { Input } from "@/components/ui/input";
 import { basicTimeFormat } from "@/util/timeFormat";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 type Props = {
   id: string;
@@ -24,6 +25,7 @@ type Props = {
 
 function StepArtifacts({ id, stepProps }: Props) {
   const { taskId } = useParams();
+  const credentialGetter = useCredentialGetter();
   const {
     data: artifacts,
     isFetching,
@@ -32,6 +34,7 @@ function StepArtifacts({ id, stepProps }: Props) {
   } = useQuery<Array<ArtifactApiResponse>>({
     queryKey: ["task", taskId, "steps", id, "artifacts"],
     queryFn: async () => {
+      const client = await getClient(credentialGetter);
       return client
         .get(`/tasks/${taskId}/steps/${id}/artifacts`)
         .then((response) => response.data);

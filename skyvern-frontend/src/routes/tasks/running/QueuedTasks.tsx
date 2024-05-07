@@ -1,4 +1,4 @@
-import { client } from "@/api/AxiosClient";
+import { getClient } from "@/api/AxiosClient";
 import { Status, TaskApiResponse } from "@/api/types";
 import { useQuery } from "@tanstack/react-query";
 import { basicTimeFormat } from "@/util/timeFormat";
@@ -12,12 +12,16 @@ import {
 } from "@/components/ui/table";
 import { useNavigate } from "react-router-dom";
 import { StatusBadge } from "@/components/StatusBadge";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 function QueuedTasks() {
   const navigate = useNavigate();
+  const credentialGetter = useCredentialGetter();
+
   const { data: tasks } = useQuery<Array<TaskApiResponse>>({
     queryKey: ["tasks", "queued"],
     queryFn: async () => {
+      const client = await getClient(credentialGetter);
       return client
         .get("/tasks", {
           params: {

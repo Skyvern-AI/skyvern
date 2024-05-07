@@ -1,4 +1,4 @@
-import { client } from "@/api/AxiosClient";
+import { getClient } from "@/api/AxiosClient";
 import { TaskApiResponse } from "@/api/types";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
@@ -12,13 +12,16 @@ import {
 } from "@/components/ui/card";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { LatestScreenshot } from "./LatestScreenshot";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 function RunningTasks() {
   const navigate = useNavigate();
+  const credentialGetter = useCredentialGetter();
 
   const { data: runningTasks } = useQuery<Array<TaskApiResponse>>({
     queryKey: ["tasks", "running"],
     queryFn: async () => {
+      const client = await getClient(credentialGetter);
       return client
         .get("/tasks", {
           params: {

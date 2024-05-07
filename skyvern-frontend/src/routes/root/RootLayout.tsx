@@ -7,11 +7,7 @@ import { Profile } from "./Profile";
 import { useContext } from "react";
 import { UserContext } from "@/store/UserContext";
 
-type Props = {
-  onLogout?: () => void;
-};
-
-function RootLayout({ onLogout }: Props) {
+function RootLayout() {
   const user = useContext(UserContext);
 
   return (
@@ -30,7 +26,7 @@ function RootLayout({ onLogout }: Props) {
           <SideNav />
           {user ? (
             <div className="absolute bottom-2 left-0 w-72 px-6 shrink-0">
-              <Profile name={user.name} onLogout={onLogout} />
+              <Profile name={user.name} />
             </div>
           ) : null}
         </aside>

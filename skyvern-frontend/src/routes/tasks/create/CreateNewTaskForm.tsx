@@ -21,7 +21,7 @@ import {
 } from "../data/descriptionHelperContent";
 import { Textarea } from "@/components/ui/textarea";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { client } from "@/api/AxiosClient";
+import { getClient } from "@/api/AxiosClient";
 import { useToast } from "@/components/ui/use-toast";
 import { InfoCircledIcon } from "@radix-ui/react-icons";
 import {
@@ -34,6 +34,7 @@ import { ToastAction } from "@radix-ui/react-toast";
 import { Link } from "react-router-dom";
 import fetchToCurl from "fetch-to-curl";
 import { apiBaseUrl, envCredential } from "@/util/env";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 const createNewTaskFormSchema = z.object({
   url: z.string().url({
@@ -68,6 +69,7 @@ function createTaskRequestObject(formValues: CreateNewTaskFormValues) {
 function CreateNewTaskForm({ initialValues }: Props) {
   const queryClient = useQueryClient();
   const { toast } = useToast();
+  const credentialGetter = useCredentialGetter();
 
   const form = useForm<CreateNewTaskFormValues>({
     resolver: zodResolver(createNewTaskFormSchema),
@@ -75,8 +77,9 @@ function CreateNewTaskForm({ initialValues }: Props) {
   });
 
   const mutation = useMutation({
-    mutationFn: (formValues: CreateNewTaskFormValues) => {
+    mutationFn: async (formValues: CreateNewTaskFormValues) => {
       const taskRequest = createTaskRequestObject(formValues);
+      const client = await getClient(credentialGetter);
       return client.post<
         ReturnType<typeof createTaskRequestObject>,
         { data: { task_id: string } }
