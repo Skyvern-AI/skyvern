@@ -1,10 +1,11 @@
-import { client } from "@/api/AxiosClient";
+import { getClient } from "@/api/AxiosClient";
 import { StepApiResponse } from "@/api/types";
 import { cn } from "@/util/utils";
 import { useQuery } from "@tanstack/react-query";
 import { useParams, useSearchParams } from "react-router-dom";
 import { PAGE_SIZE } from "../constants";
 import { CheckboxIcon, CrossCircledIcon } from "@radix-ui/react-icons";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 type Props = {
   activeIndex: number;
@@ -15,6 +16,7 @@ function StepNavigation({ activeIndex, onActiveIndexChange }: Props) {
   const { taskId } = useParams();
   const [searchParams] = useSearchParams();
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
+  const credentialGetter = useCredentialGetter();
 
   const {
     data: steps,
@@ -23,6 +25,7 @@ function StepNavigation({ activeIndex, onActiveIndexChange }: Props) {
   } = useQuery<Array<StepApiResponse>>({
     queryKey: ["task", taskId, "steps", page],
     queryFn: async () => {
+      const client = await getClient(credentialGetter);
       return client
         .get(`/tasks/${taskId}/steps`, {
           params: {

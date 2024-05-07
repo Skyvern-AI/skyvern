@@ -3,10 +3,9 @@ import { ExitIcon, PersonIcon } from "@radix-ui/react-icons";
 
 type Props = {
   name: string;
-  onLogout?: () => void;
 };
 
-function Profile({ name, onLogout }: Props) {
+function Profile({ name }: Props) {
   return (
     <div className="flex items-center border-2 p-2 rounded-lg">
       <div className="flex gap-2 items-center">
@@ -14,13 +13,7 @@ function Profile({ name, onLogout }: Props) {
         <p className="w-40 overflow-hidden text-ellipsis">{name}</p>
       </div>
       <div>
-        <Button
-          variant="outline"
-          size="icon"
-          onClick={() => {
-            onLogout?.();
-          }}
-        >
+        <Button variant="outline" size="icon">
           <ExitIcon className="h-4 w-4" />
         </Button>
       </div>

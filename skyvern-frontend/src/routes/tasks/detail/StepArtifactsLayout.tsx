@@ -4,10 +4,12 @@ import { StepArtifacts } from "./StepArtifacts";
 import { useQuery } from "@tanstack/react-query";
 import { StepApiResponse } from "@/api/types";
 import { useParams } from "react-router-dom";
-import { client } from "@/api/AxiosClient";
+import { getClient } from "@/api/AxiosClient";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 function StepArtifactsLayout() {
   const [activeIndex, setActiveIndex] = useState(0);
+  const credentialGetter = useCredentialGetter();
   const { taskId } = useParams();
 
   const {
@@ -17,6 +19,7 @@ function StepArtifactsLayout() {
   } = useQuery<Array<StepApiResponse>>({
     queryKey: ["task", taskId, "steps"],
     queryFn: async () => {
+      const client = await getClient(credentialGetter);
       return client
         .get(`/tasks/${taskId}/steps`)
         .then((response) => response.data);

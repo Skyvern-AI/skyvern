@@ -1,4 +1,4 @@
-import { client } from "@/api/AxiosClient";
+import { getClient } from "@/api/AxiosClient";
 import {
   ArtifactApiResponse,
   ArtifactType,
@@ -7,12 +7,15 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { getImageURL } from "../detail/artifactUtils";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 type Props = {
   id: string;
 };
 
 function LatestScreenshot({ id }: Props) {
+  const credentialGetter = useCredentialGetter();
+
   const {
     data: artifact,
     isFetching,
@@ -20,6 +23,7 @@ function LatestScreenshot({ id }: Props) {
   } = useQuery<ArtifactApiResponse | undefined>({
     queryKey: ["task", id, "latestScreenshot"],
     queryFn: async () => {
+      const client = await getClient(credentialGetter);
       const steps: StepApiResponse[] = await client
         .get(`/tasks/${id}/steps`)
         .then((response) => response.data);

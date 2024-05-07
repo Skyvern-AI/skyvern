@@ -1,4 +1,4 @@
-import { client } from "@/api/AxiosClient";
+import { getClient } from "@/api/AxiosClient";
 import { Status, TaskApiResponse } from "@/api/types";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -20,9 +20,11 @@ import {
 } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Separator } from "@/components/ui/separator";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 function TaskDetails() {
   const { taskId } = useParams();
+  const credentialGetter = useCredentialGetter();
 
   const {
     data: task,
@@ -32,6 +34,7 @@ function TaskDetails() {
   } = useQuery<TaskApiResponse>({
     queryKey: ["task", taskId, "details"],
     queryFn: async () => {
+      const client = await getClient(credentialGetter);
       return client.get(`/tasks/${taskId}`).then((response) => response.data);
     },
     refetchInterval: (query) => {

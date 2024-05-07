@@ -1,4 +1,4 @@
-import { client } from "@/api/AxiosClient";
+import { getClient } from "@/api/AxiosClient";
 import { TaskApiResponse } from "@/api/types";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -32,11 +32,13 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 function TaskList() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
+  const credentialGetter = useCredentialGetter();
 
   const {
     data: tasks,
@@ -46,6 +48,7 @@ function TaskList() {
   } = useQuery<Array<TaskApiResponse>>({
     queryKey: ["tasks", "all", page],
     queryFn: async () => {
+      const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
       params.append("page", String(page));
       params.append("page_size", String(PAGE_SIZE));

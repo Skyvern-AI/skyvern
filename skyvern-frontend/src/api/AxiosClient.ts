@@ -18,7 +18,9 @@ export function setAuthorizationHeader(token: string) {
 }
 
 export function removeAuthorizationHeader() {
-  delete client.defaults.headers.common["Authorization"];
+  if (client.defaults.headers.common["Authorization"]) {
+    delete client.defaults.headers.common["Authorization"];
+  }
 }
 
 export function setApiKeyHeader(apiKey: string) {
@@ -26,7 +28,24 @@ export function setApiKeyHeader(apiKey: string) {
 }
 
 export function removeApiKeyHeader() {
-  delete client.defaults.headers.common["X-API-Key"];
+  if (client.defaults.headers.common["X-API-Key"]) {
+    delete client.defaults.headers.common["X-API-Key"];
+  }
 }
 
-export { client, artifactApiClient };
+async function getClient(credentialGetter: CredentialGetter | null) {
+  if (credentialGetter) {
+    removeApiKeyHeader();
+    const credential = await credentialGetter();
+    if (!credential) {
+      console.warn("No credential found");
+      return client;
+    }
+    setAuthorizationHeader(credential);
+  }
+  return client;
+}
+
+export type CredentialGetter = () => Promise<string | null>;
+
+export { getClient, artifactApiClient };

@@ -8,12 +8,12 @@ import { NavLink } from "react-router-dom";
 
 function SideNav() {
   return (
-    <nav className="flex flex-col gap-4">
+    <nav>
       <NavLink
         to="create"
         className={({ isActive }) => {
           return cn(
-            "flex items-center px-6 py-2 hover:bg-primary-foreground rounded-2xl",
+            "flex items-center px-6 py-4 hover:bg-primary-foreground rounded-2xl",
             {
               "bg-primary-foreground": isActive,
             },
@@ -27,7 +27,7 @@ function SideNav() {
         to="tasks"
         className={({ isActive }) => {
           return cn(
-            "flex items-center px-6 py-2 hover:bg-primary-foreground rounded-2xl",
+            "flex items-center px-6 py-4 hover:bg-primary-foreground rounded-2xl",
             {
               "bg-primary-foreground": isActive,
             },
@@ -41,7 +41,7 @@ function SideNav() {
         to="settings"
         className={({ isActive }) => {
           return cn(
-            "flex items-center px-6 py-2 hover:bg-primary-foreground rounded-2xl",
+            "flex items-center px-6 py-4 hover:bg-primary-foreground rounded-2xl",
             {
               "bg-primary-foreground": isActive,
             },
