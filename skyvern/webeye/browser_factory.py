@@ -219,20 +219,18 @@ class BrowserState:
             await self.pw.stop()
             LOG.info("Playwright is stopped")
 
-    async def take_screenshot(self, full_page: bool = False, file_path: str | None = None) -> bytes:
-        if not self.page:
-            LOG.error("BrowserState has no page")
-            raise MissingBrowserStatePage()
+    @staticmethod
+    async def take_screenshot_from_page(page: Page, full_page: bool = False, file_path: str | None = None) -> bytes:
         try:
-            await self.page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
+            await page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
             LOG.info("Page is fully loaded, agent is about to take screenshots")
             if file_path:
-                return await self.page.screenshot(
+                return await page.screenshot(
                     path=file_path,
                     full_page=full_page,
                     timeout=SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
                 )
-            return await self.page.screenshot(
+            return await page.screenshot(
                 full_page=full_page,
                 timeout=SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
                 animations="disabled",
@@ -243,3 +241,10 @@ class BrowserState:
         except Exception as e:
             LOG.exception(f"Unknown error while taking screenshot: {str(e)}")
             raise FailedToTakeScreenshot(error_message=str(e)) from e
+
+    async def take_screenshot(self, full_page: bool = False, file_path: str | None = None) -> bytes:
+        if not self.page:
+            LOG.error("BrowserState has no page")
+            raise MissingBrowserStatePage()
+
+        return await self.take_screenshot_from_page(self.page, full_page, file_path)
