@@ -232,7 +232,18 @@ function isElementVisible(element) {
   }
   if (!isElementStyleVisibilityVisible(element, style)) return false;
   const rect = element.getBoundingClientRect();
-  return rect.width > 0 && rect.height > 0;
+  if (rect.width <= 0 || rect.height <= 0) {
+    return false;
+  }
+
+  // if the center point of the element is not in the page, we tag it as an interactable element
+  const center_x = (rect.left + rect.width) / 2;
+  const center_y = (rect.top + rect.height) / 2;
+  if (center_x < 0 || center_y < 0) {
+    return false;
+  }
+
+  return true;
 }
 
 function isHiddenOrDisabled(element) {
@@ -894,14 +905,19 @@ function buildTreeFromBody() {
     });
   };
 
-  // some elements without children should be removed out, such as <label>
+  // some elements without children nodes should be removed out, such as <label>
   const removeOrphanNode = (results) => {
     const trimmedResults = [];
     for (let i = 0; i < results.length; i++) {
       const element = results[i];
       element.children = removeOrphanNode(element.children);
-      if (element.tagName === "label" && element.children.length === 0) {
-        continue;
+      if (element.tagName === "label") {
+        const labelElement = document.querySelector(
+          element.tagName + '[unique_id="' + element.id + '"]',
+        );
+        if (labelElement && labelElement.childElementCount === 0) {
+          continue;
+        }
       }
       trimmedResults.push(element);
     }
