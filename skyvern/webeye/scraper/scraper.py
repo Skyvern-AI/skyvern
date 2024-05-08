@@ -184,7 +184,7 @@ async def scrape_web_unsafe(
     await remove_bounding_boxes(page)
     await scroll_to_top(page, drow_boxes=False)
 
-    elements, element_tree = await get_interactable_element_tree(page, browser_state.new_context_tree)
+    elements, element_tree = await get_interactable_element_tree(page)
     element_tree = cleanup_elements(copy.deepcopy(element_tree))
 
     _build_element_links(elements)
@@ -211,15 +211,15 @@ async def scrape_web_unsafe(
     )
 
 
-async def get_interactable_element_tree(page: Page, new_context_tree: bool) -> tuple[list[dict], list[dict]]:
+async def get_interactable_element_tree(page: Page) -> tuple[list[dict], list[dict]]:
     """
     Get the element tree of the page, including all the elements that are interactable.
     :param page: Page instance to get the element tree from.
     :return: Tuple containing the element tree and a map of element IDs to elements.
     """
     await page.evaluate(JS_FUNCTION_DEFS)
-    js_script = "(new_ctx) => buildTreeFromBody(new_ctx)"
-    elements, element_tree = await page.evaluate(js_script, new_context_tree)
+    js_script = "() => buildTreeFromBody()"
+    elements, element_tree = await page.evaluate(js_script)
     return elements, element_tree
 
 

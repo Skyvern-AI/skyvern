@@ -25,7 +25,6 @@ class BrowserManager:
     async def _create_browser_state(
         proxy_location: ProxyLocation | None = None,
         url: str | None = None,
-        new_context_tree: bool = False,
         task_id: str | None = None,
     ) -> BrowserState:
         pw = await async_playwright().start()
@@ -40,7 +39,6 @@ class BrowserManager:
             browser_context=browser_context,
             page=None,
             browser_artifacts=browser_artifacts,
-            new_context_tree=new_context_tree,
         )
 
     async def get_or_create_for_task(self, task: Task) -> BrowserState:
@@ -55,9 +53,8 @@ class BrowserManager:
             self.pages[task.task_id] = self.pages[task.workflow_run_id]
             return self.pages[task.task_id]
 
-        new_ctx = True
-        LOG.info("Creating browser state for task", task_id=task.task_id, new_ctx=new_ctx)
-        browser_state = await self._create_browser_state(task.proxy_location, task.url, new_ctx, task.task_id)
+        LOG.info("Creating browser state for task", task_id=task.task_id)
+        browser_state = await self._create_browser_state(task.proxy_location, task.url, task.task_id)
 
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.

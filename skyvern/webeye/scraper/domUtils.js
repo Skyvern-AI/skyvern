@@ -544,7 +544,7 @@ function getListboxOptions(element) {
   return selectOptions;
 }
 
-function buildTreeFromBody(new_ctx = false) {
+function buildTreeFromBody() {
   var elements = [];
   var resultArray = [];
 
@@ -634,7 +634,6 @@ function buildTreeFromBody(new_ctx = false) {
     }
 
     if (
-      new_ctx &&
       checkRequiredFromStyle(element) &&
       !attrs["required"] &&
       !attrs["aria-required"]
@@ -712,7 +711,7 @@ function buildTreeFromBody(new_ctx = false) {
         elements[interactableParentId].children.push(elementObj);
       }
       // options already added to the select.options, no need to add options anymore
-      if (new_ctx && elementObj.options && elementObj.options.length > 0) {
+      if (elementObj.options && elementObj.options.length > 0) {
         return elementObj;
       }
       // Recursively process the children of the element
@@ -744,7 +743,7 @@ function buildTreeFromBody(new_ctx = false) {
       if (parentEle) {
         if (
           targetParentElements.has(parentEle.tagName.toLowerCase()) ||
-          (new_ctx && checkParentClass(parentEle.className.toLowerCase()))
+          checkParentClass(parentEle.className.toLowerCase())
         ) {
           targetContextualParent = parentEle;
         }
@@ -939,7 +938,7 @@ function buildTreeFromBody(new_ctx = false) {
       element.context = context;
     }
 
-    if (new_ctx && checkStringIncludeRequire(context)) {
+    if (checkStringIncludeRequire(context)) {
       if (
         !element.attributes["required"] &&
         !element.attributes["aria-required"]
@@ -947,10 +946,6 @@ function buildTreeFromBody(new_ctx = false) {
         element.attributes["required"] = true;
       }
     }
-  }
-
-  if (!new_ctx) {
-    return [elements, resultArray];
   }
 
   resultArray = removeOrphanNode(resultArray);
