@@ -629,7 +629,9 @@ class ForgeAgent:
         )
         prompt_template = "extract-action"
         if app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-            "USE_CLAUDE3_SONNET", task.workflow_run_id or task.task_id
+            "USE_CLAUDE3_SONNET",
+            task.workflow_run_id or task.task_id,
+            properties={"organization_id": task.organization_id},
         ):
             LOG.info("Using Claude3 Sonnet prompt template for action extraction")
             prompt_template = "extract-action-claude3-sonnet"
