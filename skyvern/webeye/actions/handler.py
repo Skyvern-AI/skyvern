@@ -6,9 +6,10 @@ import uuid
 from typing import Any, Awaitable, Callable, List
 
 import structlog
+from deprecation import deprecated
 from playwright.async_api import Locator, Page
 
-from skyvern.constants import SKYVERN_DIR
+from skyvern.constants import REPO_ROOT_DIR
 from skyvern.exceptions import ImaginaryFileUrl, MissingElement, MissingFileUrl, MultipleElementsFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -205,12 +206,13 @@ async def handle_upload_file_action(
         )
 
 
+@deprecated("This function is deprecated. Downloads are handled by the click action handler now.")
 async def handle_download_file_action(
     action: actions.DownloadFileAction, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
 ) -> list[ActionResult]:
     xpath = await validate_actions_in_dom(action, page, scraped_page)
     file_name = f"{action.file_name or uuid.uuid4()}"
-    full_file_path = f"{SKYVERN_DIR}/downloads/{task.workflow_run_id or task.task_id}/{file_name}"
+    full_file_path = f"{REPO_ROOT_DIR}/downloads/{task.workflow_run_id or task.task_id}/{file_name}"
     try:
         # Start waiting for the download
         async with page.expect_download() as download_info:
@@ -222,7 +224,7 @@ async def handle_download_file_action(
         download = await download_info.value
 
         # Create download folders if they don't exist
-        download_folder = f"{SKYVERN_DIR}/downloads/{task.workflow_run_id or task.task_id}"
+        download_folder = f"{REPO_ROOT_DIR}/downloads/{task.workflow_run_id or task.task_id}"
         os.makedirs(download_folder, exist_ok=True)
         # Wait for the download process to complete and save the downloaded file
         await download.save_as(full_file_path)
@@ -452,7 +454,7 @@ ActionHandler.register_action_type(ActionType.SOLVE_CAPTCHA, handle_solve_captch
 ActionHandler.register_action_type(ActionType.CLICK, handle_click_action)
 ActionHandler.register_action_type(ActionType.INPUT_TEXT, handle_input_text_action)
 ActionHandler.register_action_type(ActionType.UPLOAD_FILE, handle_upload_file_action)
-ActionHandler.register_action_type(ActionType.DOWNLOAD_FILE, handle_download_file_action)
+# ActionHandler.register_action_type(ActionType.DOWNLOAD_FILE, handle_download_file_action)
 ActionHandler.register_action_type(ActionType.NULL_ACTION, handle_null_action)
 ActionHandler.register_action_type(ActionType.SELECT_OPTION, handle_select_option_action)
 ActionHandler.register_action_type(ActionType.WAIT, handle_wait_action)
@@ -525,8 +527,18 @@ async def chain_click(
 
     fc_func = lambda fc: fc.set_files(files=file)
     page.on("filechooser", fc_func)
-
     LOG.info("Registered file chooser listener", action=action, path=file)
+
+    # If a download is triggered due to the click, we need to let LLM know in action_results
+    download_triggered = False
+
+    def download_func(download: Any) -> None:
+        nonlocal download_triggered
+        download_triggered = True
+
+    page.on("download", download_func)
+    LOG.info("Registered download listener", action=action)
+
     """
     Clicks on an element identified by the xpath and its parent if failed.
     :param xpath: xpath of the element to click
@@ -535,12 +547,15 @@ async def chain_click(
     try:
         await page.click(f"xpath={xpath}", timeout=timeout)
         LOG.info("Chain click: main element click succeeded", action=action, xpath=xpath)
-        return [ActionSuccess(javascript_triggered=javascript_triggered)]
+        return [ActionSuccess(javascript_triggered=javascript_triggered, download_triggered=download_triggered)]
     except Exception as e:
-        action_results: list[ActionResult] = [ActionFailure(e, javascript_triggered=javascript_triggered)]
+        action_results: list[ActionResult] = [
+            ActionFailure(e, javascript_triggered=javascript_triggered, download_triggered=download_triggered)
+        ]
         if await is_input_element(page.locator(xpath)):
             LOG.info("Chain click: it's an input element. going to try sibling click", action=action, xpath=xpath)
             sibling_action_result = await click_sibling_of_input(page.locator(xpath), timeout=timeout)
+            sibling_action_result.download_triggered = download_triggered
             action_results.append(sibling_action_result)
             if type(sibling_action_result) == ActionSuccess:
                 return action_results
@@ -556,6 +571,7 @@ async def chain_click(
                 ActionSuccess(
                     javascript_triggered=javascript_triggered,
                     interacted_with_parent=True,
+                    download_triggered=download_triggered,
                 )
             )
         except Exception as pe:
@@ -575,6 +591,7 @@ async def chain_click(
         if file:
             await asyncio.sleep(10)
         page.remove_listener("filechooser", fc_func)
+        page.remove_listener("download", download_func)
 
 
 def get_anchor_to_click(scraped_page: ScrapedPage, element_id: int) -> str | None:
