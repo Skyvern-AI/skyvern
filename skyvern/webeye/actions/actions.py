@@ -3,6 +3,7 @@ from enum import StrEnum
 from typing import Any, Dict, List
 
 import structlog
+from deprecation import deprecated
 from pydantic import BaseModel, Field
 
 from skyvern.forge.sdk.schemas.tasks import Task
@@ -14,7 +15,10 @@ class ActionType(StrEnum):
     CLICK = "click"
     INPUT_TEXT = "input_text"
     UPLOAD_FILE = "upload_file"
+
+    # This action is not used in the current implementation. Click actions are used instead."
     DOWNLOAD_FILE = "download_file"
+
     SELECT_OPTION = "select_option"
     CHECKBOX = "checkbox"
     WAIT = "wait"
@@ -70,6 +74,7 @@ class UploadFileAction(WebAction):
         return f"UploadFileAction(element_id={self.element_id}, file={self.file_url}, is_upload_file_tag={self.is_upload_file_tag})"
 
 
+@deprecated("This action is not used in the current implementation. Click actions are used instead.")
 class DownloadFileAction(WebAction):
     action_type: ActionType = ActionType.DOWNLOAD_FILE
     file_name: str
@@ -158,6 +163,7 @@ def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Actio
             # TODO: see if the element is a file input element. if it's not, convert this action into a click action
 
             actions.append(UploadFileAction(element_id=element_id, file_url=action["file_url"], reasoning=reasoning))
+        # This action is not used in the current implementation. Click actions are used instead.
         elif action_type == ActionType.DOWNLOAD_FILE:
             actions.append(
                 DownloadFileAction(element_id=element_id, file_name=action["file_name"], reasoning=reasoning)
@@ -214,7 +220,8 @@ ActionTypeUnion = (
     ClickAction
     | InputTextAction
     | UploadFileAction
-    | DownloadFileAction
+    # Deprecated
+    # | DownloadFileAction
     | SelectOptionAction
     | CheckboxAction
     | WaitAction
