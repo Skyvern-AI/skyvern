@@ -226,6 +226,8 @@ class BrowserState:
             LOG.error("BrowserState has no page")
             raise MissingBrowserStatePage()
         try:
+            await self.page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
+            LOG.info("Page is fully loaded, agent is about to take screenshots")
             if file_path:
                 return await self.page.screenshot(
                     path=file_path,
