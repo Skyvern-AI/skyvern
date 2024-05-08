@@ -65,6 +65,9 @@ if SettingsManager.get_settings().ENABLE_ANTHROPIC:
     LLMConfigRegistry.register_config(
         "ANTHROPIC_CLAUDE3_SONNET", LLMConfig("anthropic/claude-3-sonnet-20240229", ["ANTHROPIC_API_KEY"], True)
     )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE3_HAIKU", LLMConfig("anthropic/claude-3-haiku-20240307", ["ANTHROPIC_API_KEY"], True)
+    )
 
 if SettingsManager.get_settings().ENABLE_BEDROCK:
     # Supported through AWS IAM authentication
@@ -80,6 +83,14 @@ if SettingsManager.get_settings().ENABLE_BEDROCK:
         "BEDROCK_ANTHROPIC_CLAUDE3_SONNET",
         LLMConfig(
             "bedrock/anthropic.claude-3-sonnet-20240229-v1:0",
+            ["AWS_REGION"],
+            True,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE3_HAIKU",
+        LLMConfig(
+            "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
             ["AWS_REGION"],
             True,
         ),
