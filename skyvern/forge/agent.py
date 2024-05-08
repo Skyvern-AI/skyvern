@@ -279,6 +279,7 @@ class ForgeAgent:
                     task,
                     next_step,
                     api_key=api_key,
+                    close_browser_on_completion=close_browser_on_completion,
                 )
             elif SettingsManager.get_settings().execute_all_steps() and next_step:
                 return await self.execute_step(
@@ -286,6 +287,7 @@ class ForgeAgent:
                     task,
                     next_step,
                     api_key=api_key,
+                    close_browser_on_completion=close_browser_on_completion,
                 )
             else:
                 LOG.info(
