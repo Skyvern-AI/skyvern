@@ -65,4 +65,3 @@ def try_to_extract_json_from_markdown_format(text):
         return match.group(1)
     else:
         return text
-    
