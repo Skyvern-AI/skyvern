@@ -2,6 +2,8 @@
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
 
 - [Skyvern Frontend](#skyvern-frontend)
+  - [Quickstart](#quickstart)
+    - [Populate env file](#populate-env-file)
   - [Development](#development)
   - [Build for production](#build-for-production)
   - [Preview the production build locally](#preview-the-production-build-locally)
@@ -9,6 +11,30 @@
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
 # Skyvern Frontend
+
+## Quickstart
+
+### Populate env file
+
+Copy example env file:
+
+```sh
+cp .env.example .env
+```
+
+Populate `VITE_SKYVERN_API_KEY` with your API key.
+
+Then run:
+
+```sh
+npm install
+```
+
+```sh
+npm start
+```
+
+This will build the app and serve from port 8080.
 
 ## Development
 
