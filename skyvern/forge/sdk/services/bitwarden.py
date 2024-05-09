@@ -58,7 +58,7 @@ class BitwardenService:
             login_result = BitwardenService.run_command(login_command, env)
 
             # Print both stdout and stderr for debugging
-            if login_result.stderr:
+            if login_result.stderr and "You are already logged in as" not in login_result.stderr:
                 raise BitwardenLoginError(login_result.stderr)
 
             # Step 2: Unlock the vault
