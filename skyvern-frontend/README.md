@@ -2,6 +2,8 @@
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
 
 - [Skyvern Frontend](#skyvern-frontend)
+  - [Quickstart](#quickstart)
+    - [Populate env file](#populate-env-file)
   - [Development](#development)
   - [Build for production](#build-for-production)
   - [Preview the production build locally](#preview-the-production-build-locally)
