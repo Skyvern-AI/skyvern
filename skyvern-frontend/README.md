@@ -10,6 +10,30 @@
 
 # Skyvern Frontend
 
+## Quickstart
+
+### Populate env file
+
+Copy example env file:
+
+```sh
+cp .env.example .env
+```
+
+Populate `VITE_SKYVERN_API_KEY` with your API key.
+
+Then run:
+
+```sh
+npm install
+```
+
+```sh
+npm start
+```
+
+This will build the app and serve from port 8080.
+
 ## Development
 
 ```sh
