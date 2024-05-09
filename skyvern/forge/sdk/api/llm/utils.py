@@ -8,6 +8,7 @@ import litellm
 from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
+
 async def llm_messages_builder(
     prompt: str,
     screenshots: list[bytes] | None = None,
@@ -50,10 +51,12 @@ def parse_api_response(response: litellm.ModelResponse) -> dict[str, str]:
     except Exception as e:
         raise InvalidLLMResponseFormat(str(response)) from e
 
+
 def replace_useless_text_around_json(input_string):
     first_occurrence_of_brace = input_string.find("{")
     last_occurrence_of_brace = input_string.rfind("}")
     return input_string[first_occurrence_of_brace : last_occurrence_of_brace + 1]
+
 
 def try_to_extract_json_from_markdown_format(text):
     pattern = r"```json\s*(.*?)\s*```"
