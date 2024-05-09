@@ -52,13 +52,13 @@ def parse_api_response(response: litellm.ModelResponse) -> dict[str, str]:
         raise InvalidLLMResponseFormat(str(response)) from e
 
 
-def replace_useless_text_around_json(input_string):
+def replace_useless_text_around_json(input_string: str) -> str:
     first_occurrence_of_brace = input_string.find("{")
     last_occurrence_of_brace = input_string.rfind("}")
     return input_string[first_occurrence_of_brace : last_occurrence_of_brace + 1]
 
 
-def try_to_extract_json_from_markdown_format(text):
+def try_to_extract_json_from_markdown_format(text: str) -> str:
     pattern = r"```json\s*(.*?)\s*```"
     match = re.search(pattern, text, re.DOTALL)
     if match:
