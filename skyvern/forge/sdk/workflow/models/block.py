@@ -14,6 +14,7 @@ import filetype
 import structlog
 from pydantic import BaseModel, Field
 
+from skyvern.config import settings
 from skyvern.exceptions import (
     ContextParameterValueNotFound,
     MissingBrowserStatePage,
@@ -215,7 +216,7 @@ class TaskBlock(Block):
             )
 
             if self.url:
-                await browser_state.page.goto(self.url)
+                await browser_state.page.goto(self.url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
 
             try:
                 await app.agent.execute_step(organization=organization, task=task, step=step, workflow_run=workflow_run)
