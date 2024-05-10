@@ -11,7 +11,7 @@ if (!environment) {
 }
 
 const envCredential: string | null =
-  import.meta.env.VITE_API_CREDENTIAL ?? null;
+  import.meta.env.VITE_SKYVERN_API_KEY ?? null;
 
 const artifactApiBaseUrl = import.meta.env.VITE_ARTIFACT_API_BASE_URL;
 

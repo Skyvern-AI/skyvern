@@ -65,6 +65,12 @@ if SettingsManager.get_settings().ENABLE_OPENAI:
 
 if SettingsManager.get_settings().ENABLE_ANTHROPIC:
     LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE3",
+        LLMConfig(
+            "anthropic/claude-3-sonnet-20240229", ["ANTHROPIC_API_KEY"], supports_vision=True, add_assistant_prefix=True
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "ANTHROPIC_CLAUDE3_OPUS",
         LLMConfig(
             "anthropic/claude-3-opus-20240229", ["ANTHROPIC_API_KEY"], supports_vision=True, add_assistant_prefix=True

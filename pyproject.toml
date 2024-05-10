@@ -52,6 +52,9 @@ filetype = "^1.2.0"
 redis = "^5.0.3"
 onnxruntime = "<1.17"
 supabase = "^2.4.3"
+aioredlock = "^0.7.3"
+fpdf = "^1.7.2"
+pypdf = "^4.2.0"
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.12.0"

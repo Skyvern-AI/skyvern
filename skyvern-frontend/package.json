@@ -11,7 +11,9 @@
     "preview": "vite preview",
     "prepare": "cd .. && husky skyvern-frontend/.husky",
     "precommit": "lint-staged",
-    "run-artifact-server": "node artifactServer.js"
+    "run-artifact-server": "node artifactServer.js",
+    "serve": "npm run build && node localServer.js",
+    "start": "npm run serve & npm run run-artifact-server"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.3.4",
@@ -36,11 +38,13 @@
     "embla-carousel-react": "^8.0.0",
     "express": "^4.19.2",
     "fetch-to-curl": "^0.6.0",
+    "open": "^10.1.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-hook-form": "^7.51.1",
     "react-medium-image-zoom": "^5.1.11",
     "react-router-dom": "^6.22.3",
+    "serve-handler": "^6.1.5",
     "tailwind-merge": "^2.2.2",
     "tailwindcss-animate": "^1.0.7",
     "zod": "^3.22.4",
