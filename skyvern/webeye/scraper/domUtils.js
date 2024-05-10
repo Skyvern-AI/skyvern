@@ -1141,7 +1141,6 @@ function removeBoundingBoxes() {
 function scrollToTop(draw_boxes) {
   removeBoundingBoxes();
   window.scrollTo({ left: 0, top: 0, behavior: "instant" });
-  scrollDownAndUp();
   if (draw_boxes) {
     var elementsAndResultArray = buildTreeFromBody();
     drawBoundingBoxes(elementsAndResultArray[0]);
@@ -1158,39 +1157,9 @@ function scrollToNextPage(draw_boxes) {
     top: window.innerHeight - 200,
     behavior: "instant",
   });
-  scrollUpAndDown();
   if (draw_boxes) {
     var elementsAndResultArray = buildTreeFromBody();
     drawBoundingBoxes(elementsAndResultArray[0]);
   }
   return window.scrollY;
-}
-
-function scrollUpAndDown() {
-  // remove select2-drop-above class to prevent dropdown from being rendered on top of the box
-  // then scroll up by 1 and scroll down by 1
-  removeSelect2DropAbove();
-  window.scrollBy({ left: 0, top: -1, behavior: "instant" });
-  removeSelect2DropAbove();
-  window.scrollBy({ left: 0, top: 1, behavior: "instant" });
-}
-
-function scrollDownAndUp() {
-  // remove select2-drop-above class to prevent dropdown from being rendered on top of the box
-  // then scroll up by 1 and scroll down by 1
-  removeSelect2DropAbove();
-  window.scrollBy({ left: 0, top: 1, behavior: "instant" });
-  removeSelect2DropAbove();
-  window.scrollBy({ left: 0, top: -1, behavior: "instant" });
-}
-
-function removeSelect2DropAbove() {
-  var select2DropAbove = document.getElementsByClassName("select2-drop-above");
-  var allElements = [];
-  for (var i = 0; i < select2DropAbove.length; i++) {
-    allElements.push(select2DropAbove[i]);
-  }
-  allElements.forEach((ele) => {
-    ele.classList.remove("select2-drop-above");
-  });
 }
