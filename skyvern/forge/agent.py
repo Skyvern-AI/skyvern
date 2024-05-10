@@ -1112,8 +1112,8 @@ class ForgeAgent:
             await self.update_task(task, status=TaskStatus.terminated, failure_reason=failure_reason)
             return False, last_step, None
         # If the max steps are exceeded, mark the current step as the last step and conclude the task
-        context = skyvern_context.ensure_context()
-        override_max_steps_per_run = context.max_steps_override
+        context = skyvern_context.current()
+        override_max_steps_per_run = context.max_steps_override if context else None
         max_steps_per_run = (
             override_max_steps_per_run
             or organization.max_steps_per_run
