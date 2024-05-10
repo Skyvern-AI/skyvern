@@ -1,5 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import { Status, TaskApiResponse } from "@/api/types";
+import { TaskApiResponse } from "@/api/types";
 import { useQuery } from "@tanstack/react-query";
 import { basicTimeFormat } from "@/util/timeFormat";
 import {
@@ -32,11 +32,7 @@ function QueuedTasks() {
     },
   });
 
-  const queuedTasks = tasks
-    ?.filter((task) => task.status === Status.Queued)
-    .slice(0, 10);
-
-  if (queuedTasks?.length === 0) {
+  if (tasks?.length === 0) {
     return <div>No queued tasks</div>;
   }
 
@@ -50,16 +46,16 @@ function QueuedTasks() {
         </TableRow>
       </TableHeader>
       <TableBody>
-        {queuedTasks?.length === 0 ? (
+        {tasks?.length === 0 ? (
           <TableRow>
             <TableCell colSpan={3}>No queued tasks</TableCell>
           </TableRow>
         ) : (
-          queuedTasks?.map((task) => {
+          tasks?.map((task) => {
             return (
               <TableRow
                 key={task.task_id}
-                className="cursor-pointer w-4"
+                className="cursor-pointer w-4 hover:bg-muted/50"
                 onClick={() => {
                   navigate(task.task_id);
                 }}
