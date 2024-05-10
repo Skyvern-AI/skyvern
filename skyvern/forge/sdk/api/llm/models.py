@@ -10,6 +10,7 @@ class LLMConfig:
     model_name: str
     required_env_vars: list[str]
     supports_vision: bool
+    add_assistant_prefix: bool
 
     def get_missing_env_vars(self) -> list[str]:
         missing_env_vars = []
