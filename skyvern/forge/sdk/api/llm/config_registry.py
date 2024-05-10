@@ -55,21 +55,38 @@ if not any(
 
 
 if SettingsManager.get_settings().ENABLE_OPENAI:
-    LLMConfigRegistry.register_config("OPENAI_GPT4_TURBO", LLMConfig("gpt-4-turbo", ["OPENAI_API_KEY"], True))
-    LLMConfigRegistry.register_config("OPENAI_GPT4V", LLMConfig("gpt-4-turbo", ["OPENAI_API_KEY"], True))
+    LLMConfigRegistry.register_config(
+        "OPENAI_GPT4_TURBO",
+        LLMConfig("gpt-4-turbo", ["OPENAI_API_KEY"], supports_vision=False, add_assistant_prefix=False),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_GPT4V", LLMConfig("gpt-4-turbo", ["OPENAI_API_KEY"], supports_vision=True, add_assistant_prefix=False)
+    )
 
 if SettingsManager.get_settings().ENABLE_ANTHROPIC:
     LLMConfigRegistry.register_config(
-        "ANTHROPIC_CLAUDE3", LLMConfig("anthropic/claude-3-sonnet-20240229", ["ANTHROPIC_API_KEY"], True)
+        "ANTHROPIC_CLAUDE3",
+        LLMConfig(
+            "anthropic/claude-3-sonnet-20240229", ["ANTHROPIC_API_KEY"], supports_vision=True, add_assistant_prefix=True
+        ),
     )
     LLMConfigRegistry.register_config(
-        "ANTHROPIC_CLAUDE3_OPUS", LLMConfig("anthropic/claude-3-opus-20240229", ["ANTHROPIC_API_KEY"], True)
+        "ANTHROPIC_CLAUDE3_OPUS",
+        LLMConfig(
+            "anthropic/claude-3-opus-20240229", ["ANTHROPIC_API_KEY"], supports_vision=True, add_assistant_prefix=True
+        ),
     )
     LLMConfigRegistry.register_config(
-        "ANTHROPIC_CLAUDE3_SONNET", LLMConfig("anthropic/claude-3-sonnet-20240229", ["ANTHROPIC_API_KEY"], True)
+        "ANTHROPIC_CLAUDE3_SONNET",
+        LLMConfig(
+            "anthropic/claude-3-sonnet-20240229", ["ANTHROPIC_API_KEY"], supports_vision=True, add_assistant_prefix=True
+        ),
     )
     LLMConfigRegistry.register_config(
-        "ANTHROPIC_CLAUDE3_HAIKU", LLMConfig("anthropic/claude-3-haiku-20240307", ["ANTHROPIC_API_KEY"], True)
+        "ANTHROPIC_CLAUDE3_HAIKU",
+        LLMConfig(
+            "anthropic/claude-3-haiku-20240307", ["ANTHROPIC_API_KEY"], supports_vision=True, add_assistant_prefix=True
+        ),
     )
 
 if SettingsManager.get_settings().ENABLE_BEDROCK:
@@ -79,7 +96,8 @@ if SettingsManager.get_settings().ENABLE_BEDROCK:
         LLMConfig(
             "bedrock/anthropic.claude-3-opus-20240229-v1:0",
             ["AWS_REGION"],
-            True,
+            supports_vision=True,
+            add_assistant_prefix=True,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -87,7 +105,8 @@ if SettingsManager.get_settings().ENABLE_BEDROCK:
         LLMConfig(
             "bedrock/anthropic.claude-3-sonnet-20240229-v1:0",
             ["AWS_REGION"],
-            True,
+            supports_vision=True,
+            add_assistant_prefix=True,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -95,7 +114,8 @@ if SettingsManager.get_settings().ENABLE_BEDROCK:
         LLMConfig(
             "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
             ["AWS_REGION"],
-            True,
+            supports_vision=True,
+            add_assistant_prefix=True,
         ),
     )
 
@@ -105,6 +125,7 @@ if SettingsManager.get_settings().ENABLE_AZURE:
         LLMConfig(
             f"azure/{SettingsManager.get_settings().AZURE_DEPLOYMENT}",
             ["AZURE_DEPLOYMENT", "AZURE_API_KEY", "AZURE_API_BASE", "AZURE_API_VERSION"],
-            True,
+            supports_vision=True,
+            add_assistant_prefix=False,
         ),
     )

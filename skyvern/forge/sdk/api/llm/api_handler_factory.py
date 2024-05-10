@@ -81,7 +81,7 @@ class LLMAPIHandlerFactory:
                         data=screenshot,
                     )
 
-            messages = await llm_messages_builder(prompt, screenshots)
+            messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
             if step:
                 await app.ARTIFACT_MANAGER.create_artifact(
                     step=step,
@@ -115,7 +115,7 @@ class LLMAPIHandlerFactory:
                     organization_id=step.organization_id,
                     incremental_cost=llm_cost,
                 )
-            parsed_response = parse_api_response(response)
+            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
             if step:
                 await app.ARTIFACT_MANAGER.create_artifact(
                     step=step,
@@ -159,7 +159,7 @@ class LLMAPIHandlerFactory:
             if not llm_config.supports_vision:
                 screenshots = None
 
-            messages = await llm_messages_builder(prompt, screenshots)
+            messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
             if step:
                 await app.ARTIFACT_MANAGER.create_artifact(
                     step=step,
@@ -199,7 +199,7 @@ class LLMAPIHandlerFactory:
                     organization_id=step.organization_id,
                     incremental_cost=llm_cost,
                 )
-            parsed_response = parse_api_response(response)
+            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
             if step:
                 await app.ARTIFACT_MANAGER.create_artifact(
                     step=step,
