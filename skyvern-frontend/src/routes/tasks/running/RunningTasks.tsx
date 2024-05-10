@@ -40,7 +40,7 @@ function RunningTasks() {
     return (
       <Card
         key={task.task_id}
-        className="hover:bg-primary-foreground cursor-pointer"
+        className="hover:bg-muted/50 cursor-pointer"
         onClick={() => {
           navigate(`/tasks/${task.task_id}`);
         }}
