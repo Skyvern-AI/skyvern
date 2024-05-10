@@ -1140,8 +1140,7 @@ function removeBoundingBoxes() {
 
 function scrollToTop(draw_boxes) {
   removeBoundingBoxes();
-  window.scrollTo(0, 0);
-  scrollDownAndUp();
+  window.scrollTo({ left: 0, top: 0, behavior: "instant" });
   if (draw_boxes) {
     var elementsAndResultArray = buildTreeFromBody();
     drawBoundingBoxes(elementsAndResultArray[0]);
@@ -1153,40 +1152,14 @@ function scrollToNextPage(draw_boxes) {
   // remove bounding boxes, scroll to next page with 200px overlap, then draw bounding boxes again
   // return true if there is a next page, false otherwise
   removeBoundingBoxes();
-  window.scrollBy(0, window.innerHeight - 200);
-  scrollUpAndDown();
+  window.scrollBy({
+    left: 0,
+    top: window.innerHeight - 200,
+    behavior: "instant",
+  });
   if (draw_boxes) {
     var elementsAndResultArray = buildTreeFromBody();
     drawBoundingBoxes(elementsAndResultArray[0]);
   }
   return window.scrollY;
-}
-
-function scrollUpAndDown() {
-  // remove select2-drop-above class to prevent dropdown from being rendered on top of the box
-  // then scroll up by 1 and scroll down by 1
-  removeSelect2DropAbove();
-  window.scrollBy(0, -1);
-  removeSelect2DropAbove();
-  window.scrollBy(0, 1);
-}
-
-function scrollDownAndUp() {
-  // remove select2-drop-above class to prevent dropdown from being rendered on top of the box
-  // then scroll up by 1 and scroll down by 1
-  removeSelect2DropAbove();
-  window.scrollBy(0, 1);
-  removeSelect2DropAbove();
-  window.scrollBy(0, -1);
-}
-
-function removeSelect2DropAbove() {
-  var select2DropAbove = document.getElementsByClassName("select2-drop-above");
-  var allElements = [];
-  for (var i = 0; i < select2DropAbove.length; i++) {
-    allElements.push(select2DropAbove[i]);
-  }
-  allElements.forEach((ele) => {
-    ele.classList.remove("select2-drop-above");
-  });
 }
