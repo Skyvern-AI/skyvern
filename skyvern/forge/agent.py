@@ -136,6 +136,7 @@ class ForgeAgent:
             workflow_run_id=workflow_run.workflow_run_id,
             order=task_order,
             retry=task_retry,
+            max_steps_per_run=task_block.max_steps_per_run,
             error_code_mapping=task_block.error_code_mapping,
         )
         LOG.info(
@@ -1116,6 +1117,7 @@ class ForgeAgent:
         override_max_steps_per_run = context.max_steps_override if context else None
         max_steps_per_run = (
             override_max_steps_per_run
+            or task.max_steps_per_run
             or organization.max_steps_per_run
             or SettingsManager.get_settings().MAX_STEPS_PER_RUN
         )

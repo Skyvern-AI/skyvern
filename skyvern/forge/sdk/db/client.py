@@ -83,6 +83,7 @@ class AgentDB:
         workflow_run_id: str | None = None,
         order: int | None = None,
         retry: int | None = None,
+        max_steps_per_run: int | None = None,
         error_code_mapping: dict[str, str] | None = None,
     ) -> Task:
         try:
@@ -101,6 +102,7 @@ class AgentDB:
                     workflow_run_id=workflow_run_id,
                     order=order,
                     retry=retry,
+                    max_steps_per_run=max_steps_per_run,
                     error_code_mapping=error_code_mapping,
                 )
                 session.add(new_task)

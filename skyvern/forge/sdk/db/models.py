@@ -46,6 +46,7 @@ class TaskModel(Base):
     retry = Column(Integer, nullable=True)
     error_code_mapping = Column(JSON, nullable=True)
     errors = Column(JSON, default=[], nullable=False)
+    max_steps_per_run = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(
         DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False, index=True

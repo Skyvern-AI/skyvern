@@ -72,6 +72,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False) -> Task:
         workflow_run_id=task_obj.workflow_run_id,
         order=task_obj.order,
         retry=task_obj.retry,
+        max_steps_per_run=task_obj.max_steps_per_run,
         error_code_mapping=task_obj.error_code_mapping,
         errors=task_obj.errors,
     )
