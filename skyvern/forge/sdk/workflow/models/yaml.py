@@ -84,6 +84,7 @@ class TaskBlockYAML(BlockYAML):
     data_schema: dict[str, Any] | None = None
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
+    max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
 
 

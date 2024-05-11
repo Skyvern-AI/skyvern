@@ -111,6 +111,7 @@ class TaskBlock(Block):
     # error code to error description for the LLM
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
+    max_steps_per_run: int | None = None
     parameters: list[PARAMETER_TYPE] = []
 
     def get_all_parameters(

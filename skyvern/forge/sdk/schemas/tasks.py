@@ -143,6 +143,7 @@ class Task(TaskRequest):
     workflow_run_id: str | None = None
     order: int | None = None
     retry: int | None = None
+    max_steps_per_run: int | None = None
     errors: list[dict[str, Any]] = []
 
     def validate_update(
