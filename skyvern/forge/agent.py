@@ -43,7 +43,7 @@ from skyvern.webeye.actions.handler import ActionHandler
 from skyvern.webeye.actions.models import AgentStepOutput, DetailedAgentStepOutput
 from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.browser_factory import BrowserState
-from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
+from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
 
 LOG = structlog.get_logger()
 
@@ -636,13 +636,28 @@ class ForgeAgent:
         ):
             LOG.info("Using Claude3 Sonnet prompt template for action extraction")
             prompt_template = "extract-action-claude3-sonnet"
+
+        element_tree_format = ElementTreeFormat.JSON
+        if app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            "USE_HTML_ELEMENT_TREE",
+            task.workflow_run_id or task.task_id,
+            properties={"organization_id": task.organization_id},
+        ):
+            element_tree_format = ElementTreeFormat.HTML
+        LOG.info(
+            f"Building element tree",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            format=element_tree_format,
+        )
+
         extract_action_prompt = prompt_engine.load_prompt(
             prompt_template,
             navigation_goal=navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
             starting_url=starting_url,
             current_url=current_url,
-            elements=scraped_page.element_tree_trimmed,
+            elements=scraped_page.build_element_tree(element_tree_format),
             data_extraction_goal=task.data_extraction_goal,
             action_history=actions_and_results_str,
             error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else None,
