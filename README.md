@@ -72,7 +72,20 @@ Skyvern Cloud is currently in private beta. If you're interested in using Skyver
 # Quickstart
 This quickstart guide will walk you through getting Skyvern up and running on your local machine. 
 
-## Prerequisites
+## Docker Compose setup (Recommended)
+
+1. Make sure you have [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running on your machine
+1. Make sure you don't have postgres running locally (Run `docker ps` to check)
+1. Clone the repository and navigate to the root directory
+1. Fill in the LLM provider key on the [docker-compose.yml](./docker-compose.yml)
+2. Run the following command via the commandline:
+   ```bash
+    docker compose up -d
+   ```
+3. Navigate to `http://localhost:8501` in your browser to start using the UI
+
+
+## Full Setup (Contributors) - Prerequisites 
 
 ### :warning: :warning: MAKE SURE YOU ARE USING PYTHON 3.11 :warning: :warning:
 Before you begin, make sure you have the following installed:
@@ -88,7 +101,7 @@ Note: Our setup script does these two for you, but they are here for reference.
 - [PostgreSQL 14](https://www.postgresql.org/download/) (if you're on a Mac, setup script will install it for you if you have homebrew installed)
     - `brew install postgresql`
 
-## Setup
+## Setup (Contributors)
 1. Clone the repository and navigate to the root directory
 1. Open Docker Desktop (Works for Windows, macOS, and Linux) or run Docker Daemon
 1. Run the setup script to install the necessary dependencies and setup your environment
@@ -104,16 +117,6 @@ Note: Our setup script does these two for you, but they are here for reference.
     ./run_ui.sh
     ```
 1. Navigate to `http://localhost:8501` in your browser to start using the UI
-
-## Docker Compose setup
-
-1. Fill in the LLM provider key on the [docker-compose.yml](./docker-compose.yml)
-2. Run the following command:
-   ```bash
-    docker compose up -d
-   ```
-3. Navigate to `http://localhost:8501` in your browser to start using the UI
-
 
 ## Additional Setup for Contributors
 If you're looking to contribute to Skyvern, you'll need to install the pre-commit hooks to ensure code quality and consistency. You can do this by running the following command:
