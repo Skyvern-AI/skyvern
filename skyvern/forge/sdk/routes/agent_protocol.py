@@ -1,4 +1,3 @@
-import asyncio
 from typing import Annotated, Any
 
 import structlog
@@ -238,17 +237,9 @@ async def get_task(
         artifact_types=[ArtifactType.SCREENSHOT_ACTION],
         n=SettingsManager.get_settings().TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
     )
-    latest_action_screenshot_urls = []
+    latest_action_screenshot_urls: list[str] | None = None
     if latest_action_screenshot_artifacts:
-        for artifact in latest_action_screenshot_artifacts:
-            screenshot_url = await app.ARTIFACT_MANAGER.get_share_link(artifact)
-            if screenshot_url:
-                latest_action_screenshot_urls.append(screenshot_url)
-            else:
-                LOG.error(
-                    "Failed to get share link for action screenshot",
-                    artifact_id=artifact.artifact_id,
-                )
+        latest_action_screenshot_urls = await app.ARTIFACT_MANAGER.get_share_links(latest_action_screenshot_artifacts)
     elif task_obj.status in [TaskStatus.terminated, TaskStatus.completed]:
         LOG.error(
             "Failed to get latest action screenshots in task response",
@@ -416,9 +407,12 @@ async def get_agent_task_step_artifacts(
         organization_id=current_org.organization_id,
     )
     if SettingsManager.get_settings().ENV != "local":
-        signed_urls = await asyncio.gather(*[app.ARTIFACT_MANAGER.get_share_link(artifact) for artifact in artifacts])
-        for i, artifact in enumerate(artifacts):
-            artifact.signed_url = signed_urls[i]
+        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
+        if signed_urls:
+            for i, artifact in enumerate(artifacts):
+                artifact.signed_url = signed_urls[i]
+        else:
+            LOG.error("Failed to get signed urls for artifacts", task_id=task_id, step_id=step_id)
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
 

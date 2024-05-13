@@ -41,5 +41,9 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
+    async def get_share_links(self, artifacts: list[Artifact]) -> list[str] | None:
+        pass
+
+    @abstractmethod
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
         pass

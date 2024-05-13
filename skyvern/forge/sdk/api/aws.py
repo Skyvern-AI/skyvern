@@ -75,17 +75,21 @@ class AsyncAWSClient:
             return None
 
     @execute_with_async_client(client_type=AWSClientType.S3)
-    async def create_presigned_url(self, uri: str, client: AioBaseClient = None) -> str | None:
+    async def create_presigned_urls(self, uris: list[str], client: AioBaseClient = None) -> list[str] | None:
+        presigned_urls = []
         try:
-            parsed_uri = S3Uri(uri)
-            url = await client.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": parsed_uri.bucket, "Key": parsed_uri.key},
-                ExpiresIn=SettingsManager.get_settings().PRESIGNED_URL_EXPIRATION,
-            )
-            return url
+            for uri in uris:
+                parsed_uri = S3Uri(uri)
+                url = await client.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": parsed_uri.bucket, "Key": parsed_uri.key},
+                    ExpiresIn=SettingsManager.get_settings().PRESIGNED_URL_EXPIRATION,
+                )
+                presigned_urls.append(url)
+
+            return presigned_urls
         except Exception:
-            LOG.exception("Failed to create presigned url.", uri=uri)
+            LOG.exception("Failed to create presigned url for S3 objects.", uris=uris)
             return None
 
 
