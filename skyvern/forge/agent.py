@@ -888,17 +888,11 @@ class ForgeAgent:
                 artifact_types=[ArtifactType.SCREENSHOT_ACTION],
                 n=SettingsManager.get_settings().TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
             )
-            latest_action_screenshot_urls = []
+
             if latest_action_screenshot_artifacts:
-                for artifact in latest_action_screenshot_artifacts:
-                    screenshot_url = await app.ARTIFACT_MANAGER.get_share_link(artifact)
-                    if screenshot_url:
-                        latest_action_screenshot_urls.append(screenshot_url)
-                    else:
-                        LOG.error(
-                            "Failed to get share link for action screenshot",
-                            artifact_id=artifact.artifact_id,
-                        )
+                latest_action_screenshot_urls = await app.ARTIFACT_MANAGER.get_share_links(
+                    latest_action_screenshot_artifacts
+                )
             else:
                 LOG.error("Failed to get latest action screenshots")
 
