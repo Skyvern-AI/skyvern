@@ -16,6 +16,7 @@ Reply in JSON format with the following keys:
         "id": int, // The id of the element to take action on. The id has to be one from the elements list
         "text": str, // Text for INPUT_TEXT action only
         "file_url": str, // The url of the file to upload if applicable. This field must be present for UPLOAD_FILE but can also be present for CLICK only if the click is to upload the file. It should be null otherwise.
+        "download": bool, // Can only be true for CLICK actions. If true, the browser will trigger a download by clicking the element. If false, the browser will click the element without triggering a download.
         "option": {  // The option to select for SELECT_OPTION action only. null if not SELECT_OPTION action
             "label": str, // the label of the option if any. MAKE SURE YOU USE THIS LABEL TO SELECT THE OPTION. DO NOT PUT ANYTHING OTHER THAN A VALID OPTION LABEL HERE
             "index": int, // the id corresponding to the optionIndex under the the select element.
