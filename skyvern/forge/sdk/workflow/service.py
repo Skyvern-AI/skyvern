@@ -185,8 +185,18 @@ class WorkflowService:
                         block_idx=block_idx,
                         block_result=block_result,
                     )
-                    await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
-                    break
+                    if block.continue_on_failure:
+                        LOG.warning(
+                            f"Block with type {block.block_type} at index {block_idx} failed but will continue executing the workflow run {workflow_run_id}",
+                            block_type=block.block_type,
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            block_idx=block_idx,
+                            block_result=block_result,
+                            continue_on_failure=block.continue_on_failure,
+                        )
+                    else:
+                        await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
+                        break
 
             except Exception as e:
                 LOG.exception(
