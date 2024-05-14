@@ -52,9 +52,6 @@ class LocalStorage(BaseStorage):
     async def get_share_link(self, artifact: Artifact) -> str:
         return artifact.uri
 
-    async def get_share_links(self, artifacts: list[Artifact]) -> list[str]:
-        return [artifact.uri for artifact in artifacts]
-
     @staticmethod
     def _parse_uri_to_path(uri: str) -> str:
         parsed_uri = urlparse(uri)

@@ -1,16 +1,12 @@
 import asyncio
 import copy
-import json
 from collections import defaultdict
-from enum import StrEnum
-from typing import Any
 
 import structlog
 from playwright.async_api import Page
 from pydantic import BaseModel
 
 from skyvern.constants import SKYVERN_DIR, SKYVERN_ID_ATTR
-from skyvern.exceptions import UnknownElementTreeFormat
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.browser_factory import BrowserState
 
@@ -43,11 +39,6 @@ RESERVED_ATTRIBUTES = {
     "value",
 }
 
-ELEMENT_NODE_ATTRIBUTES = {
-    "id",
-    "interactable",
-}
-
 
 def load_js_script() -> str:
     # TODO: Handle file location better. This is a hacky way to find the file location.
@@ -63,48 +54,6 @@ def load_js_script() -> str:
 
 
 JS_FUNCTION_DEFS = load_js_script()
-
-
-# function to convert JSON element to HTML
-def build_attribute(key: str, value: Any) -> str:
-    if isinstance(value, bool) or isinstance(value, int):
-        return f'{key}="{str(value).lower()}"'
-
-    return f'{key}="{str(value)}"' if value else key
-
-
-def json_to_html(element: dict) -> str:
-    attributes: dict[str, Any] = element.get("attributes", {})
-
-    # adding the node attribute to attributes
-    for attr in ELEMENT_NODE_ATTRIBUTES:
-        value = element.get(attr)
-        if value is None:
-            continue
-        attributes[attr] = value
-
-    attributes_html = " ".join(build_attribute(key, value) for key, value in attributes.items())
-
-    tag = element["tagName"]
-    text = element.get("text", "")
-    # build children HTML
-    children_html = "".join(json_to_html(child) for child in element.get("children", []))
-    # build option HTML
-    option_html = "".join(
-        f'<option index="{option.get("optionIndex")}">{option.get("text")}</option>'
-        for option in element.get("options", [])
-    )
-
-    # Check if the element is self-closing
-    if tag in ["img", "input", "br", "hr", "meta", "link"]:
-        return f'<{tag}{attributes_html if not attributes_html else " "+attributes_html}>'
-    else:
-        return f'<{tag}{attributes_html if not attributes_html else " "+attributes_html}>{text}{children_html+option_html}</{tag}>'
-
-
-class ElementTreeFormat(StrEnum):
-    JSON = "json"
-    HTML = "html"
 
 
 class ScrapedPage(BaseModel):
@@ -128,15 +77,6 @@ class ScrapedPage(BaseModel):
     url: str
     html: str
     extracted_text: str | None = None
-
-    def build_element_tree(self, fmt: ElementTreeFormat = ElementTreeFormat.JSON) -> str:
-        if fmt == ElementTreeFormat.JSON:
-            return json.dumps(self.element_tree_trimmed)
-
-        if fmt == ElementTreeFormat.HTML:
-            return "".join(json_to_html(element) for element in self.element_tree_trimmed)
-
-        raise UnknownElementTreeFormat(fmt=fmt)
 
 
 async def scrape_website(

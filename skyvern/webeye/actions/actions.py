@@ -138,13 +138,7 @@ class CompleteAction(DecisiveAction):
 def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Action]:
     actions = []
     for action in json_response:
-        if "id" in action:
-            element_id = action["id"]
-        elif "element_id" in action:
-            element_id = action["element_id"]
-        else:
-            element_id = None
-
+        element_id = action["id"]
         reasoning = action["reasoning"] if "reasoning" in action else None
         if "action_type" not in action or action["action_type"] is None:
             actions.append(NullAction(reasoning=reasoning))

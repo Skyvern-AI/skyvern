@@ -16,6 +16,7 @@ from skyvern.forge.sdk.db.id import (
     generate_task_id,
     generate_workflow_id,
     generate_workflow_parameter_id,
+    generate_workflow_permanent_id,
     generate_workflow_run_id,
 )
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
@@ -131,6 +132,9 @@ class WorkflowModel(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
+
+    workflow_permanent_id = Column(String, default=generate_workflow_permanent_id)
+    version = Column(Integer, default=1)
 
 
 class WorkflowRunModel(Base):
