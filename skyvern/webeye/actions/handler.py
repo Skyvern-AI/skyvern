@@ -22,6 +22,7 @@ from skyvern.webeye.actions import actions
 from skyvern.webeye.actions.actions import (
     Action,
     ActionType,
+    CheckboxAction,
     ClickAction,
     ScrapeResult,
     SelectOptionAction,
@@ -305,7 +306,7 @@ async def handle_select_option_action(
             click_action = ClickAction(element_id=action.element_id)
             return await chain_click(task, page, click_action, child_anchor_xpath)
 
-        # handler the select action on <laebel>
+        # handler the select action on <label>
         select_element_id = get_select_id_in_label_children(scraped_page, action.element_id)
         if select_element_id is not None:
             LOG.info(
@@ -315,6 +316,17 @@ async def handle_select_option_action(
             )
             select_action = SelectOptionAction(element_id=select_element_id, option=action.option)
             return await handle_select_option_action(select_action, page, scraped_page, task, step)
+
+        # handle the select action on <label> of checkbox/radio
+        checkbox_element_id = get_checkbox_id_in_label_children(scraped_page, action.element_id)
+        if checkbox_element_id is not None:
+            LOG.info(
+                "SelectOptionAction is on <label> of <input> checkbox/radio. take the action on the real <input> checkbox/radio",
+                action=action,
+                checkbox_element_id=checkbox_element_id,
+            )
+            check_action = CheckboxAction(element_id=checkbox_element_id, is_checked=True)
+            return await handle_checkbox_action(check_action, page, scraped_page, task, step)
 
         return [ActionFailure(Exception("No anchor tag or select children found for the label for SelectOptionAction"))]
     elif tag_name == "a":
@@ -362,12 +374,13 @@ async def handle_select_option_action(
                 "SelectOptionAction on a non-listbox element. Cannot handle this action",
             )
             return [ActionFailure(Exception(f"Cannot handle SelectOptionAction on a non-listbox element"))]
-    elif tag_name == "input" and await locator.get_attribute(
-        "type", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) in ["radio", "checkbox"]:
-        # TODO: double click will uncheck the checkbox
-        click_action = ClickAction(element_id=action.element_id)
-        return await chain_click(task, page, click_action, xpath)
+    elif tag_name == "input" and element_dict.get("attributes", {}).get("type", None) in ["radio", "checkbox"]:
+        LOG.info(
+            "SelectOptionAction is on <input> checkbox/radio",
+            action=action,
+        )
+        check_action = CheckboxAction(element_id=action.element_id, is_checked=True)
+        return await handle_checkbox_action(check_action, page, scraped_page, task, step)
 
     current_text = await locator.input_value()
     if current_text == action.option.label:
@@ -391,6 +404,12 @@ async def handle_select_option_action(
                 xpath=xpath,
             )
         else:
+            LOG.warning(
+                "Failed to take select action",
+                exc_info=True,
+                action=action,
+                xpath=xpath,
+            )
             return [ActionFailure(e)]
 
     try:
@@ -638,6 +657,22 @@ def get_select_id_in_label_children(scraped_page: ScrapedPage, element_id: int) 
 
     for child in element.get("children", []):
         if child.get("tagName", "") == "select":
+            return child.get("id", None)
+
+    return None
+
+
+def get_checkbox_id_in_label_children(scraped_page: ScrapedPage, element_id: int) -> int | None:
+    """
+    search checkbox/radio in the children of <label>
+    """
+    LOG.info("Searching checkbox/radio in the label children", element_id=element_id)
+    element = scraped_page.id_to_element_dict.get(element_id, None)
+    if element is None:
+        return None
+
+    for child in element.get("children", []):
+        if child.get("tagName", "") == "input" and child.get("attributes", {}).get("type") in ["checkbox", "radio"]:
             return child.get("id", None)
 
     return None
