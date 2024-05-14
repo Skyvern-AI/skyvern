@@ -68,6 +68,7 @@ class BlockYAML(BaseModel, abc.ABC):
     block_type: BlockType
     label: str
     output_parameter_key: str | None = None
+    continue_on_failure: bool = False
 
 
 class TaskBlockYAML(BlockYAML):

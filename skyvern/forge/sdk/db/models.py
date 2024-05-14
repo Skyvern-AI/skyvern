@@ -1,6 +1,19 @@
 import datetime
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Enum, ForeignKey, Index, Integer, Numeric, String, UnicodeText
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Column,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    UnicodeText,
+    UniqueConstraint,
+)
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase
 
@@ -16,6 +29,7 @@ from skyvern.forge.sdk.db.id import (
     generate_task_id,
     generate_workflow_id,
     generate_workflow_parameter_id,
+    generate_workflow_permanent_id,
     generate_workflow_run_id,
 )
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
@@ -121,6 +135,10 @@ class ArtifactModel(Base):
 
 class WorkflowModel(Base):
     __tablename__ = "workflows"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "workflow_permanent_id", "version", name="uc_org_permanent_id_version"),
+        Index("permanent_id_version_idx", "workflow_permanent_id", "version"),
+    )
 
     workflow_id = Column(String, primary_key=True, index=True, default=generate_workflow_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
@@ -131,6 +149,9 @@ class WorkflowModel(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
+
+    workflow_permanent_id = Column(String, nullable=False, default=generate_workflow_permanent_id, index=True)
+    version = Column(Integer, default=1, nullable=False)
 
 
 class WorkflowRunModel(Base):

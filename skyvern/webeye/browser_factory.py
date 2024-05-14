@@ -224,17 +224,28 @@ class BrowserState:
         try:
             await page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
             LOG.info("Page is fully loaded, agent is about to take screenshots")
+            start_time = time.time()
+            screenshot: bytes = bytes()
             if file_path:
-                return await page.screenshot(
+                screenshot = await page.screenshot(
                     path=file_path,
                     full_page=full_page,
                     timeout=SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
                 )
-            return await page.screenshot(
+            else:
+                screenshot = await page.screenshot(
+                    full_page=full_page,
+                    timeout=SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
+                    animations="disabled",
+                )
+            end_time = time.time()
+            LOG.info(
+                f"Screenshot taking time",
+                screenshot_time=end_time - start_time,
                 full_page=full_page,
-                timeout=SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
-                animations="disabled",
+                file_path=file_path,
             )
+            return screenshot
         except TimeoutError as e:
             LOG.exception(f"Timeout error while taking screenshot: {str(e)}")
             raise FailedToTakeScreenshot(error_message=str(e)) from e

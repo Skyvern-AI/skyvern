@@ -34,6 +34,7 @@ USER_PREFIX = "u"
 STEP_PREFIX = "stp"
 ARTIFACT_PREFIX = "a"
 WORKFLOW_PREFIX = "w"
+WORKFLOW_PERMANENT_ID_PREFIX = "wpid"
 WORKFLOW_RUN_PREFIX = "wr"
 WORKFLOW_PARAMETER_PREFIX = "wp"
 AWS_SECRET_PARAMETER_PREFIX = "asp"
@@ -44,6 +45,11 @@ BITWARDEN_LOGIN_CREDENTIAL_PARAMETER_PREFIX = "blc"
 def generate_workflow_id() -> str:
     int_id = generate_id()
     return f"{WORKFLOW_PREFIX}_{int_id}"
+
+
+def generate_workflow_permanent_id() -> str:
+    int_id = generate_id()
+    return f"{WORKFLOW_PERMANENT_ID_PREFIX}_{int_id}"
 
 
 def generate_workflow_run_id() -> str:

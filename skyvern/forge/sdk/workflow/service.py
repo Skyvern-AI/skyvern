@@ -185,8 +185,18 @@ class WorkflowService:
                         block_idx=block_idx,
                         block_result=block_result,
                     )
-                    await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
-                    break
+                    if block.continue_on_failure:
+                        LOG.warning(
+                            f"Block with type {block.block_type} at index {block_idx} failed but will continue executing the workflow run {workflow_run_id}",
+                            block_type=block.block_type,
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            block_idx=block_idx,
+                            block_result=block_result,
+                            continue_on_failure=block.continue_on_failure,
+                        )
+                    else:
+                        await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
+                        break
 
             except Exception as e:
                 LOG.exception(
@@ -451,7 +461,8 @@ class WorkflowService:
 
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id)
         workflow_run_tasks = await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
-        screenshot_urls = []
+        screenshot_artifacts = []
+        screenshot_urls: list[str] | None = None
         # get the last screenshot for the last 3 tasks of the workflow run
         for task in workflow_run_tasks[::-1]:
             screenshot_artifact = await app.DATABASE.get_latest_artifact(
@@ -460,11 +471,11 @@ class WorkflowService:
                 organization_id=organization_id,
             )
             if screenshot_artifact:
-                screenshot_url = await app.ARTIFACT_MANAGER.get_share_link(screenshot_artifact)
-                if screenshot_url:
-                    screenshot_urls.append(screenshot_url)
-            if len(screenshot_urls) >= 3:
+                screenshot_artifacts.append(screenshot_artifact)
+            if len(screenshot_artifacts) >= 3:
                 break
+        if screenshot_artifacts:
+            screenshot_urls = await app.ARTIFACT_MANAGER.get_share_links(screenshot_artifacts)
 
         recording_url = None
         recording_artifact = await app.DATABASE.get_artifact_for_workflow_run(

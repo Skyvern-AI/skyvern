@@ -2,7 +2,7 @@ Identify actions to help user progress towards the user goal using the DOM eleme
 Include only the elements that are relevant to the user goal, without altering or imagining new elements.
 Use the details from the user details to fill in necessary values. Always satisfy required fields if the field isn't already filled in. Don't return any action for the same field, if this field is already filled in and the value is the same as the one you would have filled in.
 MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
-Each element is tagged with an ID.
+Each element is tagged with an ID and interactable value. You should only return actions on the interactable elements.
 If you see any information in red in the page screenshot, this means a condition wasn't satisfied. prioritize actions with the red information.
 If you see a popup in the page screenshot, prioritize actions on the popup.
 
@@ -16,6 +16,7 @@ Reply in JSON format with the following keys:
         "id": int, // The id of the element to take action on. The id has to be one from the elements list
         "text": str, // Text for INPUT_TEXT action only
         "file_url": str, // The url of the file to upload if applicable. This field must be present for UPLOAD_FILE but can also be present for CLICK only if the click is to upload the file. It should be null otherwise.
+        "download": bool, // Can only be true for CLICK actions. If true, the browser will trigger a download by clicking the element. If false, the browser will click the element without triggering a download.
         "option": {  // The option to select for SELECT_OPTION action only. null if not SELECT_OPTION action
             "label": str, // the label of the option if any. MAKE SURE YOU USE THIS LABEL TO SELECT THE OPTION. DO NOT PUT ANYTHING OTHER THAN A VALID OPTION LABEL HERE
             "index": int, // the id corresponding to the optionIndex under the the select element.

@@ -52,9 +52,7 @@ class DecisiveAction(Action, abc.ABC):
 class ClickAction(WebAction):
     action_type: ActionType = ActionType.CLICK
     file_url: str | None = None
-
-    def __repr__(self) -> str:
-        return f"ClickAction(element_id={self.element_id}, file_url={self.file_url})"
+    download: bool = False
 
 
 class InputTextAction(WebAction):
@@ -138,7 +136,13 @@ class CompleteAction(DecisiveAction):
 def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Action]:
     actions = []
     for action in json_response:
-        element_id = action["id"]
+        if "id" in action:
+            element_id = action["id"]
+        elif "element_id" in action:
+            element_id = action["element_id"]
+        else:
+            element_id = None
+
         reasoning = action["reasoning"] if "reasoning" in action else None
         if "action_type" not in action or action["action_type"] is None:
             actions.append(NullAction(reasoning=reasoning))
@@ -156,7 +160,14 @@ def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Actio
             actions.append(TerminateAction(reasoning=reasoning, errors=action["errors"] if "errors" in action else []))
         elif action_type == ActionType.CLICK:
             file_url = action["file_url"] if "file_url" in action else None
-            actions.append(ClickAction(element_id=element_id, reasoning=reasoning, file_url=file_url))
+            actions.append(
+                ClickAction(
+                    element_id=element_id,
+                    reasoning=reasoning,
+                    file_url=file_url,
+                    download=action.get("download", False),
+                )
+            )
         elif action_type == ActionType.INPUT_TEXT:
             actions.append(InputTextAction(element_id=element_id, text=action["text"], reasoning=reasoning))
         elif action_type == ActionType.UPLOAD_FILE:

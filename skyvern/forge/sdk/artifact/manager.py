@@ -71,6 +71,9 @@ class ArtifactManager:
     async def get_share_link(self, artifact: Artifact) -> str | None:
         return await app.STORAGE.get_share_link(artifact)
 
+    async def get_share_links(self, artifacts: list[Artifact]) -> list[str] | None:
+        return await app.STORAGE.get_share_links(artifacts)
+
     async def wait_for_upload_aiotasks_for_task(self, task_id: str) -> None:
         try:
             st = time.time()

@@ -81,3 +81,23 @@ export type TaskApiResponse = {
 export type User = {
   name: string;
 };
+
+export type OrganizationApiResponse = {
+  created_at: string;
+  modified_at: string;
+  max_retries_per_step: number | null;
+  max_steps_per_run: number | null;
+  organization_id: string;
+  organization_name: string;
+  webhook_callback_url: string | null;
+};
+
+export type ApiKeyApiResponse = {
+  id: string;
+  organization_id: string;
+  token: string;
+  created_at: string;
+  modified_at: string;
+  token_type: string;
+  valid: boolean;
+};
