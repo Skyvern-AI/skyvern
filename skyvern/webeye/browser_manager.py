@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import structlog
-from playwright.async_api import Browser, Playwright, async_playwright
+from playwright.async_api import async_playwright
 
 from skyvern.exceptions import MissingBrowserState
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
@@ -130,14 +130,6 @@ class BrowserManager:
             "HAR data not found for task", task_id=task_id, workflow_id=workflow_id, workflow_run_id=workflow_run_id
         )
         return b""
-
-    @classmethod
-    async def connect_to_scraping_browser(cls, pw: Playwright) -> Browser:
-        if not SettingsManager.get_settings().REMOTE_BROWSER_KEY:
-            raise Exception("REMOTE_BROWSER_KEY is empty. Cannot connect to remote browser.")
-        browser = await pw.chromium.connect_over_cdp(SettingsManager.get_settings().REMOTE_BROWSER_KEY)
-        LOG.info("Connected to remote browser", browser_type=SettingsManager.get_settings().BROWSER_TYPE)
-        return browser
 
     @classmethod
     async def close(cls) -> None:
