@@ -142,9 +142,28 @@ async def handle_click_action(
 ) -> list[ActionResult]:
     xpath = await validate_actions_in_dom(action, page, scraped_page)
     await asyncio.sleep(0.3)
+    if action.download:
+        return await handle_click_to_download_file_action(action, page, scraped_page)
     return await chain_click(
         task, page, action, xpath, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
     )
+
+
+async def handle_click_to_download_file_action(
+    action: actions.ClickAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+) -> list[ActionResult]:
+    xpath = await validate_actions_in_dom(action, page, scraped_page)
+    try:
+        await page.click(
+            f"xpath={xpath}", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS, modifiers=["Alt"]
+        )
+    except Exception as e:
+        LOG.exception("ClickAction with download failed", action=action, exc_info=True)
+        return [ActionFailure(e, download_triggered=False)]
+
+    return [ActionSuccess()]
 
 
 async def handle_input_text_action(

@@ -26,6 +26,7 @@ RESERVED_ATTRIBUTES = {
     "aria-role",
     "aria-selected",  # for option tag
     "checked",
+    "data-original-title",  # for bootstrap tooltip
     "data-ui",
     "for",
     "href",  # For a tags
@@ -373,7 +374,7 @@ def _trimmed_attributes(tag_name: str, attributes: dict) -> dict:
             new_attributes[key] = attributes[key]
         if key == "role" and attributes[key] in ["listbox", "option"]:
             new_attributes[key] = attributes[key]
-        if key in RESERVED_ATTRIBUTES:
+        if key in RESERVED_ATTRIBUTES and attributes[key]:
             new_attributes[key] = attributes[key]
     return new_attributes
 
