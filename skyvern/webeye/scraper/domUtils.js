@@ -358,8 +358,7 @@ function isInteractable(element) {
   if (
     element.hasAttribute("onclick") ||
     element.isContentEditable ||
-    element.hasAttribute("jsaction") ||
-    getEventListeners(element).click !== undefined
+    element.hasAttribute("jsaction")
   ) {
     return true;
   }
