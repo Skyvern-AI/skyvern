@@ -5,7 +5,6 @@ from playwright.async_api import async_playwright
 
 from skyvern.exceptions import MissingBrowserState
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
-from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.webeye.browser_factory import BrowserContextFactory, BrowserState
 
