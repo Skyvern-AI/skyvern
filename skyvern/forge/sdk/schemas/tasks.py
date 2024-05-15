@@ -208,23 +208,5 @@ class TaskResponse(BaseModel):
     errors: list[dict[str, Any]] = []
 
 
-class TaskOutput(BaseModel):
-    task_id: str
-    status: TaskStatus
-    extracted_information: list | dict[str, Any] | str | None = None
-    failure_reason: str | None = None
-    errors: list[dict[str, Any]] = []
-
-    @staticmethod
-    def from_task(task: Task) -> TaskOutput:
-        return TaskOutput(
-            task_id=task.task_id,
-            status=task.status,
-            extracted_information=task.extracted_information,
-            failure_reason=task.failure_reason,
-            errors=task.errors,
-        )
-
-
 class CreateTaskResponse(BaseModel):
     task_id: str
