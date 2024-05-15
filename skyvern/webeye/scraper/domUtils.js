@@ -246,9 +246,13 @@ function isElementVisible(element) {
   return true;
 }
 
-function isHiddenOrDisabled(element) {
+function isHidden(element) {
   const style = getElementComputedStyle(element);
-  return style?.display === "none" || element.hidden || element.disabled;
+  return style?.display === "none" || element.hidden;
+}
+
+function isHiddenOrDisabled(element) {
+  return isHidden(element) || element.disabled;
 }
 
 function isScriptOrStyle(element) {
@@ -445,6 +449,10 @@ const checkRequiredFromStyle = (element) => {
     return true;
   }
 
+  if (!element.className || typeof element.className !== "string") {
+    return false;
+  }
+
   return element.className.toLowerCase().includes("require");
 };
 
@@ -611,7 +619,7 @@ function buildTreeFromBody() {
     });
   };
 
-  function buildElementObject(element) {
+  function buildElementObject(element, interactable) {
     var element_id = elements.length;
     var elementTagNameLower = element.tagName.toLowerCase();
     element.setAttribute("unique_id", element_id);
@@ -658,6 +666,7 @@ function buildTreeFromBody() {
 
     let elementObj = {
       id: element_id,
+      interactable: interactable,
       tagName: elementTagNameLower,
       attributes: attrs,
       text: getElementContent(element),
@@ -704,22 +713,22 @@ function buildTreeFromBody() {
       return [];
     }
   }
-  function processElement(element, interactableParentId) {
+  function processElement(element, parentId) {
     // Check if the element is interactable
     if (isInteractable(element)) {
-      var elementObj = buildElementObject(element);
+      var elementObj = buildElementObject(element, true);
       elements.push(elementObj);
       // If the element is interactable but has no interactable parent,
       // then it starts a new tree, so add it to the result array
       // and set its id as the interactable parent id for the next elements
       // under it
-      if (interactableParentId === null) {
+      if (parentId === null) {
         resultArray.push(elementObj);
       }
       // If the element is interactable and has an interactable parent,
       // then add it to the children of the parent
       else {
-        elements[interactableParentId].children.push(elementObj);
+        elements[parentId].children.push(elementObj);
       }
       // options already added to the select.options, no need to add options anymore
       if (elementObj.options && elementObj.options.length > 0) {
@@ -731,11 +740,38 @@ function buildTreeFromBody() {
       });
       return elementObj;
     } else {
-      // For a non-interactable element, process its children
+      // For a non-interactable element, if it has direct text, we also tagged
+      // it with unique_id, but with interatable=false in the element.
+      // After that, process its children
       // and check if any of them are interactable
       let interactableChildren = [];
+      if (
+        isElementVisible(element) &&
+        !isHidden(element) &&
+        !isScriptOrStyle(element)
+      ) {
+        let textContent = "";
+        for (let i = 0; i < element.childNodes.length; i++) {
+          var node = element.childNodes[i];
+          if (node.nodeType === Node.TEXT_NODE) {
+            textContent += node.textContent.trim();
+          }
+        }
+
+        // character length limit for non-interactable elements should be 100
+        if (textContent && textContent.length <= 100) {
+          var elementObj = buildElementObject(element, false);
+          elements.push(elementObj);
+          if (parentId === null) {
+            resultArray.push(elementObj);
+          } else {
+            elements[parentId].children.push(elementObj);
+          }
+          parentId = elementObj.id;
+        }
+      }
       getChildElements(element).forEach((child) => {
-        let children = processElement(child, interactableParentId);
+        let children = processElement(child, parentId);
       });
     }
   }
@@ -754,7 +790,8 @@ function buildTreeFromBody() {
       if (parentEle) {
         if (
           targetParentElements.has(parentEle.tagName.toLowerCase()) ||
-          checkParentClass(parentEle.className.toLowerCase())
+          (typeof parentEle.className === "string" &&
+            checkParentClass(parentEle.className.toLowerCase()))
         ) {
           targetContextualParent = parentEle;
         }

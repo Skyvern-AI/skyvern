@@ -49,6 +49,7 @@ if not any(
         SettingsManager.get_settings().ENABLE_OPENAI,
         SettingsManager.get_settings().ENABLE_ANTHROPIC,
         SettingsManager.get_settings().ENABLE_AZURE,
+        SettingsManager.get_settings().ENABLE_BEDROCK,
     ]
 ):
     raise NoProviderEnabledError()
