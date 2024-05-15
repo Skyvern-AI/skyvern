@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     # LLM Configuration #
     #####################
     # ACTIVE LLM PROVIDER
-    LLM_KEY: str = "OPENAI_GPT4V"
+    LLM_KEY: str = "DYNAMIC_LLM_SELECTION"
     # COMMON
     LLM_CONFIG_MAX_TOKENS: int = 4096
     LLM_CONFIG_TEMPERATURE: float = 0
@@ -71,6 +71,7 @@ class Settings(BaseSettings):
     ENABLE_ANTHROPIC: bool = False
     ENABLE_AZURE: bool = False
     ENABLE_BEDROCK: bool = False
+    ENABLE_GPT_4O: bool = False
     # OPENAI
     OPENAI_API_KEY: str | None = None
     # ANTHROPIC
@@ -80,6 +81,10 @@ class Settings(BaseSettings):
     AZURE_API_KEY: str | None = None
     AZURE_API_BASE: str | None = None
     AZURE_API_VERSION: str | None = None
+
+    # GPT-4o settings
+    GPT_4O_ENABLED: bool = False
+    GPT_4O_API_KEY: str | None = None
 
     def is_cloud_environment(self) -> bool:
         """

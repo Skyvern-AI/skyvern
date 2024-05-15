@@ -9,6 +9,9 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 from skyvern.forge.sdk.api.llm.models import LLMConfig, LLMRouterConfig
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
+from skyvern.config import Settings
+
+
 LOG = structlog.get_logger()
 
 
@@ -43,6 +46,17 @@ class LLMConfigRegistry:
         return cls._configs[llm_key]
 
 
+# Check if GPT-4o is enabled and register it
+if SettingsManager.get_settings().ENABLE_GPT_4O:
+    LLMConfigRegistry.register_config(
+        "GPT_4O_MODEL_NAME",  # Replace with the actual model name
+        LLMConfig(
+            "gpt-4o-model-name",  # Replace with the actual model identifier
+            ["GPT_4O_API_KEY"],  # Use the API key defined in your settings
+            supports_vision=False,  # Set according to the model's capabilities
+            add_assistant_prefix=False,  # Adjust based on your naming conventions
+        ),
+    )
 # if none of the LLM providers are enabled, raise an error
 if not any(
     [
