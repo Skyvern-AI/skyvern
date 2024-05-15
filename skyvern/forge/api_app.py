@@ -10,7 +10,7 @@ from starlette.requests import HTTPConnection, Request
 from starlette_context.middleware import RawContextMiddleware
 from starlette_context.plugins.base import Plugin
 
-from skyvern.exceptions import WorkflowNotFound
+from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -74,9 +74,9 @@ def get_agent_app(router: APIRouter = base_router) -> FastAPI:
 
         LOG.info("Server startup complete. Skyvern is now online")
 
-    @app.exception_handler(WorkflowNotFound)
-    async def handle_workflow_not_found(request: Request, exc: WorkflowNotFound) -> JSONResponse:
-        return JSONResponse(status_code=404, content={"detail": exc.message})
+    @app.exception_handler(SkyvernHTTPException)
+    async def handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
 
     @app.exception_handler(Exception)
     async def unexpected_exception(request: Request, exc: Exception) -> JSONResponse:
