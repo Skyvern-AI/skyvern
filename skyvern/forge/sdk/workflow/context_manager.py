@@ -232,6 +232,11 @@ class WorkflowRunContext:
                 and isinstance(parameter.source, OutputParameter)
                 and parameter.source.key == output_parameter.key
             ):
+                value = (
+                    value["extracted_information"]
+                    if isinstance(value, dict) and "extracted_information" in value
+                    else value
+                )
                 if parameter.value:
                     LOG.warning(
                         f"Context parameter {parameter.key} already has a value, overwriting",

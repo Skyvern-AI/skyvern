@@ -339,14 +339,25 @@ class ForLoopBlock(Block):
         return context_parameters
 
     def get_loop_over_parameter_values(self, workflow_run_context: WorkflowRunContext) -> list[Any]:
-        if isinstance(self.loop_over, WorkflowParameter) or isinstance(self.loop_over, OutputParameter):
+        if isinstance(self.loop_over, WorkflowParameter):
             parameter_value = workflow_run_context.get_value(self.loop_over.key)
+        elif isinstance(self.loop_over, OutputParameter):
+            # If the output parameter is for a TaskBlock, it will be a TaskOutput object. We need to extract the
+            # value from the TaskOutput object's extracted_information field.
+            output_parameter_value = workflow_run_context.get_value(self.loop_over.key)
+            if isinstance(output_parameter_value, dict) and "extracted_information" in output_parameter_value:
+                parameter_value = output_parameter_value["extracted_information"]
+            else:
+                parameter_value = output_parameter_value
         elif isinstance(self.loop_over, ContextParameter):
             parameter_value = self.loop_over.value
             if not parameter_value:
                 source_parameter_value = workflow_run_context.get_value(self.loop_over.source.key)
                 if isinstance(source_parameter_value, dict):
-                    parameter_value = source_parameter_value.get(self.loop_over.key)
+                    if "extracted_information" in source_parameter_value:
+                        parameter_value = source_parameter_value["extracted_information"].get(self.loop_over.key)
+                    else:
+                        parameter_value = source_parameter_value.get(self.loop_over.key)
                 else:
                     raise ValueError("ContextParameter source value should be a dict")
         else:
