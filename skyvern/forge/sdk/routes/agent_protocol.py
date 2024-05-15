@@ -412,7 +412,7 @@ async def get_agent_task_step_artifacts(
             for i, artifact in enumerate(artifacts):
                 artifact.signed_url = signed_urls[i]
         else:
-            LOG.error("Failed to get signed urls for artifacts", task_id=task_id, step_id=step_id)
+            LOG.warning("Failed to get signed urls for artifacts", task_id=task_id, step_id=step_id)
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
 
