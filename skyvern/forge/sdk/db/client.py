@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Sequence
 
 import structlog
 from sqlalchemy import and_, delete, select
@@ -234,7 +234,7 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def get_task_step_models(self, task_id: str, organization_id: str | None = None) -> list[StepModel]:
+    async def get_task_step_models(self, task_id: str, organization_id: str | None = None) -> Sequence[StepModel]:
         try:
             async with self.Session() as session:
                 return (
