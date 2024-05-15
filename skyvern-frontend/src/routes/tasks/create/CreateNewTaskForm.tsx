@@ -33,8 +33,9 @@ import {
 import { ToastAction } from "@radix-ui/react-toast";
 import { Link } from "react-router-dom";
 import fetchToCurl from "fetch-to-curl";
-import { apiBaseUrl, envCredential } from "@/util/env";
+import { apiBaseUrl } from "@/util/env";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useApiCredential } from "@/hooks/useApiCredential";
 
 const createNewTaskFormSchema = z.object({
   url: z.string().url({
@@ -70,6 +71,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const credentialGetter = useCredentialGetter();
+  const apiCredential = useApiCredential();
 
   const form = useForm<CreateNewTaskFormValues>({
     resolver: zodResolver(createNewTaskFormSchema),
@@ -302,7 +304,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                 body: createTaskRequestObject(form.getValues()),
                 headers: {
                   "Content-Type": "application/json",
-                  "x-api-key": envCredential ?? "<your-api-key>",
+                  "x-api-key": apiCredential ?? "<your-api-key>",
                 },
               });
               await navigator.clipboard.writeText(curl);
