@@ -532,3 +532,88 @@ async def create_workflow(
     return await app.WORKFLOW_SERVICE.create_workflow_from_request(
         organization_id=current_org.organization_id, request=workflow_create_request
     )
+
+
+@base_router.put(
+    "/workflows/{workflow_permanent_id}",
+    openapi_extra={
+        "requestBody": {
+            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
+            "required": True,
+        },
+    },
+    response_model=Workflow,
+)
+@base_router.put(
+    "/workflows/{workflow_permanent_id}/",
+    openapi_extra={
+        "requestBody": {
+            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
+            "required": True,
+        },
+    },
+    response_model=Workflow,
+    include_in_schema=False,
+)
+async def update_workflow(
+    workflow_permanent_id: str,
+    request: Request,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Workflow:
+    analytics.capture("skyvern-oss-agent-workflow-update")
+    # validate the workflow
+    raw_yaml = await request.body()
+    try:
+        workflow_yaml = yaml.safe_load(raw_yaml)
+    except yaml.YAMLError:
+        raise HTTPException(status_code=422, detail="Invalid YAML")
+
+    workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
+    return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+        organization_id=current_org.organization_id,
+        request=workflow_create_request,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+
+
+@base_router.delete("/workflows/{workflow_permanent_id}")
+@base_router.delete("/workflows/{workflow_permanent_id}/", include_in_schema=False)
+async def delete_workflow(
+    workflow_permanent_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> None:
+    analytics.capture("skyvern-oss-agent-workflow-delete")
+    await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(workflow_permanent_id, current_org.organization_id)
+
+
+@base_router.get("/workflows", response_model=list[Workflow])
+@base_router.get("/workflows/", response_model=list[Workflow])
+async def get_workflows(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> list[Workflow]:
+    """
+    Get all workflows with the latest version for the organization.
+    """
+    analytics.capture("skyvern-oss-agent-workflows-get")
+    return await app.WORKFLOW_SERVICE.get_workflows_by_organization_id(
+        organization_id=current_org.organization_id,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@base_router.get("/workflows/{workflow_permanent_id}", response_model=Workflow)
+@base_router.get("/workflows/{workflow_permanent_id}/", response_model=Workflow)
+async def get_workflow(
+    workflow_permanent_id: str,
+    version: int | None = None,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Workflow:
+    analytics.capture("skyvern-oss-agent-workflows-get")
+    return await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+        version=version,
+    )
