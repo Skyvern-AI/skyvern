@@ -107,8 +107,22 @@ class UnknownBlockType(SkyvernException):
 
 
 class WorkflowNotFound(SkyvernHTTPException):
-    def __init__(self, workflow_id: str) -> None:
-        super().__init__(f"Workflow {workflow_id} not found", status_code=status.HTTP_404_NOT_FOUND)
+    def __init__(
+        self,
+        workflow_id: str | None = None,
+        workflow_permanent_id: str | None = None,
+        version: int | None = None,
+    ) -> None:
+        workflow_repr = ""
+        if workflow_id:
+            workflow_repr = f"workflow_id={workflow_id}"
+        if workflow_permanent_id:
+            if version:
+                workflow_repr = f"workflow_permanent_id={workflow_permanent_id}, version={version}"
+            else:
+                workflow_repr = f"workflow_permanent_id={workflow_permanent_id}"
+
+        super().__init__(f"Workflow not found. {workflow_repr}", status_code=status.HTTP_404_NOT_FOUND)
 
 
 class WorkflowRunNotFound(SkyvernException):

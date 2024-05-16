@@ -145,6 +145,8 @@ class WorkflowModel(Base):
     title = Column(String, nullable=False)
     description = Column(String, nullable=True)
     workflow_definition = Column(JSON, nullable=False)
+    proxy_location = Column(Enum(ProxyLocation))
+    webhook_callback_url = Column(String)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

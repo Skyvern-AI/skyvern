@@ -42,8 +42,12 @@ class Workflow(BaseModel):
     workflow_id: str
     organization_id: str
     title: str
+    workflow_permanent_id: str
+    version: int
     description: str | None = None
     workflow_definition: WorkflowDefinition
+    proxy_location: ProxyLocation | None = None
+    webhook_callback_url: str | None = None
 
     created_at: datetime
     modified_at: datetime

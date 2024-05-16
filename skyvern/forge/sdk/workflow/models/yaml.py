@@ -3,6 +3,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
 
+from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.workflow.models.block import BlockType
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
 
@@ -187,4 +188,6 @@ class WorkflowDefinitionYAML(BaseModel):
 class WorkflowCreateYAMLRequest(BaseModel):
     title: str
     description: str | None = None
+    proxy_location: ProxyLocation | None = None
+    webhook_callback_url: str | None = None
     workflow_definition: WorkflowDefinitionYAML
