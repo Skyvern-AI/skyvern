@@ -22,7 +22,9 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskStatus
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
+    InvalidWorkflowDefinition,
     WorkflowDefinitionHasDuplicateParameterKeys,
+    WorkflowDefinitionHasReservedParameterKeys,
 )
 from skyvern.forge.sdk.workflow.models.block import (
     BlockResult,
@@ -56,7 +58,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowRunStatusResponse,
 )
-from skyvern.forge.sdk.workflow.models.yaml import BLOCK_YAML_TYPES, WorkflowCreateYAMLRequest
+from skyvern.forge.sdk.workflow.models.yaml import BLOCK_YAML_TYPES, ForLoopBlockYAML, WorkflowCreateYAMLRequest
 from skyvern.webeye.browser_factory import BrowserState
 
 LOG = structlog.get_logger()
@@ -760,6 +762,29 @@ class WorkflowService:
             parameters: dict[str, PARAMETER_TYPE] = {}
             duplicate_parameter_keys = set()
 
+            # Check if user's trying to manually create an output parameter
+            if any(
+                parameter.parameter_type == ParameterType.OUTPUT for parameter in request.workflow_definition.parameters
+            ):
+                raise InvalidWorkflowDefinition(message="Cannot manually create output parameters")
+
+            # Check if any parameter keys collide with automatically created output parameter keys
+            block_labels = [block.label for block in request.workflow_definition.blocks]
+            # TODO (kerem): Check if block labels are unique
+            output_parameter_keys = [f"{block_label}_output" for block_label in block_labels]
+            parameter_keys = [parameter.key for parameter in request.workflow_definition.parameters]
+            if any(key in output_parameter_keys for key in parameter_keys):
+                raise WorkflowDefinitionHasReservedParameterKeys(
+                    reserved_keys=output_parameter_keys, parameter_keys=parameter_keys
+                )
+
+            # Create output parameters for all blocks
+            block_output_parameters = await WorkflowService._create_all_output_parameters_for_workflow(
+                workflow_id=workflow.workflow_id, block_yamls=request.workflow_definition.blocks
+            )
+            for block_output_parameter in block_output_parameters.values():
+                parameters[block_output_parameter.key] = block_output_parameter
+
             # We're going to process context parameters after other parameters since they depend on the other parameters
             context_parameter_yamls = []
 
@@ -833,7 +858,7 @@ class WorkflowService:
             block_label_mapping = {}
             blocks = []
             for block_yaml in request.workflow_definition.blocks:
-                block = await self.block_yaml_to_block(block_yaml, parameters)
+                block = await self.block_yaml_to_block(workflow, block_yaml, parameters)
                 blocks.append(block)
                 block_label_mapping[block.label] = block
 
@@ -858,8 +883,38 @@ class WorkflowService:
             raise e
 
     @staticmethod
-    async def block_yaml_to_block(block_yaml: BLOCK_YAML_TYPES, parameters: dict[str, Parameter]) -> BlockTypeVar:
-        output_parameter = parameters.get(block_yaml.output_parameter_key) if block_yaml.output_parameter_key else None
+    async def _create_output_parameter_for_block(workflow_id: str, block_yaml: BLOCK_YAML_TYPES) -> OutputParameter:
+        output_parameter_key = f"{block_yaml.label}_output"
+        return await app.DATABASE.create_output_parameter(
+            workflow_id=workflow_id,
+            key=output_parameter_key,
+            description=f"Output parameter for block {block_yaml.label}",
+        )
+
+    @staticmethod
+    async def _create_all_output_parameters_for_workflow(
+        workflow_id: str, block_yamls: list[BLOCK_YAML_TYPES]
+    ) -> dict[str, OutputParameter]:
+        output_parameters = {}
+        for block_yaml in block_yamls:
+            output_parameter = await WorkflowService._create_output_parameter_for_block(
+                workflow_id=workflow_id, block_yaml=block_yaml
+            )
+            output_parameters[block_yaml.label] = output_parameter
+            # Recursively create output parameters for for loop blocks
+            if isinstance(block_yaml, ForLoopBlockYAML):
+                output_parameters.update(
+                    await WorkflowService._create_all_output_parameters_for_workflow(
+                        workflow_id=workflow_id, block_yamls=block_yaml.loop_blocks
+                    )
+                )
+        return output_parameters
+
+    @staticmethod
+    async def block_yaml_to_block(
+        workflow: Workflow, block_yaml: BLOCK_YAML_TYPES, parameters: dict[str, Parameter]
+    ) -> BlockTypeVar:
+        output_parameter = parameters[f"{block_yaml.label}_output"]
         if block_yaml.block_type == BlockType.TASK:
             task_block_parameters = (
                 [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
@@ -880,7 +935,7 @@ class WorkflowService:
             )
         elif block_yaml.block_type == BlockType.FOR_LOOP:
             loop_blocks = [
-                await WorkflowService.block_yaml_to_block(loop_block, parameters)
+                await WorkflowService.block_yaml_to_block(workflow, loop_block, parameters)
                 for loop_block in block_yaml.loop_blocks
             ]
             loop_over_parameter = parameters[block_yaml.loop_over_parameter_key]
