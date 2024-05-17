@@ -17,7 +17,11 @@ class BaseExperimentationProvider(ABC):
         if feature_name not in self.result_map:
             self.result_map[feature_name] = {}
         if distinct_id not in self.result_map[feature_name]:
-            self.result_map[feature_name][distinct_id] = self.is_feature_enabled(feature_name, distinct_id, properties)
+            feature_flag_value = self.is_feature_enabled(feature_name, distinct_id, properties)
+            self.result_map[feature_name][distinct_id] = feature_flag_value
+            if feature_flag_value:
+                LOG.info("Feature flag is enabled", flag=feature_name, distinct_id=distinct_id)
+
         return self.result_map[feature_name][distinct_id]
 
 
