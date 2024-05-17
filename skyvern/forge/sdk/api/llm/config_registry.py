@@ -42,6 +42,7 @@ class LLMConfigRegistry:
 
         return cls._configs[llm_key]
 
+
 # if none of the LLM providers are enabled, raise an error
 if not any(
     [
