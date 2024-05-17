@@ -1,6 +1,7 @@
 import asyncio
 import json
 import random
+from asyncio.exceptions import CancelledError
 from datetime import datetime
 from typing import Any, Tuple
 
@@ -538,6 +539,20 @@ class ForgeAgent:
                 output=detailed_agent_step_output.to_agent_step_output(),
             )
             return completed_step, detailed_agent_step_output
+        except CancelledError:
+            LOG.exception(
+                "CancelledError in agent_step, marking step as failed",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                step_order=step.order,
+                step_retry=step.retry_index,
+            )
+            failed_step = await self.update_step(
+                step=step,
+                status=StepStatus.failed,
+                output=detailed_agent_step_output.to_agent_step_output(),
+            )
+            return failed_step, detailed_agent_step_output
         except Exception:
             LOG.exception(
                 "Unexpected exception in agent_step, marking step as failed",
