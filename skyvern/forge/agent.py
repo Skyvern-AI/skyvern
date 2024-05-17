@@ -935,7 +935,7 @@ class ForgeAgent:
                 artifact_types=[ArtifactType.SCREENSHOT_ACTION],
                 n=SettingsManager.get_settings().TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
             )
-
+            latest_action_screenshot_urls: list[str] | None = []
             if latest_action_screenshot_artifacts:
                 latest_action_screenshot_urls = await app.ARTIFACT_MANAGER.get_share_links(
                     latest_action_screenshot_artifacts
