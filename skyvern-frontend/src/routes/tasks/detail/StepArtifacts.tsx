@@ -111,7 +111,7 @@ function StepArtifacts({ id, stepProps }: Props) {
       </TabsContent>
       <TabsContent value="screenshot_llm">
         {llmScreenshots && llmScreenshots.length > 0 ? (
-          <div className="grid grid-cols-3 gap-4 p-4">
+          <div className="grid grid-cols-2 gap-4 p-4">
             {llmScreenshots.map((artifact, index) => (
               <ZoomableImage
                 key={index}
@@ -122,7 +122,7 @@ function StepArtifacts({ id, stepProps }: Props) {
             ))}
           </div>
         ) : isFetching ? (
-          <div className="grid grid-cols-3 gap-4 p-4">
+          <div className="grid grid-cols-2 gap-4 p-4">
             <Skeleton className="w-full h-full" />
             <Skeleton className="w-full h-full" />
             <Skeleton className="w-full h-full" />
@@ -133,7 +133,7 @@ function StepArtifacts({ id, stepProps }: Props) {
       </TabsContent>
       <TabsContent value="screenshot_action">
         {actionScreenshots && actionScreenshots.length > 0 ? (
-          <div className="grid grid-cols-3 gap-4 p-4">
+          <div className="grid grid-cols-2 gap-4 p-4">
             {actionScreenshots.map((artifact, index) => (
               <ZoomableImage
                 key={index}
