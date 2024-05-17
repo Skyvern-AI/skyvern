@@ -28,7 +28,11 @@ class LocalStorage(BaseStorage):
             with open(file_path, "wb") as f:
                 f.write(data)
         except Exception:
-            LOG.exception("Failed to store artifact locally.", file_path=file_path, artifact=artifact)
+            LOG.exception(
+                "Failed to store artifact locally.",
+                file_path=file_path,
+                artifact=artifact,
+            )
 
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
         file_path = None
@@ -37,7 +41,11 @@ class LocalStorage(BaseStorage):
             self._create_directories_if_not_exists(file_path)
             Path(path).replace(file_path)
         except Exception:
-            LOG.exception("Failed to store artifact locally.", file_path=file_path, artifact=artifact)
+            LOG.exception(
+                "Failed to store artifact locally.",
+                file_path=file_path,
+                artifact=artifact,
+            )
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         file_path = None
@@ -46,7 +54,11 @@ class LocalStorage(BaseStorage):
             with open(file_path, "rb") as f:
                 return f.read()
         except Exception:
-            LOG.exception("Failed to retrieve local artifact.", file_path=file_path, artifact=artifact)
+            LOG.exception(
+                "Failed to retrieve local artifact.",
+                file_path=file_path,
+                artifact=artifact,
+            )
             return None
 
     async def get_share_link(self, artifact: Artifact) -> str:

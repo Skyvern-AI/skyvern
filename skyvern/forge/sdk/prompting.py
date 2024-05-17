@@ -78,7 +78,12 @@ class PromptEngine:
             matches = get_close_matches(target, model_dirs, n=1, cutoff=0.1)
             return matches[0]
         except Exception:
-            LOG.error("Failed to get closest match.", target=target, model_dirs=model_dirs, exc_info=True)
+            LOG.error(
+                "Failed to get closest match.",
+                target=target,
+                model_dirs=model_dirs,
+                exc_info=True,
+            )
             raise
 
     def load_prompt(self, template: str, **kwargs: Any) -> str:
@@ -97,7 +102,12 @@ class PromptEngine:
             jinja_template = self.env.get_template(f"{template}.j2")
             return jinja_template.render(**kwargs)
         except Exception:
-            LOG.error("Failed to load prompt.", template=template, kwargs_keys=kwargs.keys(), exc_info=True)
+            LOG.error(
+                "Failed to load prompt.",
+                template=template,
+                kwargs_keys=kwargs.keys(),
+                exc_info=True,
+            )
             raise
 
     def load_prompt_from_string(self, template: str, **kwargs: Any) -> str:
@@ -115,5 +125,10 @@ class PromptEngine:
             jinja_template = self.env.from_string(template)
             return jinja_template.render(**kwargs)
         except Exception:
-            LOG.error("Failed to load prompt from string.", template=template, kwargs_keys=kwargs.keys(), exc_info=True)
+            LOG.error(
+                "Failed to load prompt from string.",
+                template=template,
+                kwargs_keys=kwargs.keys(),
+                exc_info=True,
+            )
             raise

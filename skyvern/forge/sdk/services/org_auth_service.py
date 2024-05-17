@@ -39,7 +39,9 @@ async def get_current_org(
     )
 
 
-async def get_current_org_with_api_key(x_api_key: Annotated[str | None, Header()] = None) -> Organization:
+async def get_current_org_with_api_key(
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> Organization:
     if not x_api_key:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -48,7 +50,9 @@ async def get_current_org_with_api_key(x_api_key: Annotated[str | None, Header()
     return await _get_current_org_cached(x_api_key, app.DATABASE)
 
 
-async def get_current_org_with_authentication(authorization: Annotated[str | None, Header()] = None) -> Organization:
+async def get_current_org_with_authentication(
+    authorization: Annotated[str | None, Header()] = None,
+) -> Organization:
     if not authorization:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

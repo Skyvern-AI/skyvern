@@ -17,4 +17,10 @@ if __name__ == "__main__":
     load_dotenv()
 
     reload = SettingsManager.get_settings().ENV == "local"
-    uvicorn.run("skyvern.forge.api_app:app", host="0.0.0.0", port=port, log_level="info", reload=reload)
+    uvicorn.run(
+        "skyvern.forge.api_app:app",
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+        reload=reload,
+    )

@@ -184,7 +184,11 @@ class AgentDB:
                 ).first():
                     return convert_to_task(task_obj, self.debug_enabled)
                 else:
-                    LOG.info("Task not found", task_id=task_id, organization_id=organization_id)
+                    LOG.info(
+                        "Task not found",
+                        task_id=task_id,
+                        organization_id=organization_id,
+                    )
                     return None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
@@ -266,7 +270,11 @@ class AgentDB:
                 ).first():
                     return convert_to_step(step, debug_enabled=self.debug_enabled)
                 else:
-                    LOG.info("Latest step not found", task_id=task_id, organization_id=organization_id)
+                    LOG.info(
+                        "Latest step not found",
+                        task_id=task_id,
+                        organization_id=organization_id,
+                    )
                     return None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
@@ -812,7 +820,10 @@ class AgentDB:
                     )
                     .where(WorkflowModel.organization_id == organization_id)
                     .where(WorkflowModel.deleted_at.is_(None))
-                    .group_by(WorkflowModel.organization_id, WorkflowModel.workflow_permanent_id)
+                    .group_by(
+                        WorkflowModel.organization_id,
+                        WorkflowModel.workflow_permanent_id,
+                    )
                     .subquery()
                 )
                 main_query = (
@@ -924,7 +935,10 @@ class AgentDB:
                 await session.commit()
                 await session.refresh(workflow_run)
                 return convert_to_workflow_run(workflow_run)
-            LOG.error("WorkflowRun not found, nothing to update", workflow_run_id=workflow_run_id)
+            LOG.error(
+                "WorkflowRun not found, nothing to update",
+                workflow_run_id=workflow_run_id,
+            )
             return None
 
     async def get_workflow_run(self, workflow_run_id: str) -> WorkflowRun | None:
@@ -1066,7 +1080,10 @@ class AgentDB:
             raise
 
     async def create_workflow_run_output_parameter(
-        self, workflow_run_id: str, output_parameter_id: str, value: dict[str, Any] | list | str | None
+        self,
+        workflow_run_id: str,
+        output_parameter_id: str,
+        value: dict[str, Any] | list | str | None,
     ) -> WorkflowRunOutputParameter:
         try:
             async with self.Session() as session:
@@ -1149,7 +1166,9 @@ class AgentDB:
                         (
                             workflow_parameter,
                             convert_to_workflow_run_parameter(
-                                workflow_run_parameter, workflow_parameter, self.debug_enabled
+                                workflow_run_parameter,
+                                workflow_parameter,
+                                self.debug_enabled,
                             ),
                         )
                     )

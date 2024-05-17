@@ -38,15 +38,18 @@ LOG = structlog.get_logger()
 
 class ActionHandler:
     _handled_action_types: dict[
-        ActionType, Callable[[Action, Page, ScrapedPage, Task, Step], Awaitable[list[ActionResult]]]
+        ActionType,
+        Callable[[Action, Page, ScrapedPage, Task, Step], Awaitable[list[ActionResult]]],
     ] = {}
 
     _setup_action_types: dict[
-        ActionType, Callable[[Action, Page, ScrapedPage, Task, Step], Awaitable[list[ActionResult]]]
+        ActionType,
+        Callable[[Action, Page, ScrapedPage, Task, Step], Awaitable[list[ActionResult]]],
     ] = {}
 
     _teardown_action_types: dict[
-        ActionType, Callable[[Action, Page, ScrapedPage, Task, Step], Awaitable[list[ActionResult]]]
+        ActionType,
+        Callable[[Action, Page, ScrapedPage, Task, Step], Awaitable[list[ActionResult]]],
     ] = {}
 
     @classmethod
@@ -111,10 +114,19 @@ class ActionHandler:
                 return actions_result
 
             else:
-                LOG.error("Unsupported action type in handler", action=action, type=type(action))
+                LOG.error(
+                    "Unsupported action type in handler",
+                    action=action,
+                    type=type(action),
+                )
                 return [ActionFailure(Exception(f"Unsupported action type: {type(action)}"))]
         except MissingElement as e:
-            LOG.info("Known exceptions", action=action, exception_type=type(e), exception_message=str(e))
+            LOG.info(
+                "Known exceptions",
+                action=action,
+                exception_type=type(e),
+                exception_message=str(e),
+            )
             return [ActionFailure(e)]
         except MultipleElementsFound as e:
             LOG.exception(
@@ -128,7 +140,11 @@ class ActionHandler:
 
 
 async def handle_solve_captcha_action(
-    action: actions.SolveCaptchaAction, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+    action: actions.SolveCaptchaAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
 ) -> list[ActionResult]:
     LOG.warning(
         "Please solve the captcha on the page, you have 30 seconds",
@@ -139,14 +155,22 @@ async def handle_solve_captcha_action(
 
 
 async def handle_click_action(
-    action: actions.ClickAction, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+    action: actions.ClickAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
 ) -> list[ActionResult]:
     xpath = await validate_actions_in_dom(action, page, scraped_page)
     await asyncio.sleep(0.3)
     if action.download:
         return await handle_click_to_download_file_action(action, page, scraped_page)
     return await chain_click(
-        task, page, action, xpath, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+        task,
+        page,
+        action,
+        xpath,
+        timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
     )
 
 
@@ -158,7 +182,9 @@ async def handle_click_to_download_file_action(
     xpath = await validate_actions_in_dom(action, page, scraped_page)
     try:
         await page.click(
-            f"xpath={xpath}", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS, modifiers=["Alt"]
+            f"xpath={xpath}",
+            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+            modifiers=["Alt"],
         )
     except Exception as e:
         LOG.exception("ClickAction with download failed", action=action, exc_info=True)
@@ -168,7 +194,11 @@ async def handle_click_to_download_file_action(
 
 
 async def handle_input_text_action(
-    action: actions.InputTextAction, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+    action: actions.InputTextAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
 ) -> list[ActionResult]:
     xpath = await validate_actions_in_dom(action, page, scraped_page)
     locator = page.locator(f"xpath={xpath}")
@@ -184,7 +214,11 @@ async def handle_input_text_action(
 
 
 async def handle_upload_file_action(
-    action: actions.UploadFileAction, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+    action: actions.UploadFileAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
 ) -> list[ActionResult]:
     if not action.file_url:
         LOG.warning("InputFileAction has no file_url", action=action)
@@ -209,7 +243,8 @@ async def handle_upload_file_action(
         LOG.info("Taking UploadFileAction. Found file input tag", action=action)
         if file_path:
             await page.locator(f"xpath={xpath}").set_input_files(
-                file_path, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+                file_path,
+                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
             )
 
             # Sleep for 10 seconds after uploading a file to let the page process it
@@ -222,13 +257,21 @@ async def handle_upload_file_action(
         # treat it as a click action
         action.is_upload_file_tag = False
         return await chain_click(
-            task, page, action, xpath, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+            task,
+            page,
+            action,
+            xpath,
+            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
         )
 
 
 @deprecated("This function is deprecated. Downloads are handled by the click action handler now.")
 async def handle_download_file_action(
-    action: actions.DownloadFileAction, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+    action: actions.DownloadFileAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
 ) -> list[ActionResult]:
     xpath = await validate_actions_in_dom(action, page, scraped_page)
     file_name = f"{action.file_name or uuid.uuid4()}"
@@ -238,7 +281,9 @@ async def handle_download_file_action(
         async with page.expect_download() as download_info:
             await asyncio.sleep(0.3)
             await page.click(
-                f"xpath={xpath}", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS, modifiers=["Alt"]
+                f"xpath={xpath}",
+                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+                modifiers=["Alt"],
             )
 
         download = await download_info.value
@@ -260,20 +305,33 @@ async def handle_download_file_action(
 
 
 async def handle_null_action(
-    action: actions.NullAction, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+    action: actions.NullAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
 ) -> list[ActionResult]:
     return [ActionSuccess()]
 
 
 async def handle_select_option_action(
-    action: actions.SelectOptionAction, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+    action: actions.SelectOptionAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
 ) -> list[ActionResult]:
     xpath = await validate_actions_in_dom(action, page, scraped_page)
 
     locator = page.locator(f"xpath={xpath}")
     tag_name = await get_tag_name_lowercase(locator)
     element_dict = scraped_page.id_to_element_dict[action.element_id]
-    LOG.info("SelectOptionAction", action=action, tag_name=tag_name, element_dict=element_dict)
+    LOG.info(
+        "SelectOptionAction",
+        action=action,
+        tag_name=tag_name,
+        element_dict=element_dict,
+    )
 
     # if element is not a select option, prioritize clicking the linked element if any
     if tag_name != "select" and "linked_element" in element_dict:
@@ -290,7 +348,11 @@ async def handle_select_option_action(
                 linked_element=element_dict["linked_element"],
             )
             return [ActionSuccess()]
-        LOG.warning("Failed to click linked element", action=action, linked_element=element_dict["linked_element"])
+        LOG.warning(
+            "Failed to click linked element",
+            action=action,
+            linked_element=element_dict["linked_element"],
+        )
 
     # check if the element is an a tag first. If yes, click it instead of selecting the option
     if tag_name == "label":
@@ -360,7 +422,7 @@ async def handle_select_option_action(
                 except Exception as e:
                     LOG.error("Failed to click option", action=action, exc_info=True)
                     return [ActionFailure(e)]
-            return [ActionFailure(Exception(f"SelectOption option index is missing"))]
+            return [ActionFailure(Exception("SelectOption option index is missing"))]
         elif role_attribute == "option":
             LOG.info(
                 "SelectOptionAction on an option element. Clicking the option",
@@ -373,7 +435,7 @@ async def handle_select_option_action(
             LOG.error(
                 "SelectOptionAction on a non-listbox element. Cannot handle this action",
             )
-            return [ActionFailure(Exception(f"Cannot handle SelectOptionAction on a non-listbox element"))]
+            return [ActionFailure(Exception("Cannot handle SelectOptionAction on a non-listbox element"))]
     elif tag_name == "input" and element_dict.get("attributes", {}).get("type", None) in ["radio", "checkbox"]:
         LOG.info(
             "SelectOptionAction is on <input> checkbox/radio",
@@ -387,13 +449,19 @@ async def handle_select_option_action(
         return [ActionSuccess()]
     try:
         # First click by label (if it matches)
-        await page.click(f"xpath={xpath}", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+        await page.click(
+            f"xpath={xpath}",
+            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        )
         await page.select_option(
             xpath,
             label=action.option.label,
             timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
         )
-        await page.click(f"xpath={xpath}", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+        await page.click(
+            f"xpath={xpath}",
+            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        )
         return [ActionSuccess()]
     except Exception as e:
         if action.option.index is not None:
@@ -418,23 +486,35 @@ async def handle_select_option_action(
         if match:
             # This means we were trying to select an option xpath, click the option
             option_index = int(match.group(1))
-            await page.click(f"xpath={xpath}", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+            await page.click(
+                f"xpath={xpath}",
+                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+            )
             await page.select_option(
                 xpath,
                 index=option_index,
                 timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
             )
-            await page.click(f"xpath={xpath}", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+            await page.click(
+                f"xpath={xpath}",
+                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+            )
             return [ActionSuccess()]
         else:
             # This means the supplied index was for the select element, not a reference to the xpath dict
-            await page.click(f"xpath={xpath}", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+            await page.click(
+                f"xpath={xpath}",
+                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+            )
             await page.select_option(
                 xpath,
                 index=action.option.index,
                 timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
             )
-            await page.click(f"xpath={xpath}", timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+            await page.click(
+                f"xpath={xpath}",
+                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+            )
         return [ActionSuccess()]
     except Exception as e:
         LOG.warning("Failed to click on the option by index", action=action, exc_info=True)
@@ -442,7 +522,11 @@ async def handle_select_option_action(
 
 
 async def handle_checkbox_action(
-    self: actions.CheckboxAction, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+    self: actions.CheckboxAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
 ) -> list[ActionResult]:
     """
     ******* NOT REGISTERED *******
@@ -462,20 +546,32 @@ async def handle_checkbox_action(
 
 
 async def handle_wait_action(
-    action: actions.WaitAction, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+    action: actions.WaitAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
 ) -> list[ActionResult]:
     await asyncio.sleep(10)
     return [ActionFailure(exception=Exception("Wait action is treated as a failure"))]
 
 
 async def handle_terminate_action(
-    action: actions.TerminateAction, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+    action: actions.TerminateAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
 ) -> list[ActionResult]:
     return [ActionSuccess()]
 
 
 async def handle_complete_action(
-    action: actions.CompleteAction, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+    action: actions.CompleteAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
 ) -> list[ActionResult]:
     extracted_data = None
     if action.data_extraction_goal:
@@ -526,7 +622,11 @@ async def validate_actions_in_dom(action: WebAction, page: Page, scraped_page: S
 
     num_elements = await locator.count()
     if num_elements < 1:
-        LOG.warning("No elements found with action xpath. Validation failed.", action=action, xpath=xpath)
+        LOG.warning(
+            "No elements found with action xpath. Validation failed.",
+            action=action,
+            xpath=xpath,
+        )
         raise MissingElement(xpath=xpath, element_id=action.element_id)
     elif num_elements > 1:
         LOG.warning(
@@ -560,10 +660,14 @@ async def chain_click(
         try:
             file = await download_file(file_url)
         except Exception:
-            LOG.exception("Failed to download file, continuing without it", action=action, file_url=file_url)
+            LOG.exception(
+                "Failed to download file, continuing without it",
+                action=action,
+                file_url=file_url,
+            )
             file = []
 
-    fc_func = lambda fc: fc.set_files(files=file)
+    fc_func = lambda fc: fc.set_files(files=file)  # noqa: E731
     page.on("filechooser", fc_func)
     LOG.info("Registered file chooser listener", action=action, path=file)
 
@@ -585,13 +689,26 @@ async def chain_click(
     try:
         await page.click(f"xpath={xpath}", timeout=timeout)
         LOG.info("Chain click: main element click succeeded", action=action, xpath=xpath)
-        return [ActionSuccess(javascript_triggered=javascript_triggered, download_triggered=download_triggered)]
+        return [
+            ActionSuccess(
+                javascript_triggered=javascript_triggered,
+                download_triggered=download_triggered,
+            )
+        ]
     except Exception as e:
         action_results: list[ActionResult] = [
-            ActionFailure(e, javascript_triggered=javascript_triggered, download_triggered=download_triggered)
+            ActionFailure(
+                e,
+                javascript_triggered=javascript_triggered,
+                download_triggered=download_triggered,
+            )
         ]
         if await is_input_element(page.locator(xpath)):
-            LOG.info("Chain click: it's an input element. going to try sibling click", action=action, xpath=xpath)
+            LOG.info(
+                "Chain click: it's an input element. going to try sibling click",
+                action=action,
+                xpath=xpath,
+            )
             sibling_action_result = await click_sibling_of_input(page.locator(xpath), timeout=timeout)
             sibling_action_result.download_triggered = download_triggered
             action_results.append(sibling_action_result)
@@ -604,7 +721,11 @@ async def chain_click(
             javascript_triggered = javascript_triggered or parent_javascript_triggered
             parent_locator = page.locator(xpath).locator("..")
             await parent_locator.click(timeout=timeout)
-            LOG.info("Chain click: successfully clicked parent element", action=action, parent_xpath=parent_xpath)
+            LOG.info(
+                "Chain click: successfully clicked parent element",
+                action=action,
+                parent_xpath=parent_xpath,
+            )
             action_results.append(
                 ActionSuccess(
                     javascript_triggered=javascript_triggered,
@@ -613,9 +734,18 @@ async def chain_click(
                 )
             )
         except Exception as pe:
-            LOG.warning("Failed to click parent element", action=action, parent_xpath=parent_xpath, exc_info=True)
+            LOG.warning(
+                "Failed to click parent element",
+                action=action,
+                parent_xpath=parent_xpath,
+                exc_info=True,
+            )
             action_results.append(
-                ActionFailure(pe, javascript_triggered=javascript_triggered, interacted_with_parent=True)
+                ActionFailure(
+                    pe,
+                    javascript_triggered=javascript_triggered,
+                    interacted_with_parent=True,
+                )
             )
             # We don't raise exception here because we do log the exception, and return ActionFailure as the last action
 
@@ -765,7 +895,7 @@ async def extract_information_for_navigation_goal(
         extracted_information_schema=task.extracted_information_schema,
         current_url=scraped_page.url,
         extracted_text=scraped_page.extracted_text,
-        error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else None,
+        error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
     )
 
     json_response = await app.LLM_API_HANDLER(
@@ -804,7 +934,12 @@ async def click_listbox_option(
                     await page.click(f"xpath={option_xpath}", timeout=1000)
                     return True
                 except Exception:
-                    LOG.error("Failed to click on the option", action=action, option_xpath=option_xpath, exc_info=True)
+                    LOG.error(
+                        "Failed to click on the option",
+                        action=action,
+                        option_xpath=option_xpath,
+                        exc_info=True,
+                    )
         if "children" in child:
             bfs_queue.extend(child["children"])
     return False

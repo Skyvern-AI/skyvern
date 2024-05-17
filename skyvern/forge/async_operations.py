@@ -50,7 +50,7 @@ class AsyncOperation:
     def run(self) -> asyncio.Task | None:
         if self.aio_task is not None and not self.aio_task.done():
             LOG.warning(
-                f"Task already running",
+                "Task already running",
                 task_id=self.task_id,
                 operation_type=self.type,
                 agent_phase=self.agent_phase,
@@ -113,7 +113,7 @@ class AsyncOperationPool:
             aio_task = self._aio_tasks[task_id][operation_type]
             if not aio_task.done():
                 LOG.info(
-                    f"aio task already running",
+                    "aio task already running",
                     task_id=task_id,
                     operation_type=operation_type,
                     agent_phase=agent_phase,
@@ -130,6 +130,9 @@ class AsyncOperationPool:
             async with asyncio.timeout(30):
                 await asyncio.gather(*[aio_task for aio_task in self.get_aio_tasks(task_id) if not aio_task.done()])
         except asyncio.TimeoutError:
-            LOG.error(f"Timeout (30s) while waiting for pending async tasks for task_id={task_id}", task_id=task_id)
+            LOG.error(
+                f"Timeout (30s) while waiting for pending async tasks for task_id={task_id}",
+                task_id=task_id,
+            )
 
         self.remove_operations(task_id)

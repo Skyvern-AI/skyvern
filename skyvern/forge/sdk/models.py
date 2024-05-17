@@ -53,7 +53,12 @@ class Step(BaseModel):
     output_token_count: int = 0
     step_cost: float = 0
 
-    def validate_update(self, status: StepStatus | None, output: AgentStepOutput | None, is_last: bool | None) -> None:
+    def validate_update(
+        self,
+        status: StepStatus | None,
+        output: AgentStepOutput | None,
+        is_last: bool | None,
+    ) -> None:
         old_status = self.status
 
         if status and not old_status.can_update_to(status):

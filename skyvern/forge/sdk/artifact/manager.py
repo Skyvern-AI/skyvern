@@ -17,7 +17,11 @@ class ArtifactManager:
     upload_aiotasks_map: dict[str, list[asyncio.Task[None]]] = defaultdict(list)
 
     async def create_artifact(
-        self, step: Step, artifact_type: ArtifactType, data: bytes | None = None, path: str | None = None
+        self,
+        step: Step,
+        artifact_type: ArtifactType,
+        data: bytes | None = None,
+        path: str | None = None,
     ) -> str:
         # TODO (kerem): Which is better?
         #    current: (disadvantage: we create the artifact_id UUID here)
@@ -87,7 +91,10 @@ class ArtifactManager:
                 duration=time.time() - st,
             )
         except asyncio.TimeoutError:
-            LOG.error(f"Timeout (30s) while waiting for upload tasks for task_id={task_id}", task_id=task_id)
+            LOG.error(
+                f"Timeout (30s) while waiting for upload tasks for task_id={task_id}",
+                task_id=task_id,
+            )
 
         del self.upload_aiotasks_map[task_id]
 
@@ -109,7 +116,10 @@ class ArtifactManager:
                 duration=time.time() - st,
             )
         except asyncio.TimeoutError:
-            LOG.error(f"Timeout (30s) while waiting for upload tasks for task_ids={task_ids}", task_ids=task_ids)
+            LOG.error(
+                f"Timeout (30s) while waiting for upload tasks for task_ids={task_ids}",
+                task_ids=task_ids,
+            )
 
         for task_id in task_ids:
             del self.upload_aiotasks_map[task_id]

@@ -13,7 +13,10 @@ async def create_org(org_name: str, webhook_callback_url: str | None = None) -> 
     await create_org_api_token(organization.organization_id)
 
 
-def main(org_name: str, webhook_callback_url: Annotated[Optional[str], typer.Argument()] = None) -> None:
+def main(
+    org_name: str,
+    webhook_callback_url: Annotated[Optional[str], typer.Argument()] = None,
+) -> None:
     asyncio.run(create_org(org_name, webhook_callback_url))
 
 

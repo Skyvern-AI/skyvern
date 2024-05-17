@@ -166,7 +166,10 @@ class WorkflowService:
         wp_wps_tuples = await self.get_workflow_run_parameter_tuples(workflow_run_id=workflow_run.workflow_run_id)
         workflow_output_parameters = await self.get_workflow_output_parameters(workflow_id=workflow.workflow_id)
         app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
-            workflow_run_id, wp_wps_tuples, workflow_output_parameters, context_parameters
+            workflow_run_id,
+            wp_wps_tuples,
+            workflow_output_parameters,
+            context_parameters,
         )
         # Execute workflow blocks
         blocks = workflow.workflow_definition.blocks
@@ -203,7 +206,11 @@ class WorkflowService:
                         )
                     else:
                         await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
-                        await self.send_workflow_response(workflow=workflow, workflow_run=workflow_run, api_key=api_key)
+                        await self.send_workflow_response(
+                            workflow=workflow,
+                            workflow_run=workflow_run,
+                            api_key=api_key,
+                        )
                         return workflow_run
 
             except Exception:
@@ -224,13 +231,21 @@ class WorkflowService:
 
         # Create a mapping of status to (action, log_func, log_message)
         status_action_mapping = {
-            TaskStatus.running: (None, LOG.error, "has running tasks, this should not happen"),
+            TaskStatus.running: (
+                None,
+                LOG.error,
+                "has running tasks, this should not happen",
+            ),
             TaskStatus.terminated: (
                 self.mark_workflow_run_as_terminated,
                 LOG.warning,
                 "has terminated tasks, marking as terminated",
             ),
-            TaskStatus.failed: (self.mark_workflow_run_as_failed, LOG.warning, "has failed tasks, marking as failed"),
+            TaskStatus.failed: (
+                self.mark_workflow_run_as_failed,
+                LOG.warning,
+                "has failed tasks, marking as failed",
+            ),
             TaskStatus.completed: (
                 self.mark_workflow_run_as_completed,
                 LOG.info,
@@ -333,7 +348,7 @@ class WorkflowService:
             title=title,
             organization_id=organization_id,
             description=description,
-            workflow_definition=workflow_definition.model_dump() if workflow_definition else None,
+            workflow_definition=(workflow_definition.model_dump() if workflow_definition else None),
         )
 
     async def delete_workflow_by_permanent_id(
@@ -529,7 +544,10 @@ class WorkflowService:
         for task in workflow_run_tasks[::-1]:
             screenshot_artifact = await app.DATABASE.get_latest_artifact(
                 task_id=task.task_id,
-                artifact_types=[ArtifactType.SCREENSHOT_ACTION, ArtifactType.SCREENSHOT_FINAL],
+                artifact_types=[
+                    ArtifactType.SCREENSHOT_ACTION,
+                    ArtifactType.SCREENSHOT_FINAL,
+                ],
                 organization_id=organization_id,
             )
             if screenshot_artifact:
@@ -541,17 +559,19 @@ class WorkflowService:
 
         recording_url = None
         recording_artifact = await app.DATABASE.get_artifact_for_workflow_run(
-            workflow_run_id=workflow_run_id, artifact_type=ArtifactType.RECORDING, organization_id=organization_id
+            workflow_run_id=workflow_run_id,
+            artifact_type=ArtifactType.RECORDING,
+            organization_id=organization_id,
         )
         if recording_artifact:
             recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
         workflow_parameter_tuples = await app.DATABASE.get_workflow_run_parameters(workflow_run_id=workflow_run_id)
         parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
-        output_parameter_tuples: list[tuple[OutputParameter, WorkflowRunOutputParameter]] = (
-            await self.get_output_parameter_workflow_run_output_parameter_tuples(
-                workflow_id=workflow_id, workflow_run_id=workflow_run_id
-            )
+        output_parameter_tuples: list[
+            tuple[OutputParameter, WorkflowRunOutputParameter]
+        ] = await self.get_output_parameter_workflow_run_output_parameter_tuples(
+            workflow_id=workflow_id, workflow_run_id=workflow_run_id
         )
         if output_parameter_tuples:
             outputs = {output_parameter.key: output.value for output_parameter, output in output_parameter_tuples}
@@ -587,7 +607,9 @@ class WorkflowService:
         tasks = await self.get_tasks_by_workflow_run_id(workflow_run.workflow_run_id)
         all_workflow_task_ids = [task.task_id for task in tasks]
         browser_state = await app.BROWSER_MANAGER.cleanup_for_workflow_run(
-            workflow_run.workflow_run_id, all_workflow_task_ids, close_browser_on_completion
+            workflow_run.workflow_run_id,
+            all_workflow_task_ids,
+            close_browser_on_completion,
         )
         if browser_state:
             await self.persist_video_data(browser_state, workflow, workflow_run)
@@ -600,7 +622,10 @@ class WorkflowService:
             workflow_run_id=workflow_run.workflow_run_id,
             organization_id=workflow.organization_id,
         )
-        LOG.info("Built workflow run status response", workflow_run_status_response=workflow_run_status_response)
+        LOG.info(
+            "Built workflow run status response",
+            workflow_run_status_response=workflow_run_status_response,
+        )
 
         if not workflow_run.webhook_callback_url:
             LOG.warning(
@@ -661,7 +686,8 @@ class WorkflowService:
                 )
         except Exception as e:
             raise FailedToSendWebhook(
-                workflow_id=workflow.workflow_id, workflow_run_id=workflow_run.workflow_run_id
+                workflow_id=workflow.workflow_id,
+                workflow_run_id=workflow_run.workflow_run_id,
             ) from e
 
     async def persist_video_data(
@@ -681,10 +707,16 @@ class WorkflowService:
             )
 
     async def persist_har_data(
-        self, browser_state: BrowserState, last_step: Step, workflow: Workflow, workflow_run: WorkflowRun
+        self,
+        browser_state: BrowserState,
+        last_step: Step,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
     ) -> None:
         har_data = await app.BROWSER_MANAGER.get_har_data(
-            workflow_id=workflow.workflow_id, workflow_run_id=workflow_run.workflow_run_id, browser_state=browser_state
+            workflow_id=workflow.workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            browser_state=browser_state,
         )
         if har_data:
             await app.ARTIFACT_MANAGER.create_artifact(
@@ -703,7 +735,11 @@ class WorkflowService:
         await app.ARTIFACT_MANAGER.create_artifact(step=last_step, artifact_type=ArtifactType.TRACE, path=trace_path)
 
     async def persist_debug_artifacts(
-        self, browser_state: BrowserState, last_task: Task, workflow: Workflow, workflow_run: WorkflowRun
+        self,
+        browser_state: BrowserState,
+        last_task: Task,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
     ) -> None:
         last_step = await app.DATABASE.get_latest_step(
             task_id=last_task.task_id, organization_id=last_task.organization_id
@@ -720,7 +756,11 @@ class WorkflowService:
         request: WorkflowCreateYAMLRequest,
         workflow_permanent_id: str | None = None,
     ) -> Workflow:
-        LOG.info("Creating workflow from request", organization_id=organization_id, title=request.title)
+        LOG.info(
+            "Creating workflow from request",
+            organization_id=organization_id,
+            title=request.title,
+        )
         try:
             if workflow_permanent_id:
                 existing_latest_workflow = await self.get_workflow_by_permanent_id(
@@ -769,7 +809,8 @@ class WorkflowService:
 
             # Create output parameters for all blocks
             block_output_parameters = await WorkflowService._create_all_output_parameters_for_workflow(
-                workflow_id=workflow.workflow_id, block_yamls=request.workflow_definition.blocks
+                workflow_id=workflow.workflow_id,
+                block_yamls=request.workflow_definition.blocks,
             )
             for block_output_parameter in block_output_parameters.values():
                 parameters[block_output_parameter.key] = block_output_parameter
@@ -822,7 +863,8 @@ class WorkflowService:
             for context_parameter in context_parameter_yamls:
                 if context_parameter.source_parameter_key not in parameters:
                     raise ContextParameterSourceNotDefined(
-                        context_parameter_key=context_parameter.key, source_key=context_parameter.source_parameter_key
+                        context_parameter_key=context_parameter.key,
+                        source_key=context_parameter.source_parameter_key,
                     )
 
                 if context_parameter.key in parameters:
@@ -901,7 +943,9 @@ class WorkflowService:
 
     @staticmethod
     async def block_yaml_to_block(
-        workflow: Workflow, block_yaml: BLOCK_YAML_TYPES, parameters: dict[str, Parameter]
+        workflow: Workflow,
+        block_yaml: BLOCK_YAML_TYPES,
+        parameters: dict[str, Parameter],
     ) -> BlockTypeVar:
         output_parameter = parameters[f"{block_yaml.label}_output"]
         if block_yaml.block_type == BlockType.TASK:

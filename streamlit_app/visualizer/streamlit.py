@@ -50,16 +50,18 @@ for config in CONFIGS_DICT:
 st.sidebar.markdown("#### **Settings**")
 select_env = st.sidebar.selectbox("Environment", list(SETTINGS.keys()), on_change=reset_session_state)
 select_org = st.sidebar.selectbox(
-    "Organization", list(SETTINGS[select_env]["orgs"].keys()), on_change=reset_session_state
+    "Organization",
+    list(SETTINGS[select_env]["orgs"].keys()),
+    on_change=reset_session_state,
 )
 
 # Hack the sidebar size to be a little bit smaller
 st.markdown(
-    f"""
+    """
         <style>
-            .sidebar .sidebar-content {{
+            .sidebar .sidebar-content {
                 width: 375px;
-            }}
+            }
         </style>
     """,
     unsafe_allow_html=True,
@@ -68,7 +70,8 @@ st.markdown(
 # Initialize session state
 if "client" not in st.session_state:
     st.session_state.client = SkyvernClient(
-        base_url=SETTINGS[select_env]["host"], credentials=SETTINGS[select_env]["orgs"][select_org]
+        base_url=SETTINGS[select_env]["host"],
+        credentials=SETTINGS[select_env]["orgs"][select_org],
     )
 if "repository" not in st.session_state:
     st.session_state.repository = TaskRepository(st.session_state.client)
@@ -133,7 +136,8 @@ def copy_curl_to_clipboard(task_request_body: TaskRequest) -> None:
 with execute_tab:
     # Streamlit doesn't support "focusing" on a tab, so this is a workaround to make the requested tab be the "first" tab
     sorted_supported_examples = sorted(
-        supported_examples, key=lambda x: (-1 if x.name.lower() == tab_name.lower() else 0)
+        supported_examples,
+        key=lambda x: (-1 if x.name.lower() == tab_name.lower() else 0),
     )
     example_tabs = st.tabs([supported_example.name for supported_example in sorted_supported_examples])
 
@@ -157,7 +161,9 @@ with execute_tab:
                     # Create all the fields to create a TaskRequest object
                     st_url = st.text_input("URL*", value=example.url, key=f"url_{unique_key}")
                     st_webhook_callback_url = st.text_input(
-                        "Webhook Callback URL", key=f"webhook_{unique_key}", placeholder="Optional"
+                        "Webhook Callback URL",
+                        key=f"webhook_{unique_key}",
+                        placeholder="Optional",
                     )
                     st_navigation_goal = st.text_area(
                         "Navigation Goal",
@@ -252,11 +258,11 @@ with visualizer_tab:
 
     col_tasks, _, col_steps, _, col_artifacts = st.columns([4, 1, 6, 1, 18])
 
-    col_tasks.markdown(f"#### Tasks")
-    col_steps.markdown(f"#### Steps")
+    col_tasks.markdown("#### Tasks")
+    col_steps.markdown("#### Steps")
     col_artifacts.markdown("#### Artifacts")
     tasks_response = repository.get_tasks(task_page_number)
-    if type(tasks_response) is not list:
+    if not isinstance(tasks_response, list):
         st.error("Failed to fetch tasks.")
         st.error(tasks_response)
         st.error(
@@ -282,7 +288,7 @@ with visualizer_tab:
                 on_click=select_task,
                 args=(task,),
                 use_container_width=True,
-                type="primary" if selected_task and task_id == selected_task["task_id"] else "secondary",
+                type=("primary" if selected_task and task_id == selected_task["task_id"] else "secondary"),
             )
             for task_id, task in tasks.items()
         }
@@ -339,10 +345,16 @@ with visualizer_tab:
             if task_steps:
                 col_steps_prev, _, col_steps_next = col_steps.columns([3, 1, 3])
                 col_steps_prev.button(
-                    "prev", on_click=go_to_previous_step, key="previous_step_button", use_container_width=True
+                    "prev",
+                    on_click=go_to_previous_step,
+                    key="previous_step_button",
+                    use_container_width=True,
                 )
                 col_steps_next.button(
-                    "next", on_click=go_to_next_step, key="next_step_button", use_container_width=True
+                    "next",
+                    on_click=go_to_next_step,
+                    key="next_step_button",
+                    use_container_width=True,
                 )
 
             step_id_buttons = {
@@ -351,7 +363,7 @@ with visualizer_tab:
                     on_click=select_step,
                     args=(step,),
                     use_container_width=True,
-                    type="primary" if selected_step and step["step_id"] == selected_step["step_id"] else "secondary",
+                    type=("primary" if selected_step and step["step_id"] == selected_step["step_id"] else "secondary"),
                 )
                 for step in task_steps
             }
@@ -439,7 +451,10 @@ with visualizer_tab:
                         # tab_llm_prompt.text_area("collapsed", value=content, label_visibility="collapsed", height=1000)
                     elif file_name.endswith("llm_request.json"):
                         streamlit_content_safe(
-                            tab_llm_request, tab_llm_request.json, read_artifact_safe(uri), "No LLM request available."
+                            tab_llm_request,
+                            tab_llm_request.json,
+                            read_artifact_safe(uri),
+                            "No LLM request available.",
                         )
                     elif file_name.endswith("llm_response_parsed.json"):
                         streamlit_content_safe(
@@ -456,8 +471,18 @@ with visualizer_tab:
                             "No raw LLM response available.",
                         )
                     elif file_name.endswith("html_scrape.html"):
-                        streamlit_content_safe(tab_html, tab_html.text, read_artifact_safe(uri), "No html available.")
+                        streamlit_content_safe(
+                            tab_html,
+                            tab_html.text,
+                            read_artifact_safe(uri),
+                            "No html available.",
+                        )
                     elif file_name.endswith("html_action.html"):
-                        streamlit_content_safe(tab_html, tab_html.text, read_artifact_safe(uri), "No html available.")
+                        streamlit_content_safe(
+                            tab_html,
+                            tab_html.text,
+                            read_artifact_safe(uri),
+                            "No html available.",
+                        )
                     else:
                         st.write(f"Artifact {file_name} not supported.")

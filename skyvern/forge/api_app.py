@@ -102,7 +102,8 @@ def get_agent_app(router: APIRouter = base_router) -> FastAPI:
             LOG.info("Loading additional module to set up api app", module=module)
             __import__(module)
         LOG.info(
-            "Additional modules loaded to set up api app", modules=SettingsManager.get_settings().ADDITIONAL_MODULES
+            "Additional modules loaded to set up api app",
+            modules=SettingsManager.get_settings().ADDITIONAL_MODULES,
         )
 
     if forge_app.setup_api_app:

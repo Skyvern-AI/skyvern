@@ -1,7 +1,7 @@
 """Create tables
 
 Revision ID: 99423c1dec60
-Revises: 
+Revises:
 Create Date: 2024-03-01 05:37:31.862957+00:00
 
 """
@@ -31,12 +31,21 @@ def upgrade() -> None:
         sa.Column("modified_at", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("organization_id"),
     )
-    op.create_index(op.f("ix_organizations_organization_id"), "organizations", ["organization_id"], unique=False)
+    op.create_index(
+        op.f("ix_organizations_organization_id"),
+        "organizations",
+        ["organization_id"],
+        unique=False,
+    )
     op.create_table(
         "organization_auth_tokens",
         sa.Column("id", sa.String(), nullable=False),
         sa.Column("organization_id", sa.String(), nullable=False),
-        sa.Column("token_type", sa.Enum("api", name="organizationauthtokentype"), nullable=False),
+        sa.Column(
+            "token_type",
+            sa.Enum("api", name="organizationauthtokentype"),
+            nullable=False,
+        ),
         sa.Column("token", sa.String(), nullable=False),
         sa.Column("valid", sa.Boolean(), nullable=False),
         sa.Column("created_at", sa.DateTime(), nullable=False),
@@ -48,14 +57,24 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index(op.f("ix_organization_auth_tokens_id"), "organization_auth_tokens", ["id"], unique=False)
+    op.create_index(
+        op.f("ix_organization_auth_tokens_id"),
+        "organization_auth_tokens",
+        ["id"],
+        unique=False,
+    )
     op.create_index(
         op.f("ix_organization_auth_tokens_organization_id"),
         "organization_auth_tokens",
         ["organization_id"],
         unique=False,
     )
-    op.create_index(op.f("ix_organization_auth_tokens_token"), "organization_auth_tokens", ["token"], unique=False)
+    op.create_index(
+        op.f("ix_organization_auth_tokens_token"),
+        "organization_auth_tokens",
+        ["token"],
+        unique=False,
+    )
     op.create_table(
         "workflows",
         sa.Column("workflow_id", sa.String(), nullable=False),
@@ -96,7 +115,10 @@ def upgrade() -> None:
         unique=False,
     )
     op.create_index(
-        op.f("ix_aws_secret_parameters_workflow_id"), "aws_secret_parameters", ["workflow_id"], unique=False
+        op.f("ix_aws_secret_parameters_workflow_id"),
+        "aws_secret_parameters",
+        ["workflow_id"],
+        unique=False,
     )
     op.create_table(
         "workflow_parameters",
@@ -115,7 +137,12 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("workflow_parameter_id"),
     )
-    op.create_index(op.f("ix_workflow_parameters_workflow_id"), "workflow_parameters", ["workflow_id"], unique=False)
+    op.create_index(
+        op.f("ix_workflow_parameters_workflow_id"),
+        "workflow_parameters",
+        ["workflow_id"],
+        unique=False,
+    )
     op.create_index(
         op.f("ix_workflow_parameters_workflow_parameter_id"),
         "workflow_parameters",
@@ -129,7 +156,16 @@ def upgrade() -> None:
         sa.Column("status", sa.String(), nullable=False),
         sa.Column(
             "proxy_location",
-            sa.Enum("US_CA", "US_NY", "US_TX", "US_FL", "US_WA", "RESIDENTIAL", "NONE", name="proxylocation"),
+            sa.Enum(
+                "US_CA",
+                "US_NY",
+                "US_TX",
+                "US_FL",
+                "US_WA",
+                "RESIDENTIAL",
+                "NONE",
+                name="proxylocation",
+            ),
             nullable=True,
         ),
         sa.Column("webhook_callback_url", sa.String(), nullable=True),
@@ -141,7 +177,12 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("workflow_run_id"),
     )
-    op.create_index(op.f("ix_workflow_runs_workflow_run_id"), "workflow_runs", ["workflow_run_id"], unique=False)
+    op.create_index(
+        op.f("ix_workflow_runs_workflow_run_id"),
+        "workflow_runs",
+        ["workflow_run_id"],
+        unique=False,
+    )
     op.create_table(
         "tasks",
         sa.Column("task_id", sa.String(), nullable=False),
@@ -156,7 +197,16 @@ def upgrade() -> None:
         sa.Column("failure_reason", sa.String(), nullable=True),
         sa.Column(
             "proxy_location",
-            sa.Enum("US_CA", "US_NY", "US_TX", "US_FL", "US_WA", "RESIDENTIAL", "NONE", name="proxylocation"),
+            sa.Enum(
+                "US_CA",
+                "US_NY",
+                "US_TX",
+                "US_FL",
+                "US_WA",
+                "RESIDENTIAL",
+                "NONE",
+                name="proxylocation",
+            ),
             nullable=True,
         ),
         sa.Column("extracted_information_schema", sa.JSON(), nullable=True),
@@ -199,7 +249,10 @@ def upgrade() -> None:
         unique=False,
     )
     op.create_index(
-        op.f("ix_workflow_run_parameters_workflow_run_id"), "workflow_run_parameters", ["workflow_run_id"], unique=False
+        op.f("ix_workflow_run_parameters_workflow_run_id"),
+        "workflow_run_parameters",
+        ["workflow_run_id"],
+        unique=False,
     )
     op.create_table(
         "steps",
@@ -261,23 +314,38 @@ def downgrade() -> None:
     op.drop_table("artifacts")
     op.drop_index(op.f("ix_steps_step_id"), table_name="steps")
     op.drop_table("steps")
-    op.drop_index(op.f("ix_workflow_run_parameters_workflow_run_id"), table_name="workflow_run_parameters")
-    op.drop_index(op.f("ix_workflow_run_parameters_workflow_parameter_id"), table_name="workflow_run_parameters")
+    op.drop_index(
+        op.f("ix_workflow_run_parameters_workflow_run_id"),
+        table_name="workflow_run_parameters",
+    )
+    op.drop_index(
+        op.f("ix_workflow_run_parameters_workflow_parameter_id"),
+        table_name="workflow_run_parameters",
+    )
     op.drop_table("workflow_run_parameters")
     op.drop_index(op.f("ix_tasks_task_id"), table_name="tasks")
     op.drop_table("tasks")
     op.drop_index(op.f("ix_workflow_runs_workflow_run_id"), table_name="workflow_runs")
     op.drop_table("workflow_runs")
-    op.drop_index(op.f("ix_workflow_parameters_workflow_parameter_id"), table_name="workflow_parameters")
+    op.drop_index(
+        op.f("ix_workflow_parameters_workflow_parameter_id"),
+        table_name="workflow_parameters",
+    )
     op.drop_index(op.f("ix_workflow_parameters_workflow_id"), table_name="workflow_parameters")
     op.drop_table("workflow_parameters")
     op.drop_index(op.f("ix_aws_secret_parameters_workflow_id"), table_name="aws_secret_parameters")
-    op.drop_index(op.f("ix_aws_secret_parameters_aws_secret_parameter_id"), table_name="aws_secret_parameters")
+    op.drop_index(
+        op.f("ix_aws_secret_parameters_aws_secret_parameter_id"),
+        table_name="aws_secret_parameters",
+    )
     op.drop_table("aws_secret_parameters")
     op.drop_index(op.f("ix_workflows_workflow_id"), table_name="workflows")
     op.drop_table("workflows")
     op.drop_index(op.f("ix_organization_auth_tokens_token"), table_name="organization_auth_tokens")
-    op.drop_index(op.f("ix_organization_auth_tokens_organization_id"), table_name="organization_auth_tokens")
+    op.drop_index(
+        op.f("ix_organization_auth_tokens_organization_id"),
+        table_name="organization_auth_tokens",
+    )
     op.drop_index(op.f("ix_organization_auth_tokens_id"), table_name="organization_auth_tokens")
     op.drop_table("organization_auth_tokens")
     op.drop_index(op.f("ix_organizations_organization_id"), table_name="organizations")

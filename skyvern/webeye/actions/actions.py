@@ -157,7 +157,12 @@ def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Actio
                 reasoning=reasoning,
                 actions=actions,
             )
-            actions.append(TerminateAction(reasoning=reasoning, errors=action["errors"] if "errors" in action else []))
+            actions.append(
+                TerminateAction(
+                    reasoning=reasoning,
+                    errors=action["errors"] if "errors" in action else [],
+                )
+            )
         elif action_type == ActionType.CLICK:
             file_url = action["file_url"] if "file_url" in action else None
             actions.append(
@@ -173,11 +178,21 @@ def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Actio
         elif action_type == ActionType.UPLOAD_FILE:
             # TODO: see if the element is a file input element. if it's not, convert this action into a click action
 
-            actions.append(UploadFileAction(element_id=element_id, file_url=action["file_url"], reasoning=reasoning))
+            actions.append(
+                UploadFileAction(
+                    element_id=element_id,
+                    file_url=action["file_url"],
+                    reasoning=reasoning,
+                )
+            )
         # This action is not used in the current implementation. Click actions are used instead.
         elif action_type == ActionType.DOWNLOAD_FILE:
             actions.append(
-                DownloadFileAction(element_id=element_id, file_name=action["file_name"], reasoning=reasoning)
+                DownloadFileAction(
+                    element_id=element_id,
+                    file_name=action["file_name"],
+                    reasoning=reasoning,
+                )
             )
         elif action_type == ActionType.SELECT_OPTION:
             actions.append(
@@ -192,7 +207,13 @@ def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Actio
                 )
             )
         elif action_type == ActionType.CHECKBOX:
-            actions.append(CheckboxAction(element_id=element_id, is_checked=action["is_checked"], reasoning=reasoning))
+            actions.append(
+                CheckboxAction(
+                    element_id=element_id,
+                    is_checked=action["is_checked"],
+                    reasoning=reasoning,
+                )
+            )
         elif action_type == ActionType.WAIT:
             actions.append(WaitAction(reasoning=reasoning))
         elif action_type == ActionType.COMPLETE:
