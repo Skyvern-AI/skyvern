@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     # LLM Configuration #
     #####################
     # ACTIVE LLM PROVIDER
-    LLM_KEY: str = "OPENAI_GPT4o"
+    LLM_KEY: str = "OPENAI_GPT4V"
     # COMMON
     LLM_CONFIG_MAX_TOKENS: int = 4096
     LLM_CONFIG_TEMPERATURE: float = 0
