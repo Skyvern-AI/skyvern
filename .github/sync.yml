@@ -11,6 +11,8 @@ Skyvern-AI/skyvern-cloud:
     dest: setup.sh
   - source: .env.example
     dest: .env.example
+  - source: .pre-commit-config.yaml
+    dest: .pre-commit-config.yaml
   - source: run_ui.sh
     dest: run_ui.sh
   - source: run_skyvern.sh
