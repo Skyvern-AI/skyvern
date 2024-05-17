@@ -52,7 +52,7 @@ setup_llm_providers() {
         else
             update_or_add_env_var "OPENAI_API_KEY" "$openai_api_key"
             update_or_add_env_var "ENABLE_OPENAI" "true"
-            model_options+=("OPENAI_GPT4_TURBO" "OPENAI_GPT4V")
+            model_options+=("OPENAI_GPT4_TURBO" "OPENAI_GPT4V" "OPENAI_GPT4O")
         fi
     else
         update_or_add_env_var "ENABLE_OPENAI" "false"

@@ -33,7 +33,10 @@ async def llm_messages_builder(
             )
     # Anthropic models seems to struggle to always output a valid json object so we need to prefill the response to force it:
     if add_assistant_prefix:
-        return [{"role": "user", "content": messages}, {"role": "assistant", "content": "{"}]
+        return [
+            {"role": "user", "content": messages},
+            {"role": "assistant", "content": "{"},
+        ]
     return [{"role": "user", "content": messages}]
 
 

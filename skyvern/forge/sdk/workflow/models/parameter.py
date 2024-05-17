@@ -114,6 +114,10 @@ class OutputParameter(Parameter):
 
 
 ParameterSubclasses = Union[
-    WorkflowParameter, ContextParameter, AWSSecretParameter, BitwardenLoginCredentialParameter, OutputParameter
+    WorkflowParameter,
+    ContextParameter,
+    AWSSecretParameter,
+    BitwardenLoginCredentialParameter,
+    OutputParameter,
 ]
 PARAMETER_TYPE = Annotated[ParameterSubclasses, Field(discriminator="parameter_type")]

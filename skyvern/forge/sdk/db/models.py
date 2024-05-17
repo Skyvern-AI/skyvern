@@ -63,7 +63,11 @@ class TaskModel(Base):
     max_steps_per_run = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(
-        DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False, index=True
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+        index=True,
     )
 
 
@@ -80,7 +84,12 @@ class StepModel(Base):
     is_last = Column(Boolean, default=False)
     retry_index = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
-    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
     input_token_count = Column(Integer, default=0)
     output_token_count = Column(Integer, default=0)
     step_cost = Column(Numeric, default=0)
@@ -96,7 +105,12 @@ class OrganizationModel(Base):
     max_retries_per_step = Column(Integer, nullable=True)
     domain = Column(String, nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
-    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime,
+        nullable=False,
+    )
 
 
 class OrganizationAuthTokenModel(Base):
@@ -115,7 +129,12 @@ class OrganizationAuthTokenModel(Base):
     valid = Column(Boolean, nullable=False, default=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
-    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime,
+        nullable=False,
+    )
     deleted_at = Column(DateTime, nullable=True)
 
 
@@ -130,13 +149,23 @@ class ArtifactModel(Base):
     artifact_type = Column(String)
     uri = Column(String)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
-    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
 
 
 class WorkflowModel(Base):
     __tablename__ = "workflows"
     __table_args__ = (
-        UniqueConstraint("organization_id", "workflow_permanent_id", "version", name="uc_org_permanent_id_version"),
+        UniqueConstraint(
+            "organization_id",
+            "workflow_permanent_id",
+            "version",
+            name="uc_org_permanent_id_version",
+        ),
         Index("permanent_id_version_idx", "workflow_permanent_id", "version"),
     )
 
@@ -145,9 +174,16 @@ class WorkflowModel(Base):
     title = Column(String, nullable=False)
     description = Column(String, nullable=True)
     workflow_definition = Column(JSON, nullable=False)
+    proxy_location = Column(Enum(ProxyLocation))
+    webhook_callback_url = Column(String)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
-    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
     deleted_at = Column(DateTime, nullable=True)
 
     workflow_permanent_id = Column(String, nullable=False, default=generate_workflow_permanent_id, index=True)
@@ -164,7 +200,12 @@ class WorkflowRunModel(Base):
     webhook_callback_url = Column(String)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
-    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
 
 
 class WorkflowParameterModel(Base):
@@ -177,7 +218,12 @@ class WorkflowParameterModel(Base):
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"), index=True, nullable=False)
     default_value = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
-    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
     deleted_at = Column(DateTime, nullable=True)
 
 
@@ -189,7 +235,12 @@ class OutputParameterModel(Base):
     description = Column(String, nullable=True)
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"), index=True, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
-    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
     deleted_at = Column(DateTime, nullable=True)
 
 
@@ -202,7 +253,12 @@ class AWSSecretParameterModel(Base):
     description = Column(String, nullable=True)
     aws_key = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
-    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
     deleted_at = Column(DateTime, nullable=True)
 
 
@@ -210,7 +266,10 @@ class BitwardenLoginCredentialParameterModel(Base):
     __tablename__ = "bitwarden_login_credential_parameters"
 
     bitwarden_login_credential_parameter_id = Column(
-        String, primary_key=True, index=True, default=generate_bitwarden_login_credential_parameter_id
+        String,
+        primary_key=True,
+        index=True,
+        default=generate_bitwarden_login_credential_parameter_id,
     )
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"), index=True, nullable=False)
     key = Column(String, nullable=False)
@@ -220,16 +279,29 @@ class BitwardenLoginCredentialParameterModel(Base):
     bitwarden_master_password_aws_secret_key = Column(String, nullable=False)
     url_parameter_key = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
-    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
     deleted_at = Column(DateTime, nullable=True)
 
 
 class WorkflowRunParameterModel(Base):
     __tablename__ = "workflow_run_parameters"
 
-    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), primary_key=True, index=True)
+    workflow_run_id = Column(
+        String,
+        ForeignKey("workflow_runs.workflow_run_id"),
+        primary_key=True,
+        index=True,
+    )
     workflow_parameter_id = Column(
-        String, ForeignKey("workflow_parameters.workflow_parameter_id"), primary_key=True, index=True
+        String,
+        ForeignKey("workflow_parameters.workflow_parameter_id"),
+        primary_key=True,
+        index=True,
     )
     # Can be bool | int | float | str | dict | list depending on the workflow parameter type
     value = Column(String, nullable=False)
@@ -239,9 +311,17 @@ class WorkflowRunParameterModel(Base):
 class WorkflowRunOutputParameterModel(Base):
     __tablename__ = "workflow_run_output_parameters"
 
-    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), primary_key=True, index=True)
+    workflow_run_id = Column(
+        String,
+        ForeignKey("workflow_runs.workflow_run_id"),
+        primary_key=True,
+        index=True,
+    )
     output_parameter_id = Column(
-        String, ForeignKey("output_parameters.output_parameter_id"), primary_key=True, index=True
+        String,
+        ForeignKey("output_parameters.output_parameter_id"),
+        primary_key=True,
+        index=True,
     )
     value = Column(JSON, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)

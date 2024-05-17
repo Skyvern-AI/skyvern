@@ -27,7 +27,10 @@ class BrowserManager:
         task_id: str | None = None,
     ) -> BrowserState:
         pw = await async_playwright().start()
-        browser_context, browser_artifacts = await BrowserContextFactory.create_browser_context(
+        (
+            browser_context,
+            browser_artifacts,
+        ) = await BrowserContextFactory.create_browser_context(
             pw,
             proxy_location=proxy_location,
             url=url,
@@ -67,7 +70,10 @@ class BrowserManager:
     async def get_or_create_for_workflow_run(self, workflow_run: WorkflowRun, url: str | None = None) -> BrowserState:
         if workflow_run.workflow_run_id in self.pages:
             return self.pages[workflow_run.workflow_run_id]
-        LOG.info("Creating browser state for workflow run", workflow_run_id=workflow_run.workflow_run_id)
+        LOG.info(
+            "Creating browser state for workflow run",
+            workflow_run_id=workflow_run.workflow_run_id,
+        )
         browser_state = await self._create_browser_state(workflow_run.proxy_location, url=url)
 
         # The URL here is only used when creating a new page, and not when using an existing page.
@@ -102,7 +108,11 @@ class BrowserManager:
         raise MissingBrowserState(task_id=task.task_id)
 
     async def get_video_data(
-        self, browser_state: BrowserState, task_id: str = "", workflow_id: str = "", workflow_run_id: str = ""
+        self,
+        browser_state: BrowserState,
+        task_id: str = "",
+        workflow_id: str = "",
+        workflow_run_id: str = "",
     ) -> bytes:
         if browser_state:
             path = browser_state.browser_artifacts.video_path
@@ -113,12 +123,19 @@ class BrowserManager:
                 except FileNotFoundError:
                     pass
         LOG.warning(
-            "Video data not found for task", task_id=task_id, workflow_id=workflow_id, workflow_run_id=workflow_run_id
+            "Video data not found for task",
+            task_id=task_id,
+            workflow_id=workflow_id,
+            workflow_run_id=workflow_run_id,
         )
         return b""
 
     async def get_har_data(
-        self, browser_state: BrowserState, task_id: str = "", workflow_id: str = "", workflow_run_id: str = ""
+        self,
+        browser_state: BrowserState,
+        task_id: str = "",
+        workflow_id: str = "",
+        workflow_run_id: str = "",
     ) -> bytes:
         if browser_state:
             path = browser_state.browser_artifacts.har_path
@@ -126,7 +143,10 @@ class BrowserManager:
                 with open(path, "rb") as f:
                     return f.read()
         LOG.warning(
-            "HAR data not found for task", task_id=task_id, workflow_id=workflow_id, workflow_run_id=workflow_run_id
+            "HAR data not found for task",
+            task_id=task_id,
+            workflow_id=workflow_id,
+            workflow_run_id=workflow_run_id,
         )
         return b""
 
@@ -154,7 +174,10 @@ class BrowserManager:
         return browser_state_to_close
 
     async def cleanup_for_workflow_run(
-        self, workflow_run_id: str, task_ids: list[str], close_browser_on_completion: bool = True
+        self,
+        workflow_run_id: str,
+        task_ids: list[str],
+        close_browser_on_completion: bool = True,
     ) -> BrowserState | None:
         LOG.info("Cleaning up for workflow run")
         browser_state_to_close = self.pages.pop(workflow_run_id, None)

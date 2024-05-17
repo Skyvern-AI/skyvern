@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicateBlockLabels
-from skyvern.forge.sdk.workflow.models.block import BlockResult, BlockTypeVar
+from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 
 
@@ -42,8 +42,12 @@ class Workflow(BaseModel):
     workflow_id: str
     organization_id: str
     title: str
+    workflow_permanent_id: str
+    version: int
     description: str | None = None
     workflow_definition: WorkflowDefinition
+    proxy_location: ProxyLocation | None = None
+    webhook_callback_url: str | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -94,5 +98,4 @@ class WorkflowRunStatusResponse(BaseModel):
     parameters: dict[str, Any]
     screenshot_urls: list[str] | None = None
     recording_url: str | None = None
-    payload: dict[str, Any] | None = None
-    output: BlockResult | None = None
+    outputs: dict[str, Any] | None = None

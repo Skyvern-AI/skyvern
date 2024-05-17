@@ -31,7 +31,8 @@ tracer.configure(
 setup_logger()
 SETTINGS_MANAGER = SettingsManager.get_settings()
 DATABASE = AgentDB(
-    SettingsManager.get_settings().DATABASE_STRING, debug_enabled=SettingsManager.get_settings().DEBUG_MODE
+    SettingsManager.get_settings().DATABASE_STRING,
+    debug_enabled=SettingsManager.get_settings().DEBUG_MODE,
 )
 STORAGE = StorageFactory.get_storage()
 ARTIFACT_MANAGER = ArtifactManager()

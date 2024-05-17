@@ -59,5 +59,4 @@ class LLMAPIHandler(Protocol):
         step: Step | None = None,
         screenshots: list[bytes] | None = None,
         parameters: dict[str, Any] | None = None,
-    ) -> Awaitable[dict[str, Any]]:
-        ...
+    ) -> Awaitable[dict[str, Any]]: ...

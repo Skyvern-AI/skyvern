@@ -63,6 +63,6 @@ class DetailedAgentStepOutput(BaseModel):
     def to_agent_step_output(self) -> AgentStepOutput:
         return AgentStepOutput(
             action_results=self.action_results if self.action_results else [],
-            actions_and_results=self.actions_and_results if self.actions_and_results else [],
+            actions_and_results=(self.actions_and_results if self.actions_and_results else []),
             errors=self.extract_errors(),
         )

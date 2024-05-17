@@ -1,6 +1,15 @@
+from fastapi import status
+
+
 class SkyvernException(Exception):
     def __init__(self, message: str | None = None):
         self.message = message
+        super().__init__(message)
+
+
+class SkyvernHTTPException(SkyvernException):
+    def __init__(self, message: str | None = None, status_code: int = status.HTTP_400_BAD_REQUEST):
+        self.status_code = status_code
         super().__init__(message)
 
 
@@ -10,7 +19,12 @@ class InvalidOpenAIResponseFormat(SkyvernException):
 
 
 class FailedToSendWebhook(SkyvernException):
-    def __init__(self, task_id: str | None = None, workflow_run_id: str | None = None, workflow_id: str | None = None):
+    def __init__(
+        self,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_id: str | None = None,
+    ):
         workflow_run_str = f"workflow_run_id={workflow_run_id}" if workflow_run_id else ""
         workflow_str = f"workflow_id={workflow_id}" if workflow_id else ""
         task_str = f"task_id={task_id}" if task_id else ""
@@ -22,9 +36,9 @@ class ProxyLocationNotSupportedError(SkyvernException):
         super().__init__(f"Unknown proxy location: {proxy_location}")
 
 
-class TaskNotFound(SkyvernException):
+class TaskNotFound(SkyvernHTTPException):
     def __init__(self, task_id: str | None = None):
-        super().__init__(f"Task {task_id} not found")
+        super().__init__(f"Task {task_id} not found", status_code=status.HTTP_404_NOT_FOUND)
 
 
 class ScriptNotFound(SkyvernException):
@@ -97,9 +111,26 @@ class UnknownBlockType(SkyvernException):
         super().__init__(f"Unknown block type {block_type}")
 
 
-class WorkflowNotFound(SkyvernException):
-    def __init__(self, workflow_id: str) -> None:
-        super().__init__(f"Workflow {workflow_id} not found")
+class WorkflowNotFound(SkyvernHTTPException):
+    def __init__(
+        self,
+        workflow_id: str | None = None,
+        workflow_permanent_id: str | None = None,
+        version: int | None = None,
+    ) -> None:
+        workflow_repr = ""
+        if workflow_id:
+            workflow_repr = f"workflow_id={workflow_id}"
+        if workflow_permanent_id:
+            if version:
+                workflow_repr = f"workflow_permanent_id={workflow_permanent_id}, version={version}"
+            else:
+                workflow_repr = f"workflow_permanent_id={workflow_permanent_id}"
+
+        super().__init__(
+            f"Workflow not found. {workflow_repr}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
 
 
 class WorkflowRunNotFound(SkyvernException):
@@ -119,9 +150,12 @@ class MissingValueForParameter(SkyvernException):
         )
 
 
-class WorkflowParameterNotFound(SkyvernException):
+class WorkflowParameterNotFound(SkyvernHTTPException):
     def __init__(self, workflow_parameter_id: str) -> None:
-        super().__init__(f"Workflow parameter {workflow_parameter_id} not found")
+        super().__init__(
+            f"Workflow parameter {workflow_parameter_id} not found",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
 
 
 class FailedToNavigateToUrl(SkyvernException):
@@ -163,14 +197,20 @@ class BrowserStateMissingPage(SkyvernException):
         super().__init__("BrowserState is missing the main page")
 
 
-class OrganizationNotFound(SkyvernException):
+class OrganizationNotFound(SkyvernHTTPException):
     def __init__(self, organization_id: str) -> None:
-        super().__init__(f"Organization {organization_id} not found")
+        super().__init__(
+            f"Organization {organization_id} not found",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
 
 
-class StepNotFound(SkyvernException):
+class StepNotFound(SkyvernHTTPException):
     def __init__(self, organization_id: str, task_id: str, step_id: str | None = None) -> None:
-        super().__init__(f"Step {step_id or 'latest'} not found. organization_id={organization_id} task_id={task_id}")
+        super().__init__(
+            f"Step {step_id or 'latest'} not found. organization_id={organization_id} task_id={task_id}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
 
 
 class FailedToTakeScreenshot(SkyvernException):

@@ -29,8 +29,7 @@ LOG = structlog.get_logger()
 class BrowserContextCreator(Protocol):
     def __call__(
         self, playwright: Playwright, **kwargs: dict[str, Any]
-    ) -> Awaitable[tuple[BrowserContext, BrowserArtifacts]]:
-        ...
+    ) -> Awaitable[tuple[BrowserContext, BrowserArtifacts]]: ...
 
 
 class BrowserContextFactory:
@@ -63,7 +62,10 @@ class BrowserContextFactory:
             ],
             "record_har_path": har_dir,
             "record_video_dir": video_dir,
-            "viewport": {"width": settings.BROWSER_WIDTH, "height": settings.BROWSER_HEIGHT},
+            "viewport": {
+                "width": settings.BROWSER_WIDTH,
+                "height": settings.BROWSER_HEIGHT,
+            },
         }
 
     @staticmethod
@@ -74,7 +76,10 @@ class BrowserContextFactory:
         traces_dir: str | None = None,
     ) -> BrowserArtifacts:
         return BrowserArtifacts(
-            video_path=video_path, har_path=har_path, video_artifact_id=video_artifact_id, traces_dir=traces_dir
+            video_path=video_path,
+            har_path=har_path,
+            video_artifact_id=video_artifact_id,
+            traces_dir=traces_dir,
         )
 
     @classmethod
@@ -157,7 +162,10 @@ class BrowserState:
             LOG.info("playwright is started")
         if self.browser_context is None:
             LOG.info("creating browser context")
-            browser_context, browser_artifacts = await BrowserContextFactory.create_browser_context(self.pw, url=url)
+            (
+                browser_context,
+                browser_artifacts,
+            ) = await BrowserContextFactory.create_browser_context(self.pw, url=url)
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts
             LOG.info("browser context is created")
@@ -180,7 +188,11 @@ class BrowserState:
                             start_time = time.time()
                             await self.page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
                             end_time = time.time()
-                            LOG.info(f"Page loading time", loading_time=end_time - start_time, url=url)
+                            LOG.info(
+                                "Page loading time",
+                                loading_time=end_time - start_time,
+                                url=url,
+                            )
                         except Error as playright_error:
                             LOG.exception(f"Error while navigating to url: {str(playright_error)}")
                             raise FailedToNavigateToUrl(url=url, error_message=str(playright_error))
@@ -240,7 +252,7 @@ class BrowserState:
                 )
             end_time = time.time()
             LOG.info(
-                f"Screenshot taking time",
+                "Screenshot taking time",
                 screenshot_time=end_time - start_time,
                 full_page=full_page,
                 file_path=file_path,

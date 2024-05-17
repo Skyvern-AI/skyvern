@@ -91,7 +91,10 @@ class BackgroundTaskExecutor(AsyncExecutor):
         api_key: str | None,
         **kwargs: dict,
     ) -> None:
-        LOG.info("Executing workflow using background task executor", workflow_run_id=workflow_run_id)
+        LOG.info(
+            "Executing workflow using background task executor",
+            workflow_run_id=workflow_run_id,
+        )
         background_tasks.add_task(
             app.WORKFLOW_SERVICE.execute_workflow,
             workflow_run_id=workflow_run_id,

@@ -67,7 +67,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False) -> Task:
         extracted_information=task_obj.extracted_information,
         failure_reason=task_obj.failure_reason,
         organization_id=task_obj.organization_id,
-        proxy_location=ProxyLocation(task_obj.proxy_location) if task_obj.proxy_location else None,
+        proxy_location=(ProxyLocation(task_obj.proxy_location) if task_obj.proxy_location else None),
         extracted_information_schema=task_obj.extracted_information_schema,
         workflow_run_id=task_obj.workflow_run_id,
         order=task_obj.order,
@@ -112,7 +112,9 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
     )
 
 
-def convert_to_organization_auth_token(org_auth_token: OrganizationAuthTokenModel) -> OrganizationAuthToken:
+def convert_to_organization_auth_token(
+    org_auth_token: OrganizationAuthTokenModel,
+) -> OrganizationAuthToken:
     return OrganizationAuthToken(
         id=org_auth_token.id,
         organization_id=org_auth_token.organization_id,
@@ -126,7 +128,10 @@ def convert_to_organization_auth_token(org_auth_token: OrganizationAuthTokenMode
 
 def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = False) -> Artifact:
     if debug_enabled:
-        LOG.debug("Converting ArtifactModel to Artifact", artifact_id=artifact_model.artifact_id)
+        LOG.debug(
+            "Converting ArtifactModel to Artifact",
+            artifact_id=artifact_model.artifact_id,
+        )
 
     return Artifact(
         artifact_id=artifact_model.artifact_id,
@@ -142,12 +147,19 @@ def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = Fal
 
 def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = False) -> Workflow:
     if debug_enabled:
-        LOG.debug("Converting WorkflowModel to Workflow", workflow_id=workflow_model.workflow_id)
+        LOG.debug(
+            "Converting WorkflowModel to Workflow",
+            workflow_id=workflow_model.workflow_id,
+        )
 
     return Workflow(
         workflow_id=workflow_model.workflow_id,
         organization_id=workflow_model.organization_id,
         title=workflow_model.title,
+        workflow_permanent_id=workflow_model.workflow_permanent_id,
+        webhook_callback_url=workflow_model.webhook_callback_url,
+        proxy_location=(ProxyLocation(workflow_model.proxy_location) if workflow_model.proxy_location else None),
+        version=workflow_model.version,
         description=workflow_model.description,
         workflow_definition=WorkflowDefinition.model_validate(workflow_model.workflow_definition),
         created_at=workflow_model.created_at,
@@ -158,13 +170,18 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
 
 def convert_to_workflow_run(workflow_run_model: WorkflowRunModel, debug_enabled: bool = False) -> WorkflowRun:
     if debug_enabled:
-        LOG.debug("Converting WorkflowRunModel to WorkflowRun", workflow_run_id=workflow_run_model.workflow_run_id)
+        LOG.debug(
+            "Converting WorkflowRunModel to WorkflowRun",
+            workflow_run_id=workflow_run_model.workflow_run_id,
+        )
 
     return WorkflowRun(
         workflow_run_id=workflow_run_model.workflow_run_id,
         workflow_id=workflow_run_model.workflow_id,
         status=WorkflowRunStatus[workflow_run_model.status],
-        proxy_location=ProxyLocation(workflow_run_model.proxy_location) if workflow_run_model.proxy_location else None,
+        proxy_location=(
+            ProxyLocation(workflow_run_model.proxy_location) if workflow_run_model.proxy_location else None
+        ),
         webhook_callback_url=workflow_run_model.webhook_callback_url,
         created_at=workflow_run_model.created_at,
         modified_at=workflow_run_model.modified_at,
@@ -217,7 +234,8 @@ def convert_to_aws_secret_parameter(
 
 
 def convert_to_bitwarden_login_credential_parameter(
-    bitwarden_login_credential_parameter_model: BitwardenLoginCredentialParameterModel, debug_enabled: bool = False
+    bitwarden_login_credential_parameter_model: BitwardenLoginCredentialParameterModel,
+    debug_enabled: bool = False,
 ) -> BitwardenLoginCredentialParameter:
     if debug_enabled:
         LOG.debug(
