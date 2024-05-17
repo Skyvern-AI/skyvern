@@ -54,7 +54,10 @@ class ForgeAgent:
             for module in SettingsManager.get_settings().ADDITIONAL_MODULES:
                 LOG.info("Loading additional module", module=module)
                 __import__(module)
-            LOG.info("Additional modules loaded", modules=SettingsManager.get_settings().ADDITIONAL_MODULES)
+            LOG.info(
+                "Additional modules loaded",
+                modules=SettingsManager.get_settings().ADDITIONAL_MODULES,
+            )
         LOG.info(
             "Initializing ForgeAgent",
             env=SettingsManager.get_settings().ENV,
@@ -115,7 +118,10 @@ class ForgeAgent:
         if task_url is None:
             browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(workflow_run=workflow_run)
             if not browser_state.page:
-                LOG.error("BrowserState has no page", workflow_run_id=workflow_run.workflow_run_id)
+                LOG.error(
+                    "BrowserState has no page",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
                 raise MissingBrowserStatePage(workflow_run_id=workflow_run.workflow_run_id)
 
             if browser_state.page.url == "about:blank":
@@ -155,7 +161,9 @@ class ForgeAgent:
         )
         # Update task status to running
         task = await app.DATABASE.update_task(
-            task_id=task.task_id, organization_id=task.organization_id, status=TaskStatus.running
+            task_id=task.task_id,
+            organization_id=task.organization_id,
+            status=TaskStatus.running,
         )
         step = await app.DATABASE.create_step(
             task.task_id,
@@ -215,7 +223,11 @@ class ForgeAgent:
         try:
             # Check some conditions before executing the step, throw an exception if the step can't be executed
             await self.validate_step_execution(task, step)
-            step, browser_state, detailed_output = await self._initialize_execution_state(task, step, workflow_run)
+            (
+                step,
+                browser_state,
+                detailed_output,
+            ) = await self._initialize_execution_state(task, step, workflow_run)
 
             if browser_state.page:
                 self.register_async_operations(organization, task, browser_state.page)
@@ -242,9 +254,11 @@ class ForgeAgent:
                     return step, detailed_output, None
             elif step.status == StepStatus.completed:
                 # TODO (kerem): keep the task object uptodate at all times so that send_task_response can just use it
-                is_task_completed, maybe_last_step, maybe_next_step = await self.handle_completed_step(
-                    organization, task, step
-                )
+                (
+                    is_task_completed,
+                    maybe_last_step,
+                    maybe_next_step,
+                ) = await self.handle_completed_step(organization, task, step)
                 if is_task_completed is not None and maybe_last_step:
                     last_step = maybe_last_step
                     await self.send_task_response(
@@ -358,7 +372,10 @@ class ForgeAgent:
                 step_retry=step.retry_index,
             )
             step = await self.update_step(step=step, status=StepStatus.running)
-            scraped_page, extract_action_prompt = await self._build_and_record_step_prompt(
+            (
+                scraped_page,
+                extract_action_prompt,
+            ) = await self._build_and_record_step_prompt(
                 task,
                 step,
                 browser_state,
@@ -380,7 +397,8 @@ class ForgeAgent:
             else:
                 actions = [
                     CompleteAction(
-                        reasoning="Task has no navigation goal.", data_extraction_goal=task.data_extraction_goal
+                        reasoning="Task has no navigation goal.",
+                        data_extraction_goal=task.data_extraction_goal,
                     )
                 ]
             detailed_agent_step_output.actions = actions
@@ -393,7 +411,9 @@ class ForgeAgent:
                     step_retry=step.retry_index,
                 )
                 step = await self.update_step(
-                    step=step, status=StepStatus.failed, output=detailed_agent_step_output.to_agent_step_output()
+                    step=step,
+                    status=StepStatus.failed,
+                    output=detailed_agent_step_output.to_agent_step_output(),
                 )
                 detailed_agent_step_output = DetailedAgentStepOutput(
                     scraped_page=scraped_page,
@@ -426,7 +446,11 @@ class ForgeAgent:
                 # if there are wait actions and there are other actions in the list, skip wait actions
                 if wait_actions_len > 0 and wait_actions_len < len(actions):
                     actions = [action for action in actions if action.action_type != ActionType.WAIT]
-                    LOG.info("Skipping wait actions", wait_actions_to_skip=wait_actions_to_skip, actions=actions)
+                    LOG.info(
+                        "Skipping wait actions",
+                        wait_actions_to_skip=wait_actions_to_skip,
+                        actions=actions,
+                    )
 
             # initialize list of tuples and set actions as the first element of each tuple so that in the case
             # of an exception, we can still see all the actions
@@ -436,13 +460,19 @@ class ForgeAgent:
             for action_idx, action in enumerate(actions):
                 if isinstance(action, WebAction):
                     if action.element_id in web_action_element_ids:
-                        LOG.error("Duplicate action element id. Action handling stops", action=action)
+                        LOG.error(
+                            "Duplicate action element id. Action handling stops",
+                            action=action,
+                        )
                         break
                     web_action_element_ids.add(action.element_id)
 
                 self.async_operation_pool.run_operation(task.task_id, AgentPhase.action)
                 results = await ActionHandler.handle_action(scraped_page, task, step, browser_state, action)
-                detailed_agent_step_output.actions_and_results[action_idx] = (action, results)
+                detailed_agent_step_output.actions_and_results[action_idx] = (
+                    action,
+                    results,
+                )
                 # wait random time between actions to avoid detection
                 await asyncio.sleep(random.uniform(1.0, 2.0))
                 await self.record_artifacts_after_action(task, step, browser_state)
@@ -467,7 +497,10 @@ class ForgeAgent:
                     # for now, we're being optimistic and assuming that
                     # js call doesn't have impact on the following actions
                     if results[-1].javascript_triggered:
-                        LOG.info("Action triggered javascript. Stop executing reamaining actions.", action=action)
+                        LOG.info(
+                            "Action triggered javascript. Stop executing reamaining actions.",
+                            action=action,
+                        )
                         # stop executing the rest actions
                         break
                 else:
@@ -484,7 +517,9 @@ class ForgeAgent:
                     )
                     # if the action failed, don't execute the rest of the actions, mark the step as failed, and retry
                     failed_step = await self.update_step(
-                        step=step, status=StepStatus.failed, output=detailed_agent_step_output.to_agent_step_output()
+                        step=step,
+                        status=StepStatus.failed,
+                        output=detailed_agent_step_output.to_agent_step_output(),
                     )
                     return failed_step, detailed_agent_step_output
 
@@ -498,7 +533,9 @@ class ForgeAgent:
             )
             # If no action errors return the agent state and output
             completed_step = await self.update_step(
-                step=step, status=StepStatus.completed, output=detailed_agent_step_output.to_agent_step_output()
+                step=step,
+                status=StepStatus.completed,
+                output=detailed_agent_step_output.to_agent_step_output(),
             )
             return completed_step, detailed_agent_step_output
         except Exception:
@@ -510,7 +547,9 @@ class ForgeAgent:
                 step_retry=step.retry_index,
             )
             failed_step = await self.update_step(
-                step=step, status=StepStatus.failed, output=detailed_agent_step_output.to_agent_step_output()
+                step=step,
+                status=StepStatus.failed,
+                output=detailed_agent_step_output.to_agent_step_output(),
             )
             return failed_step, detailed_agent_step_output
 
@@ -645,7 +684,7 @@ class ForgeAgent:
         ):
             element_tree_format = ElementTreeFormat.HTML
         LOG.info(
-            f"Building element tree",
+            "Building element tree",
             task_id=task.task_id,
             workflow_run_id=task.workflow_run_id,
             format=element_tree_format,
@@ -660,7 +699,7 @@ class ForgeAgent:
             elements=scraped_page.build_element_tree(element_tree_format),
             data_extraction_goal=task.data_extraction_goal,
             action_history=actions_and_results_str,
-            error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else None,
+            error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
             utc_datetime=datetime.utcnow(),
         )
 
@@ -791,7 +830,11 @@ class ForgeAgent:
                 LOG.error("Failed to get task from db when sending task response")
                 raise TaskNotFound(task_id=task.task_id)
         except Exception as e:
-            LOG.error("Failed to get task from db when sending task response", task_id=task.task_id, error=e)
+            LOG.error(
+                "Failed to get task from db when sending task response",
+                task_id=task.task_id,
+                error=e,
+            )
             raise TaskNotFound(task_id=task.task_id) from e
         task = refreshed_task
         # log the task status as an event
@@ -843,7 +886,11 @@ class ForgeAgent:
         await self.execute_task_webhook(task=task, last_step=last_step, api_key=api_key)
 
     async def execute_task_webhook(
-        self, task: Task, last_step: Step, api_key: str | None, skip_artifacts: bool = False
+        self,
+        task: Task,
+        last_step: Step,
+        api_key: str | None,
+        skip_artifacts: bool = False,
     ) -> None:
         if not api_key:
             LOG.warning(
@@ -1106,7 +1153,11 @@ class ForgeAgent:
             )
             last_step = await self.update_step(step, is_last=True)
             extracted_information = await self.get_extracted_information_for_task(task)
-            await self.update_task(task, status=TaskStatus.completed, extracted_information=extracted_information)
+            await self.update_task(
+                task,
+                status=TaskStatus.completed,
+                extracted_information=extracted_information,
+            )
             return True, last_step, None
         if step.is_terminated():
             LOG.info(
@@ -1193,5 +1244,7 @@ class ForgeAgent:
         task_errors.extend([error.model_dump() for error in step_errors])
 
         return await app.DATABASE.update_task(
-            task_id=task.task_id, organization_id=task.organization_id, errors=task_errors
+            task_id=task.task_id,
+            organization_id=task.organization_id,
+            errors=task_errors,
         )

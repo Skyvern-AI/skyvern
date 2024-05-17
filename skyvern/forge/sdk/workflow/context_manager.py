@@ -93,7 +93,7 @@ class WorkflowRunContext:
         assume it's an actual parameter value and return it.
 
         """
-        if type(secret_id_or_value) is str:
+        if isinstance(secret_id_or_value, str):
             return self.secrets.get(secret_id_or_value)
         return None
 
@@ -149,7 +149,7 @@ class WorkflowRunContext:
                 url = self.values[parameter.url_parameter_key]
             else:
                 LOG.error(f"URL parameter {parameter.url_parameter_key} not found or has no value")
-                raise ValueError(f"URL parameter for Bitwarden login credentials not found or has no value")
+                raise ValueError("URL parameter for Bitwarden login credentials not found or has no value")
 
             try:
                 secret_credentials = BitwardenService.get_secret_value_from_url(
@@ -224,7 +224,9 @@ class WorkflowRunContext:
         await self.set_parameter_values_for_output_parameter_dependent_blocks(parameter, value)
 
     async def set_parameter_values_for_output_parameter_dependent_blocks(
-        self, output_parameter: OutputParameter, value: dict[str, Any] | list | str | None
+        self,
+        output_parameter: OutputParameter,
+        value: dict[str, Any] | list | str | None,
     ) -> None:
         for key, parameter in self.parameters.items():
             if (
@@ -268,7 +270,7 @@ class WorkflowRunContext:
                 isinstance(x, ContextParameter),
                 # This makes sure that ContextParameters witha ContextParameter source are processed after all other
                 # ContextParameters
-                isinstance(x.source, ContextParameter) if isinstance(x, ContextParameter) else False,
+                (isinstance(x.source, ContextParameter) if isinstance(x, ContextParameter) else False),
                 isinstance(x, BitwardenLoginCredentialParameter),
             )
         )

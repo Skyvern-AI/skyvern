@@ -54,7 +54,10 @@ async def webhook(
             x_skyvern_timestamp=x_skyvern_timestamp,
             payload=payload,
         )
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing webhook signature or timestamp")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing webhook signature or timestamp",
+        )
 
     generated_signature = generate_skyvern_signature(
         payload.decode("utf-8"),
@@ -82,7 +85,12 @@ async def check_server_status() -> Response:
 
 
 @base_router.post("/tasks", tags=["agent"], response_model=CreateTaskResponse)
-@base_router.post("/tasks/", tags=["agent"], response_model=CreateTaskResponse, include_in_schema=False)
+@base_router.post(
+    "/tasks/",
+    tags=["agent"],
+    response_model=CreateTaskResponse,
+    include_in_schema=False,
+)
 async def create_agent_task(
     background_tasks: BackgroundTasks,
     task: TaskRequest,
@@ -342,13 +350,21 @@ async def get_agent_tasks(
     """
     analytics.capture("skyvern-oss-agent-tasks-get")
     tasks = await app.DATABASE.get_tasks(
-        page, page_size, task_status=task_status, organization_id=current_org.organization_id
+        page,
+        page_size,
+        task_status=task_status,
+        organization_id=current_org.organization_id,
     )
     return ORJSONResponse([task.to_task_response().model_dump() for task in tasks])
 
 
 @base_router.get("/internal/tasks", tags=["agent"], response_model=list[Task])
-@base_router.get("/internal/tasks/", tags=["agent"], response_model=list[Task], include_in_schema=False)
+@base_router.get(
+    "/internal/tasks/",
+    tags=["agent"],
+    response_model=list[Task],
+    include_in_schema=False,
+)
 async def get_agent_tasks_internal(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
@@ -367,7 +383,12 @@ async def get_agent_tasks_internal(
 
 
 @base_router.get("/tasks/{task_id}/steps", tags=["agent"], response_model=list[Step])
-@base_router.get("/tasks/{task_id}/steps/", tags=["agent"], response_model=list[Step], include_in_schema=False)
+@base_router.get(
+    "/tasks/{task_id}/steps/",
+    tags=["agent"],
+    response_model=list[Step],
+    include_in_schema=False,
+)
 async def get_agent_task_steps(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -382,7 +403,11 @@ async def get_agent_task_steps(
     return ORJSONResponse([step.model_dump() for step in steps])
 
 
-@base_router.get("/tasks/{task_id}/steps/{step_id}/artifacts", tags=["agent"], response_model=list[Artifact])
+@base_router.get(
+    "/tasks/{task_id}/steps/{step_id}/artifacts",
+    tags=["agent"],
+    response_model=list[Artifact],
+)
 @base_router.get(
     "/tasks/{task_id}/steps/{step_id}/artifacts/",
     tags=["agent"],
@@ -412,7 +437,11 @@ async def get_agent_task_step_artifacts(
             for i, artifact in enumerate(artifacts):
                 artifact.signed_url = signed_urls[i]
         else:
-            LOG.warning("Failed to get signed urls for artifacts", task_id=task_id, step_id=step_id)
+            LOG.warning(
+                "Failed to get signed urls for artifacts",
+                task_id=task_id,
+                step_id=step_id,
+            )
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
 
@@ -424,7 +453,11 @@ class ActionResultTmp(BaseModel):
 
 
 @base_router.get("/tasks/{task_id}/actions", response_model=list[ActionResultTmp])
-@base_router.get("/tasks/{task_id}/actions/", response_model=list[ActionResultTmp], include_in_schema=False)
+@base_router.get(
+    "/tasks/{task_id}/actions/",
+    response_model=list[ActionResultTmp],
+    include_in_schema=False,
+)
 async def get_task_actions(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -441,7 +474,11 @@ async def get_task_actions(
 
 
 @base_router.post("/workflows/{workflow_id}/run", response_model=RunWorkflowResponse)
-@base_router.post("/workflows/{workflow_id}/run/", response_model=RunWorkflowResponse, include_in_schema=False)
+@base_router.post(
+    "/workflows/{workflow_id}/run/",
+    response_model=RunWorkflowResponse,
+    include_in_schema=False,
+)
 async def execute_workflow(
     background_tasks: BackgroundTasks,
     workflow_id: str,
@@ -476,7 +513,10 @@ async def execute_workflow(
     )
 
 
-@base_router.get("/workflows/{workflow_id}/runs/{workflow_run_id}", response_model=WorkflowRunStatusResponse)
+@base_router.get(
+    "/workflows/{workflow_id}/runs/{workflow_run_id}",
+    response_model=WorkflowRunStatusResponse,
+)
 @base_router.get(
     "/workflows/{workflow_id}/runs/{workflow_run_id}/",
     response_model=WorkflowRunStatusResponse,

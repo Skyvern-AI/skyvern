@@ -35,5 +35,5 @@ async def create_org_api_token(org_id: str) -> OrganizationAuthToken:
         token=api_key,
         token_type=OrganizationAuthTokenType.api,
     )
-    LOG.info(f"Created API token for organization", organization_id=org_id)
+    LOG.info("Created API token for organization", organization_id=org_id)
     return org_auth_token

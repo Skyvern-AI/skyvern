@@ -81,16 +81,20 @@ class Block(BaseModel, abc.ABC):
             value=value,
         )
         LOG.info(
-            f"Registered output parameter value",
+            "Registered output parameter value",
             output_parameter_id=self.output_parameter.output_parameter_id,
             workflow_run_id=workflow_run_id,
         )
 
     def build_block_result(
-        self, success: bool, output_parameter_value: dict[str, Any] | list | str | None = None
+        self,
+        success: bool,
+        output_parameter_value: dict[str, Any] | list | str | None = None,
     ) -> BlockResult:
         return BlockResult(
-            success=success, output_parameter=self.output_parameter, output_parameter_value=output_parameter_value
+            success=success,
+            output_parameter=self.output_parameter,
+            output_parameter_value=output_parameter_value,
         )
 
     @classmethod
@@ -236,11 +240,14 @@ class TaskBlock(Block):
                 workflow_run=workflow_run, url=self.url
             )
             if not browser_state.page:
-                LOG.error("BrowserState has no page", workflow_run_id=workflow_run.workflow_run_id)
+                LOG.error(
+                    "BrowserState has no page",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
                 raise MissingBrowserStatePage(workflow_run_id=workflow_run.workflow_run_id)
 
             LOG.info(
-                f"Navigating to page",
+                "Navigating to page",
                 url=self.url,
                 workflow_run_id=workflow_run_id,
                 task_id=task.task_id,
@@ -253,7 +260,12 @@ class TaskBlock(Block):
                 await browser_state.page.goto(self.url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
 
             try:
-                await app.agent.execute_step(organization=organization, task=task, step=step, workflow_run=workflow_run)
+                await app.agent.execute_step(
+                    organization=organization,
+                    task=task,
+                    step=step,
+                    workflow_run=workflow_run,
+                )
             except Exception as e:
                 # Make sure the task is marked as failed in the database before raising the exception
                 await app.DATABASE.update_task(
@@ -273,7 +285,7 @@ class TaskBlock(Block):
 
             if updated_task.status == TaskStatus.completed or updated_task.status == TaskStatus.terminated:
                 LOG.info(
-                    f"Task completed",
+                    "Task completed",
                     task_id=updated_task.task_id,
                     task_status=updated_task.status,
                     workflow_run_id=workflow_run_id,
@@ -400,7 +412,7 @@ class ForLoopBlock(Block):
         )
         if not loop_over_values or len(loop_over_values) == 0:
             LOG.info(
-                f"No loop_over values found",
+                "No loop_over values found",
                 block_type=self.block_type,
                 workflow_run_id=workflow_run_id,
                 num_loop_over_values=len(loop_over_values),
@@ -519,7 +531,11 @@ class TextPromptBlock(Block):
             + json.dumps(self.json_schema, indent=2)
             + "\n```\n\n"
         )
-        LOG.info("TextPromptBlock: Sending prompt to LLM", prompt=prompt, llm_key=self.llm_key)
+        LOG.info(
+            "TextPromptBlock: Sending prompt to LLM",
+            prompt=prompt,
+            llm_key=self.llm_key,
+        )
         response = await llm_api_handler(prompt=prompt)
         LOG.info("TextPromptBlock: Received response from LLM", response=response)
         return response
@@ -692,7 +708,12 @@ class SendEmailBlock(Block):
         workflow_run_id: str,
     ) -> list[PARAMETER_TYPE]:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        parameters = [self.smtp_host, self.smtp_port, self.smtp_username, self.smtp_password]
+        parameters = [
+            self.smtp_host,
+            self.smtp_port,
+            self.smtp_username,
+            self.smtp_password,
+        ]
 
         if self.file_attachments:
             for file_path in self.file_attachments:
@@ -732,7 +753,12 @@ class SendEmailBlock(Block):
         if email_config_problems:
             raise InvalidEmailClientConfiguration(email_config_problems)
 
-        return smtp_host_value, smtp_port_value, smtp_username_value, smtp_password_value
+        return (
+            smtp_host_value,
+            smtp_port_value,
+            smtp_username_value,
+            smtp_password_value,
+        )
 
     def _get_file_paths(self, workflow_run_context: WorkflowRunContext, workflow_run_id: str) -> list[str]:
         file_paths = []
@@ -846,7 +872,12 @@ class SendEmailBlock(Block):
                     subtype=subtype,
                 )
                 with open(path, "rb") as fp:
-                    msg.add_attachment(fp.read(), maintype=maintype, subtype=subtype, filename=attachment_filename)
+                    msg.add_attachment(
+                        fp.read(),
+                        maintype=maintype,
+                        subtype=subtype,
+                        filename=attachment_filename,
+                    )
             finally:
                 if path:
                     os.unlink(path)
@@ -884,6 +915,12 @@ class SendEmailBlock(Block):
 
 
 BlockSubclasses = Union[
-    ForLoopBlock, TaskBlock, CodeBlock, TextPromptBlock, DownloadToS3Block, UploadToS3Block, SendEmailBlock
+    ForLoopBlock,
+    TaskBlock,
+    CodeBlock,
+    TextPromptBlock,
+    DownloadToS3Block,
+    UploadToS3Block,
+    SendEmailBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]

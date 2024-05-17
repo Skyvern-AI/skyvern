@@ -82,13 +82,27 @@ class TaskStatus(StrEnum):
     completed = "completed"
 
     def is_final(self) -> bool:
-        return self in {TaskStatus.failed, TaskStatus.terminated, TaskStatus.completed, TaskStatus.timed_out}
+        return self in {
+            TaskStatus.failed,
+            TaskStatus.terminated,
+            TaskStatus.completed,
+            TaskStatus.timed_out,
+        }
 
     def can_update_to(self, new_status: TaskStatus) -> bool:
         allowed_transitions: dict[TaskStatus, set[TaskStatus]] = {
-            TaskStatus.created: {TaskStatus.queued, TaskStatus.running, TaskStatus.timed_out},
+            TaskStatus.created: {
+                TaskStatus.queued,
+                TaskStatus.running,
+                TaskStatus.timed_out,
+            },
             TaskStatus.queued: {TaskStatus.running, TaskStatus.timed_out},
-            TaskStatus.running: {TaskStatus.completed, TaskStatus.failed, TaskStatus.terminated, TaskStatus.timed_out},
+            TaskStatus.running: {
+                TaskStatus.completed,
+                TaskStatus.failed,
+                TaskStatus.terminated,
+                TaskStatus.timed_out,
+            },
             TaskStatus.failed: set(),
             TaskStatus.terminated: set(),
             TaskStatus.completed: set(),

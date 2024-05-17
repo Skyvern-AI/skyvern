@@ -64,6 +64,18 @@ def streamlit_show_recording(st_obj: Any, uri: str) -> None:
     content = read_artifact_safe(uri, is_webm=True)  # type: ignore
     if content:
         random_key = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
-        st_obj.download_button("Download recording", content, f"recording{uri.split('/')[-1]}.webm", key=random_key)
+        st_obj.download_button(
+            "Download recording",
+            content,
+            f"recording{uri.split('/')[-1]}.webm",
+            key=random_key,
+        )
 
-    streamlit_content_safe(st_obj, st_obj.video, content, "No recording available.", format="video/webm", start_time=0)
+    streamlit_content_safe(
+        st_obj,
+        st_obj.video,
+        content,
+        "No recording available.",
+        format="video/webm",
+        start_time=0,
+    )

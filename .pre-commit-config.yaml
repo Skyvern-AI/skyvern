@@ -13,17 +13,19 @@ repos:
       - id: check-symlinks
       - id: debug-statements
       - id: detect-private-key
-
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Ruff version.
+    rev: v0.4.4
+    hooks:
+      # Run the linter.
+      - id: ruff
+        args: [--fix]
+      # Run the formatter.
+      - id: ruff-format
   - repo: https://github.com/pycqa/isort
     rev: 5.13.2
     hooks:
       - id: isort
-        language_version: python3.11
-
-  - repo: https://github.com/psf/black
-    rev: 24.4.2
-    hooks:
-      - id: black
         language_version: python3.11
 
   - repo: https://github.com/pre-commit/pygrep-hooks

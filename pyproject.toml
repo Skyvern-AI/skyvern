@@ -57,8 +57,7 @@ fpdf = "^1.7.2"
 pypdf = "^4.2.0"
 
 [tool.poetry.group.dev.dependencies]
-isort = "^5.12.0"
-black = "^23.3.0"
+isort = "^5.13.2"
 pre-commit = "^3.3.3"
 mypy = "^1.4.1"
 flake8 = "^6.0.0"
@@ -84,11 +83,38 @@ clipboard = "^0.0.4"
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 
-[tool.black]
+[tool.ruff]
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".ipynb_checkpoints",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pyenv",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    ".vscode",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "site-packages",
+    "venv",
+    "alembic/env.py",
+]
 line-length = 120
-target-version = ['py311']
-include = '\.pyi?$'
-extend-exclude = '(/dist|/.venv|/venv|/build)/'
+target-version = "py311"
 
 [tool.isort]
 profile = "black"

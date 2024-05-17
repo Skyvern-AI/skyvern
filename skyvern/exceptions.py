@@ -19,7 +19,12 @@ class InvalidOpenAIResponseFormat(SkyvernException):
 
 
 class FailedToSendWebhook(SkyvernException):
-    def __init__(self, task_id: str | None = None, workflow_run_id: str | None = None, workflow_id: str | None = None):
+    def __init__(
+        self,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_id: str | None = None,
+    ):
         workflow_run_str = f"workflow_run_id={workflow_run_id}" if workflow_run_id else ""
         workflow_str = f"workflow_id={workflow_id}" if workflow_id else ""
         task_str = f"task_id={task_id}" if task_id else ""
@@ -122,7 +127,10 @@ class WorkflowNotFound(SkyvernHTTPException):
             else:
                 workflow_repr = f"workflow_permanent_id={workflow_permanent_id}"
 
-        super().__init__(f"Workflow not found. {workflow_repr}", status_code=status.HTTP_404_NOT_FOUND)
+        super().__init__(
+            f"Workflow not found. {workflow_repr}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
 
 
 class WorkflowRunNotFound(SkyvernException):
@@ -144,7 +152,10 @@ class MissingValueForParameter(SkyvernException):
 
 class WorkflowParameterNotFound(SkyvernHTTPException):
     def __init__(self, workflow_parameter_id: str) -> None:
-        super().__init__(f"Workflow parameter {workflow_parameter_id} not found", status_code=status.HTTP_404_NOT_FOUND)
+        super().__init__(
+            f"Workflow parameter {workflow_parameter_id} not found",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
 
 
 class FailedToNavigateToUrl(SkyvernException):
@@ -188,7 +199,10 @@ class BrowserStateMissingPage(SkyvernException):
 
 class OrganizationNotFound(SkyvernHTTPException):
     def __init__(self, organization_id: str) -> None:
-        super().__init__(f"Organization {organization_id} not found", status_code=status.HTTP_404_NOT_FOUND)
+        super().__init__(
+            f"Organization {organization_id} not found",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
 
 
 class StepNotFound(SkyvernHTTPException):

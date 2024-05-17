@@ -199,9 +199,18 @@ geico_sample_data = SampleTaskRequest(
                                         "additionalProperties": False,
                                         "description": "The vehicle that the collision and comprehensive coverage is for",
                                         "properties": {
-                                            "make": {"description": "The make of the vehicle", "type": "string"},
-                                            "model": {"description": "The model of the vehicle", "type": "string"},
-                                            "year": {"description": "The year of the vehicle", "type": "string"},
+                                            "make": {
+                                                "description": "The make of the vehicle",
+                                                "type": "string",
+                                            },
+                                            "model": {
+                                                "description": "The model of the vehicle",
+                                                "type": "string",
+                                            },
+                                            "year": {
+                                                "description": "The year of the vehicle",
+                                                "type": "string",
+                                            },
                                         },
                                         "type": "object",
                                     },
@@ -225,4 +234,9 @@ geico_sample_data = SampleTaskRequest(
 )
 
 
-supported_examples = [geico_sample_data, finditparts_sample_data, california_edd_sample_data, bci_seguros_sample_data]
+supported_examples = [
+    geico_sample_data,
+    finditparts_sample_data,
+    california_edd_sample_data,
+    bci_seguros_sample_data,
+]

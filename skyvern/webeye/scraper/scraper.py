@@ -241,7 +241,11 @@ async def scrape_web_unsafe(
         scroll_y_px_old = scroll_y_px
         LOG.info("Scrolling to next page", url=url, num_screenshots=len(screenshots))
         scroll_y_px = await scroll_to_next_page(page, drow_boxes=True)
-        LOG.info("Scrolled to next page", scroll_y_px=scroll_y_px, scroll_y_px_old=scroll_y_px_old)
+        LOG.info(
+            "Scrolled to next page",
+            scroll_y_px=scroll_y_px,
+            scroll_y_px_old=scroll_y_px_old,
+        )
     await remove_bounding_boxes(page)
     await scroll_to_top(page, drow_boxes=False)
 

@@ -53,7 +53,11 @@ class BitwardenService:
         """
         # Step 1: Set up environment variables and log in
         try:
-            env = {"BW_CLIENTID": client_id, "BW_CLIENTSECRET": client_secret, "BW_PASSWORD": master_password}
+            env = {
+                "BW_CLIENTID": client_id,
+                "BW_CLIENTSECRET": client_secret,
+                "BW_PASSWORD": master_password,
+            }
             login_command = ["bw", "login", "--apikey"]
             login_result = BitwardenService.run_command(login_command, env)
 
@@ -81,7 +85,15 @@ class BitwardenService:
                 raise BitwardenUnlockError("Session key is empty.")
 
             # Step 3: Retrieve the items
-            list_command = ["bw", "list", "items", "--url", url, "--session", session_key]
+            list_command = [
+                "bw",
+                "list",
+                "items",
+                "--url",
+                url,
+                "--session",
+                session_key,
+            ]
             items_result = BitwardenService.run_command(list_command)
 
             if items_result.stderr and "Event post failed" not in items_result.stderr:
@@ -100,7 +112,11 @@ class BitwardenService:
             totp_result = BitwardenService.run_command(totp_command)
 
             if totp_result.stderr and "Event post failed" not in totp_result.stderr:
-                LOG.warning("Bitwarden TOTP Error", error=totp_result.stderr, e=BitwardenTOTPError(totp_result.stderr))
+                LOG.warning(
+                    "Bitwarden TOTP Error",
+                    error=totp_result.stderr,
+                    e=BitwardenTOTPError(totp_result.stderr),
+                )
             totp_code = totp_result.stdout
 
             credentials: list[dict[str, str]] = [
