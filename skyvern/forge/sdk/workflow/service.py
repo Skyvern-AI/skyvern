@@ -548,10 +548,10 @@ class WorkflowService:
 
         workflow_parameter_tuples = await app.DATABASE.get_workflow_run_parameters(workflow_run_id=workflow_run_id)
         parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
-        output_parameter_tuples: list[
-            tuple[OutputParameter, WorkflowRunOutputParameter]
-        ] = await self.get_output_parameter_workflow_run_output_parameter_tuples(
-            workflow_id=workflow_id, workflow_run_id=workflow_run_id
+        output_parameter_tuples: list[tuple[OutputParameter, WorkflowRunOutputParameter]] = (
+            await self.get_output_parameter_workflow_run_output_parameter_tuples(
+                workflow_id=workflow_id, workflow_run_id=workflow_run_id
+            )
         )
         if output_parameter_tuples:
             outputs = {output_parameter.key: output.value for output_parameter, output in output_parameter_tuples}
@@ -938,9 +938,11 @@ class WorkflowService:
             return CodeBlock(
                 label=block_yaml.label,
                 code=block_yaml.code,
-                parameters=[parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-                if block_yaml.parameter_keys
-                else [],
+                parameters=(
+                    [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                    if block_yaml.parameter_keys
+                    else []
+                ),
                 output_parameter=output_parameter,
             )
         elif block_yaml.block_type == BlockType.TEXT_PROMPT:
@@ -948,9 +950,11 @@ class WorkflowService:
                 label=block_yaml.label,
                 llm_key=block_yaml.llm_key,
                 prompt=block_yaml.prompt,
-                parameters=[parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-                if block_yaml.parameter_keys
-                else [],
+                parameters=(
+                    [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                    if block_yaml.parameter_keys
+                    else []
+                ),
                 json_schema=block_yaml.json_schema,
                 output_parameter=output_parameter,
             )

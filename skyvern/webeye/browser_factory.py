@@ -29,8 +29,7 @@ LOG = structlog.get_logger()
 class BrowserContextCreator(Protocol):
     def __call__(
         self, playwright: Playwright, **kwargs: dict[str, Any]
-    ) -> Awaitable[tuple[BrowserContext, BrowserArtifacts]]:
-        ...
+    ) -> Awaitable[tuple[BrowserContext, BrowserArtifacts]]: ...
 
 
 class BrowserContextFactory:

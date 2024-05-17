@@ -37,9 +37,11 @@ class LLMAPIHandlerFactory:
             redis_port=llm_config.redis_port,
             redis_password=llm_config.redis_password,
             routing_strategy=llm_config.routing_strategy,
-            fallbacks=[{llm_config.main_model_group: llm_config.fallback_model_group}]
-            if llm_config.fallback_model_group
-            else [],
+            fallbacks=(
+                [{llm_config.main_model_group: llm_config.fallback_model_group}]
+                if llm_config.fallback_model_group
+                else []
+            ),
             num_retries=llm_config.num_retries,
             retry_after=llm_config.retry_delay_seconds,
             set_verbose=False if SettingsManager.get_settings().is_cloud_environment() else llm_config.set_verbose,
