@@ -187,7 +187,26 @@ function TaskDetails() {
                 <Label className="w-40 shrink-0">Data Extraction Goal</Label>
                 <Textarea
                   rows={5}
-                  value={task.request.data_extraction_goal}
+                  value={task.request.data_extraction_goal ?? ""}
+                  readOnly
+                />
+              </div>
+              <div className="flex items-center">
+                <Label className="w-40 shrink-0">
+                  Extracted Information Schema
+                </Label>
+                <Textarea
+                  rows={5}
+                  value={
+                    typeof task.request.extracted_information_schema ===
+                    "object"
+                      ? JSON.stringify(
+                          task.request.extracted_information_schema,
+                          null,
+                          2,
+                        )
+                      : task.request.extracted_information_schema
+                  }
                   readOnly
                 />
               </div>

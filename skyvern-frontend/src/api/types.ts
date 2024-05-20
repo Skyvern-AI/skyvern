@@ -65,7 +65,7 @@ export type TaskApiResponse = {
     navigation_payload: string | object; // stringified JSON
     error_code_mapping: null;
     proxy_location: string;
-    extracted_information_schema: string;
+    extracted_information_schema: string | object;
   };
   task_id: string;
   status: Status;
@@ -100,4 +100,51 @@ export type ApiKeyApiResponse = {
   modified_at: string;
   token_type: string;
   valid: boolean;
+};
+
+export type WorkflowParameter = {
+  workflow_parameter_id: string;
+  workflow_parameter_type?: string;
+  key: string;
+  description: string | null;
+  workflow_id: string;
+  parameter_type: "workflow"; // TODO other values
+  default_value?: string;
+  created_at: string | null;
+  modified_at: string | null;
+  deleted_at: string | null;
+};
+
+export type WorkflowBlock = {
+  label: string;
+  block_type: string;
+  output_parameter?: null;
+  continue_on_failure: boolean;
+  url: string;
+  title: string;
+  navigation_goal: string;
+  data_extraction_goal: string;
+  data_schema: object | null;
+  error_code_mapping: null; // ?
+  max_retries: number | null;
+  max_steps_per_run: number | null;
+  parameters: []; // ?
+};
+
+export type WorkflowApiResponse = {
+  workflow_id: string;
+  organization_id: string;
+  title: string;
+  workflow_permanent_id: string;
+  version: number;
+  description: string;
+  workflow_definition: {
+    parameters: Array<WorkflowParameter>;
+    blocks: Array<WorkflowBlock>;
+  };
+  proxy_location: string;
+  webhook_callback_url: string;
+  created_at: string;
+  modified_at: string;
+  deleted_at: string | null;
 };
