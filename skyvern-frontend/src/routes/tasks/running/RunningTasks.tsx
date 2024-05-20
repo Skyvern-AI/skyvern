@@ -46,7 +46,9 @@ function RunningTasks() {
         }}
       >
         <CardHeader>
-          <CardTitle>{task.task_id}</CardTitle>
+          <CardTitle className="overflow-hidden text-ellipsis whitespace-nowrap">
+            {task.task_id}
+          </CardTitle>
           <CardDescription className="whitespace-nowrap overflow-hidden text-ellipsis">
             {task.request.url}
           </CardDescription>

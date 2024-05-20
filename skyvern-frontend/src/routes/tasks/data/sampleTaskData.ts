@@ -1,5 +1,9 @@
 import { SampleCase } from "../types";
 
+export const blank = {
+  url: "https://www.example.com",
+};
+
 export const bci_seguros = {
   url: "https://www.bciseguros.cl/nuestros_seguros/personas/seguro-automotriz/",
   navigationGoal:
@@ -239,6 +243,26 @@ export const geico = {
   },
 };
 
+export function getSample(sample: SampleCase) {
+  switch (sample) {
+    case "geico": {
+      return geico;
+    }
+    case "finditparts": {
+      return finditparts;
+    }
+    case "california_edd": {
+      return california_edd;
+    }
+    case "bci_seguros": {
+      return bci_seguros;
+    }
+    case "blank": {
+      return blank;
+    }
+  }
+}
+
 export function getSampleForInitialFormValues(sample: SampleCase) {
   switch (sample) {
     case "geico":
@@ -278,5 +302,10 @@ export function getSampleForInitialFormValues(sample: SampleCase) {
           2,
         ),
       };
+    case "blank": {
+      return {
+        ...blank,
+      };
+    }
   }
 }
