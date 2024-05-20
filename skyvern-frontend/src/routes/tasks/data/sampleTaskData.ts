@@ -2,6 +2,10 @@ import { SampleCase } from "../types";
 
 export const blank = {
   url: "https://www.example.com",
+  navigationGoal: null,
+  dataExtractionGoal: null,
+  navigationPayload: null,
+  extractedInformationSchema: null,
 };
 
 export const bci_seguros = {
@@ -25,12 +29,14 @@ export const bci_seguros = {
     "tipo de combustible": "Bencina",
     "km approx a recorrer": "28,000",
   },
+  extractedInformationSchema: null,
 };
 
 export const california_edd = {
   url: "https://eddservices.edd.ca.gov/acctservices/AccountManagement/AccountServlet?Command=NEW_SIGN_UP",
   navigationGoal:
     "Navigate through the employer services online enrollment form. Terminate when the form is completed",
+  dataExtractionGoal: null,
   navigationPayload: {
     username: "isthisreal1",
     password: "Password123!",
@@ -40,6 +46,7 @@ export const california_edd = {
     email: "isthisreal1@gmail.com",
     phone_number: "412-444-1234",
   },
+  extractedInformationSchema: null,
 };
 
 export const finditparts = {
@@ -51,6 +58,7 @@ export const finditparts = {
   navigationPayload: {
     product_id: "W01-377-8537",
   },
+  extractedInformationSchema: null,
 };
 
 export const geico = {
@@ -263,49 +271,16 @@ export function getSample(sample: SampleCase) {
   }
 }
 
-export function getSampleForInitialFormValues(sample: SampleCase) {
-  switch (sample) {
-    case "geico":
-      return {
-        ...geico,
-        navigationPayload: JSON.stringify(geico.navigationPayload, null, 2),
-        extractedInformationSchema: JSON.stringify(
-          geico.extractedInformationSchema,
-          null,
-          2,
-        ),
-      };
-    case "finditparts":
-      return {
-        ...finditparts,
-        navigationPayload: JSON.stringify(
-          finditparts.navigationPayload,
-          null,
-          2,
-        ),
-      };
-    case "california_edd":
-      return {
-        ...california_edd,
-        navigationPayload: JSON.stringify(
-          california_edd.navigationPayload,
-          null,
-          2,
-        ),
-      };
-    case "bci_seguros":
-      return {
-        ...bci_seguros,
-        navigationPayload: JSON.stringify(
-          bci_seguros.navigationPayload,
-          null,
-          2,
-        ),
-      };
-    case "blank": {
-      return {
-        ...blank,
-      };
-    }
+function transformKV([key, value]: [string, unknown]) {
+  if (value === null) {
+    return [key, ""];
   }
+  if (typeof value === "object") {
+    return [key, JSON.stringify(value, null, 2)];
+  }
+  return [key, value];
+}
+
+export function getSampleForInitialFormValues(sample: SampleCase) {
+  return Object.fromEntries(Object.entries(getSample(sample)).map(transformKV));
 }

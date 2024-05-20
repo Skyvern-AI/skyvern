@@ -60,8 +60,8 @@ export type TaskApiResponse = {
     title: string | null;
     url: string;
     webhook_callback_url: string;
-    navigation_goal: string;
-    data_extraction_goal: string;
+    navigation_goal: string | null;
+    data_extraction_goal: string | null;
     navigation_payload: string | object; // stringified JSON
     error_code_mapping: null;
     proxy_location: string;

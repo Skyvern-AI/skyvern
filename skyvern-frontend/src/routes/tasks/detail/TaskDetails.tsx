@@ -165,7 +165,7 @@ function TaskDetails() {
                 <Label className="w-40 shrink-0">Navigation Goal</Label>
                 <Textarea
                   rows={5}
-                  value={task.request.navigation_goal}
+                  value={task.request.navigation_goal ?? ""}
                   readOnly
                 />
               </div>

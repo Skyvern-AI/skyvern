@@ -37,16 +37,34 @@ import { apiBaseUrl } from "@/util/env";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useApiCredential } from "@/hooks/useApiCredential";
 
-const createNewTaskFormSchema = z.object({
-  url: z.string().url({
-    message: "Invalid URL",
-  }),
-  webhookCallbackUrl: z.string().or(z.null()).optional(), // url maybe, but shouldn't be validated as one
-  navigationGoal: z.string().or(z.null()).optional(),
-  dataExtractionGoal: z.string().or(z.null()).optional(),
-  navigationPayload: z.string().or(z.null()).optional(),
-  extractedInformationSchema: z.string().or(z.null()).optional(),
-});
+const createNewTaskFormSchema = z
+  .object({
+    url: z.string().url({
+      message: "Invalid URL",
+    }),
+    webhookCallbackUrl: z.string().or(z.null()).optional(), // url maybe, but shouldn't be validated as one
+    navigationGoal: z.string().or(z.null()).optional(),
+    dataExtractionGoal: z.string().or(z.null()).optional(),
+    navigationPayload: z.string().or(z.null()).optional(),
+    extractedInformationSchema: z.string().or(z.null()).optional(),
+  })
+  .superRefine(({ navigationGoal, dataExtractionGoal }, ctx) => {
+    if (!navigationGoal && !dataExtractionGoal) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "At least one of navigation goal or data extraction goal must be provided",
+        path: ["navigationGoal"],
+      });
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "At least one of navigation goal or data extraction goal must be provided",
+        path: ["dataExtractionGoal"],
+      });
+      return z.NEVER;
+    }
+  });
 
 export type CreateNewTaskFormValues = z.infer<typeof createNewTaskFormSchema>;
 
@@ -54,16 +72,22 @@ type Props = {
   initialValues: CreateNewTaskFormValues;
 };
 
+function transform(value: unknown) {
+  return value === "" ? null : value;
+}
+
 function createTaskRequestObject(formValues: CreateNewTaskFormValues) {
   return {
     url: formValues.url,
-    webhook_callback_url: formValues.webhookCallbackUrl ?? "",
-    navigation_goal: formValues.navigationGoal ?? "",
-    data_extraction_goal: formValues.dataExtractionGoal ?? "",
+    webhook_callback_url: transform(formValues.webhookCallbackUrl),
+    navigation_goal: transform(formValues.navigationGoal),
+    data_extraction_goal: transform(formValues.dataExtractionGoal),
     proxy_location: "NONE",
     error_code_mapping: null,
-    navigation_payload: formValues.navigationPayload,
-    extracted_information_schema: formValues.extractedInformationSchema,
+    navigation_payload: transform(formValues.navigationPayload),
+    extracted_information_schema: transform(
+      formValues.extractedInformationSchema,
+    ),
   };
 }
 
@@ -266,7 +290,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                   rows={5}
                   placeholder="Navigation Payload"
                   {...field}
-                  value={field.value ?? ""}
+                  value={field.value === null ? "" : field.value}
                 />
               </FormControl>
               <FormMessage />
@@ -298,7 +322,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                   placeholder="Extracted Information Schema"
                   rows={5}
                   {...field}
-                  value={field.value ?? ""}
+                  value={field.value === null ? "" : field.value}
                 />
               </FormControl>
               <FormMessage />
