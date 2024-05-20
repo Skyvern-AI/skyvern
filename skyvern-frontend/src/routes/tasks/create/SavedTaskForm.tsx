@@ -37,20 +37,39 @@ import {
   urlDescription,
   webhookCallbackUrlDescription,
 } from "../data/descriptionHelperContent";
+import { SubmitEvent } from "@/types";
 
-const savedTaskFormSchema = z.object({
-  title: z.string().min(1, "Title is required"),
-  description: z.string(),
-  url: z.string().url({
-    message: "Invalid URL",
-  }),
-  proxyLocation: z.string().or(z.null()).optional(),
-  webhookCallbackUrl: z.string().or(z.null()).optional(), // url maybe, but shouldn't be validated as one
-  navigationGoal: z.string().or(z.null()).optional(),
-  dataExtractionGoal: z.string().or(z.null()).optional(),
-  navigationPayload: z.string().or(z.null()).optional(),
-  extractedInformationSchema: z.string().or(z.null()).optional(),
-});
+const savedTaskFormSchema = z
+  .object({
+    title: z.string().min(1, "Title is required"),
+    description: z.string(),
+    url: z.string().url({
+      message: "Invalid URL",
+    }),
+    proxyLocation: z.string().or(z.null()).optional(),
+    webhookCallbackUrl: z.string().or(z.null()).optional(), // url maybe, but shouldn't be validated as one
+    navigationGoal: z.string().or(z.null()).optional(),
+    dataExtractionGoal: z.string().or(z.null()).optional(),
+    navigationPayload: z.string().or(z.null()).optional(),
+    extractedInformationSchema: z.string().or(z.null()).optional(),
+  })
+  .superRefine(({ navigationGoal, dataExtractionGoal }, ctx) => {
+    if (!navigationGoal && !dataExtractionGoal) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "At least one of navigation goal or data extraction goal must be provided",
+        path: ["navigationGoal"],
+      });
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "At least one of navigation goal or data extraction goal must be provided",
+        path: ["dataExtractionGoal"],
+      });
+      return z.NEVER;
+    }
+  });
 
 export type SavedTaskFormValues = z.infer<typeof savedTaskFormSchema>;
 
@@ -58,16 +77,22 @@ type Props = {
   initialValues: SavedTaskFormValues;
 };
 
+function transform(value: unknown) {
+  return value === "" ? null : value;
+}
+
 function createTaskRequestObject(formValues: SavedTaskFormValues) {
   return {
     url: formValues.url,
-    webhook_callback_url: formValues.webhookCallbackUrl ?? "",
-    navigation_goal: formValues.navigationGoal ?? "",
-    data_extraction_goal: formValues.dataExtractionGoal ?? "",
-    proxy_location: formValues.proxyLocation,
+    webhook_callback_url: transform(formValues.webhookCallbackUrl),
+    navigation_goal: transform(formValues.navigationGoal),
+    data_extraction_goal: transform(formValues.dataExtractionGoal),
+    proxy_location: transform(formValues.proxyLocation),
     error_code_mapping: null,
-    navigation_payload: formValues.navigationPayload,
-    extracted_information_schema: formValues.extractedInformationSchema,
+    navigation_payload: transform(formValues.navigationPayload),
+    extracted_information_schema: transform(
+      formValues.extractedInformationSchema,
+    ),
   };
 }
 
@@ -179,13 +204,30 @@ function SavedTaskForm({ initialValues }: Props) {
     },
   });
 
-  function onSubmit(values: SavedTaskFormValues) {
+  function handleCreate(values: SavedTaskFormValues) {
     createTaskMutation.mutate(values);
+  }
+
+  function handleSave(values: SavedTaskFormValues) {
+    saveTaskMutation.mutate(values);
   }
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-8">
+      <form
+        onSubmit={(event) => {
+          const submitter = (
+            (event.nativeEvent as SubmitEvent).submitter as HTMLButtonElement
+          ).value;
+          if (submitter === "save") {
+            form.handleSubmit(handleSave)(event);
+          }
+          if (submitter === "create") {
+            form.handleSubmit(handleCreate)(event);
+          }
+        }}
+        className="space-y-8"
+      >
         <FormField
           control={form.control}
           name="title"
@@ -359,7 +401,7 @@ function SavedTaskForm({ initialValues }: Props) {
                   rows={5}
                   placeholder="Navigation Payload"
                   {...field}
-                  value={field.value ?? ""}
+                  value={field.value === null ? "" : field.value}
                 />
               </FormControl>
               <FormMessage />
@@ -391,7 +433,7 @@ function SavedTaskForm({ initialValues }: Props) {
                   placeholder="Extracted Information Schema"
                   rows={5}
                   {...field}
-                  value={field.value ?? ""}
+                  value={field.value === null ? "" : field.value}
                 />
               </FormControl>
               <FormMessage />
@@ -423,11 +465,10 @@ function SavedTaskForm({ initialValues }: Props) {
           </Button>
           {isDirty && (
             <Button
-              type="button"
+              type="submit"
+              name="save"
+              value="save"
               variant="secondary"
-              onClick={() => {
-                saveTaskMutation.mutate(form.getValues());
-              }}
               disabled={saveTaskMutation.isPending}
             >
               {saveTaskMutation.isPending && (
@@ -437,7 +478,12 @@ function SavedTaskForm({ initialValues }: Props) {
             </Button>
           )}
 
-          <Button type="submit" disabled={createTaskMutation.isPending}>
+          <Button
+            type="submit"
+            name="create"
+            value="create"
+            disabled={createTaskMutation.isPending}
+          >
             {createTaskMutation.isPending && (
               <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
             )}
