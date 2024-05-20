@@ -75,7 +75,7 @@ def build_attribute(key: str, value: Any) -> str:
 
 
 def json_to_html(element: dict) -> str:
-    attributes: dict[str, Any] = element.get("attributes", {})
+    attributes: dict[str, Any] = copy.deepcopy(element.get("attributes", {}))
 
     # adding the node attribute to attributes
     for attr in ELEMENT_NODE_ATTRIBUTES:
