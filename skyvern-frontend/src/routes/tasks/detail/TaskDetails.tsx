@@ -117,7 +117,7 @@ function TaskDetails() {
               </TabsContent>
               <TabsContent value="final-screenshot">
                 {task ? (
-                  <div className="h-[450px] w-[800px]">
+                  <div className="h-[450px] w-[800px] overflow-hidden">
                     {task.screenshot_url ? (
                       <ZoomableImage
                         src={getScreenshotURL(task)}
