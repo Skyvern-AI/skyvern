@@ -48,10 +48,12 @@ from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrap
 
 LOG = structlog.get_logger()
 
+
 class ActionLinkedNode:
     def __init__(self, action: ActionTypeUnion) -> None:
         self.action = action
         self.next: ActionLinkedNode | None = None
+
 
 class ForgeAgent:
     def __init__(self) -> None:
@@ -490,7 +492,9 @@ class ForgeAgent:
                         )
 
                         # if the last action succeeded, then skip handling
-                        previous_action, previous_result = detailed_agent_step_output.actions_and_results[previous_action_idx]
+                        previous_action, previous_result = detailed_agent_step_output.actions_and_results[
+                            previous_action_idx
+                        ]
                         if len(previous_result) > 0 and previous_result[-1].success:
                             LOG.info(
                                 "Previous action succeeded, so skip this one.",
