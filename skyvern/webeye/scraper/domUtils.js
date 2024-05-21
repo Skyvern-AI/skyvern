@@ -991,7 +991,8 @@ function buildTreeFromBody() {
       element.context = context;
     }
 
-    if (checkStringIncludeRequire(context)) {
+    // FIXME: skip <a> for now to prevent navigating to other page by mistake
+    if (element.tagName !== "a" && checkStringIncludeRequire(context)) {
       if (
         !element.attributes["required"] &&
         !element.attributes["aria-required"]
