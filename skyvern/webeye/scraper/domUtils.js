@@ -758,8 +758,10 @@ function buildTreeFromBody() {
           }
         }
 
-        // character length limit for non-interactable elements should be 100
-        if (textContent && textContent.length <= 100) {
+        // character length limit for non-interactable elements should be 5000
+        // we don't use element context in HTML format,
+        // so we need to make sure we parse all text node to avoid missing text in HTML.
+        if (textContent && textContent.length <= 5000) {
           var elementObj = buildElementObject(element, false);
           elements.push(elementObj);
           if (parentId === null) {
@@ -991,7 +993,8 @@ function buildTreeFromBody() {
       element.context = context;
     }
 
-    if (checkStringIncludeRequire(context)) {
+    // FIXME: skip <a> for now to prevent navigating to other page by mistake
+    if (element.tagName !== "a" && checkStringIncludeRequire(context)) {
       if (
         !element.attributes["required"] &&
         !element.attributes["aria-required"]
