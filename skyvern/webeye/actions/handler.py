@@ -34,6 +34,7 @@ from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage
 
 LOG = structlog.get_logger()
+TEXT_INPUT_DELAY = 10  # 10ms between each character input
 
 
 class ActionHandler:
@@ -209,7 +210,9 @@ async def handle_input_text_action(
 
     await locator.clear()
     text = get_actual_value_of_parameter_if_secret(task, action.text)
-    await locator.fill(text, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+    # 1.5 times the time it takes to type the text so it has time to finish typing
+    total_timeout = max(len(text) * TEXT_INPUT_DELAY * 1.5, SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+    await locator.press_sequentially(text, delay=TEXT_INPUT_DELAY, timeout=total_timeout)
     return [ActionSuccess()]
 
 
