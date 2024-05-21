@@ -48,6 +48,10 @@ from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrap
 
 LOG = structlog.get_logger()
 
+class ActionLinkedNode:
+    def __init__(self, action: ActionTypeUnion) -> None:
+        self.action = action
+        self.next: ActionLinkedNode | None = None
 
 class ForgeAgent:
     def __init__(self) -> None:
@@ -457,16 +461,57 @@ class ForgeAgent:
             # of an exception, we can still see all the actions
             detailed_agent_step_output.actions_and_results = [(action, []) for action in actions]
 
-            web_action_element_ids = set()
+            # build a linked action chain by the action_idx
+            action_linked_list: list[ActionLinkedNode] = []
+            element_id_to_action_index: dict[int, int] = dict()
             for action_idx, action in enumerate(actions):
+                node = ActionLinkedNode(action=action)
+                action_linked_list.append(node)
+
+                previous_action_idx = element_id_to_action_index.get(action.element_id)
+                if previous_action_idx is not None:
+                    previous_node = action_linked_list[previous_action_idx]
+                    previous_node.next = node
+
+                element_id_to_action_index[action.element_id] = action_idx
+
+            element_id_to_last_action: dict[int, int] = dict()
+            for action_idx, action_node in enumerate(action_linked_list):
+                action = action_node.action
                 if isinstance(action, WebAction):
-                    if action.element_id in web_action_element_ids:
-                        LOG.error(
-                            "Duplicate action element id. Action handling stops",
+                    previous_action_idx = element_id_to_last_action.get(action.element_id)
+                    if previous_action_idx is not None:
+                        LOG.warning(
+                            "Duplicate action element id.",
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            step_order=step.order,
                             action=action,
                         )
-                        break
-                    web_action_element_ids.add(action.element_id)
+
+                        # if the last action succeeded, then skip handling
+                        previous_action, previous_result = detailed_agent_step_output.actions_and_results[previous_action_idx]
+                        if len(previous_result) > 0 and previous_result[-1].success:
+                            LOG.info(
+                                "Previous action succeeded, so skip this one.",
+                                task_id=task.task_id,
+                                step_id=step.step_id,
+                                step_order=step.order,
+                                previouse_action=previous_action,
+                                previouse_result=previous_result,
+                            )
+                            continue
+
+                        LOG.warning(
+                            "Previous action failed, so handle this action.",
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            step_order=step.order,
+                            previouse_action=previous_action,
+                            previouse_result=previous_result,
+                        )
+
+                    element_id_to_last_action[action.element_id] = action_idx
 
                 self.async_operation_pool.run_operation(task.task_id, AgentPhase.action)
                 results = await ActionHandler.handle_action(scraped_page, task, step, browser_state, action)
@@ -505,6 +550,20 @@ class ForgeAgent:
                         # stop executing the rest actions
                         break
                 else:
+                    if action_node.next is not None:
+                        LOG.warning(
+                            "Action failed, but have duplicated element id in the action list. Continue excuting.",
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            step_order=step.order,
+                            step_retry=step.retry_index,
+                            action_idx=action_idx,
+                            action=action,
+                            next_action=action_node.next.action,
+                            action_result=results,
+                        )
+                        continue
+
                     LOG.warning(
                         "Action failed, marking step as failed",
                         task_id=task.task_id,
