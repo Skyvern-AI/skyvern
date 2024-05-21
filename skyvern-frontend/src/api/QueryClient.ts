@@ -4,6 +4,7 @@ const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       staleTime: Infinity,
+      retry: false,
     },
   },
 });
