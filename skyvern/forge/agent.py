@@ -791,6 +791,11 @@ class ForgeAgent:
             artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
             data=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode(),
         )
+        await app.ARTIFACT_MANAGER.create_artifact(
+            step=step,
+            artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
+            data=scraped_page.build_element_tree(element_tree_format).encode(),
+        )
 
         return scraped_page, extract_action_prompt
 
