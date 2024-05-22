@@ -763,13 +763,14 @@ class ForgeAgent:
             format=element_tree_format,
         )
 
+        element_tree_in_prompt: str = scraped_page.build_element_tree(element_tree_format)
         extract_action_prompt = prompt_engine.load_prompt(
             prompt_template,
             navigation_goal=navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
             starting_url=starting_url,
             current_url=current_url,
-            elements=scraped_page.build_element_tree(element_tree_format),
+            elements=element_tree_in_prompt,
             data_extraction_goal=task.data_extraction_goal,
             action_history=actions_and_results_str,
             error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
@@ -790,6 +791,11 @@ class ForgeAgent:
             step=step,
             artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
             data=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode(),
+        )
+        await app.ARTIFACT_MANAGER.create_artifact(
+            step=step,
+            artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
+            data=element_tree_in_prompt.encode(),
         )
 
         return scraped_page, extract_action_prompt

@@ -24,6 +24,7 @@ class ArtifactType(StrEnum):
     VISIBLE_ELEMENTS_ID_XPATH_MAP = "visible_elements_id_xpath_map"
     VISIBLE_ELEMENTS_TREE = "visible_elements_tree"
     VISIBLE_ELEMENTS_TREE_TRIMMED = "visible_elements_tree_trimmed"
+    VISIBLE_ELEMENTS_TREE_IN_PROMPT = "visible_elements_tree_in_prompt"
 
     # DEPRECATED. pls use HTML_SCRAPE or HTML_ACTION
     HTML = "html"

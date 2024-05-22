@@ -16,6 +16,7 @@ FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
     ArtifactType.VISIBLE_ELEMENTS_ID_XPATH_MAP: "json",
     ArtifactType.VISIBLE_ELEMENTS_TREE: "json",
     ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED: "json",
+    ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT: "txt",
     ArtifactType.HTML_SCRAPE: "html",
     ArtifactType.HTML_ACTION: "html",
     ArtifactType.TRACE: "zip",
