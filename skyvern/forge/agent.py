@@ -470,6 +470,9 @@ class ForgeAgent:
                 node = ActionLinkedNode(action=action)
                 action_linked_list.append(node)
 
+                if not isinstance(action, WebAction):
+                    continue
+
                 previous_action_idx = element_id_to_action_index.get(action.element_id)
                 if previous_action_idx is not None:
                     previous_node = action_linked_list[previous_action_idx]
