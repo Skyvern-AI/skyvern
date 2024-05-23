@@ -149,7 +149,7 @@ if SettingsManager.get_settings().ENABLE_BEDROCK:
 
 if SettingsManager.get_settings().ENABLE_AZURE:
     LLMConfigRegistry.register_config(
-        "AZURE_OPENAI_GPT4V",
+        "AZURE_OPENAI",
         LLMConfig(
             f"azure/{SettingsManager.get_settings().AZURE_DEPLOYMENT}",
             [
