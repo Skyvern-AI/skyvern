@@ -186,6 +186,7 @@ class LLMAPIHandlerFactory:
                 # TODO (kerem): add a timeout to this call
                 # TODO (kerem): add a retry mechanism to this call (acompletion_with_retries)
                 # TODO (kerem): use litellm fallbacks? https://litellm.vercel.app/docs/tutorials/fallbacks#how-does-completion_with_fallbacks-work
+                LOG.info("Calling LLM API", llm_key=llm_key, model=llm_config.model_name)
                 response = await litellm.acompletion(
                     model=llm_config.model_name,
                     messages=messages,
