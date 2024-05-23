@@ -561,6 +561,7 @@ class AgentDB:
                         .filter_by(task_id=task_id)
                         .filter_by(step_id=step_id)
                         .filter_by(organization_id=organization_id)
+                        .order_by(ArtifactModel.created_at)
                     )
                 ).all():
                     return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifacts]
