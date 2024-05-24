@@ -211,7 +211,7 @@ async def handle_input_text_action(
     await locator.clear()
     text = get_actual_value_of_parameter_if_secret(task, action.text)
     # 1.5 times the time it takes to type the text so it has time to finish typing
-    total_timeout = max(len(text) * TEXT_INPUT_DELAY * 1.5, SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+    total_timeout = max(len(text) * TEXT_INPUT_DELAY * 3, SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
     await locator.press_sequentially(text, delay=TEXT_INPUT_DELAY, timeout=total_timeout)
     return [ActionSuccess()]
 
