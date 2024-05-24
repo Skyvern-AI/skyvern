@@ -190,8 +190,10 @@ class LLMAPIHandlerFactory:
                 response = await litellm.acompletion(
                     model=llm_config.model_name,
                     messages=messages,
+                    timeout=SettingsManager.get_settings().LLM_CONFIG_TIMEOUT,
                     **active_parameters,
                 )
+                LOG.info("LLM API call successful", llm_key=llm_key, model=llm_config.model_name)
             except openai.OpenAIError as e:
                 raise LLMProviderError(llm_key) from e
             except Exception as e:
