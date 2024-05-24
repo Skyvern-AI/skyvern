@@ -573,7 +573,7 @@ function uniqueId() {
     return result;
 }
 
-function buildTreeFromBody() {
+function buildTreeFromBody(frame = 'main') {
   var elements = [];
   var resultArray = [];
 
@@ -676,6 +676,7 @@ function buildTreeFromBody() {
 
     let elementObj = {
       id: element_id,
+      frame: frame,
       interactable: interactable,
       tagName: elementTagNameLower,
       attributes: attrs,
@@ -749,6 +750,11 @@ function buildTreeFromBody() {
         processElement(child, elementObj.id);
       });
       return elementObj;
+    } else if (element.tagName.toLowerCase() === 'iframe') {
+      let iframeElementObject = buildElementObject(element, true);
+
+      elements.push(iframeElementObject);
+      resultArray.push(iframeElementObject);
     } else {
       // For a non-interactable element, if it has direct text, we also tagged
       // it with unique_id, but with interatable=false in the element.

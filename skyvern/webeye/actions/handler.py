@@ -32,6 +32,7 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage
+from skyvern.constants import SKYVERN_ID_ATTR
 
 LOG = structlog.get_logger()
 TEXT_INPUT_DELAY = 10  # 10ms between each character input
@@ -181,9 +182,11 @@ async def handle_click_to_download_file_action(
     scraped_page: ScrapedPage,
 ) -> list[ActionResult]:
     xpath = await validate_actions_in_dom(action, page, scraped_page)
+
+    locator = resolve_locator(page, action.frame, xpath)
+
     try:
-        await page.click(
-            f"xpath={xpath}",
+        await locator.click(
             timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
             modifiers=["Alt"],
         )
@@ -202,7 +205,8 @@ async def handle_input_text_action(
     step: Step,
 ) -> list[ActionResult]:
     xpath = await validate_actions_in_dom(action, page, scraped_page)
-    locator = page.locator(f"xpath={xpath}")
+
+    locator = resolve_locator(page, action.frame, xpath)
 
     current_text = await locator.input_value()
     if current_text == action.text:
@@ -238,20 +242,29 @@ async def handle_upload_file_action(
             file_url=action.file_url,
         )
         return [ActionFailure(ImaginaryFileUrl(action.file_url))]
+
     xpath = await validate_actions_in_dom(action, page, scraped_page)
+
     file_path = await download_file(file_url)
-    locator = page.locator(f"xpath={xpath}")
+
+    locator = resolve_locator(page, action.frame, xpath)
+
     is_file_input = await is_file_input_element(locator)
+
     if is_file_input:
         LOG.info("Taking UploadFileAction. Found file input tag", action=action)
         if file_path:
-            await page.locator(f"xpath={xpath}").set_input_files(
+
+            locator = resolve_locator(page, action.frame, xpath)
+
+            await locator.set_input_files(
                 file_path,
                 timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
             )
 
             # Sleep for 10 seconds after uploading a file to let the page process it
             await asyncio.sleep(10)
+
             return [ActionSuccess()]
         else:
             return [ActionFailure(Exception(f"Failed to download file from {action.file_url}"))]
@@ -283,8 +296,10 @@ async def handle_download_file_action(
         # Start waiting for the download
         async with page.expect_download() as download_info:
             await asyncio.sleep(0.3)
-            await page.click(
-                f"xpath={xpath}",
+
+            locator = resolve_locator(page, action.frame, xpath)
+
+            await locator.click(
                 timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
                 modifiers=["Alt"],
             )
@@ -326,7 +341,8 @@ async def handle_select_option_action(
 ) -> list[ActionResult]:
     xpath = await validate_actions_in_dom(action, page, scraped_page)
 
-    locator = page.locator(f"xpath={xpath}")
+    locator = resolve_locator(page, action.frame, xpath)
+
     tag_name = await get_tag_name_lowercase(locator)
     element_dict = scraped_page.id_to_element_dict[action.element_id]
     LOG.info(
@@ -368,7 +384,7 @@ async def handle_select_option_action(
                 action=action,
                 child_anchor_xpath=child_anchor_xpath,
             )
-            click_action = ClickAction(element_id=action.element_id)
+            click_action = ClickAction(frame=action.frame, element_id=action.element_id)
             return await chain_click(task, page, click_action, child_anchor_xpath)
 
         # handler the select action on <label>
@@ -379,7 +395,7 @@ async def handle_select_option_action(
                 action=action,
                 select_element_id=select_element_id,
             )
-            select_action = SelectOptionAction(element_id=select_element_id, option=action.option)
+            select_action = SelectOptionAction(frame=action.frame, element_id=select_element_id, option=action.option)
             return await handle_select_option_action(select_action, page, scraped_page, task, step)
 
         # handle the select action on <label> of checkbox/radio
@@ -390,7 +406,7 @@ async def handle_select_option_action(
                 action=action,
                 checkbox_element_id=checkbox_element_id,
             )
-            check_action = CheckboxAction(element_id=checkbox_element_id, is_checked=True)
+            check_action = CheckboxAction(frame=action.frame, element_id=checkbox_element_id, is_checked=True)
             return await handle_checkbox_action(check_action, page, scraped_page, task, step)
 
         return [ActionFailure(Exception("No anchor tag or select children found for the label for SelectOptionAction"))]
@@ -400,7 +416,7 @@ async def handle_select_option_action(
             "SelectOptionAction is an anchor tag. Clicking it instead of selecting the option",
             action=action,
         )
-        click_action = ClickAction(element_id=action.element_id)
+        click_action = ClickAction(frame=action.frame, element_id=action.element_id)
         action_result = await chain_click(task, page, click_action, xpath)
         return action_result
     elif tag_name == "ul" or tag_name == "div" or tag_name == "li":
@@ -432,7 +448,7 @@ async def handle_select_option_action(
                 action=action,
             )
             # click the option element
-            click_action = ClickAction(element_id=action.element_id)
+            click_action = ClickAction(frame=action.frame, element_id=action.element_id)
             return await chain_click(task, page, click_action, xpath)
         else:
             LOG.error(
@@ -444,25 +460,25 @@ async def handle_select_option_action(
             "SelectOptionAction is on <input> checkbox/radio",
             action=action,
         )
-        check_action = CheckboxAction(element_id=action.element_id, is_checked=True)
+        check_action = CheckboxAction(frame=action.frame, element_id=action.element_id, is_checked=True)
         return await handle_checkbox_action(check_action, page, scraped_page, task, step)
 
     current_text = await locator.input_value()
     if current_text == action.option.label:
         return [ActionSuccess()]
+
+    select_locator = resolve_locator(page, action.frame, xpath)
+
     try:
         # First click by label (if it matches)
-        await page.click(
-            f"xpath={xpath}",
+        await select_locator.click(
             timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
         )
-        await page.select_option(
-            xpath,
+        await select_locator.select_option(
             label=action.option.label,
             timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
         )
-        await page.click(
-            f"xpath={xpath}",
+        await select_locator.click(
             timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
         )
         return [ActionSuccess()]
@@ -486,36 +502,33 @@ async def handle_select_option_action(
     try:
         option_xpath = scraped_page.id_to_xpath_dict[action.option.index]
         match = re.search(r"option\[(\d+)]$", option_xpath)
+
         if match:
+            option_locator = resolve_locator(page, action.frame, option_xpath)
+
             # This means we were trying to select an option xpath, click the option
             option_index = int(match.group(1))
-            await page.click(
-                f"xpath={xpath}",
+            await option_locator.click(
                 timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
             )
-            await page.select_option(
-                xpath,
+            await option_locator.select_option(
                 index=option_index,
                 timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
             )
-            await page.click(
-                f"xpath={xpath}",
+            await option_locator.click(
                 timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
             )
             return [ActionSuccess()]
         else:
             # This means the supplied index was for the select element, not a reference to the xpath dict
-            await page.click(
-                f"xpath={xpath}",
+            await select_locator.click(
                 timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
             )
-            await page.select_option(
-                xpath,
+            await select_locator.select_option(
                 index=action.option.index,
                 timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
             )
-            await page.click(
-                f"xpath={xpath}",
+            await select_locator.click(
                 timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
             )
         return [ActionSuccess()]
@@ -526,6 +539,7 @@ async def handle_select_option_action(
 
 async def handle_checkbox_action(
     self: actions.CheckboxAction,
+    action: Action,
     page: Page,
     scraped_page: ScrapedPage,
     task: Task,
@@ -539,10 +553,13 @@ async def handle_checkbox_action(
     Developers who tried this and failed: 2 (Suchintan and Shu 😂)
     """
     xpath = await validate_actions_in_dom(self, page, scraped_page)
+
+    locator = resolve_locator(page, action.frame, xpath)
+
     if self.is_checked:
-        await page.check(xpath, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+        await locator.check(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
     else:
-        await page.uncheck(xpath, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+        await locator.uncheck(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
 
     # TODO (suchintan): Why does checking the label work, but not the actual input element?
     return [ActionSuccess()]
@@ -621,7 +638,8 @@ def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) -> Any:
 
 async def validate_actions_in_dom(action: WebAction, page: Page, scraped_page: ScrapedPage) -> str:
     xpath = scraped_page.id_to_xpath_dict[action.element_id]
-    locator = page.locator(xpath)
+
+    locator = resolve_locator(page, action.frame, xpath)
 
     num_elements = await locator.count()
     if num_elements < 1:
@@ -688,9 +706,11 @@ async def chain_click(
     Clicks on an element identified by the xpath and its parent if failed.
     :param xpath: xpath of the element to click
     """
-    javascript_triggered = await is_javascript_triggered(page, xpath)
+    javascript_triggered = await is_javascript_triggered(page, action.frame, xpath)
     try:
-        await page.click(f"xpath={xpath}", timeout=timeout)
+        locator = resolve_locator(page, action.frame, xpath)
+        await locator.click(timeout=timeout)
+
         LOG.info("Chain click: main element click succeeded", action=action, xpath=xpath)
         return [
             ActionSuccess(
@@ -720,10 +740,12 @@ async def chain_click(
 
         parent_xpath = f"{xpath}/.."
         try:
-            parent_javascript_triggered = await is_javascript_triggered(page, parent_xpath)
+            parent_javascript_triggered = await is_javascript_triggered(page, action.frame, parent_xpath)
             javascript_triggered = javascript_triggered or parent_javascript_triggered
-            parent_locator = page.locator(xpath).locator("..")
+
+            parent_locator = resolve_locator(page, action.frame, xpath).locator("..")
             await parent_locator.click(timeout=timeout)
+
             LOG.info(
                 "Chain click: successfully clicked parent element",
                 action=action,
@@ -765,12 +787,12 @@ async def chain_click(
         page.remove_listener("download", download_func)
 
 
-def get_anchor_to_click(scraped_page: ScrapedPage, element_id: int) -> str | None:
+def get_anchor_to_click(scraped_page: ScrapedPage, element_id: str) -> str | None:
     """
     Get the anchor tag under the label to click
     """
     LOG.info("Getting anchor tag to click", element_id=element_id)
-    element_id = int(element_id)
+
     for ele in scraped_page.elements:
         if "id" in ele and ele["id"] == element_id:
             for child in ele["children"]:
@@ -779,7 +801,7 @@ def get_anchor_to_click(scraped_page: ScrapedPage, element_id: int) -> str | Non
     return None
 
 
-def get_select_id_in_label_children(scraped_page: ScrapedPage, element_id: int) -> int | None:
+def get_select_id_in_label_children(scraped_page: ScrapedPage, element_id: str) -> str | None:
     """
     search <select> in the children of <label>
     """
@@ -795,7 +817,7 @@ def get_select_id_in_label_children(scraped_page: ScrapedPage, element_id: int) 
     return None
 
 
-def get_checkbox_id_in_label_children(scraped_page: ScrapedPage, element_id: int) -> int | None:
+def get_checkbox_id_in_label_children(scraped_page: ScrapedPage, element_id: str) -> str | None:
     """
     search checkbox/radio in the children of <label>
     """
@@ -811,9 +833,10 @@ def get_checkbox_id_in_label_children(scraped_page: ScrapedPage, element_id: int
     return None
 
 
-async def is_javascript_triggered(page: Page, xpath: str) -> bool:
-    locator = page.locator(f"xpath={xpath}")
+async def is_javascript_triggered(page: Page, frame: str, xpath: str) -> bool:
+    locator = resolve_locator(page, frame, xpath)
     element = locator.first
+
     tag_name = await element.evaluate("e => e.tagName")
     if tag_name.lower() == "a":
         href = await element.evaluate("e => e.href")
@@ -916,7 +939,7 @@ async def click_listbox_option(
     scraped_page: ScrapedPage,
     page: Page,
     action: actions.SelectOptionAction,
-    listbox_element_id: int,
+    listbox_element_id: str,
 ) -> bool:
     listbox_element = scraped_page.id_to_element_dict[listbox_element_id]
     # this is a listbox element, get all the children
@@ -934,7 +957,10 @@ async def click_listbox_option(
             if text and (text == action.option.label or text == action.option.value):
                 option_xpath = scraped_page.id_to_xpath_dict[child["id"]]
                 try:
-                    await page.click(f"xpath={option_xpath}", timeout=1000)
+                    locator = resolve_locator(page, action.frame, option_xpath)
+
+                    await locator.click(timeout=1000)
+
                     return True
                 except Exception:
                     LOG.error(
@@ -946,3 +972,10 @@ async def click_listbox_option(
         if "children" in child:
             bfs_queue.extend(child["children"])
     return False
+
+
+def resolve_locator(page: Page, frame: str, xpath: str) -> Locator:
+    if frame == 'main':
+        return page.locator(f"xpath={xpath}")
+
+    return page.frame_locator(f"[{SKYVERN_ID_ATTR}='{frame}']").locator(f"xpath={xpath}")
