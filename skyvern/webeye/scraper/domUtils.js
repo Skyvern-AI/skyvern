@@ -563,6 +563,16 @@ function getListboxOptions(element) {
   return selectOptions;
 }
 
+function uniqueId() {
+    const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    let result = '';
+    for (let i = 0; i < 4; i++) {
+        const randomIndex = Math.floor(Math.random() * characters.length);
+        result += characters[randomIndex];
+    }
+    return result;
+}
+
 function buildTreeFromBody() {
   var elements = [];
   var resultArray = [];
@@ -620,7 +630,7 @@ function buildTreeFromBody() {
   };
 
   function buildElementObject(element, interactable) {
-    var element_id = elements.length;
+    var element_id = element.getAttribute('unique_id') ?? uniqueId();
     var elementTagNameLower = element.tagName.toLowerCase();
     element.setAttribute("unique_id", element_id);
     // if element is an "a" tag and has a target="_blank" attribute, remove the target attribute
@@ -728,7 +738,7 @@ function buildTreeFromBody() {
       // If the element is interactable and has an interactable parent,
       // then add it to the children of the parent
       else {
-        elements[parentId].children.push(elementObj);
+        elements.find((element) => element.id === parentId).children.push(elementObj);
       }
       // options already added to the select.options, no need to add options anymore
       if (elementObj.options && elementObj.options.length > 0) {
@@ -767,13 +777,13 @@ function buildTreeFromBody() {
           if (parentId === null) {
             resultArray.push(elementObj);
           } else {
-            elements[parentId].children.push(elementObj);
+            elements.find((element) => element.id === parentId).children.push(elementObj)
           }
           parentId = elementObj.id;
         }
       }
       getChildElements(element).forEach((child) => {
-        let children = processElement(child, parentId);
+        processElement(child, parentId);
       });
     }
   }
@@ -966,8 +976,6 @@ function buildTreeFromBody() {
   // TODO: Handle iframes
   // setup before parsing the dom
   checkSelect2();
-  // Clear all the unique_id attributes so that there are no conflicts
-  removeAllUniqueIdAttributes();
   processElement(document.body, null);
 
   for (var element of elements) {

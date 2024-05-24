@@ -465,7 +465,7 @@ class ForgeAgent:
 
             # build a linked action chain by the action_idx
             action_linked_list: list[ActionLinkedNode] = []
-            element_id_to_action_index: dict[int, int] = dict()
+            element_id_to_action_index: dict[str, int] = dict()
             for action_idx, action in enumerate(actions):
                 node = ActionLinkedNode(action=action)
                 action_linked_list.append(node)
@@ -480,7 +480,7 @@ class ForgeAgent:
 
                 element_id_to_action_index[action.element_id] = action_idx
 
-            element_id_to_last_action: dict[int, int] = dict()
+            element_id_to_last_action: dict[str, int] = dict()
             for action_idx, action_node in enumerate(action_linked_list):
                 action = action_node.action
                 if isinstance(action, WebAction):

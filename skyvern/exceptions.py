@@ -47,7 +47,7 @@ class ScriptNotFound(SkyvernException):
 
 
 class MissingElement(SkyvernException):
-    def __init__(self, xpath: str | None = None, element_id: int | None = None):
+    def __init__(self, xpath: str | None = None, element_id: str | None = None):
         super().__init__(
             f"Found no elements. Might be due to previous actions which removed this element."
             f" xpath={xpath} element_id={element_id}",
@@ -55,7 +55,7 @@ class MissingElement(SkyvernException):
 
 
 class MultipleElementsFound(SkyvernException):
-    def __init__(self, num: int, xpath: str | None = None, element_id: int | None = None):
+    def __init__(self, num: int, xpath: str | None = None, element_id: str | None = None):
         super().__init__(
             f"Found {num} elements. Expected 1. num_elements={num} xpath={xpath} element_id={element_id}",
         )
