@@ -6,7 +6,7 @@ from enum import StrEnum
 from typing import Any
 
 import structlog
-from playwright.async_api import Page
+from playwright.async_api import Page, Frame
 from pydantic import BaseModel
 
 from skyvern.constants import SKYVERN_DIR, SKYVERN_ID_ATTR
@@ -46,6 +46,7 @@ RESERVED_ATTRIBUTES = {
 
 ELEMENT_NODE_ATTRIBUTES = {
     "id",
+    "frame",
     "interactable",
 }
 
@@ -186,16 +187,26 @@ async def scrape_website(
             num_retry=num_retry,
         )
 
-
-async def get_all_visible_text(page: Page) -> str:
+async def get_frame_text(iframe: Frame) -> str:
     """
-    Get all the visible text on the page.
-    :param page: Page instance to get the text from.
-    :return: All the visible text on the page.
+    Get all the visible text in the iframe.
+    :param iframe: Frame instance to get the text from.
+    :return: All the visible text from the iframe.
     """
     js_script = "() => document.body.innerText"
-    return await page.evaluate(js_script)
 
+    try:
+        text = await iframe.evaluate(js_script)
+    except:
+        return ''
+
+    for child_frame in iframe.child_frames:
+        if child_frame.is_detached():
+            continue
+
+        text += await get_frame_text(child_frame)
+
+    return text
 
 async def scrape_web_unsafe(
     browser_state: BrowserState,
@@ -262,7 +273,8 @@ async def scrape_web_unsafe(
         id_to_xpath_dict[element_id] = f"//*[@{SKYVERN_ID_ATTR}='{element_id}']"
         id_to_element_dict[element_id] = element
 
-    text_content = await get_all_visible_text(page)
+    text_content = await get_frame_text(page.main_frame)
+
     return ScrapedPage(
         elements=elements,
         id_to_xpath_dict=id_to_xpath_dict,
@@ -283,8 +295,35 @@ async def get_interactable_element_tree(page: Page) -> tuple[list[dict], list[di
     :return: Tuple containing the element tree and a map of element IDs to elements.
     """
     await page.evaluate(JS_FUNCTION_DEFS)
-    js_script = "() => buildTreeFromBody()"
-    elements, element_tree = await page.evaluate(js_script)
+    main_frame_js_script = "() => buildTreeFromBody('main')"
+    elements, element_tree = await page.evaluate(main_frame_js_script)
+
+    for frame in page.main_frame.child_frames:
+        if frame.is_detached():
+            continue
+
+        try:
+            frame_element = await frame.frame_element()
+        except:
+            continue
+
+        unique_id = await frame_element.get_attribute('unique_id')
+
+        frame_js_script = f"() => buildTreeFromBody('{unique_id}')"
+
+        await frame.evaluate(JS_FUNCTION_DEFS)
+        frame_elements, frame_element_tree = await frame.evaluate(frame_js_script)
+
+        elements = elements + frame_elements
+
+        for element in elements:
+            if element['id'] == unique_id:
+                element['children'] = frame_elements
+
+        for element_tree_item in element_tree:
+            if element_tree_item['id'] == unique_id:
+                element_tree_item['children'] = frame_element_tree
+
     return elements, element_tree
 
 
