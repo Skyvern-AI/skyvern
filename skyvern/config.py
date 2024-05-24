@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     # ACTIVE LLM PROVIDER
     LLM_KEY: str = "OPENAI_GPT4O"
     # COMMON
+    LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
     LLM_CONFIG_TEMPERATURE: float = 0
     # LLM PROVIDER SPECIFIC
