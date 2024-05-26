@@ -55,6 +55,7 @@ supabase = "^2.4.3"
 aioredlock = "^0.7.3"
 fpdf = "^1.7.2"
 pypdf = "^4.2.0"
+stripe = "^9.7.0"
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"
