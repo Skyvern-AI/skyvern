@@ -64,7 +64,7 @@ export const finditparts = {
 export const geico = {
   url: "https://www.geico.com",
   navigationGoal:
-    "Navigate through the website until you generate an auto insurance quote. Do not generate a home insurance quote. If you're on a page showing an auto insurance quote (with premium amounts), your goal is COMPLETE",
+    "Navigate through the website until you generate an auto insurance quote. Do not generate a home insurance quote. If this page contains an auto insurance quote, consider the goal achieved",
   dataExtractionGoal:
     "Extract all quote information in JSON format including the premium amount, the timeframe for the quote.",
   navigationPayload: {
