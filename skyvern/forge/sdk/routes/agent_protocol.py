@@ -481,8 +481,9 @@ async def get_task_actions(
 )
 async def execute_workflow(
     background_tasks: BackgroundTasks,
-    workflow_id: str,
+    workflow_id: str,  # this is the workflow_permanent_id
     workflow_request: WorkflowRequestBody,
+    version: int | None = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
@@ -493,8 +494,9 @@ async def execute_workflow(
     workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
         request_id=request_id,
         workflow_request=workflow_request,
-        workflow_id=workflow_id,
+        workflow_permanent_id=workflow_id,
         organization_id=current_org.organization_id,
+        version=version,
         max_steps_override=x_max_steps_override,
     )
     if x_max_steps_override:
@@ -502,7 +504,7 @@ async def execute_workflow(
     await AsyncExecutorFactory.get_executor().execute_workflow(
         background_tasks=background_tasks,
         organization_id=current_org.organization_id,
-        workflow_id=workflow_id,
+        workflow_id=workflow_run.workflow_id,
         workflow_run_id=workflow_run.workflow_run_id,
         max_steps_override=x_max_steps_override,
         api_key=x_api_key,
