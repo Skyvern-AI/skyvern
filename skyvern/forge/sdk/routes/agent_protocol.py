@@ -11,6 +11,7 @@ from skyvern.exceptions import StepNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Organization, Step
@@ -99,6 +100,7 @@ async def create_agent_task(
     x_max_steps_override: Annotated[int | None, Header()] = None,
 ) -> CreateTaskResponse:
     analytics.capture("skyvern-oss-agent-task-create", data={"url": task.url})
+    await PermissionCheckerFactory.get_instance().check(current_org)
 
     if current_org and current_org.organization_name == "CoverageCat":
         task.proxy_location = ProxyLocation.RESIDENTIAL
