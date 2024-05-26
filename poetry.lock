@@ -6062,6 +6062,21 @@ release = ["twine"]
 test = ["pylint", "pytest", "pytest-black", "pytest-cov", "pytest-pylint"]
 
 [[package]]
+name = "stripe"
+version = "9.7.0"
+description = "Python bindings for the Stripe API"
+optional = false
+python-versions = ">=3.6"
+files = [
+    {file = "stripe-9.7.0-py2.py3-none-any.whl", hash = "sha256:266af2f4ff23ca3cdc73c332cf2776fd2e1084b1e9379b03fb981b1040ed69f0"},
+    {file = "stripe-9.7.0.tar.gz", hash = "sha256:af694723bf7968cea18a956641dcef786ec1f72de8022718fa3ef5f7868bd430"},
+]
+
+[package.dependencies]
+requests = {version = ">=2.20", markers = "python_version >= \"3.0\""}
+typing-extensions = {version = ">=4.5.0", markers = "python_version >= \"3.7\""}
+
+[[package]]
 name = "structlog"
 version = "23.3.0"
 description = "Structured Logging for Python"
@@ -7190,4 +7205,4 @@ testing = ["big-O", "jaraco.functools", "jaraco.itertools", "more-itertools", "p
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.11,<3.12"
-content-hash = "0dc27842c8de420ea8e4d4573e2e062f4a99d27b0e8e4c398abea4b7137b7e2d"
+content-hash = "525799973a084af745be22b7c8ead47729df7ed19e0ec1cfc94f25b20b893693"

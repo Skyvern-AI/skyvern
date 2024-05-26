@@ -1,5 +1,6 @@
 from playwright.async_api import Page
 
+from skyvern.exceptions import StepTerminationError
 from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.sdk.models import Organization, Step, StepStatus
@@ -33,7 +34,7 @@ class AgentFunction:
 
         can_execute = has_valid_task_status and has_valid_step_status and has_no_running_steps
         if not can_execute:
-            raise Exception(f"Cannot execute step. Reasons: {reasons}, Step: {step}")
+            raise StepTerminationError(step_id=step.step_id, reason="Cannot execute step. Reasons: {reasons}")
 
     def generate_async_operations(
         self,
