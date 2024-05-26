@@ -17,6 +17,7 @@ from skyvern.exceptions import (
     FailedToSendWebhook,
     InvalidWorkflowTaskURLState,
     MissingBrowserStatePage,
+    StepTerminationError,
     TaskNotFound,
 )
 from skyvern.forge import app
@@ -78,34 +79,6 @@ class ForgeAgent:
             debug_mode=SettingsManager.get_settings().DEBUG_MODE,
         )
         self.async_operation_pool = AsyncOperationPool()
-
-    async def validate_step_execution(
-        self,
-        task: Task,
-        step: Step,
-    ) -> None:
-        """
-        Checks if the step can be executed.
-        :return: A tuple of whether the step can be executed and a list of reasons why it can't be executed.
-        """
-        reasons = []
-        # can't execute if task status is not running
-        has_valid_task_status = task.status == TaskStatus.running
-        if not has_valid_task_status:
-            reasons.append(f"invalid_task_status:{task.status}")
-        # can't execute if the step is already running or completed
-        has_valid_step_status = step.status in [StepStatus.created, StepStatus.failed]
-        if not has_valid_step_status:
-            reasons.append(f"invalid_step_status:{step.status}")
-        # can't execute if the task has another step that is running
-        steps = await app.DATABASE.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
-        has_no_running_steps = not any(step.status == StepStatus.running for step in steps)
-        if not has_no_running_steps:
-            reasons.append(f"another_step_is_running_for_task:{task.task_id}")
-
-        can_execute = has_valid_task_status and has_valid_step_status and has_no_running_steps
-        if not can_execute:
-            raise Exception(f"Cannot execute step. Reasons: {reasons}, Step: {step}")
 
     async def create_task_and_step_from_block(
         self,
@@ -211,9 +184,7 @@ class ForgeAgent:
         return task
 
     def register_async_operations(self, organization: Organization, task: Task, page: Page) -> None:
-        if not app.generate_async_operations:
-            return
-        operations = app.generate_async_operations(organization, task, page)
+        operations = app.AGENT_FUNCTION.generate_async_operations(organization, task, page)
         self.async_operation_pool.add_operations(task.task_id, operations)
 
     async def execute_step(
@@ -229,7 +200,7 @@ class ForgeAgent:
         detailed_output: DetailedAgentStepOutput | None = None
         try:
             # Check some conditions before executing the step, throw an exception if the step can't be executed
-            await self.validate_step_execution(task, step)
+            await app.AGENT_FUNCTION.validate_step_execution(task, step)
             (
                 step,
                 browser_state,
@@ -323,6 +294,28 @@ class ForgeAgent:
 
             return step, detailed_output, next_step
         # TODO (kerem): Let's add other exceptions that we know about here as custom exceptions as well
+        except StepTerminationError as e:
+            LOG.error(
+                "Step cannot be executed. Task terminated",
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            await self.update_step(
+                step=step,
+                status=StepStatus.failed,
+            )
+            task = await self.update_task(
+                task,
+                status=TaskStatus.failed,
+                failure_reason=e.message,
+            )
+            await self.send_task_response(
+                task=task,
+                last_step=step,
+                api_key=api_key,
+                close_browser_on_completion=close_browser_on_completion,
+            )
+            return step, detailed_output, next_step
         except FailedToSendWebhook:
             LOG.exception(
                 "Failed to send webhook",
