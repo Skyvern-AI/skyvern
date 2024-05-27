@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     LLM_CONFIG_MAX_TOKENS: int = 4096
     LLM_CONFIG_TEMPERATURE: float = 0
     # LLM PROVIDER SPECIFIC
-    ENABLE_OPENAI: bool = True
+    ENABLE_OPENAI: bool = False
     ENABLE_ANTHROPIC: bool = False
     ENABLE_AZURE: bool = False
     ENABLE_BEDROCK: bool = False
