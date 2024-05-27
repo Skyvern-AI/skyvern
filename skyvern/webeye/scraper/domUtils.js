@@ -1184,7 +1184,7 @@ function removeBoundingBoxes() {
 
 function scrollToTop(draw_boxes) {
   removeBoundingBoxes();
-  window.scrollTo({ left: 0, top: 0, behavior: "instant" });
+  window.scroll({ left: 0, top: 0, behavior: "instant" });
   if (draw_boxes) {
     var elementsAndResultArray = buildTreeFromBody();
     drawBoundingBoxes(elementsAndResultArray[0]);
