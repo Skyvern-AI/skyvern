@@ -37,6 +37,7 @@ services:
       - OPENAI_API_KEY=<your_openai_key>
       # If you want to use other LLM provider, like azure and anthropic:
       # - ENABLE_ANTHROPIC=true
+      # - LLM_KEY=ANTHROPIC_CLAUDE3_OPUS
       # - ANTHROPIC_API_KEY=<your_anthropic_key>
       # - ENABLE_AZURE=true
       # - LLM_KEY=AZURE_OPENAI_GPT4V
@@ -47,6 +48,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/app/.streamlit/secrets.toml"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
   
   streamlit:
     image: public.ecr.aws/t6d4b5t4/skyvern:latest
@@ -60,5 +66,6 @@ services:
       - ./.streamlit:/app/.streamlit
     command: ["/bin/bash", "entrypoint-streamlit.sh"]
     depends_on:
-      - skyvern
+      skyvern:
+        condition: service_healthy
 
