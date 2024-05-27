@@ -7,7 +7,6 @@ import streamlit as st
 
 from skyvern import analytics
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, TaskRequest
-
 from streamlit_app.visualizer import styles
 from streamlit_app.visualizer.api import SkyvernClient
 from streamlit_app.visualizer.artifact_loader import (

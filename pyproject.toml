@@ -125,9 +125,7 @@ force_grid_wrap = 0
 use_parentheses = true
 ensure_newline_before_comments = true
 line_length = 120
-known_skyvern = "skyvern"
-known_cloud = "cloud"
-sections = ["FUTURE", "STDLIB", "THIRDPARTY", "SKYVERN", "CLOUD", "FIRSTPARTY", "LOCALFOLDER"]
+sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
 skip_glob = [".tox", "__pycache__", "*.pyc", "venv*/*", "reports", "venv", "env", "node_modules", ".env", ".venv", "dist"]
 skip = ["webeye/actions/__init__.py", "forge/sdk/__init__.py"]
 
