@@ -830,9 +830,13 @@ function buildTreeFromBody() {
     let linkedElements = new Array();
     const elementId = currentEle.getAttribute("id");
     if (elementId) {
-      linkedElements = [
-        ...document.querySelectorAll(`label[for="${elementId}"]`),
-      ];
+      try {
+        linkedElements = [
+          ...document.querySelectorAll(`label[for="${elementId}"]`),
+        ];
+      } catch (e) {
+        console.log("failed to query labels: ", e);
+      }
     }
     const labelled = currentEle.getAttribute("aria-labelledby");
     if (labelled) {
