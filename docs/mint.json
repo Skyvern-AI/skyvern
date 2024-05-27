@@ -18,18 +18,21 @@
   "topbarLinks": [
     {
       "name": "Discord",
-      "url": "https://skyvern.com/pricing"
+      "url": "https://discord.gg/fG2XXEuQX3"
+    }, {
+      "name": "Github",
+      "url": "https://github.com/Skyvern-AI/Skyvern/"
     }
   ],
   "topbarCtaButton": {
-    "name": "Github",
-    "url": "https://github.com/Skyvern-AI/Skyvern/"
+    "name": "Try Skyvern Cloud",
+    "url": "https://app.skyvern.com"
   },
   "anchors": [
     {
-      "name": "Documentation",
-      "icon": "book-open-cover",
-      "url": "https://docs.skyvern.com"
+      "name": "Blog",
+      "icon": "newspaper",
+      "url": "https://blog.skyvern.com"
     },
     {
       "name": "Community",
@@ -40,6 +43,11 @@
       "name": "Github",
       "icon": "github",
       "url": "https://github.com/Skyvern-AI/Skyvern/"
+    },
+    {
+      "name": "Skyvern Cloud",
+      "icon": "cloud",
+      "url": "https://app.skyvern.com"
     }
   ],
   "navigation": [
