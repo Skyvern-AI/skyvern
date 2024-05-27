@@ -3,9 +3,8 @@ from typing import Annotated, Optional
 
 import typer
 
-from skyvern.forge.app import DATABASE
-
 from scripts.create_api_key import create_org_api_token
+from skyvern.forge.app import DATABASE
 
 
 async def create_org(org_name: str, webhook_callback_url: str | None = None) -> None:
