@@ -14,11 +14,7 @@ function RootLayout() {
     <>
       <div className="w-full h-full px-4">
         <aside className="fixed w-72 px-6 shrink-0 min-h-screen border-r-2">
-          <Link
-            to="https://skyvern.com"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
+          <Link to={window.location.origin}>
             <div className="h-24">
               <Logo />
             </div>
