@@ -487,29 +487,27 @@ class ForgeAgent:
                             action=action,
                         )
 
-                        # if the last action succeeded, then skip handling
                         previous_action, previous_result = detailed_agent_step_output.actions_and_results[
                             previous_action_idx
                         ]
                         if len(previous_result) > 0 and previous_result[-1].success:
                             LOG.info(
-                                "Previous action succeeded, so skip this one.",
+                                "Previous action succeeded, but we'll still continue.",
                                 task_id=task.task_id,
                                 step_id=step.step_id,
                                 step_order=step.order,
-                                previouse_action=previous_action,
-                                previouse_result=previous_result,
+                                previous_action=previous_action,
+                                previous_result=previous_result,
                             )
-                            continue
-
-                        LOG.warning(
-                            "Previous action failed, so handle this action.",
-                            task_id=task.task_id,
-                            step_id=step.step_id,
-                            step_order=step.order,
-                            previouse_action=previous_action,
-                            previouse_result=previous_result,
-                        )
+                        else:
+                            LOG.warning(
+                                "Previous action failed, so handle the next action.",
+                                task_id=task.task_id,
+                                step_id=step.step_id,
+                                step_order=step.order,
+                                previous_action=previous_action,
+                                previous_result=previous_result,
+                            )
 
                     element_id_to_last_action[action.element_id] = action_idx
 
