@@ -267,3 +267,8 @@ class UnknownElementTreeFormat(SkyvernException):
 class StepTerminationError(SkyvernException):
     def __init__(self, step_id: str, reason: str) -> None:
         super().__init__(f"Step {step_id} cannot be executed and task is terminated. Reason: {reason}")
+
+
+class UnsupportedActionType(SkyvernException):
+    def __init__(self, action_type: str):
+        super().__init__(f"Unsupport action type: {action_type}")
