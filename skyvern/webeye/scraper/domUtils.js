@@ -540,10 +540,19 @@ function getElementContent(element, skipped_element = null) {
 function getSelectOptions(element) {
   const options = Array.from(element.options);
   const selectOptions = [];
-  for (const option of options) {
+
+  for (const optionElement of options) {
+    let id = optionElement.getAttribute("unique_id");
+
+    if (!id) {
+      id = uniqueId();
+      optionElement.setAttribute("unique_id", id);
+    }
+
     selectOptions.push({
-      optionIndex: option.index,
-      text: removeMultipleSpaces(option.textContent),
+      id: id,
+      optionIndex: optionElement.index,
+      text: removeMultipleSpaces(optionElement.textContent),
     });
   }
   return selectOptions;
@@ -554,23 +563,33 @@ function getListboxOptions(element) {
   var optionElements = element.querySelectorAll('[role="option"]');
   let selectOptions = [];
   for (var i = 0; i < optionElements.length; i++) {
-    var ele = optionElements[i];
+    let optionElement = optionElements[i];
+
+    let id = optionElement.getAttribute("unique_id");
+
+    if (!id) {
+      id = uniqueId();
+      optionElement.setAttribute("unique_id", id);
+    }
+
     selectOptions.push({
+      id: id,
       optionIndex: i,
-      text: removeMultipleSpaces(ele.textContent),
+      text: removeMultipleSpaces(optionElement.textContent),
     });
   }
   return selectOptions;
 }
 
 function uniqueId() {
-    const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    let result = '';
-    for (let i = 0; i < 4; i++) {
-        const randomIndex = Math.floor(Math.random() * characters.length);
-        result += characters[randomIndex];
-    }
-    return result;
+  const characters =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let result = "";
+  for (let i = 0; i < 4; i++) {
+    const randomIndex = Math.floor(Math.random() * characters.length);
+    result += characters[randomIndex];
+  }
+  return result;
 }
 
 function buildTreeFromBody(frame = 'main') {
@@ -630,7 +649,7 @@ function buildTreeFromBody(frame = 'main') {
   };
 
   function buildElementObject(element, interactable) {
-    var element_id = element.getAttribute('unique_id') ?? uniqueId();
+    var element_id = element.getAttribute("unique_id") ?? uniqueId();
     var elementTagNameLower = element.tagName.toLowerCase();
     element.setAttribute("unique_id", element_id);
     // if element is an "a" tag and has a target="_blank" attribute, remove the target attribute
@@ -739,7 +758,10 @@ function buildTreeFromBody(frame = 'main') {
       // If the element is interactable and has an interactable parent,
       // then add it to the children of the parent
       else {
-        elements.find((element) => element.id === parentId).children.push(elementObj);
+        // TODO: use dict/object so that we access these in O(1) instead
+        elements
+          .find((element) => element.id === parentId)
+          .children.push(elementObj);
       }
       // options already added to the select.options, no need to add options anymore
       if (elementObj.options && elementObj.options.length > 0) {
@@ -783,7 +805,10 @@ function buildTreeFromBody(frame = 'main') {
           if (parentId === null) {
             resultArray.push(elementObj);
           } else {
-            elements.find((element) => element.id === parentId).children.push(elementObj)
+            // TODO: use dict/object so that we access these in O(1) instead
+            elements
+              .find((element) => element.id === parentId)
+              .children.push(elementObj);
           }
           parentId = elementObj.id;
         }
@@ -1032,14 +1057,6 @@ function drawBoundingBoxes(elements) {
   var groups = groupElementsVisually(elements);
   var hintMarkers = createHintMarkersForGroups(groups);
   addHintMarkersToPage(hintMarkers);
-}
-
-function removeAllUniqueIdAttributes() {
-  var elementsWithUniqueId = document.querySelectorAll("[unique_id]");
-
-  elementsWithUniqueId.forEach(function (element) {
-    element.removeAttribute("unique_id");
-  });
 }
 
 function captchaSolvedCallback() {

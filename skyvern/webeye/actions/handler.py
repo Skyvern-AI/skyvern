@@ -500,7 +500,7 @@ async def handle_select_option_action(
             return [ActionFailure(e)]
 
     try:
-        option_xpath = scraped_page.id_to_xpath_dict[action.option.index]
+        option_xpath = scraped_page.id_to_xpath_dict[action.option.id]
         match = re.search(r"option\[(\d+)]$", option_xpath)
 
         if match:

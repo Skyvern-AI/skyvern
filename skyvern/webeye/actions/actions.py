@@ -94,9 +94,10 @@ class SelectOption(BaseModel):
     label: str | None
     value: str | None
     index: int | None
+    id: str | None
 
     def __repr__(self) -> str:
-        return f"SelectOption(label={self.label}, value={self.value}, index={self.index})"
+        return f"SelectOption(label={self.label}, value={self.value}, index={self.index}, id={self.id})"
 
 
 class SelectOptionAction(WebAction):
@@ -207,6 +208,7 @@ def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Actio
                         label=action["option"]["label"],
                         value=action["option"]["value"],
                         index=action["option"]["index"],
+                        id=action["option"]["id"],
                     ),
                     reasoning=reasoning,
                 )
