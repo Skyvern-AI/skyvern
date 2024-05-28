@@ -715,6 +715,7 @@ function buildTreeFromBody() {
   }
   function processElement(element, parentId) {
     if (element === null) {
+      console.log("get a null element");
       return;
     }
 
