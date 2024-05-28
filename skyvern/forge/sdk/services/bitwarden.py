@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 from enum import StrEnum
 
@@ -14,6 +15,11 @@ from skyvern.exceptions import (
 )
 
 LOG = structlog.get_logger()
+
+
+def is_valid_email(email: str) -> bool:
+    pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+    return re.match(pattern, email) is not None
 
 
 class BitwardenConstants(StrEnum):
@@ -161,8 +167,18 @@ class BitwardenService:
                 if "login" in item
             ]
 
-            # Todo: Handle multiple credentials, for now just return the last one
-            return credentials[-1] if credentials else {}
+            if len(credentials) == 1:
+                return credentials[0]
+
+            # Choose multiple credentials according to the defined rule,
+            # if no cred matches the rule, return empty.
+            # TODO: For now hard code to choose the first valid email username
+            for cred in credentials:
+                if is_valid_email(cred.get(BitwardenConstants.USERNAME, "")):
+                    return cred
+
+            LOG.warning("No credential in Bitwarden matches the rule")
+            return {}
         finally:
             # Step 4: Log out
             BitwardenService.logout()
