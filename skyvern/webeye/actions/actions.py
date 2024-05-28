@@ -37,7 +37,6 @@ class Action(BaseModel):
 
 
 class WebAction(Action, abc.ABC):
-    frame: str | int
     element_id: str
 
 

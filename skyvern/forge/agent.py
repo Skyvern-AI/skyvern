@@ -813,6 +813,11 @@ class ForgeAgent:
         )
         await app.ARTIFACT_MANAGER.create_artifact(
             step=step,
+            artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
+            data=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode(),
+        )
+        await app.ARTIFACT_MANAGER.create_artifact(
+            step=step,
             artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE,
             data=json.dumps(scraped_page.element_tree, indent=2).encode(),
         )
