@@ -714,6 +714,11 @@ function buildTreeFromBody() {
     }
   }
   function processElement(element, parentId) {
+    if (element === null) {
+      console.log("get a null element");
+      return;
+    }
+
     // Check if the element is interactable
     if (isInteractable(element)) {
       var elementObj = buildElementObject(element, true);
