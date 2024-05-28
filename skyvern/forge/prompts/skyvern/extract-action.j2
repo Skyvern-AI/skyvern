@@ -19,8 +19,9 @@ Reply in JSON format with the following keys:
         "download": bool, // Can only be true for CLICK actions. If true, the browser will trigger a download by clicking the element. If false, the browser will click the element without triggering a download.
         "option": {  // The option to select for SELECT_OPTION action only. null if not SELECT_OPTION action
             "label": str, // the label of the option if any. MAKE SURE YOU USE THIS LABEL TO SELECT THE OPTION. DO NOT PUT ANYTHING OTHER THAN A VALID OPTION LABEL HERE
-            "index": int, // the id corresponding to the optionIndex under the the select element.
+            "index": int, // the index corresponding to the index under the select element.
             "value": str // the value of the option. MAKE SURE YOU USE THIS VALUE TO SELECT THE OPTION. DO NOT PUT ANYTHING OTHER THAN A VALID OPTION VALUE HERE
+            "id": str // the id of the option.
         },
 {% if error_code_mapping_str %}
         "errors": array // A list of errors. This is used to surface any errors that matches the current situation for COMPLETE and TERMINATE actions. For other actions or if no error description suits the current situation on the screenshots, return an empty list. You are allowed to return multiple errors if there are multiple errors on the page.

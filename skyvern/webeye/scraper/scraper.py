@@ -92,7 +92,7 @@ def json_to_html(element: dict) -> str:
     children_html = "".join(json_to_html(child) for child in element.get("children", []))
     # build option HTML
     option_html = "".join(
-        f'<option index="{option.get("optionIndex")}">{option.get("text")}</option>'
+        f'<option index="{option.get("optionIndex")}" id="{option.get("id")}">{option.get("text")}</option>'
         for option in element.get("options", [])
     )
 

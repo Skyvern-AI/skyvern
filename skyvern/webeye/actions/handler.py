@@ -484,7 +484,7 @@ async def handle_select_option_action(
             return [ActionFailure(e)]
 
     try:
-        option_xpath = scraped_page.id_to_xpath_dict[action.option.index]
+        option_xpath = scraped_page.id_to_xpath_dict[action.option.id]
         match = re.search(r"option\[(\d+)]$", option_xpath)
         if match:
             # This means we were trying to select an option xpath, click the option
@@ -765,7 +765,7 @@ async def chain_click(
         page.remove_listener("download", download_func)
 
 
-def get_anchor_to_click(scraped_page: ScrapedPage, element_id: int) -> str | None:
+def get_anchor_to_click(scraped_page: ScrapedPage, element_id: str) -> str | None:
     """
     Get the anchor tag under the label to click
     """
@@ -779,7 +779,7 @@ def get_anchor_to_click(scraped_page: ScrapedPage, element_id: int) -> str | Non
     return None
 
 
-def get_select_id_in_label_children(scraped_page: ScrapedPage, element_id: int) -> int | None:
+def get_select_id_in_label_children(scraped_page: ScrapedPage, element_id: str) -> str | None:
     """
     search <select> in the children of <label>
     """
@@ -795,7 +795,7 @@ def get_select_id_in_label_children(scraped_page: ScrapedPage, element_id: int) 
     return None
 
 
-def get_checkbox_id_in_label_children(scraped_page: ScrapedPage, element_id: int) -> int | None:
+def get_checkbox_id_in_label_children(scraped_page: ScrapedPage, element_id: str) -> str | None:
     """
     search checkbox/radio in the children of <label>
     """
@@ -916,7 +916,7 @@ async def click_listbox_option(
     scraped_page: ScrapedPage,
     page: Page,
     action: actions.SelectOptionAction,
-    listbox_element_id: int,
+    listbox_element_id: str,
 ) -> bool:
     listbox_element = scraped_page.id_to_element_dict[listbox_element_id]
     # this is a listbox element, get all the children
