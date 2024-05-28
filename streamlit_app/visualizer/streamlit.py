@@ -308,6 +308,7 @@ with visualizer_tab:
             tab_screenshot,
             tab_post_action_screenshot,
             tab_id_to_xpath,
+            tab_id_to_frame,
             tab_element_tree,
             tab_element_tree_trimmed,
             tab_llm_prompt,
@@ -323,6 +324,7 @@ with visualizer_tab:
                 ":rainbow[Screenshot]",
                 ":rainbow[Action Screenshots]",
                 ":red[ID -> XPath]",
+                ":red[ID -> Frame]",
                 ":orange[Element Tree]",
                 ":blue[Element Tree (Trimmed)]",
                 ":yellow[LLM Prompt]",
@@ -421,6 +423,13 @@ with visualizer_tab:
                             tab_id_to_xpath.json,
                             read_artifact_safe(uri),
                             "No ID -> XPath map available.",
+                        )
+                    elif file_name.endswith("id_frame_map.json"):
+                        streamlit_content_safe(
+                            tab_id_to_frame,
+                            tab_id_to_frame.json,
+                            read_artifact_safe(uri),
+                            "No ID -> Frame map available.",
                         )
                     elif file_name.endswith("tree.json"):
                         streamlit_content_safe(

@@ -46,7 +46,6 @@ RESERVED_ATTRIBUTES = {
 
 ELEMENT_NODE_ATTRIBUTES = {
     "id",
-    "frame",
     "interactable",
 }
 
@@ -123,6 +122,7 @@ class ScrapedPage(BaseModel):
 
     elements: list[dict]
     id_to_element_dict: dict[str, dict] = {}
+    id_to_frame_dict: dict[str, str] = {}
     id_to_xpath_dict: dict[str, str]
     element_tree: list[dict]
     element_tree_trimmed: list[dict]
@@ -267,11 +267,14 @@ async def scrape_web_unsafe(
 
     id_to_xpath_dict = {}
     id_to_element_dict = {}
+    id_to_frame_dict = {}
+
     for element in elements:
         element_id = element["id"]
         # get_interactable_element_tree marks each interactable element with a unique_id attribute
         id_to_xpath_dict[element_id] = f"//*[@{SKYVERN_ID_ATTR}='{element_id}']"
         id_to_element_dict[element_id] = element
+        id_to_frame_dict[element_id] = element["frame"]
 
     text_content = await get_frame_text(page.main_frame)
 
@@ -279,6 +282,7 @@ async def scrape_web_unsafe(
         elements=elements,
         id_to_xpath_dict=id_to_xpath_dict,
         id_to_element_dict=id_to_element_dict,
+        id_to_frame_dict=id_to_frame_dict,
         element_tree=element_tree,
         element_tree_trimmed=trim_element_tree(copy.deepcopy(element_tree)),
         screenshots=screenshots,

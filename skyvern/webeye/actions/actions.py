@@ -36,7 +36,6 @@ class Action(BaseModel):
 
 
 class WebAction(Action, abc.ABC):
-    frame: str | int
     element_id: str
 
 
@@ -169,7 +168,6 @@ def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Actio
             file_url = action["file_url"] if "file_url" in action else None
             actions.append(
                 ClickAction(
-                    frame=action["frame"],
                     element_id=element_id,
                     reasoning=reasoning,
                     file_url=file_url,
@@ -177,13 +175,12 @@ def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Actio
                 )
             )
         elif action_type == ActionType.INPUT_TEXT:
-            actions.append(InputTextAction(frame=action["frame"],element_id=element_id, text=action["text"], reasoning=reasoning))
+            actions.append(InputTextAction(element_id=element_id, text=action["text"], reasoning=reasoning))
         elif action_type == ActionType.UPLOAD_FILE:
             # TODO: see if the element is a file input element. if it's not, convert this action into a click action
 
             actions.append(
                 UploadFileAction(
-                    frame=action["frame"],
                     element_id=element_id,
                     file_url=action["file_url"],
                     reasoning=reasoning,
@@ -193,7 +190,6 @@ def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Actio
         elif action_type == ActionType.DOWNLOAD_FILE:
             actions.append(
                 DownloadFileAction(
-                    frame=action["frame"],
                     element_id=element_id,
                     file_name=action["file_name"],
                     reasoning=reasoning,
@@ -202,7 +198,6 @@ def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Actio
         elif action_type == ActionType.SELECT_OPTION:
             actions.append(
                 SelectOptionAction(
-                    frame=action["frame"],
                     element_id=element_id,
                     option=SelectOption(
                         label=action["option"]["label"],
@@ -216,7 +211,6 @@ def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Actio
         elif action_type == ActionType.CHECKBOX:
             actions.append(
                 CheckboxAction(
-                    frame=action["frame"],
                     element_id=element_id,
                     is_checked=action["is_checked"],
                     reasoning=reasoning,

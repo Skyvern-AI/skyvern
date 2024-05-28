@@ -14,6 +14,7 @@ FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
     ArtifactType.LLM_RESPONSE: "json",
     ArtifactType.LLM_RESPONSE_PARSED: "json",
     ArtifactType.VISIBLE_ELEMENTS_ID_XPATH_MAP: "json",
+    ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP: "json",
     ArtifactType.VISIBLE_ELEMENTS_TREE: "json",
     ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED: "json",
     ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT: "txt",
