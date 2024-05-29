@@ -20,6 +20,7 @@ function CreateNewTaskFormPage() {
         .then((response) => response.data);
     },
     enabled: !!template && !sampleCases.includes(template as SampleCase),
+    refetchOnWindowFocus: false,
   });
 
   if (!template) {
