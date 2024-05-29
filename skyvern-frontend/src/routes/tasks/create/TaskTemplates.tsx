@@ -43,7 +43,7 @@ function TaskTemplates() {
   const navigate = useNavigate();
 
   return (
-    <div className="max-w-6xl mx-auto px-8">
+    <div>
       <section className="py-4">
         <header>
           <h1 className="text-3xl">Skyvern Templates</h1>

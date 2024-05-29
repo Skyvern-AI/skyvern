@@ -36,6 +36,7 @@ import fetchToCurl from "fetch-to-curl";
 import { apiBaseUrl } from "@/util/env";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useApiCredential } from "@/hooks/useApiCredential";
+import { AxiosError } from "axios";
 
 const createNewTaskFormSchema = z
   .object({
@@ -111,7 +112,23 @@ function CreateNewTaskForm({ initialValues }: Props) {
         { data: { task_id: string } }
       >("/tasks", taskRequest);
     },
-    onError: (error) => {
+    onError: (error: AxiosError) => {
+      if (error.response?.status === 402) {
+        toast({
+          variant: "destructive",
+          title: "Failed to create task",
+          description:
+            "You don't have enough credits to run this task. Go to billing to see your credit balance.",
+          action: (
+            <ToastAction altText="Go to Billing">
+              <Button asChild>
+                <Link to="billing">Go to Billing</Link>
+              </Button>
+            </ToastAction>
+          ),
+        });
+        return;
+      }
       toast({
         variant: "destructive",
         title: "There was an error creating the task.",
@@ -120,6 +137,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
     },
     onSuccess: (response) => {
       toast({
+        variant: "success",
         title: "Task Created",
         description: `${response.data.task_id} created successfully.`,
         action: (

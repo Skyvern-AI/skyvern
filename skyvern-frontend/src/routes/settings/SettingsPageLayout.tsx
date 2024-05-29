@@ -2,7 +2,7 @@ import { Outlet } from "react-router-dom";
 
 function SettingsPageLayout() {
   return (
-    <div className="flex flex-col gap-4 px-6">
+    <div className="max-w-6xl mx-auto px-8">
       <main>
         <Outlet />
       </main>

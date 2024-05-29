@@ -54,7 +54,7 @@ function TaskDetails() {
   }
 
   return (
-    <div className="flex flex-col gap-8 max-w-6xl mx-auto p-8 pt-0">
+    <div className="flex flex-col gap-8">
       <div className="flex items-center">
         <Label className="w-32 shrink-0 text-lg">Task ID</Label>
         <Input value={taskId} readOnly />
