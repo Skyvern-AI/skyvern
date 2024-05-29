@@ -46,6 +46,13 @@ function TaskTemplates() {
     <div>
       <section className="py-4">
         <header>
+          <h1 className="text-3xl">Your Templates</h1>
+        </header>
+        <Separator className="mt-2 mb-8" />
+        <SavedTasks />
+      </section>
+      <section className="py-4">
+        <header>
           <h1 className="text-3xl">Skyvern Templates</h1>
         </header>
         <Separator className="mt-2 mb-8" />
@@ -71,13 +78,6 @@ function TaskTemplates() {
             );
           })}
         </div>
-      </section>
-      <section className="py-4">
-        <header>
-          <h1 className="text-3xl">Your Templates</h1>
-        </header>
-        <Separator className="mt-2 mb-8" />
-        <SavedTasks />
       </section>
     </div>
   );
