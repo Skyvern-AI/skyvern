@@ -814,6 +814,7 @@ class SendEmailBlock(Block):
         msg = EmailMessage()
         msg["Subject"] = self.subject + f" - Workflow Run ID: {workflow_run_id}"
         msg["To"] = ", ".join(self.recipients)
+        msg["BCC"] = self.sender  # BCC the sender so there is a record of the email being sent
         msg["From"] = self.sender
         if self.body and workflow_run_context.has_parameter(self.body) and workflow_run_context.has_value(self.body):
             # We're purposely not decrypting the body parameter value here because we don't want to expose secrets
