@@ -167,18 +167,21 @@ class BitwardenService:
                 if "login" in item
             ]
 
+            if len(credentials) == 0:
+                return {}
+
             if len(credentials) == 1:
                 return credentials[0]
 
             # Choose multiple credentials according to the defined rule,
-            # if no cred matches the rule, return empty.
+            # if no cred matches the rule, return the first one.
             # TODO: For now hard code to choose the first valid email username
             for cred in credentials:
                 if is_valid_email(cred.get(BitwardenConstants.USERNAME, "")):
                     return cred
 
-            LOG.warning("No credential in Bitwarden matches the rule")
-            return {}
+            LOG.warning("No credential in Bitwarden matches the rule, returning the frist match")
+            return credentials[0]
         finally:
             # Step 4: Log out
             BitwardenService.logout()
