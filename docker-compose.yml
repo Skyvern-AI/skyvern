@@ -3,6 +3,7 @@ version: '3.8'
 services:
   postgres:
     image: postgres:14-alpine
+    restart: always
     # comment out if you want to externally connect DB
     # ports:
     #   - 5432:5432
@@ -20,11 +21,11 @@ services:
       retries: 5
 
   skyvern:
-    image: public.ecr.aws/t6d4b5t4/skyvern:latest
+    image: public.ecr.aws/skyvern/skyvern:latest
     restart: on-failure
     # comment out if you want to externally call skyvern API
-    # ports:
-    #   - 8000:8000
+    ports:
+      - 8000:8000
     volumes:
       - ./artifacts:/data/artifacts
       - ./videos:/data/videos
@@ -40,7 +41,7 @@ services:
       # - LLM_KEY=ANTHROPIC_CLAUDE3_OPUS
       # - ANTHROPIC_API_KEY=<your_anthropic_key>
       # - ENABLE_AZURE=true
-      # - LLM_KEY=AZURE_OPENAI_GPT4V
+      # - LLM_KEY=AZURE_OPENAI
       # - AZURE_DEPLOYMENT=<your_azure_deployment>
       # - AZURE_API_KEY=<your_azure_api_key>
       # - AZURE_API_BASE=<your_azure_api_base>
@@ -53,9 +54,27 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  skyvern-ui:
+    image: public.ecr.aws/skyvern/skyvern-ui:latest
+    restart: on-failure
+    ports:
+      - 8080:8080
+      - 9090:9090
+    volumes:
+      - ./artifacts:/data/artifacts
+      - ./videos:/data/videos
+      - ./har:/data/har
+      - ./.streamlit:/app/.streamlit
+    # environment:
+    #   - VITE_API_BASE_URL=
+    #   - VITE_SKYVERN_API_KEY=
+    depends_on:
+      skyvern:
+        condition: service_healthy
   
   streamlit:
-    image: public.ecr.aws/t6d4b5t4/skyvern:latest
+    image: public.ecr.aws/skyvern/skyvern:latest
     restart: on-failure
     ports:
       - 8501:8501
