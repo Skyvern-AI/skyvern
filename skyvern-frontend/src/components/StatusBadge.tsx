@@ -19,7 +19,9 @@ function StatusBadge({ status }: Props) {
     variant = "warning";
   }
 
-  return <Badge variant={variant}>{status}</Badge>;
+  const statusText = status === "timed_out" ? "timed out" : status;
+
+  return <Badge variant={variant}>{statusText}</Badge>;
 }
 
 export { StatusBadge };
