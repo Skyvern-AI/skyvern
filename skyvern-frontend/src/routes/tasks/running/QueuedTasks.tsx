@@ -57,7 +57,9 @@ function QueuedTasks() {
                     navigate(task.task_id);
                   }}
                 >
-                  <TableCell className="w-1/3">{task.request.url}</TableCell>
+                  <TableCell className="w-1/3 max-w-64 overflow-hidden whitespace-nowrap overflow-ellipsis">
+                    {task.request.url}
+                  </TableCell>
                   <TableCell className="w-1/3">
                     <StatusBadge status={task.status} />
                   </TableCell>

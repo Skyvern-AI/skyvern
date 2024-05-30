@@ -84,7 +84,7 @@ function TaskHistory() {
                 return (
                   <TableRow key={task.task_id} className="w-4">
                     <TableCell
-                      className="w-1/3 cursor-pointer"
+                      className="w-1/3 cursor-pointer max-w-64 overflow-hidden whitespace-nowrap overflow-ellipsis"
                       onClick={() => {
                         navigate(task.task_id);
                       }}
