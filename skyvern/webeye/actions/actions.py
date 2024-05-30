@@ -134,7 +134,7 @@ class CompleteAction(DecisiveAction):
     data_extraction_goal: str | None = None
 
 
-def marshal_action(action: Dict[str, Any], data_extraction_goal: str | None = None) -> Action:
+def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None) -> Action:
     if "id" in action:
         element_id = action["id"]
     elif "element_id" in action:
@@ -225,7 +225,7 @@ def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Actio
     actions: List[Action] = []
     for action in json_response:
         try:
-            action_instance = marshal_action(action=action, data_extraction_goal=task.data_extraction_goal)
+            action_instance = parse_action(action=action, data_extraction_goal=task.data_extraction_goal)
             if isinstance(action_instance, TerminateAction):
                 LOG.warning(
                     "Agent decided to terminate",
