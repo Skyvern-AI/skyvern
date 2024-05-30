@@ -967,6 +967,7 @@ class WorkflowService:
                 data_extraction_goal=block_yaml.data_extraction_goal,
                 data_schema=block_yaml.data_schema,
                 error_code_mapping=block_yaml.error_code_mapping,
+                max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
             )
         elif block_yaml.block_type == BlockType.FOR_LOOP:
