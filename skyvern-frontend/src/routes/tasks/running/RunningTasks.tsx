@@ -53,9 +53,8 @@ function RunningTasks() {
             {task.request.url}
           </CardDescription>
         </CardHeader>
-        <CardContent>
-          Latest screenshot:
-          <div className="w-40 h-40 border-2">
+        <CardContent className="flex items-center justify-center">
+          <div className="w-40 h-40">
             <LatestScreenshot id={task.task_id} />
           </div>
         </CardContent>
