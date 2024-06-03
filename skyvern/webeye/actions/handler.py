@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import re
 import uuid
 from typing import Any, Awaitable, Callable, List
 
@@ -516,40 +515,20 @@ async def handle_select_option_action(
             return [ActionFailure(e)]
 
     try:
-        option_xpath = scraped_page.id_to_xpath_dict[action.option.id]
-        match = re.search(r"option\[(\d+)]$", option_xpath)
-        if match:
-            # This means we were trying to select an option xpath, click the option
-            option_index = int(match.group(1))
-            await page.click(
-                f"xpath={xpath}",
-                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
-            )
-            await page.select_option(
-                xpath,
-                index=option_index,
-                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
-            )
-            await page.click(
-                f"xpath={xpath}",
-                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
-            )
-            return [ActionSuccess()]
-        else:
-            # This means the supplied index was for the select element, not a reference to the xpath dict
-            await page.click(
-                f"xpath={xpath}",
-                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
-            )
-            await page.select_option(
-                xpath,
-                index=action.option.index,
-                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
-            )
-            await page.click(
-                f"xpath={xpath}",
-                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
-            )
+        # This means the supplied index was for the select element, not a reference to the xpath dict
+        await page.click(
+            f"xpath={xpath}",
+            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        )
+        await page.select_option(
+            xpath,
+            index=action.option.index,
+            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        )
+        await page.click(
+            f"xpath={xpath}",
+            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        )
         return [ActionSuccess()]
     except Exception as e:
         LOG.warning("Failed to click on the option by index", action=action, exc_info=True)
@@ -787,7 +766,6 @@ def get_anchor_to_click(scraped_page: ScrapedPage, element_id: str) -> str | Non
     Get the anchor tag under the label to click
     """
     LOG.info("Getting anchor tag to click", element_id=element_id)
-    element_id = int(element_id)
     for ele in scraped_page.elements:
         if "id" in ele and ele["id"] == element_id:
             for child in ele["children"]:
