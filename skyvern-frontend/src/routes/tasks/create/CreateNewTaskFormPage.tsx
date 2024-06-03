@@ -21,6 +21,7 @@ function CreateNewTaskFormPage() {
     },
     enabled: !!template && !sampleCases.includes(template as SampleCase),
     refetchOnWindowFocus: false,
+    staleTime: Infinity,
   });
 
   if (!template) {
