@@ -576,7 +576,7 @@ function uniqueId() {
   return result;
 }
 
-function buildTreeFromBody(frame = 'main') {
+function buildTreeFromBody(frame = "main") {
   var elements = [];
   var resultArray = [];
 
@@ -761,7 +761,7 @@ function buildTreeFromBody(frame = 'main') {
         processElement(child, elementObj.id);
       });
       return elementObj;
-    } else if (element.tagName.toLowerCase() === 'iframe') {
+    } else if (element.tagName.toLowerCase() === "iframe") {
       let iframeElementObject = buildElementObject(element, true);
 
       elements.push(iframeElementObject);
