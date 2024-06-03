@@ -96,7 +96,7 @@ class SelectOption(BaseModel):
     index: int | None
 
     def __repr__(self) -> str:
-        return f"SelectOption(label={self.label}, value={self.value}, index={self.index}"
+        return f"SelectOption(label={self.label}, value={self.value}, index={self.index})"
 
 
 class SelectOptionAction(WebAction):
