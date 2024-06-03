@@ -68,3 +68,13 @@ def zip_files(files_path: str, zip_file_path: str) -> str:
 
 def get_path_for_workflow_download_directory(workflow_run_id: str) -> Path:
     return Path(f"{REPO_ROOT_DIR}/downloads/{workflow_run_id}/")
+
+
+def get_number_of_files_in_directory(directory: Path, recursive: bool = False) -> int:
+    count = 0
+    for root, dirs, files in os.walk(directory):
+        if not recursive:
+            count += len(files)
+            break
+        count += len(files)
+    return count

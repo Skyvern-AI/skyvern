@@ -969,6 +969,7 @@ class WorkflowService:
                 error_code_mapping=block_yaml.error_code_mapping,
                 max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
+                complete_on_download=block_yaml.complete_on_download,
             )
         elif block_yaml.block_type == BlockType.FOR_LOOP:
             loop_blocks = [
