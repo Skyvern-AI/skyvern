@@ -37,6 +37,13 @@ export type ArtifactApiResponse = {
   organization_id: string;
 };
 
+export type ActionAndResultApiResponse = [
+  ActionApiResponse,
+  {
+    success: boolean;
+  },
+];
+
 export type StepApiResponse = {
   step_id: string;
   task_id: string;
@@ -47,8 +54,7 @@ export type StepApiResponse = {
   order: number;
   organization_id: string;
   output: {
-    action_results: unknown[];
-    actions_and_results: unknown[];
+    actions_and_results: ActionAndResultApiResponse[];
     errors: unknown[];
   };
   retry_index: number;
@@ -148,4 +154,40 @@ export type WorkflowApiResponse = {
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
+};
+
+// TODO complete this
+export const ActionTypes = {
+  InputText: "input_text",
+  Click: "click",
+  SelectOption: "select_option",
+  UploadFile: "upload_file",
+  complete: "complete",
+} as const;
+
+export type ActionType = (typeof ActionTypes)[keyof typeof ActionTypes];
+
+export type Option = {
+  label: string;
+  index: number;
+  value: string;
+};
+
+export type ActionApiResponse = {
+  reasoning: string;
+  confidence_float: number;
+  action_type: ActionType;
+  text: string | null;
+  option: Option | null;
+  file_url: string | null;
+};
+
+export type Action = {
+  reasoning: string;
+  confidence: number;
+  type: ActionType;
+  input: string;
+  success: boolean;
+  stepId: string;
+  index: number;
 };
