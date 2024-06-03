@@ -8,7 +8,7 @@ import structlog
 from deprecation import deprecated
 from playwright.async_api import Locator, Page
 
-from skyvern.constants import REPO_ROOT_DIR
+from skyvern.constants import REPO_ROOT_DIR, SKYVERN_ID_ATTR
 from skyvern.exceptions import ImaginaryFileUrl, MissingElement, MissingFileUrl, MultipleElementsFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -35,7 +35,6 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage
-from skyvern.constants import SKYVERN_ID_ATTR
 
 LOG = structlog.get_logger()
 TEXT_INPUT_DELAY = 10  # 10ms between each character input
@@ -176,7 +175,7 @@ async def handle_click_action(
             num_downloaded_files_before=num_downloaded_files_before,
             download_dir=download_dir,
         )
-    xpath = await validate_actions_in_dom(action, page, scraped_page)
+    xpath, frame = await validate_actions_in_dom(action, page, scraped_page)
     await asyncio.sleep(0.3)
     if action.download:
         results = await handle_click_to_download_file_action(action, page, scraped_page)
@@ -186,6 +185,7 @@ async def handle_click_action(
             page,
             action,
             xpath,
+            frame,
             timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
         )
 
@@ -285,7 +285,6 @@ async def handle_upload_file_action(
     if is_file_input:
         LOG.info("Taking UploadFileAction. Found file input tag", action=action)
         if file_path:
-
             locator = resolve_locator(page, frame, xpath)
 
             await locator.set_input_files(
@@ -551,8 +550,7 @@ async def handle_select_option_action(
 
 
 async def handle_checkbox_action(
-    self: actions.CheckboxAction,
-    action: Action,
+    action: actions.CheckboxAction,
     page: Page,
     scraped_page: ScrapedPage,
     task: Task,
@@ -565,11 +563,11 @@ async def handle_checkbox_action(
     Treating checkbox actions as click actions seem to perform way more reliably
     Developers who tried this and failed: 2 (Suchintan and Shu 😂)
     """
-    xpath, frame = await validate_actions_in_dom(self, page, scraped_page)
+    xpath, frame = await validate_actions_in_dom(action, page, scraped_page)
 
     locator = resolve_locator(page, frame, xpath)
 
-    if self.is_checked:
+    if action.is_checked:
         await locator.check(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
     else:
         await locator.uncheck(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
@@ -649,7 +647,7 @@ def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) -> Any:
     return secret_value if secret_value is not None else parameter
 
 
-async def validate_actions_in_dom(action: WebAction, page: Page, scraped_page: ScrapedPage) -> (str, str):
+async def validate_actions_in_dom(action: WebAction, page: Page, scraped_page: ScrapedPage) -> tuple[str, str]:
     xpath = scraped_page.id_to_xpath_dict[action.element_id]
     frame = scraped_page.id_to_frame_dict[action.element_id]
 
@@ -976,7 +974,7 @@ async def click_listbox_option(
 
 
 def resolve_locator(page: Page, frame: str, xpath: str) -> Locator:
-    if frame == 'main':
+    if frame == "main":
         return page.locator(f"xpath={xpath}")
 
     return page.frame_locator(f"[{SKYVERN_ID_ATTR}='{frame}']").locator(f"xpath={xpath}")

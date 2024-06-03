@@ -6,7 +6,7 @@ from enum import StrEnum
 from typing import Any
 
 import structlog
-from playwright.async_api import Page, Frame
+from playwright.async_api import Frame, Page
 from pydantic import BaseModel
 
 from skyvern.constants import SKYVERN_DIR, SKYVERN_ID_ATTR
@@ -92,7 +92,7 @@ def json_to_html(element: dict) -> str:
     children_html = "".join(json_to_html(child) for child in element.get("children", []))
     # build option HTML
     option_html = "".join(
-        f'<option index="{option.get("optionIndex")}" id="{option.get("id")}">{option.get("text")}</option>'
+        f'<option index="{option.get("optionIndex")}">{option.get("text")}</option>'
         for option in element.get("options", [])
     )
 
@@ -187,6 +187,7 @@ async def scrape_website(
             num_retry=num_retry,
         )
 
+
 async def get_frame_text(iframe: Frame) -> str:
     """
     Get all the visible text in the iframe.
@@ -197,8 +198,12 @@ async def get_frame_text(iframe: Frame) -> str:
 
     try:
         text = await iframe.evaluate(js_script)
-    except:
-        return ''
+    except Exception:
+        LOG.warning(
+            "failed to get text from iframe",
+            exc_info=True,
+        )
+        return ""
 
     for child_frame in iframe.child_frames:
         if child_frame.is_detached():
@@ -207,6 +212,7 @@ async def get_frame_text(iframe: Frame) -> str:
         text += await get_frame_text(child_frame)
 
     return text
+
 
 async def scrape_web_unsafe(
     browser_state: BrowserState,
@@ -308,10 +314,14 @@ async def get_interactable_element_tree(page: Page) -> tuple[list[dict], list[di
 
         try:
             frame_element = await frame.frame_element()
-        except:
+        except Exception:
+            LOG.warning(
+                "Unable to get frame_element",
+                exc_info=True,
+            )
             continue
 
-        unique_id = await frame_element.get_attribute('unique_id')
+        unique_id = await frame_element.get_attribute("unique_id")
 
         frame_js_script = f"() => buildTreeFromBody('{unique_id}')"
 
@@ -321,12 +331,12 @@ async def get_interactable_element_tree(page: Page) -> tuple[list[dict], list[di
         elements = elements + frame_elements
 
         for element in elements:
-            if element['id'] == unique_id:
-                element['children'] = frame_elements
+            if element["id"] == unique_id:
+                element["children"] = frame_elements
 
         for element_tree_item in element_tree:
-            if element_tree_item['id'] == unique_id:
-                element_tree_item['children'] = frame_element_tree
+            if element_tree_item["id"] == unique_id:
+                element_tree_item["children"] = frame_element_tree
 
     return elements, element_tree
 
