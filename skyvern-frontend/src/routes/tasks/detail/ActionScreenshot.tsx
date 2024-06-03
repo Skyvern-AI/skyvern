@@ -42,7 +42,7 @@ function ActionScreenshot({ stepId, index }: Props) {
   }
 
   return screenshot ? (
-    <figure className="max-h-[400px] flex flex-col mx-auto items-center gap-2 overflow-hidden">
+    <figure className="max-w-full flex flex-col mx-auto items-center gap-2 overflow-hidden">
       <ZoomableImage src={getImageURL(screenshot)} alt="llm-screenshot" />
     </figure>
   ) : (

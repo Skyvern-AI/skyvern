@@ -23,7 +23,7 @@ function TaskActions() {
 
   return (
     <div className="flex gap-2">
-      <div className="w-3/4 h-[40rem] border rounded">
+      <div className="w-3/4 border rounded">
         <div className="p-4">
           <InputReasoningCard
             input={activeAction.input}
@@ -32,12 +32,10 @@ function TaskActions() {
           />
         </div>
         <div className="p-4">
-          <div className="p-4">
-            <ActionScreenshot
-              stepId={activeAction.stepId}
-              index={activeAction.index}
-            />
-          </div>
+          <ActionScreenshot
+            stepId={activeAction.stepId}
+            index={activeAction.index}
+          />
         </div>
       </div>
       <ScrollableActionList
