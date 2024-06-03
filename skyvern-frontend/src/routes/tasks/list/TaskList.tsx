@@ -11,7 +11,7 @@ import { TaskHistory } from "./TaskHistory";
 
 function TaskList() {
   return (
-    <div className="flex flex-col gap-8 max-w-6xl mx-auto p-8 pt-0">
+    <div className="flex flex-col gap-8">
       <Card>
         <CardHeader className="border-b-2">
           <CardTitle className="text-xl">Running Tasks</CardTitle>

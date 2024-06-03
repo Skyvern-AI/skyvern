@@ -11,6 +11,7 @@ from skyvern.exceptions import StepNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Organization, Step
@@ -99,6 +100,7 @@ async def create_agent_task(
     x_max_steps_override: Annotated[int | None, Header()] = None,
 ) -> CreateTaskResponse:
     analytics.capture("skyvern-oss-agent-task-create", data={"url": task.url})
+    await PermissionCheckerFactory.get_instance().check(current_org)
 
     if current_org and current_org.organization_name == "CoverageCat":
         task.proxy_location = ProxyLocation.RESIDENTIAL
@@ -481,8 +483,9 @@ async def get_task_actions(
 )
 async def execute_workflow(
     background_tasks: BackgroundTasks,
-    workflow_id: str,
+    workflow_id: str,  # this is the workflow_permanent_id
     workflow_request: WorkflowRequestBody,
+    version: int | None = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
@@ -493,8 +496,9 @@ async def execute_workflow(
     workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
         request_id=request_id,
         workflow_request=workflow_request,
-        workflow_id=workflow_id,
+        workflow_permanent_id=workflow_id,
         organization_id=current_org.organization_id,
+        version=version,
         max_steps_override=x_max_steps_override,
     )
     if x_max_steps_override:
@@ -502,7 +506,7 @@ async def execute_workflow(
     await AsyncExecutorFactory.get_executor().execute_workflow(
         background_tasks=background_tasks,
         organization_id=current_org.organization_id,
-        workflow_id=workflow_id,
+        workflow_id=workflow_run.workflow_id,
         workflow_run_id=workflow_run.workflow_run_id,
         max_steps_override=x_max_steps_override,
         api_key=x_api_key,

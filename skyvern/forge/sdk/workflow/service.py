@@ -68,8 +68,9 @@ class WorkflowService:
         self,
         request_id: str | None,
         workflow_request: WorkflowRequestBody,
-        workflow_id: str,
+        workflow_permanent_id: str,
         organization_id: str,
+        version: int | None = None,
         max_steps_override: int | None = None,
     ) -> WorkflowRun:
         """
@@ -83,13 +84,15 @@ class WorkflowService:
         :return: The created workflow run.
         """
         # Validate the workflow and the organization
-        workflow = await self.get_workflow(workflow_id=workflow_id, organization_id=organization_id)
+        workflow = await self.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+            version=version,
+        )
         if workflow is None:
-            LOG.error(f"Workflow {workflow_id} not found")
-            raise WorkflowNotFound(workflow_id=workflow_id)
-        if workflow.organization_id != organization_id:
-            LOG.error(f"Workflow {workflow_id} does not belong to organization {organization_id}")
-            raise WorkflowOrganizationMismatch(workflow_id=workflow_id, organization_id=organization_id)
+            LOG.error(f"Workflow {workflow_permanent_id} not found", workflow_version=version)
+            raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
+        workflow_id = workflow.workflow_id
         if workflow_request.proxy_location is None and workflow.proxy_location is not None:
             workflow_request.proxy_location = workflow.proxy_location
         if workflow_request.webhook_callback_url is None and workflow.webhook_callback_url is not None:
@@ -583,7 +586,7 @@ class WorkflowService:
             )
             outputs = None
         return WorkflowRunStatusResponse(
-            workflow_id=workflow_id,
+            workflow_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run_id,
             status=workflow_run.status,
             proxy_location=workflow_run.proxy_location,
@@ -964,7 +967,9 @@ class WorkflowService:
                 data_extraction_goal=block_yaml.data_extraction_goal,
                 data_schema=block_yaml.data_schema,
                 error_code_mapping=block_yaml.error_code_mapping,
+                max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
+                complete_on_download=block_yaml.complete_on_download,
             )
         elif block_yaml.block_type == BlockType.FOR_LOOP:
             loop_blocks = [

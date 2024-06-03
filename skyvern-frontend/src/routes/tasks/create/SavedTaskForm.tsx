@@ -38,6 +38,7 @@ import {
   webhookCallbackUrlDescription,
 } from "../data/descriptionHelperContent";
 import { SubmitEvent } from "@/types";
+import { AxiosError } from "axios";
 
 const savedTaskFormSchema = z
   .object({
@@ -148,7 +149,23 @@ function SavedTaskForm({ initialValues }: Props) {
         { data: { task_id: string } }
       >("/tasks", taskRequest);
     },
-    onError: (error) => {
+    onError: (error: AxiosError) => {
+      if (error.response?.status === 402) {
+        toast({
+          variant: "destructive",
+          title: "Failed to create task",
+          description:
+            "You don't have enough credits to run this task. Go to billing to see your credit balance.",
+          action: (
+            <ToastAction altText="Go to Billing">
+              <Button asChild>
+                <Link to="billing">Go to Billing</Link>
+              </Button>
+            </ToastAction>
+          ),
+        });
+        return;
+      }
       toast({
         variant: "destructive",
         title: "Error",

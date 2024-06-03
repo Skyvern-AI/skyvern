@@ -6,8 +6,9 @@ on:
 
 env:
   AWS_REGION: us-east-1
-  ECR_REPOSITORY: skyvern
-  REGISTRY_ALIAS: t6d4b5t4 # skyvern
+  ECR_BACKEND_REPOSITORY: skyvern
+  ECR_UI_REPOSITORY: skyvern-ui
+  REGISTRY_ALIAS: skyvern # t6d4b5t4 
 
 jobs:
   run-ci:
@@ -36,7 +37,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v1
       
-      - name: Build, tag, and push image to Amazon Public ECR
+      - name: Build, tag, and push backend image to Amazon Public ECR
         id: build-image
         uses: docker/build-push-action@v2
         env:
@@ -48,6 +49,23 @@ jobs:
             linux/arm64
           push: true
           tags: |
-            ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
-            ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_REPOSITORY }}:${{ github.event.release.tag_name }}
-            ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_REPOSITORY }}:latest
+            ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_BACKEND_REPOSITORY }}:${{ github.sha }}
+            ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_BACKEND_REPOSITORY }}:${{ github.event.release.tag_name }}
+            ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_BACKEND_REPOSITORY }}:latest
+
+      - name: Build, tag, and push ui image to Amazon Public ECR
+        id: build-ui-image
+        uses: docker/build-push-action@v2
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr-public.outputs.registry }}
+        with:
+          context: .
+          file: Dockerfile.ui
+          platforms: |
+            linux/amd64
+            linux/arm64
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_UI_REPOSITORY }}:${{ github.sha }}
+            ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_UI_REPOSITORY }}:${{ github.event.release.tag_name }}
+            ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_UI_REPOSITORY }}:latest

@@ -217,7 +217,7 @@ class WorkflowRunContext:
         self, parameter: OutputParameter, value: dict[str, Any] | list | str | None
     ) -> None:
         if parameter.key in self.values:
-            LOG.error(f"Output parameter {parameter.output_parameter_id} already has a registered value")
+            LOG.warning(f"Output parameter {parameter.output_parameter_id} already has a registered value")
             return
 
         self.values[parameter.key] = value

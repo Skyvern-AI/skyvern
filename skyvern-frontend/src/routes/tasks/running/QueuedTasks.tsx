@@ -37,9 +37,10 @@ function QueuedTasks() {
       <Table>
         <TableHeader>
           <TableRow>
-            <TableHead className="w-1/3">URL</TableHead>
-            <TableHead className="w-1/3">Status</TableHead>
-            <TableHead className="w-1/3">Created At</TableHead>
+            <TableHead className="w-1/4">ID</TableHead>
+            <TableHead className="w-1/4">URL</TableHead>
+            <TableHead className="w-1/4">Status</TableHead>
+            <TableHead className="w-1/4">Created At</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -57,11 +58,14 @@ function QueuedTasks() {
                     navigate(task.task_id);
                   }}
                 >
-                  <TableCell className="w-1/3">{task.request.url}</TableCell>
-                  <TableCell className="w-1/3">
+                  <TableCell className="w-1/4">{task.task_id}</TableCell>
+                  <TableCell className="w-1/4 max-w-64 overflow-hidden whitespace-nowrap overflow-ellipsis">
+                    {task.request.url}
+                  </TableCell>
+                  <TableCell className="w-1/4">
                     <StatusBadge status={task.status} />
                   </TableCell>
-                  <TableCell className="w-1/3">
+                  <TableCell className="w-1/4">
                     {basicTimeFormat(task.created_at)}
                   </TableCell>
                 </TableRow>

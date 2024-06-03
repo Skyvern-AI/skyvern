@@ -57,7 +57,7 @@ finditparts_sample_data = SampleTaskRequest(
 geico_sample_data = SampleTaskRequest(
     name="Geico",
     url="https://www.geico.com",
-    navigation_goal="Navigate through the website until you generate an auto insurance quote. Do not generate a home insurance quote. If this page contains an auto insurance quote, consider the goal achieved",
+    navigation_goal="Navigate through the website until you generate an auto insurance quote. Do not generate a home insurance quote. If you're on a page showing an auto insurance quote (with premium amounts), your goal is COMPLETE.",
     data_extraction_goal="Extract all quote information in JSON format including the premium amount, the timeframe for the quote.",
     navigation_payload={
         "licensed_at_age": 19,

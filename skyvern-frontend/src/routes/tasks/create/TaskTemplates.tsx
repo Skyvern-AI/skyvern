@@ -43,7 +43,14 @@ function TaskTemplates() {
   const navigate = useNavigate();
 
   return (
-    <div className="max-w-6xl mx-auto px-8">
+    <div>
+      <section className="py-4">
+        <header>
+          <h1 className="text-3xl">Your Templates</h1>
+        </header>
+        <Separator className="mt-2 mb-8" />
+        <SavedTasks />
+      </section>
       <section className="py-4">
         <header>
           <h1 className="text-3xl">Skyvern Templates</h1>
@@ -71,13 +78,6 @@ function TaskTemplates() {
             );
           })}
         </div>
-      </section>
-      <section className="py-4">
-        <header>
-          <h1 className="text-3xl">Your Templates</h1>
-        </header>
-        <Separator className="mt-2 mb-8" />
-        <SavedTasks />
       </section>
     </div>
   );

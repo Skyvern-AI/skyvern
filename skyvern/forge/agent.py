@@ -17,11 +17,13 @@ from skyvern.exceptions import (
     FailedToSendWebhook,
     InvalidWorkflowTaskURLState,
     MissingBrowserStatePage,
+    StepTerminationError,
     TaskNotFound,
 )
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.files import get_number_of_files_in_directory, get_path_for_workflow_download_directory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
@@ -78,34 +80,6 @@ class ForgeAgent:
             debug_mode=SettingsManager.get_settings().DEBUG_MODE,
         )
         self.async_operation_pool = AsyncOperationPool()
-
-    async def validate_step_execution(
-        self,
-        task: Task,
-        step: Step,
-    ) -> None:
-        """
-        Checks if the step can be executed.
-        :return: A tuple of whether the step can be executed and a list of reasons why it can't be executed.
-        """
-        reasons = []
-        # can't execute if task status is not running
-        has_valid_task_status = task.status == TaskStatus.running
-        if not has_valid_task_status:
-            reasons.append(f"invalid_task_status:{task.status}")
-        # can't execute if the step is already running or completed
-        has_valid_step_status = step.status in [StepStatus.created, StepStatus.failed]
-        if not has_valid_step_status:
-            reasons.append(f"invalid_step_status:{step.status}")
-        # can't execute if the task has another step that is running
-        steps = await app.DATABASE.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
-        has_no_running_steps = not any(step.status == StepStatus.running for step in steps)
-        if not has_no_running_steps:
-            reasons.append(f"another_step_is_running_for_task:{task.task_id}")
-
-        can_execute = has_valid_task_status and has_valid_step_status and has_no_running_steps
-        if not can_execute:
-            raise Exception(f"Cannot execute step. Reasons: {reasons}, Step: {step}")
 
     async def create_task_and_step_from_block(
         self,
@@ -211,9 +185,7 @@ class ForgeAgent:
         return task
 
     def register_async_operations(self, organization: Organization, task: Task, page: Page) -> None:
-        if not app.generate_async_operations:
-            return
-        operations = app.generate_async_operations(organization, task, page)
+        operations = app.AGENT_FUNCTION.generate_async_operations(organization, task, page)
         self.async_operation_pool.add_operations(task.task_id, operations)
 
     async def execute_step(
@@ -224,12 +196,20 @@ class ForgeAgent:
         api_key: str | None = None,
         workflow_run: WorkflowRun | None = None,
         close_browser_on_completion: bool = True,
+        # If complete_on_download is True and there is a workflow run, the task will be marked as completed
+        # if a download happens during the step execution.
+        complete_on_download: bool = False,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
         next_step: Step | None = None
         detailed_output: DetailedAgentStepOutput | None = None
+        num_files_before = 0
         try:
+            if task.workflow_run_id:
+                num_files_before = get_number_of_files_in_directory(
+                    get_path_for_workflow_download_directory(task.workflow_run_id)
+                )
             # Check some conditions before executing the step, throw an exception if the step can't be executed
-            await self.validate_step_execution(task, step)
+            await app.AGENT_FUNCTION.validate_step_execution(task, step)
             (
                 step,
                 browser_state,
@@ -242,6 +222,30 @@ class ForgeAgent:
             step, detailed_output = await self.agent_step(task, step, browser_state, organization=organization)
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)
             retry = False
+
+            if complete_on_download and task.workflow_run_id:
+                num_files_after = get_number_of_files_in_directory(
+                    get_path_for_workflow_download_directory(task.workflow_run_id)
+                )
+                if num_files_after > num_files_before:
+                    LOG.info(
+                        "Task marked as completed due to download",
+                        task_id=task.task_id,
+                        num_files_before=num_files_before,
+                        num_files_after=num_files_after,
+                    )
+                    last_step = await self.update_step(step, is_last=True)
+                    completed_task = await self.update_task(
+                        task,
+                        status=TaskStatus.completed,
+                    )
+                    await self.send_task_response(
+                        task=completed_task,
+                        last_step=last_step,
+                        api_key=api_key,
+                        close_browser_on_completion=close_browser_on_completion,
+                    )
+                    return last_step, detailed_output, None
 
             # If the step failed, mark the step as failed and retry
             if step.status == StepStatus.failed:
@@ -302,6 +306,7 @@ class ForgeAgent:
                     next_step,
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
+                    complete_on_download=complete_on_download,
                 )
             elif SettingsManager.get_settings().execute_all_steps() and next_step:
                 return await self.execute_step(
@@ -310,6 +315,7 @@ class ForgeAgent:
                     next_step,
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
+                    complete_on_download=complete_on_download,
                 )
             else:
                 LOG.info(
@@ -323,6 +329,28 @@ class ForgeAgent:
 
             return step, detailed_output, next_step
         # TODO (kerem): Let's add other exceptions that we know about here as custom exceptions as well
+        except StepTerminationError as e:
+            LOG.error(
+                "Step cannot be executed. Task terminated",
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            await self.update_step(
+                step=step,
+                status=StepStatus.failed,
+            )
+            task = await self.update_task(
+                task,
+                status=TaskStatus.failed,
+                failure_reason=e.message,
+            )
+            await self.send_task_response(
+                task=task,
+                last_step=step,
+                api_key=api_key,
+                close_browser_on_completion=close_browser_on_completion,
+            )
+            return step, detailed_output, next_step
         except FailedToSendWebhook:
             LOG.exception(
                 "Failed to send webhook",
@@ -494,29 +522,27 @@ class ForgeAgent:
                             action=action,
                         )
 
-                        # if the last action succeeded, then skip handling
                         previous_action, previous_result = detailed_agent_step_output.actions_and_results[
                             previous_action_idx
                         ]
                         if len(previous_result) > 0 and previous_result[-1].success:
                             LOG.info(
-                                "Previous action succeeded, so skip this one.",
+                                "Previous action succeeded, but we'll still continue.",
                                 task_id=task.task_id,
                                 step_id=step.step_id,
                                 step_order=step.order,
-                                previouse_action=previous_action,
-                                previouse_result=previous_result,
+                                previous_action=previous_action,
+                                previous_result=previous_result,
                             )
-                            continue
-
-                        LOG.warning(
-                            "Previous action failed, so handle this action.",
-                            task_id=task.task_id,
-                            step_id=step.step_id,
-                            step_order=step.order,
-                            previouse_action=previous_action,
-                            previouse_result=previous_result,
-                        )
+                        else:
+                            LOG.warning(
+                                "Previous action failed, so handle the next action.",
+                                task_id=task.task_id,
+                                step_id=step.step_id,
+                                step_order=step.order,
+                                previous_action=previous_action,
+                                previous_result=previous_result,
+                            )
 
                     element_id_to_last_action[action.element_id] = action_idx
 

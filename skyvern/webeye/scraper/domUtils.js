@@ -743,6 +743,11 @@ function buildTreeFromBody() {
     }
   }
   function processElement(element, parentId) {
+    if (element === null) {
+      console.log("get a null element");
+      return;
+    }
+
     // Check if the element is interactable
     if (isInteractable(element)) {
       var elementObj = buildElementObject(element, true);
@@ -865,9 +870,13 @@ function buildTreeFromBody() {
     let linkedElements = new Array();
     const elementId = currentEle.getAttribute("id");
     if (elementId) {
-      linkedElements = [
-        ...document.querySelectorAll(`label[for="${elementId}"]`),
-      ];
+      try {
+        linkedElements = [
+          ...document.querySelectorAll(`label[for="${elementId}"]`),
+        ];
+      } catch (e) {
+        console.log("failed to query labels: ", e);
+      }
     }
     const labelled = currentEle.getAttribute("aria-labelledby");
     if (labelled) {
@@ -1205,7 +1214,7 @@ function removeBoundingBoxes() {
 
 function scrollToTop(draw_boxes) {
   removeBoundingBoxes();
-  window.scrollTo({ left: 0, top: 0, behavior: "instant" });
+  window.scroll({ left: 0, top: 0, behavior: "instant" });
   if (draw_boxes) {
     var elementsAndResultArray = buildTreeFromBody();
     drawBoundingBoxes(elementsAndResultArray[0]);

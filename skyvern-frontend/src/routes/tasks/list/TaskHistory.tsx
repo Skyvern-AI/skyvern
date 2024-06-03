@@ -47,6 +47,7 @@ function TaskHistory() {
       params.append("task_status", "completed");
       params.append("task_status", "failed");
       params.append("task_status", "terminated");
+      params.append("task_status", "timed_out");
       return client
         .get("/tasks", {
           params,
@@ -65,9 +66,10 @@ function TaskHistory() {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead className="w-1/3">URL</TableHead>
-              <TableHead className="w-1/4">Status</TableHead>
-              <TableHead className="w-1/3">Created At</TableHead>
+              <TableHead className="w-1/4">ID</TableHead>
+              <TableHead className="w-1/4">URL</TableHead>
+              <TableHead className="w-1/6">Status</TableHead>
+              <TableHead className="w-1/4">Created At</TableHead>
               <TableHead className="w-1/12" />
             </TableRow>
           </TableHeader>
@@ -81,9 +83,17 @@ function TaskHistory() {
             ) : (
               tasks?.map((task) => {
                 return (
-                  <TableRow key={task.task_id} className="w-4">
+                  <TableRow key={task.task_id}>
                     <TableCell
-                      className="w-1/3 cursor-pointer"
+                      className="w-1/4 cursor-pointer"
+                      onClick={() => {
+                        navigate(task.task_id);
+                      }}
+                    >
+                      {task.task_id}
+                    </TableCell>
+                    <TableCell
+                      className="w-1/4 cursor-pointer max-w-64 overflow-hidden whitespace-nowrap overflow-ellipsis"
                       onClick={() => {
                         navigate(task.task_id);
                       }}
@@ -91,7 +101,7 @@ function TaskHistory() {
                       {task.request.url}
                     </TableCell>
                     <TableCell
-                      className="w-1/4 cursor-pointer"
+                      className="w-1/6 cursor-pointer"
                       onClick={() => {
                         navigate(task.task_id);
                       }}
@@ -99,7 +109,7 @@ function TaskHistory() {
                       <StatusBadge status={task.status} />
                     </TableCell>
                     <TableCell
-                      className="w-1/3 cursor-pointer"
+                      className="w-1/4 cursor-pointer"
                       onClick={() => {
                         navigate(task.task_id);
                       }}

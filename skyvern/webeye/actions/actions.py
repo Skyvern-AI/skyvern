@@ -4,8 +4,9 @@ from typing import Any, Dict, List
 
 import structlog
 from deprecation import deprecated
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
+from skyvern.exceptions import UnsupportedActionType
 from skyvern.forge.sdk.schemas.tasks import Task
 
 LOG = structlog.get_logger()
@@ -134,109 +135,218 @@ class CompleteAction(DecisiveAction):
     data_extraction_goal: str | None = None
 
 
+def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None) -> Action:
+    if "id" in action:
+        element_id = action["id"]
+    elif "element_id" in action:
+        element_id = action["element_id"]
+    else:
+        element_id = None
+
+    reasoning = action["reasoning"] if "reasoning" in action else None
+
+    if "action_type" not in action or action["action_type"] is None:
+        return NullAction(reasoning=reasoning)
+
+    # `.upper()` handles the case where the LLM returns a lowercase action type (e.g. "click" instead of "CLICK")
+    action_type = ActionType[action["action_type"].upper()]
+
+    if action_type == ActionType.TERMINATE:
+        return TerminateAction(
+            reasoning=reasoning,
+            errors=action["errors"] if "errors" in action else [],
+        )
+
+    if action_type == ActionType.CLICK:
+        file_url = action["file_url"] if "file_url" in action else None
+        return ClickAction(
+            element_id=element_id,
+            reasoning=reasoning,
+            file_url=file_url,
+            download=action.get("download", False),
+        )
+
+    if action_type == ActionType.INPUT_TEXT:
+        return InputTextAction(element_id=element_id, text=action["text"], reasoning=reasoning)
+
+    if action_type == ActionType.UPLOAD_FILE:
+        # TODO: see if the element is a file input element. if it's not, convert this action into a click action
+        return UploadFileAction(
+            element_id=element_id,
+            file_url=action["file_url"],
+            reasoning=reasoning,
+        )
+
+    # This action is not used in the current implementation. Click actions are used instead.
+    if action_type == ActionType.DOWNLOAD_FILE:
+        return DownloadFileAction(
+            element_id=element_id,
+            file_name=action["file_name"],
+            reasoning=reasoning,
+        )
+
+    if action_type == ActionType.SELECT_OPTION:
+        return SelectOptionAction(
+            element_id=element_id,
+            option=SelectOption(
+                label=action["option"]["label"],
+                value=action["option"]["value"],
+                index=action["option"]["index"],
+            ),
+            reasoning=reasoning,
+        )
+
+    if action_type == ActionType.CHECKBOX:
+        return CheckboxAction(
+            element_id=element_id,
+            is_checked=action["is_checked"],
+            reasoning=reasoning,
+        )
+
+    if action_type == ActionType.WAIT:
+        return WaitAction(reasoning=reasoning)
+
+    if action_type == ActionType.COMPLETE:
+        return CompleteAction(
+            reasoning=reasoning,
+            data_extraction_goal=data_extraction_goal,
+            errors=action["errors"] if "errors" in action else [],
+        )
+
+    if action_type == "null":
+        return NullAction(reasoning=reasoning)
+
+    if action_type == ActionType.SOLVE_CAPTCHA:
+        return SolveCaptchaAction(reasoning=reasoning)
+
+    raise UnsupportedActionType(action_type=action_type)
+
+
+def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None) -> Action:
+    if "id" in action:
+        element_id = action["id"]
+    elif "element_id" in action:
+        element_id = action["element_id"]
+    else:
+        element_id = None
+
+    reasoning = action["reasoning"] if "reasoning" in action else None
+
+    if "action_type" not in action or action["action_type"] is None:
+        return NullAction(reasoning=reasoning)
+
+    # `.upper()` handles the case where the LLM returns a lowercase action type (e.g. "click" instead of "CLICK")
+    action_type = ActionType[action["action_type"].upper()]
+
+    if action_type == ActionType.TERMINATE:
+        return TerminateAction(
+            reasoning=reasoning,
+            errors=action["errors"] if "errors" in action else [],
+        )
+
+    if action_type == ActionType.CLICK:
+        file_url = action["file_url"] if "file_url" in action else None
+        return ClickAction(
+            element_id=element_id,
+            reasoning=reasoning,
+            file_url=file_url,
+            download=action.get("download", False),
+        )
+
+    if action_type == ActionType.INPUT_TEXT:
+        return InputTextAction(element_id=element_id, text=action["text"], reasoning=reasoning)
+
+    if action_type == ActionType.UPLOAD_FILE:
+        # TODO: see if the element is a file input element. if it's not, convert this action into a click action
+        return UploadFileAction(
+            element_id=element_id,
+            file_url=action["file_url"],
+            reasoning=reasoning,
+        )
+
+    # This action is not used in the current implementation. Click actions are used instead.
+    if action_type == ActionType.DOWNLOAD_FILE:
+        return DownloadFileAction(
+            element_id=element_id,
+            file_name=action["file_name"],
+            reasoning=reasoning,
+        )
+
+    if action_type == ActionType.SELECT_OPTION:
+        return SelectOptionAction(
+            element_id=element_id,
+            option=SelectOption(
+                label=action["option"]["label"],
+                value=action["option"]["value"],
+                index=action["option"]["index"],
+                id=action["option"]["id"],
+            ),
+            reasoning=reasoning,
+        )
+
+    if action_type == ActionType.CHECKBOX:
+        return CheckboxAction(
+            element_id=element_id,
+            is_checked=action["is_checked"],
+            reasoning=reasoning,
+        )
+
+    if action_type == ActionType.WAIT:
+        return WaitAction(reasoning=reasoning)
+
+    if action_type == ActionType.COMPLETE:
+        return CompleteAction(
+            reasoning=reasoning,
+            data_extraction_goal=data_extraction_goal,
+            errors=action["errors"] if "errors" in action else [],
+        )
+
+    if action_type == "null":
+        return NullAction(reasoning=reasoning)
+
+    if action_type == ActionType.SOLVE_CAPTCHA:
+        return SolveCaptchaAction(reasoning=reasoning)
+
+    raise UnsupportedActionType(action_type=action_type)
+
+
 def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Action]:
-    actions = []
+    actions: List[Action] = []
     for action in json_response:
-        if "id" in action:
-            element_id = action["id"]
-        elif "element_id" in action:
-            element_id = action["element_id"]
-        else:
-            element_id = None
+        try:
+            action_instance = parse_action(action=action, data_extraction_goal=task.data_extraction_goal)
+            if isinstance(action_instance, TerminateAction):
+                LOG.warning(
+                    "Agent decided to terminate",
+                    task_id=task.task_id,
+                    llm_response=json_response,
+                    reasoning=action_instance.reasoning,
+                    actions=actions,
+                )
+            actions.append(action_instance)
 
-        reasoning = action["reasoning"] if "reasoning" in action else None
-        if "action_type" not in action or action["action_type"] is None:
-            actions.append(NullAction(reasoning=reasoning))
-            continue
-        # `.upper()` handles the case where the LLM returns a lowercase action type (e.g. "click" instead of "CLICK")
-        action_type = ActionType[action["action_type"].upper()]
-        if action_type == ActionType.TERMINATE:
-            LOG.warning(
-                "Agent decided to terminate",
-                task_id=task.task_id,
-                llm_response=json_response,
-                reasoning=reasoning,
-                actions=actions,
-            )
-            actions.append(
-                TerminateAction(
-                    reasoning=reasoning,
-                    errors=action["errors"] if "errors" in action else [],
-                )
-            )
-        elif action_type == ActionType.CLICK:
-            file_url = action["file_url"] if "file_url" in action else None
-            actions.append(
-                ClickAction(
-                    element_id=element_id,
-                    reasoning=reasoning,
-                    file_url=file_url,
-                    download=action.get("download", False),
-                )
-            )
-        elif action_type == ActionType.INPUT_TEXT:
-            actions.append(InputTextAction(element_id=element_id, text=action["text"], reasoning=reasoning))
-        elif action_type == ActionType.UPLOAD_FILE:
-            # TODO: see if the element is a file input element. if it's not, convert this action into a click action
-
-            actions.append(
-                UploadFileAction(
-                    element_id=element_id,
-                    file_url=action["file_url"],
-                    reasoning=reasoning,
-                )
-            )
-        # This action is not used in the current implementation. Click actions are used instead.
-        elif action_type == ActionType.DOWNLOAD_FILE:
-            actions.append(
-                DownloadFileAction(
-                    element_id=element_id,
-                    file_name=action["file_name"],
-                    reasoning=reasoning,
-                )
-            )
-        elif action_type == ActionType.SELECT_OPTION:
-            actions.append(
-                SelectOptionAction(
-                    element_id=element_id,
-                    option=SelectOption(
-                        label=action["option"]["label"],
-                        value=action["option"]["value"],
-                        index=action["option"]["index"],
-                        id=action["option"]["id"],
-                    ),
-                    reasoning=reasoning,
-                )
-            )
-        elif action_type == ActionType.CHECKBOX:
-            actions.append(
-                CheckboxAction(
-                    element_id=element_id,
-                    is_checked=action["is_checked"],
-                    reasoning=reasoning,
-                )
-            )
-        elif action_type == ActionType.WAIT:
-            actions.append(WaitAction(reasoning=reasoning))
-        elif action_type == ActionType.COMPLETE:
-            actions.append(
-                CompleteAction(
-                    reasoning=reasoning,
-                    data_extraction_goal=task.data_extraction_goal,
-                    errors=action["errors"] if "errors" in action else [],
-                )
-            )
-        elif action_type == "null":
-            actions.append(NullAction(reasoning=reasoning))
-        elif action_type == ActionType.SOLVE_CAPTCHA:
-            actions.append(SolveCaptchaAction(reasoning=reasoning))
-        else:
+        except UnsupportedActionType:
             LOG.error(
                 "Unsupported action type when parsing actions",
                 task_id=task.task_id,
-                action_type=action_type,
                 raw_action=action,
+                exc_info=True,
             )
+        except ValidationError:
+            LOG.error(
+                "Invalid action",
+                task_id=task.task_id,
+                raw_action=action,
+                exc_info=True,
+            )
+        except Exception:
+            LOG.error(
+                "Failed to marshal action",
+                task_id=task.task_id,
+                raw_action=action,
+                exc_info=True,
+            )
+
     return actions
 
 

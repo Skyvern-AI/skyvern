@@ -3,8 +3,8 @@
 <h1 align="center">
  <a href="https://www.skyvern.com">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="images/skyvern_logo.png"/>
-    <img height="120" src="images/skyvern_logo_blackbg.png"/>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/skyvern_logo.png"/>
+    <img height="120" src="docs/images/skyvern_logo_blackbg.png"/>
   </picture>
  </a>
  <br />
@@ -28,7 +28,7 @@
 [Skyvern](https://www.skyvern.com) automates browser-based workflows using LLMs and computer vision. It provides a simple API endpoint to fully automate manual workflows, replacing brittle or unreliable automation solutions. 
 
 <p align="center">
-  <img src="images/geico_shu_recording_cropped.gif"/>
+  <img src="docs/images/geico_shu_recording_cropped.gif"/>
 </p>
 
 Traditional approaches to browser automations required writing custom scripts for websites, often relying on DOM parsing and XPath-based interactions which would break whenever the website layouts changed.
@@ -50,8 +50,8 @@ Want to see examples of Skyvern in action? Jump to [#real-world-examples-of-skyv
 Skyvern was inspired by the Task-Driven autonomous agent design popularized by [BabyAGI](https://github.com/yoheinakajima/babyagi) and [AutoGPT](https://github.com/Significant-Gravitas/AutoGPT) -- with one major bonus: we give Skyvern the ability to interact with websites using browser automation libraries like [Playwright](https://playwright.dev/).
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="images/skyvern-system-diagram-dark.png" />
-  <img src="images/skyvern-system-diagram-light.png" />
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/skyvern-system-diagram-dark.png" />
+  <img src="docs/images/skyvern-system-diagram-light.png" />
 </picture>
 
 <!-- TODO (suchintan): 
@@ -130,7 +130,7 @@ pre-commit install
 Once you have the UI running, you can start an automation by filling out the fields shown in the UI and clicking "Execute" 
 
 <p align="center" >
-  <img src="images/skyvern_visualizer_run_task.png"/>
+  <img src="docs/images/skyvern_visualizer_run_task.png"/>
 </p>
 
 ### Executing tasks (cURL)
@@ -159,14 +159,14 @@ Every time you call the API, you will be given a task_id you can use to find a t
 
 In the screenshot below, we're navigating to finditparts.com and searching for a truck part. You'll see each action it took listed there, alongside the reasoning behind each action.
 <p align="center">
-  <img src="images/skyvern_visualizer_debug_llm_response.png"/>
+  <img src="docs/images/skyvern_visualizer_debug_llm_response.png"/>
 </p>
 
 
 In addition to the actions suggested by the LLM in text form, Skyvern's visualizer also shows the state of the screen at the time of the action, with a 1:1 action to screenshot mapping. This allows you to see exactly what Skyvern saw when it made a decision, and debug any issues that may have arisen. 
 
 <p align="center">
-  <img src="images/skyvern_visualizer_debug_action_screenshot.png"/>
+  <img src="docs/images/skyvern_visualizer_debug_action_screenshot.png"/>
 </p>
 
 
@@ -188,7 +188,7 @@ You'll need to have Skyvern running locally if you want to try these examples ou
 ./run_ui.sh finditparts
 ```
 <p align="center">
-  <img src="images/finditparts_recording_crop.gif"/>
+  <img src="docs/images/finditparts_recording_crop.gif"/>
 </p>
 
 ## Navigating to government websites to register accounts or fill out forms 
@@ -197,7 +197,7 @@ You'll need to have Skyvern running locally if you want to try these examples ou
 ./run_ui.sh california_edd 
 ```
 <p align="center">
-  <img src="images/edd_services.gif"/>
+  <img src="docs/images/edd_services.gif"/>
 </p>
 <!-- Add example of delaware entity lookups x2 -->
 
@@ -207,7 +207,7 @@ You'll need to have Skyvern running locally if you want to try these examples ou
 ./run_ui.sh bci_seguros
 ```
 <p align="center">
-  <img src="images/bci_seguros_recording.gif"/>
+  <img src="docs/images/bci_seguros_recording.gif"/>
 </p>
 
 💡 See it in action
@@ -215,7 +215,7 @@ You'll need to have Skyvern running locally if you want to try these examples ou
 ./run_ui.sh geico
 ```
 <p align="center">
-  <img src="images/geico_shu_recording_cropped.gif"/>
+  <img src="docs/images/geico_shu_recording_cropped.gif"/>
 </p>
 
 <!---

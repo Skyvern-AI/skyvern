@@ -106,6 +106,7 @@ class TaskStatus(StrEnum):
             TaskStatus.failed: set(),
             TaskStatus.terminated: set(),
             TaskStatus.completed: set(),
+            TaskStatus.timed_out: set(),
         }
         return new_status in allowed_transitions[self]
 
