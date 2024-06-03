@@ -19,10 +19,26 @@ class ActionResult(BaseModel):
     interacted_with_parent: bool | None = None
 
     def __str__(self) -> str:
-        return (
-            f"ActionResult(success={self.success}, exception_type={self.exception_type}, "
-            f"exception_message={self.exception_message}), data={self.data}"
-        )
+        results = ["ActionResult(success={self.success}"]
+        if self.exception_type or self.exception_message:
+            results.append(f"exception_type={self.exception_type}")
+            results.append(f"exception_message={self.exception_message}")
+        if self.data:
+            results.append(f"data={self.data}")
+        if self.step_order:
+            results.append(f"step_order={self.step_order}")
+        if self.step_retry_number:
+            results.append(f"step_retry_number={self.step_retry_number}")
+        if self.javascript_triggered:
+            results.append(f"javascript_triggered={self.javascript_triggered}")
+        if self.download_triggered is not None:
+            results.append(f"download_triggered={self.download_triggered}")
+        if self.interacted_with_sibling is not None:
+            results.append(f"interacted_with_sibling={self.interacted_with_sibling}")
+        if self.interacted_with_parent is not None:
+            results.append(f"interacted_with_parent={self.interacted_with_parent}")
+
+        return ", ".join(results) + ")"
 
     def __repr__(self) -> str:
         return self.__str__()

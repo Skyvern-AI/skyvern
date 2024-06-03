@@ -23,6 +23,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.files import get_number_of_files_in_directory, get_path_for_workflow_download_directory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
@@ -195,10 +196,18 @@ class ForgeAgent:
         api_key: str | None = None,
         workflow_run: WorkflowRun | None = None,
         close_browser_on_completion: bool = True,
+        # If complete_on_download is True and there is a workflow run, the task will be marked as completed
+        # if a download happens during the step execution.
+        complete_on_download: bool = False,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
         next_step: Step | None = None
         detailed_output: DetailedAgentStepOutput | None = None
+        num_files_before = 0
         try:
+            if task.workflow_run_id:
+                num_files_before = get_number_of_files_in_directory(
+                    get_path_for_workflow_download_directory(task.workflow_run_id)
+                )
             # Check some conditions before executing the step, throw an exception if the step can't be executed
             await app.AGENT_FUNCTION.validate_step_execution(task, step)
             (
@@ -213,6 +222,30 @@ class ForgeAgent:
             step, detailed_output = await self.agent_step(task, step, browser_state, organization=organization)
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)
             retry = False
+
+            if complete_on_download and task.workflow_run_id:
+                num_files_after = get_number_of_files_in_directory(
+                    get_path_for_workflow_download_directory(task.workflow_run_id)
+                )
+                if num_files_after > num_files_before:
+                    LOG.info(
+                        "Task marked as completed due to download",
+                        task_id=task.task_id,
+                        num_files_before=num_files_before,
+                        num_files_after=num_files_after,
+                    )
+                    last_step = await self.update_step(step, is_last=True)
+                    completed_task = await self.update_task(
+                        task,
+                        status=TaskStatus.completed,
+                    )
+                    await self.send_task_response(
+                        task=completed_task,
+                        last_step=last_step,
+                        api_key=api_key,
+                        close_browser_on_completion=close_browser_on_completion,
+                    )
+                    return last_step, detailed_output, None
 
             # If the step failed, mark the step as failed and retry
             if step.status == StepStatus.failed:
@@ -273,6 +306,7 @@ class ForgeAgent:
                     next_step,
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
+                    complete_on_download=complete_on_download,
                 )
             elif SettingsManager.get_settings().execute_all_steps() and next_step:
                 return await self.execute_step(
@@ -281,6 +315,7 @@ class ForgeAgent:
                     next_step,
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
+                    complete_on_download=complete_on_download,
                 )
             else:
                 LOG.info(

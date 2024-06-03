@@ -183,7 +183,7 @@ class BrowserState:
                     await self._close_all_other_pages()
                     LOG.info("A new page is created")
                     if url:
-                        LOG.info(f"Navigating page to {url} and waiting for 3 seconds")
+                        LOG.info(f"Navigating page to {url} and waiting for 5 seconds")
                         try:
                             start_time = time.time()
                             await self.page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
@@ -193,6 +193,7 @@ class BrowserState:
                                 loading_time=end_time - start_time,
                                 url=url,
                             )
+                            await asyncio.sleep(5)
                         except Error as playright_error:
                             LOG.exception(f"Error while navigating to url: {str(playright_error)}")
                             raise FailedToNavigateToUrl(url=url, error_message=str(playright_error))

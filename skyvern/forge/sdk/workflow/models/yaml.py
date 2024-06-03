@@ -87,6 +87,7 @@ class TaskBlockYAML(BlockYAML):
     max_retries: int = 0
     max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
+    complete_on_download: bool = False
 
 
 class ForLoopBlockYAML(BlockYAML):
