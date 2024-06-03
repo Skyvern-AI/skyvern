@@ -33,7 +33,7 @@ function ZoomableImage(props: HTMLImageElementProps) {
       <img
         {...props}
         onClick={openModal}
-        className={clsx("cursor-pointer", props.className)}
+        className={clsx("cursor-pointer object-contain", props.className)}
       />
       {modalOpen && (
         <div
