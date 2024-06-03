@@ -970,6 +970,7 @@ class WorkflowService:
                 max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
                 complete_on_download=block_yaml.complete_on_download,
+                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.FOR_LOOP:
             loop_blocks = [
@@ -982,6 +983,7 @@ class WorkflowService:
                 loop_over=loop_over_parameter,
                 loop_blocks=loop_blocks,
                 output_parameter=output_parameter,
+                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.CODE:
             return CodeBlock(
@@ -993,6 +995,7 @@ class WorkflowService:
                     else []
                 ),
                 output_parameter=output_parameter,
+                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.TEXT_PROMPT:
             return TextPromptBlock(
@@ -1006,18 +1009,21 @@ class WorkflowService:
                 ),
                 json_schema=block_yaml.json_schema,
                 output_parameter=output_parameter,
+                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.DOWNLOAD_TO_S3:
             return DownloadToS3Block(
                 label=block_yaml.label,
                 output_parameter=output_parameter,
                 url=block_yaml.url,
+                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.UPLOAD_TO_S3:
             return UploadToS3Block(
                 label=block_yaml.label,
                 output_parameter=output_parameter,
                 path=block_yaml.path,
+                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.SEND_EMAIL:
             return SendEmailBlock(
@@ -1032,5 +1038,6 @@ class WorkflowService:
                 subject=block_yaml.subject,
                 body=block_yaml.body,
                 file_attachments=block_yaml.file_attachments or [],
+                continue_on_failure=block_yaml.continue_on_failure,
             )
         raise ValueError(f"Invalid block type {block_yaml.block_type}")
