@@ -121,8 +121,8 @@ class ScrapedPage(BaseModel):
     """
 
     elements: list[dict]
-    id_to_element_dict: dict[int, dict] = {}
-    id_to_xpath_dict: dict[int, str]
+    id_to_element_dict: dict[str, dict] = {}
+    id_to_xpath_dict: dict[str, str]
     element_tree: list[dict]
     element_tree_trimmed: list[dict]
     screenshots: list[bytes]

@@ -37,7 +37,7 @@ class Action(BaseModel):
 
 
 class WebAction(Action, abc.ABC):
-    element_id: int
+    element_id: str
 
 
 class UserDefinedError(BaseModel):

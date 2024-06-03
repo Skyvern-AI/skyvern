@@ -540,6 +540,7 @@ function getElementContent(element, skipped_element = null) {
 function getSelectOptions(element) {
   const options = Array.from(element.options);
   const selectOptions = [];
+
   for (const option of options) {
     selectOptions.push({
       optionIndex: option.index,
@@ -554,13 +555,25 @@ function getListboxOptions(element) {
   var optionElements = element.querySelectorAll('[role="option"]');
   let selectOptions = [];
   for (var i = 0; i < optionElements.length; i++) {
-    var ele = optionElements[i];
+    let ele = optionElements[i];
+
     selectOptions.push({
       optionIndex: i,
       text: removeMultipleSpaces(ele.textContent),
     });
   }
   return selectOptions;
+}
+
+function uniqueId() {
+  const characters =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let result = "";
+  for (let i = 0; i < 4; i++) {
+    const randomIndex = Math.floor(Math.random() * characters.length);
+    result += characters[randomIndex];
+  }
+  return result;
 }
 
 function buildTreeFromBody() {
@@ -620,7 +633,7 @@ function buildTreeFromBody() {
   };
 
   function buildElementObject(element, interactable) {
-    var element_id = elements.length;
+    var element_id = element.getAttribute("unique_id") ?? uniqueId();
     var elementTagNameLower = element.tagName.toLowerCase();
     element.setAttribute("unique_id", element_id);
     // if element is an "a" tag and has a target="_blank" attribute, remove the target attribute
@@ -733,7 +746,10 @@ function buildTreeFromBody() {
       // If the element is interactable and has an interactable parent,
       // then add it to the children of the parent
       else {
-        elements[parentId].children.push(elementObj);
+        // TODO: use dict/object so that we access these in O(1) instead
+        elements
+          .find((element) => element.id === parentId)
+          .children.push(elementObj);
       }
       // options already added to the select.options, no need to add options anymore
       if (elementObj.options && elementObj.options.length > 0) {
@@ -772,13 +788,16 @@ function buildTreeFromBody() {
           if (parentId === null) {
             resultArray.push(elementObj);
           } else {
-            elements[parentId].children.push(elementObj);
+            // TODO: use dict/object so that we access these in O(1) instead
+            elements
+              .find((element) => element.id === parentId)
+              .children.push(elementObj);
           }
           parentId = elementObj.id;
         }
       }
       getChildElements(element).forEach((child) => {
-        let children = processElement(child, parentId);
+        processElement(child, parentId);
       });
     }
   }
@@ -975,8 +994,6 @@ function buildTreeFromBody() {
   // TODO: Handle iframes
   // setup before parsing the dom
   checkSelect2();
-  // Clear all the unique_id attributes so that there are no conflicts
-  removeAllUniqueIdAttributes();
   processElement(document.body, null);
 
   for (var element of elements) {
@@ -1027,14 +1044,6 @@ function drawBoundingBoxes(elements) {
   var groups = groupElementsVisually(elements);
   var hintMarkers = createHintMarkersForGroups(groups);
   addHintMarkersToPage(hintMarkers);
-}
-
-function removeAllUniqueIdAttributes() {
-  var elementsWithUniqueId = document.querySelectorAll("[unique_id]");
-
-  elementsWithUniqueId.forEach(function (element) {
-    element.removeAttribute("unique_id");
-  });
 }
 
 function captchaSolvedCallback() {
