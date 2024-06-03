@@ -115,11 +115,15 @@ class LLMAPIHandlerFactory:
                     data=response.model_dump_json(indent=2).encode("utf-8"),
                 )
                 llm_cost = litellm.completion_cost(completion_response=response)
+                prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
+                completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
                 await app.DATABASE.update_step(
                     task_id=step.task_id,
                     step_id=step.step_id,
                     organization_id=step.organization_id,
                     incremental_cost=llm_cost,
+                    incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
+                    incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
                 )
             parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
             if step:
@@ -206,11 +210,15 @@ class LLMAPIHandlerFactory:
                     data=response.model_dump_json(indent=2).encode("utf-8"),
                 )
                 llm_cost = litellm.completion_cost(completion_response=response)
+                prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
+                completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
                 await app.DATABASE.update_step(
                     task_id=step.task_id,
                     step_id=step.step_id,
                     organization_id=step.organization_id,
                     incremental_cost=llm_cost,
+                    incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
+                    incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
                 )
             parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
             if step:
