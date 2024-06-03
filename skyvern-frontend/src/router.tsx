@@ -8,6 +8,9 @@ import { SettingsPageLayout } from "./routes/settings/SettingsPageLayout";
 import { TaskDetails } from "./routes/tasks/detail/TaskDetails";
 import { CreateNewTaskLayout } from "./routes/tasks/create/CreateNewTaskLayout";
 import { CreateNewTaskFormPage } from "./routes/tasks/create/CreateNewTaskFormPage";
+import { TaskActions } from "./routes/tasks/detail/TaskActions";
+import { TaskRecording } from "./routes/tasks/detail/TaskRecording";
+import { TaskParameters } from "./routes/tasks/detail/TaskParameters";
 
 const router = createBrowserRouter([
   {
@@ -29,6 +32,24 @@ const router = createBrowserRouter([
           {
             path: ":taskId",
             element: <TaskDetails />,
+            children: [
+              {
+                index: true,
+                element: <Navigate to="actions" />,
+              },
+              {
+                path: "actions",
+                element: <TaskActions />,
+              },
+              {
+                path: "recording",
+                element: <TaskRecording />,
+              },
+              {
+                path: "parameters",
+                element: <TaskParameters />,
+              },
+            ],
           },
         ],
       },
