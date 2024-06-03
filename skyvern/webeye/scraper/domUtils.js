@@ -541,18 +541,10 @@ function getSelectOptions(element) {
   const options = Array.from(element.options);
   const selectOptions = [];
 
-  for (const optionElement of options) {
-    let id = optionElement.getAttribute("unique_id");
-
-    if (!id) {
-      id = uniqueId();
-      optionElement.setAttribute("unique_id", id);
-    }
-
+  for (const option of options) {
     selectOptions.push({
-      id: id,
-      optionIndex: optionElement.index,
-      text: removeMultipleSpaces(optionElement.textContent),
+      optionIndex: option.index,
+      text: removeMultipleSpaces(option.textContent),
     });
   }
   return selectOptions;
@@ -563,19 +555,11 @@ function getListboxOptions(element) {
   var optionElements = element.querySelectorAll('[role="option"]');
   let selectOptions = [];
   for (var i = 0; i < optionElements.length; i++) {
-    let optionElement = optionElements[i];
-
-    let id = optionElement.getAttribute("unique_id");
-
-    if (!id) {
-      id = uniqueId();
-      optionElement.setAttribute("unique_id", id);
-    }
+    let ele = optionElements[i];
 
     selectOptions.push({
-      id: id,
       optionIndex: i,
-      text: removeMultipleSpaces(optionElement.textContent),
+      text: removeMultipleSpaces(ele.textContent),
     });
   }
   return selectOptions;
