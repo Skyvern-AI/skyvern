@@ -18,7 +18,7 @@ Reply in JSON format with the following keys:
         "file_url": str, // The url of the file to upload if applicable. This field must be present for UPLOAD_FILE but can also be present for CLICK only if the click is to upload the file. It should be null otherwise.
         "option": {  // The option to select for SELECT_OPTION action only. null if not SELECT_OPTION action
             "label": str, // the label of the option if any. MAKE SURE YOU USE THIS LABEL TO SELECT THE OPTION. DO NOT PUT ANYTHING OTHER THAN A VALID OPTION LABEL HERE
-            "index": int, // the id corresponding to the optionIndex under the the select element.
+            "index": int, // the id corresponding to the option index under the the select element.
             "value": str // the value of the option. MAKE SURE YOU USE THIS VALUE TO SELECT THE OPTION. DO NOT PUT ANYTHING OTHER THAN A VALID OPTION VALUE HERE
         },
 {% if error_code_mapping_str %}
