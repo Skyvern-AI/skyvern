@@ -51,7 +51,7 @@ function TaskDetails() {
   const informationContent =
     task?.status === Status.Completed
       ? JSON.stringify(task.extracted_information, null, 2)
-      : task?.status === "failed" || task?.status === "terminated"
+      : task?.status === Status.Failed || task?.status === Status.Terminated
         ? JSON.stringify(task?.failure_reason)
         : "";
 
