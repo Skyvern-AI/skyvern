@@ -533,7 +533,7 @@ async def get_workflow_run(
 ) -> WorkflowRunStatusResponse:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
     return await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
-        workflow_id=workflow_id,
+        workflow_permanent_id=workflow_id,
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
     )
