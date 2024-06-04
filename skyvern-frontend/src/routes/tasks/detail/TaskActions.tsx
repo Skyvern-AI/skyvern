@@ -4,6 +4,7 @@ import { ActionScreenshot } from "./ActionScreenshot";
 import { InputReasoningCard } from "./InputReasoningCard";
 import { ScrollableActionList } from "./ScrollableActionList";
 import { useActions } from "./useActions";
+import { Skeleton } from "@/components/ui/skeleton";
 
 function TaskActions() {
   const { taskId } = useParams();
@@ -14,7 +15,16 @@ function TaskActions() {
   const activeAction = data?.[selectedActionIndex];
 
   if (isFetching || !data) {
-    return <div>Loading...</div>;
+    return (
+      <div className="flex gap-2">
+        <div className="h-[40rem] w-3/4">
+          <Skeleton className="h-full" />
+        </div>
+        <div className="h-[40rem] w-1/4">
+          <Skeleton className="h-full" />
+        </div>
+      </div>
+    );
   }
 
   if (!activeAction) {
