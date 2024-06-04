@@ -8,6 +8,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { basicTimeFormat } from "@/util/timeFormat";
@@ -31,7 +32,11 @@ function TaskParameters() {
   });
 
   if (taskIsFetching) {
-    return <div>Loading parameters...</div>;
+    return (
+      <div className="h-[40rem]">
+        <Skeleton className="h-full" />
+      </div>
+    );
   }
 
   if (taskIsError || !task) {

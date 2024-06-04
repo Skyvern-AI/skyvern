@@ -4,6 +4,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 import { getRecordingURL } from "./artifactUtils";
 import { useParams } from "react-router-dom";
+import { Skeleton } from "@/components/ui/skeleton";
 
 function TaskRecording() {
   const { taskId } = useParams();
@@ -22,7 +23,13 @@ function TaskRecording() {
   });
 
   if (taskIsFetching) {
-    return <div>Loading recording...</div>;
+    return (
+      <div className="flex mx-auto">
+        <div className="w-[800px] h-[450px]">
+          <Skeleton className="h-full" />
+        </div>
+      </div>
+    );
   }
 
   if (taskIsError || !task) {
