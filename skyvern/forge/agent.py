@@ -18,6 +18,7 @@ from skyvern.exceptions import (
     InvalidWorkflowTaskURLState,
     MissingBrowserStatePage,
     StepTerminationError,
+    StepUnableToExecuteError,
     TaskNotFound,
 )
 from skyvern.forge import app
@@ -329,9 +330,16 @@ class ForgeAgent:
 
             return step, detailed_output, next_step
         # TODO (kerem): Let's add other exceptions that we know about here as custom exceptions as well
+        except StepUnableToExecuteError:
+            LOG.error(
+                "Step cannot be executed. Task execution stopped",
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            raise
         except StepTerminationError as e:
             LOG.error(
-                "Step cannot be executed. Task terminated",
+                "Step cannot be executed. Task failed.",
                 task_id=task.task_id,
                 step_id=step.step_id,
             )
