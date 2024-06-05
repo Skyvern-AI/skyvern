@@ -11,6 +11,7 @@ import { CreateNewTaskFormPage } from "./routes/tasks/create/CreateNewTaskFormPa
 import { TaskActions } from "./routes/tasks/detail/TaskActions";
 import { TaskRecording } from "./routes/tasks/detail/TaskRecording";
 import { TaskParameters } from "./routes/tasks/detail/TaskParameters";
+import { StepArtifactsLayout } from "./routes/tasks/detail/StepArtifactsLayout";
 
 const router = createBrowserRouter([
   {
@@ -48,6 +49,10 @@ const router = createBrowserRouter([
               {
                 path: "parameters",
                 element: <TaskParameters />,
+              },
+              {
+                path: "artifacts",
+                element: <StepArtifactsLayout />,
               },
             ],
           },

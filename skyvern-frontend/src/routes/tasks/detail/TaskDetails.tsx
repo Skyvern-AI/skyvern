@@ -121,6 +121,19 @@ function TaskDetails() {
           >
             Parameters
           </NavLink>
+          <NavLink
+            to="artifacts"
+            className={({ isActive }) => {
+              return cn(
+                "cursor-pointer px-2 py-1 rounded-md text-muted-foreground",
+                {
+                  "bg-primary-foreground text-foreground": isActive,
+                },
+              );
+            }}
+          >
+            Artifacts
+          </NavLink>
         </div>
       </div>
       <Outlet />
