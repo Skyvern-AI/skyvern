@@ -1,5 +1,5 @@
 from enum import StrEnum
-from typing import Any, Dict
+from typing import Annotated, Any, Dict
 
 import structlog
 from deprecation import deprecated
@@ -47,7 +47,7 @@ class Action(BaseModel):
     action_type: ActionType
     description: str | None = None
     reasoning: str | None = None
-    element_id: int | str | None = None
+    element_id: Annotated[str, Field(coerce_numbers_to_str=True)] | None = None
 
     # DecisiveAction (CompleteAction, TerminateAction) fields
     errors: list[UserDefinedError] | None = None
@@ -64,7 +64,7 @@ class Action(BaseModel):
 
 
 class WebAction(Action):
-    element_id: int | str
+    element_id: Annotated[str, Field(coerce_numbers_to_str=True)]
 
 
 class DecisiveAction(Action):
