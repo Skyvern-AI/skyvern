@@ -60,9 +60,23 @@ class DetailedAgentStepOutput(BaseModel):
                     errors.extend(action.errors)
         return errors
 
+    def get_clean_detailed_output(self) -> DetailedAgentStepOutput:
+        return DetailedAgentStepOutput(
+            scraped_page=self.scraped_page,
+            extract_action_prompt=self.extract_action_prompt,
+            llm_response=self.llm_response,
+            actions=self.actions,
+            action_results=self.action_results,
+            actions_and_results=None
+            if self.actions_and_results is None
+            else [(action, result) for action, result in self.actions_and_results if result],
+        )
+
     def to_agent_step_output(self) -> AgentStepOutput:
+        clean_output = self.get_clean_detailed_output()
+
         return AgentStepOutput(
-            action_results=self.action_results if self.action_results else [],
-            actions_and_results=(self.actions_and_results if self.actions_and_results else []),
-            errors=self.extract_errors(),
+            action_results=clean_output.action_results if clean_output.action_results else [],
+            actions_and_results=(clean_output.actions_and_results if clean_output.actions_and_results else []),
+            errors=clean_output.extract_errors(),
         )
