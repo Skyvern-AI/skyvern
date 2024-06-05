@@ -51,7 +51,7 @@ const router = createBrowserRouter([
                 element: <TaskParameters />,
               },
               {
-                path: "artifacts",
+                path: "diagnostics",
                 element: <StepArtifactsLayout />,
               },
             ],
