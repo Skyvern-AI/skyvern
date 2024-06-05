@@ -1,6 +1,5 @@
-import abc
 from enum import StrEnum
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import structlog
 from deprecation import deprecated
@@ -27,17 +26,6 @@ class ActionType(StrEnum):
     SOLVE_CAPTCHA = "solve_captcha"
     TERMINATE = "terminate"
     COMPLETE = "complete"
-    # Note: Remember to update ActionTypeUnion with new actions
-
-
-class Action(BaseModel):
-    action_type: ActionType
-    description: str | None = None
-    reasoning: str | None = None
-
-
-class WebAction(Action, abc.ABC):
-    element_id: str
 
 
 class UserDefinedError(BaseModel):
@@ -46,14 +34,50 @@ class UserDefinedError(BaseModel):
     confidence_float: float = Field(..., ge=0, le=1)
 
 
-class DecisiveAction(Action, abc.ABC):
-    errors: List[UserDefinedError] = []
+class SelectOption(BaseModel):
+    label: str | None
+    value: str | None
+    index: int | None
+
+    def __repr__(self) -> str:
+        return f"SelectOption(label={self.label}, value={self.value}, index={self.index})"
+
+
+class Action(BaseModel):
+    action_type: ActionType
+    description: str | None = None
+    reasoning: str | None = None
+    element_id: str | None = None
+
+    # DecisiveAction (CompleteAction, TerminateAction) fields
+    errors: list[UserDefinedError] | None = None
+    data_extraction_goal: str | None = None
+
+    # WebAction fields
+    file_name: str | None = None
+    file_url: str | None = None
+    download: bool | None = None
+    is_upload_file_tag: bool | None = None
+    text: str | None = None
+    option: SelectOption | None = None
+    is_checked: bool | None = None
+
+
+class WebAction(Action):
+    element_id: str
+
+
+class DecisiveAction(Action):
+    errors: list[UserDefinedError] = []
 
 
 class ClickAction(WebAction):
     action_type: ActionType = ActionType.CLICK
     file_url: str | None = None
     download: bool = False
+
+    def __repr__(self) -> str:
+        return f"ClickAction(element_id={self.element_id}, file_url={self.file_url}, download={self.download})"
 
 
 class InputTextAction(WebAction):
@@ -88,15 +112,6 @@ class NullAction(Action):
 
 class SolveCaptchaAction(Action):
     action_type: ActionType = ActionType.SOLVE_CAPTCHA
-
-
-class SelectOption(BaseModel):
-    label: str | None
-    value: str | None
-    index: int | None
-
-    def __repr__(self) -> str:
-        return f"SelectOption(label={self.label}, value={self.value}, index={self.index})"
 
 
 class SelectOptionAction(WebAction):
@@ -221,8 +236,8 @@ def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None
     raise UnsupportedActionType(action_type=action_type)
 
 
-def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Action]:
-    actions: List[Action] = []
+def parse_actions(task: Task, json_response: list[Dict[str, Any]]) -> list[Action]:
+    actions: list[Action] = []
     for action in json_response:
         try:
             action_instance = parse_action(action=action, data_extraction_goal=task.data_extraction_goal)
@@ -257,7 +272,6 @@ def parse_actions(task: Task, json_response: List[Dict[str, Any]]) -> List[Actio
                 raw_action=action,
                 exc_info=True,
             )
-
     return actions
 
 
@@ -268,20 +282,3 @@ class ScrapeResult(BaseModel):
     """
 
     scraped_data: dict[str, Any] | list[dict[str, Any]]
-
-
-# https://blog.devgenius.io/deserialize-child-classes-with-pydantic-that-gonna-work-784230e1cf83
-ActionTypeUnion = (
-    ClickAction
-    | InputTextAction
-    | UploadFileAction
-    # Deprecated
-    # | DownloadFileAction
-    | SelectOptionAction
-    | CheckboxAction
-    | WaitAction
-    | NullAction
-    | SolveCaptchaAction
-    | TerminateAction
-    | CompleteAction
-)

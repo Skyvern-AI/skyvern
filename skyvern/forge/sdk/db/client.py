@@ -309,7 +309,7 @@ class AgentDB:
                     if status is not None:
                         step.status = status
                     if output is not None:
-                        step.output = output.model_dump()
+                        step.output = output.model_dump(exclude_none=True)
                     if is_last is not None:
                         step.is_last = is_last
                     if retry_index is not None:
