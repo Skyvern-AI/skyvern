@@ -18,7 +18,6 @@ from skyvern.exceptions import (
     InvalidWorkflowTaskURLState,
     MissingBrowserStatePage,
     StepTerminationError,
-    StepUnableToExecuteError,
     TaskNotFound,
 )
 from skyvern.forge import app
@@ -37,7 +36,6 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun
 from skyvern.webeye.actions.actions import (
     Action,
     ActionType,
-    ActionTypeUnion,
     CompleteAction,
     UserDefinedError,
     WebAction,
@@ -53,7 +51,7 @@ LOG = structlog.get_logger()
 
 
 class ActionLinkedNode:
-    def __init__(self, action: ActionTypeUnion) -> None:
+    def __init__(self, action: Action) -> None:
         self.action = action
         self.next: ActionLinkedNode | None = None
 
@@ -330,16 +328,9 @@ class ForgeAgent:
 
             return step, detailed_output, next_step
         # TODO (kerem): Let's add other exceptions that we know about here as custom exceptions as well
-        except StepUnableToExecuteError:
-            LOG.error(
-                "Step cannot be executed. Task execution stopped",
-                task_id=task.task_id,
-                step_id=step.step_id,
-            )
-            raise
         except StepTerminationError as e:
             LOG.error(
-                "Step cannot be executed. Task failed.",
+                "Step cannot be executed. Task terminated",
                 task_id=task.task_id,
                 step_id=step.step_id,
             )
@@ -841,7 +832,7 @@ class ForgeAgent:
         # Get action results from the last app.SETTINGS.PROMPT_ACTION_HISTORY_WINDOW steps
         steps = await app.DATABASE.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
         window_steps = steps[-1 * SettingsManager.get_settings().PROMPT_ACTION_HISTORY_WINDOW :]
-        actions_and_results: list[tuple[ActionTypeUnion, list[ActionResult]]] = []
+        actions_and_results: list[tuple[Action, list[ActionResult]]] = []
         for window_step in window_steps:
             if window_step.output and window_step.output.actions_and_results:
                 actions_and_results.extend(window_step.output.actions_and_results)

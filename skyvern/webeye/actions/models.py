@@ -5,7 +5,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.webeye.actions.actions import Action, ActionTypeUnion, DecisiveAction, UserDefinedError
+from skyvern.webeye.actions.actions import Action, DecisiveAction, UserDefinedError
 from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.scraper.scraper import ScrapedPage
 
@@ -18,7 +18,7 @@ class AgentStepOutput(BaseModel):
     # Will be deprecated once we move to the new format below
     action_results: list[ActionResult] | None = None
     # Nullable for backwards compatibility, once backfill is done, this won't be nullable anymore
-    actions_and_results: list[tuple[ActionTypeUnion, list[ActionResult]]] | None = None
+    actions_and_results: list[tuple[Action, list[ActionResult]]] | None = None
     errors: list[UserDefinedError] = []
 
     def __repr__(self) -> str:
@@ -38,7 +38,7 @@ class DetailedAgentStepOutput(BaseModel):
     llm_response: dict[str, Any] | None
     actions: list[Action] | None
     action_results: list[ActionResult] | None
-    actions_and_results: list[tuple[ActionTypeUnion, list[ActionResult]]] | None
+    actions_and_results: list[tuple[Action, list[ActionResult]]] | None
 
     class Config:
         exclude = ["scraped_page", "extract_action_prompt"]
