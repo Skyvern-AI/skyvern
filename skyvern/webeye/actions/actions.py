@@ -47,7 +47,7 @@ class Action(BaseModel):
     action_type: ActionType
     description: str | None = None
     reasoning: str | None = None
-    element_id: str | None = None
+    element_id: int | str | None = None
 
     # DecisiveAction (CompleteAction, TerminateAction) fields
     errors: list[UserDefinedError] | None = None
@@ -64,7 +64,7 @@ class Action(BaseModel):
 
 
 class WebAction(Action):
-    element_id: str
+    element_id: int | str
 
 
 class DecisiveAction(Action):
