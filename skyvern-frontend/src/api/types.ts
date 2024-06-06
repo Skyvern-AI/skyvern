@@ -39,9 +39,11 @@ export type ArtifactApiResponse = {
 
 export type ActionAndResultApiResponse = [
   ActionApiResponse,
-  {
-    success: boolean;
-  },
+  [
+    {
+      success: boolean;
+    },
+  ],
 ];
 
 export type StepApiResponse = {
@@ -166,6 +168,16 @@ export const ActionTypes = {
 } as const;
 
 export type ActionType = (typeof ActionTypes)[keyof typeof ActionTypes];
+
+export const ReadableActionTypes: {
+  [key in ActionType]: string;
+} = {
+  input_text: "Input Text",
+  click: "Click",
+  select_option: "Select Option",
+  upload_file: "Upload File",
+  complete: "Complete",
+};
 
 export type Option = {
   label: string;
