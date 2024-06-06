@@ -293,8 +293,6 @@ class AgentDB:
         retry_index: int | None = None,
         organization_id: str | None = None,
         incremental_cost: float | None = None,
-        incremental_input_tokens: int | None = None,
-        incremental_output_tokens: int | None = None,
     ) -> Step:
         try:
             async with self.Session() as session:
@@ -309,17 +307,13 @@ class AgentDB:
                     if status is not None:
                         step.status = status
                     if output is not None:
-                        step.output = output.model_dump(exclude_none=True)
+                        step.output = output.model_dump()
                     if is_last is not None:
                         step.is_last = is_last
                     if retry_index is not None:
                         step.retry_index = retry_index
                     if incremental_cost is not None:
                         step.step_cost = incremental_cost + float(step.step_cost or 0)
-                    if incremental_input_tokens is not None:
-                        step.input_token_count = incremental_input_tokens + (step.input_token_count or 0)
-                    if incremental_output_tokens is not None:
-                        step.output_token_count = incremental_output_tokens + (step.output_token_count or 0)
 
                     await session.commit()
                     updated_step = await self.get_step(task_id, step_id, organization_id)

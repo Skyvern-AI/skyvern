@@ -6,7 +6,13 @@ import requests
 import structlog
 
 from skyvern import analytics
-from skyvern.exceptions import FailedToSendWebhook, MissingValueForParameter, WorkflowNotFound, WorkflowRunNotFound
+from skyvern.exceptions import (
+    FailedToSendWebhook,
+    MissingValueForParameter,
+    WorkflowNotFound,
+    WorkflowOrganizationMismatch,
+    WorkflowRunNotFound,
+)
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
@@ -521,14 +527,17 @@ class WorkflowService:
 
     async def build_workflow_run_status_response(
         self,
-        workflow_permanent_id: str,
+        workflow_id: str,
         workflow_run_id: str,
         organization_id: str,
     ) -> WorkflowRunStatusResponse:
-        workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id, organization_id=organization_id)
+        workflow = await self.get_workflow(workflow_id=workflow_id, organization_id=organization_id)
         if workflow is None:
-            LOG.error(f"Workflow {workflow_permanent_id} not found")
-            raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id)
+            LOG.error(f"Workflow {workflow_id} not found")
+            raise WorkflowNotFound(workflow_id=workflow_id)
+        if workflow.organization_id != organization_id:
+            LOG.error(f"Workflow {workflow_id} does not belong to organization {organization_id}")
+            raise WorkflowOrganizationMismatch(workflow_id=workflow_id, organization_id=organization_id)
 
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id)
         workflow_run_tasks = await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
@@ -565,14 +574,14 @@ class WorkflowService:
         output_parameter_tuples: list[
             tuple[OutputParameter, WorkflowRunOutputParameter]
         ] = await self.get_output_parameter_workflow_run_output_parameter_tuples(
-            workflow_id=workflow_run.workflow_id, workflow_run_id=workflow_run_id
+            workflow_id=workflow_id, workflow_run_id=workflow_run_id
         )
         if output_parameter_tuples:
             outputs = {output_parameter.key: output.value for output_parameter, output in output_parameter_tuples}
         else:
             LOG.error(
                 "No output parameters found for workflow run",
-                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
                 workflow_run_id=workflow_run_id,
             )
             outputs = None
@@ -612,7 +621,7 @@ class WorkflowService:
         await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks_for_tasks(all_workflow_task_ids)
 
         workflow_run_status_response = await self.build_workflow_run_status_response(
-            workflow_permanent_id=workflow.workflow_permanent_id,
+            workflow_id=workflow.workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             organization_id=workflow.organization_id,
         )
@@ -974,7 +983,6 @@ class WorkflowService:
                 loop_over=loop_over_parameter,
                 loop_blocks=loop_blocks,
                 output_parameter=output_parameter,
-                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.CODE:
             return CodeBlock(
@@ -986,7 +994,6 @@ class WorkflowService:
                     else []
                 ),
                 output_parameter=output_parameter,
-                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.TEXT_PROMPT:
             return TextPromptBlock(
@@ -1000,21 +1007,18 @@ class WorkflowService:
                 ),
                 json_schema=block_yaml.json_schema,
                 output_parameter=output_parameter,
-                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.DOWNLOAD_TO_S3:
             return DownloadToS3Block(
                 label=block_yaml.label,
                 output_parameter=output_parameter,
                 url=block_yaml.url,
-                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.UPLOAD_TO_S3:
             return UploadToS3Block(
                 label=block_yaml.label,
                 output_parameter=output_parameter,
                 path=block_yaml.path,
-                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.SEND_EMAIL:
             return SendEmailBlock(
@@ -1029,6 +1033,5 @@ class WorkflowService:
                 subject=block_yaml.subject,
                 body=block_yaml.body,
                 file_attachments=block_yaml.file_attachments or [],
-                continue_on_failure=block_yaml.continue_on_failure,
             )
         raise ValueError(f"Invalid block type {block_yaml.block_type}")

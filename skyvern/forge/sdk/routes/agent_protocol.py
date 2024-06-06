@@ -195,7 +195,7 @@ async def execute_agent_task_step(
             )
     step, _, _ = await app.agent.execute_step(current_org, task, step)
     return Response(
-        content=step.model_dump_json(exclude_none=True) if step else "",
+        content=step.model_dump_json() if step else "",
         status_code=200,
         media_type="application/json",
     )
@@ -402,7 +402,7 @@ async def get_agent_task_steps(
     """
     analytics.capture("skyvern-oss-agent-task-steps-get")
     steps = await app.DATABASE.get_task_steps(task_id, organization_id=current_org.organization_id)
-    return ORJSONResponse([step.model_dump(exclude_none=True) for step in steps])
+    return ORJSONResponse([step.model_dump() for step in steps])
 
 
 @base_router.get(
@@ -533,7 +533,7 @@ async def get_workflow_run(
 ) -> WorkflowRunStatusResponse:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
     return await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
-        workflow_permanent_id=workflow_id,
+        workflow_id=workflow_id,
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
     )

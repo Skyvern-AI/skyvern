@@ -5,7 +5,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.webeye.actions.actions import Action, DecisiveAction, UserDefinedError
+from skyvern.webeye.actions.actions import Action, ActionTypeUnion, DecisiveAction, UserDefinedError
 from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.scraper.scraper import ScrapedPage
 
@@ -18,7 +18,7 @@ class AgentStepOutput(BaseModel):
     # Will be deprecated once we move to the new format below
     action_results: list[ActionResult] | None = None
     # Nullable for backwards compatibility, once backfill is done, this won't be nullable anymore
-    actions_and_results: list[tuple[Action, list[ActionResult]]] | None = None
+    actions_and_results: list[tuple[ActionTypeUnion, list[ActionResult]]] | None = None
     errors: list[UserDefinedError] = []
 
     def __repr__(self) -> str:
@@ -38,7 +38,7 @@ class DetailedAgentStepOutput(BaseModel):
     llm_response: dict[str, Any] | None
     actions: list[Action] | None
     action_results: list[ActionResult] | None
-    actions_and_results: list[tuple[Action, list[ActionResult]]] | None
+    actions_and_results: list[tuple[ActionTypeUnion, list[ActionResult]]] | None
 
     class Config:
         exclude = ["scraped_page", "extract_action_prompt"]
@@ -60,23 +60,9 @@ class DetailedAgentStepOutput(BaseModel):
                     errors.extend(action.errors)
         return errors
 
-    def get_clean_detailed_output(self) -> DetailedAgentStepOutput:
-        return DetailedAgentStepOutput(
-            scraped_page=self.scraped_page,
-            extract_action_prompt=self.extract_action_prompt,
-            llm_response=self.llm_response,
-            actions=self.actions,
-            action_results=self.action_results,
-            actions_and_results=None
-            if self.actions_and_results is None
-            else [(action, result) for action, result in self.actions_and_results if result],
-        )
-
     def to_agent_step_output(self) -> AgentStepOutput:
-        clean_output = self.get_clean_detailed_output()
-
         return AgentStepOutput(
-            action_results=clean_output.action_results if clean_output.action_results else [],
-            actions_and_results=(clean_output.actions_and_results if clean_output.actions_and_results else []),
-            errors=clean_output.extract_errors(),
+            action_results=self.action_results if self.action_results else [],
+            actions_and_results=(self.actions_and_results if self.actions_and_results else []),
+            errors=self.extract_errors(),
         )
