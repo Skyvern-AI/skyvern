@@ -54,7 +54,7 @@ function useActions(
             confidence: actionAndResult[0].confidence_float,
             input: getActionInput(actionAndResult[0]),
             type: actionAndResult[0].action_type,
-            success: actionAndResult[1].success,
+            success: actionAndResult[1][0].success,
             stepId: step.step_id,
             index,
           };

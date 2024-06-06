@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { useParams } from "react-router-dom";
 import { ActionScreenshot } from "./ActionScreenshot";
-import { InputReasoningCard } from "./InputReasoningCard";
 import { ScrollableActionList } from "./ScrollableActionList";
 import { useActions } from "./useActions";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -33,14 +32,7 @@ function TaskActions() {
 
   return (
     <div className="flex gap-2">
-      <div className="w-3/4 border rounded">
-        <div className="p-4">
-          <InputReasoningCard
-            input={activeAction.input}
-            reasoning={activeAction.reasoning}
-            confidence={activeAction.confidence}
-          />
-        </div>
+      <div className="w-2/3 border rounded">
         <div className="p-4">
           <ActionScreenshot
             stepId={activeAction.stepId}
