@@ -21,7 +21,7 @@ function createEmptyTaskTemplate() {
     title: "New Template",
     description: "",
     webhook_callback_url: null,
-    proxy_location: "RESIDENTIAL",
+    proxy_location: "NONE",
     workflow_definition: {
       parameters: [
         {

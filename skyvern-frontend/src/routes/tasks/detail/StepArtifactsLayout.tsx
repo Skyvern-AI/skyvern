@@ -37,7 +37,7 @@ function StepArtifactsLayout() {
   const activeStep = steps[activeIndex];
 
   return (
-    <div className="flex">
+    <div className="px-4 flex">
       <aside className="w-64 shrink-0">
         <StepNavigation
           activeIndex={activeIndex}

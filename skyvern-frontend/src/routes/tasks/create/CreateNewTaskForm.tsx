@@ -83,7 +83,7 @@ function createTaskRequestObject(formValues: CreateNewTaskFormValues) {
     webhook_callback_url: transform(formValues.webhookCallbackUrl),
     navigation_goal: transform(formValues.navigationGoal),
     data_extraction_goal: transform(formValues.dataExtractionGoal),
-    proxy_location: "RESIDENTIAL",
+    proxy_location: "NONE",
     error_code_mapping: null,
     navigation_payload: transform(formValues.navigationPayload),
     extracted_information_schema: transform(

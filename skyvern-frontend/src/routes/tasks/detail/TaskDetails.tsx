@@ -41,44 +41,40 @@ function TaskDetails() {
     return <div>Error: {taskError?.message}</div>;
   }
 
-  const informationContentLabel =
-    task?.status === Status.Completed
-      ? "Extracted Information"
-      : task?.status === Status.Failed || task?.status === Status.Terminated
-        ? "Failure Reason"
-        : "";
-
-  const informationContent =
-    task?.status === Status.Completed
-      ? JSON.stringify(task.extracted_information, null, 2)
-      : task?.status === Status.Failed || task?.status === Status.Terminated
-        ? JSON.stringify(task?.failure_reason)
-        : "";
-
   return (
     <div className="flex flex-col gap-8">
       <div className="flex items-center gap-4">
         <Input value={taskId} className="w-52" readOnly />
         {taskIsFetching ? (
-          <Skeleton className="w-28 h-8" />
+          <Skeleton className="w-32 h-8" />
         ) : task ? (
           <StatusBadge status={task?.status} />
         ) : null}
       </div>
       <div>
-        {taskIsFetching ? (
-          <div className="flex items-center gap-2">
-            <Skeleton className="w-32 h-32" />
-            <Skeleton className="w-full h-32" />
-          </div>
-        ) : (
+        {task?.status === Status.Completed ? (
           <div className="flex items-center">
             <Label className="w-32 shrink-0 text-lg">
-              {informationContentLabel}
+              Extracted Information
             </Label>
-            <Textarea rows={5} value={informationContent} readOnly />
+            <Textarea
+              rows={5}
+              value={JSON.stringify(task.extracted_information, null, 2)}
+              readOnly
+            />
           </div>
-        )}
+        ) : null}
+        {task?.status === Status.Failed ||
+        task?.status === Status.Terminated ? (
+          <div className="flex items-center">
+            <Label>Failure Reason</Label>
+            <Textarea
+              rows={5}
+              value={JSON.stringify(task.failure_reason)}
+              readOnly
+            />
+          </div>
+        ) : null}
       </div>
       <div className="flex justify-center items-center">
         <div className="inline-flex border rounded bg-muted p-1">
@@ -120,19 +116,6 @@ function TaskDetails() {
             }}
           >
             Parameters
-          </NavLink>
-          <NavLink
-            to="diagnostics"
-            className={({ isActive }) => {
-              return cn(
-                "cursor-pointer px-2 py-1 rounded-md text-muted-foreground",
-                {
-                  "bg-primary-foreground text-foreground": isActive,
-                },
-              );
-            }}
-          >
-            Diagnostics
           </NavLink>
         </div>
       </div>
