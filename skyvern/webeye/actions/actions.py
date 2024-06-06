@@ -35,9 +35,9 @@ class UserDefinedError(BaseModel):
 
 
 class SelectOption(BaseModel):
-    label: str | None
-    value: str | None
-    index: int | None
+    label: str | None = None
+    value: str | None = None
+    index: int | None = None
 
     def __repr__(self) -> str:
         return f"SelectOption(label={self.label}, value={self.value}, index={self.index})"
