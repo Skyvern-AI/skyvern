@@ -517,6 +517,7 @@ async def handle_select_option_action(
                 exc_info=True,
                 action=action,
                 xpath=xpath,
+                frame=frame,
             )
         else:
             LOG.warning(
@@ -524,22 +525,20 @@ async def handle_select_option_action(
                 exc_info=True,
                 action=action,
                 xpath=xpath,
+                frame=frame,
             )
             return [ActionFailure(e)]
 
     try:
         # This means the supplied index was for the select element, not a reference to the xpath dict
-        await page.click(
-            f"xpath={xpath}",
+        await locator.click(
             timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
         )
-        await page.select_option(
-            xpath,
+        await locator.select_option(
             index=action.option.index,
             timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
         )
-        await page.click(
-            f"xpath={xpath}",
+        await locator.click(
             timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
         )
         return [ActionSuccess()]
@@ -710,8 +709,8 @@ async def chain_click(
     :param xpath: xpath of the element to click
     """
     javascript_triggered = await is_javascript_triggered(scraped_page, page, frame, xpath)
+    locator = resolve_locator(scraped_page, page, frame, xpath)
     try:
-        locator = resolve_locator(scraped_page, page, frame, xpath)
         await locator.click(timeout=timeout)
 
         LOG.info("Chain click: main element click succeeded", action=action, xpath=xpath)
@@ -727,13 +726,13 @@ async def chain_click(
                 javascript_triggered=javascript_triggered,
             )
         ]
-        if await is_input_element(page.locator(xpath)):
+        if await is_input_element(locator):
             LOG.info(
                 "Chain click: it's an input element. going to try sibling click",
                 action=action,
                 xpath=xpath,
             )
-            sibling_action_result = await click_sibling_of_input(page.locator(xpath), timeout=timeout)
+            sibling_action_result = await click_sibling_of_input(locator, timeout=timeout)
             action_results.append(sibling_action_result)
             if type(sibling_action_result) == ActionSuccess:
                 return action_results
