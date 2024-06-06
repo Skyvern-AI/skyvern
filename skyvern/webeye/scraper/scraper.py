@@ -349,10 +349,11 @@ async def get_interactable_element_tree(page: Page) -> tuple[list[dict], list[di
     main_frame_js_script = "() => buildTreeFromBody('main.frame')"
     elements, element_tree = await page.evaluate(main_frame_js_script)
 
-    if len(page.main_frame.child_frames) > 0:
-        elements, element_tree = await get_interactable_element_tree_in_frame(
-            page.main_frame.child_frames, elements, element_tree
-        )
+    # FIXME: some unexpected exception in iframe. turn off temporarily
+    # if len(page.main_frame.child_frames) > 0:
+    #     elements, element_tree = await get_interactable_element_tree_in_frame(
+    #         page.main_frame.child_frames, elements, element_tree
+    #     )
 
     return elements, element_tree
 
