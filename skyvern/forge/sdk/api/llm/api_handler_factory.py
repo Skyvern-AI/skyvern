@@ -38,7 +38,7 @@ class LLMAPIHandlerFactory:
             redis_password=llm_config.redis_password,
             routing_strategy=llm_config.routing_strategy,
             fallbacks=(
-                [{llm_config.main_model_group: llm_config.fallback_model_group}]
+                [{llm_config.main_model_group: [llm_config.fallback_model_group]}]
                 if llm_config.fallback_model_group
                 else []
             ),
@@ -97,7 +97,9 @@ class LLMAPIHandlerFactory:
                     ).encode("utf-8"),
                 )
             try:
+                LOG.info("Calling LLM API", llm_key=llm_key, model=llm_config.model_name)
                 response = await router.acompletion(model=main_model_group, messages=messages, **parameters)
+                LOG.info("LLM API call successful", llm_key=llm_key, model=llm_config.model_name)
             except openai.OpenAIError as e:
                 raise LLMProviderError(llm_key) from e
             except Exception as e:
