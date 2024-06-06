@@ -6,10 +6,10 @@ from typing import Any, Awaitable, Callable, List
 
 import structlog
 from deprecation import deprecated
-from playwright.async_api import Locator, Page
+from playwright.async_api import FrameLocator, Locator, Page
 
 from skyvern.constants import REPO_ROOT_DIR, SKYVERN_ID_ATTR
-from skyvern.exceptions import ImaginaryFileUrl, MissingElement, MissingFileUrl, MultipleElementsFound
+from skyvern.exceptions import ImaginaryFileUrl, MissingElement, MissingFileUrl, MultipleElementsFound, SkyvernException
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
@@ -182,6 +182,7 @@ async def handle_click_action(
     else:
         results = await chain_click(
             task,
+            scraped_page,
             page,
             action,
             xpath,
@@ -211,7 +212,7 @@ async def handle_click_to_download_file_action(
 ) -> list[ActionResult]:
     xpath, frame = await validate_actions_in_dom(action, page, scraped_page)
 
-    locator = resolve_locator(page, frame, xpath)
+    locator = resolve_locator(scraped_page, page, frame, xpath)
 
     try:
         await locator.click(
@@ -234,7 +235,7 @@ async def handle_input_text_action(
 ) -> list[ActionResult]:
     xpath, frame = await validate_actions_in_dom(action, page, scraped_page)
 
-    locator = resolve_locator(page, frame, xpath)
+    locator = resolve_locator(scraped_page, page, frame, xpath)
 
     current_text = await locator.input_value()
     if current_text == action.text:
@@ -278,14 +279,14 @@ async def handle_upload_file_action(
 
     file_path = await download_file(file_url)
 
-    locator = resolve_locator(page, frame, xpath)
+    locator = resolve_locator(scraped_page, page, frame, xpath)
 
     is_file_input = await is_file_input_element(locator)
 
     if is_file_input:
         LOG.info("Taking UploadFileAction. Found file input tag", action=action)
         if file_path:
-            locator = resolve_locator(page, frame, xpath)
+            locator = resolve_locator(scraped_page, page, frame, xpath)
 
             await locator.set_input_files(
                 file_path,
@@ -304,6 +305,7 @@ async def handle_upload_file_action(
         action.is_upload_file_tag = False
         return await chain_click(
             task,
+            scraped_page,
             page,
             action,
             xpath,
@@ -328,7 +330,7 @@ async def handle_download_file_action(
         async with page.expect_download() as download_info:
             await asyncio.sleep(0.3)
 
-            locator = resolve_locator(page, frame, xpath)
+            locator = resolve_locator(scraped_page, page, frame, xpath)
 
             await locator.click(
                 timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
@@ -372,7 +374,7 @@ async def handle_select_option_action(
 ) -> list[ActionResult]:
     xpath, frame = await validate_actions_in_dom(action, page, scraped_page)
 
-    locator = resolve_locator(page, frame, xpath)
+    locator = resolve_locator(scraped_page, page, frame, xpath)
 
     tag_name = await get_tag_name_lowercase(locator)
     element_dict = scraped_page.id_to_element_dict[action.element_id]
@@ -416,7 +418,7 @@ async def handle_select_option_action(
                 child_anchor_xpath=child_anchor_xpath,
             )
             click_action = ClickAction(element_id=action.element_id)
-            return await chain_click(task, page, click_action, child_anchor_xpath, frame)
+            return await chain_click(task, scraped_page, page, click_action, child_anchor_xpath, frame)
 
         # handler the select action on <label>
         select_element_id = get_select_id_in_label_children(scraped_page, action.element_id)
@@ -448,7 +450,7 @@ async def handle_select_option_action(
             action=action,
         )
         click_action = ClickAction(element_id=action.element_id)
-        action_result = await chain_click(task, page, click_action, xpath, frame)
+        action_result = await chain_click(task, scraped_page, page, click_action, xpath, frame)
         return action_result
     elif tag_name == "ul" or tag_name == "div" or tag_name == "li":
         # if the role is listbox, find the option with the "label" or "value" and click that option element
@@ -480,7 +482,7 @@ async def handle_select_option_action(
             )
             # click the option element
             click_action = ClickAction(element_id=action.element_id)
-            return await chain_click(task, page, click_action, xpath, frame)
+            return await chain_click(task, scraped_page, page, click_action, xpath, frame)
         else:
             LOG.error(
                 "SelectOptionAction on a non-listbox element. Cannot handle this action",
@@ -565,7 +567,7 @@ async def handle_checkbox_action(
     """
     xpath, frame = await validate_actions_in_dom(action, page, scraped_page)
 
-    locator = resolve_locator(page, frame, xpath)
+    locator = resolve_locator(scraped_page, page, frame, xpath)
 
     if action.is_checked:
         await locator.check(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
@@ -651,7 +653,7 @@ async def validate_actions_in_dom(action: WebAction, page: Page, scraped_page: S
     xpath = scraped_page.id_to_xpath_dict[action.element_id]
     frame = scraped_page.id_to_frame_dict[action.element_id]
 
-    locator = resolve_locator(page, frame, xpath)
+    locator = resolve_locator(scraped_page, page, frame, xpath)
 
     num_elements = await locator.count()
     if num_elements < 1:
@@ -676,6 +678,7 @@ async def validate_actions_in_dom(action: WebAction, page: Page, scraped_page: S
 
 async def chain_click(
     task: Task,
+    scraped_page: ScrapedPage,
     page: Page,
     action: ClickAction | UploadFileAction,
     xpath: str,
@@ -709,9 +712,9 @@ async def chain_click(
     Clicks on an element identified by the xpath and its parent if failed.
     :param xpath: xpath of the element to click
     """
-    javascript_triggered = await is_javascript_triggered(page, frame, xpath)
+    javascript_triggered = await is_javascript_triggered(scraped_page, page, frame, xpath)
     try:
-        locator = resolve_locator(page, frame, xpath)
+        locator = resolve_locator(scraped_page, page, frame, xpath)
         await locator.click(timeout=timeout)
 
         LOG.info("Chain click: main element click succeeded", action=action, xpath=xpath)
@@ -740,10 +743,10 @@ async def chain_click(
 
         parent_xpath = f"{xpath}/.."
         try:
-            parent_javascript_triggered = await is_javascript_triggered(page, frame, parent_xpath)
+            parent_javascript_triggered = await is_javascript_triggered(scraped_page, page, frame, parent_xpath)
             javascript_triggered = javascript_triggered or parent_javascript_triggered
 
-            parent_locator = resolve_locator(page, frame, xpath).locator("..")
+            parent_locator = resolve_locator(scraped_page, page, frame, xpath).locator("..")
             await parent_locator.click(timeout=timeout)
 
             LOG.info(
@@ -830,8 +833,8 @@ def get_checkbox_id_in_label_children(scraped_page: ScrapedPage, element_id: str
     return None
 
 
-async def is_javascript_triggered(page: Page, frame: str, xpath: str) -> bool:
-    locator = resolve_locator(page, frame, xpath)
+async def is_javascript_triggered(scraped_page: ScrapedPage, page: Page, frame: str, xpath: str) -> bool:
+    locator = resolve_locator(scraped_page, page, frame, xpath)
     element = locator.first
 
     tag_name = await element.evaluate("e => e.tagName")
@@ -956,7 +959,7 @@ async def click_listbox_option(
                 option_frame = scraped_page.id_to_frame_dict[child["id"]]
 
                 try:
-                    locator = resolve_locator(page, option_frame, option_xpath)
+                    locator = resolve_locator(scraped_page, page, option_frame, option_xpath)
 
                     await locator.click(timeout=1000)
 
@@ -973,8 +976,26 @@ async def click_listbox_option(
     return False
 
 
-def resolve_locator(page: Page, frame: str, xpath: str) -> Locator:
-    if frame == "main":
-        return page.locator(f"xpath={xpath}")
+def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, xpath: str) -> Locator:
+    iframe_path: list[str] = []
 
-    return page.frame_locator(f"[{SKYVERN_ID_ATTR}='{frame}']").locator(f"xpath={xpath}")
+    while frame != "main.frame":
+        iframe_path.append(frame)
+
+        frame_element = scrape_page.id_to_element_dict.get(frame)
+        if frame_element is None:
+            raise MissingElement(element_id=frame)
+
+        parent_frame = frame_element.get("frame")
+        if not parent_frame:
+            raise SkyvernException(f"element without frame: {frame_element}")
+
+        LOG.info(f"{frame} is a child frame of {parent_frame}")
+        frame = parent_frame
+
+    current_page: Page | FrameLocator = page
+    while len(iframe_path) > 0:
+        child_frame = iframe_path.pop()
+        current_page = current_page.frame_locator(f"[{SKYVERN_ID_ATTR}='{child_frame}']")
+
+    return current_page.locator(f"xpath={xpath}")

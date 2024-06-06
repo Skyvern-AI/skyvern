@@ -298,17 +298,10 @@ async def scrape_web_unsafe(
     )
 
 
-async def get_interactable_element_tree(page: Page) -> tuple[list[dict], list[dict]]:
-    """
-    Get the element tree of the page, including all the elements that are interactable.
-    :param page: Page instance to get the element tree from.
-    :return: Tuple containing the element tree and a map of element IDs to elements.
-    """
-    await page.evaluate(JS_FUNCTION_DEFS)
-    main_frame_js_script = "() => buildTreeFromBody('main')"
-    elements, element_tree = await page.evaluate(main_frame_js_script)
-
-    for frame in page.main_frame.child_frames:
+async def get_interactable_element_tree_in_frame(
+    frames: list[Frame], elements: list[dict], element_tree: list[dict]
+) -> tuple[list[dict], list[dict]]:
+    for frame in frames:
         if frame.is_detached():
             continue
 
@@ -328,7 +321,10 @@ async def get_interactable_element_tree(page: Page) -> tuple[list[dict], list[di
         await frame.evaluate(JS_FUNCTION_DEFS)
         frame_elements, frame_element_tree = await frame.evaluate(frame_js_script)
 
-        elements = elements + frame_elements
+        if len(frame.child_frames) > 0:
+            frame_elements, frame_element_tree = await get_interactable_element_tree_in_frame(
+                frame.child_frames, frame_elements, frame_element_tree
+            )
 
         for element in elements:
             if element["id"] == unique_id:
@@ -337,6 +333,26 @@ async def get_interactable_element_tree(page: Page) -> tuple[list[dict], list[di
         for element_tree_item in element_tree:
             if element_tree_item["id"] == unique_id:
                 element_tree_item["children"] = frame_element_tree
+
+        elements = elements + frame_elements
+
+    return elements, element_tree
+
+
+async def get_interactable_element_tree(page: Page) -> tuple[list[dict], list[dict]]:
+    """
+    Get the element tree of the page, including all the elements that are interactable.
+    :param page: Page instance to get the element tree from.
+    :return: Tuple containing the element tree and a map of element IDs to elements.
+    """
+    await page.evaluate(JS_FUNCTION_DEFS)
+    main_frame_js_script = "() => buildTreeFromBody('main.frame')"
+    elements, element_tree = await page.evaluate(main_frame_js_script)
+
+    if len(page.main_frame.child_frames) > 0:
+        elements, element_tree = await get_interactable_element_tree_in_frame(
+            page.main_frame.child_frames, elements, element_tree
+        )
 
     return elements, element_tree
 
@@ -405,6 +421,9 @@ def trim_element_tree(elements: list[dict]) -> list[dict]:
         queue.append(element)
     while queue:
         queue_ele = queue.pop(0)
+        if "frame" in queue_ele:
+            del queue_ele["frame"]
+
         if "attributes" in queue_ele:
             tag_name = queue_ele["tagName"] if "tagName" in queue_ele else ""
             new_attributes = _trimmed_attributes(tag_name, queue_ele["attributes"])

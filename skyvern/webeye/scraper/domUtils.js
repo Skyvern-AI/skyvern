@@ -342,6 +342,10 @@ function isInteractable(element) {
 
   const tagName = element.tagName.toLowerCase();
 
+  if (tagName === "iframe") {
+    return false;
+  }
+
   if (tagName === "a" && element.href) {
     return true;
   }
@@ -576,7 +580,7 @@ function uniqueId() {
   return result;
 }
 
-function buildTreeFromBody(frame = "main") {
+function buildTreeFromBody(frame = "main.frame") {
   var elements = [];
   var resultArray = [];
 
@@ -762,7 +766,7 @@ function buildTreeFromBody(frame = "main") {
       });
       return elementObj;
     } else if (element.tagName.toLowerCase() === "iframe") {
-      let iframeElementObject = buildElementObject(element, true);
+      let iframeElementObject = buildElementObject(element, false);
 
       elements.push(iframeElementObject);
       resultArray.push(iframeElementObject);
