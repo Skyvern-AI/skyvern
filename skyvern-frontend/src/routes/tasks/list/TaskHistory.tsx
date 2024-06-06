@@ -87,7 +87,7 @@ function TaskHistory() {
                     <TableCell
                       className="w-1/4 cursor-pointer"
                       onClick={() => {
-                        navigate(task.task_id);
+                        navigate(`${task.task_id}/actions`);
                       }}
                     >
                       {task.task_id}
@@ -95,7 +95,7 @@ function TaskHistory() {
                     <TableCell
                       className="w-1/4 cursor-pointer max-w-64 overflow-hidden whitespace-nowrap overflow-ellipsis"
                       onClick={() => {
-                        navigate(task.task_id);
+                        navigate(`${task.task_id}/actions`);
                       }}
                     >
                       {task.request.url}
@@ -103,7 +103,7 @@ function TaskHistory() {
                     <TableCell
                       className="w-1/6 cursor-pointer"
                       onClick={() => {
-                        navigate(task.task_id);
+                        navigate(`${task.task_id}/actions`);
                       }}
                     >
                       <StatusBadge status={task.status} />
@@ -111,7 +111,7 @@ function TaskHistory() {
                     <TableCell
                       className="w-1/4 cursor-pointer"
                       onClick={() => {
-                        navigate(task.task_id);
+                        navigate(`${task.task_id}/actions`);
                       }}
                     >
                       {basicTimeFormat(task.created_at)}
