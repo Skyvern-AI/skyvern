@@ -673,7 +673,7 @@ class UploadToS3Block(Block):
             client = self.get_async_aws_client()
             # is the file path a file or a directory?
             if os.path.isdir(self.path):
-                # get all files in the directory, if there are more than 10 files, we will not upload them
+                # get all files in the directory, if there are more than 25 files, we will not upload them
                 files = os.listdir(self.path)
                 if len(files) > 25:
                     raise ValueError("Too many files in the directory, not uploading")
