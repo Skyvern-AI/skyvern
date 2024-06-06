@@ -35,6 +35,10 @@ const router = createBrowserRouter([
             element: <TaskDetails />,
             children: [
               {
+                index: true,
+                element: <Navigate to="actions" />,
+              },
+              {
                 path: "actions",
                 element: <TaskActions />,
               },
