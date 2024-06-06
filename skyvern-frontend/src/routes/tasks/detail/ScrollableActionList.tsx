@@ -70,6 +70,7 @@ function ScrollableActionList({
           const selected = activeIndex === index;
           return (
             <div
+              key={index}
               ref={(element) => {
                 refs.current[index] = element;
               }}
