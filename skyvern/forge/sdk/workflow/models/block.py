@@ -675,7 +675,7 @@ class UploadToS3Block(Block):
             if os.path.isdir(self.path):
                 # get all files in the directory, if there are more than 10 files, we will not upload them
                 files = os.listdir(self.path)
-                if len(files) > 10:
+                if len(files) > 25:
                     raise ValueError("Too many files in the directory, not uploading")
                 for file in files:
                     # if the file is a directory, we will not upload it
