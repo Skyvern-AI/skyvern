@@ -621,7 +621,7 @@ class ForgeAgent:
                         status=StepStatus.failed,
                         output=detailed_agent_step_output.to_agent_step_output(),
                     )
-                    return failed_step, detailed_agent_step_output
+                    return failed_step, detailed_agent_step_output.get_clean_detailed_output()
 
             LOG.info(
                 "Actions executed successfully, marking step as completed",
@@ -637,7 +637,7 @@ class ForgeAgent:
                 status=StepStatus.completed,
                 output=detailed_agent_step_output.to_agent_step_output(),
             )
-            return completed_step, detailed_agent_step_output
+            return completed_step, detailed_agent_step_output.get_clean_detailed_output()
         except CancelledError:
             LOG.exception(
                 "CancelledError in agent_step, marking step as failed",
@@ -651,7 +651,7 @@ class ForgeAgent:
                 status=StepStatus.failed,
                 output=detailed_agent_step_output.to_agent_step_output(),
             )
-            return failed_step, detailed_agent_step_output
+            return failed_step, detailed_agent_step_output.get_clean_detailed_output()
         except Exception:
             LOG.exception(
                 "Unexpected exception in agent_step, marking step as failed",
@@ -665,7 +665,7 @@ class ForgeAgent:
                 status=StepStatus.failed,
                 output=detailed_agent_step_output.to_agent_step_output(),
             )
-            return failed_step, detailed_agent_step_output
+            return failed_step, detailed_agent_step_output.get_clean_detailed_output()
 
     async def record_artifacts_after_action(self, task: Task, step: Step, browser_state: BrowserState) -> None:
         if not browser_state.page:
