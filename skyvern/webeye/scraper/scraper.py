@@ -46,7 +46,6 @@ RESERVED_ATTRIBUTES = {
 
 ELEMENT_NODE_ATTRIBUTES = {
     "id",
-    "interactable",
 }
 
 
