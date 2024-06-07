@@ -1,19 +1,19 @@
+import { getClient } from "@/api/AxiosClient";
 import { Action, ActionTypes, ReadableActionTypes } from "@/api/types";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Separator } from "@/components/ui/separator";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { cn } from "@/util/utils";
 import {
   ArrowLeftIcon,
   ArrowRightIcon,
-  CheckIcon,
-  Cross1Icon,
+  CheckCircledIcon,
+  CrossCircledIcon,
 } from "@radix-ui/react-icons";
 import { useQueryClient } from "@tanstack/react-query";
-import { useParams } from "react-router-dom";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { getClient } from "@/api/AxiosClient";
 import { useEffect, useRef } from "react";
-import { cn } from "@/util/utils";
-import { Badge } from "@/components/ui/badge";
-import { Separator } from "@/components/ui/separator";
+import { useParams } from "react-router-dom";
 
 type Props = {
   data: Array<Action | null>;
@@ -75,9 +75,9 @@ function ScrollableActionList({
                 refs.current[index] = element;
               }}
               className={cn(
-                "flex p-4 rounded-lg shadow-md border hover:bg-muted cursor-pointer",
+                "flex p-4 rounded-lg shadow-md border border-transparent hover:border-slate-500 cursor-pointer",
                 {
-                  "bg-muted": selected,
+                  "border-slate-500": selected,
                 },
               )}
               onClick={() => onActiveIndexChange(index)}
@@ -101,24 +101,27 @@ function ScrollableActionList({
               }}
             >
               <div className="flex-1 p-2 pt-0 space-y-2">
-                <div className="flex gap-2 items-center">
-                  <span>#{index + 1}</span>
-                  <Badge>{ReadableActionTypes[action.type]}</Badge>
-                  <div>{action.confidence}</div>
+                <div className="flex justify-between">
+                  <div className="flex gap-2 items-center">
+                    <span>#{index + 1}</span>
+                    <Badge>{ReadableActionTypes[action.type]}</Badge>
+                    <div>{action.confidence}</div>
+                  </div>
+                  <div>
+                    {action.success ? (
+                      <CheckCircledIcon className="w-6 h-6 text-success" />
+                    ) : (
+                      <CrossCircledIcon className="w-6 h-6 text-destructive" />
+                    )}
+                  </div>
                 </div>
+
                 <div className="text-sm">{action.reasoning}</div>
                 {action.type === ActionTypes.InputText && (
                   <>
                     <Separator className="bg-slate-50 block" />
                     <div className="text-sm">Input: {action.input}</div>
                   </>
-                )}
-              </div>
-              <div>
-                {action.success ? (
-                  <CheckIcon className="w-4 h-4 text-success" />
-                ) : (
-                  <Cross1Icon className="w-4 h-4 text-destructive" />
                 )}
               </div>
             </div>
