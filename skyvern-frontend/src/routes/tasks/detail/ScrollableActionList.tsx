@@ -75,7 +75,7 @@ function ScrollableActionList({
                 refs.current[index] = element;
               }}
               className={cn(
-                "flex p-4 rounded-lg shadow-md border border-transparent hover:border-slate-500 cursor-pointer",
+                "flex p-4 rounded-lg shadow-md border hover:border-slate-500 cursor-pointer",
                 {
                   "border-slate-500": selected,
                 },
