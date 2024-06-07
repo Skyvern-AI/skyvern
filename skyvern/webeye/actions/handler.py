@@ -267,7 +267,6 @@ async def handle_input_text_action(
         return [ActionSuccess()]
 
     # If the input is a text input, we type the text character by character
-    await locator.clear(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
     # 3 times the time it takes to type the text so it has time to finish typing
     total_timeout = max(len(text) * TEXT_INPUT_DELAY * 3, SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
     await locator.press_sequentially(text, timeout=total_timeout)
