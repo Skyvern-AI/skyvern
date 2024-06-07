@@ -57,14 +57,11 @@
     --accent: 217.2 32.6% 17.5%;
     --accent-foreground: 210 40% 98%;
 
-    --warning: 40.6, 96.1%, 40.4%;
-    --warning-foreground: 47.9, 95.8%, 53.1%;
+    --warning: 40.6 96.1% 40.4%;
+    --warning-foreground: 54.5 91.7% 95.3%;
 
-    --warning: 40.6, 96.1%, 40.4%;
-    --warning-foreground: 54.5, 91.7%, 95.3%;
-
-    --success: 142.1, 76.2%, 36.3%;
-    --success-foreground: 138.5, 76.5%, 96.7%;
+    --success: 142.1 76.2% 36.3%;
+    --success-foreground: 138.5 76.5% 96.7%;
 
     --border: 217.2 32.6% 17.5%;
     --input: 217.2 32.6% 17.5%;
