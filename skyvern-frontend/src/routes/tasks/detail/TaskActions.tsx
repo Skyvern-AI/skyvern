@@ -13,7 +13,7 @@ function TaskActions() {
 
   const activeAction = data?.[selectedActionIndex];
 
-  if (isFetching || !data) {
+  if (isFetching) {
     return (
       <div className="flex gap-2">
         <div className="h-[40rem] w-3/4">
@@ -26,8 +26,12 @@ function TaskActions() {
     );
   }
 
+  if (!data) {
+    return <div>No actions</div>;
+  }
+
   if (!activeAction) {
-    return <div>No action</div>;
+    return <div>No active action</div>;
   }
 
   return (

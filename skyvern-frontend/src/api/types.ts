@@ -55,7 +55,7 @@ export type StepApiResponse = {
   is_last: boolean;
   order: number;
   organization_id: string;
-  output: {
+  output?: {
     actions_and_results: ActionAndResultApiResponse[];
     errors: unknown[];
   };

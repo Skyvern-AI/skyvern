@@ -55,7 +55,7 @@ function QueuedTasks() {
                   key={task.task_id}
                   className="w-4"
                   onClick={() => {
-                    navigate(task.task_id);
+                    navigate(`${task.task_id}/actions`);
                   }}
                 >
                   <TableCell className="w-1/4">{task.task_id}</TableCell>
