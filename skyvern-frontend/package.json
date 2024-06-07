@@ -39,6 +39,7 @@
     "express": "^4.19.2",
     "fetch-to-curl": "^0.6.0",
     "open": "^10.1.0",
+    "posthog-js": "^1.138.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-hook-form": "^7.51.1",
