@@ -277,3 +277,8 @@ class StepUnableToExecuteError(SkyvernException):
 class UnsupportedActionType(SkyvernException):
     def __init__(self, action_type: str):
         super().__init__(f"Unsupport action type: {action_type}")
+
+
+class InvalidElementForTextInput(SkyvernException):
+    def __init__(self, element_id: str, tag_name: str):
+        super().__init__(f"The {tag_name} element with id={element_id} doesn't support text input.")

@@ -6,10 +6,17 @@ from typing import Any, Awaitable, Callable, List
 
 import structlog
 from deprecation import deprecated
-from playwright.async_api import FrameLocator, Locator, Page
+from playwright.async_api import FrameLocator, Locator, Page, TimeoutError
 
 from skyvern.constants import REPO_ROOT_DIR, SKYVERN_ID_ATTR
-from skyvern.exceptions import ImaginaryFileUrl, MissingElement, MissingFileUrl, MultipleElementsFound, SkyvernException
+from skyvern.exceptions import (
+    ImaginaryFileUrl,
+    InvalidElementForTextInput,
+    MissingElement,
+    MissingFileUrl,
+    MultipleElementsFound,
+    SkyvernException,
+)
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
@@ -38,6 +45,7 @@ from skyvern.webeye.scraper.scraper import ScrapedPage
 
 LOG = structlog.get_logger()
 TEXT_INPUT_DELAY = 10  # 10ms between each character input
+COMMON_INPUT_TAGS = {"input", "textarea", "select"}
 
 
 class ActionHandler:
@@ -237,12 +245,28 @@ async def handle_input_text_action(
 
     locator = resolve_locator(scraped_page, page, frame, xpath)
 
-    current_text = await locator.input_value()
+    current_text = await get_input_value(locator)
     if current_text == action.text:
         return [ActionSuccess()]
 
-    await locator.clear()
+    # before filling text, we need to validate if the element can be filled if it's not one of COMMON_INPUT_TAGS
+    tag_name = scraped_page.id_to_element_dict[action.element_id]["tagName"].lower()
     text = get_actual_value_of_parameter_if_secret(task, action.text)
+
+    try:
+        await locator.clear(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+    except TimeoutError:
+        LOG.info("None input tag clear timeout", action=action)
+        return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
+    except Exception:
+        LOG.warning("Failed to clear the input field", action=action, exc_info=True)
+        return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
+
+    if tag_name not in COMMON_INPUT_TAGS:
+        await locator.fill(text, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+        return [ActionSuccess()]
+
+    # If the input is a text input, we type the text character by character
     # 3 times the time it takes to type the text so it has time to finish typing
     total_timeout = max(len(text) * TEXT_INPUT_DELAY * 3, SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
     await locator.press_sequentially(text, timeout=total_timeout)
@@ -995,3 +1019,11 @@ def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, xpath: str
         current_page = current_page.frame_locator(f"[{SKYVERN_ID_ATTR}='{child_frame}']")
 
     return current_page.locator(f"xpath={xpath}")
+
+
+async def get_input_value(locator: Locator) -> str | None:
+    tag_name = await get_tag_name_lowercase(locator)
+    if tag_name in COMMON_INPUT_TAGS:
+        return await locator.input_value()
+    # for span, div, p or other tags:
+    return await locator.inner_text()
