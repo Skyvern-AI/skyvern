@@ -18,6 +18,7 @@ from skyvern.forge.sdk.db.models import (
     OrganizationModel,
     OutputParameterModel,
     StepModel,
+    TaskGenerationModel,
     TaskModel,
     WorkflowModel,
     WorkflowParameterModel,
@@ -42,6 +43,7 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_workflow_run_parameter,
 )
 from skyvern.forge.sdk.models import Organization, OrganizationAuthToken, Step, StepStatus
+from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskStatus
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -1236,3 +1238,34 @@ class AgentDB:
             )
             await session.execute(stmt)
             await session.commit()
+
+    async def create_task_generation(
+        self,
+        organization_id: str,
+        user_prompt: str,
+        url: str | None = None,
+        navigation_goal: str | None = None,
+        navigation_payload: dict[str, Any] | None = None,
+        data_extraction_goal: str | None = None,
+        extracted_information_schema: dict[str, Any] | None = None,
+        llm: str | None = None,
+        llm_prompt: str | None = None,
+        llm_response: str | None = None,
+    ) -> TaskGeneration:
+        async with self.Session() as session:
+            new_task_generation = TaskGenerationModel(
+                organization_id=organization_id,
+                user_prompt=user_prompt,
+                url=url,
+                navigation_goal=navigation_goal,
+                navigation_payload=navigation_payload,
+                data_extraction_goal=data_extraction_goal,
+                extracted_information_schema=extracted_information_schema,
+                llm=llm,
+                llm_prompt=llm_prompt,
+                llm_response=llm_response,
+            )
+            session.add(new_task_generation)
+            await session.commit()
+            await session.refresh(new_task_generation)
+            return TaskGeneration.model_validate(new_task_generation)

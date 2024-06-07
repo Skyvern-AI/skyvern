@@ -210,6 +210,7 @@ class ForgeAgent:
                 )
             # Check some conditions before executing the step, throw an exception if the step can't be executed
             await app.AGENT_FUNCTION.validate_step_execution(task, step)
+
             (
                 step,
                 browser_state,
@@ -337,27 +338,31 @@ class ForgeAgent:
             )
             raise
         except StepTerminationError as e:
-            LOG.error(
+            LOG.warning(
                 "Step cannot be executed. Task failed.",
                 task_id=task.task_id,
                 step_id=step.step_id,
+                exc_info=True,
             )
             await self.update_step(
                 step=step,
                 status=StepStatus.failed,
+                force_update=True,
             )
             task = await self.update_task(
                 task,
                 status=TaskStatus.failed,
                 failure_reason=e.message,
+                force_update=True,
             )
             await self.send_task_response(
                 task=task,
                 last_step=step,
                 api_key=api_key,
                 close_browser_on_completion=close_browser_on_completion,
+                skip_cleanup=True,
             )
-            return step, detailed_output, next_step
+            return step, detailed_output, None
         except FailedToSendWebhook:
             LOG.exception(
                 "Failed to send webhook",
@@ -939,6 +944,7 @@ class ForgeAgent:
         api_key: str | None = None,
         close_browser_on_completion: bool = True,
         skip_artifacts: bool = False,
+        skip_cleanup: bool = False,
     ) -> None:
         """
         send the task response to the webhook callback url
@@ -957,6 +963,10 @@ class ForgeAgent:
             )
             raise TaskNotFound(task_id=task.task_id) from e
         task = refreshed_task
+        if skip_cleanup:
+            await self.execute_task_webhook(task=task, last_step=last_step, api_key=api_key)
+            return
+
         # log the task status as an event
         analytics.capture("skyvern-oss-agent-task-status", {"status": task.status})
         # We skip the artifacts and send the webhook response directly only when there is an issue with the browser
@@ -1165,8 +1175,10 @@ class ForgeAgent:
         output: AgentStepOutput | None = None,
         is_last: bool | None = None,
         retry_index: int | None = None,
+        force_update: bool = False,
     ) -> Step:
-        step.validate_update(status, output, is_last)
+        if not force_update:
+            step.validate_update(status, output, is_last)
         updates: dict[str, Any] = {}
         if status is not None:
             updates["status"] = status
@@ -1200,8 +1212,10 @@ class ForgeAgent:
         status: TaskStatus,
         extracted_information: dict[str, Any] | list | str | None = None,
         failure_reason: str | None = None,
+        force_update: bool = False,
     ) -> Task:
-        task.validate_update(status, extracted_information, failure_reason)
+        if not force_update:
+            task.validate_update(status, extracted_information, failure_reason)
         updates: dict[str, Any] = {}
         if status is not None:
             updates["status"] = status
