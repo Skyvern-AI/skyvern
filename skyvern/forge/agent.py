@@ -854,7 +854,7 @@ class ForgeAgent:
         return json.dumps(
             [
                 {
-                    "action": action.model_dump(exclude_none=True, exclude={"text"}),
+                    "action": action.model_dump(exclude_none=True, exclude={"text", "confidence_float"}),
                     "results": [
                         result.model_dump(
                             exclude_none=True,
