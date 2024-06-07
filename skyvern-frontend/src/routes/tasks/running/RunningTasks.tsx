@@ -42,7 +42,7 @@ function RunningTasks() {
         key={task.task_id}
         className="hover:bg-muted/50 cursor-pointer"
         onClick={() => {
-          navigate(`/tasks/${task.task_id}`);
+          navigate(`/tasks/${task.task_id}/actions`);
         }}
       >
         <CardHeader>
