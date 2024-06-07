@@ -1,0 +1,16 @@
+We are building an AI agent that can automate browser tasks. The task creation schema is a JSON object with the following fields:
+
+url: required field, the starting URL for the task. This will be the first page the agent visits in order to achieve its goals.
+navigation_goal: optional. The value should be a string that we can use as an input to a Large Language Modal. It needs to tell the agent the goal in terms of navigating the website. It needs to define a single goal. You can include explicit completion and failure criteria. You can define guardrails that could help the agent from taking certain actions or getting derailed.
+data_extraction_goal: optional. The value should be a string that we can use as an input to a Large Language Modal. It needs to tell the agent the goal in terms of extracting data. It needs to be a single goal.
+navigation_payload: optional. The value should be JSON. Use this field if there is any information for the agent to be able to complete the task such as values that can help fill a form, parameters for queries and so on.
+extracted_information_schema: optional. The exact schema of the data to be extracted.
+
+At least one of navigation goal or data extraction goal should be provided. The agent can't proceed without any goals. 
+
+If a field is not required to achieve a task, provide the value `null`.
+
+Respond with only JSON output that follows the task creation schema for the following prompt:
+```
+{{ user_prompt }}
+```

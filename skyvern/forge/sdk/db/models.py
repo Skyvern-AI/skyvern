@@ -26,6 +26,7 @@ from skyvern.forge.sdk.db.id import (
     generate_organization_auth_token_id,
     generate_output_parameter_id,
     generate_step_id,
+    generate_task_generation_id,
     generate_task_id,
     generate_workflow_id,
     generate_workflow_parameter_id,
@@ -325,3 +326,27 @@ class WorkflowRunOutputParameterModel(Base):
     )
     value = Column(JSON, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+
+class TaskGenerationModel(Base):
+    """
+    Generate a task based on the prompt (natural language description of the task) from the user
+    """
+
+    __tablename__ = "task_generations"
+
+    task_generation_id = Column(String, primary_key=True, default=generate_task_generation_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    user_prompt = Column(String, nullable=False, index=True)  # The prompt from the user
+    url = Column(String)
+    navigation_goal = Column(String)
+    navigation_payload = Column(JSON)
+    data_extraction_goal = Column(String)
+    extracted_information_schema = Column(JSON)
+
+    llm = Column(String)  # language model to use
+    llm_prompt = Column(String)  # The prompt sent to the language model
+    llm_response = Column(String)  # The response from the language model
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

@@ -40,6 +40,7 @@ WORKFLOW_PARAMETER_PREFIX = "wp"
 AWS_SECRET_PARAMETER_PREFIX = "asp"
 OUTPUT_PARAMETER_PREFIX = "op"
 BITWARDEN_LOGIN_CREDENTIAL_PARAMETER_PREFIX = "blc"
+TASK_GENERATION_PREFIX = "tg"
 
 
 def generate_workflow_id() -> str:
@@ -105,6 +106,11 @@ def generate_artifact_id() -> str:
 def generate_user_id() -> str:
     int_id = generate_id()
     return f"{USER_PREFIX}_{int_id}"
+
+
+def generate_task_generation_id() -> str:
+    int_id = generate_id()
+    return f"{TASK_GENERATION_PREFIX}_{int_id}"
 
 
 def generate_id() -> int:
