@@ -37,13 +37,13 @@ export type ArtifactApiResponse = {
   organization_id: string;
 };
 
+export type ActionResultApiResponse = {
+  success: boolean;
+};
+
 export type ActionAndResultApiResponse = [
   ActionApiResponse,
-  [
-    {
-      success: boolean;
-    },
-  ],
+  Array<ActionResultApiResponse>,
 ];
 
 export type StepApiResponse = {

@@ -23,7 +23,7 @@ function getActionInput(action: ActionApiResponse) {
 }
 
 function useActions(taskId: string): {
-  data?: Array<Action>;
+  data?: Array<Action | null>;
   isFetching: boolean;
 } {
   const credentialGetter = useCredentialGetter();
@@ -56,16 +56,20 @@ function useActions(taskId: string): {
       const actionsAndResults = step.output.actions_and_results;
 
       const actions = actionsAndResults.map((actionAndResult, index) => {
-        const action: Action = {
-          reasoning: actionAndResult[0].reasoning,
-          confidence: actionAndResult[0].confidence_float,
-          input: getActionInput(actionAndResult[0]),
-          type: actionAndResult[0].action_type,
-          success: actionAndResult[1][0].success,
+        const action = actionAndResult[0];
+        const actionResult = actionAndResult[1];
+        if (actionResult.length === 0) {
+          return null;
+        }
+        return {
+          reasoning: action.reasoning,
+          confidence: action.confidence_float,
+          input: getActionInput(action),
+          type: action.action_type,
+          success: actionResult?.[0]?.success ?? false,
           stepId: step.step_id,
           index,
         };
-        return action;
       });
       return actions;
     })
