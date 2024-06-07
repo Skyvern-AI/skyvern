@@ -1,12 +1,7 @@
 from datetime import datetime
-from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
-
-
-class LLMType(StrEnum):
-    OPENAI_GPT4O = "OPENAI_GPT4O"
 
 
 class TaskGenerationBase(BaseModel):
@@ -19,7 +14,7 @@ class TaskGenerationBase(BaseModel):
     navigation_payload: dict[str, Any] | None = None
     data_extraction_goal: str | None = None
     extracted_information_schema: dict[str, Any] | None = None
-    llm: LLMType | None = None
+    llm: str | None = None
     llm_prompt: str | None = None
     llm_response: str | None = None
 
