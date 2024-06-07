@@ -45,7 +45,6 @@ class SelectOption(BaseModel):
 
 class Action(BaseModel):
     action_type: ActionType
-    confidence_float: float | None = None
     description: str | None = None
     reasoning: str | None = None
     element_id: Annotated[str, Field(coerce_numbers_to_str=True)] | None = None
@@ -159,10 +158,9 @@ def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None
         element_id = None
 
     reasoning = action["reasoning"] if "reasoning" in action else None
-    confidence_float = action["confidence_float"] if "confidence_float" in action else None
 
     if "action_type" not in action or action["action_type"] is None:
-        return NullAction(reasoning=reasoning, confidence_float=confidence_float)
+        return NullAction(reasoning=reasoning)
 
     # `.upper()` handles the case where the LLM returns a lowercase action type (e.g. "click" instead of "CLICK")
     action_type = ActionType[action["action_type"].upper()]
@@ -170,7 +168,6 @@ def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None
     if action_type == ActionType.TERMINATE:
         return TerminateAction(
             reasoning=reasoning,
-            confidence_float=confidence_float,
             errors=action["errors"] if "errors" in action else [],
         )
 
@@ -179,24 +176,17 @@ def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None
         return ClickAction(
             element_id=element_id,
             reasoning=reasoning,
-            confidence_float=confidence_float,
             file_url=file_url,
             download=action.get("download", False),
         )
 
     if action_type == ActionType.INPUT_TEXT:
-        return InputTextAction(
-            element_id=element_id,
-            text=action["text"],
-            reasoning=reasoning,
-            confidence_float=confidence_float,
-        )
+        return InputTextAction(element_id=element_id, text=action["text"], reasoning=reasoning)
 
     if action_type == ActionType.UPLOAD_FILE:
         # TODO: see if the element is a file input element. if it's not, convert this action into a click action
         return UploadFileAction(
             element_id=element_id,
-            confidence_float=confidence_float,
             file_url=action["file_url"],
             reasoning=reasoning,
         )
@@ -207,7 +197,6 @@ def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None
             element_id=element_id,
             file_name=action["file_name"],
             reasoning=reasoning,
-            confidence_float=confidence_float,
         )
 
     if action_type == ActionType.SELECT_OPTION:
@@ -219,7 +208,6 @@ def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None
                 index=action["option"]["index"],
             ),
             reasoning=reasoning,
-            confidence_float=confidence_float,
         )
 
     if action_type == ActionType.CHECKBOX:
@@ -227,25 +215,23 @@ def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None
             element_id=element_id,
             is_checked=action["is_checked"],
             reasoning=reasoning,
-            confidence_float=confidence_float,
         )
 
     if action_type == ActionType.WAIT:
-        return WaitAction(reasoning=reasoning, confidence_float=confidence_float)
+        return WaitAction(reasoning=reasoning)
 
     if action_type == ActionType.COMPLETE:
         return CompleteAction(
             reasoning=reasoning,
-            confidence_float=confidence_float,
             data_extraction_goal=data_extraction_goal,
             errors=action["errors"] if "errors" in action else [],
         )
 
     if action_type == "null":
-        return NullAction(reasoning=reasoning, confidence_float=confidence_float)
+        return NullAction(reasoning=reasoning)
 
     if action_type == ActionType.SOLVE_CAPTCHA:
-        return SolveCaptchaAction(reasoning=reasoning, confidence_float=confidence_float)
+        return SolveCaptchaAction(reasoning=reasoning)
 
     raise UnsupportedActionType(action_type=action_type)
 
