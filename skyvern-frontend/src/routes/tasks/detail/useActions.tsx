@@ -53,7 +53,7 @@ function useActions(taskId: string): {
 
   const actions = stepsQuery.data
     ?.map((step) => {
-      const actionsAndResults = step.output.actions_and_results;
+      const actionsAndResults = step.output?.actions_and_results ?? [];
 
       const actions = actionsAndResults.map((actionAndResult, index) => {
         const action: Action = {
