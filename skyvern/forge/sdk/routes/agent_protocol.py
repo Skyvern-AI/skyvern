@@ -436,7 +436,7 @@ async def get_agent_task_step_artifacts(
         step_id,
         organization_id=current_org.organization_id,
     )
-    if SettingsManager.get_settings().ENV != "local":
+    if SettingsManager.get_settings().ENV != "local" or SettingsManager.get_settings().GENERATE_PRESIGNED_URLS:
         signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
         if signed_urls:
             for i, artifact in enumerate(artifacts):
