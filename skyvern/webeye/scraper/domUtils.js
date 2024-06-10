@@ -1146,15 +1146,17 @@ function createHintMarkersForGroups(groups) {
   for (let i = 0; i < hintMarkers.length; i++) {
     const hintMarker = hintMarkers[i];
     hintMarker.hintString = hintStrings[i];
-	try {
+    try {
       hintMarker.element.innerHTML = hintMarker.hintString.toUpperCase();
     } catch (e) {
       // Ensure trustedTypes is available
-      if (typeof trustedTypes !== 'undefined') {
+      if (typeof trustedTypes !== "undefined") {
         const escapeHTMLPolicy = trustedTypes.createPolicy("default", {
           createHTML: (string) => string,
         });
-        hintMarker.element.innerHTML = escapeHTMLPolicy.createHTML(hintMarker.hintString.toUpperCase());
+        hintMarker.element.innerHTML = escapeHTMLPolicy.createHTML(
+          hintMarker.hintString.toUpperCase(),
+        );
       } else {
         console.error("trustedTypes is not supported in this environment.");
       }
