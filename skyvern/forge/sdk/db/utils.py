@@ -241,6 +241,7 @@ def convert_to_bitwarden_login_credential_parameter(
         LOG.debug(
             "Converting BitwardenLoginCredentialParameterModel to BitwardenLoginCredentialParameter",
             bitwarden_login_credential_parameter_id=bitwarden_login_credential_parameter_model.bitwarden_login_credential_parameter_id,
+            bitwarden_collection_id=bitwarden_login_credential_parameter_model.bitwarden_collection_id,
         )
 
     return BitwardenLoginCredentialParameter(
@@ -251,6 +252,7 @@ def convert_to_bitwarden_login_credential_parameter(
         bitwarden_client_id_aws_secret_key=bitwarden_login_credential_parameter_model.bitwarden_client_id_aws_secret_key,
         bitwarden_client_secret_aws_secret_key=bitwarden_login_credential_parameter_model.bitwarden_client_secret_aws_secret_key,
         bitwarden_master_password_aws_secret_key=bitwarden_login_credential_parameter_model.bitwarden_master_password_aws_secret_key,
+        bitwarden_collection_id=bitwarden_login_credential_parameter_model.bitwarden_collection_id,
         url_parameter_key=bitwarden_login_credential_parameter_model.url_parameter_key,
         created_at=bitwarden_login_credential_parameter_model.created_at,
         modified_at=bitwarden_login_credential_parameter_model.modified_at,
