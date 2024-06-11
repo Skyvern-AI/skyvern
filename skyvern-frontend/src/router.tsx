@@ -12,6 +12,7 @@ import { TaskActions } from "./routes/tasks/detail/TaskActions";
 import { TaskRecording } from "./routes/tasks/detail/TaskRecording";
 import { TaskParameters } from "./routes/tasks/detail/TaskParameters";
 import { StepArtifactsLayout } from "./routes/tasks/detail/StepArtifactsLayout";
+import { CreateNewTaskFromPrompt } from "./routes/tasks/create/CreateNewTaskFromPrompt";
 
 const router = createBrowserRouter([
   {
@@ -65,6 +66,10 @@ const router = createBrowserRouter([
           {
             index: true,
             element: <TaskTemplates />,
+          },
+          {
+            path: "sk-prompt",
+            element: <CreateNewTaskFromPrompt />,
           },
           {
             path: ":template",
