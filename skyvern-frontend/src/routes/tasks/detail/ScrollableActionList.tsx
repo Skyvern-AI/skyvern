@@ -3,6 +3,12 @@ import { Action, ActionTypes, ReadableActionTypes } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { cn } from "@/util/utils";
 import {
@@ -105,9 +111,20 @@ function ScrollableActionList({
                   <div className="flex gap-2 items-center">
                     <span>#{index + 1}</span>
                     <Badge>{ReadableActionTypes[action.type]}</Badge>
-                    <div>{action.confidence}</div>
                   </div>
-                  <div>
+                  <div className="flex items-center gap-2">
+                    {typeof action.confidence === "number" && (
+                      <TooltipProvider>
+                        <Tooltip>
+                          <TooltipTrigger>
+                            <Badge variant="secondary">
+                              {action.confidence}
+                            </Badge>
+                          </TooltipTrigger>
+                          <TooltipContent>Confidence Score</TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    )}
                     {action.success ? (
                       <CheckCircledIcon className="w-6 h-6 text-success" />
                     ) : (
