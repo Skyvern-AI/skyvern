@@ -187,7 +187,7 @@ export type Option = {
 
 export type ActionApiResponse = {
   reasoning: string;
-  confidence_float: number;
+  confidence_float?: number;
   action_type: ActionType;
   text: string | null;
   option: Option | null;
@@ -196,7 +196,7 @@ export type ActionApiResponse = {
 
 export type Action = {
   reasoning: string;
-  confidence: number;
+  confidence?: number;
   type: ActionType;
   input: string;
   success: boolean;
