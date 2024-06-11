@@ -41,19 +41,33 @@ function TaskDetails() {
     return <div>Error: {taskError?.message}</div>;
   }
 
-  const informationContentLabel =
-    task?.status === Status.Completed
-      ? "Extracted Information"
-      : task?.status === Status.Failed || task?.status === Status.Terminated
-        ? "Failure Reason"
-        : "";
+  const showExtractedInformation =
+    task?.status === Status.Completed && task.extracted_information !== null;
+  const extractedInformation = showExtractedInformation ? (
+    <div className="flex items-center">
+      <Label className="w-32 shrink-0 text-lg">Extracted Information</Label>
+      <Textarea
+        rows={5}
+        value={JSON.stringify(task.extracted_information, null, 2)}
+        readOnly
+      />
+    </div>
+  ) : null;
 
-  const informationContent =
-    task?.status === Status.Completed
-      ? JSON.stringify(task.extracted_information, null, 2)
-      : task?.status === Status.Failed || task?.status === Status.Terminated
-        ? JSON.stringify(task?.failure_reason)
-        : "";
+  const showFailureReason =
+    task?.status === Status.Failed ||
+    task?.status === Status.Terminated ||
+    task?.status === Status.TimedOut;
+  const failureReason = showFailureReason ? (
+    <div className="flex items-center">
+      <Label className="w-32 shrink-0 text-lg">Failure Reason</Label>
+      <Textarea
+        rows={5}
+        value={JSON.stringify(task.failure_reason, null, 2)}
+        readOnly
+      />
+    </div>
+  ) : null;
 
   return (
     <div className="flex flex-col gap-8">
@@ -65,21 +79,17 @@ function TaskDetails() {
           <StatusBadge status={task?.status} />
         ) : null}
       </div>
-      <div>
-        {taskIsFetching ? (
-          <div className="flex items-center gap-2">
-            <Skeleton className="w-32 h-32" />
-            <Skeleton className="w-full h-32" />
-          </div>
-        ) : (
-          <div className="flex items-center">
-            <Label className="w-32 shrink-0 text-lg">
-              {informationContentLabel}
-            </Label>
-            <Textarea rows={5} value={informationContent} readOnly />
-          </div>
-        )}
-      </div>
+      {taskIsFetching ? (
+        <div className="flex items-center gap-2">
+          <Skeleton className="w-32 h-32" />
+          <Skeleton className="w-full h-32" />
+        </div>
+      ) : (
+        <>
+          {extractedInformation}
+          {failureReason}
+        </>
+      )}
       <div className="flex justify-center items-center">
         <div className="inline-flex border rounded bg-muted p-1">
           <NavLink
