@@ -157,12 +157,14 @@ class WorkflowRunContext:
                     client_secret,
                     master_password,
                     url,
+                    collection_id=parameter.bitwarden_collection_id,
                 )
                 if secret_credentials:
                     self.secrets[BitwardenConstants.URL] = url
                     self.secrets[BitwardenConstants.CLIENT_SECRET] = client_secret
                     self.secrets[BitwardenConstants.CLIENT_ID] = client_id
                     self.secrets[BitwardenConstants.MASTER_PASSWORD] = master_password
+                    self.secrets[BitwardenConstants.BW_COLLECTION_ID] = parameter.bitwarden_collection_id
 
                     random_secret_id = self.generate_random_secret_id()
                     # username secret
@@ -181,7 +183,6 @@ class WorkflowRunContext:
                         "totp": totp_secret_id,
                     }
             except BitwardenBaseError as e:
-                BitwardenService.logout()
                 LOG.error(f"Failed to get secret from Bitwarden. Error: {e}")
                 raise e
         elif isinstance(parameter, ContextParameter):

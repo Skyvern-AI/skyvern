@@ -450,6 +450,7 @@ class WorkflowService:
         url_parameter_key: str,
         key: str,
         description: str | None = None,
+        bitwarden_collection_id: str | None = None,
     ) -> Parameter:
         return await app.DATABASE.create_bitwarden_login_credential_parameter(
             workflow_id=workflow_id,
@@ -459,6 +460,7 @@ class WorkflowService:
             url_parameter_key=url_parameter_key,
             key=key,
             description=description,
+            bitwarden_collection_id=bitwarden_collection_id,
         )
 
     async def create_output_parameter(
@@ -833,6 +835,7 @@ class WorkflowService:
                         url_parameter_key=parameter.url_parameter_key,
                         key=parameter.key,
                         description=parameter.description,
+                        bitwarden_collection_id=parameter.bitwarden_collection_id,
                     )
                 elif parameter.parameter_type == ParameterType.WORKFLOW:
                     parameters[parameter.key] = await self.create_workflow_parameter(

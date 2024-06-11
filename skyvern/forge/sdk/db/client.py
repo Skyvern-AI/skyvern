@@ -1026,6 +1026,7 @@ class AgentDB:
         url_parameter_key: str,
         key: str,
         description: str | None = None,
+        bitwarden_collection_id: str | None = None,
     ) -> BitwardenLoginCredentialParameter:
         async with self.Session() as session:
             bitwarden_login_credential_parameter = BitwardenLoginCredentialParameterModel(
@@ -1036,6 +1037,7 @@ class AgentDB:
                 url_parameter_key=url_parameter_key,
                 key=key,
                 description=description,
+                bitwarden_collection_id=bitwarden_collection_id,
             )
             session.add(bitwarden_login_credential_parameter)
             await session.commit()
