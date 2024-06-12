@@ -67,7 +67,17 @@ https://github.com/Skyvern-AI/skyvern/assets/3853670/4fd87a66-39a1-4c3b-b9ac-64c
 # Skyvern Cloud
 We offer a managed cloud version of Skyvern that allows you to run Skyvern without having to manage the infrastructure. It allows to you run multiple Skyvern instances in parallel to automate your workflows at scale. In addition, Skyvern cloud comes bundled with anti-bot detection mechanisms, proxy network, and CAPTCHA solving to allow you to complete more complicated workflows.
 
-Skyvern Cloud is currently in private beta. If you're interested in using Skyvern Cloud, please reach out to us [via email](mailto:suchintan@skyvern.com) 
+If you'd like to try it out, 
+1. Navigate to [app.skyvern.com](https://app.skyvern.com)
+2. Create an account
+3. Set up your credit card information to get $5 of credits on us
+4. Kick off your first task and see Skyvern in action!
+
+Here are some tips that may help you on your adventure:
+1. Skyvern is really good at carrying out one task. If you give it too many instructions to do, it has a high likelihood of getting confused along the way.
+2. Being really explicit about goals is very important. For example, if you're generating an insurance quote, let it know very clearly how it can identify it's accomplished its goals. Use words like "COMPLETE" or "TERMINATE" to indicate success and failure modes, respectively.
+3. If you'd like to do more advanced things such as chaining multiple instructions together, or securely logging in, please feel free to book some time with me! I'm always happy to help
+
 
 # Quickstart
 This quickstart guide will walk you through getting Skyvern up and running on your local machine. 
