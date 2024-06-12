@@ -9,7 +9,6 @@ import requests
 import structlog
 from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Page
-from tenacity import RetryError, retry, stop_after_attempt, wait_exponential
 
 from skyvern import analytics
 from skyvern.exceptions import (
@@ -384,23 +383,14 @@ class ForgeAgent:
                 error_message=e.error_message,
             )
             failure_reason = f"Failed to navigate to URL. URL:{e.url}, Error:{e.error_message}"
-            try:
-                await self.fail_task(task, None, failure_reason)
-            except RetryError:
-                LOG.error(
-                    "Failed to update status and failure reason in database. Task might going to be time_out",
-                    task_id=task.task_id,
-                    step_id=step.step_id,
-                )
-            finally:
-                await self.send_task_response(
-                    task=task,
-                    last_step=step,
-                    api_key=api_key,
-                    close_browser_on_completion=close_browser_on_completion,
-                    skip_artifacts=True,
-                )
-
+            await self.fail_task(task, step, failure_reason)
+            await self.send_task_response(
+                task=task,
+                last_step=step,
+                api_key=api_key,
+                close_browser_on_completion=close_browser_on_completion,
+                skip_artifacts=True,
+            )
             return step, detailed_output, next_step
         except Exception as e:
             LOG.exception(
@@ -413,40 +403,35 @@ class ForgeAgent:
             if isinstance(e, SkyvernException):
                 failure_reason = f"unexpected SkyvernException({e.__class__.__name__})"
 
-            try:
-                await self.fail_task(task, step, failure_reason)
-            except RetryError:
-                LOG.error(
-                    "Failed to update status and failure reason in database. Task might going to be time_out",
-                    task_id=task.task_id,
-                    step_id=step.step_id,
-                )
-            finally:
-                await self.send_task_response(
-                    task=task,
-                    last_step=step,
-                    api_key=api_key,
-                    close_browser_on_completion=close_browser_on_completion,
-                )
-
-            return step, detailed_output, next_step
-
-    @retry(
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1, min=2, max=120),
-    )
-    async def fail_task(self, task: Task, step: Step | None, reason: str | None) -> None:
-        if step is not None and step.status.can_update_to(StepStatus.failed):
-            await self.update_step(
-                step=step,
-                status=StepStatus.failed,
+            await self.fail_task(task, step, failure_reason)
+            await self.send_task_response(
+                task=task,
+                last_step=step,
+                api_key=api_key,
+                close_browser_on_completion=close_browser_on_completion,
             )
+            return step, detailed_output, None
 
-        if task.status.can_update_to(TaskStatus.failed):
-            await self.update_task(
-                task,
-                status=TaskStatus.failed,
-                failure_reason=reason,
+    async def fail_task(self, task: Task, step: Step | None, reason: str | None) -> None:
+        try:
+            if step is not None and step.status.can_update_to(StepStatus.failed):
+                await self.update_step(
+                    step=step,
+                    status=StepStatus.failed,
+                )
+
+            if task.status.can_update_to(TaskStatus.failed):
+                await self.update_task(
+                    task,
+                    status=TaskStatus.failed,
+                    failure_reason=reason,
+                )
+        except Exception:
+            LOG.exception(
+                "Failed to update status and failure reason in database. Task might going to be time_out",
+                task_id=task.task_id,
+                step_id=step.step_id if step else "",
+                reason=reason,
             )
 
     async def agent_step(
