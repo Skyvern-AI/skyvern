@@ -211,12 +211,20 @@ def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None
         )
 
     if action_type == ActionType.SELECT_OPTION:
+        option = action["option"]
+        if option is None:
+            raise ValidationError("SelectOptionAction requires an 'option' field")
+        label = option.get("label")
+        value = option.get("value")
+        index = option.get("index")
+        if label is None and value is None and index is None:
+            raise ValidationError("At least one of 'label', 'value', or 'index' must be provided for a SelectOption")
         return SelectOptionAction(
             element_id=element_id,
             option=SelectOption(
-                label=action["option"]["label"],
-                value=action["option"]["value"],
-                index=action["option"]["index"],
+                label=label,
+                value=value,
+                index=index,
             ),
             reasoning=reasoning,
             confidence_float=confidence_float,
