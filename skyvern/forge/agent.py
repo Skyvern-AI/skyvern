@@ -345,17 +345,7 @@ class ForgeAgent:
                 step_id=step.step_id,
                 exc_info=True,
             )
-            await self.update_step(
-                step=step,
-                status=StepStatus.failed,
-                force_update=True,
-            )
-            task = await self.update_task(
-                task,
-                status=TaskStatus.failed,
-                failure_reason=e.message,
-                force_update=True,
-            )
+            await self.fail_task(task, step, e.message)
             await self.send_task_response(
                 task=task,
                 last_step=step,
@@ -1214,10 +1204,8 @@ class ForgeAgent:
         output: AgentStepOutput | None = None,
         is_last: bool | None = None,
         retry_index: int | None = None,
-        force_update: bool = False,
     ) -> Step:
-        if not force_update:
-            step.validate_update(status, output, is_last)
+        step.validate_update(status, output, is_last)
         updates: dict[str, Any] = {}
         if status is not None:
             updates["status"] = status
@@ -1251,10 +1239,8 @@ class ForgeAgent:
         status: TaskStatus,
         extracted_information: dict[str, Any] | list | str | None = None,
         failure_reason: str | None = None,
-        force_update: bool = False,
     ) -> Task:
-        if not force_update:
-            task.validate_update(status, extracted_information, failure_reason)
+        task.validate_update(status, extracted_information, failure_reason)
         updates: dict[str, Any] = {}
         if status is not None:
             updates["status"] = status
