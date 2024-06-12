@@ -3,9 +3,10 @@ from datetime import datetime
 from typing import Awaitable, Callable
 
 import structlog
-from fastapi import APIRouter, FastAPI, Response
+from fastapi import APIRouter, FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 from starlette.requests import HTTPConnection, Request
 from starlette_context.middleware import RawContextMiddleware
 from starlette_context.plugins.base import Plugin
@@ -77,6 +78,10 @@ def get_agent_app(router: APIRouter = base_router) -> FastAPI:
     @app.exception_handler(SkyvernHTTPException)
     async def handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+
+    @app.exception_handler(ValidationError)
+    async def handle_pydantic_validation_error(request: Request, exc: ValidationError) -> JSONResponse:
+        return JSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, content={"detail": str(exc)})
 
     @app.exception_handler(Exception)
     async def unexpected_exception(request: Request, exc: Exception) -> JSONResponse:
