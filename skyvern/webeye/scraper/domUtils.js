@@ -480,12 +480,12 @@ function getElementContext(element) {
   // if the element already has a context, then add it to the list first
   for (var child of element.childNodes) {
     let childContext = "";
-    if (child.nodeType === Node.TEXT_NODE) {
+    if (child.nodeType === Node.TEXT_NODE && isElementVisible(element)) {
       if (!element.hasAttribute("unique_id")) {
-        childContext = child.data.trim();
+        childContext = getVisibleText(child).trim();
       }
     } else if (child.nodeType === Node.ELEMENT_NODE) {
-      if (!child.hasAttribute("unique_id")) {
+      if (!child.hasAttribute("unique_id") && isElementVisible(child)) {
         childContext = getElementContext(child);
       }
     }
@@ -496,13 +496,36 @@ function getElementContext(element) {
   return fullContext.join(";");
 }
 
+function getVisibleText(element) {
+  let visibleText = [];
+
+  function collectVisibleText(node) {
+    if (
+      node.nodeType === Node.TEXT_NODE &&
+      isElementVisible(node.parentElement)
+    ) {
+      const trimmedText = node.data.trim();
+      if (trimmedText.length > 0) {
+        visibleText.push(trimmedText);
+      }
+    } else if (node.nodeType === Node.ELEMENT_NODE && isElementVisible(node)) {
+      for (let child of node.childNodes) {
+        collectVisibleText(child);
+      }
+    }
+  }
+
+  collectVisibleText(element);
+  return visibleText.join(" ");
+}
+
 function getElementContent(element, skipped_element = null) {
   // DFS to get all the text content from all the nodes under the element
   if (skipped_element && element === skipped_element) {
     return "";
   }
 
-  let textContent = element.textContent;
+  let textContent = getVisibleText(element);
   let nodeContent = "";
   // if element has children, then build a list of text and join with a semicolon
   if (element.childNodes.length > 0) {
@@ -511,8 +534,10 @@ function getElementContent(element, skipped_element = null) {
     for (var child of element.childNodes) {
       let childText = "";
       if (child.nodeType === Node.TEXT_NODE) {
-        childText = child.data.trim();
-        nodeTextContentList.push(childText);
+        childText = getVisibleText(child).trim();
+        if (childText.length > 0) {
+          nodeTextContentList.push(childText);
+        }
       } else if (child.nodeType === Node.ELEMENT_NODE) {
         // childText = child.textContent.trim();
         childText = getElementContent(child, skipped_element);
@@ -563,7 +588,7 @@ function getListboxOptions(element) {
 
     selectOptions.push({
       optionIndex: i,
-      text: removeMultipleSpaces(ele.textContent),
+      text: removeMultipleSpaces(getVisibleText(ele)),
     });
   }
   return selectOptions;
@@ -785,7 +810,7 @@ function buildTreeFromBody(frame = "main.frame") {
         for (let i = 0; i < element.childNodes.length; i++) {
           var node = element.childNodes[i];
           if (node.nodeType === Node.TEXT_NODE) {
-            textContent += node.textContent.trim();
+            textContent += getVisibleText(node).trim();
           }
         }
 
