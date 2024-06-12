@@ -5,6 +5,7 @@ import subprocess
 from enum import StrEnum
 
 import structlog
+import tldextract
 
 from skyvern.exceptions import (
     BitwardenListItemsError,
@@ -117,12 +118,14 @@ class BitwardenService:
                 raise BitwardenUnlockError("Session key is empty.")
 
             # Step 3: Retrieve the items
+            # Extract the domain from the URL and search for items in Bitwarden with that domain
+            domain = tldextract.extract(url).domain
             list_command = [
                 "bw",
                 "list",
                 "items",
-                "--url",
-                url,
+                "--search",
+                domain,
                 "--session",
                 session_key,
             ]
