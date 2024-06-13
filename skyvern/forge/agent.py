@@ -17,6 +17,7 @@ from skyvern.exceptions import (
     FailedToSendWebhook,
     InvalidWorkflowTaskURLState,
     MissingBrowserStatePage,
+    SkyvernException,
     StepTerminationError,
     StepUnableToExecuteError,
     TaskNotFound,
@@ -344,17 +345,7 @@ class ForgeAgent:
                 step_id=step.step_id,
                 exc_info=True,
             )
-            await self.update_step(
-                step=step,
-                status=StepStatus.failed,
-                force_update=True,
-            )
-            task = await self.update_task(
-                task,
-                status=TaskStatus.failed,
-                failure_reason=e.message,
-                force_update=True,
-            )
+            await self.fail_task(task, step, e.message)
             await self.send_task_response(
                 task=task,
                 last_step=step,
@@ -381,11 +372,8 @@ class ForgeAgent:
                 url=e.url,
                 error_message=e.error_message,
             )
-            task = await self.update_task(
-                task,
-                status=TaskStatus.failed,
-                failure_reason=f"Failed to navigate to URL. URL:{e.url}, Error:{e.error_message}",
-            )
+            failure_reason = f"Failed to navigate to URL. URL:{e.url}, Error:{e.error_message}"
+            await self.fail_task(task, step, failure_reason)
             await self.send_task_response(
                 task=task,
                 last_step=step,
@@ -394,6 +382,47 @@ class ForgeAgent:
                 skip_artifacts=True,
             )
             return step, detailed_output, next_step
+        except Exception as e:
+            LOG.exception(
+                "Got an unexpected exception in step, fail the task",
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+
+            failure_reason = "unexpected exception"
+            if isinstance(e, SkyvernException):
+                failure_reason = f"unexpected SkyvernException({e.__class__.__name__})"
+
+            await self.fail_task(task, step, failure_reason)
+            await self.send_task_response(
+                task=task,
+                last_step=step,
+                api_key=api_key,
+                close_browser_on_completion=close_browser_on_completion,
+            )
+            return step, detailed_output, None
+
+    async def fail_task(self, task: Task, step: Step | None, reason: str | None) -> None:
+        try:
+            if step is not None and step.status.can_update_to(StepStatus.failed):
+                await self.update_step(
+                    step=step,
+                    status=StepStatus.failed,
+                )
+
+            if task.status.can_update_to(TaskStatus.failed):
+                await self.update_task(
+                    task,
+                    status=TaskStatus.failed,
+                    failure_reason=reason,
+                )
+        except Exception:
+            LOG.exception(
+                "Failed to update status and failure reason in database. Task might going to be time_out",
+                task_id=task.task_id,
+                step_id=step.step_id if step else "",
+                reason=reason,
+            )
 
     async def agent_step(
         self,
@@ -1175,10 +1204,8 @@ class ForgeAgent:
         output: AgentStepOutput | None = None,
         is_last: bool | None = None,
         retry_index: int | None = None,
-        force_update: bool = False,
     ) -> Step:
-        if not force_update:
-            step.validate_update(status, output, is_last)
+        step.validate_update(status, output, is_last)
         updates: dict[str, Any] = {}
         if status is not None:
             updates["status"] = status
@@ -1212,10 +1239,8 @@ class ForgeAgent:
         status: TaskStatus,
         extracted_information: dict[str, Any] | list | str | None = None,
         failure_reason: str | None = None,
-        force_update: bool = False,
     ) -> Task:
-        if not force_update:
-            task.validate_update(status, extracted_information, failure_reason)
+        task.validate_update(status, extracted_information, failure_reason)
         updates: dict[str, Any] = {}
         if status is not None:
             updates["status"] = status

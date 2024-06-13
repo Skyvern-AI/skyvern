@@ -95,8 +95,13 @@ class TaskStatus(StrEnum):
                 TaskStatus.queued,
                 TaskStatus.running,
                 TaskStatus.timed_out,
+                TaskStatus.failed,
             },
-            TaskStatus.queued: {TaskStatus.running, TaskStatus.timed_out},
+            TaskStatus.queued: {
+                TaskStatus.running,
+                TaskStatus.timed_out,
+                TaskStatus.failed,
+            },
             TaskStatus.running: {
                 TaskStatus.completed,
                 TaskStatus.failed,
