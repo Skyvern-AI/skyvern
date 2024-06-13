@@ -282,3 +282,18 @@ class UnsupportedActionType(SkyvernException):
 class InvalidElementForTextInput(SkyvernException):
     def __init__(self, element_id: str, tag_name: str):
         super().__init__(f"The {tag_name} element with id={element_id} doesn't support text input.")
+
+
+class ElementIsNotLabel(SkyvernException):
+    def __init__(self, tag_name: str):
+        super().__init__(f"<{tag_name}> element is not <label>")
+
+
+class MissingElementDict(SkyvernException):
+    def __init__(self, element_id: str) -> None:
+        super().__init__(f"Found no element in the dict. element_id={element_id}")
+
+
+class MissingElementInIframe(SkyvernException):
+    def __init__(self, element_id: str) -> None:
+        super().__init__(f"Found no iframe includes the element. element_id={element_id}")
