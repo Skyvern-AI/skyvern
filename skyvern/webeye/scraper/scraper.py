@@ -46,7 +46,6 @@ RESERVED_ATTRIBUTES = {
 
 ELEMENT_NODE_ATTRIBUTES = {
     "id",
-    "interactable",
 }
 
 
@@ -424,6 +423,9 @@ def trim_element_tree(elements: list[dict]) -> list[dict]:
         queue_ele = queue.pop(0)
         if "frame" in queue_ele:
             del queue_ele["frame"]
+
+        if not queue_ele.get("interactable"):
+            del queue_ele["id"]
 
         if "attributes" in queue_ele:
             tag_name = queue_ele["tagName"] if "tagName" in queue_ele else ""
