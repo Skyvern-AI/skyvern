@@ -12,12 +12,17 @@ import { SavedTasks } from "./SavedTasks";
 import { getSample } from "../data/sampleTaskData";
 import { Textarea } from "@/components/ui/textarea";
 import { useState } from "react";
-import { PaperPlaneIcon, ReloadIcon } from "@radix-ui/react-icons";
+import {
+  InfoCircledIcon,
+  PaperPlaneIcon,
+  ReloadIcon,
+} from "@radix-ui/react-icons";
 import { useMutation } from "@tanstack/react-query";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { getClient } from "@/api/AxiosClient";
 import { AxiosError } from "axios";
 import { toast } from "@/components/ui/use-toast";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
 const examplePrompts = [
   "What is the top post on hackernews?",
@@ -78,6 +83,22 @@ function TaskTemplates() {
 
   return (
     <div>
+      <Alert variant="warning">
+        <InfoCircledIcon className="h-4 w-4" />
+        <AlertTitle>
+          Have a complicated workflow you would like to automate?
+        </AlertTitle>
+        <AlertDescription>
+          <a
+            href="https://meetings.hubspot.com/suchintan"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="underline underline-offset-2 ml-auto"
+          >
+            Book a demo {"->"}
+          </a>
+        </AlertDescription>
+      </Alert>
       <section className="py-4">
         <header>
           <h1 className="text-3xl mb-2">Try a prompt</h1>
