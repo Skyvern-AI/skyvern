@@ -480,21 +480,18 @@ function SavedTaskForm({ initialValues }: Props) {
           >
             Copy cURL
           </Button>
-          {isDirty && (
-            <Button
-              type="submit"
-              name="save"
-              value="save"
-              variant="secondary"
-              disabled={saveTaskMutation.isPending}
-            >
-              {saveTaskMutation.isPending && (
-                <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-              )}
-              Save Changes
-            </Button>
-          )}
-
+          <Button
+            type="submit"
+            name="save"
+            value="save"
+            variant="secondary"
+            disabled={saveTaskMutation.isPending || !isDirty}
+          >
+            {saveTaskMutation.isPending && (
+              <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+            )}
+            Save Changes
+          </Button>
           <Button
             type="submit"
             name="create"
