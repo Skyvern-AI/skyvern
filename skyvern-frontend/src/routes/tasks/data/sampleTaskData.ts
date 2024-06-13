@@ -52,7 +52,7 @@ export const california_edd = {
 export const finditparts = {
   url: "https://www.finditparts.com",
   navigationGoal:
-    "Search for the specified product id, add it to cart and then navigate to the cart page. Your goal is COMPLETE when you're on the cart page and the specified product is in the cart",
+    "Search for the specified product id, add it to cart and then navigate to the cart page. Your goal is COMPLETE when you're on the cart page and the specified product is in the cart. Do not attempt to checkout.",
   dataExtractionGoal:
     "Extract all product quantity information from the cart page",
   navigationPayload: {
