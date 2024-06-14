@@ -2,21 +2,47 @@ import typing
 from enum import StrEnum
 
 import structlog
-from playwright.async_api import Locator, Page
+from playwright.async_api import FrameLocator, Locator, Page
 
+from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     ElementIsNotLabel,
     MissingElement,
     MissingElementDict,
     MissingElementInIframe,
     MultipleElementsFound,
+    SkyvernException,
 )
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.webeye.actions.handler import resolve_locator
 from skyvern.webeye.scraper.scraper import ScrapedPage
 
 LOG = structlog.get_logger()
 TEXT_INPUT_DELAY = 10
+
+
+def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, xpath: str) -> Locator:
+    iframe_path: list[str] = []
+
+    while frame != "main.frame":
+        iframe_path.append(frame)
+
+        frame_element = scrape_page.id_to_element_dict.get(frame)
+        if frame_element is None:
+            raise MissingElement(element_id=frame)
+
+        parent_frame = frame_element.get("frame")
+        if not parent_frame:
+            raise SkyvernException(f"element without frame: {frame_element}")
+
+        LOG.info(f"{frame} is a child frame of {parent_frame}")
+        frame = parent_frame
+
+    current_page: Page | FrameLocator = page
+    while len(iframe_path) > 0:
+        child_frame = iframe_path.pop()
+        current_page = current_page.frame_locator(f"[{SKYVERN_ID_ATTR}='{child_frame}']")
+
+    return current_page.locator(f"xpath={xpath}")
 
 
 class InteractiveElement(StrEnum):
