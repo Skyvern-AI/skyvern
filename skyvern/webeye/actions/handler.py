@@ -6,16 +6,15 @@ from typing import Any, Awaitable, Callable, List
 
 import structlog
 from deprecation import deprecated
-from playwright.async_api import FrameLocator, Locator, Page, TimeoutError
+from playwright.async_api import Locator, Page, TimeoutError
 
-from skyvern.constants import REPO_ROOT_DIR, SKYVERN_ID_ATTR
+from skyvern.constants import REPO_ROOT_DIR
 from skyvern.exceptions import (
     ImaginaryFileUrl,
     InvalidElementForTextInput,
     MissingElement,
     MissingFileUrl,
     MultipleElementsFound,
-    SkyvernException,
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -42,6 +41,7 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage
+from skyvern.webeye.utils.dom import resolve_locator
 
 LOG = structlog.get_logger()
 TEXT_INPUT_DELAY = 10  # 10ms between each character input
@@ -994,31 +994,6 @@ async def click_listbox_option(
         if "children" in child:
             bfs_queue.extend(child["children"])
     return False
-
-
-def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, xpath: str) -> Locator:
-    iframe_path: list[str] = []
-
-    while frame != "main.frame":
-        iframe_path.append(frame)
-
-        frame_element = scrape_page.id_to_element_dict.get(frame)
-        if frame_element is None:
-            raise MissingElement(element_id=frame)
-
-        parent_frame = frame_element.get("frame")
-        if not parent_frame:
-            raise SkyvernException(f"element without frame: {frame_element}")
-
-        LOG.info(f"{frame} is a child frame of {parent_frame}")
-        frame = parent_frame
-
-    current_page: Page | FrameLocator = page
-    while len(iframe_path) > 0:
-        child_frame = iframe_path.pop()
-        current_page = current_page.frame_locator(f"[{SKYVERN_ID_ATTR}='{child_frame}']")
-
-    return current_page.locator(f"xpath={xpath}")
 
 
 async def get_input_value(locator: Locator) -> str | None:
