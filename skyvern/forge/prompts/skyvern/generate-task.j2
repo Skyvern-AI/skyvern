@@ -1,10 +1,16 @@
 We are building an AI agent that can automate browser tasks. The task creation schema is a JSON object with the following fields:
 
-url: required field, the starting URL for the task. This will be the first page the agent visits in order to achieve its goals.
-navigation_goal: optional. The value should be a string that we can use as an input to a Large Language Modal. It needs to tell the agent the goal in terms of navigating the website. It needs to define a single goal. You can include explicit completion and failure criteria. You can define guardrails that could help the agent from taking certain actions or getting derailed.
-data_extraction_goal: optional. The value should be a string that we can use as an input to a Large Language Modal. It needs to tell the agent the goal in terms of extracting data. It needs to be a single goal.
-navigation_payload: optional. The value should be JSON. Use this field if there is any information for the agent to be able to complete the task such as values that can help fill a form, parameters for queries and so on.
-extracted_information_schema: optional. The exact schema of the data to be extracted.
+url: str. This is a required field. It is the starting URL for the task. This will be the first page the agent visits in order to achieve the goal.
+
+navigation_goal_reasoning: str. This is a required field. The reason why navigation goal is needed to achieve the goal. Navigation goal is needed when the agent needs to take actions on the website to achieve the goal such as clicking a button, typing in a search bar, or navigating to another URL.
+is_navigation_goal_required: bool. This is a required field. Based on the navigation_goal_reasoning, whether the navigation goal is required to achieve the task.
+navigation_goal: str. This is an optional field. If is_navigation_goal_required is true, then this field should be provided. Otherwise, provide the value null. The value should be a string that we can use as an input to a Large Language Modal. It needs to tell the agent what actions need to be taken to achieve the task. It needs to define a single goal. You can include explicit completion and failure criteria. You can define guardrails that could help the agent from taking certain actions or getting derailed.
+
+data_extraction_goal_reasoning: str. This is a required field. The reason why data extraction goal is needed to achieve the goal. Data extraction goal is needed when the agent needs to extract data from the website to achieve the goal.
+is_data_extraction_goal_required: bool. This is a required field. Based on data_extraction_goal_reasoning, whether the data extraction goal is required to achieve the goal.
+data_extraction_goal: str. This is an optional field. The value should be a string that we can use as an input to a Large Language Modal. It needs to tell the agent the goal in terms of extracting data. It needs to be a single goal.
+navigation_payload: json. This is an optional field. The value should be JSON. Use this field if there is any information for the agent to be able to complete the task such as values that can help fill a form, parameters for queries and so on.
+extracted_information_schema: json. This is an optional field. The exact schema of the data to be extracted. This field should be provided if there is a data_extraction_goal. This should be a JSON object that defines the schema of the data to be extracted.
 
 At least one of navigation goal or data extraction goal should be provided. The agent can't proceed without any goals. 
 
