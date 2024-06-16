@@ -665,13 +665,7 @@ function buildTreeFromBody(frame = "main.frame") {
     var element_id = element.getAttribute("unique_id") ?? uniqueId();
     var elementTagNameLower = element.tagName.toLowerCase();
     element.setAttribute("unique_id", element_id);
-    // if element is an "a" tag and has a target="_blank" attribute, remove the target attribute
-    // We're doing this so that skyvern can do all the navigation in a single page/tab and not open new tab
-    if (element.tagName.toLowerCase() === "a") {
-      if (element.getAttribute("target") === "_blank") {
-        element.removeAttribute("target");
-      }
-    }
+
     const attrs = {};
     for (const attr of element.attributes) {
       var attrValue = attr.value;
@@ -760,6 +754,14 @@ function buildTreeFromBody(frame = "main.frame") {
     if (element === null) {
       console.log("get a null element");
       return;
+    }
+
+    // if element is an "a" tag and has a target="_blank" attribute, remove the target attribute
+    // We're doing this so that skyvern can do all the navigation in a single page/tab and not open new tab
+    if (element.tagName.toLowerCase() === "a") {
+      if (element.getAttribute("target") === "_blank") {
+        element.removeAttribute("target");
+      }
     }
 
     // Check if the element is interactable
