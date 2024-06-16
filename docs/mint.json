@@ -48,41 +48,51 @@
       "name": "Skyvern Cloud",
       "icon": "cloud",
       "url": "https://app.skyvern.com"
+    },
+    {
+      "name": "Book a demo",
+      "icon": "calendar",
+      "url": "https://meetings.hubspot.com/suchintan"
     }
   ],
   "navigation": [
     {
-      "group": "Get Started",
+      "group": "Getting Started",
       "pages": [
         "introduction",
-        "getting-started"
+        "getting-started/skyvern-in-action",
+        "getting-started/quickstart-skyvern-cloud",
+        "getting-started/quickstart-open-source",
+        "getting-started/supported-features"
       ]
     },
     {
-      "group": "Running Tasks",
+      "group": "Tasks",
       "pages": [
         "running-tasks/introduction",
+        "running-tasks/prompting-tips",
         "running-tasks/advanced-features",
         "running-tasks/api-spec",
-        "running-tasks/prompting-tips",
-        "running-tasks/faq"
+        "running-tasks/webhooks",
+        "running-tasks/visualizing-results",
+        "running-tasks/visualizing-results-advanced"
       ]
     },
     {
-      "group": "Visualizer",
-      "pages": [
-        "visualizer/set-up",
-        "visualizer/tasks-and-steps",
-        "visualizer/debugging-a-step",
-        "visualizer/faq"
-      ]
-    },
-    {
-      "group": "Workflows",
+      "group": "Workflows (Beta)",
       "pages": [
         "workflows/introduction",
-        "workflows/components",
-        "workflows/faq"
+        "workflows/creating-workflows",
+        "workflows/running-workflows",
+        "workflows/workflow-blocks"
+      ]
+    },
+    {
+      "group": "Integrations",
+      "pages": [
+        "integrations/zapier",
+        "integrations/make.com",
+        "integrations/api"
       ]
     }
   ],
