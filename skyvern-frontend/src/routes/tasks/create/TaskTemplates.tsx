@@ -55,6 +55,10 @@ const templateSamples: {
     title: "bci_seguros",
     description: "Generate an auto insurance quote",
   },
+  job_application: {
+    title: "Job Application",
+    description: "Fill a job application form",
+  },
 };
 
 function TaskTemplates() {

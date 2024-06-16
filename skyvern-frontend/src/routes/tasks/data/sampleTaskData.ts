@@ -61,6 +61,19 @@ export const finditparts = {
   extractedInformationSchema: null,
 };
 
+export const job_application = {
+  url: "https://jobs.lever.co/leverdemo-8/45d39614-464a-4b62-a5cd-8683ce4fb80a/apply",
+  navigationGoal:
+    "Fill out the job application form and apply to the job. Fill out any public burden questions if they appear in the form. Your goal is complete when the page says you've successfully applied to the job. Terminate if you are unable to apply successfully.",
+  navigationPayload: {
+    name: "John Doe",
+    email: "john.doe@gmail.com",
+    phone: "123-456-7890",
+    resume_url: "https://www.msnlabs.com/img/resume-sample.pdf",
+    cover_letter: "Generate a compelling cover letter for me",
+  },
+};
+
 export const geico = {
   url: "https://www.geico.com",
   navigationGoal:
@@ -264,6 +277,9 @@ export function getSample(sample: SampleCase) {
     }
     case "bci_seguros": {
       return bci_seguros;
+    }
+    case "job_application": {
+      return job_application;
     }
     case "blank": {
       return blank;
