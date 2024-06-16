@@ -4,3 +4,5 @@ from pathlib import Path
 SKYVERN_ID_ATTR: str = "unique_id"
 SKYVERN_DIR = Path(__file__).parent
 REPO_ROOT_DIR = SKYVERN_DIR.parent
+
+INPUT_TEXT_TIMEOUT = 120000  # 2 minutes
