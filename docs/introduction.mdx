@@ -1,71 +1,87 @@
 ---
 title: Introduction
-description: 'Welcome to the home of your new documentation'
+description: '🐉 Automate Browser-based workflows using LLMs and Computer Vision 🐉'
 ---
 
-<img
-  className="block dark:hidden"
-  src="/images/hero-light.svg"
-  alt="Hero Light"
-/>
-<img
-  className="hidden dark:block"
-  src="/images/hero-dark.svg"
-  alt="Hero Dark"
-/>
+[Skyvern](https://www.skyvern.com) automates browser-based workflows using LLMs and computer vision. It provides a simple API endpoint to fully automate manual workflows, replacing brittle or unreliable automation solutions. 
+<p align="center">
+  <img src="images/geico_shu_recording_cropped.gif" alt="Recording of Skyvern automating an insurance quote being generated on Geico.com" />
+</p>
 
-## Setting up
+# Why Skyvern?
 
-The first step to world-class documentation is setting up your editing environments.
+Traditional approaches to browser automations required writing custom scripts for websites, often relying on DOM parsing and XPath-based interactions which would break whenever the website layouts changed.
 
-<CardGroup cols={2}>
-  <Card
-    title="Edit Your Docs"
-    icon="pen-to-square"
-    href="https://mintlify.com/docs/quickstart"
-  >
-    Get your docs set up locally for easy development
-  </Card>
-  <Card
-    title="Preview Changes"
-    icon="image"
-    href="https://mintlify.com/docs/development"
-  >
-    Preview your changes before you push to make sure they're perfect
-  </Card>
-</CardGroup>
+Instead of only relying on code-defined XPath interactions, Skyvern relies on prompts in addition to computer vision and LLMs to the mix to parse items in the viewport in real-time, create a plan for interaction and interact with them.
 
-## Make it yours
+This approach gives us a few advantages:
 
-Update your docs to your brand and add valuable content for the best user conversion.
+1. Skyvern can operate on websites it’s never seen before, as it’s able to map visual elements to actions necessary to complete a workflow, without any customized code
+1. Skyvern is resistant to website layout changes, as there are no pre-determined XPaths or other selectors our system is looking for while trying to navigate
+1. Skyvern is able to take a single workflow and apply it to a large number of websites, as it’s able to reason through the interactions necessary to complete the workflow
+1. Skyvern leverages LLMs to reason through interactions to ensure we can cover complex situations. Examples include:
+    1. If you wanted to get an auto insurance quote from Geico, the answer to a common question “Were you eligible to drive at 18?” could be inferred from the driver receiving their license at age 16
+    1. If you were doing competitor analysis, it’s understanding that an Arnold Palmer 22 oz can at 7/11 is almost definitely the same product as a 23 oz can at Gopuff (even though the sizes are slightly different, which could be a rounding error!)
+
+Want to see examples of Skyvern in action? [Check out some examples we have here](introduction/use-cases)
+
+# How it works
+Skyvern was inspired by the Task-Driven autonomous agent design popularized by [BabyAGI](https://github.com/yoheinakajima/babyagi) and [AutoGPT](https://github.com/Significant-Gravitas/AutoGPT) -- with one major bonus: we give Skyvern the ability to interact with websites using browser automation libraries like [Playwright](https://playwright.dev/).
+
+<picture>
+  <img className="hidden dark:block" src="images/skyvern-system-diagram-dark.png" alt="Skyvern's system diagram"/>
+  <img className="block dark:hidden" src="images/skyvern-system-diagram-light.png" alt="Skyvern's system diagram" />
+</picture>
+
+
+## Skyvern use-cases
 
 <CardGroup cols={2}>
   <Card
-    title="Customize Style"
-    icon="palette"
-    href="https://mintlify.com/docs/settings/global"
+    title="Automatically apply to jobs"
+    icon="magnifying-glass"
+    href="getting-started/skyvern-in-action#automatically-apply-to-jobs-on-sites-like-lever-co"
   >
-    Customize your docs to your company's colors and brands
+    Watch Skyvern automatically apply to jobs
   </Card>
   <Card
-    title="Reference APIs"
-    icon="code"
-    href="https://mintlify.com/docs/api-playground/openapi"
+    title="Automate e-commerce transactions"
+    icon="cart-shopping"
+    href="getting-started/skyvern-in-action#automate-transactions-on-e-commerce-websites"
   >
-    Automatically generate endpoints from an OpenAPI spec
+    Watch Skyvern automate purchases on e-commerce websites
   </Card>
   <Card
-    title="Add Components"
-    icon="screwdriver-wrench"
-    href="https://mintlify.com/docs/components/accordion"
+    title="Interact with government websites"
+    icon="landmark-dome"
+    href="getting-started/skyvern-in-action#navigating-to-government-websites-to-register-accounts-or-fill-out-forms"
   >
-    Build interactive features and designs to guide your users
+    Watch Skyvern automate interacting with government websites
   </Card>
   <Card
-    title="Get Inspiration"
-    icon="stars"
-    href="https://mintlify.com/customers"
+    title="Generate insurance quotes"
+    icon="clipboard"
+    href="getting-started/skyvern-in-action#retrieving-insurance-quotes-from-insurance-providers-in-any-language"
   >
-    Check out our showcase of our favorite documentation
+    Watch Skyvern navigate complex multi-page forms in any language
   </Card>
 </CardGroup>
+
+## Quickstart
+<CardGroup cols={2}>
+  <Card
+    title="Quickstart (Skyvern Cloud)"
+    icon="cloud"
+    href="getting-started/quickstart-skyvern-cloud"
+  >
+    Start automating tasks with the hosted version of Skyvern
+  </Card>
+  <Card
+    title="Quickstart (Open Source)"
+    icon="github"
+    href="getting-started/quickstart-skyvern-open-source"
+  >
+    Start automating tasks in your own cloud
+  </Card>
+</CardGroup>
+
