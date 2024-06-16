@@ -8,7 +8,7 @@ import structlog
 from deprecation import deprecated
 from playwright.async_api import Locator, Page, TimeoutError
 
-from skyvern.constants import REPO_ROOT_DIR
+from skyvern.constants import INPUT_TEXT_TIMEOUT, REPO_ROOT_DIR
 from skyvern.exceptions import (
     ImaginaryFileUrl,
     InvalidElementForTextInput,
@@ -268,8 +268,7 @@ async def handle_input_text_action(
 
     # If the input is a text input, we type the text character by character
     # 3 times the time it takes to type the text so it has time to finish typing
-    total_timeout = max(len(text) * TEXT_INPUT_DELAY * 3, SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
-    await locator.press_sequentially(text, timeout=total_timeout)
+    await locator.press_sequentially(text, timeout=INPUT_TEXT_TIMEOUT)
     return [ActionSuccess()]
 
 

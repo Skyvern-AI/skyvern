@@ -4,7 +4,7 @@ from enum import StrEnum
 import structlog
 from playwright.async_api import FrameLocator, Locator, Page
 
-from skyvern.constants import SKYVERN_ID_ATTR
+from skyvern.constants import INPUT_TEXT_TIMEOUT, SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     ElementIsNotLabel,
     MissingElement,
@@ -17,7 +17,6 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.scraper.scraper import ScrapedPage
 
 LOG = structlog.get_logger()
-TEXT_INPUT_DELAY = 10
 
 
 def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, xpath: str) -> Locator:
@@ -97,8 +96,7 @@ class SkyvernElement:
     async def input_sequentially(
         self, text: str, default_timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
     ) -> None:
-        total_timeout = max(len(text) * TEXT_INPUT_DELAY * 3, default_timeout)
-        await self.locator.press_sequentially(text, timeout=total_timeout)
+        await self.locator.press_sequentially(text, timeout=INPUT_TEXT_TIMEOUT)
 
 
 class DomUtil:
