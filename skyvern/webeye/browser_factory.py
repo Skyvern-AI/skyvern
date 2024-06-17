@@ -5,7 +5,7 @@ import tempfile
 import time
 import uuid
 from datetime import datetime
-from typing import Any, Awaitable, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 
 import structlog
 from playwright._impl._errors import TimeoutError
@@ -21,6 +21,7 @@ from skyvern.exceptions import (
     UnknownErrorWhileCreatingBrowserContext,
 )
 from skyvern.forge.sdk.core.skyvern_context import current
+from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.get_logger()
@@ -34,6 +35,7 @@ class BrowserContextCreator(Protocol):
 
 class BrowserContextFactory:
     _creators: dict[str, BrowserContextCreator] = {}
+    _validator: Callable[[Page], Awaitable[bool]] | None = None
 
     @staticmethod
     def get_subdir() -> str:
@@ -101,6 +103,16 @@ class BrowserContextFactory:
         except Exception as e:
             raise UnknownErrorWhileCreatingBrowserContext(browser_type, e) from e
 
+    @classmethod
+    def set_validate_browser_context(cls, validator: Callable[[Page], Awaitable[bool]]) -> None:
+        cls._validator = validator
+
+    @classmethod
+    async def validate_browser_context(cls, page: Page) -> bool:
+        if cls._validator is None:
+            return True
+        return await cls._validator(page)
+
 
 class BrowserArtifacts(BaseModel):
     video_path: str | None = None
@@ -155,7 +167,12 @@ class BrowserState:
             if page != self.page:
                 await page.close()
 
-    async def check_and_fix_state(self, url: str | None = None) -> None:
+    async def check_and_fix_state(
+        self,
+        url: str | None = None,
+        proxy_location: ProxyLocation | None = None,
+        task_id: str | None = None,
+    ) -> None:
         if self.pw is None:
             LOG.info("Starting playwright")
             self.pw = await async_playwright().start()
@@ -165,7 +182,12 @@ class BrowserState:
             (
                 browser_context,
                 browser_artifacts,
-            ) = await BrowserContextFactory.create_browser_context(self.pw, url=url)
+            ) = await BrowserContextFactory.create_browser_context(
+                self.pw,
+                url=url,
+                proxy_location=proxy_location,
+                task_id=task_id,
+            )
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts
             LOG.info("browser context is created")
@@ -216,9 +238,27 @@ class BrowserState:
         if self.browser_artifacts.video_path is None:
             self.browser_artifacts.video_path = await self.page.video.path() if self.page and self.page.video else None
 
-    async def get_or_create_page(self, url: str | None = None) -> Page:
-        await self.check_and_fix_state(url)
+    async def get_or_create_page(
+        self,
+        url: str | None = None,
+        proxy_location: ProxyLocation | None = None,
+        task_id: str | None = None,
+    ) -> Page:
+        if self.page is not None:
+            return self.page
+
+        await self.check_and_fix_state(url=url, proxy_location=proxy_location, task_id=task_id)
         assert self.page is not None
+
+        if not await BrowserContextFactory.validate_browser_context(self.page):
+            await self._close_all_other_pages()
+            if self.browser_context is not None:
+                await self.browser_context.close()
+            self.browser_context = None
+            self.page = None
+            await self.check_and_fix_state(url=url, proxy_location=proxy_location, task_id=task_id)
+            assert self.page is not None
+
         return self.page
 
     async def close(self, close_browser_on_completion: bool = True) -> None:

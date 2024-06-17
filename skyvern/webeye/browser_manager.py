@@ -60,7 +60,7 @@ class BrowserManager:
 
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.
-        await browser_state.get_or_create_page(task.url)
+        await browser_state.get_or_create_page(url=task.url, proxy_location=task.proxy_location, task_id=task.task_id)
 
         self.pages[task.task_id] = browser_state
         if task.workflow_run_id:
@@ -78,7 +78,7 @@ class BrowserManager:
 
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.
-        await browser_state.get_or_create_page(url)
+        await browser_state.get_or_create_page(url=url, proxy_location=workflow_run.proxy_location)
 
         self.pages[workflow_run.workflow_run_id] = browser_state
         return browser_state
