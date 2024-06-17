@@ -109,7 +109,7 @@ class OrganizationModel(Base):
     modified_at = Column(
         DateTime,
         default=datetime.datetime.utcnow,
-        onupdate=datetime.datetime,
+        onupdate=datetime.datetime.utcnow,
         nullable=False,
     )
 
@@ -133,7 +133,7 @@ class OrganizationAuthTokenModel(Base):
     modified_at = Column(
         DateTime,
         default=datetime.datetime.utcnow,
-        onupdate=datetime.datetime,
+        onupdate=datetime.datetime.utcnow,
         nullable=False,
     )
     deleted_at = Column(DateTime, nullable=True)

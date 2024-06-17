@@ -17,6 +17,7 @@ from skyvern.forge.sdk.core.permissions.permission_checker_factory import Permis
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Organization, Step
+from skyvern.forge.sdk.schemas.organizations import OrganizationUpdate
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration, TaskGenerationBase
 from skyvern.forge.sdk.schemas.tasks import (
     CreateTaskResponse,
@@ -693,3 +694,18 @@ async def generate_task(
     except LLMProviderError:
         LOG.error("Failed to generate task", exc_info=True)
         raise HTTPException(status_code=400, detail="Failed to generate task. Please try again later.")
+
+
+@base_router.put("/organizations/", include_in_schema=False)
+@base_router.put("/organizations")
+async def update_organization(
+    org_update: OrganizationUpdate,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Organization:
+    return await app.DATABASE.update_organization(
+        current_org.organization_id,
+        organization_name=org_update.organization_name,
+        webhook_callback_url=org_update.webhook_callback_url,
+        max_steps_per_run=org_update.max_steps_per_run,
+        max_retries_per_step=org_update.max_retries_per_step,
+    )

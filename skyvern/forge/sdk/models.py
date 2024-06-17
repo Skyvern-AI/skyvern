@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.webeye.actions.actions import ActionType
@@ -118,6 +118,8 @@ class Step(BaseModel):
 
 
 class Organization(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     organization_id: str
     organization_name: str
     webhook_callback_url: str | None = None
