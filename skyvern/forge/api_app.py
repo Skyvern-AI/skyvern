@@ -15,6 +15,7 @@ from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.routes.agent_protocol import base_router
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.scheduler import SCHEDULER
@@ -74,6 +75,10 @@ def get_agent_app(router: APIRouter = base_router) -> FastAPI:
         SCHEDULER.start()
 
         LOG.info("Server startup complete. Skyvern is now online")
+
+    @app.exception_handler(NotFoundError)
+    async def handle_not_found_error(request: Request, exc: NotFoundError) -> Response:
+        return Response(status_code=status.HTTP_404_NOT_FOUND)
 
     @app.exception_handler(SkyvernHTTPException)
     async def handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:

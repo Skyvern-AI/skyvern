@@ -485,6 +485,32 @@ class AgentDB:
 
         return convert_to_organization(org)
 
+    async def update_organization(
+        self,
+        organization_id: str,
+        organization_name: str | None = None,
+        webhook_callback_url: str | None = None,
+        max_steps_per_run: int | None = None,
+        max_retries_per_step: int | None = None,
+    ) -> Organization:
+        async with self.Session() as session:
+            organization = (
+                await session.scalars(select(OrganizationModel).filter_by(organization_id=organization_id))
+            ).first()
+            if not organization:
+                raise NotFoundError
+            if organization_name:
+                organization.organization_name = organization_name
+            if webhook_callback_url:
+                organization.webhook_callback_url = webhook_callback_url
+            if max_steps_per_run:
+                organization.max_steps_per_run = max_steps_per_run
+            if max_retries_per_step:
+                organization.max_retries_per_step = max_retries_per_step
+            await session.commit()
+            await session.refresh(organization)
+            return Organization.model_validate(organization)
+
     async def get_valid_org_auth_token(
         self,
         organization_id: str,
