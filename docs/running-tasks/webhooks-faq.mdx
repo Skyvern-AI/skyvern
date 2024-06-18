@@ -1,0 +1,36 @@
+---
+title: Webhooks FAQ
+description: 'How Skyvern notifies you when its done'
+---
+
+# FAQ 
+## Webhooks vs HTTP requests?
+
+We use Webhooks for executing tasks as the expected runtime of these jobs can exceed default HTTP timeouts (1 minute)
+
+## How do we handle webhook authentication? (ie how can we handle callbacks?)
+
+- a python example for how to generate the signature:
+
+```python
+def validate_skyvern_request_headers(request: Request) -> bool:
+		header_skyvern_signature = request.headers["x-skyvern-signature"]
+		payload = request.body() # this is a bytes
+		hash_obj = hmac.new(SKYVERN_API_KEY.encode("utf-8"), msg=payload, digestmod=hashlib.sha256)
+    client_generated_signature = hash_obj.hexdigest()
+		return header_skyvern_signature == client_generated_signature
+```
+
+SKYVERN_API_KEY: this is the [api key](/running-tasks/introduction) specific to your organization
+
+# Webhook common parameters
+
+| Parameter | Type | Required? | Sample Value | Description |
+| --- | --- | --- | --- | --- |
+| webhook_callback_url | String | yes | …  |  |
+
+# Required Headers
+
+| Parameter | Type | Required? | Sample Value | Description |
+| --- | --- | --- | --- | --- |
+| x-api-key | String | yes | eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e<br/>yJleHAiOjQ4MjU0MjI5NzUsInN1YiI6<br/>Im9fMTA2MTUxNzEyNjQ5ODUxMzQ2In0 | Bearer token that gives your backend access to the Skyvern API. This will be manually provided by us |

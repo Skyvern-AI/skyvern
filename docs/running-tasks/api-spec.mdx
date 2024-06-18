@@ -1,0 +1,99 @@
+---
+title: API Spec
+description: 'The core building block in Skyvern'
+---
+
+Tasks are the building block of Skyvern. They represent a single instruction to the browser to go do something using language models. Ex. “Go to alibaba and extract this information”
+
+## Request - Initiate a task (Webhook)
+
+### Body
+
+| Parameter | Type | Required? | Sample Value | Description |
+| --- | --- | --- | --- | --- |
+| url | String | yes | https://jobs.lever.co/leverdemo-8/45d39614-464a-4b62-a5cd-8683ce4fb80a/apply | The website that you would like to browse / scrape. This should be the ideal starting point for the agent |
+| webhook_callback_url | String | no | …  | The callback URL once our system is finished processing this async task |
+| navigation_goal | String | no | Apply for a job | The prompt that tells the agent what the user-facing goal is. This is the guiding light for the LLM as it navigates a particular website / sitemap to achieve this specified goal |
+| data_extraction_goal | String | no | Was the job application successful? | The prompt that instructs the agent to extract information once the agent has achieved its user_goal |
+| navigation_payload | Object | no |         "name": "Chris P. Bacon",<br/>"email": "mailto:chris@pbacon.com" | JSON-formatted payload with any “facts” or information that would help the agent perform its job. In the case of navigating an insurance quote, this payload would include any user information to help fill out the insurance flow such as date of birth, or age they got their license, and so on<br/><br/>This can include nested information, and the formatting isn’t validated |
+| proxy_location | String | yes | RESIDENTIAL | Proxy location for the web-browsing request. Please pass RESIDENTIAL as a value |
+| extracted_information_schema | JSON | no |  | Used to enforce a JSON schema spec to be enforced in the data_extraction_goal. Similar to https://json-schema.org/ definition. |
+
+## Example Request (Apply for a job)
+
+```python
+{
+    "url": "https://jobs.lever.co/leverdemo-8/45d39614-464a-4b62-a5cd-8683ce4fb80a/apply",
+    "navigation_goal": "Apply for a job",
+    "data_extraction_goal": "Was the job application successful?",
+    "proxy_location": "RESIDENTIAL",
+    "navigation_payload": {
+        "name": "Chris P. Bacon",
+        "email": "chris@pbacon.com"
+    }
+}
+```
+
+## Response
+
+| Parameter | Type | Always returned? | Sample Value | Description |
+| --- | --- | --- | --- | --- |
+| task_id | String | yes | t_123456 | The task id associated with this specific task |
+
+## Response Webhook - Task conclusion (POST)
+
+### Headers
+
+| Parameter | Type | Required? | Sample Value | Description |
+| --- | --- | --- | --- | --- |
+| x-skyvern-signature | String | yes | v0=a2114d57b48eac39b9ad189<br/>dd8316235a7b4a8d21a10bd275<br/>19666489c69b503 | Authentication token that allows our service to communicate with your backend service via callback / webhook <br/>We’ll be using the same strategy slack uses, as defined here: https://api.slack.com/authentication/verifying-requests-from-slack#making__validating-a-request |
+| x-skyvern-timestamp | String | yes | 1531420618 | Timestamp used to decode and validate the incoming webhook call<br/><br/>We’ll be using the same strategy slack uses, as defined here: https://api.slack.com/authentication/verifying-requests-from-slack#making__validating-a-request |
+
+### Body
+
+| Parameter | Type | Always returned? | Sample Value | Description |
+| --- | --- | --- | --- | --- |
+| task_id | String | yes | t_123456 | The task id associated with this specific task |
+| extracted_information | Object | Yes | 'price’: ‘$100.0’ | Unstructured JSON payload containing the extracted information as specified by the users’ input prompt |
+| screenshot_url | String | Yes | … url to screenshot … | Screenshot of the final page, where the data extraction occurs |
+| recording_url | String | Yes | .. url to recording … | Recording of the entire browsing session to help debug any issues |
+| failure_reason | String | No | “Failed to pass this page - missing information: date of birth” | A failure reason that caused the job to fail. This can range from internal errors (Skyvern side) or external errors (insufficient information provided) |
+
+## Request - Task Details (GET)
+
+You can use this API to poll for task status updates if you don’t want to wait for webhook callbacks.
+
+Request type: `GET`
+
+Production:`api.skyvern.com/api/v1/tasks/{task_id}`
+
+| Parameter | Type | Required? | Sample Value | Description |
+| --- | --- | --- | --- | --- |
+| task_id | String | yes | t_123 | The id of the task you want to check the status of |
+
+## Request - List Task Details (GET)
+
+Request type: `GET`
+
+Production:`api.skyvern.com/api/v1/tasks/`
+
+| Parameter | Type | Required? | Sample Value | Description |
+| --- | --- | --- | --- | --- |
+| page | Integer | no | 1 | default=1
+has to be ≥1 |
+| page_size | Integer | no | 10 | default=10
+has to be ≥1 |
+
+## Response - Task Details (GET)
+
+| Parameter | Type | Sample Value | Description |
+| --- | --- | --- | --- |
+| request | JSON |  | Includes the initial request sent to create the task. Fields included: url,webhook_callback_url,navigation_goal,data_extraction_goal,navigation_payload,proxy_location,extracted_information_schema  |
+| task_id | String | t_123 | The id of the task you want to check the status of |
+| status | String | SUCCESS / FAILURE / IN_PROGRESS | String indicating the status of this task |
+| created_at | Timestamp | 2022-11-22T22:55:55 | Timestamp indicating when the task was created. |
+| modified_at | Timestamp | 2022-11-22T22:55:55 | Timestamp indicating when the task was last updated. Used to detect long-running tasks. |
+| extracted_information | Object | Yes | 'price’: ‘$100.0’ |
+| screenshot_url | String | Yes | … url to screenshot … |
+| recording_url | String | Yes | .. url to recording … |
+| failure_reason | String | No | “Failed to pass this page - missing information: invalid password” |
