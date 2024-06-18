@@ -216,6 +216,10 @@ function isElementVisible(element) {
   if (element.tagName.toLowerCase() === "option")
     return element.parentElement && isElementVisible(element.parentElement);
 
+  if (element.className.toString().includes("select2-offscreen")) {
+    return false;
+  }
+
   const style = getElementComputedStyle(element);
   if (!style) return true;
   if (style.display === "contents") {
@@ -414,6 +418,20 @@ const isComboboxDropdown = (element) => {
   return role && haspopup && controls && readonly;
 };
 
+const isSelect2Dropdown = (element) => {
+  return (
+    element.tagName.toLowerCase() === "span" &&
+    element.className.toString().includes("select2-chosen")
+  );
+};
+
+const isSelect2MultiChoice = (element) => {
+  return (
+    element.tagName.toLowerCase() === "input" &&
+    element.className.toString().includes("select2-input")
+  );
+};
+
 const checkParentClass = (className) => {
   const targetParentClasses = ["field", "entry"];
   for (let i = 0; i < targetParentClasses.length; i++) {
@@ -594,6 +612,58 @@ function getListboxOptions(element) {
   return selectOptions;
 }
 
+async function getSelect2OptionElements() {
+  let optionList = [];
+
+  while (true) {
+    oldOptionCount = optionList.length;
+    let newOptionList = document.querySelectorAll(
+      "#select2-drop li[role='option']",
+    );
+    if (newOptionList.length === oldOptionCount) {
+      console.log("no more options loaded, wait 5s to query again");
+      // sometimes need more time to load the options, so sleep 10s and try again
+      await sleep(5000); // wait 5s
+      newOptionList = document.querySelectorAll(
+        "#select2-drop li[role='option']",
+      );
+      console.log(newOptionList.length, " options found, after 5s");
+    }
+
+    optionList = newOptionList;
+    if (optionList.length === 0 || optionList.length === oldOptionCount) {
+      break;
+    }
+
+    lastOption = optionList[optionList.length - 1];
+    if (!lastOption.className.toString().includes("select2-more-results")) {
+      break;
+    }
+    lastOption.scrollIntoView();
+  }
+
+  return optionList;
+}
+
+async function getSelect2Options() {
+  const optionList = await getSelect2OptionElements();
+
+  let selectOptions = [];
+  for (let i = 0; i < optionList.length; i++) {
+    let ele = optionList[i];
+    if (ele.className.toString().includes("select2-more-results")) {
+      continue;
+    }
+
+    selectOptions.push({
+      optionIndex: i,
+      text: removeMultipleSpaces(ele.textContent),
+    });
+  }
+
+  return selectOptions;
+}
+
 function uniqueId() {
   const characters =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -605,63 +675,11 @@ function uniqueId() {
   return result;
 }
 
-function buildTreeFromBody(frame = "main.frame") {
+async function buildTreeFromBody(frame = "main.frame", open_select = false) {
   var elements = [];
   var resultArray = [];
 
-  const checkSelect2 = () => {
-    const showInvisible = (element) => {
-      if (element.style.display === "none") {
-        element.style.removeProperty("display");
-        return true;
-      }
-
-      const removedClass = [];
-      for (let i = 0; i < element.classList.length; i++) {
-        const className = element.classList[i];
-        if (className.includes("hidden")) {
-          removedClass.push(className);
-        }
-      }
-      if (removedClass.length !== 0) {
-        removedClass.forEach((className) => {
-          element.classList.remove(className);
-        });
-        return true;
-      }
-      return false;
-    };
-    // according to select2(https://select2.org/getting-started/basic-usage)
-    // select2-container seems to be the most common class in select2,
-    // and the invisible select seems to be the sibling to the "select2-container" element.
-    const selectContainers = document.querySelectorAll(".select2-container");
-
-    selectContainers.forEach((element) => {
-      // search select in previous
-      let _pre = element.previousElementSibling;
-      while (_pre) {
-        if (_pre.tagName.toLowerCase() === "select" && showInvisible(_pre)) {
-          // only hide the select2 container when an alternative select found
-          element.style.display = "none";
-          return;
-        }
-        _pre = _pre.previousElementSibling;
-      }
-
-      // search select in next
-      let _next = element.nextElementSibling;
-      while (_next) {
-        if (_next.tagName.toLowerCase() === "select" && showInvisible(_next)) {
-          // only hide the select2 container when an alternative select found
-          element.style.display = "none";
-          return;
-        }
-        _next = _next.nextElementSibling;
-      }
-    });
-  };
-
-  function buildElementObject(element, interactable) {
+  async function buildElementObject(element, interactable) {
     var element_id = element.getAttribute("unique_id") ?? uniqueId();
     var elementTagNameLower = element.tagName.toLowerCase();
     element.setAttribute("unique_id", element_id);
@@ -718,7 +736,7 @@ function buildTreeFromBody(frame = "main.frame") {
     } else if (attrs["role"] && attrs["role"].toLowerCase() === "listbox") {
       // if "role" key is inside attrs, then get all the elements with role "option" and get their text
       selectOptions = getListboxOptions(element);
-    } else if (isComboboxDropdown(element)) {
+    } else if (open_select && isComboboxDropdown(element)) {
       // open combobox dropdown to get options
       element.click();
       const listBox = document.getElementById(
@@ -733,6 +751,37 @@ function buildTreeFromBody(frame = "main.frame") {
           keyCode: 9,
           bubbles: true,
           key: "Tab",
+        }),
+      );
+    } else if (open_select && isSelect2Dropdown(element)) {
+      // click element to show options
+      element.dispatchEvent(
+        new MouseEvent("mousedown", {
+          bubbles: true,
+          view: window,
+        }),
+      );
+
+      selectOptions = await getSelect2Options();
+
+      // HACK: click again to close the dropdown
+      element.dispatchEvent(
+        new MouseEvent("mousedown", {
+          bubbles: true,
+          view: window,
+        }),
+      );
+    } else if (open_select && isSelect2MultiChoice(element)) {
+      // click element to show options
+      element.click();
+      selectOptions = await getSelect2Options();
+
+      // HACK: press ESC to close the dropdown
+      element.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          keyCode: 27,
+          bubbles: true,
+          key: "Escape",
         }),
       );
     }
@@ -750,7 +799,7 @@ function buildTreeFromBody(frame = "main.frame") {
       return [];
     }
   }
-  function processElement(element, parentId) {
+  async function processElement(element, parentId) {
     if (element === null) {
       console.log("get a null element");
       return;
@@ -766,7 +815,7 @@ function buildTreeFromBody(frame = "main.frame") {
 
     // Check if the element is interactable
     if (isInteractable(element)) {
-      var elementObj = buildElementObject(element, true);
+      var elementObj = await buildElementObject(element, true);
       elements.push(elementObj);
       // If the element is interactable but has no interactable parent,
       // then it starts a new tree, so add it to the result array
@@ -788,12 +837,14 @@ function buildTreeFromBody(frame = "main.frame") {
         return elementObj;
       }
       // Recursively process the children of the element
-      getChildElements(element).forEach((child) => {
-        processElement(child, elementObj.id);
-      });
+      const children = getChildElements(element);
+      for (let i = 0; i < children.length; i++) {
+        const childElement = children[i];
+        await processElement(childElement, elementObj.id);
+      }
       return elementObj;
     } else if (element.tagName.toLowerCase() === "iframe") {
-      let iframeElementObject = buildElementObject(element, false);
+      let iframeElementObject = await buildElementObject(element, false);
 
       elements.push(iframeElementObject);
       resultArray.push(iframeElementObject);
@@ -820,7 +871,7 @@ function buildTreeFromBody(frame = "main.frame") {
         // we don't use element context in HTML format,
         // so we need to make sure we parse all text node to avoid missing text in HTML.
         if (textContent && textContent.length <= 5000) {
-          var elementObj = buildElementObject(element, false);
+          var elementObj = await buildElementObject(element, false);
           elements.push(elementObj);
           if (parentId === null) {
             resultArray.push(elementObj);
@@ -833,9 +884,12 @@ function buildTreeFromBody(frame = "main.frame") {
           parentId = elementObj.id;
         }
       }
-      getChildElements(element).forEach((child) => {
-        processElement(child, parentId);
-      });
+
+      const children = getChildElements(element);
+      for (let i = 0; i < children.length; i++) {
+        const childElement = children[i];
+        await processElement(childElement, parentId);
+      }
     }
   }
 
@@ -1030,8 +1084,7 @@ function buildTreeFromBody(frame = "main.frame") {
 
   // TODO: Handle iframes
   // setup before parsing the dom
-  checkSelect2();
-  processElement(document.body, null);
+  await processElement(document.body, null);
 
   for (var element of elements) {
     if (
@@ -1247,17 +1300,17 @@ function removeBoundingBoxes() {
   }
 }
 
-function scrollToTop(draw_boxes) {
+async function scrollToTop(draw_boxes) {
   removeBoundingBoxes();
   window.scroll({ left: 0, top: 0, behavior: "instant" });
   if (draw_boxes) {
-    var elementsAndResultArray = buildTreeFromBody();
+    var elementsAndResultArray = await buildTreeFromBody();
     drawBoundingBoxes(elementsAndResultArray[0]);
   }
   return window.scrollY;
 }
 
-function scrollToNextPage(draw_boxes) {
+async function scrollToNextPage(draw_boxes) {
   // remove bounding boxes, scroll to next page with 200px overlap, then draw bounding boxes again
   // return true if there is a next page, false otherwise
   removeBoundingBoxes();
@@ -1267,8 +1320,12 @@ function scrollToNextPage(draw_boxes) {
     behavior: "instant",
   });
   if (draw_boxes) {
-    var elementsAndResultArray = buildTreeFromBody();
+    var elementsAndResultArray = await buildTreeFromBody();
     drawBoundingBoxes(elementsAndResultArray[0]);
   }
   return window.scrollY;
+}
+
+async function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

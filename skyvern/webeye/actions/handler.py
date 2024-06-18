@@ -11,6 +11,7 @@ from playwright.async_api import Locator, Page, TimeoutError
 from skyvern.constants import INPUT_TEXT_TIMEOUT, REPO_ROOT_DIR
 from skyvern.exceptions import (
     ImaginaryFileUrl,
+    InputActionOnSelect2Dropdown,
     InvalidElementForTextInput,
     MissingElement,
     MissingFileUrl,
@@ -41,7 +42,7 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage
-from skyvern.webeye.utils.dom import resolve_locator
+from skyvern.webeye.utils.dom import DomUtil, InteractiveElement, Select2Dropdown, resolve_locator
 
 LOG = structlog.get_logger()
 TEXT_INPUT_DELAY = 10  # 10ms between each character input
@@ -241,6 +242,11 @@ async def handle_input_text_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    dom = DomUtil(scraped_page, page)
+    skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
+    if await skyvern_element.is_select2_dropdown():
+        return [ActionFailure(InputActionOnSelect2Dropdown(element_id=action.element_id))]
+
     xpath, frame = await validate_actions_in_dom(action, page, scraped_page)
 
     locator = resolve_locator(scraped_page, page, frame, xpath)
@@ -392,6 +398,9 @@ async def handle_select_option_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    dom = DomUtil(scraped_page, page)
+    skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
+
     xpath, frame = await validate_actions_in_dom(action, page, scraped_page)
 
     locator = resolve_locator(scraped_page, page, frame, xpath)
@@ -428,17 +437,23 @@ async def handle_select_option_action(
 
     # check if the element is an a tag first. If yes, click it instead of selecting the option
     if tag_name == "label":
-        # TODO: this is a hack to handle the case where the label is the only thing that's clickable
-        # it's a label, look for the anchor tag
-        child_anchor_xpath = get_anchor_to_click(scraped_page, action.element_id)
-        if child_anchor_xpath:
-            LOG.info(
-                "SelectOptionAction is a label tag. Clicking the anchor tag instead of selecting the option",
-                action=action,
-                child_anchor_xpath=child_anchor_xpath,
-            )
-            click_action = ClickAction(element_id=action.element_id)
-            return await chain_click(task, scraped_page, page, click_action, child_anchor_xpath, frame)
+        # label pointed to select2 <a> element
+        select2_element_id: str | None = None
+        # search <a> anchor first and then search <input> anchor
+        select2_element_id = skyvern_element.find_element_id_in_label_children(InteractiveElement.A)
+        if select2_element_id is None:
+            select2_element_id = skyvern_element.find_element_id_in_label_children(InteractiveElement.INPUT)
+
+        if select2_element_id is not None:
+            select2_skyvern_element = await dom.get_skyvern_element_by_id(element_id=select2_element_id)
+            if await select2_skyvern_element.is_select2_dropdown():
+                LOG.info(
+                    "SelectOptionAction is on <label>. take the action on the real select2 element",
+                    action=action,
+                    select2_element_id=select2_element_id,
+                )
+                select_action = SelectOptionAction(element_id=select2_element_id, option=action.option)
+                return await handle_select_option_action(select_action, page, scraped_page, task, step)
 
         # handler the select action on <label>
         select_element_id = get_select_id_in_label_children(scraped_page, action.element_id)
@@ -462,16 +477,77 @@ async def handle_select_option_action(
             check_action = CheckboxAction(element_id=checkbox_element_id, is_checked=True)
             return await handle_checkbox_action(check_action, page, scraped_page, task, step)
 
-        return [ActionFailure(Exception("No anchor tag or select children found for the label for SelectOptionAction"))]
-    elif tag_name == "a":
-        # turn the SelectOptionAction into a ClickAction
+        return [ActionFailure(Exception("No element pointed by the label found"))]
+    elif await skyvern_element.is_select2_dropdown():
         LOG.info(
-            "SelectOptionAction is an anchor tag. Clicking it instead of selecting the option",
+            "This is a select2 dropdown",
             action=action,
         )
-        click_action = ClickAction(element_id=action.element_id)
-        action_result = await chain_click(task, scraped_page, page, click_action, xpath, frame)
-        return action_result
+        timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+
+        select2_element = Select2Dropdown(page=page, skyvern_element=skyvern_element)
+
+        await select2_element.open()
+        options = await select2_element.get_options()
+
+        result: List[ActionResult] = []
+        # select by label first, then by index
+        if action.option.label is not None or action.option.value is not None:
+            try:
+                for option in options:
+                    option_content = option.get("text")
+                    option_index = option.get("optionIndex", None)
+                    if option_index is None:
+                        LOG.warning(
+                            "Select2 option index is None",
+                            option=option,
+                        )
+                        continue
+                    if action.option.label == option_content or action.option.value == option_content:
+                        await select2_element.select_by_index(index=option_index, timeout=timeout)
+                        result.append(ActionSuccess())
+                        return result
+                LOG.info(
+                    "no target select2 option matched by label, try to select by index",
+                    action=action,
+                )
+            except Exception as e:
+                result.append(ActionFailure(e))
+                LOG.info(
+                    "failed to select by label in select2, try to select by index",
+                    exc_info=True,
+                    action=action,
+                )
+
+        if action.option.index is not None:
+            if action.option.index >= len(options):
+                result.append(ActionFailure(Exception("Select index out of bound")))
+                return result
+
+            try:
+                option_content = options[action.option.index].get("text")
+                if option_content != action.option.label:
+                    LOG.warning(
+                        "Select option label is not consistant to the action value. Might select wrong option.",
+                        option_content=option_content,
+                        action=action,
+                    )
+
+                await select2_element.select_by_index(index=action.option.index, timeout=timeout)
+                result.append(ActionSuccess())
+                return result
+            except Exception as e:
+                result.append(ActionFailure(e))
+                LOG.info(
+                    "failed to select by index in select2, try to select by label",
+                    exc_info=True,
+                    action=action,
+                )
+
+        if len(result) == 0:
+            result.append(ActionFailure(Exception("nothing is selected, try to select again.")))
+
+        return result
     elif tag_name == "ul" or tag_name == "div" or tag_name == "li":
         # if the role is listbox, find the option with the "label" or "value" and click that option element
         # references:
