@@ -297,3 +297,10 @@ class MissingElementDict(SkyvernException):
 class MissingElementInIframe(SkyvernException):
     def __init__(self, element_id: str) -> None:
         super().__init__(f"Found no iframe includes the element. element_id={element_id}")
+
+
+class InputActionOnSelect2Dropdown(SkyvernException):
+    def __init__(self, element_id: str):
+        super().__init__(
+            f"Input action on a select element, please try to use select action on this element. element_id={element_id}"
+        )

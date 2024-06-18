@@ -63,19 +63,18 @@
         "getting-started/skyvern-in-action",
         "getting-started/quickstart-skyvern-cloud",
         "getting-started/quickstart-open-source",
-        "getting-started/supported-features"
+        "getting-started/supported-functionality"
       ]
     },
     {
       "group": "Tasks",
       "pages": [
         "running-tasks/introduction",
-        "running-tasks/prompting-tips",
-        "running-tasks/advanced-features",
         "running-tasks/api-spec",
-        "running-tasks/webhooks",
+        "running-tasks/webhooks-faq",
         "running-tasks/visualizing-results",
-        "running-tasks/visualizing-results-advanced"
+        "running-tasks/prompting-tips",
+        "running-tasks/advanced-features"
       ]
     },
     {
