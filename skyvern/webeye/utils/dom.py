@@ -1,3 +1,4 @@
+import asyncio
 import typing
 from enum import StrEnum
 
@@ -14,7 +15,7 @@ from skyvern.exceptions import (
     SkyvernException,
 )
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.webeye.scraper.scraper import ScrapedPage
+from skyvern.webeye.scraper.scraper import ScrapedPage, get_select2_options
 
 LOG = structlog.get_logger()
 
@@ -45,9 +46,15 @@ def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, xpath: str
 
 
 class InteractiveElement(StrEnum):
+    A = "a"
     INPUT = "input"
     SELECT = "select"
     BUTTON = "button"
+
+
+class SkyvernOptionType(typing.TypedDict):
+    optionIndex: int
+    text: str
 
 
 class SkyvernElement:
@@ -59,6 +66,18 @@ class SkyvernElement:
     def __init__(self, locator: Locator, static_element: dict) -> None:
         self.__static_element = static_element
         self.locator = locator
+
+    async def is_select2_dropdown(self) -> bool:
+        tag_name = self.get_tag_name()
+        element_class = await self.get_attr("class")
+        if element_class is None:
+            return False
+        return (
+            (tag_name == "a" and "select2-choice" in element_class)
+            or (tag_name == "span" and "select2-chosen" in element_class)
+            or (tag_name == "span" and "select2-arrow" in element_class)
+            or (tag_name == "input" and "select2-input" in element_class)
+        )
 
     def get_tag_name(self) -> str:
         return self.__static_element.get("tagName", "")
@@ -136,3 +155,24 @@ class DomUtil:
             raise MultipleElementsFound(num=num_elements, xpath=xpath, element_id=element_id)
 
         return SkyvernElement(locator, element)
+
+
+class Select2Dropdown:
+    def __init__(self, page: Page, skyvern_element: SkyvernElement) -> None:
+        self.skyvern_element = skyvern_element
+        self.page = page
+
+    async def open(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
+        await self.skyvern_element.locator.click(timeout=timeout)
+        # wait for the options to load
+        await asyncio.sleep(3)
+
+    async def get_options(self) -> typing.List[SkyvernOptionType]:
+        options = await get_select2_options(self.page)
+        return typing.cast(typing.List[SkyvernOptionType], options)
+
+    async def select_by_index(
+        self, index: int, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    ) -> None:
+        anchor = self.page.locator("#select2-drop li[role='option']")
+        await anchor.nth(index).click(timeout=timeout)
