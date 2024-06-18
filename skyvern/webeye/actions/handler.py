@@ -516,11 +516,8 @@ async def handle_select_option_action(
         check_action = CheckboxAction(element_id=action.element_id, is_checked=True)
         return await handle_checkbox_action(check_action, page, scraped_page, task, step)
 
-    current_value = await locator.input_value()
-    # find the text of the option with the current value
-    option_locator = locator.locator(f'option[value="{current_value}"]')
-    option_text = await option_locator.text_content()
-    if option_text == action.option.label:
+    current_text = await locator.input_value()
+    if current_text == action.option.label:
         return [ActionSuccess()]
 
     try:
@@ -532,8 +529,9 @@ async def handle_select_option_action(
             label=action.option.label,
             timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
         )
-        # In case we need to unfocus the select element, press Tab
-        await page.keyboard.press("Tab")
+        await locator.click(
+            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        )
         return [ActionSuccess()]
     except Exception as e:
         if action.option.index is not None:
