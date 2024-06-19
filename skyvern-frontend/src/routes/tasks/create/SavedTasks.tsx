@@ -28,7 +28,7 @@ function createEmptyTaskTemplate() {
           parameter_type: "workflow",
           workflow_parameter_type: "json",
           key: "navigation_payload",
-          default_value: JSON.stringify({}),
+          default_value: "null",
         },
       ],
       blocks: [

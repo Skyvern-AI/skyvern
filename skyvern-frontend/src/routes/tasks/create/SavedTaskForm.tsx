@@ -39,6 +39,12 @@ import {
 } from "../data/descriptionHelperContent";
 import { SubmitEvent } from "@/types";
 import { AxiosError } from "axios";
+import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from "@/components/ui/accordion";
 
 const savedTaskFormSchema = z
   .object({
@@ -298,37 +304,7 @@ function SavedTaskForm({ initialValues }: Props) {
             </FormItem>
           )}
         />
-        <FormField
-          control={form.control}
-          name="webhookCallbackUrl"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>
-                <div className="flex gap-2">
-                  Webhook Callback URL
-                  <TooltipProvider>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <InfoCircledIcon />
-                      </TooltipTrigger>
-                      <TooltipContent className="max-w-[250px]">
-                        <p>{webhookCallbackUrlDescription}</p>
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                </div>
-              </FormLabel>
-              <FormControl>
-                <Input
-                  placeholder="example.com"
-                  {...field}
-                  value={field.value === null ? "" : field.value}
-                />
-              </FormControl>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+
         <FormField
           control={form.control}
           name="navigationGoal"
@@ -352,7 +328,7 @@ function SavedTaskForm({ initialValues }: Props) {
               <FormControl>
                 <Textarea
                   rows={5}
-                  placeholder="Navigation Goal"
+                  placeholder="How do you want Skyvern to navigate?"
                   {...field}
                   value={field.value === null ? "" : field.value}
                 />
@@ -384,7 +360,7 @@ function SavedTaskForm({ initialValues }: Props) {
               <FormControl>
                 <Textarea
                   rows={5}
-                  placeholder="Data Extraction Goal"
+                  placeholder="If you want Skyvern to extract data after it's finished navigating"
                   {...field}
                   value={field.value === null ? "" : field.value}
                 />
@@ -416,7 +392,7 @@ function SavedTaskForm({ initialValues }: Props) {
               <FormControl>
                 <Textarea
                   rows={5}
-                  placeholder="Navigation Payload"
+                  placeholder="Any context Skyvern needs to complete its actions (ex. text that may be required to fill out forms)"
                   {...field}
                   value={field.value === null ? "" : field.value}
                 />
@@ -425,38 +401,77 @@ function SavedTaskForm({ initialValues }: Props) {
             </FormItem>
           )}
         />
-        <FormField
-          control={form.control}
-          name="extractedInformationSchema"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>
-                <div className="flex gap-2">
-                  Extracted Information Schema
-                  <TooltipProvider>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <InfoCircledIcon />
-                      </TooltipTrigger>
-                      <TooltipContent className="max-w-[250px]">
-                        <p>{extractedInformationSchemaDescription}</p>
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                </div>
-              </FormLabel>
-              <FormControl>
-                <Textarea
-                  placeholder="Extracted Information Schema"
-                  rows={5}
-                  {...field}
-                  value={field.value === null ? "" : field.value}
-                />
-              </FormControl>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+        <Accordion type="single" collapsible>
+          <AccordionItem value="advanced-settings">
+            <AccordionTrigger>Advanced Settings</AccordionTrigger>
+            <AccordionContent className="space-y-8 px-1 py-4">
+              <FormField
+                control={form.control}
+                name="extractedInformationSchema"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>
+                      <div className="flex gap-2">
+                        Extracted Information Schema
+                        <TooltipProvider>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <InfoCircledIcon />
+                            </TooltipTrigger>
+                            <TooltipContent className="max-w-[250px]">
+                              <p>{extractedInformationSchemaDescription}</p>
+                            </TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                      </div>
+                    </FormLabel>
+                    <FormControl>
+                      <Textarea
+                        placeholder="Jsonc schema to force the json format for extracted information"
+                        rows={5}
+                        {...field}
+                        value={field.value === null ? "" : field.value}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="webhookCallbackUrl"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>
+                      <div className="flex gap-2">
+                        Webhook Callback URL
+                        <TooltipProvider>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <InfoCircledIcon />
+                            </TooltipTrigger>
+                            <TooltipContent className="max-w-[250px]">
+                              <p>{webhookCallbackUrlDescription}</p>
+                            </TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                      </div>
+                    </FormLabel>
+                    <FormControl>
+                      <Input
+                        placeholder="The URL of a webhook endpoint to send the extracted information"
+                        {...field}
+                        value={field.value === null ? "" : field.value}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </AccordionContent>
+          </AccordionItem>
+        </Accordion>
+
         <div className="flex justify-end gap-3">
           <Button
             type="button"
