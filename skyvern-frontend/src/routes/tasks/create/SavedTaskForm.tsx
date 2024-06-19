@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button";
 import {
   Form,
   FormControl,
+  FormDescription,
   FormField,
   FormItem,
   FormLabel,
@@ -39,6 +40,12 @@ import {
 } from "../data/descriptionHelperContent";
 import { SubmitEvent } from "@/types";
 import { AxiosError } from "axios";
+import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from "@/components/ui/accordion";
 
 const savedTaskFormSchema = z
   .object({
@@ -291,6 +298,7 @@ function SavedTaskForm({ initialValues }: Props) {
                   </TooltipProvider>
                 </div>
               </FormLabel>
+              <FormDescription>The starting URL for the task</FormDescription>
               <FormControl>
                 <Input placeholder="example.com" {...field} />
               </FormControl>
@@ -298,37 +306,7 @@ function SavedTaskForm({ initialValues }: Props) {
             </FormItem>
           )}
         />
-        <FormField
-          control={form.control}
-          name="webhookCallbackUrl"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>
-                <div className="flex gap-2">
-                  Webhook Callback URL
-                  <TooltipProvider>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <InfoCircledIcon />
-                      </TooltipTrigger>
-                      <TooltipContent className="max-w-[250px]">
-                        <p>{webhookCallbackUrlDescription}</p>
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                </div>
-              </FormLabel>
-              <FormControl>
-                <Input
-                  placeholder="example.com"
-                  {...field}
-                  value={field.value === null ? "" : field.value}
-                />
-              </FormControl>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+
         <FormField
           control={form.control}
           name="navigationGoal"
@@ -349,6 +327,9 @@ function SavedTaskForm({ initialValues }: Props) {
                   </TooltipProvider>
                 </div>
               </FormLabel>
+              <FormDescription>
+                How do you want Skyvern to navigate?
+              </FormDescription>
               <FormControl>
                 <Textarea
                   rows={5}
@@ -381,6 +362,10 @@ function SavedTaskForm({ initialValues }: Props) {
                   </TooltipProvider>
                 </div>
               </FormLabel>
+              <FormDescription>
+                If you want Skyvern to extract data after it's finished
+                navigating
+              </FormDescription>
               <FormControl>
                 <Textarea
                   rows={5}
@@ -413,6 +398,10 @@ function SavedTaskForm({ initialValues }: Props) {
                   </TooltipProvider>
                 </div>
               </FormLabel>
+              <FormDescription>
+                Any context Skyvern needs to complete its actions (ex. text that
+                may be required to fill out forms)
+              </FormDescription>
               <FormControl>
                 <Textarea
                   rows={5}
@@ -425,38 +414,85 @@ function SavedTaskForm({ initialValues }: Props) {
             </FormItem>
           )}
         />
-        <FormField
-          control={form.control}
-          name="extractedInformationSchema"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>
-                <div className="flex gap-2">
-                  Extracted Information Schema
-                  <TooltipProvider>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <InfoCircledIcon />
-                      </TooltipTrigger>
-                      <TooltipContent className="max-w-[250px]">
-                        <p>{extractedInformationSchemaDescription}</p>
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                </div>
-              </FormLabel>
-              <FormControl>
-                <Textarea
-                  placeholder="Extracted Information Schema"
-                  rows={5}
-                  {...field}
-                  value={field.value === null ? "" : field.value}
-                />
-              </FormControl>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+        <Accordion type="single" collapsible>
+          <AccordionItem value="advanced-settings">
+            <AccordionTrigger>Advanced Settings</AccordionTrigger>
+            <AccordionContent className="space-y-8 px-1 py-4">
+              <FormField
+                control={form.control}
+                name="extractedInformationSchema"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>
+                      <div className="flex gap-2">
+                        Extracted Information Schema
+                        <TooltipProvider>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <InfoCircledIcon />
+                            </TooltipTrigger>
+                            <TooltipContent className="max-w-[250px]">
+                              <p>{extractedInformationSchemaDescription}</p>
+                            </TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                      </div>
+                    </FormLabel>
+                    <FormDescription>
+                      Jsonc schema to force the json format for extracted
+                      information
+                    </FormDescription>
+                    <FormControl>
+                      <Textarea
+                        placeholder="Extracted Information Schema"
+                        rows={5}
+                        {...field}
+                        value={field.value === null ? "" : field.value}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="webhookCallbackUrl"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>
+                      <div className="flex gap-2">
+                        Webhook Callback URL
+                        <TooltipProvider>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <InfoCircledIcon />
+                            </TooltipTrigger>
+                            <TooltipContent className="max-w-[250px]">
+                              <p>{webhookCallbackUrlDescription}</p>
+                            </TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                      </div>
+                    </FormLabel>
+                    <FormDescription>
+                      The URL of a webhook endpoint to send the extracted
+                      information
+                    </FormDescription>
+                    <FormControl>
+                      <Input
+                        placeholder="example.com"
+                        {...field}
+                        value={field.value === null ? "" : field.value}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </AccordionContent>
+          </AccordionItem>
+        </Accordion>
+
         <div className="flex justify-end gap-3">
           <Button
             type="button"
