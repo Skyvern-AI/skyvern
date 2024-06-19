@@ -46,6 +46,8 @@ function CreateNewTaskFormPage() {
     (parameter: WorkflowParameter) => parameter.key === "navigation_payload",
   ).default_value;
 
+  const dataSchema = data.workflow_definition.blocks[0].data_schema;
+
   return (
     <SavedTaskForm
       initialValues={{
@@ -57,8 +59,7 @@ function CreateNewTaskFormPage() {
         navigationGoal: data.workflow_definition.blocks[0].navigation_goal,
         dataExtractionGoal:
           data.workflow_definition.blocks[0].data_extraction_goal,
-        extractedInformationSchema:
-          data.workflow_definition.blocks[0].data_schema,
+        extractedInformationSchema: JSON.stringify(dataSchema, null, 2),
         navigationPayload,
       }}
     />
