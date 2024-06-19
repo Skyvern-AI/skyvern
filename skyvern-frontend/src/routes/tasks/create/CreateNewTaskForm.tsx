@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import {
   Form,
   FormControl,
+  FormDescription,
   FormField,
   FormItem,
   FormLabel,
@@ -187,6 +188,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                   </TooltipProvider>
                 </div>
               </FormLabel>
+              <FormDescription>The starting URL for the task</FormDescription>
               <FormControl>
                 <Input placeholder="example.com" {...field} />
               </FormControl>
@@ -194,7 +196,6 @@ function CreateNewTaskForm({ initialValues }: Props) {
             </FormItem>
           )}
         />
-
         <FormField
           control={form.control}
           name="navigationGoal"
@@ -215,10 +216,13 @@ function CreateNewTaskForm({ initialValues }: Props) {
                   </TooltipProvider>
                 </div>
               </FormLabel>
+              <FormDescription>
+                How do you want Skyvern to navigate?
+              </FormDescription>
               <FormControl>
                 <Textarea
                   rows={5}
-                  placeholder="How do you want Skyvern to navigate?"
+                  placeholder="Navigation Goal"
                   {...field}
                   value={field.value === null ? "" : field.value}
                 />
@@ -247,10 +251,14 @@ function CreateNewTaskForm({ initialValues }: Props) {
                   </TooltipProvider>
                 </div>
               </FormLabel>
+              <FormDescription>
+                If you want Skyvern to extract data after it's finished
+                navigating
+              </FormDescription>
               <FormControl>
                 <Textarea
                   rows={5}
-                  placeholder="If you want Skyvern to extract data after it's finished navigating"
+                  placeholder="Data Extraction Goal"
                   {...field}
                   value={field.value === null ? "" : field.value}
                 />
@@ -279,10 +287,14 @@ function CreateNewTaskForm({ initialValues }: Props) {
                   </TooltipProvider>
                 </div>
               </FormLabel>
+              <FormDescription>
+                Any context Skyvern needs to complete its actions (ex. text that
+                may be required to fill out forms)
+              </FormDescription>
               <FormControl>
                 <Textarea
                   rows={5}
-                  placeholder="Any context Skyvern needs to complete its actions (ex. text that may be required to fill out forms)"
+                  placeholder="Navigation Payload"
                   {...field}
                   value={field.value === null ? "" : field.value}
                 />
@@ -315,9 +327,13 @@ function CreateNewTaskForm({ initialValues }: Props) {
                         </TooltipProvider>
                       </div>
                     </FormLabel>
+                    <FormDescription>
+                      Jsonc schema to force the json format for extracted
+                      information
+                    </FormDescription>
                     <FormControl>
                       <Textarea
-                        placeholder="Jsonc schema to force the json format for extracted information"
+                        placeholder="Extracted Information Schema"
                         rows={5}
                         {...field}
                         value={field.value === null ? "" : field.value}
@@ -347,9 +363,13 @@ function CreateNewTaskForm({ initialValues }: Props) {
                         </TooltipProvider>
                       </div>
                     </FormLabel>
+                    <FormDescription>
+                      The URL of a webhook endpoint to send the extracted
+                      information
+                    </FormDescription>
                     <FormControl>
                       <Input
-                        placeholder="The URL of a webhook endpoint to send the extracted information"
+                        placeholder="example.com"
                         {...field}
                         value={field.value === null ? "" : field.value}
                       />
