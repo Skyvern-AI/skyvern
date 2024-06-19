@@ -61,23 +61,39 @@ const savedTaskFormSchema = z
     navigationPayload: z.string().or(z.null()).optional(),
     extractedInformationSchema: z.string().or(z.null()).optional(),
   })
-  .superRefine(({ navigationGoal, dataExtractionGoal }, ctx) => {
-    if (!navigationGoal && !dataExtractionGoal) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message:
-          "At least one of navigation goal or data extraction goal must be provided",
-        path: ["navigationGoal"],
-      });
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message:
-          "At least one of navigation goal or data extraction goal must be provided",
-        path: ["dataExtractionGoal"],
-      });
-      return z.NEVER;
-    }
-  });
+  .superRefine(
+    (
+      { navigationGoal, dataExtractionGoal, extractedInformationSchema },
+      ctx,
+    ) => {
+      if (!navigationGoal && !dataExtractionGoal) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            "At least one of navigation goal or data extraction goal must be provided",
+          path: ["navigationGoal"],
+        });
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            "At least one of navigation goal or data extraction goal must be provided",
+          path: ["dataExtractionGoal"],
+        });
+        return z.NEVER;
+      }
+      if (extractedInformationSchema) {
+        try {
+          JSON.parse(extractedInformationSchema);
+        } catch (e) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "Invalid JSON",
+            path: ["extractedInformationSchema"],
+          });
+        }
+      }
+    },
+  );
 
 export type SavedTaskFormValues = z.infer<typeof savedTaskFormSchema>;
 
@@ -105,6 +121,17 @@ function createTaskRequestObject(formValues: SavedTaskFormValues) {
 }
 
 function createTaskTemplateRequestObject(values: SavedTaskFormValues) {
+  let extractedInformationSchema = null;
+  if (values.extractedInformationSchema) {
+    try {
+      extractedInformationSchema = JSON.parse(
+        values.extractedInformationSchema,
+      );
+    } catch (e) {
+      extractedInformationSchema = values.extractedInformationSchema;
+    }
+  }
+
   return {
     title: values.title,
     description: values.description,
@@ -126,7 +153,7 @@ function createTaskTemplateRequestObject(values: SavedTaskFormValues) {
           url: values.url,
           navigation_goal: values.navigationGoal,
           data_extraction_goal: values.dataExtractionGoal,
-          data_schema: values.extractedInformationSchema,
+          data_schema: extractedInformationSchema,
         },
       ],
     },
