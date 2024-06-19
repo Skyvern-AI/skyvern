@@ -56,39 +56,23 @@ const createNewTaskFormSchema = z
     navigationPayload: z.string().or(z.null()).optional(),
     extractedInformationSchema: z.string().or(z.null()).optional(),
   })
-  .superRefine(
-    (
-      { navigationGoal, dataExtractionGoal, extractedInformationSchema },
-      ctx,
-    ) => {
-      if (!navigationGoal && !dataExtractionGoal) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message:
-            "At least one of navigation goal or data extraction goal must be provided",
-          path: ["navigationGoal"],
-        });
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message:
-            "At least one of navigation goal or data extraction goal must be provided",
-          path: ["dataExtractionGoal"],
-        });
-        return z.NEVER;
-      }
-      if (extractedInformationSchema) {
-        try {
-          JSON.parse(extractedInformationSchema);
-        } catch (e) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            message: "Invalid JSON",
-            path: ["extractedInformationSchema"],
-          });
-        }
-      }
-    },
-  );
+  .superRefine(({ navigationGoal, dataExtractionGoal }, ctx) => {
+    if (!navigationGoal && !dataExtractionGoal) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "At least one of navigation goal or data extraction goal must be provided",
+        path: ["navigationGoal"],
+      });
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "At least one of navigation goal or data extraction goal must be provided",
+        path: ["dataExtractionGoal"],
+      });
+      return z.NEVER;
+    }
+  });
 
 export type CreateNewTaskFormValues = z.infer<typeof createNewTaskFormSchema>;
 
@@ -101,17 +85,6 @@ function transform(value: unknown) {
 }
 
 function createTaskRequestObject(formValues: CreateNewTaskFormValues) {
-  let extractedInformationSchema = null;
-  if (formValues.extractedInformationSchema) {
-    try {
-      extractedInformationSchema = JSON.parse(
-        formValues.extractedInformationSchema,
-      );
-    } catch (e) {
-      extractedInformationSchema = formValues.extractedInformationSchema;
-    }
-  }
-
   return {
     url: formValues.url,
     webhook_callback_url: transform(formValues.webhookCallbackUrl),
@@ -120,7 +93,9 @@ function createTaskRequestObject(formValues: CreateNewTaskFormValues) {
     proxy_location: "RESIDENTIAL",
     error_code_mapping: null,
     navigation_payload: transform(formValues.navigationPayload),
-    extracted_information_schema: extractedInformationSchema,
+    extracted_information_schema: transform(
+      formValues.extractedInformationSchema,
+    ),
   };
 }
 
