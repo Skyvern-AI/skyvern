@@ -69,7 +69,7 @@ setup_llm_providers() {
         else
             update_or_add_env_var "ANTHROPIC_API_KEY" "$anthropic_api_key"
             update_or_add_env_var "ENABLE_ANTHROPIC" "true"
-            model_options+=("ANTHROPIC_CLAUDE3_OPUS" "ANTHROPIC_CLAUDE3_SONNET" "ANTHROPIC_CLAUDE3_HAIKU")
+            model_options+=("ANTHROPIC_CLAUDE3_OPUS" "ANTHROPIC_CLAUDE3_SONNET" "ANTHROPIC_CLAUDE3_HAIKU" "ANTHROPIC_CLAUDE3.5_SONNET")
         fi
     else
         update_or_add_env_var "ENABLE_ANTHROPIC" "false"
