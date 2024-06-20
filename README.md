@@ -201,7 +201,7 @@ Reach out to us (founders@skyvern.com) to see this live
 </p>
 
 ## Automate the job application process
-💡 See it in action at [app.skyvern.com](app.skyvern.com)
+💡 See it in action at [app.skyvern.com](https://app.skyvern.com)
 <p align="center">
   <img src="docs/images/job_application_demo.gif"/>
 </p>
