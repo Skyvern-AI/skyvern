@@ -193,11 +193,17 @@ You'll need to have Skyvern running locally if you want to try these examples ou
 ./run_skyvern.sh
 ```
 
-## Invoice Downloading
+## Invoice Downloading on many different websites
 Reach out to us (founders@skyvern.com) to see this live
 
 <p align="center">
   <img src="docs/images/invoice_downloading.gif"/>
+</p>
+
+## Automate the job application process
+💡 See it in action at [app.skyvern.com](app.skyvern.com)
+<p align="center">
+  <img src="docs/images/job_application_demo.gif"/>
 </p>
 
 ## Automate materials procurement for a manufacturing company
