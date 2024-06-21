@@ -167,6 +167,9 @@ class Select2Dropdown:
         # wait for the options to load
         await asyncio.sleep(3)
 
+    async def close(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
+        await self.page.locator("#select2-drop").press("Escape", timeout=timeout)
+
     async def get_options(self) -> typing.List[SkyvernOptionType]:
         options = await get_select2_options(self.page)
         return typing.cast(typing.List[SkyvernOptionType], options)
