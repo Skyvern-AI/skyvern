@@ -24,7 +24,7 @@ import { apiBaseUrl } from "@/util/env";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { InfoCircledIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { ToastAction } from "@radix-ui/react-toast";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import fetchToCurl from "fetch-to-curl";
 import { useForm, useFormState } from "react-hook-form";
 import { Link, useParams } from "react-router-dom";
@@ -46,6 +46,9 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
+import { OrganizationApiResponse } from "@/api/types";
+import { MAX_STEPS_DEFAULT } from "../constants";
+import { Skeleton } from "@/components/ui/skeleton";
 
 const savedTaskFormSchema = z
   .object({
@@ -60,6 +63,7 @@ const savedTaskFormSchema = z
     dataExtractionGoal: z.string().or(z.null()).optional(),
     navigationPayload: z.string().or(z.null()).optional(),
     extractedInformationSchema: z.string().or(z.null()).optional(),
+    maxSteps: z.number().optional(),
   })
   .superRefine(
     (
@@ -154,6 +158,7 @@ function createTaskTemplateRequestObject(values: SavedTaskFormValues) {
           navigation_goal: values.navigationGoal,
           data_extraction_goal: values.dataExtractionGoal,
           data_schema: extractedInformationSchema,
+          max_steps_per_run: values.maxSteps,
         },
       ],
     },
@@ -167,9 +172,30 @@ function SavedTaskForm({ initialValues }: Props) {
   const apiCredential = useApiCredential();
   const { template } = useParams();
 
+  const { data: organizations, isPending: organizationIsPending } = useQuery<
+    Array<OrganizationApiResponse>
+  >({
+    queryKey: ["organizations"],
+    queryFn: async () => {
+      const client = await getClient(credentialGetter);
+      return await client
+        .get("/organizations")
+        .then((response) => response.data.organizations);
+    },
+  });
+
+  const organization = organizations?.[0];
+
   const form = useForm<SavedTaskFormValues>({
     resolver: zodResolver(savedTaskFormSchema),
     defaultValues: initialValues,
+    values: {
+      ...initialValues,
+      maxSteps:
+        initialValues.maxSteps ??
+        organization?.max_steps_per_run ??
+        MAX_STEPS_DEFAULT,
+    },
   });
 
   const { isDirty } = useFormState({ control: form.control });
@@ -178,10 +204,19 @@ function SavedTaskForm({ initialValues }: Props) {
     mutationFn: async (formValues: SavedTaskFormValues) => {
       const taskRequest = createTaskRequestObject(formValues);
       const client = await getClient(credentialGetter);
+      const includeOverrideHeader =
+        formValues.maxSteps !== organization?.max_steps_per_run &&
+        formValues.maxSteps !== MAX_STEPS_DEFAULT;
       return client.post<
         ReturnType<typeof createTaskRequestObject>,
         { data: { task_id: string } }
-      >("/tasks", taskRequest);
+      >("/tasks", taskRequest, {
+        ...(includeOverrideHeader && {
+          headers: {
+            "x-max-steps-override": formValues.maxSteps ?? MAX_STEPS_DEFAULT,
+          },
+        }),
+      });
     },
     onError: (error: AxiosError) => {
       if (error.response?.status === 402) {
@@ -515,6 +550,40 @@ function SavedTaskForm({ initialValues }: Props) {
                     <FormMessage />
                   </FormItem>
                 )}
+              />
+              <FormField
+                control={form.control}
+                name="maxSteps"
+                render={({ field }) => {
+                  return (
+                    <FormItem>
+                      <FormLabel>Max Steps</FormLabel>
+                      <FormDescription>
+                        Max steps for this task. This will override your
+                        organization wide setting.
+                      </FormDescription>
+                      <FormControl>
+                        {organizationIsPending ? (
+                          <Skeleton className="h-8" />
+                        ) : (
+                          <Input
+                            {...field}
+                            type="number"
+                            min={1}
+                            max={
+                              organization?.max_steps_per_run ??
+                              MAX_STEPS_DEFAULT
+                            }
+                            value={field.value ?? MAX_STEPS_DEFAULT}
+                            onChange={(event) => {
+                              field.onChange(parseInt(event.target.value));
+                            }}
+                          />
+                        )}
+                      </FormControl>
+                    </FormItem>
+                  );
+                }}
               />
             </AccordionContent>
           </AccordionItem>

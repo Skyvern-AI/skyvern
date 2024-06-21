@@ -46,6 +46,7 @@ import {
 } from "@/components/ui/accordion";
 import { OrganizationApiResponse } from "@/api/types";
 import { Skeleton } from "@/components/ui/skeleton";
+import { MAX_STEPS_DEFAULT } from "../constants";
 
 const createNewTaskFormSchema = z
   .object({
@@ -94,15 +95,12 @@ function createTaskRequestObject(formValues: CreateNewTaskFormValues) {
     navigation_goal: transform(formValues.navigationGoal),
     data_extraction_goal: transform(formValues.dataExtractionGoal),
     proxy_location: "RESIDENTIAL",
-    error_code_mapping: null,
     navigation_payload: transform(formValues.navigationPayload),
     extracted_information_schema: transform(
       formValues.extractedInformationSchema,
     ),
   };
 }
-
-const MAX_STEPS_DEFAULT = 10;
 
 function CreateNewTaskForm({ initialValues }: Props) {
   const queryClient = useQueryClient();
