@@ -522,30 +522,36 @@ async def handle_select_option_action(
         if action.option.index is not None:
             if action.option.index >= len(options):
                 result.append(ActionFailure(Exception("Select index out of bound")))
-                return result
+            else:
+                try:
+                    option_content = options[action.option.index].get("text")
+                    if option_content != action.option.label:
+                        LOG.warning(
+                            "Select option label is not consistant to the action value. Might select wrong option.",
+                            option_content=option_content,
+                            action=action,
+                        )
 
-            try:
-                option_content = options[action.option.index].get("text")
-                if option_content != action.option.label:
-                    LOG.warning(
-                        "Select option label is not consistant to the action value. Might select wrong option.",
-                        option_content=option_content,
+                    await select2_element.select_by_index(index=action.option.index, timeout=timeout)
+                    result.append(ActionSuccess())
+                    return result
+                except Exception as e:
+                    result.append(ActionFailure(e))
+                    LOG.info(
+                        "failed to select by index in select2, try to select by label",
+                        exc_info=True,
                         action=action,
                     )
 
-                await select2_element.select_by_index(index=action.option.index, timeout=timeout)
-                result.append(ActionSuccess())
-                return result
-            except Exception as e:
-                result.append(ActionFailure(e))
-                LOG.info(
-                    "failed to select by index in select2, try to select by label",
-                    exc_info=True,
-                    action=action,
-                )
-
         if len(result) == 0:
             result.append(ActionFailure(Exception("nothing is selected, try to select again.")))
+
+        if isinstance(result[-1], ActionFailure):
+            LOG.info(
+                "Failed to select a select2 option, close the dropdown",
+                action=action,
+            )
+            await select2_element.close()
 
         return result
     elif tag_name == "ul" or tag_name == "div" or tag_name == "li":
