@@ -48,6 +48,8 @@ function CreateNewTaskFormPage() {
 
   const dataSchema = data.workflow_definition.blocks[0].data_schema;
 
+  const maxSteps = data.workflow_definition.blocks[0].max_steps_per_run;
+
   return (
     <SavedTaskForm
       initialValues={{
@@ -61,6 +63,7 @@ function CreateNewTaskFormPage() {
           data.workflow_definition.blocks[0].data_extraction_goal,
         extractedInformationSchema: JSON.stringify(dataSchema, null, 2),
         navigationPayload,
+        maxSteps,
       }}
     />
   );
