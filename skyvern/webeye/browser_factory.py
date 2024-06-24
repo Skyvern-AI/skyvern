@@ -15,6 +15,8 @@ from pydantic import BaseModel
 from skyvern.config import settings
 from skyvern.exceptions import (
     FailedToNavigateToUrl,
+    FailedToReloadPage,
+    FailedToStopLoadingPage,
     FailedToTakeScreenshot,
     MissingBrowserStatePage,
     UnknownBrowserType,
@@ -159,6 +161,12 @@ class BrowserState:
         self.page = page
         self.browser_artifacts = browser_artifacts
 
+    def __assert_page(self) -> Page:
+        if self.page is not None:
+            return self.page
+        LOG.error("BrowserState has no page")
+        raise MissingBrowserStatePage()
+
     async def _close_all_other_pages(self) -> None:
         if not self.browser_context or not self.page:
             return
@@ -261,6 +269,31 @@ class BrowserState:
 
         return self.page
 
+    async def stop_page_loading(self) -> None:
+        page = self.__assert_page()
+        try:
+            await page.evaluate("window.stop()")
+        except Exception as e:
+            LOG.exception(f"Error while stop loading the page: {repr(e)}")
+            raise FailedToStopLoadingPage(url=page.url, error_message=repr(e))
+
+    async def reload_page(self) -> None:
+        page = self.__assert_page()
+
+        LOG.info(f"Reload page {page.url} and waiting for 5 seconds")
+        try:
+            start_time = time.time()
+            await page.reload(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+            end_time = time.time()
+            LOG.info(
+                "Page loading time",
+                loading_time=end_time - start_time,
+            )
+            await asyncio.sleep(5)
+        except Exception as e:
+            LOG.exception(f"Error while reload url: {repr(e)}")
+            raise FailedToReloadPage(url=page.url, error_message=repr(e))
+
     async def close(self, close_browser_on_completion: bool = True) -> None:
         LOG.info("Closing browser state")
         if self.browser_context and close_browser_on_completion:
@@ -307,8 +340,5 @@ class BrowserState:
             raise FailedToTakeScreenshot(error_message=str(e)) from e
 
     async def take_screenshot(self, full_page: bool = False, file_path: str | None = None) -> bytes:
-        if not self.page:
-            LOG.error("BrowserState has no page")
-            raise MissingBrowserStatePage()
-
-        return await self.take_screenshot_from_page(self.page, full_page, file_path)
+        page = self.__assert_page()
+        return await self.take_screenshot_from_page(page, full_page, file_path)

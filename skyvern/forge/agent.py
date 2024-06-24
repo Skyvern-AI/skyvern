@@ -11,10 +11,13 @@ from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Page
 
 from skyvern import analytics
+from skyvern.constants import SCRAPE_TYPE_ORDER, ScrapeType
 from skyvern.exceptions import (
     BrowserStateMissingPage,
+    EmptyScrapePage,
     FailedToNavigateToUrl,
     FailedToSendWebhook,
+    FailedToTakeScreenshot,
     InvalidWorkflowTaskURLState,
     MissingBrowserStatePage,
     SkyvernException,
@@ -778,6 +781,36 @@ class ForgeAgent:
         )
         return step, browser_state, detailed_output
 
+    async def _scrape_with_type(
+        self,
+        task: Task,
+        step: Step,
+        browser_state: BrowserState,
+        scrape_type: ScrapeType,
+    ) -> ScrapedPage | None:
+        if scrape_type == ScrapeType.NORMAL:
+            pass
+
+        elif scrape_type == ScrapeType.STOPLOADING:
+            LOG.info(
+                "Try to stop loading the page before scraping",
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            await browser_state.stop_page_loading()
+        elif scrape_type == ScrapeType.RELOAD:
+            LOG.info(
+                "Try to reload the page before scraping",
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            await browser_state.reload_page()
+
+        return await scrape_website(
+            browser_state,
+            task.url,
+        )
+
     async def _build_and_record_step_prompt(
         self,
         task: Task,
@@ -788,10 +821,30 @@ class ForgeAgent:
         self.async_operation_pool.run_operation(task.task_id, AgentPhase.scrape)
 
         # Scrape the web page and get the screenshot and the elements
-        scraped_page = await scrape_website(
-            browser_state,
-            task.url,
-        )
+        # HACK: try scrape_website three time to handle screenshot timeout
+        # first time: normal scrape to take screenshot
+        # second time: stop window loading before scraping
+        # third time: reload the page before scraping
+        scraped_page: ScrapedPage | None = None
+        for scrape_type in SCRAPE_TYPE_ORDER:
+            try:
+                scraped_page = await self._scrape_with_type(
+                    task=task, step=step, browser_state=browser_state, scrape_type=scrape_type
+                )
+                break
+            except FailedToTakeScreenshot as e:
+                if scrape_type == ScrapeType.RELOAD:
+                    LOG.error(
+                        "Failed to take screenshot after stop-loading and reload-page retry",
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                    )
+                    raise e
+                continue
+
+        if scraped_page is None:
+            raise EmptyScrapePage
+
         await app.ARTIFACT_MANAGER.create_artifact(
             step=step,
             artifact_type=ArtifactType.HTML_SCRAPE,

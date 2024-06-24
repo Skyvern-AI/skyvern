@@ -10,7 +10,7 @@ from playwright.async_api import Frame, Page
 from pydantic import BaseModel
 
 from skyvern.constants import SKYVERN_DIR, SKYVERN_ID_ATTR
-from skyvern.exceptions import UnknownElementTreeFormat
+from skyvern.exceptions import FailedToTakeScreenshot, UnknownElementTreeFormat
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.browser_factory import BrowserState
 
@@ -169,7 +169,7 @@ async def scrape_website(
     try:
         num_retry += 1
         return await scrape_web_unsafe(browser_state, url)
-    except Exception:
+    except Exception as e:
         # NOTE: MAX_SCRAPING_RETRIES is set to 0 in both staging and production
         if num_retry > SettingsManager.get_settings().MAX_SCRAPING_RETRIES:
             LOG.error(
@@ -178,7 +178,10 @@ async def scrape_website(
                 url=url,
                 exc_info=True,
             )
-            raise Exception("Scraping failed.")
+            if isinstance(e, FailedToTakeScreenshot):
+                raise e
+            else:
+                raise Exception("Scraping failed.")
         LOG.info("Scraping failed, will retry", num_retry=num_retry, url=url)
         return await scrape_website(
             browser_state,
