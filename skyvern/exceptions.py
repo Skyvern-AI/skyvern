@@ -323,3 +323,30 @@ class InputActionOnSelect2Dropdown(SkyvernException):
         super().__init__(
             f"Input action on a select element, please try to use select action on this element. element_id={element_id}"
         )
+
+
+class FailToSelectByLabel(SkyvernException):
+    def __init__(self, element_id: str):
+        super().__init__(f"Failed to select by label. element_id={element_id}")
+
+
+class FailToSelectByIndex(SkyvernException):
+    def __init__(self, element_id: str):
+        super().__init__(f"Failed to select by index. element_id={element_id}")
+
+
+class OptionIndexOutOfBound(SkyvernException):
+    def __init__(self, element_id: str):
+        super().__init__(f"Option index is out of bound. element_id={element_id}")
+
+
+class FailToSelectByValue(SkyvernException):
+    def __init__(self, element_id: str):
+        super().__init__(f"Failed to select by value. element_id={element_id}")
+
+
+class EmptySelect(SkyvernException):
+    def __init__(self, element_id: str):
+        super().__init__(
+            f"nothing is selected, try to select again. element_id={element_id}",
+        )

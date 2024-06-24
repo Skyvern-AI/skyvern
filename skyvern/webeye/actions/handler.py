@@ -10,12 +10,17 @@ from playwright.async_api import Locator, Page, TimeoutError
 
 from skyvern.constants import INPUT_TEXT_TIMEOUT, REPO_ROOT_DIR
 from skyvern.exceptions import (
+    EmptySelect,
+    FailToSelectByIndex,
+    FailToSelectByLabel,
+    FailToSelectByValue,
     ImaginaryFileUrl,
     InputActionOnSelect2Dropdown,
     InvalidElementForTextInput,
     MissingElement,
     MissingFileUrl,
     MultipleElementsFound,
+    OptionIndexOutOfBound,
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -42,7 +47,7 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage
-from skyvern.webeye.utils.dom import DomUtil, InteractiveElement, Select2Dropdown, resolve_locator
+from skyvern.webeye.utils.dom import DomUtil, InteractiveElement, Select2Dropdown, SkyvernElement, resolve_locator
 
 LOG = structlog.get_logger()
 TEXT_INPUT_DELAY = 10  # 10ms between each character input
@@ -521,7 +526,7 @@ async def handle_select_option_action(
 
         if action.option.index is not None:
             if action.option.index >= len(options):
-                result.append(ActionFailure(Exception("Select index out of bound")))
+                result.append(ActionFailure(OptionIndexOutOfBound(action.element_id)))
             else:
                 try:
                     option_content = options[action.option.index].get("text")
@@ -531,20 +536,19 @@ async def handle_select_option_action(
                             option_content=option_content,
                             action=action,
                         )
-
                     await select2_element.select_by_index(index=action.option.index, timeout=timeout)
                     result.append(ActionSuccess())
                     return result
-                except Exception as e:
-                    result.append(ActionFailure(e))
+                except Exception:
+                    result.append(ActionFailure(FailToSelectByIndex(action.element_id)))
                     LOG.info(
-                        "failed to select by index in select2, try to select by label",
+                        "failed to select by index in select2",
                         exc_info=True,
                         action=action,
                     )
 
         if len(result) == 0:
-            result.append(ActionFailure(Exception("nothing is selected, try to select again.")))
+            result.append(ActionFailure(EmptySelect(action.element_id)))
 
         if isinstance(result[-1], ActionFailure):
             LOG.info(
@@ -598,58 +602,14 @@ async def handle_select_option_action(
         check_action = CheckboxAction(element_id=action.element_id, is_checked=True)
         return await handle_checkbox_action(check_action, page, scraped_page, task, step)
 
-    current_text = await locator.input_value()
-    if current_text == action.option.label:
-        return [ActionSuccess()]
-
     try:
-        # First click by label (if it matches)
-        await locator.click(
-            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
-        )
-        await locator.select_option(
-            label=action.option.label,
-            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
-        )
-        await locator.click(
-            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
-        )
-        return [ActionSuccess()]
-    except Exception as e:
-        if action.option.index is not None:
-            LOG.warning(
-                "Failed to click on the option by label, trying by index",
-                exc_info=True,
-                action=action,
-                xpath=xpath,
-                frame=frame,
-            )
-        else:
-            LOG.warning(
-                "Failed to take select action",
-                exc_info=True,
-                action=action,
-                xpath=xpath,
-                frame=frame,
-            )
-            return [ActionFailure(e)]
+        current_text = await locator.input_value()
+        if current_text == action.option.label or current_text == action.option.value:
+            return [ActionSuccess()]
+    except Exception:
+        LOG.info("failed to confirm if the select option has been done, force to take the action again.")
 
-    try:
-        # This means the supplied index was for the select element, not a reference to the xpath dict
-        await locator.click(
-            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
-        )
-        await locator.select_option(
-            index=action.option.index,
-            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
-        )
-        await locator.click(
-            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
-        )
-        return [ActionSuccess()]
-    except Exception as e:
-        LOG.warning("Failed to click on the option by index", action=action, exc_info=True)
-        return [ActionFailure(e)]
+    return await normal_select(action=action, skyvern_element=skyvern_element, xpath=xpath, frame=frame)
 
 
 async def handle_checkbox_action(
@@ -887,6 +847,118 @@ async def chain_click(
         if file:
             await asyncio.sleep(10)
         page.remove_listener("filechooser", fc_func)
+
+
+async def normal_select(
+    action: actions.SelectOptionAction,
+    skyvern_element: SkyvernElement,
+    xpath: str,
+    frame: str,
+) -> List[ActionResult]:
+    action_result: List[ActionResult] = []
+    is_success = False
+    locator = skyvern_element.locator
+
+    try:
+        await locator.click(
+            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        )
+    except Exception as e:
+        LOG.error(
+            "Failed to click before select action",
+            exc_info=True,
+            action=action,
+            xpath=xpath,
+            frame=frame,
+        )
+        action_result.append(ActionFailure(e))
+        return action_result
+
+    if not is_success and action.option.label is not None:
+        try:
+            # First click by label (if it matches)
+            await locator.select_option(
+                label=action.option.label,
+                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+            )
+            is_success = True
+            action_result.append(ActionSuccess())
+        except Exception:
+            action_result.append(ActionFailure(FailToSelectByLabel(action.element_id)))
+            LOG.error(
+                "Failed to take select action by label",
+                exc_info=True,
+                action=action,
+                xpath=xpath,
+                frame=frame,
+            )
+
+    if not is_success and action.option.value is not None:
+        try:
+            # click by value (if it matches)
+            await locator.select_option(
+                value=action.option.value,
+                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+            )
+            is_success = True
+            action_result.append(ActionSuccess())
+        except Exception:
+            action_result.append(ActionFailure(FailToSelectByValue(action.element_id)))
+            LOG.error(
+                "Failed to take select action by value",
+                exc_info=True,
+                action=action,
+                xpath=xpath,
+                frame=frame,
+            )
+
+    if not is_success and action.option.index is not None:
+        if action.option.index >= len(skyvern_element.get_options()):
+            action_result.append(ActionFailure(OptionIndexOutOfBound(action.element_id)))
+            LOG.error(
+                "option index is out of bound",
+                action=action,
+                xpath=xpath,
+                frame=frame,
+            )
+        else:
+            try:
+                # This means the supplied index was for the select element, not a reference to the xpath dict
+                await locator.select_option(
+                    index=action.option.index,
+                    timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+                )
+                is_success = True
+                action_result.append(ActionSuccess())
+            except Exception:
+                action_result.append(ActionFailure(FailToSelectByIndex(action.element_id)))
+                LOG.error(
+                    "Failed to click on the option by index",
+                    exc_info=True,
+                    action=action,
+                    xpath=xpath,
+                    frame=frame,
+                )
+
+    try:
+        await locator.click(
+            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        )
+    except Exception as e:
+        LOG.error(
+            "Failed to click after select action",
+            exc_info=True,
+            action=action,
+            xpath=xpath,
+            frame=frame,
+        )
+        action_result.append(ActionFailure(e))
+        return action_result
+
+    if len(action_result) == 0:
+        action_result.append(ActionFailure(EmptySelect(element_id=action.element_id)))
+
+    return action_result
 
 
 def get_anchor_to_click(scraped_page: ScrapedPage, element_id: str) -> str | None:
