@@ -110,6 +110,17 @@ function transform(value: unknown) {
 }
 
 function createTaskRequestObject(formValues: SavedTaskFormValues) {
+  let extractedInformationSchema = null;
+  if (formValues.extractedInformationSchema) {
+    try {
+      extractedInformationSchema = JSON.parse(
+        formValues.extractedInformationSchema,
+      );
+    } catch (e) {
+      extractedInformationSchema = formValues.extractedInformationSchema;
+    }
+  }
+
   return {
     url: formValues.url,
     webhook_callback_url: transform(formValues.webhookCallbackUrl),
@@ -118,9 +129,7 @@ function createTaskRequestObject(formValues: SavedTaskFormValues) {
     proxy_location: transform(formValues.proxyLocation),
     error_code_mapping: null,
     navigation_payload: transform(formValues.navigationPayload),
-    extracted_information_schema: transform(
-      formValues.extractedInformationSchema,
-    ),
+    extracted_information_schema: extractedInformationSchema,
   };
 }
 
