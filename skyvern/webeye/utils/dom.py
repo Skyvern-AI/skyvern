@@ -85,6 +85,13 @@ class SkyvernElement:
     def get_id(self) -> int | None:
         return self.__static_element.get("id")
 
+    def get_options(self) -> typing.List[SkyvernOptionType]:
+        options = self.__static_element.get("options", None)
+        if options is None:
+            return []
+
+        return typing.cast(typing.List[SkyvernOptionType], options)
+
     def find_element_id_in_label_children(self, element_type: InteractiveElement) -> str | None:
         tag_name = self.get_tag_name()
         if tag_name != "label":
