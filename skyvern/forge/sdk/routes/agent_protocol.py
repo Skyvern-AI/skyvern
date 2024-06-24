@@ -670,7 +670,7 @@ async def get_workflow(
 @base_router.post("/generate/task/")
 async def generate_task(
     data: GenerateTaskRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org_with_authentication),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> TaskGeneration:
     llm_prompt = prompt_engine.load_prompt("generate-task", user_prompt=data.prompt)
     try:
