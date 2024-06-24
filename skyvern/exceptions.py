@@ -165,6 +165,20 @@ class FailedToNavigateToUrl(SkyvernException):
         super().__init__(f"Failed to navigate to url {url}. Error message: {error_message}")
 
 
+class FailedToReloadPage(SkyvernException):
+    def __init__(self, url: str, error_message: str) -> None:
+        self.url = url
+        self.error_message = error_message
+        super().__init__(f"Failed to reload page url {url}. Error message: {error_message}")
+
+
+class FailedToStopLoadingPage(SkyvernException):
+    def __init__(self, url: str, error_message: str) -> None:
+        self.url = url
+        self.error_message = error_message
+        super().__init__(f"Failed to stop loading page url {url}. Error message: {error_message}")
+
+
 class UnexpectedTaskStatus(SkyvernException):
     def __init__(self, task_id: str, status: str) -> None:
         super().__init__(f"Unexpected task status {status} for task {task_id}")
@@ -216,6 +230,11 @@ class StepNotFound(SkyvernHTTPException):
 class FailedToTakeScreenshot(SkyvernException):
     def __init__(self, error_message: str) -> None:
         super().__init__(f"Failed to take screenshot. Error message: {error_message}")
+
+
+class EmptyScrapePage(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("Failed to scrape the page, returned an NONE result")
 
 
 class WorkflowRunContextNotInitialized(SkyvernException):
