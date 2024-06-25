@@ -65,13 +65,14 @@ class AsyncAWSClient:
             LOG.exception("S3 upload failed.", uri=uri)
 
     @execute_with_async_client(client_type=AWSClientType.S3)
-    async def download_file(self, uri: str, client: AioBaseClient = None) -> bytes | None:
+    async def download_file(self, uri: str, client: AioBaseClient = None, log_exception: bool = True) -> bytes | None:
         try:
             parsed_uri = S3Uri(uri)
             response = await client.get_object(Bucket=parsed_uri.bucket, Key=parsed_uri.key)
             return await response["Body"].read()
         except Exception:
-            LOG.exception("S3 download failed", uri=uri)
+            if log_exception:
+                LOG.exception("S3 download failed", uri=uri)
             return None
 
     @execute_with_async_client(client_type=AWSClientType.S3)
