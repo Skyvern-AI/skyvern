@@ -60,6 +60,18 @@ function TaskHistory() {
     return <div>Error: {error?.message}</div>;
   }
 
+  function handleNavigate(event: React.MouseEvent, id: string) {
+    if (event.ctrlKey || event.metaKey) {
+      window.open(
+        window.location.origin + `/tasks/${id}/actions`,
+        "_blank",
+        "noopener noreferrer",
+      );
+    } else {
+      navigate(`${id}/actions`);
+    }
+  }
+
   return (
     <>
       <div className="rounded-md border">
@@ -86,33 +98,25 @@ function TaskHistory() {
                   <TableRow key={task.task_id}>
                     <TableCell
                       className="w-1/4 cursor-pointer"
-                      onClick={() => {
-                        navigate(`${task.task_id}/actions`);
-                      }}
+                      onClick={(event) => handleNavigate(event, task.task_id)}
                     >
                       {task.task_id}
                     </TableCell>
                     <TableCell
                       className="w-1/4 cursor-pointer max-w-64 overflow-hidden whitespace-nowrap overflow-ellipsis"
-                      onClick={() => {
-                        navigate(`${task.task_id}/actions`);
-                      }}
+                      onClick={(event) => handleNavigate(event, task.task_id)}
                     >
                       {task.request.url}
                     </TableCell>
                     <TableCell
                       className="w-1/6 cursor-pointer"
-                      onClick={() => {
-                        navigate(`${task.task_id}/actions`);
-                      }}
+                      onClick={(event) => handleNavigate(event, task.task_id)}
                     >
                       <StatusBadge status={task.status} />
                     </TableCell>
                     <TableCell
                       className="w-1/4 cursor-pointer"
-                      onClick={() => {
-                        navigate(`${task.task_id}/actions`);
-                      }}
+                      onClick={(event) => handleNavigate(event, task.task_id)}
                     >
                       {basicTimeFormat(task.created_at)}
                     </TableCell>
