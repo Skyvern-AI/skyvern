@@ -727,6 +727,9 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
       text: getElementContent(element),
       children: [],
       rect: DomUtils.getVisibleClientRect(element, true),
+      // don't trim any attr of this element if keepAllAttr=True
+      keepAllAttr:
+        elementTagNameLower === "svg" || element.closest("svg") !== null,
     };
 
     // get options for select element or for listbox element
@@ -859,19 +862,30 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
         !isHidden(element) &&
         !isScriptOrStyle(element)
       ) {
-        let textContent = "";
-        for (let i = 0; i < element.childNodes.length; i++) {
-          var node = element.childNodes[i];
-          if (node.nodeType === Node.TEXT_NODE) {
-            textContent += getVisibleText(node).trim();
+        let elementObj = null;
+        if (element.tagName.toLowerCase() === "svg") {
+          // if element is <svg> we save all attributes and its children
+          elementObj = buildElementObject(element, false);
+        } else if (element.closest("svg")) {
+          // if elemnet is the children of <svg>
+          elementObj = buildElementObject(element, false);
+        } else {
+          // character length limit for non-interactable elements should be 5000
+          // we don't use element context in HTML format,
+          // so we need to make sure we parse all text node to avoid missing text in HTML.
+          let textContent = "";
+          for (let i = 0; i < element.childNodes.length; i++) {
+            var node = element.childNodes[i];
+            if (node.nodeType === Node.TEXT_NODE) {
+              textContent += getVisibleText(node).trim();
+            }
+          }
+          if (textContent && textContent.length <= 5000) {
+            elementObj = buildElementObject(element, false);
           }
         }
 
-        // character length limit for non-interactable elements should be 5000
-        // we don't use element context in HTML format,
-        // so we need to make sure we parse all text node to avoid missing text in HTML.
-        if (textContent && textContent.length <= 5000) {
-          var elementObj = await buildElementObject(element, false);
+        if (elementObj !== null) {
           elements.push(elementObj);
           if (parentId === null) {
             resultArray.push(elementObj);

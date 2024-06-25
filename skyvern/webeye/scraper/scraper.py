@@ -453,13 +453,16 @@ def trim_element_tree(elements: list[dict]) -> list[dict]:
         if not queue_ele.get("interactable"):
             del queue_ele["id"]
 
-        if "attributes" in queue_ele:
+        if "attributes" in queue_ele and not queue_ele.get("keepAllAttr", False):
             tag_name = queue_ele["tagName"] if "tagName" in queue_ele else ""
             new_attributes = _trimmed_attributes(tag_name, queue_ele["attributes"])
             if new_attributes:
                 queue_ele["attributes"] = new_attributes
             else:
                 del queue_ele["attributes"]
+        # remove the tag, don't need it in the HTML tree
+        del queue_ele["keepAllAttr"]
+
         if "children" in queue_ele:
             queue.extend(queue_ele["children"])
             if not queue_ele["children"]:
