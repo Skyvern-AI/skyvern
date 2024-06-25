@@ -14,6 +14,7 @@ import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/use-toast";
+import { envCredential } from "@/util/env";
 
 type StreamMessage = {
   task_id: string;
@@ -70,12 +71,18 @@ function TaskActions() {
 
     async function run() {
       // Create WebSocket connection.
-      const credential = await credentialGetter!();
+      let credential = null;
+      if (credentialGetter) {
+        const token = await credentialGetter();
+        credential = `?token=Bearer ${token}`;
+      } else {
+        credential = `?apikey=${envCredential}`;
+      }
       if (socket) {
         socket.close();
       }
       socket = new WebSocket(
-        `${wssBaseUrl}/stream/tasks/${taskId}?token=Bearer ${credential}`,
+        `${wssBaseUrl}/stream/tasks/${taskId}${credential}`,
       );
       // Listen for messages
       socket.addEventListener("message", (event) => {
