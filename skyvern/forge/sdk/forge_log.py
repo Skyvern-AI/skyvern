@@ -6,6 +6,14 @@ from structlog.typing import EventDict
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
+LOGGING_LEVEL_MAP: dict[str, int] = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
 
 def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
     """
@@ -73,8 +81,10 @@ def setup_logger() -> None:
         if SettingsManager.get_settings().JSON_LOGGING
         else []
     )
+    LOG_LEVEL_VAL = LOGGING_LEVEL_MAP.get(SettingsManager.get_settings().LOG_LEVEL, logging.INFO)
 
     structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(LOG_LEVEL_VAL),
         processors=[
             structlog.processors.add_log_level,
             structlog.processors.TimeStamper(fmt="iso"),
@@ -82,7 +92,7 @@ def setup_logger() -> None:
             structlog.processors.format_exc_info,
         ]
         + additional_processors
-        + [renderer]
+        + [renderer],
     )
     uvicorn_error = logging.getLogger("uvicorn.error")
     uvicorn_error.disabled = True
