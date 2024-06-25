@@ -461,8 +461,7 @@ async def handle_select_option_action(
                 return await handle_select_option_action(select_action, page, scraped_page, task, step)
 
         # handler the select action on <label>
-        select_element_id = get_select_id_in_label_children(scraped_page, action.element_id)
-        if select_element_id is not None:
+        if select_element_id := get_select_id_in_label_children(scraped_page, action.element_id):
             LOG.info(
                 "SelectOptionAction is on <label>. take the action on the real <select>",
                 action=action,
@@ -472,15 +471,14 @@ async def handle_select_option_action(
             return await handle_select_option_action(select_action, page, scraped_page, task, step)
 
         # handle the select action on <label> of checkbox/radio
-        checkbox_element_id = get_checkbox_id_in_label_children(scraped_page, action.element_id)
-        if checkbox_element_id is not None:
+        if checkbox_element_id := get_checkbox_id_in_label_children(scraped_page, action.element_id):
             LOG.info(
                 "SelectOptionAction is on <label> of <input> checkbox/radio. take the action on the real <input> checkbox/radio",
                 action=action,
                 checkbox_element_id=checkbox_element_id,
             )
-            check_action = CheckboxAction(element_id=checkbox_element_id, is_checked=True)
-            return await handle_checkbox_action(check_action, page, scraped_page, task, step)
+            select_action = SelectOptionAction(element_id=checkbox_element_id, option=action.option)
+            return await handle_select_option_action(select_action, page, scraped_page, task, step)
 
         return [ActionFailure(Exception("No element pointed by the label found"))]
     elif await skyvern_element.is_select2_dropdown():
@@ -594,13 +592,20 @@ async def handle_select_option_action(
                 "SelectOptionAction on a non-listbox element. Cannot handle this action",
             )
             return [ActionFailure(Exception("Cannot handle SelectOptionAction on a non-listbox element"))]
-    elif tag_name == "input" and element_dict.get("attributes", {}).get("type", None) in ["radio", "checkbox"]:
+    elif await skyvern_element.is_checkbox():
         LOG.info(
-            "SelectOptionAction is on <input> checkbox/radio",
+            "SelectOptionAction is on <input> checkbox",
             action=action,
         )
         check_action = CheckboxAction(element_id=action.element_id, is_checked=True)
         return await handle_checkbox_action(check_action, page, scraped_page, task, step)
+    elif await skyvern_element.is_radio():
+        LOG.info(
+            "SelectOptionAction is on <input> radio",
+            action=action,
+        )
+        click_action = ClickAction(element_id=action.element_id)
+        return await chain_click(task, scraped_page, page, click_action, xpath, frame)
 
     try:
         current_text = await locator.input_value()
