@@ -809,6 +809,7 @@ class ForgeAgent:
         return await scrape_website(
             browser_state,
             task.url,
+            scrape_exclude=app.scrape_exclude,
         )
 
     async def _build_and_record_step_prompt(

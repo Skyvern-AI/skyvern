@@ -3,6 +3,7 @@ from typing import Awaitable, Callable
 from ddtrace import tracer
 from ddtrace.filters import FilterRequestsOnUrl
 from fastapi import FastAPI
+from playwright.async_api import Frame, Page
 
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.agent_functions import AgentFunction
@@ -40,6 +41,7 @@ LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(SettingsManager.get_s
 WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
 WORKFLOW_SERVICE = WorkflowService()
 AGENT_FUNCTION = AgentFunction()
+scrape_exclude: Callable[[Page, Frame], Awaitable[bool]] | None = None
 authentication_function: Callable[[str], Awaitable[Organization]] | None = None
 setup_api_app: Callable[[FastAPI], None] | None = None
 
