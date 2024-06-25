@@ -36,8 +36,6 @@ function TaskRecording() {
     return <div>Error loading recording</div>;
   }
 
-  console.log(task);
-
   return (
     <div className="flex mx-auto">
       {task.recording_url ? (
