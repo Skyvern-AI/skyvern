@@ -65,7 +65,7 @@ function TaskHistory() {
       window.open(
         window.location.origin + `/tasks/${id}/actions`,
         "_blank",
-        "noopener noreferrer",
+        "noopener,noreferrer",
       );
     } else {
       navigate(`${id}/actions`);
