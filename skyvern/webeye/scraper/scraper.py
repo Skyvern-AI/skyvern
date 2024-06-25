@@ -3,7 +3,7 @@ import copy
 import json
 from collections import defaultdict
 from enum import StrEnum
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import structlog
 from playwright.async_api import Frame, Page
@@ -144,6 +144,7 @@ async def scrape_website(
     browser_state: BrowserState,
     url: str,
     num_retry: int = 0,
+    scrape_exclude: Callable[[Page, Frame], Awaitable[bool]] | None = None,
 ) -> ScrapedPage:
     """
     ************************************************************************************************
@@ -168,7 +169,7 @@ async def scrape_website(
     """
     try:
         num_retry += 1
-        return await scrape_web_unsafe(browser_state, url)
+        return await scrape_web_unsafe(browser_state, url, scrape_exclude)
     except Exception as e:
         # NOTE: MAX_SCRAPING_RETRIES is set to 0 in both staging and production
         if num_retry > SettingsManager.get_settings().MAX_SCRAPING_RETRIES:
@@ -187,6 +188,7 @@ async def scrape_website(
             browser_state,
             url,
             num_retry=num_retry,
+            scrape_exclude=scrape_exclude,
         )
 
 
@@ -219,6 +221,7 @@ async def get_frame_text(iframe: Frame) -> str:
 async def scrape_web_unsafe(
     browser_state: BrowserState,
     url: str,
+    scrape_exclude: Callable[[Page, Frame], Awaitable[bool]] | None = None,
 ) -> ScrapedPage:
     """
     Asynchronous function that performs web scraping without any built-in error handling. This function is intended
@@ -268,7 +271,7 @@ async def scrape_web_unsafe(
     await remove_bounding_boxes(page)
     await scroll_to_top(page, drow_boxes=False)
 
-    elements, element_tree = await get_interactable_element_tree(page)
+    elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
     element_tree = cleanup_elements(copy.deepcopy(element_tree))
 
     _build_element_links(elements)
@@ -307,10 +310,16 @@ async def get_select2_options(page: Page) -> list[dict[str, Any]]:
 
 
 async def get_interactable_element_tree_in_frame(
-    frames: list[Frame], elements: list[dict], element_tree: list[dict]
+    frames: list[Frame],
+    elements: list[dict],
+    element_tree: list[dict],
+    scrape_exclude: Callable[[Page, Frame], Awaitable[bool]] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     for frame in frames:
         if frame.is_detached():
+            continue
+
+        if scrape_exclude is not None and await scrape_exclude(frame.page, frame):
             continue
 
         try:
@@ -331,7 +340,10 @@ async def get_interactable_element_tree_in_frame(
 
         if len(frame.child_frames) > 0:
             frame_elements, frame_element_tree = await get_interactable_element_tree_in_frame(
-                frame.child_frames, frame_elements, frame_element_tree
+                frame.child_frames,
+                frame_elements,
+                frame_element_tree,
+                scrape_exclude=scrape_exclude,
             )
 
         for element in elements:
@@ -347,7 +359,10 @@ async def get_interactable_element_tree_in_frame(
     return elements, element_tree
 
 
-async def get_interactable_element_tree(page: Page) -> tuple[list[dict], list[dict]]:
+async def get_interactable_element_tree(
+    page: Page,
+    scrape_exclude: Callable[[Page, Frame], Awaitable[bool]] | None = None,
+) -> tuple[list[dict], list[dict]]:
     """
     Get the element tree of the page, including all the elements that are interactable.
     :param page: Page instance to get the element tree from.
@@ -357,11 +372,13 @@ async def get_interactable_element_tree(page: Page) -> tuple[list[dict], list[di
     main_frame_js_script = "async () => await buildTreeFromBody('main.frame', true)"
     elements, element_tree = await page.evaluate(main_frame_js_script)
 
-    # FIXME: some unexpected exception in iframe. turn off temporarily
-    # if len(page.main_frame.child_frames) > 0:
-    #     elements, element_tree = await get_interactable_element_tree_in_frame(
-    #         page.main_frame.child_frames, elements, element_tree
-    #     )
+    if len(page.main_frame.child_frames) > 0:
+        elements, element_tree = await get_interactable_element_tree_in_frame(
+            page.main_frame.child_frames,
+            elements,
+            element_tree,
+            scrape_exclude=scrape_exclude,
+        )
 
     return elements, element_tree
 
