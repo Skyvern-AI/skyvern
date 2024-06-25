@@ -36,14 +36,24 @@ function RunningTasks() {
     return <div>No running tasks</div>;
   }
 
+  function handleNavigate(event: React.MouseEvent, id: string) {
+    if (event.ctrlKey || event.metaKey) {
+      window.open(
+        window.location.origin + `/tasks/${id}/actions`,
+        "_blank",
+        "noopener,noreferrer",
+      );
+    } else {
+      navigate(`/tasks/${id}/actions`);
+    }
+  }
+
   return runningTasks?.map((task) => {
     return (
       <Card
         key={task.task_id}
         className="hover:bg-muted/50 cursor-pointer"
-        onClick={() => {
-          navigate(`/tasks/${task.task_id}/actions`);
-        }}
+        onClick={(event) => handleNavigate(event, task.task_id)}
       >
         <CardHeader>
           <CardTitle className="overflow-hidden text-ellipsis whitespace-nowrap">
