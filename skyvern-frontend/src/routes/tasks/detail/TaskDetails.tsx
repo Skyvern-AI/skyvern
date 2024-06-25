@@ -1,7 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
 import { Status, TaskApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
@@ -16,11 +15,11 @@ function TaskDetails() {
 
   const {
     data: task,
-    isFetching: taskIsFetching,
+    isLoading: taskIsLoading,
     isError: taskIsError,
     error: taskError,
   } = useQuery<TaskApiResponse>({
-    queryKey: ["task", taskId, "details"],
+    queryKey: ["task", taskId],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client.get(`/tasks/${taskId}`).then((response) => response.data);
@@ -30,7 +29,7 @@ function TaskDetails() {
         query.state.data?.status === Status.Running ||
         query.state.data?.status === Status.Queued
       ) {
-        return 30000;
+        return 10000;
       }
       return false;
     },
@@ -72,14 +71,14 @@ function TaskDetails() {
   return (
     <div className="flex flex-col gap-8">
       <div className="flex items-center gap-4">
-        <Input value={taskId} className="w-52" readOnly />
-        {taskIsFetching ? (
+        <span className="text-lg">{taskId}</span>
+        {taskIsLoading ? (
           <Skeleton className="w-28 h-8" />
         ) : task ? (
           <StatusBadge status={task?.status} />
         ) : null}
       </div>
-      {taskIsFetching ? (
+      {taskIsLoading ? (
         <div className="flex items-center gap-2">
           <Skeleton className="w-32 h-32" />
           <Skeleton className="w-full h-32" />
