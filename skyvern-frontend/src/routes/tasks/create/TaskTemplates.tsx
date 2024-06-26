@@ -151,6 +151,7 @@ function TaskTemplates() {
         <header>
           <h1 className="text-3xl">Your Templates</h1>
         </header>
+        <p className="text-sm mt-1">Your saved task templates</p>
         <Separator className="mt-2 mb-8" />
         <SavedTasks />
       </section>
@@ -158,6 +159,9 @@ function TaskTemplates() {
         <header>
           <h1 className="text-3xl">Skyvern Templates</h1>
         </header>
+        <p className="text-sm mt-1">
+          Sample tasks that showcase Skyvern's capabilities
+        </p>
         <Separator className="mt-2 mb-8" />
         <div className="grid grid-cols-4 gap-4">
           {Object.entries(templateSamples).map(([sampleKey, sample]) => {
