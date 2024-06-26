@@ -58,6 +58,7 @@ pypdf = "^4.2.0"
 stripe = "^9.7.0"
 tldextract = "^5.1.2"
 websockets = "^12.0"
+email-validator = "^2.2.0"
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"
