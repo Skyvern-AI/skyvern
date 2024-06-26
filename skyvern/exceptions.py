@@ -350,3 +350,15 @@ class EmptySelect(SkyvernException):
         super().__init__(
             f"nothing is selected, try to select again. element_id={element_id}",
         )
+
+
+class TaskAlreadyCanceled(SkyvernHTTPException):
+    def __init__(self, new_status: str, task_id: str):
+        super().__init__(
+            f"Invalid task status transition to {new_status} for {task_id} because task is already canceled"
+        )
+
+
+class InvalidTaskStatusTransition(SkyvernHTTPException):
+    def __init__(self, old_status: str, new_status: str, task_id: str):
+        super().__init__(f"Invalid task status transition from {old_status} to {new_status} for {task_id}")
