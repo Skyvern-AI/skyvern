@@ -12,7 +12,8 @@ function StatusBadge({ status }: Props) {
   } else if (
     status === "failed" ||
     status === "terminated" ||
-    status === "timed_out"
+    status === "timed_out" ||
+    status === "canceled"
   ) {
     variant = "destructive";
   } else if (status === "running") {
