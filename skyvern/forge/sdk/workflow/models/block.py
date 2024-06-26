@@ -12,6 +12,7 @@ from typing import Annotated, Any, Literal, Union
 
 import filetype
 import structlog
+from email_validator import EmailNotValidError, validate_email
 from pydantic import BaseModel, Field
 
 from skyvern.config import settings
@@ -29,7 +30,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.schemas.tasks import TaskOutput, TaskStatus
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.exceptions import InvalidEmailClientConfiguration
+from skyvern.forge.sdk.workflow.exceptions import InvalidEmailClientConfiguration, NoValidEmailRecipient
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
@@ -818,12 +819,36 @@ class SendEmailBlock(Block):
         file_path.write(downloaded_bytes)
         return file_path.name
 
+    def get_real_email_recipients(self, workflow_run_context: WorkflowRunContext) -> list[str]:
+        recipients = []
+        for recipient in self.recipients:
+            if workflow_run_context.has_parameter(recipient):
+                maybe_recipient = workflow_run_context.get_value(recipient)
+            else:
+                maybe_recipient = recipient
+
+            # check if maybe_recipient is a valid email address
+            try:
+                validate_email(maybe_recipient)
+                recipients.append(maybe_recipient)
+            except EmailNotValidError as e:
+                LOG.warning(
+                    "SendEmailBlock: Invalid email address",
+                    recipient=maybe_recipient,
+                    reason=str(e),
+                )
+
+        if not recipients:
+            raise NoValidEmailRecipient(recipients=recipients)
+
+        return recipients
+
     async def _build_email_message(
         self, workflow_run_context: WorkflowRunContext, workflow_run_id: str
     ) -> EmailMessage:
         msg = EmailMessage()
         msg["Subject"] = self.subject + f" - Workflow Run ID: {workflow_run_id}"
-        msg["To"] = ", ".join(self.recipients)
+        msg["To"] = ", ".join(self.get_real_email_recipients(workflow_run_context))
         msg["BCC"] = self.sender  # BCC the sender so there is a record of the email being sent
         msg["From"] = self.sender
         if self.body and workflow_run_context.has_parameter(self.body) and workflow_run_context.has_value(self.body):

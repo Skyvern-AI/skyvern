@@ -64,6 +64,11 @@ class InvalidEmailClientConfiguration(BaseWorkflowException):
         super().__init__(f"Email client configuration is invalid. These parameters are missing or invalid: {problems}")
 
 
+class NoValidEmailRecipient(BaseWorkflowException):
+    def __init__(self, recipients: list[str]) -> None:
+        super().__init__(f"No valid email recipient found. Recipients: {recipients}")
+
+
 class ContextParameterSourceNotDefined(BaseWorkflowHTTPException):
     def __init__(self, context_parameter_key: str, source_key: str) -> None:
         super().__init__(
