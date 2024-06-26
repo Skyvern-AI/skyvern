@@ -281,6 +281,22 @@ async def get_task(
     )
 
 
+@base_router.post("/tasks/{task_id}/cancel")
+@base_router.post("/tasks/{task_id}/cancel/", include_in_schema=False)
+async def cancel_task(
+    task_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> None:
+    analytics.capture("skyvern-oss-agent-task-get")
+    task_obj = await app.DATABASE.get_task(task_id, organization_id=current_org.organization_id)
+    if not task_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task not found {task_id}",
+        )
+    await app.agent.update_task(task_obj, status=TaskStatus.canceled)
+
+
 @base_router.post(
     "/tasks/{task_id}/retry_webhook",
     tags=["agent"],
