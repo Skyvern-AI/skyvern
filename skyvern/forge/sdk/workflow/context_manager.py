@@ -151,13 +151,22 @@ class WorkflowRunContext:
                 LOG.error(f"URL parameter {parameter.url_parameter_key} not found or has no value")
                 raise ValueError("URL parameter for Bitwarden login credentials not found or has no value")
 
+            collection_id = None
+            if parameter.bitwarden_collection_id:
+                if self.has_parameter(parameter.bitwarden_collection_id) and self.has_value(
+                    parameter.bitwarden_collection_id
+                ):
+                    collection_id = self.values[parameter.bitwarden_collection_id]
+                else:
+                    collection_id = parameter.bitwarden_collection_id
+
             try:
                 secret_credentials = BitwardenService.get_secret_value_from_url(
                     client_id,
                     client_secret,
                     master_password,
                     url,
-                    collection_id=parameter.bitwarden_collection_id,
+                    collection_id=collection_id,
                 )
                 if secret_credentials:
                     self.secrets[BitwardenConstants.URL] = url
