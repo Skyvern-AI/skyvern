@@ -213,12 +213,12 @@ def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None
     if action_type == ActionType.SELECT_OPTION:
         option = action["option"]
         if option is None:
-            raise ValidationError("SelectOptionAction requires an 'option' field")
+            raise ValueError("SelectOptionAction requires an 'option' field")
         label = option.get("label")
         value = option.get("value")
         index = option.get("index")
         if label is None and value is None and index is None:
-            raise ValidationError("At least one of 'label', 'value', or 'index' must be provided for a SelectOption")
+            raise ValueError("At least one of 'label', 'value', or 'index' must be provided for a SelectOption")
         return SelectOptionAction(
             element_id=element_id,
             option=SelectOption(
@@ -280,8 +280,8 @@ def parse_actions(task: Task, json_response: list[Dict[str, Any]]) -> list[Actio
                 raw_action=action,
                 exc_info=True,
             )
-        except ValidationError:
-            LOG.error(
+        except (ValidationError, ValueError):
+            LOG.warning(
                 "Invalid action",
                 task_id=task.task_id,
                 raw_action=action,
