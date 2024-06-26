@@ -19,6 +19,7 @@ export const Status = {
   Completed: "completed",
   Queued: "queued",
   TimedOut: "timed_out",
+  Canceled: "canceled",
 } as const;
 
 export type Status = (typeof Status)[keyof typeof Status];
