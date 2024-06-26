@@ -36,7 +36,7 @@ class StepStatus(StrEnum):
         return self in status_cant_have_output
 
     def is_terminal(self) -> bool:
-        status_is_terminal = {StepStatus.failed, StepStatus.completed}
+        status_is_terminal = {StepStatus.failed, StepStatus.completed, StepStatus.canceled}
         return self in status_is_terminal
 
 
