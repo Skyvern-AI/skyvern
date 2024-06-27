@@ -148,6 +148,7 @@ function createTaskTemplateRequestObject(values: SavedTaskFormValues) {
   return {
     title: values.title,
     description: values.description,
+    is_saved_task: true,
     webhook_callback_url: values.webhookCallbackUrl,
     proxy_location: values.proxyLocation,
     workflow_definition: {
