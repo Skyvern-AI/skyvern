@@ -863,11 +863,12 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
         !isScriptOrStyle(element)
       ) {
         let elementObj = null;
+        let isParentSVG = element.closest("svg");
         if (element.tagName.toLowerCase() === "svg") {
           // if element is <svg> we save all attributes and its children
           elementObj = await buildElementObject(element, false);
-        } else if (element.closest("svg")) {
-          // if elemnet is the children of <svg>
+        } else if (isParentSVG && isParentSVG.getAttribute("unique_id")) {
+          // if elemnet is the children of the <svg> with an unique_id
           elementObj = await buildElementObject(element, false);
         } else {
           // character length limit for non-interactable elements should be 5000
