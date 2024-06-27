@@ -66,6 +66,9 @@ class Step(BaseModel):
         if status and not old_status.can_update_to(status):
             raise ValueError(f"invalid_status_transition({old_status},{status},{self.step_id})")
 
+        if status == StepStatus.canceled:
+            return
+
         if status and status.requires_output() and output is None:
             raise ValueError(f"status_requires_output({status},{self.step_id})")
 
