@@ -281,6 +281,7 @@ class WorkflowService:
         webhook_callback_url: str | None = None,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
+        is_saved_task: bool = False,
     ) -> Workflow:
         return await app.DATABASE.create_workflow(
             title=title,
@@ -291,6 +292,7 @@ class WorkflowService:
             webhook_callback_url=webhook_callback_url,
             workflow_permanent_id=workflow_permanent_id,
             version=version,
+            is_saved_task=is_saved_task,
         )
 
     async def get_workflow(self, workflow_id: str, organization_id: str | None = None) -> Workflow:
@@ -319,6 +321,8 @@ class WorkflowService:
         organization_id: str,
         page: int = 1,
         page_size: int = 10,
+        only_saved_tasks: bool = False,
+        only_workflows: bool = False,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
@@ -327,6 +331,8 @@ class WorkflowService:
             organization_id=organization_id,
             page=page,
             page_size=page_size,
+            only_saved_tasks=only_saved_tasks,
+            only_workflows=only_workflows,
         )
 
     async def update_workflow(
@@ -773,6 +779,7 @@ class WorkflowService:
                     webhook_callback_url=request.webhook_callback_url,
                     workflow_permanent_id=workflow_permanent_id,
                     version=existing_version + 1,
+                    is_saved_task=request.is_saved_task,
                 )
             else:
                 workflow = await self.create_workflow(
@@ -782,6 +789,7 @@ class WorkflowService:
                     organization_id=organization_id,
                     proxy_location=request.proxy_location,
                     webhook_callback_url=request.webhook_callback_url,
+                    is_saved_task=request.is_saved_task,
                 )
             # Create parameters from the request
             parameters: dict[str, PARAMETER_TYPE] = {}

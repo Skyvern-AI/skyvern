@@ -160,6 +160,7 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         webhook_callback_url=workflow_model.webhook_callback_url,
         proxy_location=(ProxyLocation(workflow_model.proxy_location) if workflow_model.proxy_location else None),
         version=workflow_model.version,
+        is_saved_task=workflow_model.is_saved_task,
         description=workflow_model.description,
         workflow_definition=WorkflowDefinition.model_validate(workflow_model.workflow_definition),
         created_at=workflow_model.created_at,

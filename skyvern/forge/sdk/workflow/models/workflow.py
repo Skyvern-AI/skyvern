@@ -44,6 +44,7 @@ class Workflow(BaseModel):
     title: str
     workflow_permanent_id: str
     version: int
+    is_saved_task: bool
     description: str | None = None
     workflow_definition: WorkflowDefinition
     proxy_location: ProxyLocation | None = None

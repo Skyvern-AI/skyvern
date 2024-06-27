@@ -189,6 +189,7 @@ class WorkflowModel(Base):
 
     workflow_permanent_id = Column(String, nullable=False, default=generate_workflow_permanent_id, index=True)
     version = Column(Integer, default=1, nullable=False)
+    is_saved_task = Column(Boolean, default=False, nullable=False)
 
 
 class WorkflowRunModel(Base):

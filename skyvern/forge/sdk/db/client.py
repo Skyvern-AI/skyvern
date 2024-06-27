@@ -774,6 +774,7 @@ class AgentDB:
         webhook_callback_url: str | None = None,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
+        is_saved_task: bool = False,
     ) -> Workflow:
         async with self.Session() as session:
             workflow = WorkflowModel(
@@ -783,6 +784,7 @@ class AgentDB:
                 workflow_definition=workflow_definition,
                 proxy_location=proxy_location,
                 webhook_callback_url=webhook_callback_url,
+                is_saved_task=is_saved_task,
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
@@ -838,6 +840,8 @@ class AgentDB:
         organization_id: str,
         page: int = 1,
         page_size: int = 10,
+        only_saved_tasks: bool = False,
+        only_workflows: bool = False,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
@@ -861,17 +865,18 @@ class AgentDB:
                     )
                     .subquery()
                 )
+                main_query = select(WorkflowModel).join(
+                    subquery,
+                    (WorkflowModel.organization_id == subquery.c.organization_id)
+                    & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
+                    & (WorkflowModel.version == subquery.c.max_version),
+                )
+                if only_saved_tasks:
+                    main_query = main_query.where(WorkflowModel.is_saved_task.is_(True))
+                elif only_workflows:
+                    main_query = main_query.where(WorkflowModel.is_saved_task.is_(False))
                 main_query = (
-                    select(WorkflowModel)
-                    .join(
-                        subquery,
-                        (WorkflowModel.organization_id == subquery.c.organization_id)
-                        & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
-                        & (WorkflowModel.version == subquery.c.max_version),
-                    )
-                    .order_by(WorkflowModel.created_at.desc())  # Example ordering by creation date
-                    .limit(page_size)
-                    .offset(db_page * page_size)
+                    main_query.order_by(WorkflowModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
                 )
                 workflows = (await session.scalars(main_query)).all()
                 return [convert_to_workflow(workflow, self.debug_enabled) for workflow in workflows]
