@@ -654,16 +654,27 @@ async def delete_workflow(
 async def get_workflows(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
+    only_saved_tasks: bool = Query(False),
+    only_workflows: bool = Query(False),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[Workflow]:
     """
     Get all workflows with the latest version for the organization.
     """
     analytics.capture("skyvern-oss-agent-workflows-get")
+
+    if only_saved_tasks and only_workflows:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="only_saved_tasks and only_workflows cannot be used together",
+        )
+
     return await app.WORKFLOW_SERVICE.get_workflows_by_organization_id(
         organization_id=current_org.organization_id,
         page=page,
         page_size=page_size,
+        only_saved_tasks=only_saved_tasks,
+        only_workflows=only_workflows,
     )
 
 
