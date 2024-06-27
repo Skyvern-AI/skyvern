@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     LONG_RUNNING_TASK_WARNING_RATIO: float = 0.95
     MAX_RETRIES_PER_STEP: int = 5
     DEBUG_MODE: bool = False
-    DATABASE_STRING: str = "postgresql+psycopg://skyvern@localhost/skyvern"
+    DATABASE_STRING: str = "postgresql+psycopg://skyvern-open-source@localhost/skyvern-open-source"
     PROMPT_ACTION_HISTORY_WINDOW: int = 5
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
