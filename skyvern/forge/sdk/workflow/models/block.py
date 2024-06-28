@@ -615,7 +615,7 @@ class DownloadToS3Block(Block):
 
         uri = None
         try:
-            uri = f"s3://{SettingsManager.get_settings().AWS_S3_BUCKET_DOWNLOADS}/{SettingsManager.get_settings().ENV}/{workflow_run_id}/{uuid.uuid4()}"
+            uri = f"s3://{SettingsManager.get_settings().AWS_S3_BUCKET_UPLOADS}/{SettingsManager.get_settings().ENV}/{workflow_run_id}/{uuid.uuid4()}"
             await self._upload_file_to_s3(uri, file_path)
         except Exception as e:
             LOG.error("DownloadToS3Block: Failed to upload file to S3", uri=uri, error=str(e))
