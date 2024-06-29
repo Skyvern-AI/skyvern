@@ -524,11 +524,36 @@ class AgentDB:
                         .filter_by(organization_id=organization_id)
                         .filter_by(token_type=token_type)
                         .filter_by(valid=True)
+                        .order_by(OrganizationAuthTokenModel.created_at.desc())
                     )
                 ).first():
                     return convert_to_organization_auth_token(token)
                 else:
                     return None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_valid_org_auth_tokens(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+    ) -> list[OrganizationAuthToken]:
+        try:
+            async with self.Session() as session:
+                tokens = (
+                    await session.scalars(
+                        select(OrganizationAuthTokenModel)
+                        .filter_by(organization_id=organization_id)
+                        .filter_by(token_type=token_type)
+                        .filter_by(valid=True)
+                        .order_by(OrganizationAuthTokenModel.created_at.desc())
+                    )
+                ).all()
+                return [convert_to_organization_auth_token(token) for token in tokens]
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
