@@ -14,7 +14,7 @@ command_exists() {
 
 ensure_required_commands() {
     # Ensure required commands are available
-    for cmd in poetry; do
+    for cmd in poetry npm; do
         if ! command_exists "$cmd"; then
             echo "Error: $cmd is not installed." >&2
             exit 1
@@ -165,6 +165,11 @@ choose_python_version_or_fail() {
 # Function to install dependencies
 install_dependencies() {
     poetry install
+    echo "Installing frontend dependencies"
+    cd skyvern-frontend
+    npm run --silent install
+    cd ..
+    echo "Frontend dependencies installed."
 }
 
 activate_poetry_env() {
@@ -255,9 +260,20 @@ create_organization() {
         echo "Existing secrets.toml file backed up as secrets.backup.toml"
     fi
 
+    # Check if secrets.toml exists and back it up
+    if [ -f "skyvern-frontend/.env" ]; then
+        cp skyvern-frontend/.env skyvern-frontend/.env.backup
+        echo "Skyvern Frontend - existing .env file backed up as .env.backup"
+    fi
+
     # Update the secrets-open-source.toml file
     echo -e "[skyvern]\nconfigs = [\n    {\"env\" = \"local\", \"host\" = \"http://127.0.0.1:8000/api/v1\", \"orgs\" = [{name=\"Skyvern\", cred=\"$api_token\"}]}\n]" > .streamlit/secrets.toml
     echo ".streamlit/secrets.toml file updated with organization details."
+
+    cp skyvern-frontend/.env.example skyvern-frontend/.env
+    echo "skyvern-frontend/.env file created."
+    sed -i '' -e "s/YOUR_API_KEY/$api_token/g" skyvern-frontend/.env
+    echo "skyvern-frontend/.env file updated with API token."
 }
 
 # Main function
