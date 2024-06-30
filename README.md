@@ -104,6 +104,7 @@ Before you begin, make sure you have the following installed:
 - [Brew (if you're on a Mac)](https://brew.sh/)
 - [Poetry](https://python-poetry.org/docs/#installation)
     - `brew install poetry`
+- [node](https://nodejs.org/en/download/)
 - [Docker](https://docs.docker.com/engine/install/)
   
 Note: Our setup script does these two for you, but they are here for reference.
