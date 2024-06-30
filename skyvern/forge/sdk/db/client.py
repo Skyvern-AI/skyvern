@@ -566,18 +566,19 @@ class AgentDB:
         organization_id: str,
         token_type: OrganizationAuthTokenType,
         token: str,
+        valid: bool | None = True,
     ) -> OrganizationAuthToken | None:
         try:
             async with self.Session() as session:
-                if token_obj := (
-                    await session.scalars(
-                        select(OrganizationAuthTokenModel)
-                        .filter_by(organization_id=organization_id)
-                        .filter_by(token_type=token_type)
-                        .filter_by(token=token)
-                        .filter_by(valid=True)
-                    )
-                ).first():
+                query = (
+                    select(OrganizationAuthTokenModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(token_type=token_type)
+                    .filter_by(token=token)
+                )
+                if valid is not None:
+                    query = query.filter_by(valid=valid)
+                if token_obj := (await session.scalars(query)).first():
                     return convert_to_organization_auth_token(token_obj)
                 else:
                     return None

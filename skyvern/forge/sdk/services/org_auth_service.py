@@ -109,11 +109,18 @@ async def _get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
         organization_id=organization.organization_id,
         token_type=OrganizationAuthTokenType.api,
         token=x_api_key,
+        valid=None,
     )
     if not api_key_db_obj:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid credentials",
+        )
+
+    if api_key_db_obj.valid is False:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your API key has expired. Please retrieve the latest one from https://app.skyvern.com/settings",
         )
 
     # set organization_id in skyvern context and log context
