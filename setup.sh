@@ -167,7 +167,7 @@ install_dependencies() {
     poetry install
     echo "Installing frontend dependencies"
     cd skyvern-frontend
-    npm run --silent install
+    npm install --silent
     cd ..
     echo "Frontend dependencies installed."
 }
@@ -272,7 +272,7 @@ create_organization() {
 
     cp skyvern-frontend/.env.example skyvern-frontend/.env
     echo "skyvern-frontend/.env file created."
-    sed -i '' -e "s/YOUR_API_KEY/$api_token/g" skyvern-frontend/.env
+    echo -e "\nVITE_SKYVERN_API_KEY=$api_token" >> skyvern-frontend/.env
     echo "skyvern-frontend/.env file updated with API token."
 }
 
