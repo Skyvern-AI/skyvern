@@ -140,6 +140,17 @@ initialize_env_file() {
     echo ".env file has been initialized."
 }
 
+initialize_frontend_env_file() {
+    if [ -f "skyvern-frontend/.env" ]; then
+        echo "skyvern-frontend/.env file already exists, skipping initialization."
+        return
+    fi
+
+    echo "Initializing skyvern-frontend/.env file..."
+    cp skyvern-frontend/.env.example skyvern-frontend/.env
+    echo "skyvern-frontend/.env file has been initialized."
+}
+
 # Function to remove Poetry environment
 remove_poetry_env() {
     local env_path
@@ -260,19 +271,11 @@ create_organization() {
         echo "Existing secrets.toml file backed up as secrets.backup.toml"
     fi
 
-    # Check if secrets.toml exists and back it up
-    if [ -f "skyvern-frontend/.env" ]; then
-        cp skyvern-frontend/.env skyvern-frontend/.env.backup
-        echo "Skyvern Frontend - existing .env file backed up as .env.backup"
-    fi
-
     # Update the secrets-open-source.toml file
     echo -e "[skyvern]\nconfigs = [\n    {\"env\" = \"local\", \"host\" = \"http://127.0.0.1:8000/api/v1\", \"orgs\" = [{name=\"Skyvern\", cred=\"$api_token\"}]}\n]" > .streamlit/secrets.toml
     echo ".streamlit/secrets.toml file updated with organization details."
 
-    cp skyvern-frontend/.env.example skyvern-frontend/.env
-    echo "skyvern-frontend/.env file created."
-    echo -e "\nVITE_SKYVERN_API_KEY=$api_token" >> skyvern-frontend/.env
+    sed -i".backup" -e "s/YOUR_API_KEY/$api_token/g" skyvern-frontend/.env
     echo "skyvern-frontend/.env file updated with API token."
 }
 
@@ -280,6 +283,7 @@ create_organization() {
 main() {
     ensure_required_commands
     initialize_env_file
+    initialize_frontend_env_file
     choose_python_version_or_fail
     remove_poetry_env
     install_dependencies
