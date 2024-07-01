@@ -19,7 +19,7 @@ class StepStatus(StrEnum):
 
     def can_update_to(self, new_status: StepStatus) -> bool:
         allowed_transitions: dict[StepStatus, set[StepStatus]] = {
-            StepStatus.created: {StepStatus.running, StepStatus.canceled},
+            StepStatus.created: {StepStatus.running, StepStatus.failed, StepStatus.canceled},
             StepStatus.running: {StepStatus.completed, StepStatus.failed, StepStatus.canceled},
             StepStatus.failed: set(),
             StepStatus.completed: set(),
