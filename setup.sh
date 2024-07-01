@@ -275,7 +275,16 @@ create_organization() {
     echo -e "[skyvern]\nconfigs = [\n    {\"env\" = \"local\", \"host\" = \"http://127.0.0.1:8000/api/v1\", \"orgs\" = [{name=\"Skyvern\", cred=\"$api_token\"}]}\n]" > .streamlit/secrets.toml
     echo ".streamlit/secrets.toml file updated with organization details."
 
-    sed -i".backup" -e "s/YOUR_API_KEY/$api_token/g" skyvern-frontend/.env
+    # Check if skyvern-frontend/.env exists and back it up
+    # This is redundant for first time set up but useful for subsequent runs
+    if [ -f "skyvern-frontend/.env" ]; then
+        mv skyvern-frontend/.env skyvern-frontend/.env.backup
+        echo "Existing skyvern-frontend/.env file backed up as skyvern-frontend/.env.backup"
+    fi
+
+    # Update the skyvern-frontend/.env file
+    # sed wants a backup file extension, and providing empty string doesn't work on all platforms
+    sed -i".old" -e "s/YOUR_API_KEY/$api_token/g" skyvern-frontend/.env
     echo "skyvern-frontend/.env file updated with API token."
 }
 
