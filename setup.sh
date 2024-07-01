@@ -280,6 +280,7 @@ create_organization() {
     if [ -f "skyvern-frontend/.env" ]; then
         mv skyvern-frontend/.env skyvern-frontend/.env.backup
         echo "Existing skyvern-frontend/.env file backed up as skyvern-frontend/.env.backup"
+        cp skyvern-frontend/.env.example skyvern-frontend/.env
     fi
 
     # Update the skyvern-frontend/.env file
