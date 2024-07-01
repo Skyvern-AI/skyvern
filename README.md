@@ -128,7 +128,7 @@ Note: Our setup script does these two for you, but they are here for reference.
     ```bash
     ./run_ui.sh
     ```
-1. Navigate to `http://localhost:8501` in your browser to start using the UI
+1. Navigate to `http://localhost:8080` in your browser to start using the UI
 
 ## Additional Setup for Contributors
 If you're looking to contribute to Skyvern, you'll need to install the pre-commit hooks to ensure code quality and consistency. You can do this by running the following command:
