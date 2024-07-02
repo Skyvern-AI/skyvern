@@ -53,6 +53,14 @@ function StepArtifacts({ id, stepProps }: Props) {
     (artifact) => artifact.artifact_type === ArtifactType.ActionScreenshot,
   );
 
+  const visibleElementsTree = artifacts?.find(
+    (artifact) => artifact.artifact_type === ArtifactType.VisibleElementsTree,
+  );
+
+  const llmRequest = artifacts?.find(
+    (artifact) => artifact.artifact_type === ArtifactType.LLMRequest,
+  );
+
   const visibleElementsTreeTrimmed = artifacts?.find(
     (artifact) =>
       artifact.artifact_type === ArtifactType.VisibleElementsTreeTrimmed,
@@ -72,14 +80,16 @@ function StepArtifacts({ id, stepProps }: Props) {
 
   return (
     <Tabs defaultValue="info" className="w-full">
-      <TabsList className="grid w-full h-16 grid-cols-4">
+      <TabsList className="grid w-full h-16 grid-cols-5">
         <TabsTrigger value="info">Info</TabsTrigger>
         <TabsTrigger value="screenshot_llm">Annotated Screenshots</TabsTrigger>
         <TabsTrigger value="screenshot_action">Action Screenshots</TabsTrigger>
         <TabsTrigger value="element_tree_trimmed">Element Tree</TabsTrigger>
+        <TabsTrigger value="html_element_tree">HTML Element Tree</TabsTrigger>
         <TabsTrigger value="llm_prompt">Prompt</TabsTrigger>
         <TabsTrigger value="llm_response_parsed">Action List</TabsTrigger>
         <TabsTrigger value="html_raw">HTML (Raw)</TabsTrigger>
+        <TabsTrigger value="llm_request">LLM Request (Raw)</TabsTrigger>
       </TabsList>
       <TabsContent value="info">
         <div className="flex flex-col gap-6 p-4">
@@ -158,6 +168,11 @@ function StepArtifacts({ id, stepProps }: Props) {
           <JSONArtifact artifact={visibleElementsTreeTrimmed} />
         ) : null}
       </TabsContent>
+      <TabsContent value="html_element_tree">
+        {visibleElementsTree ? (
+          <JSONArtifact artifact={visibleElementsTree} />
+        ) : null}
+      </TabsContent>
       <TabsContent value="llm_prompt">
         {llmPrompt ? <TextArtifact artifact={llmPrompt} /> : null}
       </TabsContent>
@@ -168,6 +183,9 @@ function StepArtifacts({ id, stepProps }: Props) {
       </TabsContent>
       <TabsContent value="html_raw">
         {htmlRaw ? <TextArtifact artifact={htmlRaw} /> : null}
+      </TabsContent>
+      <TabsContent value="llm_request">
+        {llmRequest ? <JSONArtifact artifact={llmRequest} /> : null}
       </TabsContent>
     </Tabs>
   );
