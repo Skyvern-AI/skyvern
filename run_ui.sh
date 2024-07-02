@@ -6,7 +6,7 @@ cd skyvern-frontend
 
 if [ ! -f .env ]; then
   cp .env.example .env
-  echo "Please add your api keys to the skyvern-frontend/.env file."
+  echo "[ERROR] Please add your api keys to the skyvern-frontend/.env file."
 fi
 
 npm install --silent
