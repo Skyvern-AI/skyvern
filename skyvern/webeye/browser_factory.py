@@ -142,8 +142,29 @@ async def _create_headful_chromium(playwright: Playwright, **kwargs: dict) -> tu
     return browser_context, browser_artifacts
 
 
+async def _create_attached_chromium(playwright: Playwright, **kwargs: dict) -> tuple[BrowserContext, BrowserArtifacts]:
+    ws_endpoint = SettingsManager.get_settings().WS_ENDPOINT
+    browser = await playwright.chromium.connect_over_cdp(ws_endpoint)
+    browser_args = BrowserContextFactory.build_browser_args()
+    browser_args.update(
+        {
+            "headless": False,
+        }
+    )
+    contexts = browser.contexts
+    if contexts:
+        browser_context = contexts[0]
+    else:
+        print("No existing contexts found. Creating a new context...")
+        browser_context = await browser.new_context(**browser_args)
+
+    browser_artifacts = BrowserContextFactory.build_browser_artifacts(har_path=browser_args["record_har_path"])
+    return browser_context, browser_artifacts
+
+
 BrowserContextFactory.register_type("chromium-headless", _create_headless_chromium)
 BrowserContextFactory.register_type("chromium-headful", _create_headful_chromium)
+BrowserContextFactory.register_type("chromium-attached", _create_attached_chromium)
 
 
 class BrowserState:
@@ -168,7 +189,8 @@ class BrowserState:
         raise MissingBrowserStatePage()
 
     async def _close_all_other_pages(self) -> None:
-        if not self.browser_context or not self.page:
+        browser_type = SettingsManager.get_settings().BROWSER_TYPE
+        if not self.browser_context or not self.page or browser_type == "chromium-attached":
             return
         pages = self.browser_context.pages
         for page in pages:
