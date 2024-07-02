@@ -213,7 +213,10 @@ function isElementStyleVisibilityVisible(element, style) {
 function isElementVisible(element) {
   // TODO: This is a hack to not check visibility for option elements
   // because they are not visible by default. We check their parent instead for visibility.
-  if (element.tagName.toLowerCase() === "option")
+  if (
+    element.tagName.toLowerCase() === "option" ||
+    (element.tagName.toLowerCase() === "input" && element.type === "radio")
+  )
     return element.parentElement && isElementVisible(element.parentElement);
 
   if (element.className.toString().includes("select2-offscreen")) {
@@ -1088,7 +1091,11 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
         const labelElement = document.querySelector(
           element.tagName + '[unique_id="' + element.id + '"]',
         );
-        if (labelElement && labelElement.childElementCount === 0) {
+        if (
+          labelElement &&
+          labelElement.childElementCount === 0 &&
+          !labelElement.getAttribute("for")
+        ) {
           continue;
         }
       }
@@ -1234,15 +1241,30 @@ function createHintMarkersForGroups(groups) {
     return [];
   }
 
-  const hintMarkers = groups.map((group) => createHintMarkerForGroup(group));
-
+  const hintMarkers = groups
+    .filter((group) => group.elements.some((element) => element.interactable))
+    .map((group) => createHintMarkerForGroup(group));
   // fill in marker text
-  const hintStrings = generateHintStrings(hintMarkers.length);
+  // const hintStrings = generateHintStrings(hintMarkers.length);
   for (let i = 0; i < hintMarkers.length; i++) {
     const hintMarker = hintMarkers[i];
-    hintMarker.hintString = hintStrings[i];
+
+    let interactableElementFound = false;
+
+    for (let i = 0; i < hintMarker.group.elements.length; i++) {
+      if (hintMarker.group.elements[i].interactable) {
+        hintMarker.hintString = hintMarker.group.elements[i].id;
+        interactableElementFound = true;
+        break;
+      }
+    }
+
+    if (!interactableElementFound) {
+      hintMarker.hintString = "";
+    }
+
     try {
-      hintMarker.element.innerHTML = hintMarker.hintString.toUpperCase();
+      hintMarker.element.innerHTML = hintMarker.hintString;
     } catch (e) {
       // Ensure trustedTypes is available
       if (typeof trustedTypes !== "undefined") {
@@ -1262,21 +1284,22 @@ function createHintMarkersForGroups(groups) {
 }
 
 function createHintMarkerForGroup(group) {
+  // Calculate the position of the element relative to the document
+  var scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+  var scrollLeft = window.pageXOffset || document.documentElement.scrollLeft;
+
   const marker = {};
   // yellow annotation box with string
   const el = document.createElement("div");
-  el.style.left = group.rect.left + "px";
-  el.style.top = group.rect.top + "px";
+  el.style.position = "absolute";
+  el.style.left = group.rect.left + scrollLeft + "px";
+  el.style.top = group.rect.top + scrollTop + "px";
   // Each group is assigned a different incremental z-index, we use the same z-index for the
   // bounding box and the hint marker
   el.style.zIndex = this.currentZIndex;
 
   // The bounding box around the group of hints.
   const boundingBox = document.createElement("div");
-
-  // Calculate the position of the element relative to the document
-  var scrollTop = window.pageYOffset || document.documentElement.scrollTop;
-  var scrollLeft = window.pageXOffset || document.documentElement.scrollLeft;
 
   // Set styles for the bounding box
   boundingBox.style.position = "absolute";
@@ -1302,7 +1325,7 @@ function addHintMarkersToPage(hintMarkers) {
   const parent = document.createElement("div");
   parent.id = "boundingBoxContainer";
   for (const hintMarker of hintMarkers) {
-    // parent.appendChild(hintMarker.element);
+    parent.appendChild(hintMarker.element);
     parent.appendChild(hintMarker.boundingBox);
   }
   document.documentElement.appendChild(parent);
