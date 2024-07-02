@@ -42,7 +42,7 @@ function RootLayout() {
             <GitHubLogoIcon className="w-6 h-6" />
           </Link>
         </div>
-        <main className="pl-72">
+        <main className="pl-72 pb-4">
           <Outlet />
         </main>
       </div>
