@@ -310,7 +310,7 @@ class ElementIsNotLabel(SkyvernException):
 
 class MissingElementDict(SkyvernException):
     def __init__(self, element_id: str) -> None:
-        super().__init__(f"Found no element in the dict. element_id={element_id}")
+        super().__init__(f"Invalid element id. element_id={element_id}")
 
 
 class MissingElementInIframe(SkyvernException):
@@ -323,6 +323,11 @@ class InputActionOnSelect2Dropdown(SkyvernException):
         super().__init__(
             f"Input action on a select element, please try to use select action on this element. element_id={element_id}"
         )
+
+
+class FailToClick(SkyvernException):
+    def __init__(self, element_id: str):
+        super().__init__(f"Failed to click. element_id={element_id}")
 
 
 class FailToSelectByLabel(SkyvernException):

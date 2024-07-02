@@ -11,6 +11,7 @@ from playwright.async_api import Locator, Page, TimeoutError
 from skyvern.constants import INPUT_TEXT_TIMEOUT, REPO_ROOT_DIR
 from skyvern.exceptions import (
     EmptySelect,
+    FailToClick,
     FailToSelectByIndex,
     FailToSelectByLabel,
     FailToSelectByValue,
@@ -789,10 +790,11 @@ async def chain_click(
                 javascript_triggered=javascript_triggered,
             )
         ]
-    except Exception as e:
+
+    except Exception:
         action_results: list[ActionResult] = [
             ActionFailure(
-                e,
+                FailToClick(action.element_id),
                 javascript_triggered=javascript_triggered,
             )
         ]
@@ -826,7 +828,7 @@ async def chain_click(
                     interacted_with_parent=True,
                 )
             )
-        except Exception as pe:
+        except Exception:
             LOG.warning(
                 "Failed to click parent element",
                 action=action,
@@ -835,7 +837,7 @@ async def chain_click(
             )
             action_results.append(
                 ActionFailure(
-                    pe,
+                    FailToClick(action.element_id),
                     javascript_triggered=javascript_triggered,
                     interacted_with_parent=True,
                 )
@@ -1073,9 +1075,12 @@ async def click_sibling_of_input(
             javascript_triggered=javascript_triggered,
             interacted_with_sibling=True,
         )
-    except Exception as e:
+    except Exception:
         LOG.warning("Failed to click sibling label of input element", exc_info=True)
-        return ActionFailure(exception=e, javascript_triggered=javascript_triggered)
+        return ActionFailure(
+            exception=Exception("Failed while trying to click sibling of input element"),
+            javascript_triggered=javascript_triggered,
+        )
 
 
 async def extract_information_for_navigation_goal(

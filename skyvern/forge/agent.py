@@ -930,7 +930,7 @@ class ForgeAgent:
             LOG.info("Using Claude3 Sonnet prompt template for action extraction")
             prompt_template = "extract-action-claude3-sonnet"
 
-        # TODO: we only use HTML element for now, introduce a way to swith in the future
+        # TODO: we only use HTML element for now, introduce a way to switch in the future
         element_tree_format = ElementTreeFormat.HTML
         LOG.info(
             "Building element tree",

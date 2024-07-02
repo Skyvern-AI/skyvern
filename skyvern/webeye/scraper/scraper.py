@@ -476,6 +476,7 @@ def trim_element_tree(elements: list[dict]) -> list[dict]:
 
 def _trimmed_attributes(tag_name: str, attributes: dict) -> dict:
     new_attributes: dict = {}
+
     for key in attributes:
         if key == "id" and tag_name in ["input", "textarea", "select"]:
             # We don't want to remove the id attribute any of these elements in case there's a label for it
@@ -484,6 +485,7 @@ def _trimmed_attributes(tag_name: str, attributes: dict) -> dict:
             new_attributes[key] = attributes[key]
         if key in RESERVED_ATTRIBUTES and attributes[key]:
             new_attributes[key] = attributes[key]
+
     return new_attributes
 
 
