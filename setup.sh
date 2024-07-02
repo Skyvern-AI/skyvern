@@ -14,7 +14,7 @@ command_exists() {
 
 ensure_required_commands() {
     # Ensure required commands are available
-    for cmd in poetry; do
+    for cmd in poetry npm; do
         if ! command_exists "$cmd"; then
             echo "Error: $cmd is not installed." >&2
             exit 1
@@ -140,6 +140,17 @@ initialize_env_file() {
     echo ".env file has been initialized."
 }
 
+initialize_frontend_env_file() {
+    if [ -f "skyvern-frontend/.env" ]; then
+        echo "skyvern-frontend/.env file already exists, skipping initialization."
+        return
+    fi
+
+    echo "Initializing skyvern-frontend/.env file..."
+    cp skyvern-frontend/.env.example skyvern-frontend/.env
+    echo "skyvern-frontend/.env file has been initialized."
+}
+
 # Function to remove Poetry environment
 remove_poetry_env() {
     local env_path
@@ -165,6 +176,11 @@ choose_python_version_or_fail() {
 # Function to install dependencies
 install_dependencies() {
     poetry install
+    echo "Installing frontend dependencies"
+    cd skyvern-frontend
+    npm install --silent
+    cd ..
+    echo "Frontend dependencies installed."
 }
 
 activate_poetry_env() {
@@ -258,12 +274,26 @@ create_organization() {
     # Update the secrets-open-source.toml file
     echo -e "[skyvern]\nconfigs = [\n    {\"env\" = \"local\", \"host\" = \"http://127.0.0.1:8000/api/v1\", \"orgs\" = [{name=\"Skyvern\", cred=\"$api_token\"}]}\n]" > .streamlit/secrets.toml
     echo ".streamlit/secrets.toml file updated with organization details."
+
+    # Check if skyvern-frontend/.env exists and back it up
+    # This is redundant for first time set up but useful for subsequent runs
+    if [ -f "skyvern-frontend/.env" ]; then
+        mv skyvern-frontend/.env skyvern-frontend/.env.backup
+        echo "Existing skyvern-frontend/.env file backed up as skyvern-frontend/.env.backup"
+        cp skyvern-frontend/.env.example skyvern-frontend/.env
+    fi
+
+    # Update the skyvern-frontend/.env file
+    # sed wants a backup file extension, and providing empty string doesn't work on all platforms
+    sed -i".old" -e "s/YOUR_API_KEY/$api_token/g" skyvern-frontend/.env
+    echo "skyvern-frontend/.env file updated with API token."
 }
 
 # Main function
 main() {
     ensure_required_commands
     initialize_env_file
+    initialize_frontend_env_file
     choose_python_version_or_fail
     remove_poetry_env
     install_dependencies

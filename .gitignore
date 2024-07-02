@@ -171,3 +171,5 @@ postgres-data
 
 ## Frontend
 node_modules
+.env.backup
+.env.old
