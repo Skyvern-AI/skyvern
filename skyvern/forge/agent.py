@@ -876,24 +876,24 @@ class ForgeAgent:
         # Scrape the web page and get the screenshot and the elements
         # HACK: try scrape_website three time to handle screenshot timeout
         # first time: normal scrape to take screenshot
-        # second time: stop window loading before scraping
+        # second time: try again the normal scrape, (stopping window loading before scraping barely helps, but causing problem)
         # third time: reload the page before scraping
         scraped_page: ScrapedPage | None = None
-        for scrape_type in SCRAPE_TYPE_ORDER:
+        for idx, scrape_type in enumerate(SCRAPE_TYPE_ORDER):
             try:
                 scraped_page = await self._scrape_with_type(
                     task=task, step=step, browser_state=browser_state, scrape_type=scrape_type
                 )
                 break
             except FailedToTakeScreenshot as e:
-                if scrape_type == ScrapeType.RELOAD:
-                    LOG.error(
-                        "Failed to take screenshot after stop-loading and reload-page retry",
-                        task_id=task.task_id,
-                        step_id=step.step_id,
-                    )
-                    raise e
-                continue
+                if idx < len(SCRAPE_TYPE_ORDER) - 1:
+                    continue
+                LOG.error(
+                    "Failed to take screenshot after two normal attemps and reload-page retry",
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                )
+                raise e
 
         if scraped_page is None:
             raise EmptyScrapePage

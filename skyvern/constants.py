@@ -15,4 +15,4 @@ class ScrapeType(StrEnum):
     RELOAD = "reload"
 
 
-SCRAPE_TYPE_ORDER = [ScrapeType.NORMAL, ScrapeType.STOPLOADING, ScrapeType.RELOAD]
+SCRAPE_TYPE_ORDER = [ScrapeType.NORMAL, ScrapeType.NORMAL, ScrapeType.RELOAD]
