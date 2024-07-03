@@ -9,7 +9,7 @@ import structlog
 from playwright.async_api import Frame, Page
 from pydantic import BaseModel
 
-from skyvern.constants import SKYVERN_DIR, SKYVERN_ID_ATTR
+from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR, SKYVERN_ID_ATTR
 from skyvern.exceptions import FailedToTakeScreenshot, UnknownElementTreeFormat
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.browser_factory import BrowserState
@@ -289,6 +289,16 @@ async def scrape_web_unsafe(
 
     text_content = await get_frame_text(page.main_frame)
 
+    html = ""
+    try:
+        html = await get_page_content(page)
+    except Exception:
+        LOG.error(
+            "Failed out to get HTML content",
+            url=url,
+            exc_info=True,
+        )
+
     return ScrapedPage(
         elements=elements,
         id_to_xpath_dict=id_to_xpath_dict,
@@ -298,9 +308,14 @@ async def scrape_web_unsafe(
         element_tree_trimmed=trim_element_tree(copy.deepcopy(element_tree)),
         screenshots=screenshots,
         url=page.url,
-        html=await page.content(),
+        html=html,
         extracted_text=text_content,
     )
+
+
+async def get_page_content(page: Page, timeout: float = PAGE_CONTENT_TIMEOUT) -> str:
+    async with asyncio.timeout(timeout):
+        return await page.content()
 
 
 async def get_select2_options(page: Page) -> list[dict[str, Any]]:
