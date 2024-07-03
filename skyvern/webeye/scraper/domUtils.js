@@ -357,6 +357,11 @@ function isInteractable(element) {
     return true;
   }
 
+  // Check if the option's parent (select) is hidden or disabled
+  if (tagName === "option" && isHiddenOrDisabled(element.parentElement)) {
+    return false;
+  }
+
   if (
     tagName === "button" ||
     tagName === "select" ||
@@ -718,7 +723,11 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
     }
 
     if (elementTagNameLower === "input" || elementTagNameLower === "textarea") {
-      attrs["value"] = element.value;
+      if (element.type === "radio") {
+        attrs["value"] = "" + element.checked + "";
+      } else {
+        attrs["value"] = element.value;
+      }
     }
 
     let elementObj = {
@@ -906,6 +915,11 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
       const children = getChildElements(element);
       for (let i = 0; i < children.length; i++) {
         const childElement = children[i];
+
+        // Skip processing option-children of an non-interactable select element as they are already added to the select.options
+        if (childElement.tagName.toLowerCase() === "option") {
+          continue;
+        }
         await processElement(childElement, parentId);
       }
     }
@@ -1366,4 +1380,22 @@ async function scrollToNextPage(draw_boxes) {
 
 async function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Helper method for debugging
+function findNodeById(arr, targetId, path = []) {
+  for (let i = 0; i < arr.length; i++) {
+    const currentPath = [...path, arr[i].id];
+    if (arr[i].id === targetId) {
+      console.log("Lineage:", currentPath.join(" -> "));
+      return arr[i];
+    }
+    if (arr[i].children && arr[i].children.length > 0) {
+      const result = findNodeById(arr[i].children, targetId, currentPath);
+      if (result) {
+        return result;
+      }
+    }
+  }
+  return null;
 }

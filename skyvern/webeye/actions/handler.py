@@ -109,6 +109,9 @@ class ActionHandler:
             if action.action_type in ActionHandler._handled_action_types:
                 actions_result: list[ActionResult] = []
 
+                if invalid_web_action_check := check_for_invalid_web_action(action, page, scraped_page, task, step):
+                    return invalid_web_action_check
+
                 # do setup before action handler
                 if setup := ActionHandler._setup_action_types.get(action.action_type):
                     results = await setup(action, page, scraped_page, task, step)
@@ -156,6 +159,19 @@ class ActionHandler:
         except Exception as e:
             LOG.exception("Unhandled exception in action handler", action=action)
             return [ActionFailure(e)]
+
+
+def check_for_invalid_web_action(
+    action: actions.Action,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    if isinstance(action, WebAction) and action.element_id not in scraped_page.id_to_element_dict:
+        return [ActionFailure(MissingElement(element_id=action.element_id), stop_execution_on_failure=False)]
+
+    return []
 
 
 async def handle_solve_captcha_action(
