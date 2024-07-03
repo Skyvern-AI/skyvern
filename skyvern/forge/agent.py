@@ -52,7 +52,7 @@ from skyvern.webeye.actions.handler import ActionHandler
 from skyvern.webeye.actions.models import AgentStepOutput, DetailedAgentStepOutput
 from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.browser_factory import BrowserState
-from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
+from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, get_page_content, scrape_website
 
 LOG = structlog.get_logger()
 
@@ -786,7 +786,7 @@ class ForgeAgent:
             )
 
         try:
-            html = await browser_state.page.content()
+            html = await get_page_content(browser_state.page)
             await app.ARTIFACT_MANAGER.create_artifact(
                 step=step,
                 artifact_type=ArtifactType.HTML_ACTION,
