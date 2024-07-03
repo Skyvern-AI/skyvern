@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     JSON_LOGGING: bool = False
     LOG_LEVEL: str = "INFO"
     PORT: int = 8000
+    ALLOWED_ORIGINS: list[str] = ["*"]
 
     # Secret key for JWT. Please generate your own secret key in production
     SECRET_KEY: str = "RX1NvhujcJqBPi8O78-7aSfJEWuT86-fll4CzKc_uek"

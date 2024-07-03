@@ -38,19 +38,9 @@ def get_agent_app(router: APIRouter = base_router) -> FastAPI:
     app = FastAPI()
 
     # Add CORS middleware
-    origins = [
-        "http://localhost:5000",
-        "http://127.0.0.1:5000",
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-        "http://localhost:8080",
-        "http://127.0.0.1:8080",
-        # Add any other origins you want to whitelist
-    ]
-
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=origins,
+        allow_origins=SettingsManager.get_settings().ALLOWED_ORIGINS,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
