@@ -678,6 +678,17 @@ class ForgeAgent:
                         )
                         # stop executing the rest actions
                         break
+                elif results and not results[-1].success and not results[-1].stop_execution_on_failure:
+                    LOG.warning(
+                        "Action failed, but not stopping execution",
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        step_order=step.order,
+                        step_retry=step.retry_index,
+                        action_idx=action_idx,
+                        action=action,
+                        action_result=results,
+                    )
                 else:
                     if action_node.next is not None:
                         LOG.warning(
@@ -1004,6 +1015,7 @@ class ForgeAgent:
                                 "interacted_with_parent",
                                 "step_retry_number",
                                 "step_order",
+                                "stop_execution_on_failure",
                             },
                         )
                         for result in results

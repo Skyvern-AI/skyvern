@@ -7,6 +7,7 @@ from skyvern.webeye.string_util import remove_whitespace
 
 class ActionResult(BaseModel):
     success: bool
+    stop_execution_on_failure: bool = True
     exception_type: str | None = None
     exception_message: str | None = None
     data: dict[str, Any] | list | str | None = None
@@ -67,6 +68,7 @@ class ActionFailure(ActionResult):
     def __init__(
         self,
         exception: Exception,
+        stop_execution_on_failure: bool = True,
         javascript_triggered: bool = False,
         download_triggered: bool | None = None,
         interacted_with_sibling: bool = False,
@@ -75,6 +77,7 @@ class ActionFailure(ActionResult):
         super().__init__(
             success=False,
             exception_type=type(exception).__name__,
+            stop_execution_on_failure=stop_execution_on_failure,
             exception_message=remove_whitespace(str(exception)),
             javascript_triggered=javascript_triggered,
             download_triggered=download_triggered,
