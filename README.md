@@ -93,7 +93,7 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
    ```bash
     docker compose up -d
    ```
-3. Navigate to `http://localhost:8501` in your browser to start using the UI
+3. Navigate to `http://localhost:8080` in your browser to start using the UI
 
 
 ## Full Setup (Contributors) - Prerequisites 
