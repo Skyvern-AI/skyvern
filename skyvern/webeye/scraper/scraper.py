@@ -6,7 +6,7 @@ from enum import StrEnum
 from typing import Any, Awaitable, Callable
 
 import structlog
-from playwright.async_api import Frame, Page
+from playwright.async_api import ElementHandle, Frame, Page
 from pydantic import BaseModel
 
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR, SKYVERN_ID_ATTR
@@ -318,10 +318,10 @@ async def get_page_content(page: Page, timeout: float = PAGE_CONTENT_TIMEOUT) ->
         return await page.content()
 
 
-async def get_select2_options(page: Page) -> list[dict[str, Any]]:
+async def get_select2_options(page: Page, element: ElementHandle) -> list[dict[str, Any]]:
     await page.evaluate(JS_FUNCTION_DEFS)
-    js_script = "async () => await getSelect2Options()"
-    return await page.evaluate(js_script)
+    js_script = "async (element) => await getSelect2Options(element)"
+    return await page.evaluate(js_script, element)
 
 
 async def get_interactable_element_tree_in_frame(
