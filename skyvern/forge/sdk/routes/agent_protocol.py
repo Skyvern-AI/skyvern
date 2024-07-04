@@ -760,7 +760,7 @@ async def validate_file_size(file: UploadFile) -> UploadFile:
     except Exception as e:
         raise HTTPException(status_code=500, detail="Could not determine file size.") from e
 
-    if size > app.SETTINGS_MANAGER.MAX_FILE_SIZE:
+    if size > app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE:
         raise HTTPException(
             status_code=413,
             detail=f"File size exceeds the maximum allowed size ({app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE} bytes)",
