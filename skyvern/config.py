@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     # S3 bucket settings
     AWS_REGION: str = "us-east-1"
     AWS_S3_BUCKET_UPLOADS: str = "skyvern-uploads"
-    MAX_UPLOAD_FILE_SIZE: int = 100 * 1024 * 1024  # 10 MB
+    MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
 
     SKYVERN_TELEMETRY: bool = True
     ANALYTICS_ID: str = "anonymous"
