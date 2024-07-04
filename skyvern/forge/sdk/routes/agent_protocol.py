@@ -763,7 +763,7 @@ async def validate_file_size(file: UploadFile) -> UploadFile:
     if size > app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE:
         raise HTTPException(
             status_code=413,
-            detail=f"File size exceeds the maximum allowed size ({app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE} bytes)",
+            detail=f"File size exceeds the maximum allowed size ({app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE/1024/1024} MB)",
         )
     return file
 
