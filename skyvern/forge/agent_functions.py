@@ -5,6 +5,7 @@ from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.sdk.models import Organization, Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.webeye.browser_factory import BrowserState
 
 
 class AgentFunction:
@@ -14,7 +15,7 @@ class AgentFunction:
         step: Step,
     ) -> None:
         """
-        Checks if the step can be executed.
+        Checks if the step can be executed. It is called before the step is executed.
         :return: A tuple of whether the step can be executed and a list of reasons why it can't be executed.
         """
         reasons = []
@@ -35,6 +36,18 @@ class AgentFunction:
         can_execute = has_valid_task_status and has_valid_step_status and has_no_running_steps
         if not can_execute:
             raise StepUnableToExecuteError(step_id=step.step_id, reason=f"Cannot execute step. Reasons: {reasons}")
+
+    async def prepare_step_execution(
+        self,
+        organization: Organization | None,
+        task: Task,
+        step: Step,
+        browser_state: BrowserState,
+    ) -> None:
+        """
+        Get prepared for the step execution. It's called at the first beginning when step running.
+        """
+        return
 
     def generate_async_operations(
         self,

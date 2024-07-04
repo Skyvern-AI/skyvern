@@ -30,6 +30,7 @@ class BrowserManager:
         (
             browser_context,
             browser_artifacts,
+            browser_cleanup,
         ) = await BrowserContextFactory.create_browser_context(
             pw,
             proxy_location=proxy_location,
@@ -41,6 +42,7 @@ class BrowserManager:
             browser_context=browser_context,
             page=None,
             browser_artifacts=browser_artifacts,
+            browser_cleanup=browser_cleanup,
         )
 
     async def get_or_create_for_task(self, task: Task) -> BrowserState:

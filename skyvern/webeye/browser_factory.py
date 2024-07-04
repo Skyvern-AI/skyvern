@@ -29,10 +29,13 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 LOG = structlog.get_logger()
 
 
+BrowserCleanupFunc = Callable[[], None] | None
+
+
 class BrowserContextCreator(Protocol):
     def __call__(
         self, playwright: Playwright, **kwargs: dict[str, Any]
-    ) -> Awaitable[tuple[BrowserContext, BrowserArtifacts]]: ...
+    ) -> Awaitable[tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]]: ...
 
 
 class BrowserContextFactory:
@@ -93,7 +96,7 @@ class BrowserContextFactory:
     @classmethod
     async def create_browser_context(
         cls, playwright: Playwright, **kwargs: Any
-    ) -> tuple[BrowserContext, BrowserArtifacts]:
+    ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
         browser_type = SettingsManager.get_settings().BROWSER_TYPE
         try:
             creator = cls._creators.get(browser_type)
@@ -123,14 +126,18 @@ class BrowserArtifacts(BaseModel):
     traces_dir: str | None = None
 
 
-async def _create_headless_chromium(playwright: Playwright, **kwargs: dict) -> tuple[BrowserContext, BrowserArtifacts]:
+async def _create_headless_chromium(
+    playwright: Playwright, **kwargs: dict
+) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     browser_args = BrowserContextFactory.build_browser_args()
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(har_path=browser_args["record_har_path"])
     browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
-    return browser_context, browser_artifacts
+    return browser_context, browser_artifacts, None
 
 
-async def _create_headful_chromium(playwright: Playwright, **kwargs: dict) -> tuple[BrowserContext, BrowserArtifacts]:
+async def _create_headful_chromium(
+    playwright: Playwright, **kwargs: dict
+) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     browser_args = BrowserContextFactory.build_browser_args()
     browser_args.update(
         {
@@ -139,7 +146,7 @@ async def _create_headful_chromium(playwright: Playwright, **kwargs: dict) -> tu
     )
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(har_path=browser_args["record_har_path"])
     browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
-    return browser_context, browser_artifacts
+    return browser_context, browser_artifacts, None
 
 
 BrowserContextFactory.register_type("chromium-headless", _create_headless_chromium)
@@ -155,11 +162,13 @@ class BrowserState:
         browser_context: BrowserContext | None = None,
         page: Page | None = None,
         browser_artifacts: BrowserArtifacts = BrowserArtifacts(),
+        browser_cleanup: BrowserCleanupFunc = None,
     ):
         self.pw = pw
         self.browser_context = browser_context
         self.page = page
         self.browser_artifacts = browser_artifacts
+        self.browser_cleanup = browser_cleanup
 
     def __assert_page(self) -> Page:
         if self.page is not None:
@@ -190,6 +199,7 @@ class BrowserState:
             (
                 browser_context,
                 browser_artifacts,
+                browser_cleanup,
             ) = await BrowserContextFactory.create_browser_context(
                 self.pw,
                 url=url,
@@ -198,6 +208,7 @@ class BrowserState:
             )
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts
+            self.browser_cleanup = browser_cleanup
             LOG.info("browser context is created")
 
         assert self.browser_context is not None
@@ -300,6 +311,9 @@ class BrowserState:
             LOG.info("Closing browser context and its pages")
             await self.browser_context.close()
             LOG.info("Main browser context and all its pages are closed")
+            if self.browser_cleanup is not None:
+                self.browser_cleanup()
+                LOG.info("Main browser cleanup is excuted")
         if self.pw and close_browser_on_completion:
             LOG.info("Stopping playwright")
             await self.pw.stop()
