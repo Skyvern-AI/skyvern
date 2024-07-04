@@ -753,8 +753,14 @@ async def update_organization(
 
 
 async def validate_file_size(file: UploadFile) -> UploadFile:
-    # Check the file size
-    if file.size > app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE:
+    try:
+        file.file.seek(0, 2)  # Move the pointer to the end of the file
+        size = file.file.tell()  # Get the current position of the pointer, which represents the file size
+        file.file.seek(0)  # Reset the pointer back to the beginning
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Could not determine file size.") from e
+
+    if size > app.SETTINGS_MANAGER.MAX_FILE_SIZE:
         raise HTTPException(
             status_code=413,
             detail=f"File size exceeds the maximum allowed size ({app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE} bytes)",
