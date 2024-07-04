@@ -503,6 +503,10 @@ class ForgeAgent:
                 step_retry=step.retry_index,
             )
             step = await self.update_step(step=step, status=StepStatus.running)
+            await app.AGENT_FUNCTION.prepare_step_execution(
+                organization=organization, task=task, step=step, browser_state=browser_state
+            )
+
             (
                 scraped_page,
                 extract_action_prompt,
