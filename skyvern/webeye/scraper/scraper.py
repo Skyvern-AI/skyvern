@@ -111,7 +111,7 @@ class ScrapedPage(BaseModel):
     """
     Scraped response from a webpage, including:
     1. List of elements
-    2. ID to xpath map
+    2. ID to css map
     3. The element tree of the page (list of dicts). Each element has children and attributes.
     4. The screenshot (base64 encoded)
     5. The URL of the page
@@ -122,7 +122,7 @@ class ScrapedPage(BaseModel):
     elements: list[dict]
     id_to_element_dict: dict[str, dict] = {}
     id_to_frame_dict: dict[str, str] = {}
-    id_to_xpath_dict: dict[str, str]
+    id_to_css_dict: dict[str, str]
     element_tree: list[dict]
     element_tree_trimmed: list[dict]
     screenshots: list[bytes]
@@ -276,14 +276,14 @@ async def scrape_web_unsafe(
 
     _build_element_links(elements)
 
-    id_to_xpath_dict = {}
+    id_to_css_dict = {}
     id_to_element_dict = {}
     id_to_frame_dict = {}
 
     for element in elements:
         element_id = element["id"]
         # get_interactable_element_tree marks each interactable element with a unique_id attribute
-        id_to_xpath_dict[element_id] = f"//*[@{SKYVERN_ID_ATTR}='{element_id}']"
+        id_to_css_dict[element_id] = f"[{SKYVERN_ID_ATTR}='{element_id}']"
         id_to_element_dict[element_id] = element
         id_to_frame_dict[element_id] = element["frame"]
 
@@ -301,7 +301,7 @@ async def scrape_web_unsafe(
 
     return ScrapedPage(
         elements=elements,
-        id_to_xpath_dict=id_to_xpath_dict,
+        id_to_css_dict=id_to_css_dict,
         id_to_element_dict=id_to_element_dict,
         id_to_frame_dict=id_to_frame_dict,
         element_tree=element_tree,

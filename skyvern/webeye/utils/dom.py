@@ -10,6 +10,7 @@ from skyvern.exceptions import (
     ElementIsNotLabel,
     MissingElement,
     MissingElementDict,
+    MissingElementInCSSMap,
     MissingElementInIframe,
     MultipleElementsFound,
     SkyvernException,
@@ -20,7 +21,7 @@ from skyvern.webeye.scraper.scraper import ScrapedPage, get_select2_options
 LOG = structlog.get_logger()
 
 
-def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, xpath: str) -> Locator:
+def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, css: str) -> Locator:
     iframe_path: list[str] = []
 
     while frame != "main.frame":
@@ -42,7 +43,7 @@ def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, xpath: str
         child_frame = iframe_path.pop()
         current_page = current_page.frame_locator(f"[{SKYVERN_ID_ATTR}='{child_frame}']")
 
-    return current_page.locator(f"xpath={xpath}")
+    return current_page.locator(css)
 
 
 class InteractiveElement(StrEnum):
@@ -161,21 +162,25 @@ class DomUtil:
         if not frame:
             raise MissingElementInIframe(element_id)
 
-        xpath = self.scraped_page.id_to_xpath_dict[element_id]
+        css = self.scraped_page.id_to_css_dict.get(element_id)
+        if not css:
+            raise MissingElementInCSSMap(element_id)
 
-        locator = resolve_locator(self.scraped_page, self.page, frame, xpath)
+        locator = resolve_locator(self.scraped_page, self.page, frame, css)
 
         num_elements = await locator.count()
         if num_elements < 1:
-            LOG.warning("No elements found with xpath. Validation failed.", xpath=xpath)
-            raise MissingElement(xpath=xpath, element_id=element_id)
+            LOG.warning("No elements found with css. Validation failed.", css=css, element_id=element_id)
+            raise MissingElement(selector=css, element_id=element_id)
 
         elif num_elements > 1:
             LOG.warning(
-                "Multiple elements found with xpath. Expected 1. Validation failed.",
+                "Multiple elements found with css. Expected 1. Validation failed.",
                 num_elements=num_elements,
+                selector=css,
+                element_id=element_id,
             )
-            raise MultipleElementsFound(num=num_elements, xpath=xpath, element_id=element_id)
+            raise MultipleElementsFound(num=num_elements, selector=css, element_id=element_id)
 
         return SkyvernElement(locator, element)
 
