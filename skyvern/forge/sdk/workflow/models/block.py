@@ -797,9 +797,6 @@ class SendEmailBlock(Block):
 
             # if the file path is a directory, add all files in the directory, skip directories, limit to 10 files
             if os.path.exists(path) and os.path.isdir(path):
-                if len(os.listdir(path)) > 10:
-                    LOG.warning("SendEmailBlock: Too many files in the directory, not attaching to email")
-                    continue
                 for file in os.listdir(path):
                     if os.path.isdir(os.path.join(path, file)):
                         LOG.warning("SendEmailBlock: Skipping directory", file=file)
