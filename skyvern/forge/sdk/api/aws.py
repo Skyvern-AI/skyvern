@@ -1,5 +1,5 @@
 from enum import StrEnum
-from typing import Any, Callable
+from typing import IO, Any, Callable
 from urllib.parse import urlparse
 
 import aioboto3
@@ -53,6 +53,17 @@ class AsyncAWSClient:
             return uri
         except Exception:
             LOG.exception("S3 upload failed.", uri=uri)
+            return None
+
+    @execute_with_async_client(client_type=AWSClientType.S3)
+    async def upload_file_stream(self, uri: str, file_obj: IO[bytes], client: AioBaseClient = None) -> str | None:
+        try:
+            parsed_uri = S3Uri(uri)
+            await client.upload_fileobj(file_obj, parsed_uri.bucket, parsed_uri.key)
+            LOG.debug("Upload file stream success", uri=uri)
+            return uri
+        except Exception:
+            LOG.exception("S3 upload stream failed.", uri=uri)
             return None
 
     @execute_with_async_client(client_type=AWSClientType.S3)
@@ -137,3 +148,6 @@ class S3Uri(object):
     @property
     def uri(self) -> str:
         return self._parsed.geturl()
+
+
+aws_client = AsyncAWSClient()
