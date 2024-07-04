@@ -137,3 +137,6 @@ class S3Uri(object):
     @property
     def uri(self) -> str:
         return self._parsed.geturl()
+
+
+aws_client = AsyncAWSClient()
