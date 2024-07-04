@@ -752,11 +752,20 @@ async def update_organization(
     )
 
 
-# Implement an endpoint that gets a single file and uploads it to S3
+async def validate_file_size(file: UploadFile) -> UploadFile:
+    # Check the file size
+    if file.size > app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File size exceeds the maximum allowed size ({app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE} bytes)",
+        )
+    return file
+
+
 @base_router.post("/upload_file/", include_in_schema=False)
 @base_router.post("/upload_file")
 async def upload_file(
-    file: UploadFile,
+    file: UploadFile = Depends(validate_file_size),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Response:
     bucket = app.SETTINGS_MANAGER.AWS_S3_BUCKET_UPLOADS
@@ -765,8 +774,8 @@ async def upload_file(
     s3_uri = (
         f"s3://{bucket}/{app.SETTINGS_MANAGER.ENV}/{current_org.organization_id}/{todays_date}/{uuid_prefixed_filename}"
     )
-    data: bytes = await file.read()
-    uploaded_s3_uri = await aws_client.upload_file(s3_uri, data)
+    # Stream the file to S3
+    uploaded_s3_uri = await aws_client.upload_file_stream(s3_uri, file.file)
     if not uploaded_s3_uri:
         raise HTTPException(status_code=500, detail="Failed to upload file to S3.")
 
