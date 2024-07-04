@@ -327,6 +327,9 @@ function isInteractableInput(element) {
 }
 
 function isInteractable(element) {
+  if (element.shadowRoot) {
+    return false;
+  }
   if (!isElementVisible(element)) {
     return false;
   }
@@ -620,8 +623,9 @@ function getListboxOptions(element) {
   return selectOptions;
 }
 
-async function getSelect2OptionElements() {
+async function getSelect2OptionElements(element) {
   let optionList = [];
+  const document = element.getRootNode();
 
   while (true) {
     oldOptionCount = optionList.length;
@@ -653,8 +657,8 @@ async function getSelect2OptionElements() {
   return optionList;
 }
 
-async function getSelect2Options() {
-  const optionList = await getSelect2OptionElements();
+async function getSelect2Options(element) {
+  const optionList = await getSelect2OptionElements(element);
 
   let selectOptions = [];
   for (let i = 0; i < optionList.length; i++) {
@@ -670,6 +674,27 @@ async function getSelect2Options() {
   }
 
   return selectOptions;
+}
+
+function getDOMElementBySkyvenElement(elementObj) {
+  // if element has shadowHost set, we need to find the shadowHost element first then find the element
+  if (elementObj.shadowHost) {
+    let shadowHostEle = document.querySelector(
+      `[unique_id="${elementObj.shadowHost}"]`,
+    );
+    if (!shadowHostEle) {
+      console.log(
+        "Could not find shadowHost element with unique_id: ",
+        elementObj.shadowHost,
+      );
+      return null;
+    }
+    return shadowHostEle.shadowRoot.querySelector(
+      `[unique_id="${elementObj.id}"]`,
+    );
+  }
+
+  return document.querySelector(`[unique_id="${elementObj.id}"]`);
 }
 
 function uniqueId() {
@@ -744,6 +769,18 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
         elementTagNameLower === "svg" || element.closest("svg") !== null,
     };
 
+    let isInShadowRoot = element.getRootNode() instanceof ShadowRoot;
+    if (isInShadowRoot) {
+      let shadowHostEle = element.getRootNode().host;
+      let shadowHostId = shadowHostEle.getAttribute("unique_id");
+      // assign shadowHostId to the shadowHost element if it doesn't have unique_id
+      if (!shadowHostId) {
+        shadowHostId = uniqueId();
+        shadowHost.setAttribute("unique_id", shadowHostId);
+      }
+      elementObj.shadowHost = shadowHostId;
+    }
+
     // get options for select element or for listbox element
     let selectOptions = null;
     if (elementTagNameLower === "select") {
@@ -754,9 +791,9 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
     } else if (open_select && isComboboxDropdown(element)) {
       // open combobox dropdown to get options
       element.click();
-      const listBox = document.getElementById(
-        element.getAttribute("aria-controls"),
-      );
+      const listBox = element
+        .getRootNode()
+        .getElementById(element.getAttribute("aria-controls"));
       if (listBox) {
         selectOptions = getListboxOptions(listBox);
       }
@@ -777,7 +814,7 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
         }),
       );
 
-      selectOptions = await getSelect2Options();
+      selectOptions = await getSelect2Options(element);
 
       // HACK: click again to close the dropdown
       element.dispatchEvent(
@@ -789,7 +826,7 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
     } else if (open_select && isSelect2MultiChoice(element)) {
       // click element to show options
       element.click();
-      selectOptions = await getSelect2Options();
+      selectOptions = await getSelect2Options(element);
 
       // HACK: press ESC to close the dropdown
       element.dispatchEvent(
@@ -820,6 +857,11 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
       return;
     }
 
+    // skip proccessing option element as they are already added to the select.options
+    if (element.tagName.toLowerCase() === "option") {
+      return;
+    }
+
     // if element is an "a" tag and has a target="_blank" attribute, remove the target attribute
     // We're doing this so that skyvern can do all the navigation in a single page/tab and not open new tab
     if (element.tagName.toLowerCase() === "a") {
@@ -847,10 +889,6 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
           .find((element) => element.id === parentId)
           .children.push(elementObj);
       }
-      // options already added to the select.options, no need to add options anymore
-      if (elementObj.options && elementObj.options.length > 0) {
-        return elementObj;
-      }
       // Recursively process the children of the element
       const children = getChildElements(element);
       for (let i = 0; i < children.length; i++) {
@@ -863,6 +901,17 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
 
       elements.push(iframeElementObject);
       resultArray.push(iframeElementObject);
+    } else if (element.shadowRoot) {
+      // shadow host element
+      let shadowHostElement = await buildElementObject(element, false);
+      elements.push(shadowHostElement);
+      resultArray.push(shadowHostElement);
+
+      const children = getChildElements(element.shadowRoot);
+      for (let i = 0; i < children.length; i++) {
+        const childElement = children[i];
+        await processElement(childElement, shadowHostElement.id);
+      }
     } else {
       // For a non-interactable element, if it has direct text, we also tagged
       // it with unique_id, but with interatable=false in the element.
@@ -915,11 +964,6 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
       const children = getChildElements(element);
       for (let i = 0; i < children.length; i++) {
         const childElement = children[i];
-
-        // Skip processing option-children of an non-interactable select element as they are already added to the select.options
-        if (childElement.tagName.toLowerCase() === "option") {
-          continue;
-        }
         await processElement(childElement, parentId);
       }
     }
@@ -932,7 +976,10 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
 
     // look up for 10 levels to find the most contextual parent element
     let targetContextualParent = null;
-    let currentEle = document.querySelector(`[unique_id="${element.id}"]`);
+    let currentEle = getDOMElementBySkyvenElement(element);
+    if (!currentEle) {
+      return ctx;
+    }
     let parentEle = currentEle;
     for (var i = 0; i < 10; i++) {
       parentEle = parentEle.parentElement;
@@ -970,7 +1017,12 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
   };
 
   const getContextByLinked = (element, ctx) => {
-    let currentEle = document.querySelector(`[unique_id="${element.id}"]`);
+    let currentEle = getDOMElementBySkyvenElement(element);
+    if (!currentEle) {
+      return ctx;
+    }
+
+    const document = currentEle.getRootNode();
     // check labels pointed to this element
     // 1. element id -> labels pointed to this id
     // 2. by attr "aria-labelledby" -> only one label with this id
@@ -1023,9 +1075,11 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
     // if the element is a child of a td, th, or tr, then pass the grandparent's context to the element
     let parentTagsThatDelegateParentContext = new Set(["td", "th", "tr"]);
     if (tagsWithDirectParentContext.has(element.tagName)) {
-      let parentElement = document.querySelector(
-        `[unique_id="${element.id}"]`,
-      ).parentElement;
+      let curElement = getDOMElementBySkyvenElement(element);
+      if (!curElement) {
+        return ctx;
+      }
+      let parentElement = curElement.parentElement;
       if (!parentElement) {
         return ctx;
       }

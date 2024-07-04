@@ -198,8 +198,11 @@ class Select2Dropdown:
     async def close(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.page.locator("#select2-drop").press("Escape", timeout=timeout)
 
-    async def get_options(self) -> typing.List[SkyvernOptionType]:
-        options = await get_select2_options(self.page)
+    async def get_options(
+        self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    ) -> typing.List[SkyvernOptionType]:
+        element_handler = await self.skyvern_element.locator.element_handle(timeout=timeout)
+        options = await get_select2_options(self.page, element_handler)
         return typing.cast(typing.List[SkyvernOptionType], options)
 
     async def select_by_index(
