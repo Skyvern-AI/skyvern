@@ -223,6 +223,11 @@ function isElementVisible(element) {
     return false;
   }
 
+  if (element.hasAttribute("aria-hidden")) {
+    const ariaHidden = element.getAttribute("aria-hidden").toLowerCase();
+    return ariaHidden === "false";
+  }
+
   const style = getElementComputedStyle(element);
   if (!style) return true;
   if (style.display === "contents") {
