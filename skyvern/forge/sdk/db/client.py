@@ -1019,11 +1019,41 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
-    async def get_workflow_runs(self, workflow_id: str) -> list[WorkflowRun]:
+    async def get_workflow_runs(self, organization_id: str, page: int = 1, page_size: int = 10) -> list[WorkflowRun]:
         try:
             async with self.Session() as session:
+                db_page = page - 1  # offset logic is 0 based
                 workflow_runs = (
-                    await session.scalars(select(WorkflowRunModel).filter_by(workflow_id=workflow_id))
+                    await session.scalars(
+                        select(WorkflowRunModel)
+                        .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
+                        .filter(WorkflowModel.organization_id == organization_id)
+                        .order_by(WorkflowRunModel.created_at.desc())
+                        .limit(page_size)
+                        .offset(db_page * page_size)
+                    )
+                ).all()
+                return [convert_to_workflow_run(run) for run in workflow_runs]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_workflow_runs_for_workflow_permanent_id(
+        self, workflow_permanent_id: str, organization_id: str, page: int = 1, page_size: int = 10
+    ) -> list[WorkflowRun]:
+        try:
+            async with self.Session() as session:
+                db_page = page - 1  # offset logic is 0 based
+                workflow_runs = (
+                    await session.scalars(
+                        select(WorkflowRunModel)
+                        .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
+                        .filter(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
+                        .filter(WorkflowModel.organization_id == organization_id)
+                        .order_by(WorkflowRunModel.created_at.desc())
+                        .limit(page_size)
+                        .offset(db_page * page_size)
+                    )
                 ).all()
                 return [convert_to_workflow_run(run) for run in workflow_runs]
         except SQLAlchemyError:

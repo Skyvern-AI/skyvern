@@ -47,6 +47,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     RunWorkflowResponse,
     Workflow,
     WorkflowRequestBody,
+    WorkflowRun,
     WorkflowRunStatusResponse,
 )
 from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
@@ -548,6 +549,52 @@ async def execute_workflow(
     return RunWorkflowResponse(
         workflow_id=workflow_id,
         workflow_run_id=workflow_run.workflow_run_id,
+    )
+
+
+@base_router.get(
+    "/workflows/runs",
+    response_model=list[WorkflowRun],
+)
+@base_router.get(
+    "/workflows/runs/",
+    response_model=list[WorkflowRun],
+    include_in_schema=False,
+)
+async def get_workflow_runs(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> list[WorkflowRun]:
+    analytics.capture("skyvern-oss-agent-workflow-runs-get")
+    return await app.WORKFLOW_SERVICE.get_workflow_runs(
+        organization_id=current_org.organization_id,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@base_router.get(
+    "/workflows/{workflow_permanent_id}/runs",
+    response_model=list[WorkflowRun],
+)
+@base_router.get(
+    "/workflows/{workflow_permanent_id}/runs/",
+    response_model=list[WorkflowRun],
+    include_in_schema=False,
+)
+async def get_workflow_runs_for_workflow_permanent_id(
+    workflow_permanent_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> list[WorkflowRun]:
+    analytics.capture("skyvern-oss-agent-workflow-runs-get")
+    return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+        page=page,
+        page_size=page_size,
     )
 
 
