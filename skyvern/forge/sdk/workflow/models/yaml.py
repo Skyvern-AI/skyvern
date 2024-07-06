@@ -4,7 +4,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, Field
 
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
-from skyvern.forge.sdk.workflow.models.block import BlockType
+from skyvern.forge.sdk.workflow.models.block import BlockType, FileType
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
 
 
@@ -162,6 +162,13 @@ class SendEmailBlockYAML(BlockYAML):
     file_attachments: list[str] | None = None
 
 
+class FileParserBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.FILE_URL_PARSER] = BlockType.FILE_URL_PARSER  # type: ignore
+
+    file_url: str
+    file_type: FileType
+
+
 PARAMETER_YAML_SUBCLASSES = (
     AWSSecretParameterYAML
     | BitwardenLoginCredentialParameterYAML
@@ -179,6 +186,7 @@ BLOCK_YAML_SUBCLASSES = (
     | DownloadToS3BlockYAML
     | UploadToS3BlockYAML
     | SendEmailBlockYAML
+    | FileParserBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 
