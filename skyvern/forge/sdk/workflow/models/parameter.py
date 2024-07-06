@@ -67,6 +67,7 @@ class WorkflowParameterType(StrEnum):
     FLOAT = "float"
     BOOLEAN = "boolean"
     JSON = "json"
+    FILE_URL = "file_url"
 
     def convert_value(self, value: str | None) -> str | int | float | bool | dict | list | None:
         if value is None:
@@ -81,6 +82,8 @@ class WorkflowParameterType(StrEnum):
             return value.lower() in ["true", "1"]
         elif self == WorkflowParameterType.JSON:
             return json.loads(value)
+        elif self == WorkflowParameterType.FILE_URL:
+            return value
 
 
 class WorkflowParameter(Parameter):

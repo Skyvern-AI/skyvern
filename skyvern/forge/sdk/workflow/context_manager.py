@@ -255,16 +255,21 @@ class WorkflowRunContext:
                         old_value=parameter.value,
                         new_value=value,
                     )
-                if not isinstance(value, dict):
+                if not isinstance(value, dict) and not isinstance(value, list):
                     raise ValueError(
-                        f"ContextParameter can't depend on an OutputParameter with a non-dict value. "
+                        f"ContextParameter can only depend on an OutputParameter with a dict or list value. "
                         f"ContextParameter key: {parameter.key}, "
                         f"OutputParameter key: {output_parameter.key}, "
                         f"OutputParameter value: {value}"
                     )
-                parameter.value = value.get(parameter.key)
-                self.parameters[parameter.key] = parameter
-                self.values[parameter.key] = parameter.value
+                if isinstance(value, dict):
+                    parameter.value = value.get(parameter.key)
+                    self.parameters[parameter.key] = parameter
+                    self.values[parameter.key] = parameter.value
+                else:
+                    parameter.value = value
+                    self.parameters[parameter.key] = parameter
+                    self.values[parameter.key] = parameter.value
 
     async def register_block_parameters(
         self,

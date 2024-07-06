@@ -9,8 +9,16 @@ import structlog
 
 from skyvern.constants import REPO_ROOT_DIR
 from skyvern.exceptions import DownloadFileMaxSizeExceeded
+from skyvern.forge.sdk.api.aws import AsyncAWSClient
 
 LOG = structlog.get_logger()
+
+
+async def download_from_s3(client: AsyncAWSClient, s3_uri: str) -> str:
+    downloaded_bytes = await client.download_file(uri=s3_uri)
+    file_path = tempfile.NamedTemporaryFile(delete=False)
+    file_path.write(downloaded_bytes)
+    return file_path.name
 
 
 async def download_file(url: str, max_size_mb: int | None = None) -> str:

@@ -25,6 +25,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
     CodeBlock,
     DownloadToS3Block,
+    FileParserBlock,
     ForLoopBlock,
     SendEmailBlock,
     TaskBlock,
@@ -1050,6 +1051,14 @@ class WorkflowService:
                 subject=block_yaml.subject,
                 body=block_yaml.body,
                 file_attachments=block_yaml.file_attachments or [],
+                continue_on_failure=block_yaml.continue_on_failure,
+            )
+        elif block_yaml.block_type == BlockType.FILE_URL_PARSER:
+            return FileParserBlock(
+                label=block_yaml.label,
+                output_parameter=output_parameter,
+                file_url=block_yaml.file_url,
+                file_type=block_yaml.file_type,
                 continue_on_failure=block_yaml.continue_on_failure,
             )
         raise ValueError(f"Invalid block type {block_yaml.block_type}")

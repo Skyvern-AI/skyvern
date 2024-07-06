@@ -75,3 +75,11 @@ class ContextParameterSourceNotDefined(BaseWorkflowHTTPException):
             f"Source parameter key {source_key} for context parameter {context_parameter_key} does not exist.",
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
+
+
+class InvalidFileType(BaseWorkflowHTTPException):
+    def __init__(self, file_url: str, file_type: str, error: str) -> None:
+        super().__init__(
+            f"File URL {file_url} is not a valid {file_type} file. Error: {error}",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )

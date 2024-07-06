@@ -1,4 +1,5 @@
 import abc
+import csv
 import json
 import os
 import smtplib
@@ -25,12 +26,16 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
-from skyvern.forge.sdk.api.files import download_file, get_path_for_workflow_download_directory
+from skyvern.forge.sdk.api.files import download_file, download_from_s3, get_path_for_workflow_download_directory
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.schemas.tasks import TaskOutput, TaskStatus
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.exceptions import InvalidEmailClientConfiguration, NoValidEmailRecipient
+from skyvern.forge.sdk.workflow.exceptions import (
+    InvalidEmailClientConfiguration,
+    InvalidFileType,
+    NoValidEmailRecipient,
+)
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
@@ -50,6 +55,7 @@ class BlockType(StrEnum):
     DOWNLOAD_TO_S3 = "download_to_s3"
     UPLOAD_TO_S3 = "upload_to_s3"
     SEND_EMAIL = "send_email"
+    FILE_URL_PARSER = "file_url_parser"
 
 
 @dataclass(frozen=True)
@@ -353,9 +359,8 @@ class ForLoopBlock(Block):
         return list(parameters)
 
     def get_loop_block_context_parameters(self, workflow_run_id: str, loop_data: Any) -> list[ContextParameter]:
-        if not isinstance(loop_data, dict):
-            # TODO (kerem): Should we add support for other types?
-            raise ValueError("loop_data should be a dict")
+        if not isinstance(loop_data, dict) and not isinstance(loop_data, list):
+            raise ValueError("loop_data should be a dict or a list.")
 
         context_parameters = []
         for loop_block in self.loop_blocks:
@@ -369,13 +374,19 @@ class ForLoopBlock(Block):
         for context_parameter in context_parameters:
             if context_parameter.source.key != self.loop_over.key:
                 continue
-            if context_parameter.key not in loop_data:
-                raise ContextParameterValueNotFound(
-                    parameter_key=context_parameter.key,
-                    existing_keys=list(loop_data.keys()),
-                    workflow_run_id=workflow_run_id,
-                )
-            context_parameter.value = loop_data[context_parameter.key]
+            # If the loop_data is a dict, we need to check if the key exists in the loop_data
+            if isinstance(loop_data, dict):
+                if context_parameter.key in loop_data:
+                    context_parameter.value = loop_data[context_parameter.key]
+                else:
+                    raise ContextParameterValueNotFound(
+                        parameter_key=context_parameter.key,
+                        existing_keys=list(loop_data.keys()),
+                        workflow_run_id=workflow_run_id,
+                    )
+            else:
+                # If the loop_data is a list, we can directly assign the loop_data to the context_parameter value
+                context_parameter.value = loop_data
 
         return context_parameters
 
@@ -859,7 +870,7 @@ class SendEmailBlock(Block):
             path = None
             try:
                 if filename.startswith("s3://"):
-                    path = await self._download_from_s3(filename)
+                    path = await download_from_s3(self.get_async_aws_client(), filename)
                 elif filename.startswith("http://") or filename.startswith("https://"):
                     path = await download_file(filename)
                 else:
@@ -947,6 +958,69 @@ class SendEmailBlock(Block):
         return self.build_block_result(success=True, output_parameter_value=result_dict)
 
 
+class FileType(StrEnum):
+    CSV = "csv"
+
+
+class FileParserBlock(Block):
+    block_type: Literal[BlockType.FILE_URL_PARSER] = BlockType.FILE_URL_PARSER
+
+    file_url: str
+    file_type: FileType
+
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,
+    ) -> list[PARAMETER_TYPE]:
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        if self.file_url and workflow_run_context.has_parameter(self.file_url):
+            return [workflow_run_context.get_parameter(self.file_url)]
+        return []
+
+    def validate_file_type(self, file_url_used: str, file_path: str) -> None:
+        if self.file_type == FileType.CSV:
+            try:
+                with open(file_path, "r") as file:
+                    csv.Sniffer().sniff(file.read(1024))
+            except csv.Error as e:
+                raise InvalidFileType(file_url=file_url_used, file_type=self.file_type, error=str(e))
+
+    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        file_url_to_use = self.file_url
+        if (
+            self.file_url
+            and workflow_run_context.has_parameter(self.file_url)
+            and workflow_run_context.has_value(self.file_url)
+        ):
+            file_url_parameter_value = workflow_run_context.get_value(self.file_url)
+            if file_url_parameter_value:
+                LOG.info(
+                    "FileParserBlock: File URL is parameterized, using parameter value",
+                    file_url_parameter_value=file_url_parameter_value,
+                    file_url_parameter_key=self.file_url,
+                )
+                file_url_to_use = file_url_parameter_value
+
+        # Download the file
+        if file_url_to_use.startswith("s3://"):
+            file_path = await download_from_s3(self.get_async_aws_client(), file_url_to_use)
+        else:
+            file_path = await download_file(file_url_to_use)
+        # Validate the file type
+        self.validate_file_type(file_url_to_use, file_path)
+        # Parse the file into a list of dictionaries where each dictionary represents a row in the file
+        parsed_data = []
+        with open(file_path, "r") as file:
+            if self.file_type == FileType.CSV:
+                reader = csv.DictReader(file)
+                for row in reader:
+                    parsed_data.append(row)
+        # Record the parsed data
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, parsed_data)
+        return self.build_block_result(success=True, output_parameter_value=parsed_data)
+
+
 BlockSubclasses = Union[
     ForLoopBlock,
     TaskBlock,
@@ -955,5 +1029,6 @@ BlockSubclasses = Union[
     DownloadToS3Block,
     UploadToS3Block,
     SendEmailBlock,
+    FileParserBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
