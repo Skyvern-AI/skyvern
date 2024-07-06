@@ -10,7 +10,7 @@ from playwright.async_api import Frame, FrameLocator, Locator, Page
 from skyvern.constants import INPUT_TEXT_TIMEOUT, SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     ElementIsNotLabel,
-    ElementIsSelect2Dropdown,
+    ElementIsNotSelect2Dropdown,
     MissingElement,
     MissingElementDict,
     MissingElementInCSSMap,
@@ -136,7 +136,7 @@ class SkyvernElement:
 
     async def get_select2_dropdown(self) -> Select2Dropdown:
         if not await self.is_select2_dropdown():
-            raise ElementIsSelect2Dropdown(self.get_id(), self.__static_element)
+            raise ElementIsNotSelect2Dropdown(self.get_id(), self.__static_element)
 
         return Select2Dropdown(self.get_frame(), self)
 
