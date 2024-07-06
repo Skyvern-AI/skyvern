@@ -308,6 +308,16 @@ class ElementIsNotLabel(SkyvernException):
         super().__init__(f"<{tag_name}> element is not <label>")
 
 
+class ElementIsNotSelect2Dropdown(SkyvernException):
+    def __init__(self, element_id: str, element: dict):
+        super().__init__(f"element[{element}] is not select2 dropdown. element_id={element_id}")
+
+
+class NoneFrameError(SkyvernException):
+    def __init__(self, frame_id: str):
+        super().__init__(f"frame content is none. frame_id={frame_id}")
+
+
 class MissingElementDict(SkyvernException):
     def __init__(self, element_id: str) -> None:
         super().__init__(f"Invalid element id. element_id={element_id}")

@@ -1,18 +1,22 @@
+from __future__ import annotations
+
 import asyncio
 import typing
 from enum import StrEnum
 
 import structlog
-from playwright.async_api import FrameLocator, Locator, Page
+from playwright.async_api import Frame, FrameLocator, Locator, Page
 
 from skyvern.constants import INPUT_TEXT_TIMEOUT, SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     ElementIsNotLabel,
+    ElementIsNotSelect2Dropdown,
     MissingElement,
     MissingElementDict,
     MissingElementInCSSMap,
     MissingElementInIframe,
     MultipleElementsFound,
+    NoneFrameError,
     SkyvernException,
 )
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -21,7 +25,9 @@ from skyvern.webeye.scraper.scraper import ScrapedPage, get_select2_options
 LOG = structlog.get_logger()
 
 
-def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, css: str) -> Locator:
+async def resolve_locator(
+    scrape_page: ScrapedPage, page: Page, frame: str, css: str
+) -> typing.Tuple[Locator, Page | Frame]:
     iframe_path: list[str] = []
 
     while frame != "main.frame":
@@ -39,11 +45,20 @@ def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, css: str) 
         frame = parent_frame
 
     current_page: Page | FrameLocator = page
+    current_frame: Page | Frame = page
+
     while len(iframe_path) > 0:
         child_frame = iframe_path.pop()
+
+        frame_handler = await current_frame.query_selector(f"[{SKYVERN_ID_ATTR}='{child_frame}']")
+        content_frame = await frame_handler.content_frame()
+        if content_frame is None:
+            raise NoneFrameError(frame_id=child_frame)
+        current_frame = content_frame
+
         current_page = current_page.frame_locator(f"[{SKYVERN_ID_ATTR}='{child_frame}']")
 
-    return current_page.locator(css)
+    return current_page.locator(css), current_frame
 
 
 class InteractiveElement(StrEnum):
@@ -64,8 +79,9 @@ class SkyvernElement:
     When you try to interact with these elements by python, you are supposed to use this class as an interface.
     """
 
-    def __init__(self, locator: Locator, static_element: dict) -> None:
+    def __init__(self, locator: Locator, frame: Page | Frame, static_element: dict) -> None:
         self.__static_element = static_element
+        self.__frame = frame
         self.locator = locator
 
     async def is_select2_dropdown(self) -> bool:
@@ -99,8 +115,11 @@ class SkyvernElement:
     def get_tag_name(self) -> str:
         return self.__static_element.get("tagName", "")
 
-    def get_id(self) -> int | None:
-        return self.__static_element.get("id")
+    def get_id(self) -> str:
+        return self.__static_element.get("id", "")
+
+    def get_attributes(self) -> typing.Dict:
+        return self.__static_element.get("attributes", {})
 
     def get_options(self) -> typing.List[SkyvernOptionType]:
         options = self.__static_element.get("options", None)
@@ -108,6 +127,18 @@ class SkyvernElement:
             return []
 
         return typing.cast(typing.List[SkyvernOptionType], options)
+
+    def get_frame(self) -> Page | Frame:
+        return self.__frame
+
+    def get_locator(self) -> Locator:
+        return self.locator
+
+    async def get_select2_dropdown(self) -> Select2Dropdown:
+        if not await self.is_select2_dropdown():
+            raise ElementIsNotSelect2Dropdown(self.get_id(), self.__static_element)
+
+        return Select2Dropdown(self.get_frame(), self)
 
     def find_element_id_in_label_children(self, element_type: InteractiveElement) -> str | None:
         tag_name = self.get_tag_name()
@@ -131,7 +162,7 @@ class SkyvernElement:
         timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
     ) -> typing.Any:
         if not dynamic:
-            if attr := self.__static_element.get("attributes", {}).get(attr_name):
+            if attr := self.get_attributes().get(attr_name):
                 return attr
 
         return await self.locator.get_attribute(attr_name, timeout=timeout)
@@ -166,7 +197,7 @@ class DomUtil:
         if not css:
             raise MissingElementInCSSMap(element_id)
 
-        locator = resolve_locator(self.scraped_page, self.page, frame, css)
+        locator, frame_content = await resolve_locator(self.scraped_page, self.page, frame, css)
 
         num_elements = await locator.count()
         if num_elements < 1:
@@ -182,31 +213,31 @@ class DomUtil:
             )
             raise MultipleElementsFound(num=num_elements, selector=css, element_id=element_id)
 
-        return SkyvernElement(locator, element)
+        return SkyvernElement(locator, frame_content, element)
 
 
 class Select2Dropdown:
-    def __init__(self, page: Page, skyvern_element: SkyvernElement) -> None:
+    def __init__(self, frame: Page | Frame, skyvern_element: SkyvernElement) -> None:
         self.skyvern_element = skyvern_element
-        self.page = page
+        self.frame = frame
 
     async def open(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
-        await self.skyvern_element.locator.click(timeout=timeout)
+        await self.skyvern_element.get_locator().click(timeout=timeout)
         # wait for the options to load
         await asyncio.sleep(3)
 
     async def close(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
-        await self.page.locator("#select2-drop").press("Escape", timeout=timeout)
+        await self.frame.locator("#select2-drop").press("Escape", timeout=timeout)
 
     async def get_options(
         self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
     ) -> typing.List[SkyvernOptionType]:
-        element_handler = await self.skyvern_element.locator.element_handle(timeout=timeout)
-        options = await get_select2_options(self.page, element_handler)
+        element_handler = await self.skyvern_element.get_locator().element_handle(timeout=timeout)
+        options = await get_select2_options(self.frame, element_handler)
         return typing.cast(typing.List[SkyvernOptionType], options)
 
     async def select_by_index(
         self, index: int, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
     ) -> None:
-        anchor = self.page.locator("#select2-drop li[role='option']")
+        anchor = self.frame.locator("#select2-drop li[role='option']")
         await anchor.nth(index).click(timeout=timeout)

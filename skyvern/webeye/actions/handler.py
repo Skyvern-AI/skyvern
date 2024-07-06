@@ -48,7 +48,7 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage
-from skyvern.webeye.utils.dom import DomUtil, InteractiveElement, Select2Dropdown, SkyvernElement
+from skyvern.webeye.utils.dom import DomUtil, InteractiveElement, SkyvernElement
 
 LOG = structlog.get_logger()
 TEXT_INPUT_DELAY = 10  # 10ms between each character input
@@ -496,7 +496,7 @@ async def handle_select_option_action(
         )
         timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
 
-        select2_element = Select2Dropdown(page=page, skyvern_element=skyvern_element)
+        select2_element = await skyvern_element.get_select2_dropdown()
 
         await select2_element.open()
         options = await select2_element.get_options()
