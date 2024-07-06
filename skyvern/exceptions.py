@@ -310,7 +310,7 @@ class ElementIsNotLabel(SkyvernException):
 
 class ElementIsNotSelect2Dropdown(SkyvernException):
     def __init__(self, element_id: str, element: dict):
-        super().__init__(f"element[{element}] is not selector2 dropdown. element_id={element_id}")
+        super().__init__(f"element[{element}] is not select2 dropdown. element_id={element_id}")
 
 
 class NoneFrameError(SkyvernException):
