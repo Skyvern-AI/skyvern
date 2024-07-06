@@ -96,7 +96,7 @@ def json_to_html(element: dict) -> str:
     )
 
     # Check if the element is self-closing
-    if tag in ["img", "input", "br", "hr", "meta", "link"]:
+    if tag in ["img", "input", "br", "hr", "meta", "link"] and not option_html and not children_html:
         return f'<{tag}{attributes_html if not attributes_html else " "+attributes_html}>'
     else:
         return f'<{tag}{attributes_html if not attributes_html else " "+attributes_html}>{text}{children_html+option_html}</{tag}>'
