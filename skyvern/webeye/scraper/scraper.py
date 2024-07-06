@@ -318,10 +318,10 @@ async def get_page_content(page: Page, timeout: float = PAGE_CONTENT_TIMEOUT) ->
         return await page.content()
 
 
-async def get_select2_options(page: Page, element: ElementHandle) -> list[dict[str, Any]]:
-    await page.evaluate(JS_FUNCTION_DEFS)
+async def get_select2_options(frame: Page | Frame, element: ElementHandle) -> list[dict[str, Any]]:
+    await frame.evaluate(JS_FUNCTION_DEFS)
     js_script = "async (element) => await getSelect2Options(element)"
-    return await page.evaluate(js_script, element)
+    return await frame.evaluate(js_script, element)
 
 
 async def get_interactable_element_tree_in_frame(
