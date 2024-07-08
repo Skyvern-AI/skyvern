@@ -324,6 +324,12 @@ async def get_select2_options(frame: Page | Frame, element: ElementHandle) -> li
     return await frame.evaluate(js_script, element)
 
 
+async def get_combobox_options(frame: Page | Frame, element: ElementHandle) -> list[dict[str, Any]]:
+    await frame.evaluate(JS_FUNCTION_DEFS)
+    js_script = "async (element) => await getListboxOptions(element)"
+    return await frame.evaluate(js_script, element)
+
+
 async def get_interactable_element_tree_in_frame(
     frames: list[Frame],
     elements: list[dict],
