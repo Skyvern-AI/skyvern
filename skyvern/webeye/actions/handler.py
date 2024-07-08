@@ -11,6 +11,7 @@ from playwright.async_api import Locator, Page, TimeoutError
 from skyvern.constants import INPUT_TEXT_TIMEOUT, REPO_ROOT_DIR
 from skyvern.exceptions import (
     EmptySelect,
+    ErrFoundSelectableElement,
     FailToClick,
     FailToSelectByIndex,
     FailToSelectByLabel,
@@ -21,6 +22,7 @@ from skyvern.exceptions import (
     MissingElement,
     MissingFileUrl,
     MultipleElementsFound,
+    NoSelectableElementFound,
     OptionIndexOutOfBound,
 )
 from skyvern.forge import app
@@ -48,7 +50,7 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage
-from skyvern.webeye.utils.dom import DomUtil, InteractiveElement, SkyvernElement
+from skyvern.webeye.utils.dom import AbstractSelectDropdown, DomUtil, SkyvernElement
 
 LOG = structlog.get_logger()
 TEXT_INPUT_DELAY = 10  # 10ms between each character input
@@ -427,79 +429,73 @@ async def handle_select_option_action(
         element_dict=element_dict,
     )
 
-    # if element is not a select option, prioritize clicking the linked element if any
-    if tag_name != "select" and "linked_element" in element_dict:
+    if not await skyvern_element.is_selectable():
+        # 1. find from children
+        # TODO: 2. find from siblings and their chidren
         LOG.info(
-            "SelectOptionAction is not on a select tag and found a linked element",
+            "Element is not selectable, try to find the selectable element in the chidren",
+            tag_name=tag_name,
             action=action,
-            linked_element=element_dict["linked_element"],
-        )
-        listbox_click_success = await click_listbox_option(scraped_page, page, action, element_dict["linked_element"])
-        if listbox_click_success:
-            LOG.info(
-                "Successfully clicked linked element",
-                action=action,
-                linked_element=element_dict["linked_element"],
-            )
-            return [ActionSuccess()]
-        LOG.warning(
-            "Failed to click linked element",
-            action=action,
-            linked_element=element_dict["linked_element"],
         )
 
-    # check if the element is an a tag first. If yes, click it instead of selecting the option
-    if tag_name == "label":
-        # label pointed to select2 <a> element
-        select2_element_id: str | None = None
-        # search <a> anchor first and then search <input> anchor
-        select2_element_id = skyvern_element.find_element_id_in_label_children(InteractiveElement.A)
-        if select2_element_id is None:
-            select2_element_id = skyvern_element.find_element_id_in_label_children(InteractiveElement.INPUT)
-
-        if select2_element_id is not None:
-            select2_skyvern_element = await dom.get_skyvern_element_by_id(element_id=select2_element_id)
-            if await select2_skyvern_element.is_select2_dropdown():
-                LOG.info(
-                    "SelectOptionAction is on <label>. take the action on the real select2 element",
-                    action=action,
-                    select2_element_id=select2_element_id,
-                )
-                select_action = SelectOptionAction(element_id=select2_element_id, option=action.option)
-                return await handle_select_option_action(select_action, page, scraped_page, task, step)
-
-        # handler the select action on <label>
-        if select_element_id := get_select_id_in_label_children(scraped_page, action.element_id):
-            LOG.info(
-                "SelectOptionAction is on <label>. take the action on the real <select>",
+        selectable_child: SkyvernElement | None = None
+        try:
+            selectable_child = await skyvern_element.find_selectable_child(dom=dom)
+        except Exception as e:
+            LOG.error(
+                "Failed to find selectable element in chidren",
+                exc_info=True,
+                tag_name=tag_name,
                 action=action,
-                select_element_id=select_element_id,
             )
-            select_action = SelectOptionAction(element_id=select_element_id, option=action.option)
-            return await handle_select_option_action(select_action, page, scraped_page, task, step)
+            return [ActionFailure(ErrFoundSelectableElement(action.element_id, e))]
 
-        # handle the select action on <label> of checkbox/radio
-        if checkbox_element_id := get_checkbox_id_in_label_children(scraped_page, action.element_id):
-            LOG.info(
-                "SelectOptionAction is on <label> of <input> checkbox/radio. take the action on the real <input> checkbox/radio",
+        if selectable_child is None:
+            LOG.error(
+                "No selectable element found in chidren",
+                tag_name=tag_name,
                 action=action,
-                checkbox_element_id=checkbox_element_id,
             )
-            select_action = SelectOptionAction(element_id=checkbox_element_id, option=action.option)
-            return await handle_select_option_action(select_action, page, scraped_page, task, step)
+            return [ActionFailure(NoSelectableElementFound(action.element_id))]
 
-        return [ActionFailure(Exception("No element pointed by the label found"))]
-    elif await skyvern_element.is_select2_dropdown():
+        LOG.info(
+            "Found selectable element in the children",
+            tag_name=selectable_child.get_tag_name(),
+            element_id=selectable_child.get_id(),
+        )
+        select_action = SelectOptionAction(element_id=selectable_child.get_id(), option=action.option)
+        return await handle_select_option_action(select_action, page, scraped_page, task, step)
+
+    select_framework: AbstractSelectDropdown | None = None
+
+    if await skyvern_element.is_combobox_dropdown():
+        LOG.info(
+            "This is a combobox dropdown",
+            action=action,
+        )
+        select_framework = await skyvern_element.get_combobox_dropdown()
+    if await skyvern_element.is_select2_dropdown():
         LOG.info(
             "This is a select2 dropdown",
             action=action,
         )
+        select_framework = await skyvern_element.get_select2_dropdown()
+
+    if select_framework is not None:
         timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
 
-        select2_element = await skyvern_element.get_select2_dropdown()
+        try:
+            current_value = await select_framework.get_current_value()
+            if current_value == action.option.label or current_value == action.option.value:
+                return [ActionSuccess()]
+        except Exception:
+            LOG.info(
+                "failed to confirm if the select option has been done, force to take the action again.",
+                exc_info=True,
+            )
 
-        await select2_element.open()
-        options = await select2_element.get_options()
+        await select_framework.open()
+        options = await select_framework.get_options()
 
         result: List[ActionResult] = []
         # select by label first, then by index
@@ -510,22 +506,22 @@ async def handle_select_option_action(
                     option_index = option.get("optionIndex", None)
                     if option_index is None:
                         LOG.warning(
-                            "Select2 option index is None",
+                            f"{select_framework.name()} option index is None",
                             option=option,
                         )
                         continue
                     if action.option.label == option_content or action.option.value == option_content:
-                        await select2_element.select_by_index(index=option_index, timeout=timeout)
+                        await select_framework.select_by_index(index=option_index, timeout=timeout)
                         result.append(ActionSuccess())
                         return result
                 LOG.info(
-                    "no target select2 option matched by label, try to select by index",
+                    f"no target {select_framework.name()} option matched by label, try to select by index",
                     action=action,
                 )
             except Exception as e:
                 result.append(ActionFailure(e))
                 LOG.info(
-                    "failed to select by label in select2, try to select by index",
+                    f"failed to select by label in {select_framework.name()}, try to select by index",
                     exc_info=True,
                     action=action,
                 )
@@ -542,13 +538,13 @@ async def handle_select_option_action(
                             option_content=option_content,
                             action=action,
                         )
-                    await select2_element.select_by_index(index=action.option.index, timeout=timeout)
+                    await select_framework.select_by_index(index=action.option.index, timeout=timeout)
                     result.append(ActionSuccess())
                     return result
                 except Exception:
                     result.append(ActionFailure(FailToSelectByIndex(action.element_id)))
                     LOG.info(
-                        "failed to select by index in select2",
+                        f"failed to select by index in {select_framework.name()}",
                         exc_info=True,
                         action=action,
                     )
@@ -558,57 +554,22 @@ async def handle_select_option_action(
 
         if isinstance(result[-1], ActionFailure):
             LOG.info(
-                "Failed to select a select2 option, close the dropdown",
+                f"Failed to select a {select_framework.name()} option, close the dropdown",
                 action=action,
             )
-            await select2_element.close()
+            await select_framework.close()
 
         return result
-    elif tag_name == "ul" or tag_name == "div" or tag_name == "li":
-        # DEPRECATED: This was used for handle select2 dropdown, and isn't used anymore.
-        # if the role is listbox, find the option with the "label" or "value" and click that option element
-        # references:
-        # https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Roles/listbox_role
-        # https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Roles/option_role
-        role_attribute = await locator.get_attribute("role")
-        if role_attribute == "listbox":
-            LOG.info(
-                "SelectOptionAction on a listbox element. Searching for the option and click it",
-                action=action,
-            )
-            # use playwright to click the option
-            # clickOption is defined in domUtils.js
-            option_locator = locator.locator('[role="option"]')
-            option_num = await option_locator.count()
-            if action.option.index and action.option.index < option_num:
-                try:
-                    await option_locator.nth(action.option.index).click(timeout=2000)
-                    return [ActionSuccess()]
-                except Exception as e:
-                    LOG.error("Failed to click option", action=action, exc_info=True)
-                    return [ActionFailure(e)]
-            return [ActionFailure(Exception("SelectOption option index is missing"))]
-        elif role_attribute == "option":
-            LOG.info(
-                "SelectOptionAction on an option element. Clicking the option",
-                action=action,
-            )
-            # click the option element
-            click_action = ClickAction(element_id=action.element_id)
-            return await chain_click(task, scraped_page, page, click_action, skyvern_element)
-        else:
-            LOG.error(
-                "SelectOptionAction on a non-listbox element. Cannot handle this action",
-            )
-            return [ActionFailure(Exception("Cannot handle SelectOptionAction on a non-listbox element"))]
-    elif await skyvern_element.is_checkbox():
+
+    if await skyvern_element.is_checkbox():
         LOG.info(
             "SelectOptionAction is on <input> checkbox",
             action=action,
         )
         check_action = CheckboxAction(element_id=action.element_id, is_checked=True)
         return await handle_checkbox_action(check_action, page, scraped_page, task, step)
-    elif await skyvern_element.is_radio():
+
+    if await skyvern_element.is_radio():
         LOG.info(
             "SelectOptionAction is on <input> radio",
             action=action,
