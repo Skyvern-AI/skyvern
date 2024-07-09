@@ -9,7 +9,7 @@ packages = [{ include = "skyvern" }]
 [tool.poetry.dependencies]
 python = "^3.11,<3.12"
 python-dotenv = "^1.0.0"
-openai = "<1.8"
+openai = "<2.0"
 tenacity = "^8.2.2"
 sqlalchemy = {extras = ["mypy"], version = "^2.0.29"}
 aiohttp = "^3.8.5"
@@ -19,7 +19,7 @@ python-multipart = "^0.0.6"
 toml = "^0.10.2"
 jinja2 = "^3.1.2"
 uvicorn = {extras = ["standard"], version = "^0.24.0.post1"}
-litellm = "1.35.35"
+litellm = "1.41.12"
 duckduckgo-search = "^3.8.0"
 selenium = "^4.13.0"
 bs4 = "^0.0.1"
