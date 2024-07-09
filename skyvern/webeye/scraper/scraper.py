@@ -44,6 +44,15 @@ RESERVED_ATTRIBUTES = {
     "value",
 }
 
+BASE64_INCLUDE_ATTRIBUTES = {
+    "href",
+    "src",
+    "poster",
+    "srcset",
+    "icon",
+}
+
+
 ELEMENT_NODE_ATTRIBUTES = {
     "id",
 }
@@ -474,6 +483,13 @@ def trim_element_tree(elements: list[dict]) -> list[dict]:
         if not queue_ele.get("interactable"):
             del queue_ele["id"]
 
+        if "attributes" in queue_ele:
+            new_attributes = _trimmed_base64_data(queue_ele["attributes"])
+            if new_attributes:
+                queue_ele["attributes"] = new_attributes
+            else:
+                del queue_ele["attributes"]
+
         if "attributes" in queue_ele and not queue_ele.get("keepAllAttr", False):
             tag_name = queue_ele["tagName"] if "tagName" in queue_ele else ""
             new_attributes = _trimmed_attributes(tag_name, queue_ele["attributes"])
@@ -493,6 +509,17 @@ def trim_element_tree(elements: list[dict]) -> list[dict]:
             if not element_text:
                 del queue_ele["text"]
     return elements
+
+
+def _trimmed_base64_data(attributes: dict) -> dict:
+    new_attributes: dict = {}
+
+    for key in attributes:
+        if key in BASE64_INCLUDE_ATTRIBUTES and "data:" in attributes.get(key, ""):
+            continue
+        new_attributes[key] = attributes[key]
+
+    return new_attributes
 
 
 def _trimmed_attributes(tag_name: str, attributes: dict) -> dict:
