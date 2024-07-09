@@ -178,7 +178,9 @@ def convert_to_workflow_run(workflow_run_model: WorkflowRunModel, debug_enabled:
 
     return WorkflowRun(
         workflow_run_id=workflow_run_model.workflow_run_id,
+        workflow_permanent_id=workflow_run_model.workflow_permanent_id,
         workflow_id=workflow_run_model.workflow_id,
+        organization_id=workflow_run_model.organization_id,
         status=WorkflowRunStatus[workflow_run_model.status],
         proxy_location=(
             ProxyLocation(workflow_run_model.proxy_location) if workflow_run_model.proxy_location else None

@@ -37,7 +37,7 @@ class BaseExperimentationProvider(ABC):
             variant = self.get_value(feature_name, distinct_id, properties)
             self.variant_map[feature_name][distinct_id] = variant
             if variant:
-                LOG.info("Feature is found", flag=feature_name, distinct_id=distinct_id)
+                LOG.info("Feature is found", flag=feature_name, distinct_id=distinct_id, variant=variant)
         return self.variant_map[feature_name][distinct_id]
 
 
