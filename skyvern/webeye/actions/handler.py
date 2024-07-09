@@ -8,7 +8,7 @@ import structlog
 from deprecation import deprecated
 from playwright.async_api import Locator, Page, TimeoutError
 
-from skyvern.constants import INPUT_TEXT_TIMEOUT, REPO_ROOT_DIR
+from skyvern.constants import REPO_ROOT_DIR
 from skyvern.exceptions import (
     EmptySelect,
     ErrFoundSelectableElement,
@@ -53,7 +53,6 @@ from skyvern.webeye.scraper.scraper import ScrapedPage
 from skyvern.webeye.utils.dom import AbstractSelectDropdown, DomUtil, SkyvernElement
 
 LOG = structlog.get_logger()
-TEXT_INPUT_DELAY = 10  # 10ms between each character input
 COMMON_INPUT_TAGS = {"input", "textarea", "select"}
 
 
@@ -271,8 +270,7 @@ async def handle_input_text_action(
     if await skyvern_element.is_select2_dropdown():
         return [ActionFailure(InputActionOnSelect2Dropdown(element_id=action.element_id))]
 
-    locator = skyvern_element.locator
-    current_text = await get_input_value(locator)
+    current_text = await get_input_value(skyvern_element.get_tag_name(), skyvern_element.get_locator())
     if current_text == action.text:
         return [ActionSuccess()]
 
@@ -281,7 +279,7 @@ async def handle_input_text_action(
     text = get_actual_value_of_parameter_if_secret(task, action.text)
 
     try:
-        await locator.clear(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+        await skyvern_element.input_clear()
     except TimeoutError:
         LOG.info("None input tag clear timeout", action=action)
         return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
@@ -290,12 +288,12 @@ async def handle_input_text_action(
         return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
 
     if tag_name not in COMMON_INPUT_TAGS:
-        await locator.fill(text, timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+        await skyvern_element.input_fill(text)
         return [ActionSuccess()]
 
     # If the input is a text input, we type the text character by character
     # 3 times the time it takes to type the text so it has time to finish typing
-    await locator.press_sequentially(text, timeout=INPUT_TEXT_TIMEOUT)
+    await skyvern_element.input_sequentially(text=text)
     return [ActionSuccess()]
 
 
@@ -1091,8 +1089,7 @@ async def click_listbox_option(
     return False
 
 
-async def get_input_value(locator: Locator) -> str | None:
-    tag_name = await get_tag_name_lowercase(locator)
+async def get_input_value(tag_name: str, locator: Locator) -> str | None:
     if tag_name in COMMON_INPUT_TAGS:
         return await locator.input_value()
     # for span, div, p or other tags:
