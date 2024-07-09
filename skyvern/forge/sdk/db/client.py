@@ -971,14 +971,18 @@ class AgentDB:
 
     async def create_workflow_run(
         self,
+        workflow_permanent_id: str,
         workflow_id: str,
+        organization_id: str,
         proxy_location: ProxyLocation | None = None,
         webhook_callback_url: str | None = None,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
                 workflow_run = WorkflowRunModel(
+                    workflow_permanent_id=workflow_permanent_id,
                     workflow_id=workflow_id,
+                    organization_id=organization_id,
                     proxy_location=proxy_location,
                     status="created",
                     webhook_callback_url=webhook_callback_url,
@@ -1026,8 +1030,7 @@ class AgentDB:
                 workflow_runs = (
                     await session.scalars(
                         select(WorkflowRunModel)
-                        .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
-                        .filter(WorkflowModel.organization_id == organization_id)
+                        .filter(WorkflowRunModel.organization_id == organization_id)
                         .order_by(WorkflowRunModel.created_at.desc())
                         .limit(page_size)
                         .offset(db_page * page_size)
@@ -1047,9 +1050,8 @@ class AgentDB:
                 workflow_runs = (
                     await session.scalars(
                         select(WorkflowRunModel)
-                        .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
-                        .filter(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
-                        .filter(WorkflowModel.organization_id == organization_id)
+                        .filter(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
+                        .filter(WorkflowRunModel.organization_id == organization_id)
                         .order_by(WorkflowRunModel.created_at.desc())
                         .limit(page_size)
                         .offset(db_page * page_size)

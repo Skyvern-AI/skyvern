@@ -66,6 +66,8 @@ class WorkflowRunStatus(StrEnum):
 class WorkflowRun(BaseModel):
     workflow_run_id: str
     workflow_id: str
+    workflow_permanent_id: str
+    organization_id: str
     status: WorkflowRunStatus
     proxy_location: ProxyLocation | None = None
     webhook_callback_url: str | None = None

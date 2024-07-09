@@ -93,7 +93,12 @@ class WorkflowService:
         if workflow_request.webhook_callback_url is None and workflow.webhook_callback_url is not None:
             workflow_request.webhook_callback_url = workflow.webhook_callback_url
         # Create the workflow run and set skyvern context
-        workflow_run = await self.create_workflow_run(workflow_request=workflow_request, workflow_id=workflow_id)
+        workflow_run = await self.create_workflow_run(
+            workflow_request=workflow_request,
+            workflow_permanent_id=workflow_permanent_id,
+            workflow_id=workflow_id,
+            organization_id=workflow.organization_id,
+        )
         LOG.info(
             f"Created workflow run {workflow_run.workflow_run_id} for workflow {workflow.workflow_id}",
             request_id=request_id,
@@ -378,9 +383,13 @@ class WorkflowService:
             page_size=page_size,
         )
 
-    async def create_workflow_run(self, workflow_request: WorkflowRequestBody, workflow_id: str) -> WorkflowRun:
+    async def create_workflow_run(
+        self, workflow_request: WorkflowRequestBody, workflow_permanent_id: str, workflow_id: str, organization_id: str
+    ) -> WorkflowRun:
         return await app.DATABASE.create_workflow_run(
+            workflow_permanent_id=workflow_permanent_id,
             workflow_id=workflow_id,
+            organization_id=organization_id,
             proxy_location=workflow_request.proxy_location,
             webhook_callback_url=workflow_request.webhook_callback_url,
         )
