@@ -7,7 +7,7 @@ from enum import StrEnum
 import structlog
 from playwright.async_api import Frame, FrameLocator, Locator, Page
 
-from skyvern.constants import INPUT_TEXT_TIMEOUT, SKYVERN_ID_ATTR
+from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     ElementIsNotComboboxDropdown,
     ElementIsNotLabel,
@@ -27,6 +27,9 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.scraper.scraper import ScrapedPage, get_combobox_options, get_select2_options
 
 LOG = structlog.get_logger()
+
+TEXT_INPUT_DELAY = 10  # 10ms between each character input
+TEXT_PRESS_MAX_LENGTH = 10
 
 
 async def resolve_locator(
@@ -249,7 +252,22 @@ class SkyvernElement:
     async def input_sequentially(
         self, text: str, default_timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
     ) -> None:
-        await self.locator.press_sequentially(text, timeout=INPUT_TEXT_TIMEOUT)
+        length = len(text)
+        if length > TEXT_PRESS_MAX_LENGTH:
+            # if the text is longer than TEXT_PRESS_MAX_LENGTH characters, we will locator.fill in initial texts until the last TEXT_PRESS_MAX_LENGTH characters
+            # and then type the last TEXT_PRESS_MAX_LENGTH characters with locator.press_sequentially
+            await self.get_locator().fill(text[: length - TEXT_PRESS_MAX_LENGTH])
+            text = text[length - TEXT_PRESS_MAX_LENGTH :]
+
+        await self.get_locator().press_sequentially(text, delay=TEXT_INPUT_DELAY, timeout=default_timeout)
+
+    async def input_fill(
+        self, text: str, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    ) -> None:
+        await self.get_locator().fill(text, timeout=timeout)
+
+    async def input_clear(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
+        await self.get_locator().clear(timeout=timeout)
 
 
 class DomUtil:
