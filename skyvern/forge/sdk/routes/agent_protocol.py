@@ -376,12 +376,15 @@ async def get_agent_tasks(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
     task_status: Annotated[list[TaskStatus] | None, Query()] = None,
+    workflow_run_id: Annotated[str | None, Query()] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Response:
     """
     Get all tasks.
     :param page: Starting page, defaults to 1
     :param page_size: Page size, defaults to 10
+    :param task_status: Task status filter
+    :param workflow_run_id: Workflow run id filter
     :return: List of tasks with pagination without steps populated. Steps can be populated by calling the
         get_agent_task endpoint.
     """
@@ -390,6 +393,7 @@ async def get_agent_tasks(
         page,
         page_size,
         task_status=task_status,
+        workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
     )
     return ORJSONResponse([task.to_task_response().model_dump() for task in tasks])
@@ -415,7 +419,9 @@ async def get_agent_tasks_internal(
         get_agent_task endpoint.
     """
     analytics.capture("skyvern-oss-agent-tasks-get-internal")
-    tasks = await app.DATABASE.get_tasks(page, page_size, organization_id=current_org.organization_id)
+    tasks = await app.DATABASE.get_tasks(
+        page, page_size, workflow_run_id=None, organization_id=current_org.organization_id
+    )
     return ORJSONResponse([task.model_dump() for task in tasks])
 
 
