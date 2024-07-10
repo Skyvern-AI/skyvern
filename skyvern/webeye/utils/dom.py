@@ -197,7 +197,7 @@ class SkyvernElement:
         if for_id == "":
             return None
 
-        locator = self.get_frame().locator(f"#{for_id}")
+        locator = self.get_frame().locator(f"[id='{for_id}']")
         # supposed to be only one element, since id is unique in the whole DOM
         if await locator.count() != 1:
             return None
@@ -349,7 +349,7 @@ class Select2Dropdown(AbstractSelectDropdown):
         self.frame = frame
 
     async def __find_anchor(self, timeout: float) -> Locator:
-        locator = self.frame.locator("#select2-drop")
+        locator = self.frame.locator("[id='select2-drop']")
         await locator.wait_for(state="visible", timeout=timeout)
         cnt = await locator.count()
         if cnt == 0:
@@ -415,7 +415,7 @@ class ComboboxDropdown(AbstractSelectDropdown):
 
     async def __find_anchor(self, timeout: float) -> Locator:
         control_id = await self.skyvern_element.get_attr("aria-controls", timeout=timeout)
-        locator = self.frame.locator(f"#{control_id}")
+        locator = self.frame.locator(f"[id='{control_id}']")
         await locator.wait_for(state="visible", timeout=timeout)
         cnt = await locator.count()
         if cnt == 0:
