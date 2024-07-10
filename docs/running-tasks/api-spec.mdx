@@ -6,12 +6,20 @@ description: 'The core building block in Skyvern'
 Tasks are the building block of Skyvern. They represent a single instruction to the browser to go do something using language models. Ex. “Go to alibaba and extract this information”
 
 ## Request - Initiate a task (Webhook)
+Request type: `POST`
+
+Production:`https://api.skyvern.com/api/v1/tasks/`
+
+### Header 
+
+| Parameter | Type | Required? | Sample Value | Description |
+| --- | --- | --- | --- | --- |
+| x-api-key | String | yes | ey....| Bearer token that gives your backend access to the Skyvern API. This will be manually provided by us |
 
 ### Body
 
 | Parameter | Type | Required? | Sample Value | Description |
 | --- | --- | --- | --- | --- |
-| url | String | yes | https://jobs.lever.co/leverdemo-8/45d39614-464a-4b62-a5cd-8683ce4fb80a/apply | The website that you would like to browse / scrape. This should be the ideal starting point for the agent |
 | webhook_callback_url | String | no | …  | The callback URL once our system is finished processing this async task |
 | navigation_goal | String | no | Apply for a job | The prompt that tells the agent what the user-facing goal is. This is the guiding light for the LLM as it navigates a particular website / sitemap to achieve this specified goal |
 | data_extraction_goal | String | no | Was the job application successful? | The prompt that instructs the agent to extract information once the agent has achieved its user_goal |
@@ -22,6 +30,8 @@ Tasks are the building block of Skyvern. They represent a single instruction to 
 ## Example Request (Apply for a job)
 
 ```python
+POST https://api.skyvern.com/api/v1/tasks/ 
+
 {
     "url": "https://jobs.lever.co/leverdemo-8/45d39614-464a-4b62-a5cd-8683ce4fb80a/apply",
     "navigation_goal": "Apply for a job",
