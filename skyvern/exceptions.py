@@ -416,3 +416,8 @@ class FailedToGetCurrentValueOfDropdown(SkyvernException):
         super().__init__(
             f"Failed to get current value of {dropdowm_type} dropdown. element_id={element_id}, failure_reason={fail_reason}"
         )
+
+
+class HttpException(SkyvernException):
+    def __init__(self, status_code: int, url: str, msg: str | None = None) -> None:
+        super().__init__(f"HTTP Exception, status_code={status_code}, url={url}" + (f", msg={msg}" if msg else ""))
