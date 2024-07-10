@@ -1,11 +1,12 @@
 import { Link, Outlet } from "react-router-dom";
 import { Toaster } from "@/components/ui/toaster";
 import { SideNav } from "./SideNav";
-import { DiscordLogoIcon, GitHubLogoIcon } from "@radix-ui/react-icons";
+import { DiscordLogoIcon } from "@radix-ui/react-icons";
 import { Logo } from "@/components/Logo";
 import { Profile } from "./Profile";
 import { useContext } from "react";
 import { UserContext } from "@/store/UserContext";
+import GitHubButton from "react-github-btn";
 
 function RootLayout() {
   const user = useContext(UserContext);
@@ -32,15 +33,17 @@ function RootLayout() {
             target="_blank"
             rel="noopener noreferrer"
           >
-            <DiscordLogoIcon className="w-6 h-6" />
+            <DiscordLogoIcon className="w-7 h-7" />
           </Link>
-          <Link
-            to="https://github.com/Skyvern-AI/skyvern"
-            target="_blank"
-            rel="noopener noreferrer"
+          <GitHubButton
+            href="https://github.com/skyvern-ai/skyvern"
+            data-color-scheme="no-preference: dark; light: dark; dark: dark;"
+            data-size="large"
+            data-show-count="true"
+            aria-label="Star skyvern-ai/skyvern on GitHub"
           >
-            <GitHubLogoIcon className="w-6 h-6" />
-          </Link>
+            Star
+          </GitHubButton>
         </div>
         <main className="pl-72 pb-4">
           <Outlet />
