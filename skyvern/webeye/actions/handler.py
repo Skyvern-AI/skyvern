@@ -715,8 +715,8 @@ async def chain_click(
 
     is_filechooser_trigger = False
 
-    def fc_func(fc: FileChooser) -> None:
-        fc.set_files(files=file)
+    async def fc_func(fc: FileChooser) -> None:
+        await fc.set_files(files=file)
         nonlocal is_filechooser_trigger
         is_filechooser_trigger = True
 
