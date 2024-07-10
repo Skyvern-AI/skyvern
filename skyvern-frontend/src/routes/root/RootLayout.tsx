@@ -35,15 +35,17 @@ function RootLayout() {
           >
             <DiscordLogoIcon className="w-7 h-7" />
           </Link>
-          <GitHubButton
-            href="https://github.com/skyvern-ai/skyvern"
-            data-color-scheme="no-preference: dark; light: dark; dark: dark;"
-            data-size="large"
-            data-show-count="true"
-            aria-label="Star skyvern-ai/skyvern on GitHub"
-          >
-            Star
-          </GitHubButton>
+          <div className="h-7">
+            <GitHubButton
+              href="https://github.com/skyvern-ai/skyvern"
+              data-color-scheme="no-preference: dark; light: dark; dark: dark;"
+              data-size="large"
+              data-show-count="true"
+              aria-label="Star skyvern-ai/skyvern on GitHub"
+            >
+              Star
+            </GitHubButton>
+          </div>
         </div>
         <main className="pl-72 pb-4">
           <Outlet />
