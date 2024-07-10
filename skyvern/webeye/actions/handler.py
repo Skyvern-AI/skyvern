@@ -6,7 +6,7 @@ from typing import Any, Awaitable, Callable, List
 
 import structlog
 from deprecation import deprecated
-from playwright.async_api import Locator, Page, TimeoutError
+from playwright.async_api import FileChooser, Locator, Page, TimeoutError
 
 from skyvern.constants import REPO_ROOT_DIR
 from skyvern.exceptions import (
@@ -24,6 +24,7 @@ from skyvern.exceptions import (
     MultipleElementsFound,
     NoSelectableElementFound,
     OptionIndexOutOfBound,
+    WrongElementToUploadFile,
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -712,7 +713,13 @@ async def chain_click(
             )
             file = []
 
-    fc_func = lambda fc: fc.set_files(files=file)  # noqa: E731
+    is_filechooser_trigger = False
+
+    async def fc_func(fc: FileChooser) -> None:
+        await fc.set_files(files=file)
+        nonlocal is_filechooser_trigger
+        is_filechooser_trigger = True
+
     page.on("filechooser", fc_func)
     LOG.info("Registered file chooser listener", action=action, path=file)
 
@@ -794,6 +801,13 @@ async def chain_click(
         if file:
             await asyncio.sleep(10)
         page.remove_listener("filechooser", fc_func)
+
+        if action.file_url and not is_filechooser_trigger:
+            LOG.warning(
+                "Action has file_url, but filechoose even hasn't been triggered. Upload file attempt seems to fail",
+                action=action,
+            )
+            return [ActionFailure(WrongElementToUploadFile(action.element_id))]
 
 
 async def normal_select(

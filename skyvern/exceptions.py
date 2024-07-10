@@ -421,3 +421,10 @@ class FailedToGetCurrentValueOfDropdown(SkyvernException):
 class HttpException(SkyvernException):
     def __init__(self, status_code: int, url: str, msg: str | None = None) -> None:
         super().__init__(f"HTTP Exception, status_code={status_code}, url={url}" + (f", msg={msg}" if msg else ""))
+
+
+class WrongElementToUploadFile(SkyvernException):
+    def __init__(self, element_id: str):
+        super().__init__(
+            f"No file chooser dialog opens, so file can't be uploaded through element {element_id}. Please try to upload again with another element."
+        )
