@@ -1,6 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import { Status, TaskApiResponse } from "@/api/types";
-import { StatusBadge } from "@/components/StatusBadge";
+import { Status } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -19,13 +18,10 @@ import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { cn } from "@/util/utils";
 import { ReloadIcon } from "@radix-ui/react-icons";
-import {
-  keepPreviousData,
-  useMutation,
-  useQuery,
-  useQueryClient,
-} from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { NavLink, Outlet, useParams } from "react-router-dom";
+import { TaskInfo } from "./TaskInfo";
+import { useTaskQuery } from "./hooks/useTaskQuery";
 
 function TaskDetails() {
   const { taskId } = useParams();
@@ -37,23 +33,7 @@ function TaskDetails() {
     isLoading: taskIsLoading,
     isError: taskIsError,
     error: taskError,
-  } = useQuery<TaskApiResponse>({
-    queryKey: ["task", taskId],
-    queryFn: async () => {
-      const client = await getClient(credentialGetter);
-      return client.get(`/tasks/${taskId}`).then((response) => response.data);
-    },
-    refetchInterval: (query) => {
-      if (
-        query.state.data?.status === Status.Running ||
-        query.state.data?.status === Status.Queued
-      ) {
-        return 10000;
-      }
-      return false;
-    },
-    placeholderData: keepPreviousData,
-  });
+  } = useTaskQuery({ id: taskId });
 
   const cancelTaskMutation = useMutation({
     mutationFn: async () => {
@@ -124,11 +104,7 @@ function TaskDetails() {
       <div className="flex justify-between items-center">
         <div className="flex items-center gap-4">
           <span className="text-lg">{taskId}</span>
-          {taskIsLoading ? (
-            <Skeleton className="w-28 h-8" />
-          ) : task ? (
-            <StatusBadge status={task?.status} />
-          ) : null}
+          {taskId && <TaskInfo id={taskId} />}
         </div>
         {taskIsRunningOrQueued && (
           <Dialog>
