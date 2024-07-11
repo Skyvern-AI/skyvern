@@ -80,7 +80,7 @@ function StepArtifacts({ id, stepProps }: Props) {
 
   return (
     <Tabs defaultValue="info" className="w-full">
-      <TabsList className="grid w-full h-16 grid-cols-5">
+      <TabsList className="grid h-16 w-full grid-cols-5">
         <TabsTrigger value="info">Info</TabsTrigger>
         <TabsTrigger value="screenshot_llm">Annotated Screenshots</TabsTrigger>
         <TabsTrigger value="screenshot_action">Action Screenshots</TabsTrigger>
@@ -126,16 +126,16 @@ function StepArtifacts({ id, stepProps }: Props) {
               <ZoomableImage
                 key={index}
                 src={getImageURL(artifact)}
-                className="object-cover w-full h-full"
+                className="h-full w-full object-cover"
                 alt="action-screenshot"
               />
             ))}
           </div>
         ) : isFetching ? (
           <div className="grid grid-cols-2 gap-4 p-4">
-            <Skeleton className="w-full h-full" />
-            <Skeleton className="w-full h-full" />
-            <Skeleton className="w-full h-full" />
+            <Skeleton className="h-full w-full" />
+            <Skeleton className="h-full w-full" />
+            <Skeleton className="h-full w-full" />
           </div>
         ) : (
           <div>No screenshots found</div>
@@ -148,16 +148,16 @@ function StepArtifacts({ id, stepProps }: Props) {
               <ZoomableImage
                 key={index}
                 src={getImageURL(artifact)}
-                className="object-cover w-full h-full"
+                className="h-full w-full object-cover"
                 alt="action-screenshot"
               />
             ))}
           </div>
         ) : isFetching ? (
           <div className="grid grid-cols-3 gap-4 p-4">
-            <Skeleton className="w-full h-full" />
-            <Skeleton className="w-full h-full" />
-            <Skeleton className="w-full h-full" />
+            <Skeleton className="h-full w-full" />
+            <Skeleton className="h-full w-full" />
+            <Skeleton className="h-full w-full" />
           </div>
         ) : (
           <div>No screenshots found</div>

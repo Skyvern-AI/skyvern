@@ -13,45 +13,45 @@ function SideNav() {
       <NavLink
         to="create"
         className={({ isActive }) => {
-          return cn("flex items-center px-5 py-3 hover:bg-muted rounded-2xl", {
+          return cn("flex items-center rounded-2xl px-5 py-3 hover:bg-muted", {
             "bg-muted": isActive,
           });
         }}
       >
-        <PlusCircledIcon className="mr-4 w-6 h-6" />
+        <PlusCircledIcon className="mr-4 h-6 w-6" />
         <span className="text-lg">Create</span>
       </NavLink>
       <NavLink
         to="tasks"
         className={({ isActive }) => {
-          return cn("flex items-center px-5 py-3 hover:bg-muted rounded-2xl", {
+          return cn("flex items-center rounded-2xl px-5 py-3 hover:bg-muted", {
             "bg-muted": isActive,
           });
         }}
       >
-        <ListBulletIcon className="mr-4 w-6 h-6" />
+        <ListBulletIcon className="mr-4 h-6 w-6" />
         <span className="text-lg">Tasks</span>
       </NavLink>
       <NavLink
         to="workflows"
         className={({ isActive }) => {
-          return cn("flex items-center px-5 py-3 hover:bg-muted rounded-2xl", {
+          return cn("flex items-center rounded-2xl px-5 py-3 hover:bg-muted", {
             "bg-muted": isActive,
           });
         }}
       >
-        <LightningBoltIcon className="mr-4 w-6 h-6" />
+        <LightningBoltIcon className="mr-4 h-6 w-6" />
         <span className="text-lg">Workflows (Beta)</span>
       </NavLink>
       <NavLink
         to="settings"
         className={({ isActive }) => {
-          return cn("flex items-center px-5 py-3 hover:bg-muted rounded-2xl", {
+          return cn("flex items-center rounded-2xl px-5 py-3 hover:bg-muted", {
             "bg-muted": isActive,
           });
         }}
       >
-        <GearIcon className="mr-4 w-6 h-6" />
+        <GearIcon className="mr-4 h-6 w-6" />
         <span className="text-lg">Settings</span>
       </NavLink>
     </nav>

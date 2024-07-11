@@ -18,7 +18,7 @@ function ActionCard({
   return (
     <div
       className={cn(
-        "flex p-4 rounded-lg shadow-md border hover:bg-muted cursor-pointer",
+        "flex cursor-pointer rounded-lg border p-4 shadow-md hover:bg-muted",
         {
           "bg-muted": selected,
         },

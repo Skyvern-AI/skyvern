@@ -77,7 +77,7 @@ function ScrollableActionList({
             refs.current[actionIndex] = element;
           }}
           className={cn(
-            "flex p-4 rounded-lg shadow-md border hover:border-slate-300 cursor-pointer",
+            "flex cursor-pointer rounded-lg border p-4 shadow-md hover:border-slate-300",
             {
               "border-slate-300": selected,
             },
@@ -95,9 +95,9 @@ function ScrollableActionList({
             });
           }}
         >
-          <div className="flex-1 p-2 pt-0 space-y-2">
+          <div className="flex-1 space-y-2 p-2 pt-0">
             <div className="flex justify-between">
-              <div className="flex gap-2 items-center">
+              <div className="flex items-center gap-2">
                 <span>#{i + 1}</span>
                 <Badge>{ReadableActionTypes[action.type]}</Badge>
               </div>
@@ -113,9 +113,9 @@ function ScrollableActionList({
                   </TooltipProvider>
                 )}
                 {action.success ? (
-                  <CheckCircledIcon className="w-6 h-6 text-success" />
+                  <CheckCircledIcon className="h-6 w-6 text-success" />
                 ) : (
-                  <CrossCircledIcon className="w-6 h-6 text-destructive" />
+                  <CrossCircledIcon className="h-6 w-6 text-destructive" />
                 )}
               </div>
             </div>
@@ -123,7 +123,7 @@ function ScrollableActionList({
             <div className="text-sm">{action.reasoning}</div>
             {action.type === ActionTypes.InputText && (
               <>
-                <Separator className="bg-slate-50 block" />
+                <Separator className="block bg-slate-50" />
                 <div className="text-sm">Input: {action.input}</div>
               </>
             )}
@@ -138,8 +138,8 @@ function ScrollableActionList({
     typeof activeIndex === "number" ? data.length - activeIndex - 1 : "stream";
 
   return (
-    <div className="w-1/3 flex flex-col items-center border rounded h-[40rem]">
-      <div className="flex items-center text-sm p-4 gap-2">
+    <div className="flex h-[40rem] w-1/3 flex-col items-center rounded border">
+      <div className="flex items-center gap-2 p-4 text-sm">
         <Button
           size="icon"
           onClick={() => {
@@ -155,7 +155,7 @@ function ScrollableActionList({
           <ArrowDownIcon />
         </Button>
       </div>
-      <div className="overflow-y-scroll w-full px-4 pb-4 space-y-4">
+      <div className="w-full space-y-4 overflow-y-scroll px-4 pb-4">
         {showStreamOption && (
           <div
             key="stream"
@@ -163,15 +163,15 @@ function ScrollableActionList({
               refs.current[data.length] = element;
             }}
             className={cn(
-              "flex p-4 rounded-lg shadow-md border hover:border-slate-300 cursor-pointer",
+              "flex cursor-pointer rounded-lg border p-4 shadow-md hover:border-slate-300",
               {
                 "border-slate-300": activeIndex === "stream",
               },
             )}
             onClick={() => onActiveIndexChange("stream")}
           >
-            <div className="text-lg flex gap-2 items-center">
-              <DotFilledIcon className="w-6 h-6 text-red-500" />
+            <div className="flex items-center gap-2 text-lg">
+              <DotFilledIcon className="h-6 w-6 text-red-500" />
               Live
             </div>
           </div>

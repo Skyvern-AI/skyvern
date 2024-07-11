@@ -17,7 +17,7 @@ function HiddenCopyableInput({ value }: Props) {
   return (
     <div className="relative w-full">
       <Input value={inputValue} className="h-10" readOnly />
-      <div className="absolute flex inset-y-0 items-center right-1">
+      <div className="absolute inset-y-0 right-1 flex items-center">
         <Button
           size="sm"
           variant="secondary"

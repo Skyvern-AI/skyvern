@@ -97,7 +97,7 @@ function TaskTemplates() {
             href="https://meetings.hubspot.com/suchintan"
             target="_blank"
             rel="noopener noreferrer"
-            className="underline underline-offset-2 ml-auto"
+            className="ml-auto underline underline-offset-2"
           >
             Book a demo {"->"}
           </a>
@@ -105,25 +105,25 @@ function TaskTemplates() {
       </Alert>
       <section className="py-4">
         <header>
-          <h1 className="text-3xl mb-2">Try a prompt</h1>
+          <h1 className="mb-2 text-3xl">Try a prompt</h1>
         </header>
         <p className="text-sm">
           We will generate a task for you automatically.
         </p>
-        <Separator className="mt-2 mb-8" />
-        <div className="flex border rounded-xl items-center pr-4 max-w-xl mx-auto">
+        <Separator className="mb-8 mt-2" />
+        <div className="mx-auto flex max-w-xl items-center rounded-xl border pr-4">
           <Textarea
-            className="rounded-xl resize-none border-transparent hover:border-transparent focus-visible:ring-0 p-2 font-mono text-sm"
+            className="resize-none rounded-xl border-transparent p-2 font-mono text-sm hover:border-transparent focus-visible:ring-0"
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
             placeholder="Enter your prompt..."
           />
           <div className="h-full">
             {getTaskFromPromptMutation.isPending ? (
-              <ReloadIcon className="w-6 h-6 animate-spin" />
+              <ReloadIcon className="h-6 w-6 animate-spin" />
             ) : (
               <PaperPlaneIcon
-                className="w-6 h-6 cursor-pointer"
+                className="h-6 w-6 cursor-pointer"
                 onClick={() => {
                   getTaskFromPromptMutation.mutate(prompt);
                 }}
@@ -131,12 +131,12 @@ function TaskTemplates() {
             )}
           </div>
         </div>
-        <div className="flex flex-wrap gap-4 mt-4 justify-center">
+        <div className="mt-4 flex flex-wrap justify-center gap-4">
           {examplePrompts.map((examplePrompt) => {
             return (
               <div
                 key={examplePrompt}
-                className="p-2 border rounded-xl cursor-pointer text-muted-foreground text-sm"
+                className="cursor-pointer rounded-xl border p-2 text-sm text-muted-foreground"
                 onClick={() => {
                   setPrompt(examplePrompt);
                 }}
@@ -151,18 +151,18 @@ function TaskTemplates() {
         <header>
           <h1 className="text-3xl">Your Templates</h1>
         </header>
-        <p className="text-sm mt-1">Your saved task templates</p>
-        <Separator className="mt-2 mb-8" />
+        <p className="mt-1 text-sm">Your saved task templates</p>
+        <Separator className="mb-8 mt-2" />
         <SavedTasks />
       </section>
       <section className="py-4">
         <header>
           <h1 className="text-3xl">Skyvern Templates</h1>
         </header>
-        <p className="text-sm mt-1">
+        <p className="mt-1 text-sm">
           Sample tasks that showcase Skyvern's capabilities
         </p>
-        <Separator className="mt-2 mb-8" />
+        <Separator className="mb-8 mt-2" />
         <div className="grid grid-cols-4 gap-4">
           {Object.entries(templateSamples).map(([sampleKey, sample]) => {
             return (
@@ -174,7 +174,7 @@ function TaskTemplates() {
                   </CardDescription>
                 </CardHeader>
                 <CardContent
-                  className="h-48 hover:bg-muted/40 cursor-pointer"
+                  className="h-48 cursor-pointer hover:bg-muted/40"
                   onClick={() => {
                     navigate(sampleKey);
                   }}

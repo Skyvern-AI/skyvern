@@ -105,7 +105,7 @@ function TaskHistory() {
                       {task.task_id}
                     </TableCell>
                     <TableCell
-                      className="w-1/4 cursor-pointer max-w-64 overflow-hidden whitespace-nowrap overflow-ellipsis"
+                      className="w-1/4 max-w-64 cursor-pointer overflow-hidden overflow-ellipsis whitespace-nowrap"
                       onClick={(event) => handleNavigate(event, task.task_id)}
                     >
                       {task.request.url}

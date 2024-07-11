@@ -33,8 +33,8 @@ function Settings() {
         </CardHeader>
         <CardContent className="p-8">
           <div className="flex flex-col gap-4">
-            <div className="flex gap-4 items-center">
-              <Label className="whitespace-nowrap w-36">Environment</Label>
+            <div className="flex items-center gap-4">
+              <Label className="w-36 whitespace-nowrap">Environment</Label>
               <Select value={environment} onValueChange={setEnvironment}>
                 <SelectTrigger>
                   <SelectValue placeholder="Environment" />
@@ -44,8 +44,8 @@ function Settings() {
                 </SelectContent>
               </Select>
             </div>
-            <div className="flex gap-4 items-center">
-              <Label className="whitespace-nowrap w-36">Organization</Label>
+            <div className="flex items-center gap-4">
+              <Label className="w-36 whitespace-nowrap">Organization</Label>
               <Select value={organization} onValueChange={setOrganization}>
                 <SelectTrigger>
                   <SelectValue placeholder="Organization" />

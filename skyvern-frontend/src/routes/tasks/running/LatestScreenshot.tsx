@@ -65,7 +65,7 @@ function LatestScreenshot({ id }: Props) {
   });
 
   if (isFetching && !artifact) {
-    return <Skeleton className="w-full h-full" />;
+    return <Skeleton className="h-full w-full" />;
   }
 
   if (isError || !artifact) {
@@ -75,7 +75,7 @@ function LatestScreenshot({ id }: Props) {
   return (
     <img
       src={getImageURL(artifact)}
-      className="w-full h-full object-contain"
+      className="h-full w-full object-contain"
       alt="Latest screenshot"
     />
   );

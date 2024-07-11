@@ -24,8 +24,8 @@ function TaskRecording() {
 
   if (taskIsFetching) {
     return (
-      <div className="flex mx-auto">
-        <div className="w-[800px] h-[450px]">
+      <div className="mx-auto flex">
+        <div className="h-[450px] w-[800px]">
           <Skeleton className="h-full" />
         </div>
       </div>
@@ -37,7 +37,7 @@ function TaskRecording() {
   }
 
   return (
-    <div className="flex mx-auto">
+    <div className="mx-auto flex">
       {task.recording_url ? (
         <video width={800} height={450} src={getRecordingURL(task)} controls />
       ) : (

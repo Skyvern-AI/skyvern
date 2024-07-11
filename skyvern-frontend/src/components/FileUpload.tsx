@@ -99,7 +99,7 @@ function FileUpload({ value, onChange }: Props) {
           <Label
             htmlFor={inputId}
             className={cn(
-              "flex w-full cursor-pointer border border-dashed items-center justify-center py-8",
+              "flex w-full cursor-pointer items-center justify-center border border-dashed py-8",
               {
                 "border-slate-500": highlight,
               },
@@ -144,7 +144,7 @@ function FileUpload({ value, onChange }: Props) {
               accept=".csv"
               className="hidden"
             />
-            <div className="max-w-full truncate flex gap-2">
+            <div className="flex max-w-full gap-2 truncate">
               {uploadFileMutation.isPending && (
                 <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
               )}
@@ -156,7 +156,7 @@ function FileUpload({ value, onChange }: Props) {
             </div>
           </Label>
         </div>
-        <div className="flex flex-col items-center justify-center before:flex before:content-[''] before:bg-slate-600">
+        <div className="flex flex-col items-center justify-center before:flex before:bg-slate-600 before:content-['']">
           OR
         </div>
         <div className="w-1/2">
@@ -181,7 +181,7 @@ function FileUpload({ value, onChange }: Props) {
 
   if (typeof value === "string") {
     return (
-      <div className="flex gap-4 items-center">
+      <div className="flex items-center gap-4">
         <span>{value}</span>
         <Button onClick={() => reset()}>Change</Button>
       </div>
@@ -190,7 +190,7 @@ function FileUpload({ value, onChange }: Props) {
 
   if (typeof value === "object" && file && "s3uri" in value) {
     return (
-      <div className="flex gap-4 items-center">
+      <div className="flex items-center gap-4">
         <a href={value.presignedUrl} className="underline">
           <span>{file.name}</span>
         </a>

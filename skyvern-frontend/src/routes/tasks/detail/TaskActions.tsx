@@ -200,7 +200,7 @@ function TaskActions() {
   function getStream() {
     if (task?.status === Status.Queued) {
       return (
-        <div className="w-full h-full flex flex-col gap-4 items-center justify-center text-lg bg-slate-900">
+        <div className="flex h-full w-full flex-col items-center justify-center gap-4 bg-slate-900 text-lg">
           <span>Your task is queued. Typical queue time is 1-2 minutes.</span>
           <span>Stream will start when the task is running.</span>
         </div>
@@ -209,7 +209,7 @@ function TaskActions() {
 
     if (task?.status === Status.Running && streamImgSrc.length === 0) {
       return (
-        <div className="w-full h-full flex items-center justify-center text-lg bg-slate-900">
+        <div className="flex h-full w-full items-center justify-center bg-slate-900 text-lg">
           Starting the stream...
         </div>
       );
@@ -217,7 +217,7 @@ function TaskActions() {
 
     if (task?.status === Status.Running && streamImgSrc.length > 0) {
       return (
-        <div className="w-full h-full">
+        <div className="h-full w-full">
           <img src={`data:image/png;base64,${streamImgSrc}`} />
         </div>
       );
@@ -227,8 +227,8 @@ function TaskActions() {
 
   return (
     <div className="flex gap-2">
-      <div className="w-2/3 border rounded">
-        <div className="p-4 w-full h-full">
+      <div className="w-2/3 rounded border">
+        <div className="h-full w-full p-4">
           {selectedAction === "stream" ? getStream() : null}
           {typeof selectedAction === "number" && activeAction ? (
             <ActionScreenshot

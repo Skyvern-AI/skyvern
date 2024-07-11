@@ -8,16 +8,16 @@ function TaskListSkeletonRows() {
     return (
       <TableRow key={index}>
         <TableCell className="w-1/3">
-          <Skeleton className="w-full h-6" />
+          <Skeleton className="h-6 w-full" />
         </TableCell>
         <TableCell className="w-1/4">
-          <Skeleton className="w-full h-6" />
+          <Skeleton className="h-6 w-full" />
         </TableCell>
         <TableCell className="w-1/3">
-          <Skeleton className="w-full h-6" />
+          <Skeleton className="h-6 w-full" />
         </TableCell>
         <TableCell className="w-1/12">
-          <Skeleton className="w-full h-6" />
+          <Skeleton className="h-6 w-full" />
         </TableCell>
       </TableRow>
     );

@@ -34,15 +34,15 @@ function ActionScreenshot({ stepId, index }: Props) {
 
   if (isFetching) {
     return (
-      <div className="max-h-[400px] flex flex-col mx-auto items-center gap-2 overflow-hidden">
-        <ReloadIcon className="animate-spin h-6 w-6" />
+      <div className="mx-auto flex max-h-[400px] flex-col items-center gap-2 overflow-hidden">
+        <ReloadIcon className="h-6 w-6 animate-spin" />
         <div>Loading screenshot...</div>
       </div>
     );
   }
 
   return screenshot ? (
-    <figure className="max-w-full flex flex-col mx-auto items-center gap-2 overflow-hidden">
+    <figure className="mx-auto flex max-w-full flex-col items-center gap-2 overflow-hidden">
       <ZoomableImage src={getImageURL(screenshot)} alt="llm-screenshot" />
     </figure>
   ) : (

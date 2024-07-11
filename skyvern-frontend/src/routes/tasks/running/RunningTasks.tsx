@@ -52,19 +52,19 @@ function RunningTasks() {
     return (
       <Card
         key={task.task_id}
-        className="hover:bg-muted/50 cursor-pointer"
+        className="cursor-pointer hover:bg-muted/50"
         onClick={(event) => handleNavigate(event, task.task_id)}
       >
         <CardHeader>
           <CardTitle className="overflow-hidden text-ellipsis whitespace-nowrap">
             {task.task_id}
           </CardTitle>
-          <CardDescription className="whitespace-nowrap overflow-hidden text-ellipsis">
+          <CardDescription className="overflow-hidden text-ellipsis whitespace-nowrap">
             {task.request.url}
           </CardDescription>
         </CardHeader>
         <CardContent className="flex items-center justify-center">
-          <div className="w-40 h-40">
+          <div className="h-40 w-40">
             <LatestScreenshot id={task.task_id} />
           </div>
         </CardContent>
