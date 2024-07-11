@@ -85,11 +85,6 @@ class BrowserManager:
         self.pages[workflow_run.workflow_run_id] = browser_state
         return browser_state
 
-    async def get_for_workflow_run(self, workflow_run_id: str) -> BrowserState | None:
-        if workflow_run_id in self.pages:
-            return self.pages[workflow_run_id]
-        return None
-
     def set_video_artifact_for_task(self, task: Task, artifact_id: str) -> None:
         if task.workflow_run_id and task.workflow_run_id in self.pages:
             if self.pages[task.workflow_run_id].browser_artifacts.video_artifact_id:

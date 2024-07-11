@@ -41,28 +41,6 @@ class BitwardenLoginCredentialParameterYAML(ParameterYAML):
     bitwarden_collection_id: str | None = None
 
 
-class BitwardenSensitiveInformationParameterYAML(ParameterYAML):
-    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
-    # Parameter 1 of Literal[...] cannot be of type "Any"
-    # This pattern already works in block.py but since the ParameterType is not defined in this file, mypy is not able
-    # to infer the type of the parameter_type attribute.
-    parameter_type: Literal[ParameterType.BITWARDEN_SENSITIVE_INFORMATION] = (
-        ParameterType.BITWARDEN_SENSITIVE_INFORMATION
-    )  # type: ignore
-
-    # bitwarden cli required fields
-    bitwarden_client_id_aws_secret_key: str
-    bitwarden_client_secret_aws_secret_key: str
-    bitwarden_master_password_aws_secret_key: str
-    # bitwarden collection id to filter the Bitwarden Identity from
-    bitwarden_collection_id: str
-    # unique key to identify the Bitwarden Identity in the collection
-    # this has to be in the identity's name
-    bitwarden_identity_key: str
-    # fields to extract from the Bitwarden Identity. Custom fields are prioritized over default identity fields
-    bitwarden_identity_fields: list[str]
-
-
 class WorkflowParameterYAML(ParameterYAML):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -194,7 +172,6 @@ class FileParserBlockYAML(BlockYAML):
 PARAMETER_YAML_SUBCLASSES = (
     AWSSecretParameterYAML
     | BitwardenLoginCredentialParameterYAML
-    | BitwardenSensitiveInformationParameterYAML
     | WorkflowParameterYAML
     | ContextParameterYAML
     | OutputParameterYAML
