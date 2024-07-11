@@ -112,9 +112,21 @@ export type ApiKeyApiResponse = {
   valid: boolean;
 };
 
+export const WorkflowParameterType = {
+  String: "string",
+  Integer: "integer",
+  Float: "float",
+  Boolean: "boolean",
+  JSON: "json",
+  FileURL: "file_url",
+} as const;
+
+export type WorkflowParameterType =
+  (typeof WorkflowParameterType)[keyof typeof WorkflowParameterType];
+
 export type WorkflowParameter = {
   workflow_parameter_id: string;
-  workflow_parameter_type?: string;
+  workflow_parameter_type: WorkflowParameterType;
   key: string;
   description: string | null;
   workflow_id: string;
@@ -144,6 +156,7 @@ export type WorkflowBlock = {
 export type WorkflowApiResponse = {
   workflow_id: string;
   organization_id: string;
+  is_saved_task: boolean;
   title: string;
   workflow_permanent_id: string;
   version: number;
@@ -203,4 +216,29 @@ export type Action = {
   success: boolean;
   stepId: string;
   index: number;
+};
+
+export type WorkflowRunApiResponse = {
+  workflow_permanent_id: string;
+  workflow_run_id: string;
+  workflow_id: string;
+  status: Status;
+  proxy_location: string;
+  webhook_callback_url: string;
+  created_at: string;
+  modified_at: string;
+};
+
+export type WorkflowRunStatusApiResponse = {
+  workflow_id: string;
+  workflow_run_id: string;
+  status: Status;
+  proxy_location: string;
+  webhook_callback_url: string | null;
+  created_at: string;
+  modified_at: string;
+  parameters: Record<string, unknown>;
+  screenshot_urls: Array<string> | null;
+  recording_url: string | null;
+  outputs: Record<string, unknown> | null;
 };

@@ -13,7 +13,7 @@ function CreateNewTaskFormPage() {
   const credentialGetter = useCredentialGetter();
 
   const { data, isFetching } = useQuery({
-    queryKey: ["workflows", template],
+    queryKey: ["savedTask", template],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client
