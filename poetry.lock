@@ -2943,13 +2943,13 @@ files = [
 
 [[package]]
 name = "litellm"
-version = "1.41.12"
+version = "1.35.35"
 description = "Library to easily interface with LLM API providers"
 optional = false
 python-versions = "!=2.7.*,!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,!=3.4.*,!=3.5.*,!=3.6.*,!=3.7.*,>=3.8"
 files = [
-    {file = "litellm-1.41.12-py3-none-any.whl", hash = "sha256:9af8b65ca48f0aa5b8ef10a63c21b00553843aa1e498f2c9308738b97d4a50f3"},
-    {file = "litellm-1.41.12.tar.gz", hash = "sha256:f94b5ac8857ea8b98b87f7d3071dbd10e24fe9e0d7831969adafb549688ce0ce"},
+    {file = "litellm-1.35.35-py3-none-any.whl", hash = "sha256:9dcf4a1fbdb1864de03f2fbcc26cc19ee83449966ad0b373b1d61f64ade963f7"},
+    {file = "litellm-1.35.35.tar.gz", hash = "sha256:f8873892f4a2f082e2f5f4fed5740f341b7d1a7778445785b2af68adbc2793e9"},
 ]
 
 [package.dependencies]
@@ -2957,17 +2957,15 @@ aiohttp = "*"
 click = "*"
 importlib-metadata = ">=6.8.0"
 jinja2 = ">=3.1.2,<4.0.0"
-jsonschema = ">=4.22.0,<5.0.0"
-openai = ">=1.27.0"
-pydantic = ">=2.0.0,<3.0.0"
+openai = ">=1.0.0"
 python-dotenv = ">=0.2.0"
 requests = ">=2.31.0,<3.0.0"
-tiktoken = ">=0.7.0"
+tiktoken = ">=0.4.0"
 tokenizers = "*"
 
 [package.extras]
-extra-proxy = ["azure-identity (>=1.15.0,<2.0.0)", "azure-keyvault-secrets (>=4.8.0,<5.0.0)", "google-cloud-kms (>=2.21.3,<3.0.0)", "prisma (==0.11.0)", "pynacl (>=1.5.0,<2.0.0)", "resend (>=0.8.0,<0.9.0)"]
-proxy = ["PyJWT (>=2.8.0,<3.0.0)", "apscheduler (>=3.10.4,<4.0.0)", "backoff", "cryptography (>=42.0.5,<43.0.0)", "fastapi (>=0.111.0,<0.112.0)", "fastapi-sso (>=0.10.0,<0.11.0)", "gunicorn (>=22.0.0,<23.0.0)", "orjson (>=3.9.7,<4.0.0)", "python-multipart (>=0.0.9,<0.0.10)", "pyyaml (>=6.0.1,<7.0.0)", "rq", "uvicorn (>=0.22.0,<0.23.0)"]
+extra-proxy = ["azure-identity (>=1.15.0,<2.0.0)", "azure-keyvault-secrets (>=4.8.0,<5.0.0)", "google-cloud-kms (>=2.21.3,<3.0.0)", "prisma (==0.11.0)", "resend (>=0.8.0,<0.9.0)"]
+proxy = ["PyJWT (>=2.8.0,<3.0.0)", "apscheduler (>=3.10.4,<4.0.0)", "backoff", "cryptography (>=42.0.5,<43.0.0)", "fastapi (>=0.109.1,<0.110.0)", "fastapi-sso (>=0.10.0,<0.11.0)", "gunicorn (>=21.2.0,<22.0.0)", "orjson (>=3.9.7,<4.0.0)", "python-multipart (>=0.0.9,<0.0.10)", "pyyaml (>=6.0.1,<7.0.0)", "rq", "uvicorn (>=0.22.0,<0.23.0)"]
 
 [[package]]
 name = "lxml"
@@ -7277,4 +7275,4 @@ testing = ["big-O", "jaraco.functools", "jaraco.itertools", "more-itertools", "p
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.11,<3.12"
-content-hash = "40e1dba8128bed75196f0c8dc21894f1b37f76a16f19b1678697df7563f67a7a"
+content-hash = "b3bb150f1811469740857a9bf062345a9597ace0d292b83f08a9f3e0707519d8"
