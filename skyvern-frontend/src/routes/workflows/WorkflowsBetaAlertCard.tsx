@@ -11,7 +11,7 @@ function WorkflowsBetaAlertCard() {
         Today, you can create and run workflows through the Skyvern API.
       </div>
       <div className="flex gap-4 py-4">
-        <Button asChild>
+        <Button variant="secondary" asChild>
           <a
             href="https://docs.skyvern.com/workflows/creating-workflows"
             target="_blank"
