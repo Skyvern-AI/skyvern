@@ -30,11 +30,7 @@ function StepArtifactsLayout() {
     return <div>Error: {error?.message}</div>;
   }
 
-  if (!steps) {
-    return <div>No steps found</div>;
-  }
-
-  const activeStep = steps[activeIndex];
+  const activeStep = steps?.[activeIndex];
 
   return (
     <div className="flex">

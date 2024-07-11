@@ -41,13 +41,9 @@ function StepNavigation({ activeIndex, onActiveIndexChange }: Props) {
     return <div>Error: {error?.message}</div>;
   }
 
-  if (!steps) {
-    return <div>No steps found</div>;
-  }
-
   return (
     <nav className="flex flex-col gap-4">
-      {steps.map((step, index) => {
+      {steps?.map((step, index) => {
         const isActive = activeIndex === index;
         return (
           <div
