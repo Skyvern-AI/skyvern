@@ -7,8 +7,8 @@ type Props = {
 
 function Profile({ name }: Props) {
   return (
-    <div className="flex items-center border-2 p-2 rounded-lg">
-      <div className="flex gap-2 items-center">
+    <div className="flex items-center rounded-lg border-2 p-2">
+      <div className="flex items-center gap-2">
         <PersonIcon className="h-4 w-4" />
         <p className="w-40 overflow-hidden text-ellipsis">{name}</p>
       </div>

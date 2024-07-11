@@ -47,10 +47,10 @@ function TaskInfo({ id }: Props) {
   if (stepsIsLoading || taskIsLoading) {
     return (
       <div className="flex gap-4">
-        <Skeleton className="w-20 h-6" />
-        <Skeleton className="w-20 h-6" />
-        <Skeleton className="w-20 h-6" />
-        <Skeleton className="w-20 h-6" />
+        <Skeleton className="h-6 w-20" />
+        <Skeleton className="h-6 w-20" />
+        <Skeleton className="h-6 w-20" />
+        <Skeleton className="h-6 w-20" />
       </div>
     );
   }

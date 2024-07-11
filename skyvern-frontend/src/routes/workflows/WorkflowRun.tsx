@@ -65,7 +65,7 @@ function WorkflowRun() {
       <header className="flex gap-2">
         <h1 className="text-lg font-semibold">{workflowRunId}</h1>
         {workflowRunIsLoading ? (
-          <Skeleton className="w-28 h-8" />
+          <Skeleton className="h-8 w-28" />
         ) : workflowRun ? (
           <StatusBadge status={workflowRun?.status} />
         ) : null}
@@ -105,7 +105,7 @@ function WorkflowRun() {
                         {task.task_id}
                       </TableCell>
                       <TableCell
-                        className="w-1/4 cursor-pointer max-w-64 overflow-hidden whitespace-nowrap overflow-ellipsis"
+                        className="w-1/4 max-w-64 cursor-pointer overflow-hidden overflow-ellipsis whitespace-nowrap"
                         onClick={(event) => handleNavigate(event, task.task_id)}
                       >
                         {task.request.url}

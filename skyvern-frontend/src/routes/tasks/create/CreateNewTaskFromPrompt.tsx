@@ -9,8 +9,8 @@ function CreateNewTaskFromPrompt() {
   return (
     <section className="space-y-8">
       <header className="flex flex-col gap-4">
-        <div className="flex gap-4 items-center">
-          <MagicWandIcon className="w-6 h-6" />
+        <div className="flex items-center gap-4">
+          <MagicWandIcon className="h-6 w-6" />
           <h1 className="text-3xl font-bold">Create New Task</h1>
         </div>
         <p>

@@ -29,7 +29,7 @@ function TextArtifact({ artifact }: Props) {
   });
 
   if (isFetching) {
-    return <Skeleton className="w-full h-48" />;
+    return <Skeleton className="h-48 w-full" />;
   }
 
   return (

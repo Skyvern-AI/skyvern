@@ -69,7 +69,7 @@ function QueuedTasks() {
                   onClick={(event) => handleNavigate(event, task.task_id)}
                 >
                   <TableCell className="w-1/4">{task.task_id}</TableCell>
-                  <TableCell className="w-1/4 max-w-64 overflow-hidden whitespace-nowrap overflow-ellipsis">
+                  <TableCell className="w-1/4 max-w-64 overflow-hidden overflow-ellipsis whitespace-nowrap">
                     {task.request.url}
                   </TableCell>
                   <TableCell className="w-1/4">

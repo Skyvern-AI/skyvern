@@ -48,7 +48,7 @@ function StepNavigation({ activeIndex, onActiveIndexChange }: Props) {
         return (
           <div
             className={cn(
-              "flex items-center px-6 py-2 hover:bg-primary-foreground rounded-2xl cursor-pointer",
+              "flex cursor-pointer items-center rounded-2xl px-6 py-2 hover:bg-primary-foreground",
               {
                 "bg-primary-foreground": isActive,
               },
@@ -59,10 +59,10 @@ function StepNavigation({ activeIndex, onActiveIndexChange }: Props) {
             }}
           >
             {step.status === "completed" && (
-              <CheckboxIcon className="w-6 h-6 mr-2 text-green-500" />
+              <CheckboxIcon className="mr-2 h-6 w-6 text-green-500" />
             )}
             {step.status === "failed" && (
-              <CrossCircledIcon className="w-6 h-6 mr-2 text-red-500" />
+              <CrossCircledIcon className="mr-2 h-6 w-6 text-red-500" />
             )}
             <span>
               {step.retry_index > 0

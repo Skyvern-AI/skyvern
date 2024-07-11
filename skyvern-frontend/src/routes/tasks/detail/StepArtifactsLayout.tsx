@@ -40,7 +40,7 @@ function StepArtifactsLayout() {
           onActiveIndexChange={setActiveIndex}
         />
       </aside>
-      <main className="px-4 w-full">
+      <main className="w-full px-4">
         {activeStep ? (
           <StepArtifacts id={activeStep.step_id} stepProps={activeStep} />
         ) : null}

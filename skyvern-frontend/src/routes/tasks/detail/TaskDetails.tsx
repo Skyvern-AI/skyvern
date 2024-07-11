@@ -101,7 +101,7 @@ function TaskDetails() {
 
   return (
     <div className="flex flex-col gap-8">
-      <div className="flex justify-between items-center">
+      <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
           <span className="text-lg">{taskId}</span>
           {taskId && <TaskInfo id={taskId} />}
@@ -141,8 +141,8 @@ function TaskDetails() {
       </div>
       {taskIsLoading ? (
         <div className="flex items-center gap-2">
-          <Skeleton className="w-32 h-32" />
-          <Skeleton className="w-full h-32" />
+          <Skeleton className="h-32 w-32" />
+          <Skeleton className="h-32 w-full" />
         </div>
       ) : (
         <>
@@ -150,13 +150,13 @@ function TaskDetails() {
           {failureReason}
         </>
       )}
-      <div className="flex justify-center items-center">
-        <div className="inline-flex border rounded bg-muted p-1">
+      <div className="flex items-center justify-center">
+        <div className="inline-flex rounded border bg-muted p-1">
           <NavLink
             to="actions"
             className={({ isActive }) => {
               return cn(
-                "cursor-pointer px-2 py-1 rounded-md text-muted-foreground",
+                "cursor-pointer rounded-md px-2 py-1 text-muted-foreground",
                 {
                   "bg-primary-foreground text-foreground": isActive,
                 },
@@ -169,7 +169,7 @@ function TaskDetails() {
             to="recording"
             className={({ isActive }) => {
               return cn(
-                "cursor-pointer px-2 py-1 rounded-md text-muted-foreground",
+                "cursor-pointer rounded-md px-2 py-1 text-muted-foreground",
                 {
                   "bg-primary-foreground text-foreground": isActive,
                 },
@@ -182,7 +182,7 @@ function TaskDetails() {
             to="parameters"
             className={({ isActive }) => {
               return cn(
-                "cursor-pointer px-2 py-1 rounded-md text-muted-foreground",
+                "cursor-pointer rounded-md px-2 py-1 text-muted-foreground",
                 {
                   "bg-primary-foreground text-foreground": isActive,
                 },
@@ -195,7 +195,7 @@ function TaskDetails() {
             to="diagnostics"
             className={({ isActive }) => {
               return cn(
-                "cursor-pointer px-2 py-1 rounded-md text-muted-foreground",
+                "cursor-pointer rounded-md px-2 py-1 text-muted-foreground",
                 {
                   "bg-primary-foreground text-foreground": isActive,
                 },

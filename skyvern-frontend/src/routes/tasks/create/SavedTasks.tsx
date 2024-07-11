@@ -108,14 +108,14 @@ function SavedTasks() {
       >
         <CardHeader>
           <CardTitle>New Template</CardTitle>
-          <CardDescription className="whitespace-nowrap overflow-hidden text-ellipsis">
+          <CardDescription className="overflow-hidden text-ellipsis whitespace-nowrap">
             Create your own template
           </CardDescription>
         </CardHeader>
-        <CardContent className="flex h-48 justify-center items-center hover:bg-muted/40 cursor-pointer">
-          {!mutation.isPending && <PlusIcon className="w-12 h-12" />}
+        <CardContent className="flex h-48 cursor-pointer items-center justify-center hover:bg-muted/40">
+          {!mutation.isPending && <PlusIcon className="h-12 w-12" />}
           {mutation.isPending && (
-            <ReloadIcon className="animate-spin w-12 h-12" />
+            <ReloadIcon className="h-12 w-12 animate-spin" />
           )}
         </CardContent>
       </Card>

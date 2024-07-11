@@ -141,7 +141,7 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
           })}
           <Button type="submit" disabled={runWorkflowMutation.isPending}>
             {runWorkflowMutation.isPending && (
-              <ReloadIcon className="mr-2 w-4 h-4 animate-spin" />
+              <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
             )}
             Run workflow
           </Button>

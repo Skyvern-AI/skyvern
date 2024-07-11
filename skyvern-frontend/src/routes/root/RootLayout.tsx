@@ -13,8 +13,8 @@ function RootLayout() {
 
   return (
     <>
-      <div className="w-full h-full px-4">
-        <aside className="fixed w-72 px-6 shrink-0 min-h-screen border-r-2">
+      <div className="h-full w-full px-4">
+        <aside className="fixed min-h-screen w-72 shrink-0 border-r-2 px-6">
           <Link to={window.location.origin}>
             <div className="h-24">
               <Logo />
@@ -22,18 +22,18 @@ function RootLayout() {
           </Link>
           <SideNav />
           {user ? (
-            <div className="absolute bottom-2 left-0 w-72 px-6 shrink-0">
+            <div className="absolute bottom-2 left-0 w-72 shrink-0 px-6">
               <Profile name={user.name} />
             </div>
           ) : null}
         </aside>
-        <div className="pl-72 h-24 flex justify-end items-center px-6 gap-4">
+        <div className="flex h-24 items-center justify-end gap-4 px-6 pl-72">
           <Link
             to="https://discord.com/invite/fG2XXEuQX3"
             target="_blank"
             rel="noopener noreferrer"
           >
-            <DiscordLogoIcon className="w-7 h-7" />
+            <DiscordLogoIcon className="h-7 w-7" />
           </Link>
           <div className="h-7">
             <GitHubButton
@@ -47,7 +47,7 @@ function RootLayout() {
             </GitHubButton>
           </div>
         </div>
-        <main className="pl-72 pb-4">
+        <main className="pb-4 pl-72">
           <Outlet />
         </main>
       </div>

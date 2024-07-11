@@ -26,7 +26,7 @@ function WorkflowTitle({ workflowPermanentId }: Props) {
   });
 
   if (isLoading) {
-    return <Skeleton className="w-full h-6" />;
+    return <Skeleton className="h-6 w-full" />;
   }
 
   if (isError || !workflow) {

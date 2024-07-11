@@ -75,8 +75,8 @@ function SavedTaskCard({ workflowId, title, url, description }: Props) {
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="flex justify-between items-center">
-          <span className="overflow-hidden text-ellipsis whitespace-nowrap ">
+        <CardTitle className="flex items-center justify-between">
+          <span className="overflow-hidden text-ellipsis whitespace-nowrap">
             {title}
           </span>
           <Dialog open={open} onOpenChange={setOpen}>
@@ -130,7 +130,7 @@ function SavedTaskCard({ workflowId, title, url, description }: Props) {
         </CardDescription>
       </CardHeader>
       <CardContent
-        className="h-48 overflow-scroll hover:bg-muted/40 cursor-pointer"
+        className="h-48 cursor-pointer overflow-scroll hover:bg-muted/40"
         onClick={() => {
           navigate(workflowId);
         }}

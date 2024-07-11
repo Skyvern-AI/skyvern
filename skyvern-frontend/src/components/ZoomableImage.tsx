@@ -38,7 +38,7 @@ function ZoomableImage(props: HTMLImageElementProps) {
       {modalOpen && (
         <div
           className={clsx(
-            "fixed inset-0 z-50 flex justify-center bg-black bg-opacity-75 overflow-auto p-16",
+            "fixed inset-0 z-50 flex justify-center overflow-auto bg-black bg-opacity-75 p-16",
             {
               "items-center": !zoom,
               "items-baseline": zoom,
@@ -46,7 +46,7 @@ function ZoomableImage(props: HTMLImageElementProps) {
           )}
         >
           <span
-            className="absolute top-4 right-4 text-white text-4xl cursor-pointer"
+            className="absolute right-4 top-4 cursor-pointer text-4xl text-white"
             onClick={closeModal}
           >
             &times;
@@ -55,9 +55,9 @@ function ZoomableImage(props: HTMLImageElementProps) {
             {...props}
             onClick={() => setZoom(!zoom)}
             className={clsx({
-              "min-h-full object-contain h-full w-full m-0 cursor-zoom-in max-h-full max-w-full":
+              "m-0 h-full max-h-full min-h-full w-full max-w-full cursor-zoom-in object-contain":
                 !zoom,
-              "min-h-full object-contain m-0 cursor-zoom-out max-w-none max-h-none mr-auto ml-auto":
+              "m-0 ml-auto mr-auto max-h-none min-h-full max-w-none cursor-zoom-out object-contain":
                 zoom,
             })}
           />
