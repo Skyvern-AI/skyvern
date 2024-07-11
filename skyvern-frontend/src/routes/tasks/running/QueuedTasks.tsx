@@ -58,7 +58,7 @@ function QueuedTasks() {
         <TableBody>
           {tasks?.length === 0 ? (
             <TableRow>
-              <TableCell colSpan={3}>No queued tasks</TableCell>
+              <TableCell colSpan={4}>No queued tasks</TableCell>
             </TableRow>
           ) : (
             tasks?.map((task) => {

@@ -1,4 +1,4 @@
-import { Navigate, createBrowserRouter } from "react-router-dom";
+import { Navigate, Outlet, createBrowserRouter } from "react-router-dom";
 import { RootLayout } from "./routes/root/RootLayout";
 import { TasksPageLayout } from "./routes/tasks/TasksPageLayout";
 import { TaskTemplates } from "./routes/tasks/create/TaskTemplates";
@@ -13,6 +13,10 @@ import { TaskRecording } from "./routes/tasks/detail/TaskRecording";
 import { TaskParameters } from "./routes/tasks/detail/TaskParameters";
 import { StepArtifactsLayout } from "./routes/tasks/detail/StepArtifactsLayout";
 import { CreateNewTaskFromPrompt } from "./routes/tasks/create/CreateNewTaskFromPrompt";
+import { WorkflowsPageLayout } from "./routes/workflows/WorkflowsPageLayout";
+import { Workflows } from "./routes/workflows/Workflows";
+import { WorkflowPage } from "./routes/workflows/WorkflowPage";
+import { WorkflowRunParameters } from "./routes/workflows/WorkflowRunParameters";
 
 const router = createBrowserRouter([
   {
@@ -74,6 +78,30 @@ const router = createBrowserRouter([
           {
             path: ":template",
             element: <CreateNewTaskFormPage />,
+          },
+        ],
+      },
+      {
+        path: "workflows",
+        element: <WorkflowsPageLayout />,
+        children: [
+          {
+            index: true,
+            element: <Workflows />,
+          },
+          {
+            path: ":workflowPermanentId",
+            element: <Outlet />,
+            children: [
+              {
+                index: true,
+                element: <WorkflowPage />,
+              },
+              {
+                path: "run",
+                element: <WorkflowRunParameters />,
+              },
+            ],
           },
         ],
       },

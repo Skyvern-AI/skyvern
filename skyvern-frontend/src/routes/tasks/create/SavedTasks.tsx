@@ -51,7 +51,7 @@ function SavedTasks() {
   const navigate = useNavigate();
 
   const { data } = useQuery<Array<WorkflowApiResponse>>({
-    queryKey: ["workflows"],
+    queryKey: ["savedTasks"],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client

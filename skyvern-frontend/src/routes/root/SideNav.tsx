@@ -1,6 +1,7 @@
 import { cn } from "@/util/utils";
 import {
   GearIcon,
+  LightningBoltIcon,
   ListBulletIcon,
   PlusCircledIcon,
 } from "@radix-ui/react-icons";
@@ -18,7 +19,7 @@ function SideNav() {
         }}
       >
         <PlusCircledIcon className="mr-4 w-6 h-6" />
-        <span className="text-lg">New Task</span>
+        <span className="text-lg">Create</span>
       </NavLink>
       <NavLink
         to="tasks"
@@ -29,7 +30,18 @@ function SideNav() {
         }}
       >
         <ListBulletIcon className="mr-4 w-6 h-6" />
-        <span className="text-lg">Task History</span>
+        <span className="text-lg">Tasks</span>
+      </NavLink>
+      <NavLink
+        to="workflows"
+        className={({ isActive }) => {
+          return cn("flex items-center px-5 py-3 hover:bg-muted rounded-2xl", {
+            "bg-muted": isActive,
+          });
+        }}
+      >
+        <LightningBoltIcon className="mr-4 w-6 h-6" />
+        <span className="text-lg">Workflows (Beta)</span>
       </NavLink>
       <NavLink
         to="settings"

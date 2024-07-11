@@ -92,7 +92,7 @@ function TaskHistory() {
               <TaskListSkeletonRows />
             ) : tasks?.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={3}>No tasks found</TableCell>
+                <TableCell colSpan={5}>No tasks found</TableCell>
               </TableRow>
             ) : (
               tasks?.map((task) => {
