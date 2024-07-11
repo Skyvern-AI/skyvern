@@ -22,6 +22,7 @@ import {
   PaginationPrevious,
 } from "@/components/ui/pagination";
 import { cn } from "@/util/utils";
+import { WorkflowTitle } from "./WorkflowTitle";
 
 function Workflows() {
   const credentialGetter = useCredentialGetter();
@@ -153,19 +154,20 @@ function Workflows() {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead className="w-1/3">Workflow ID</TableHead>
-              <TableHead className="w-1/3">Workflow Run ID</TableHead>
-              <TableHead className="w-1/3">Status</TableHead>
+              <TableHead className="w-1/4">Workflow ID</TableHead>
+              <TableHead className="w-1/4">Workflow Title</TableHead>
+              <TableHead className="w-1/4">Workflow Run ID</TableHead>
+              <TableHead className="w-1/4">Status</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {workflowRunsIsLoading ? (
               <TableRow>
-                <TableCell colSpan={3}>Loading...</TableCell>
+                <TableCell colSpan={4}>Loading...</TableCell>
               </TableRow>
             ) : workflowRuns?.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={3}>No workflow runs found</TableCell>
+                <TableCell colSpan={4}>No workflow runs found</TableCell>
               </TableRow>
             ) : (
               workflowRuns?.map((workflowRun) => {
@@ -179,13 +181,18 @@ function Workflows() {
                     }}
                     className="cursor-pointer"
                   >
-                    <TableCell className="w-1/3">
+                    <TableCell className="w-1/4">
                       {workflowRun.workflow_permanent_id}
                     </TableCell>
-                    <TableCell className="w-1/3">
+                    <TableCell className="w-1/4">
+                      <WorkflowTitle
+                        workflowPermanentId={workflowRun.workflow_permanent_id}
+                      />
+                    </TableCell>
+                    <TableCell className="w-1/4">
                       {workflowRun.workflow_run_id}
                     </TableCell>
-                    <TableCell className="w-1/3">
+                    <TableCell className="w-1/4">
                       <StatusBadge status={workflowRun.status} />
                     </TableCell>
                   </TableRow>
