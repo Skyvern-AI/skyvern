@@ -21,7 +21,7 @@ function TaskParameters() {
   const credentialGetter = useCredentialGetter();
   const {
     data: task,
-    isFetching: taskIsFetching,
+    isLoading: taskIsLoading,
     isError: taskIsError,
   } = useQuery<TaskApiResponse>({
     queryKey: ["task", taskId],
@@ -31,7 +31,7 @@ function TaskParameters() {
     },
   });
 
-  if (taskIsFetching) {
+  if (taskIsLoading) {
     return (
       <div className="h-[40rem]">
         <Skeleton className="h-full" />
