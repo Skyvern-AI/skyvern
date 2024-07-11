@@ -31,7 +31,7 @@ Workflow parameters are specific parameters you’re going to be passing into th
 | --- | --- | --- | --- | --- |
 | key | String | yes | alibaba_url | unique key corresponding to a specific parameter |
 | parameter_type | Enum | yes | workflow | The type of parameter for the workflow. Meant to indicate whether this parameter is being passed in via the run workflow endpoint (workflow), or whether a parameter is the output of a different workflow step (output). Can be workflow , context, aws_secret, or output |
-| workflow_parameter_type | Enum | no? | string | The actual type of the parameter, meant to be used for type-safety reasons.<br/>Supported types:<br/>STRING = "string"<br/>INTEGER = "integer"<br/>FLOAT = "float"<br/>BOOLEAN = "boolean"<br/>JSON = "json” |
+| workflow_parameter_type | Enum | no? | string | The actual type of the parameter, meant to be used for type-safety reasons.<br/>Supported types:<br/>STRING = "string"<br/>INTEGER = "integer"<br/>FLOAT = "float"<br/>BOOLEAN = "boolean"<br/>JSON = "json”<br/>FILE_URL = "file_url” |
 | description | string | yes | Alibaba product URL for checking the price of the product | Description of the parameter |
 
 ## Blocks
@@ -100,7 +100,7 @@ Iterate over something such as a CSV or the output of a previous block. The bloc
 ```
 
 ### CodeBlock
-This block executes user-defined code within our execution environment. It’s able to take parameters as input and transform them based on a certain specification
+This block executes user-defined code within our execution environment. It’s able to take parameters as input and transform them based on a certain specification.
 
 **Example Block**
 
@@ -167,6 +167,19 @@ Sends an email with some data
       body: website_url
       file_attachments:
         - SKYVERN_DOWNLOAD_DIRECTORY
+```
+
+### FileParserBlock
+
+Downloads and parses a file to be used within other workflow blocks.
+
+**Supported types:** csv
+
+```
+    - block_type: file_url_parser
+      label: csv_parser
+      file_type: csv
+      file_url: <csv_file_url>
 ```
 
 
