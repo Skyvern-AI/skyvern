@@ -1,8 +1,10 @@
 import abc
+import asyncio
 import csv
 import json
 import os
 import smtplib
+import textwrap
 import uuid
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -501,8 +503,13 @@ class CodeBlock(Block):
     async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+
         # get all parameters into a dictionary
         parameter_values = {}
+        maybe_browser_state = await app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+        if maybe_browser_state and maybe_browser_state.page:
+            parameter_values["skyvern_page"] = maybe_browser_state.page
+
         for parameter in self.parameters:
             value = workflow_run_context.get_value(parameter.key)
             secret_value = workflow_run_context.get_original_secret_value_or_none(value)
@@ -511,9 +518,25 @@ class CodeBlock(Block):
             else:
                 parameter_values[parameter.key] = value
 
+        # Add asyncio and the current event loop to the parameter_values
+        parameter_values["asyncio"] = asyncio
+        parameter_values["__builtins__"] = __builtins__  # Include builtins for exec context
+
         local_variables: dict[str, Any] = {}
-        exec(self.code, parameter_values, local_variables)
-        result = {"result": local_variables.get("result")}
+        result_container: dict[str, Any] = {}
+        # Define the user_code function and return it
+        user_code = textwrap.indent(self.code, "    ")
+        full_code = f"""
+async def user_code():
+{user_code}
+    result_container['result'] = locals().get('result')
+"""
+
+        exec(full_code, {**parameter_values, "result_container": result_container}, local_variables)
+        # Await the returned user_code function
+        await local_variables["user_code"]()
+
+        result = {"result": result_container.get("result")}
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result)
         return self.build_block_result(success=True, output_parameter_value=result)
 
