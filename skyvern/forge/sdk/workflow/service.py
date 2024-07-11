@@ -489,6 +489,30 @@ class WorkflowService:
             bitwarden_collection_id=bitwarden_collection_id,
         )
 
+    async def create_bitwarden_sensitive_information_parameter(
+        self,
+        workflow_id: str,
+        bitwarden_client_id_aws_secret_key: str,
+        bitwarden_client_secret_aws_secret_key: str,
+        bitwarden_master_password_aws_secret_key: str,
+        bitwarden_collection_id: str,
+        bitwarden_identity_key: str,
+        bitwarden_identity_fields: list[str],
+        key: str,
+        description: str | None = None,
+    ) -> Parameter:
+        return await app.DATABASE.create_bitwarden_sensitive_information_parameter(
+            workflow_id=workflow_id,
+            bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
+            bitwarden_client_secret_aws_secret_key=bitwarden_client_secret_aws_secret_key,
+            bitwarden_master_password_aws_secret_key=bitwarden_master_password_aws_secret_key,
+            bitwarden_collection_id=bitwarden_collection_id,
+            bitwarden_identity_key=bitwarden_identity_key,
+            bitwarden_identity_fields=bitwarden_identity_fields,
+            key=key,
+            description=description,
+        )
+
     async def create_output_parameter(
         self, workflow_id: str, key: str, description: str | None = None
     ) -> OutputParameter:
@@ -864,6 +888,18 @@ class WorkflowService:
                         key=parameter.key,
                         description=parameter.description,
                         bitwarden_collection_id=parameter.bitwarden_collection_id,
+                    )
+                elif parameter.parameter_type == ParameterType.BITWARDEN_SENSITIVE_INFORMATION:
+                    parameters[parameter.key] = await self.create_bitwarden_sensitive_information_parameter(
+                        workflow_id=workflow.workflow_id,
+                        bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
+                        bitwarden_client_secret_aws_secret_key=parameter.bitwarden_client_secret_aws_secret_key,
+                        bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
+                        bitwarden_collection_id=parameter.bitwarden_collection_id,
+                        bitwarden_identity_key=parameter.bitwarden_identity_key,
+                        bitwarden_identity_fields=parameter.bitwarden_identity_fields,
+                        key=parameter.key,
+                        description=parameter.description,
                     )
                 elif parameter.parameter_type == ParameterType.WORKFLOW:
                     parameters[parameter.key] = await self.create_workflow_parameter(

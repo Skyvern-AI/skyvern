@@ -194,6 +194,55 @@ class WorkflowRunContext:
             except BitwardenBaseError as e:
                 LOG.error(f"Failed to get secret from Bitwarden. Error: {e}")
                 raise e
+        # TODO (kerem): Implement this
+        elif parameter.parameter_type == ParameterType.BITWARDEN_SENSITIVE_INFORMATION:
+            try:
+                # Get the Bitwarden login credentials from AWS secrets
+                client_id = await aws_client.get_secret(parameter.bitwarden_client_id_aws_secret_key)
+                client_secret = await aws_client.get_secret(parameter.bitwarden_client_secret_aws_secret_key)
+                master_password = await aws_client.get_secret(parameter.bitwarden_master_password_aws_secret_key)
+            except Exception as e:
+                LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
+                raise e
+
+            bitwarden_identity_key = parameter.bitwarden_identity_key
+            if self.has_parameter(parameter.bitwarden_identity_key) and self.has_value(
+                parameter.bitwarden_identity_key
+            ):
+                bitwarden_identity_key = self.values[parameter.bitwarden_identity_key]
+
+            collection_id = parameter.bitwarden_collection_id
+            if self.has_parameter(parameter.bitwarden_collection_id) and self.has_value(
+                parameter.bitwarden_collection_id
+            ):
+                collection_id = self.values[parameter.bitwarden_collection_id]
+
+            try:
+                sensitive_values = BitwardenService.get_sensitive_information_from_identity(
+                    client_id,
+                    client_secret,
+                    master_password,
+                    collection_id,
+                    bitwarden_identity_key,
+                    parameter.bitwarden_identity_fields,
+                )
+                if sensitive_values:
+                    self.secrets[BitwardenConstants.IDENTITY_KEY] = bitwarden_identity_key
+                    self.secrets[BitwardenConstants.CLIENT_SECRET] = client_secret
+                    self.secrets[BitwardenConstants.CLIENT_ID] = client_id
+                    self.secrets[BitwardenConstants.MASTER_PASSWORD] = master_password
+                    self.secrets[BitwardenConstants.BW_COLLECTION_ID] = collection_id
+
+                    self.values[parameter.key] = {}
+                    for key, value in sensitive_values.items():
+                        random_secret_id = self.generate_random_secret_id()
+                        secret_id = f"{random_secret_id}_{key}"
+                        self.secrets[secret_id] = value
+                        self.values[parameter.key][key] = secret_id
+
+            except BitwardenBaseError as e:
+                LOG.error(f"Failed to get sensitive information from Bitwarden. Error: {e}")
+                raise e
         elif isinstance(parameter, ContextParameter):
             if isinstance(parameter.source, WorkflowParameter):
                 # TODO (kerem): set this while initializing the context manager

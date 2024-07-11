@@ -14,6 +14,7 @@ from skyvern.forge.sdk.db.models import (
     ArtifactModel,
     AWSSecretParameterModel,
     BitwardenLoginCredentialParameterModel,
+    BitwardenSensitiveInformationParameterModel,
     OrganizationAuthTokenModel,
     OrganizationModel,
     OutputParameterModel,
@@ -31,6 +32,7 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_artifact,
     convert_to_aws_secret_parameter,
     convert_to_bitwarden_login_credential_parameter,
+    convert_to_bitwarden_sensitive_information_parameter,
     convert_to_organization,
     convert_to_organization_auth_token,
     convert_to_output_parameter,
@@ -48,6 +50,7 @@ from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskStatus
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     BitwardenLoginCredentialParameter,
+    BitwardenSensitiveInformationParameter,
     OutputParameter,
     WorkflowParameter,
     WorkflowParameterType,
@@ -1137,6 +1140,35 @@ class AgentDB:
             await session.commit()
             await session.refresh(bitwarden_login_credential_parameter)
             return convert_to_bitwarden_login_credential_parameter(bitwarden_login_credential_parameter)
+
+    async def create_bitwarden_sensitive_information_parameter(
+        self,
+        workflow_id: str,
+        bitwarden_client_id_aws_secret_key: str,
+        bitwarden_client_secret_aws_secret_key: str,
+        bitwarden_master_password_aws_secret_key: str,
+        bitwarden_collection_id: str,
+        bitwarden_identity_key: str,
+        bitwarden_identity_fields: list[str],
+        key: str,
+        description: str | None = None,
+    ) -> BitwardenSensitiveInformationParameter:
+        async with self.Session() as session:
+            bitwarden_sensitive_information_parameter = BitwardenSensitiveInformationParameterModel(
+                workflow_id=workflow_id,
+                bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
+                bitwarden_client_secret_aws_secret_key=bitwarden_client_secret_aws_secret_key,
+                bitwarden_master_password_aws_secret_key=bitwarden_master_password_aws_secret_key,
+                bitwarden_collection_id=bitwarden_collection_id,
+                bitwarden_identity_key=bitwarden_identity_key,
+                bitwarden_identity_fields=bitwarden_identity_fields,
+                key=key,
+                description=description,
+            )
+            session.add(bitwarden_sensitive_information_parameter)
+            await session.commit()
+            await session.refresh(bitwarden_sensitive_information_parameter)
+            return convert_to_bitwarden_sensitive_information_parameter(bitwarden_sensitive_information_parameter)
 
     async def create_output_parameter(
         self,

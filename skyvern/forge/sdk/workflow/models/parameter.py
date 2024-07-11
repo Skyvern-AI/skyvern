@@ -12,6 +12,7 @@ class ParameterType(StrEnum):
     CONTEXT = "context"
     AWS_SECRET = "aws_secret"
     BITWARDEN_LOGIN_CREDENTIAL = "bitwarden_login_credential"
+    BITWARDEN_SENSITIVE_INFORMATION = "bitwarden_sensitive_information"
     OUTPUT = "output"
 
 
@@ -55,6 +56,30 @@ class BitwardenLoginCredentialParameter(Parameter):
     # bitwarden collection id to filter the login credentials from,
     # if not provided, no filtering will be done
     bitwarden_collection_id: str | None = None
+
+    created_at: datetime
+    modified_at: datetime
+    deleted_at: datetime | None = None
+
+
+class BitwardenSensitiveInformationParameter(Parameter):
+    parameter_type: Literal[ParameterType.BITWARDEN_SENSITIVE_INFORMATION] = (
+        ParameterType.BITWARDEN_SENSITIVE_INFORMATION
+    )
+    # parameter fields
+    bitwarden_sensitive_information_parameter_id: str
+    workflow_id: str
+    # bitwarden cli required fields
+    bitwarden_client_id_aws_secret_key: str
+    bitwarden_client_secret_aws_secret_key: str
+    bitwarden_master_password_aws_secret_key: str
+    # bitwarden collection id to filter the Bitwarden Identity from
+    bitwarden_collection_id: str
+    # unique key to identify the Bitwarden Identity in the collection
+    # this has to be in the identity's name
+    bitwarden_identity_key: str
+    # fields to extract from the Bitwarden Identity. Custom fields are prioritized over default identity fields
+    bitwarden_identity_fields: list[str]
 
     created_at: datetime
     modified_at: datetime
@@ -124,6 +149,7 @@ ParameterSubclasses = Union[
     ContextParameter,
     AWSSecretParameter,
     BitwardenLoginCredentialParameter,
+    BitwardenSensitiveInformationParameter,
     OutputParameter,
 ]
 PARAMETER_TYPE = Annotated[ParameterSubclasses, Field(discriminator="parameter_type")]

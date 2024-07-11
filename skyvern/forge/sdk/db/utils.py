@@ -10,6 +10,7 @@ from skyvern.forge.sdk.db.models import (
     ArtifactModel,
     AWSSecretParameterModel,
     BitwardenLoginCredentialParameterModel,
+    BitwardenSensitiveInformationParameterModel,
     OrganizationAuthTokenModel,
     OrganizationModel,
     OutputParameterModel,
@@ -26,6 +27,7 @@ from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskStatus
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     BitwardenLoginCredentialParameter,
+    BitwardenSensitiveInformationParameter,
     OutputParameter,
     WorkflowParameter,
     WorkflowParameterType,
@@ -260,6 +262,33 @@ def convert_to_bitwarden_login_credential_parameter(
         created_at=bitwarden_login_credential_parameter_model.created_at,
         modified_at=bitwarden_login_credential_parameter_model.modified_at,
         deleted_at=bitwarden_login_credential_parameter_model.deleted_at,
+    )
+
+
+def convert_to_bitwarden_sensitive_information_parameter(
+    bitwarden_sensitive_information_parameter_model: BitwardenSensitiveInformationParameterModel,
+    debug_enabled: bool = False,
+) -> BitwardenSensitiveInformationParameter:
+    if debug_enabled:
+        LOG.debug(
+            "Converting BitwardenSensitiveInformationParameterModel to BitwardenSensitiveInformationParameter",
+            bitwarden_sensitive_information_parameter_id=bitwarden_sensitive_information_parameter_model.bitwarden_sensitive_information_parameter_id,
+        )
+
+    return BitwardenSensitiveInformationParameter(
+        bitwarden_sensitive_information_parameter_id=bitwarden_sensitive_information_parameter_model.bitwarden_sensitive_information_parameter_id,
+        workflow_id=bitwarden_sensitive_information_parameter_model.workflow_id,
+        key=bitwarden_sensitive_information_parameter_model.key,
+        description=bitwarden_sensitive_information_parameter_model.description,
+        bitwarden_client_id_aws_secret_key=bitwarden_sensitive_information_parameter_model.bitwarden_client_id_aws_secret_key,
+        bitwarden_client_secret_aws_secret_key=bitwarden_sensitive_information_parameter_model.bitwarden_client_secret_aws_secret_key,
+        bitwarden_master_password_aws_secret_key=bitwarden_sensitive_information_parameter_model.bitwarden_master_password_aws_secret_key,
+        bitwarden_collection_id=bitwarden_sensitive_information_parameter_model.bitwarden_collection_id,
+        bitwarden_identity_key=bitwarden_sensitive_information_parameter_model.bitwarden_identity_key,
+        bitwarden_identity_fields=bitwarden_sensitive_information_parameter_model.bitwarden_identity_fields,
+        created_at=bitwarden_sensitive_information_parameter_model.created_at,
+        modified_at=bitwarden_sensitive_information_parameter_model.modified_at,
+        deleted_at=bitwarden_sensitive_information_parameter_model.deleted_at,
     )
 
 
