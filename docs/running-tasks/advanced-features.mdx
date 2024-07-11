@@ -1,2 +1,22 @@
+--- 
+title: Advanced Settings for tasks
+description: 'How to use advanced settings for tasks'
+---
 
-<img src="https://thumbs.dreamstime.com/b/pug-dog-holding-pliers-screwdriver-behind-old-wooden-sign-text-under-construction-white-background-constructor-92836854.jpg" />
+# Advanced Settings for tasks
+
+## Overriding the max_steps paramter in the task
+If you want the task to execute for a specific number of steps, you can use the `x-max-steps-override` header in the request. This will override the default `max_steps` parameter set in the task.
+
+```json
+POST https://api.skyvern.com/api/v1/tasks 
+
+Headers:
+{
+    "x-api-key": "YOUR_API_KEY",
+    "x-max-steps-override": 10
+}
+
+Body:
+.. usual task body ..
+```

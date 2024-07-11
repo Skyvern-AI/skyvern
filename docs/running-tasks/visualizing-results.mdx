@@ -1,2 +1,46 @@
+---
+title: Visualizing Results
+description: 'How to understand the information shown by Skyvern'
+---
 
-<img src="https://thumbs.dreamstime.com/b/pug-dog-holding-pliers-screwdriver-behind-old-wooden-sign-text-under-construction-white-background-constructor-92836854.jpg" />
+# Visualizing Results
+Skyvern comes bundled with a Visualizer to help you understand what's going on with your tasks. To get started, navigate to the task history page and click on any task.
+
+<img src="/images/visualizing_results/navigate_to_task.png" />
+
+
+## Actions 
+Each action that Skyvern takes can be viewed in the Action viewer. It's accompanied with a screenshot of the screen state *after* the action has executed
+
+<img src="/images/visualizing_results/view_actions.png" />
+
+## Recording 
+Each Skyvern task comes with a recording of the entire operation (end to end). To view the recording, click on the recording tab.
+
+<img src="/images/visualizing_results/view_recording.png" />
+
+## Task Parameters 
+The task parameters are the inputs that you provided to Skyvern. This includes the URL, the extraction rules, and any other information that you provided to Skyvern.
+
+<img src="/images/visualizing_results/view_parameters.png" />
+
+## Diagnostic Logs
+The diagnostics tab contains information used by Skyvern to do its processing. It includes information such as the annotated screenshots, action screenshots, element tree, prompt, action list, page HTML, and the raw LLM Request. 
+
+<img src="/images/visualizing_results/view_diagnostics.png" />
+
+## Accessing results via API
+
+You can also access the results of a task via the API. 
+
+The following endpoint can be used to get the results of a task:
+```
+GET https://api.skyvern.com/api/v1/tasks/{task_id}/steps?page=1&page_size=15
+```
+
+The response will contain a list of steps, alongside their actions and other relevant information
+
+The following endpoint can be used to retrieve artifacts for a specific step:
+```
+GET https://api.skyvern.com/api/v1/tasks/{task_id}/steps/{step_id}/artifacts
+```
