@@ -100,7 +100,11 @@ Iterate over something such as a CSV or the output of a previous block. The bloc
 ```
 
 ### CodeBlock
-This block executes user-defined code within our execution environment. It’s able to take parameters as input and transform them based on a certain specification.
+This block executes user-defined Python code within our execution environment. It’s able to take parameters as input and transform them based on a certain specification.
+
+In addition to running simple code snippets, CodeBlock allows you to:
+- execute asynchronous code
+- control your browser page inside Skyvern
 
 **Example Block**
 
@@ -117,6 +121,23 @@ This block executes user-defined code within our execution environment. It’s a
         result = None
   output_parameter_key: price_diff_percentage
 ```
+
+**Example Block with Browser Control**
+
+```json
+- block_type: code
+  label: get_tab_details
+  code: |
+    print("Getting tab details")
+    result = {
+        "url": skyvern_page.url,
+        "title": await skyvern_page.title()
+    }
+    print("Got details:", result)
+    print("Now I want to see a cat")
+    await skyvern_page.goto("https://cataas.com/cat")
+```
+
 
 ### TextPromptBlock
 
@@ -144,9 +165,9 @@ Do a custom OpenAI query as a part of your workflow
 Persists files inside S3
 
 ```
-    - block_type: upload_to_s3
-      label: upload_downloaded_files_to_s3
-      path: SKYVERN_DOWNLOAD_DIRECTORY
+- block_type: upload_to_s3
+  label: upload_downloaded_files_to_s3
+  path: SKYVERN_DOWNLOAD_DIRECTORY
 ```
 
 ### SendEmailBlock
@@ -154,19 +175,19 @@ Persists files inside S3
 Sends an email with some data
 
 ```
-    - block_type: send_email
-      label: send_email
-      smtp_host_secret_parameter_key: smtp_host
-      smtp_port_secret_parameter_key: smtp_port
-      smtp_username_secret_parameter_key: smtp_username
-      smtp_password_secret_parameter_key: smtp_password
-      sender: hello@skyvern.com
-      recipients:
-        - founders@skyvern.com
-      subject: Skyvern - Downloaded Invoices Demo
-      body: website_url
-      file_attachments:
-        - SKYVERN_DOWNLOAD_DIRECTORY
+- block_type: send_email
+  label: send_email
+  smtp_host_secret_parameter_key: smtp_host
+  smtp_port_secret_parameter_key: smtp_port
+  smtp_username_secret_parameter_key: smtp_username
+  smtp_password_secret_parameter_key: smtp_password
+  sender: hello@skyvern.com
+  recipients:
+    - founders@skyvern.com
+  subject: Skyvern - Downloaded Invoices Demo
+  body: website_url
+  file_attachments:
+    - SKYVERN_DOWNLOAD_DIRECTORY
 ```
 
 ### FileParserBlock
@@ -176,10 +197,10 @@ Downloads and parses a file to be used within other workflow blocks.
 **Supported types:** csv
 
 ```
-    - block_type: file_url_parser
-      label: csv_parser
-      file_type: csv
-      file_url: <csv_file_url>
+- block_type: file_url_parser
+  label: csv_parser
+  file_type: csv
+  file_url: <csv_file_url>
 ```
 
 
