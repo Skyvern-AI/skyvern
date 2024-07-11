@@ -107,3 +107,25 @@ has to be ≥1 |
 | screenshot_url | String | Yes | … url to screenshot … |
 | recording_url | String | Yes | .. url to recording … |
 | failure_reason | String | No | “Failed to pass this page - missing information: invalid password” |
+
+## Request - List Steps (GET)
+Each task is made up of "steps" which are the individual actions Skyvern takes to complete the task. You can use this endpoint to get all the steps of the task.
+
+Request type: `GET`
+
+Production: `https://api.skyvern.com/api/v1/tasks/{task_id}/steps`
+
+## Response - List Steps (GET)
+The response is a list of Step Object.
+
+### Step Object
+| Parameter | Type | Sample Value | Description |
+| --- | --- | --- | --- |
+| organization_id | String | o_123 | Your organization id |
+| task_id | String | tsk_123 | The id of the task |
+| step_id | String | stp_123 | The id of the step |
+| status | String | created / running / completed / failed / canceled | The status of the step |
+| order | Integer | 0 / 1 / 2 | The zero based index of the step. 0 is the first step of the task. |
+| retry_index | Integer | 0 / 1 / 2 / 3 | When a step fails, the retry step will have a retry_index that's larger than 0 |
+| input_token_count | Integer | 19223 | The number of input tokens used in this step |
+| output_token_count | Integer | 500 | The number of output tokens generated in this step |
