@@ -54,7 +54,7 @@ function WorkflowRun() {
         "noopener,noreferrer",
       );
     } else {
-      navigate(`${id}/actions`);
+      navigate(`/tasks/${id}/actions`);
     }
   }
 
