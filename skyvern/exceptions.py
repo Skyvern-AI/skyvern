@@ -428,3 +428,8 @@ class WrongElementToUploadFile(SkyvernException):
         super().__init__(
             f"No file chooser dialog opens, so file can't be uploaded through element {element_id}. Please try to upload again with another element."
         )
+
+
+class FailedToFetchSecret(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("Failed to get the actual value of the secret parameter")

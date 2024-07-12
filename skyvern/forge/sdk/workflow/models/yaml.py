@@ -224,5 +224,6 @@ class WorkflowCreateYAMLRequest(BaseModel):
     description: str | None = None
     proxy_location: ProxyLocation | None = None
     webhook_callback_url: str | None = None
+    totp_verification_url: str | None = None
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False

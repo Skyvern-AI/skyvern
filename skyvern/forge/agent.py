@@ -11,7 +11,12 @@ from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Page
 
 from skyvern import analytics
-from skyvern.constants import SCRAPE_TYPE_ORDER, ScrapeType
+from skyvern.constants import (
+    SCRAPE_TYPE_ORDER,
+    SPECIAL_FIELD_VERIFICATION_CODE,
+    VERIFICATION_CODE_PLACEHOLDER,
+    ScrapeType,
+)
 from skyvern.exceptions import (
     BrowserStateMissingPage,
     EmptyScrapePage,
@@ -120,6 +125,7 @@ class ForgeAgent:
             url=task_url,
             title=task_block.title,
             webhook_callback_url=None,
+            totp_verification_url=None,
             navigation_goal=task_block.navigation_goal,
             data_extraction_goal=task_block.data_extraction_goal,
             navigation_payload=navigation_payload,
@@ -174,6 +180,7 @@ class ForgeAgent:
             url=task_request.url,
             title=task_request.title,
             webhook_callback_url=task_request.webhook_callback_url,
+            totp_verification_url=task_request.totp_verification_url,
             navigation_goal=task_request.navigation_goal,
             data_extraction_goal=task_request.data_extraction_goal,
             navigation_payload=task_request.navigation_payload,
@@ -955,10 +962,11 @@ class ForgeAgent:
         )
 
         element_tree_in_prompt: str = scraped_page.build_element_tree(element_tree_format)
+        final_navigation_payload = self._build_navigation_payload(task)
         extract_action_prompt = prompt_engine.load_prompt(
             prompt_template,
             navigation_goal=navigation_goal,
-            navigation_payload_str=json.dumps(task.navigation_payload),
+            navigation_payload_str=json.dumps(final_navigation_payload),
             starting_url=starting_url,
             current_url=current_url,
             elements=element_tree_in_prompt,
@@ -995,6 +1003,16 @@ class ForgeAgent:
         )
 
         return scraped_page, extract_action_prompt
+
+    def _build_navigation_payload(
+        self,
+        task: Task,
+    ) -> dict[str, Any] | list | str | None:
+        final_navigation_payload = task.navigation_payload
+        if isinstance(final_navigation_payload, dict) and task.totp_verification_url:
+            if SPECIAL_FIELD_VERIFICATION_CODE not in final_navigation_payload:
+                final_navigation_payload[SPECIAL_FIELD_VERIFICATION_CODE] = VERIFICATION_CODE_PLACEHOLDER
+        return final_navigation_payload
 
     async def _get_action_results(self, task: Task) -> str:
         # Get action results from the last app.SETTINGS.PROMPT_ACTION_HISTORY_WINDOW steps

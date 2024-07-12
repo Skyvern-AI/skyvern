@@ -48,6 +48,7 @@ class TaskModel(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
     status = Column(String, index=True)
     webhook_callback_url = Column(String)
+    totp_verification_url = Column(String)
     title = Column(String)
     url = Column(String)
     navigation_goal = Column(String)
@@ -178,6 +179,7 @@ class WorkflowModel(Base):
     workflow_definition = Column(JSON, nullable=False)
     proxy_location = Column(Enum(ProxyLocation))
     webhook_callback_url = Column(String)
+    totp_verification_url = Column(String)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -203,6 +205,7 @@ class WorkflowRunModel(Base):
     status = Column(String, nullable=False)
     proxy_location = Column(Enum(ProxyLocation))
     webhook_callback_url = Column(String)
+    totp_verification_url = Column(String)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

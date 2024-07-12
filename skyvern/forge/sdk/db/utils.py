@@ -63,6 +63,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False) -> Task:
         title=task_obj.title,
         url=task_obj.url,
         webhook_callback_url=task_obj.webhook_callback_url,
+        totp_verification_url=task_obj.totp_verification_url,
         navigation_goal=task_obj.navigation_goal,
         data_extraction_goal=task_obj.data_extraction_goal,
         navigation_payload=task_obj.navigation_payload,
@@ -160,6 +161,7 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         title=workflow_model.title,
         workflow_permanent_id=workflow_model.workflow_permanent_id,
         webhook_callback_url=workflow_model.webhook_callback_url,
+        totp_verification_url=workflow_model.totp_verification_url,
         proxy_location=(ProxyLocation(workflow_model.proxy_location) if workflow_model.proxy_location else None),
         version=workflow_model.version,
         is_saved_task=workflow_model.is_saved_task,
@@ -188,6 +190,7 @@ def convert_to_workflow_run(workflow_run_model: WorkflowRunModel, debug_enabled:
             ProxyLocation(workflow_run_model.proxy_location) if workflow_run_model.proxy_location else None
         ),
         webhook_callback_url=workflow_run_model.webhook_callback_url,
+        totp_verification_url=workflow_run_model.totp_verification_url,
         created_at=workflow_run_model.created_at,
         modified_at=workflow_run_model.modified_at,
     )
