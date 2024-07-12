@@ -143,7 +143,7 @@ function TaskDetails() {
         )}
         {taskHasTerminalState && (
           <Button variant="secondary" asChild>
-            <Link to={`/create/retry/${task.task_id}`}>Retry Task</Link>
+            <Link to={`/create/retry/${task.task_id}`}>Rerun Task</Link>
           </Button>
         )}
       </div>

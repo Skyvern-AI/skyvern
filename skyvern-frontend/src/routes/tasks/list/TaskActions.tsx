@@ -161,7 +161,7 @@ function TaskActions({ task }: Props) {
                 navigate(`/create/retry/${task.task_id}`);
               }}
             >
-              Retry Task
+              Rerun Task
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
