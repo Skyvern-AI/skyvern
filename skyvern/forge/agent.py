@@ -1177,12 +1177,12 @@ class ForgeAgent:
             )
             return
 
-        await self.cleanup_browser_and_create_artifacts(close_browser_on_completion, last_step, task)
-
         # Wait for all tasks to complete before generating the links for the artifacts
         await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks_for_task(task.task_id)
 
         await self.execute_task_webhook(task=task, last_step=last_step, api_key=api_key)
+
+        await self.cleanup_browser_and_create_artifacts(close_browser_on_completion, last_step, task)
 
     async def execute_task_webhook(
         self,
