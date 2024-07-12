@@ -19,9 +19,10 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { cn } from "@/util/utils";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { NavLink, Outlet, useParams } from "react-router-dom";
+import { Link, NavLink, Outlet, useParams } from "react-router-dom";
 import { TaskInfo } from "./TaskInfo";
 import { useTaskQuery } from "./hooks/useTaskQuery";
+import { taskIsFinalized } from "@/api/utils";
 
 function TaskDetails() {
   const { taskId } = useParams();
@@ -84,6 +85,8 @@ function TaskDetails() {
   const taskIsRunningOrQueued =
     task?.status === Status.Running || task?.status === Status.Queued;
 
+  const taskHasTerminalState = task && taskIsFinalized(task);
+
   const showFailureReason =
     task?.status === Status.Failed ||
     task?.status === Status.Terminated ||
@@ -137,6 +140,11 @@ function TaskDetails() {
               </DialogFooter>
             </DialogContent>
           </Dialog>
+        )}
+        {taskHasTerminalState && (
+          <Button variant="secondary" asChild>
+            <Link to={`/create/retry/${task.task_id}`}>Retry Task</Link>
+          </Button>
         )}
       </div>
       {taskIsLoading ? (
