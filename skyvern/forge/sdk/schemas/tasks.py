@@ -32,12 +32,12 @@ class TaskRequest(BaseModel):
         description="Starting URL for the task.",
         examples=["https://www.geico.com"],
     )
-    # TODO: use HttpUrl instead of str
     webhook_callback_url: str | None = Field(
         default=None,
         description="The URL to call when the task is completed.",
         examples=["https://my-webhook.com"],
     )
+    totp_verification_url: str | None = None
     navigation_goal: str | None = Field(
         default=None,
         description="The user's goal for the task.",

@@ -82,6 +82,7 @@ class AgentDB:
         data_extraction_goal: str | None,
         navigation_payload: dict[str, Any] | list | str | None,
         webhook_callback_url: str | None = None,
+        totp_verification_url: str | None = None,
         organization_id: str | None = None,
         proxy_location: ProxyLocation | None = None,
         extracted_information_schema: dict[str, Any] | list | str | None = None,
@@ -98,6 +99,7 @@ class AgentDB:
                     url=url,
                     title=title,
                     webhook_callback_url=webhook_callback_url,
+                    totp_verification_url=totp_verification_url,
                     navigation_goal=navigation_goal,
                     data_extraction_goal=data_extraction_goal,
                     navigation_payload=navigation_payload,
@@ -806,6 +808,7 @@ class AgentDB:
         description: str | None = None,
         proxy_location: ProxyLocation | None = None,
         webhook_callback_url: str | None = None,
+        totp_verification_url: str | None = None,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
         is_saved_task: bool = False,
@@ -818,6 +821,7 @@ class AgentDB:
                 workflow_definition=workflow_definition,
                 proxy_location=proxy_location,
                 webhook_callback_url=webhook_callback_url,
+                totp_verification_url=totp_verification_url,
                 is_saved_task=is_saved_task,
             )
             if workflow_permanent_id:
@@ -984,6 +988,7 @@ class AgentDB:
         organization_id: str,
         proxy_location: ProxyLocation | None = None,
         webhook_callback_url: str | None = None,
+        totp_verification_url: str | None = None,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
@@ -994,6 +999,7 @@ class AgentDB:
                     proxy_location=proxy_location,
                     status="created",
                     webhook_callback_url=webhook_callback_url,
+                    totp_verification_url=totp_verification_url,
                 )
                 session.add(workflow_run)
                 await session.commit()

@@ -14,6 +14,7 @@ class WorkflowRequestBody(BaseModel):
     data: dict[str, Any] | None = None
     proxy_location: ProxyLocation | None = None
     webhook_callback_url: str | None = None
+    totp_verification_url: str | None = None
 
 
 class RunWorkflowResponse(BaseModel):
@@ -49,6 +50,7 @@ class Workflow(BaseModel):
     workflow_definition: WorkflowDefinition
     proxy_location: ProxyLocation | None = None
     webhook_callback_url: str | None = None
+    totp_verification_url: str | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -71,6 +73,7 @@ class WorkflowRun(BaseModel):
     status: WorkflowRunStatus
     proxy_location: ProxyLocation | None = None
     webhook_callback_url: str | None = None
+    totp_verification_url: str | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -96,6 +99,7 @@ class WorkflowRunStatusResponse(BaseModel):
     status: WorkflowRunStatus
     proxy_location: ProxyLocation | None = None
     webhook_callback_url: str | None = None
+    totp_verification_url: str | None = None
     created_at: datetime
     modified_at: datetime
     parameters: dict[str, Any]
