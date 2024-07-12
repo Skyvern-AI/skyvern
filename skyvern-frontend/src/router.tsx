@@ -17,6 +17,7 @@ import { WorkflowsPageLayout } from "./routes/workflows/WorkflowsPageLayout";
 import { Workflows } from "./routes/workflows/Workflows";
 import { WorkflowPage } from "./routes/workflows/WorkflowPage";
 import { WorkflowRunParameters } from "./routes/workflows/WorkflowRunParameters";
+import { RetryTask } from "./routes/tasks/create/retry/RetryTask";
 
 const router = createBrowserRouter([
   {
@@ -78,6 +79,10 @@ const router = createBrowserRouter([
           {
             path: ":template",
             element: <CreateNewTaskFormPage />,
+          },
+          {
+            path: "retry/:taskId",
+            element: <RetryTask />,
           },
         ],
       },

@@ -41,6 +41,7 @@ import {
   TaskTemplateFormValues,
   taskTemplateFormSchema,
 } from "../create/TaskTemplateFormSchema";
+import { useNavigate } from "react-router-dom";
 
 function createTaskTemplateRequestObject(
   values: TaskTemplateFormValues,
@@ -88,6 +89,7 @@ function TaskActions({ task }: Props) {
   const [open, setOpen] = useState(false);
   const id = useId();
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const credentialGetter = useCredentialGetter();
   const form = useForm<TaskTemplateFormValues>({
     resolver: zodResolver(taskTemplateFormSchema),
@@ -154,6 +156,13 @@ function TaskActions({ task }: Props) {
                 Save as Template
               </DropdownMenuItem>
             </DialogTrigger>
+            <DropdownMenuItem
+              onSelect={() => {
+                navigate(`/create/retry/${task.task_id}`);
+              }}
+            >
+              Retry Task
+            </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
         <DialogContent>
