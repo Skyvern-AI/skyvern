@@ -1009,9 +1009,21 @@ class ForgeAgent:
         task: Task,
     ) -> dict[str, Any] | list | str | None:
         final_navigation_payload = task.navigation_payload
-        if isinstance(final_navigation_payload, dict) and task.totp_verification_url:
-            if SPECIAL_FIELD_VERIFICATION_CODE not in final_navigation_payload:
+        if task.totp_verification_url:
+            if (
+                isinstance(final_navigation_payload, dict)
+                and SPECIAL_FIELD_VERIFICATION_CODE not in final_navigation_payload
+            ):
                 final_navigation_payload[SPECIAL_FIELD_VERIFICATION_CODE] = VERIFICATION_CODE_PLACEHOLDER
+            elif (
+                isinstance(final_navigation_payload, str)
+                and SPECIAL_FIELD_VERIFICATION_CODE not in final_navigation_payload
+            ):
+                final_navigation_payload = (
+                    final_navigation_payload
+                    + "\n"
+                    + str({SPECIAL_FIELD_VERIFICATION_CODE: VERIFICATION_CODE_PLACEHOLDER})
+                )
         return final_navigation_payload
 
     async def _get_action_results(self, task: Task) -> str:
