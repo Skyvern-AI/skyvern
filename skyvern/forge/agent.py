@@ -1017,13 +1017,14 @@ class ForgeAgent:
     async def _get_action_results(self, task: Task) -> str:
         # Get action results from the last app.SETTINGS.PROMPT_ACTION_HISTORY_WINDOW steps
         steps = await app.DATABASE.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
-        window_steps = steps[-1 * SettingsManager.get_settings().PROMPT_ACTION_HISTORY_WINDOW :]
+        # the last step is always the newly created one and it should be excluded from the history window
+        window_steps = steps[-1 - SettingsManager.get_settings().PROMPT_ACTION_HISTORY_WINDOW : -1]
         actions_and_results: list[tuple[Action, list[ActionResult]]] = []
         for window_step in window_steps:
             if window_step.output and window_step.output.actions_and_results:
                 actions_and_results.extend(window_step.output.actions_and_results)
 
-        # shall we exclude successful actions?
+        # exclude successful action from history
         return json.dumps(
             [
                 {
@@ -1044,6 +1045,7 @@ class ForgeAgent:
                     ],
                 }
                 for action, results in actions_and_results
+                if len(results) > 0 and not results[-1].success
             ]
         )
 

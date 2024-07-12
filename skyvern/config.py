@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     MAX_RETRIES_PER_STEP: int = 5
     DEBUG_MODE: bool = False
     DATABASE_STRING: str = "postgresql+psycopg://skyvern@localhost/skyvern"
-    PROMPT_ACTION_HISTORY_WINDOW: int = 5
+    PROMPT_ACTION_HISTORY_WINDOW: int = 1
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
     ENV: str = "local"
