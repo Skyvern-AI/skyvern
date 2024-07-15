@@ -606,8 +606,8 @@ function getSelectOptions(element) {
     });
   }
 
-  const selectedOption = element.querySelector("option:checked")
-  if (!selectedOption){
+  const selectedOption = element.querySelector("option:checked");
+  if (!selectedOption) {
     return [selectOptions, ""];
   }
 

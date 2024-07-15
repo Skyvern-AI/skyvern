@@ -424,7 +424,6 @@ async def handle_select_option_action(
 ) -> list[ActionResult]:
     dom = DomUtil(scraped_page, page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
-    locator = skyvern_element.locator
 
     tag_name = skyvern_element.get_tag_name()
     element_dict = scraped_page.id_to_element_dict[action.element_id]
@@ -830,7 +829,7 @@ async def normal_select(
 
     action_result: List[ActionResult] = []
     is_success = False
-    locator = skyvern_element.locator
+    locator = skyvern_element.get_locator()
 
     try:
         await locator.click(
