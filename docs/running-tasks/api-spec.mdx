@@ -46,22 +46,6 @@ POST https://api.skyvern.com/api/v1/tasks/
 }
 ```
 
-### Set Up Your Time-based One-time Password (TOTP) Endpoint
-For websites that requires a verification code (see https://www.twilio.com/docs/glossary/totp for more information) to complete a task, you have to set up a TOTP endpoint for Skyvern to fetch the verification code.
-
-Here's the TOTP endpoint contract you should use:
-
-Request (POST):
-| Parameter | Type | Required? | Sample Value | Description |
-| --- | --- | --- | --- | --- |
-| task_id | String | yes | tsk_123 | The task ID that needs the verification to be done |
-
-Response:
-| Parameter | Type | Required? | Sample Value | Description |
-| task_id | String | yes | tsk_123 | The task ID that needs the verification to be done |
-| verification_code | String | no | 123456 | The verification code |
-
-
 ## Response
 
 | Parameter | Type | Always returned? | Sample Value | Description |
