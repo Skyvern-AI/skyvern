@@ -27,6 +27,7 @@ Production:`https://api.skyvern.com/api/v1/tasks/`
 | navigation_payload | Object | no |         "name": "Chris P. Bacon",<br/>"email": "mailto:chris@pbacon.com" | JSON-formatted payload with any “facts” or information that would help the agent perform its job. In the case of navigating an insurance quote, this payload would include any user information to help fill out the insurance flow such as date of birth, or age they got their license, and so on<br/><br/>This can include nested information, and the formatting isn’t validated |
 | proxy_location | String | yes | RESIDENTIAL | Proxy location for the web-browsing request. Please pass RESIDENTIAL as a value |
 | extracted_information_schema | JSON | no |  | Used to enforce a JSON schema spec to be enforced in the data_extraction_goal. Similar to https://json-schema.org/ definition. |
+| totp_verification_url | String | no | https://mywebsite.com/two_factor_code | The url of your TOTP endpoint |
 
 ## Example Request (Apply for a job)
 
@@ -130,3 +131,10 @@ The response is a list of Step Object.
 | retry_index | Integer | 0 / 1 / 2 / 3 | When a step fails, the retry step will have a retry_index that's larger than 0 |
 | input_token_count | Integer | 19223 | The number of input tokens used in this step |
 | output_token_count | Integer | 500 | The number of output tokens generated in this step |
+
+## Request - Cancel A Task (POST)
+A task that's in any of thsese states can be canceled: ["created", "queued", "running"]
+
+Request type: `POST`
+
+Production: `https://api.skyvern.com/api/v1/tasks/{task_id}/cancel`
