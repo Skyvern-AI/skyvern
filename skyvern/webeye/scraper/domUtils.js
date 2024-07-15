@@ -605,7 +605,13 @@ function getSelectOptions(element) {
       text: removeMultipleSpaces(option.textContent),
     });
   }
-  return selectOptions;
+
+  const selectedOption = element.querySelector("option:checked");
+  if (!selectedOption) {
+    return [selectOptions, ""];
+  }
+
+  return [selectOptions, removeMultipleSpaces(selectedOption.textContent)];
 }
 
 function getListboxOptions(element) {
@@ -776,15 +782,16 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
       // assign shadowHostId to the shadowHost element if it doesn't have unique_id
       if (!shadowHostId) {
         shadowHostId = uniqueId();
-        shadowHost.setAttribute("unique_id", shadowHostId);
+        shadowHostEle.setAttribute("unique_id", shadowHostId);
       }
       elementObj.shadowHost = shadowHostId;
     }
 
     // get options for select element or for listbox element
     let selectOptions = null;
+    let selectedValue = "";
     if (elementTagNameLower === "select") {
-      selectOptions = getSelectOptions(element);
+      [selectOptions, selectedValue] = getSelectOptions(element);
     } else if (attrs["role"] && attrs["role"].toLowerCase() === "listbox") {
       // if "role" key is inside attrs, then get all the elements with role "option" and get their text
       selectOptions = getListboxOptions(element);
@@ -839,6 +846,9 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
     }
     if (selectOptions) {
       elementObj.options = selectOptions;
+    }
+    if (selectedValue) {
+      elementObj.attributes["selected"] = selectedValue;
     }
 
     return elementObj;
