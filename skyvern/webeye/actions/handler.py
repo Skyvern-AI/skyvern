@@ -583,13 +583,6 @@ async def handle_select_option_action(
         click_action = ClickAction(element_id=action.element_id)
         return await chain_click(task, scraped_page, page, click_action, skyvern_element)
 
-    try:
-        current_text = await locator.input_value()
-        if current_text == action.option.label or current_text == action.option.value:
-            return [ActionSuccess()]
-    except Exception:
-        LOG.info("failed to confirm if the select option has been done, force to take the action again.")
-
     return await normal_select(action=action, skyvern_element=skyvern_element)
 
 
@@ -828,6 +821,13 @@ async def normal_select(
     action: actions.SelectOptionAction,
     skyvern_element: SkyvernElement,
 ) -> List[ActionResult]:
+    try:
+        current_text = await skyvern_element.get_attr("selected")
+        if current_text == action.option.label or current_text == action.option.value:
+            return [ActionSuccess()]
+    except Exception:
+        LOG.info("failed to confirm if the select option has been done, force to take the action again.")
+
     action_result: List[ActionResult] = []
     is_success = False
     locator = skyvern_element.locator
