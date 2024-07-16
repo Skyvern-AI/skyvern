@@ -1,5 +1,4 @@
 import { getClient } from "@/api/AxiosClient";
-import { TaskApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 import { getRecordingURL } from "./artifactUtils";
@@ -11,18 +10,22 @@ function TaskRecording() {
   const credentialGetter = useCredentialGetter();
 
   const {
-    data: task,
-    isFetching: taskIsFetching,
+    data: recordingURL,
+    isLoading: taskIsLoading,
     isError: taskIsError,
-  } = useQuery<TaskApiResponse>({
-    queryKey: ["task", taskId],
+  } = useQuery<string | undefined>({
+    queryKey: ["task", taskId, "recordingURL"],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
-      return client.get(`/tasks/${taskId}`).then((response) => response.data);
+      const task = await client
+        .get(`/tasks/${taskId}`)
+        .then((response) => response.data);
+      return getRecordingURL(task);
     },
+    refetchOnMount: true,
   });
 
-  if (taskIsFetching) {
+  if (taskIsLoading) {
     return (
       <div className="mx-auto flex">
         <div className="h-[450px] w-[800px]">
@@ -32,14 +35,14 @@ function TaskRecording() {
     );
   }
 
-  if (taskIsError || !task) {
+  if (taskIsError) {
     return <div>Error loading recording</div>;
   }
 
   return (
     <div className="mx-auto flex">
-      {task.recording_url ? (
-        <video width={800} height={450} src={getRecordingURL(task)} controls />
+      {recordingURL ? (
+        <video width={800} height={450} src={recordingURL} controls />
       ) : (
         <div>No recording available</div>
       )}
