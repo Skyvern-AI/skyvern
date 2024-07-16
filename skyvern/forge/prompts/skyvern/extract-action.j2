@@ -9,7 +9,7 @@ If you see a popup in the page screenshot, prioritize actions on the popup.
 
 Reply in JSON format with the following keys:
 {
-    "action_plan": str, // A string that describes the plan of actions you're going to take. Be specific and to the point. Use this as a quick summary of the actions you're going to take, and what order you're going to take them in, and how that moves you towards your overall goal
+    "action_plan": str, // A string that describes the plan of actions you're going to take. Be specific and to the point. Use this as a quick summary of the actions you're going to take, and what order you're going to take them in, and how that moves you towards your overall goal. "COMPLETE" if user goal has been achieved.
     "actions": array // An array of actions. Here's the format of each action:
     [{
         "reasoning": str, // The reasoning behind the action. Be specific, referencing any user information and their fields and element ids in your reasoning. Mention why you chose the action type, and why you chose the element id. Keep the reasoning short and to the point.
