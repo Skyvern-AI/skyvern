@@ -148,7 +148,7 @@ class ArtifactModel(Base):
     artifact_id = Column(String, primary_key=True, index=True, default=generate_artifact_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
     task_id = Column(String, ForeignKey("tasks.task_id"))
-    step_id = Column(String, ForeignKey("steps.step_id"))
+    step_id = Column(String, ForeignKey("steps.step_id"), index=True)
     artifact_type = Column(String)
     uri = Column(String)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
