@@ -72,7 +72,6 @@
         "running-tasks/introduction",
         "running-tasks/api-spec",
         "running-tasks/webhooks-faq",
-        "running-tasks/totp-verification-code",
         "running-tasks/visualizing-results",
         "running-tasks/prompting-tips",
         "running-tasks/advanced-features"
