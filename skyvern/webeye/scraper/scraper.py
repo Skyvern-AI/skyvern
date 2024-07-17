@@ -6,13 +6,14 @@ from enum import StrEnum
 from typing import Any, Awaitable, Callable
 
 import structlog
-from playwright.async_api import ElementHandle, Frame, Page
+from playwright.async_api import Frame, Page
 from pydantic import BaseModel
 
-from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR, SKYVERN_ID_ATTR
+from skyvern.constants import SKYVERN_DIR, SKYVERN_ID_ATTR
 from skyvern.exceptions import FailedToTakeScreenshot, UnknownElementTreeFormat
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.browser_factory import BrowserState
+from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
@@ -257,28 +258,7 @@ async def scrape_web_unsafe(
     LOG.info("Waiting for 5 seconds before scraping the website.")
     await asyncio.sleep(5)
 
-    screenshots: list[bytes] = []
-    scroll_y_px_old = -30.0
-    scroll_y_px = await scroll_to_top(page, drow_boxes=True)
-    # Checking max number of screenshots to prevent infinite loop
-    # We are checking the difference between the old and new scroll_y_px to determine if we have reached the end of the
-    # page. If the difference is less than 25, we assume we have reached the end of the page.
-    while (
-        abs(scroll_y_px_old - scroll_y_px) > 25
-        and len(screenshots) < SettingsManager.get_settings().MAX_NUM_SCREENSHOTS
-    ):
-        screenshot = await browser_state.take_screenshot(full_page=False)
-        screenshots.append(screenshot)
-        scroll_y_px_old = scroll_y_px
-        LOG.info("Scrolling to next page", url=url, num_screenshots=len(screenshots))
-        scroll_y_px = await scroll_to_next_page(page, drow_boxes=True)
-        LOG.info(
-            "Scrolled to next page",
-            scroll_y_px=scroll_y_px,
-            scroll_y_px_old=scroll_y_px_old,
-        )
-    await remove_bounding_boxes(page)
-    await scroll_to_top(page, drow_boxes=False)
+    screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=url, draw_boxes=True)
 
     elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
     element_tree = cleanup_elements(copy.deepcopy(element_tree))
@@ -300,7 +280,8 @@ async def scrape_web_unsafe(
 
     html = ""
     try:
-        html = await get_page_content(page)
+        skyvern_frame = await SkyvernFrame.create_instance(frame=page)
+        html = await skyvern_frame.get_content()
     except Exception:
         LOG.error(
             "Failed out to get HTML content",
@@ -320,23 +301,6 @@ async def scrape_web_unsafe(
         html=html,
         extracted_text=text_content,
     )
-
-
-async def get_page_content(page: Page, timeout: float = PAGE_CONTENT_TIMEOUT) -> str:
-    async with asyncio.timeout(timeout):
-        return await page.content()
-
-
-async def get_select2_options(frame: Page | Frame, element: ElementHandle) -> list[dict[str, Any]]:
-    await frame.evaluate(JS_FUNCTION_DEFS)
-    js_script = "async (element) => await getSelect2Options(element)"
-    return await frame.evaluate(js_script, element)
-
-
-async def get_combobox_options(frame: Page | Frame, element: ElementHandle) -> list[dict[str, Any]]:
-    await frame.evaluate(JS_FUNCTION_DEFS)
-    js_script = "async (element) => await getListboxOptions(element)"
-    return await frame.evaluate(js_script, element)
 
 
 async def get_interactable_element_tree_in_frame(
@@ -411,41 +375,6 @@ async def get_interactable_element_tree(
         )
 
     return elements, element_tree
-
-
-async def scroll_to_top(page: Page, drow_boxes: bool) -> float:
-    """
-    Scroll to the top of the page and take a screenshot.
-    :param drow_boxes: If True, draw bounding boxes around the elements.
-    :param page: Page instance to take the screenshot from.
-    :return: Screenshot of the page.
-    """
-    await page.evaluate(JS_FUNCTION_DEFS)
-    js_script = f"async () => await scrollToTop({str(drow_boxes).lower()})"
-    scroll_y_px = await page.evaluate(js_script)
-    return scroll_y_px
-
-
-async def scroll_to_next_page(page: Page, drow_boxes: bool) -> bool:
-    """
-    Scroll to the next page and take a screenshot.
-    :param drow_boxes: If True, draw bounding boxes around the elements.
-    :param page: Page instance to take the screenshot from.
-    :return: Screenshot of the page.
-    """
-    await page.evaluate(JS_FUNCTION_DEFS)
-    js_script = f"async () => await scrollToNextPage({str(drow_boxes).lower()})"
-    scroll_y_px = await page.evaluate(js_script)
-    return scroll_y_px
-
-
-async def remove_bounding_boxes(page: Page) -> None:
-    """
-    Remove the bounding boxes from the page.
-    :param page: Page instance to remove the bounding boxes from.
-    """
-    js_script = "() => removeBoundingBoxes()"
-    await page.evaluate(js_script)
 
 
 def cleanup_elements(elements: list[dict]) -> list[dict]:
