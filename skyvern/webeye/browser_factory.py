@@ -8,7 +8,6 @@ from datetime import datetime
 from typing import Any, Awaitable, Callable, Protocol
 
 import structlog
-from playwright._impl._errors import TimeoutError
 from playwright.async_api import BrowserContext, Error, Page, Playwright, async_playwright
 from pydantic import BaseModel
 
@@ -17,7 +16,6 @@ from skyvern.exceptions import (
     FailedToNavigateToUrl,
     FailedToReloadPage,
     FailedToStopLoadingPage,
-    FailedToTakeScreenshot,
     MissingBrowserStatePage,
     UnknownBrowserType,
     UnknownErrorWhileCreatingBrowserContext,
@@ -25,6 +23,7 @@ from skyvern.exceptions import (
 from skyvern.forge.sdk.core.skyvern_context import current
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
@@ -319,40 +318,6 @@ class BrowserState:
             await self.pw.stop()
             LOG.info("Playwright is stopped")
 
-    @staticmethod
-    async def take_screenshot_from_page(page: Page, full_page: bool = False, file_path: str | None = None) -> bytes:
-        try:
-            await page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
-            LOG.info("Page is fully loaded, agent is about to take screenshots")
-            start_time = time.time()
-            screenshot: bytes = bytes()
-            if file_path:
-                screenshot = await page.screenshot(
-                    path=file_path,
-                    full_page=full_page,
-                    timeout=SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
-                )
-            else:
-                screenshot = await page.screenshot(
-                    full_page=full_page,
-                    timeout=SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
-                    animations="disabled",
-                )
-            end_time = time.time()
-            LOG.info(
-                "Screenshot taking time",
-                screenshot_time=end_time - start_time,
-                full_page=full_page,
-                file_path=file_path,
-            )
-            return screenshot
-        except TimeoutError as e:
-            LOG.exception(f"Timeout error while taking screenshot: {str(e)}")
-            raise FailedToTakeScreenshot(error_message=str(e)) from e
-        except Exception as e:
-            LOG.exception(f"Unknown error while taking screenshot: {str(e)}")
-            raise FailedToTakeScreenshot(error_message=str(e)) from e
-
     async def take_screenshot(self, full_page: bool = False, file_path: str | None = None) -> bytes:
         page = self.__assert_page()
-        return await self.take_screenshot_from_page(page, full_page, file_path)
+        return await SkyvernFrame.take_screenshot(page=page, full_page=full_page, file_path=file_path)

@@ -24,7 +24,8 @@ from skyvern.exceptions import (
     SkyvernException,
 )
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.webeye.scraper.scraper import ScrapedPage, get_combobox_options, get_select2_options
+from skyvern.webeye.scraper.scraper import ScrapedPage
+from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
@@ -164,13 +165,15 @@ class SkyvernElement:
         if not await self.is_select2_dropdown():
             raise ElementIsNotSelect2Dropdown(self.get_id(), self.__static_element)
 
-        return Select2Dropdown(self.get_frame(), self)
+        frame = await SkyvernFrame.create_instance(self.get_frame())
+        return Select2Dropdown(frame, self)
 
     async def get_combobox_dropdown(self) -> ComboboxDropdown:
         if not await self.is_combobox_dropdown():
             raise ElementIsNotComboboxDropdown(self.get_id(), self.__static_element)
 
-        return ComboboxDropdown(self.get_frame(), self)
+        frame = await SkyvernFrame.create_instance(self.get_frame())
+        return ComboboxDropdown(frame, self)
 
     def find_element_id_in_label_children(self, element_type: InteractiveElement) -> str | None:
         tag_name = self.get_tag_name()
@@ -344,12 +347,12 @@ class AbstractSelectDropdown(ABC):
 
 
 class Select2Dropdown(AbstractSelectDropdown):
-    def __init__(self, frame: Page | Frame, skyvern_element: SkyvernElement) -> None:
+    def __init__(self, skyvern_frame: SkyvernFrame, skyvern_element: SkyvernElement) -> None:
         self.skyvern_element = skyvern_element
-        self.frame = frame
+        self.skyvern_frame = skyvern_frame
 
     async def __find_anchor(self, timeout: float) -> Locator:
-        locator = self.frame.locator("[id='select2-drop']")
+        locator = self.skyvern_element.get_frame().locator("[id='select2-drop']")
         await locator.wait_for(state="visible", timeout=timeout)
         cnt = await locator.count()
         if cnt == 0:
@@ -397,7 +400,7 @@ class Select2Dropdown(AbstractSelectDropdown):
     ) -> typing.List[SkyvernOptionType]:
         anchor = await self.__find_anchor(timeout=timeout)
         element_handler = await anchor.element_handle(timeout=timeout)
-        options = await get_select2_options(self.frame, element_handler)
+        options = await self.skyvern_frame.get_select2_options(element_handler)
         return typing.cast(typing.List[SkyvernOptionType], options)
 
     async def select_by_index(
@@ -409,13 +412,13 @@ class Select2Dropdown(AbstractSelectDropdown):
 
 
 class ComboboxDropdown(AbstractSelectDropdown):
-    def __init__(self, frame: Page | Frame, skyvern_element: SkyvernElement) -> None:
+    def __init__(self, skyvern_frame: SkyvernFrame, skyvern_element: SkyvernElement) -> None:
         self.skyvern_element = skyvern_element
-        self.frame = frame
+        self.skyvern_frame = skyvern_frame
 
     async def __find_anchor(self, timeout: float) -> Locator:
         control_id = await self.skyvern_element.get_attr("aria-controls", timeout=timeout)
-        locator = self.frame.locator(f"[id='{control_id}']")
+        locator = self.skyvern_element.get_frame().locator(f"[id='{control_id}']")
         await locator.wait_for(state="visible", timeout=timeout)
         cnt = await locator.count()
         if cnt == 0:
@@ -445,7 +448,7 @@ class ComboboxDropdown(AbstractSelectDropdown):
     ) -> typing.List[SkyvernOptionType]:
         anchor = await self.__find_anchor(timeout=timeout)
         element_handler = await anchor.element_handle()
-        options = await get_combobox_options(self.frame, element_handler)
+        options = await self.skyvern_frame.get_combobox_options(element_handler)
         return typing.cast(typing.List[SkyvernOptionType], options)
 
     async def select_by_index(
