@@ -1,6 +1,6 @@
 We are building an AI agent that can automate browser tasks. The task creation schema is a JSON object with the following fields:
 
-url: str. This is a required field. It is the starting URL for the task. This will be the first page the agent visits in order to achieve the goal.
+url: str. This is a required field. It is the starting URL for the task. This will be the first page the agent visits in order to achieve the goal. Use HTTPS URLs only.
 
 navigation_goal_reasoning: str. This is a required field. The reason why navigation goal is needed to achieve the goal. Navigation goal is needed when the agent needs to take actions on the website to achieve the goal such as clicking a button, typing in a search bar, or navigating to another URL.
 is_navigation_goal_required: bool. This is a required field. Based on the navigation_goal_reasoning, whether the navigation goal is required to achieve the task.
