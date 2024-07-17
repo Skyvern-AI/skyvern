@@ -400,7 +400,8 @@ function SavedTaskForm({ initialValues }: Props) {
                 </div>
               </FormLabel>
               <FormDescription>
-                How do you want Skyvern to navigate?
+                How do you want Skyvern to navigate? Use words like COMPLETE and
+                TERMINATE to let Skyvern know when to finish navigating
               </FormDescription>
               <FormControl>
                 <Textarea
