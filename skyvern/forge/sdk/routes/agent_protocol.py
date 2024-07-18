@@ -33,14 +33,7 @@ from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Organization, Step
 from skyvern.forge.sdk.schemas.organizations import OrganizationUpdate
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration, TaskGenerationBase
-from skyvern.forge.sdk.schemas.tasks import (
-    CreateTaskResponse,
-    ProxyLocation,
-    Task,
-    TaskRequest,
-    TaskResponse,
-    TaskStatus,
-)
+from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.models.workflow import (
@@ -120,9 +113,6 @@ async def create_agent_task(
 ) -> CreateTaskResponse:
     analytics.capture("skyvern-oss-agent-task-create", data={"url": task.url})
     await PermissionCheckerFactory.get_instance().check(current_org)
-
-    if current_org and current_org.organization_name == "CoverageCat":
-        task.proxy_location = ProxyLocation.RESIDENTIAL
 
     created_task = await app.agent.create_task(task, current_org.organization_id)
     if x_max_steps_override:
