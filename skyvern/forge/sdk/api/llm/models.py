@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Literal, Protocol
 
 from skyvern.forge.sdk.models import Step
@@ -27,6 +27,7 @@ class LLMRouterModelConfig:
     model_name: str
     # https://litellm.vercel.app/docs/routing
     litellm_params: dict[str, Any]
+    model_info: dict[str, Any] = field(default_factory=dict)
     tpm: int | None = None
     rpm: int | None = None
 
