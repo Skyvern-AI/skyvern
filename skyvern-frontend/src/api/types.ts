@@ -179,6 +179,7 @@ export const ActionTypes = {
   SelectOption: "select_option",
   UploadFile: "upload_file",
   complete: "complete",
+  wait: "wait",
 } as const;
 
 export type ActionType = (typeof ActionTypes)[keyof typeof ActionTypes];
@@ -191,6 +192,7 @@ export const ReadableActionTypes: {
   select_option: "Select Option",
   upload_file: "Upload File",
   complete: "Complete",
+  wait: "Wait",
 };
 
 export type Option = {
