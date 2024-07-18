@@ -1,2 +1,161 @@
+---
+title: Workflow Blocks
+description: 'Individual Blocks within Skyvern'
+---
 
-<img src="https://thumbs.dreamstime.com/b/pug-dog-holding-pliers-screwdriver-behind-old-wooden-sign-text-under-construction-white-background-constructor-92836854.jpg" />
+
+### TaskBlock
+
+The magic block. Skyvern navigates through the websites to take actions and/or extract information.
+
+Example block:
+```
+- block_type: task
+      label: login
+      parameter_keys:
+        - credentials
+      url: website_url
+      navigation_goal: >-
+        If you're not on the login page, navigate to login page and login using
+        the credentials given. First, take actions on promotional popups or cookie prompts that could prevent taking other action on the web page. If you fail to login to find the login page or can't login after several trials, terminate. If login is
+        completed, you're successful. 
+      data_extraction_goal: >-
+        Extract anything for the sake of this demo
+      error_code_mapping:
+        stuck_with_popups: terminate and return this error if you can't close popups after several tries and can't take the necessary actions on the website because there is a blocking popup on the page
+        failed_to_login: terminate and return this error if you fail logging in to the page
+```
+
+### ForLoopBlock
+Iterate over something such as a CSV or the output of a previous block. The blocks nedted under `loop_blocks` are the blocks that will be repeated for each entry in the
+
+```
+- block_type: for_loop
+      label: iterate_over_order_ids
+      loop_over_parameter_key: order_ids
+      continue_on_failure: true
+      loop_blocks:
+        - block_type: task
+          label: download_invoice_for_order
+          complete_on_download: true
+          continue_on_failure: true
+          parameter_keys:
+            - order_id
+          url: order_history_url
+          navigation_goal: >-
+            Download the invoice of the order with the given order ID. 
+            Make sure to download the invoice for the given order id. 
+            If the element tree doesn't have a matching order id, check the screenshots. 
+            Complete if you have successfully downloaded the invoice according to action history, if you were able to download it, you'll see download_triggered=True for the last step. 
+            If you don't see a way to download an invoice, navigate to the order page if possible. 
+            If there's no way to download an invoice terminate. 
+            If the text suggests printing, you can assume you can download it. 
+            Return click action with download=True if you want to trigger a download.
+          error_code_mapping:
+            not_possible_to_download_invoice: return this error if the website doesn't allow downloading/viewing invoices
+            cant_solve_captcha: return this error if captcha isn't solved after multiple retries
+```
+
+### CodeBlock
+This block executes user-defined Python code within our execution environment. It’s able to take parameters as input and transform them based on a certain specification.
+
+In addition to running simple code snippets, CodeBlock allows you to:
+- execute asynchronous code
+- control your browser page inside Skyvern
+
+**Example Block**
+
+```json
+- block_type: code
+  label: calculate_percentage_diff
+  parameter_keys:
+    - alibaba_price
+    - amazon_price
+  code: |
+    if amazon_price["unitPrice"] and alibaba_price["unitPrice"]:
+        result = 1.0 * (alibaba_price["unitPrice"] - amazon_price["unitPrice"]) / amazon_price["unitPrice"]
+    else:
+        result = None
+  output_parameter_key: price_diff_percentage
+```
+
+**Example Block with Browser Control**
+
+```json
+- block_type: code
+  label: get_tab_details
+  code: |
+    print("Getting tab details")
+    result = {
+        "url": skyvern_page.url,
+        "title": await skyvern_page.title()
+    }
+    print("Got details:", result)
+    print("Now I want to see a cat")
+    await skyvern_page.goto("https://cataas.com/cat")
+```
+
+
+### TextPromptBlock
+
+Do a custom OpenAI query as a part of your workflow
+
+```
+- block_type: text_prompt
+  label: generate_new_title
+  parameter_keys:
+    - alibaba_title
+    - amazon_title
+  llm_key: OPENAI_GPT4O
+  prompt: >
+    You're given two e-commerce product titles. Use both and generate a
+    better one.
+
+      Title 1: {{ alibaba_title }}
+      Title 2: {{ amazon_title }}
+  output_parameter_key: new_title
+```
+
+### DownloadToS3Block
+### UploadToS3Block
+
+Persists files inside S3
+
+```
+- block_type: upload_to_s3
+  label: upload_downloaded_files_to_s3
+  path: SKYVERN_DOWNLOAD_DIRECTORY
+```
+
+### SendEmailBlock
+
+Sends an email with some data
+
+```
+- block_type: send_email
+  label: send_email
+  smtp_host_secret_parameter_key: smtp_host
+  smtp_port_secret_parameter_key: smtp_port
+  smtp_username_secret_parameter_key: smtp_username
+  smtp_password_secret_parameter_key: smtp_password
+  sender: hello@skyvern.com
+  recipients:
+    - founders@skyvern.com
+  subject: Skyvern - Downloaded Invoices Demo
+  body: website_url
+  file_attachments:
+    - SKYVERN_DOWNLOAD_DIRECTORY
+```
+
+### FileParserBlock
+
+Downloads and parses a file to be used within other workflow blocks.
+
+**Supported types:** csv
+
+```
+- block_type: file_url_parser
+  label: csv_parser
+  file_type: csv
+  file_url: <csv_file_url>
+```
