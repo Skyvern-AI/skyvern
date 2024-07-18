@@ -18,7 +18,9 @@ from skyvern.exceptions import (
 LOG = structlog.get_logger()
 
 
-def is_valid_email(email: str) -> bool:
+def is_valid_email(email: str | None) -> bool:
+    if not email:
+        return False
     pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
     return re.match(pattern, email) is not None
 
@@ -140,10 +142,9 @@ class BitwardenService:
             # if no cred matches the rule, return the first one.
             # TODO: For now hard code to choose the first valid email username
             for cred in credentials:
-                if is_valid_email(cred.get(BitwardenConstants.USERNAME, "")):
+                if is_valid_email(cred.get(BitwardenConstants.USERNAME)):
                     return cred
-
-            LOG.warning("No credential in Bitwarden matches the rule, returning the frist match")
+            LOG.warning("No credential in Bitwarden matches the rule, returning the first match")
             return credentials[0]
         finally:
             # Step 4: Log out
