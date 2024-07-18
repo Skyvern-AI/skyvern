@@ -25,7 +25,7 @@ Body:
 
 Skyvern supports one-time password (see https://www.twilio.com/docs/glossary/totp for more information) by fetching it from your endpoint. You can pass `totp_verification_url` when [creating a task](/running-tasks/api-spec#request-initiate-a-task). Inside this endpoint hosted by you, you have to conform to the following schema:
 
-## Set Up Your TOTP Endpoint
+### Set Up Your TOTP Endpoint
 For websites that requires a verification code to complete a task, you have to set up a TOTP endpoint for Skyvern to fetch the verification code.
 
 Here's the TOTP endpoint contract you should use:
@@ -37,10 +37,11 @@ Request (POST):
 
 Response:
 | Parameter | Type | Required? | Sample Value | Description |
+| --- | --- | --- | --- | --- |
 | task_id | String | yes | tsk_123 | The task ID that needs the verification to be done |
 | verification_code | String | no | 123456 | The verification code |
 
-## Validate The Sender of The Request
+### Validate The Sender of The Request
 Same as the webhook API, your server needs to make sure it’s Skyvern that’s making the request.
 
 - a python example for how to generate and validate the signature:
