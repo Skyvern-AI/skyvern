@@ -1064,6 +1064,7 @@ async def extract_information_for_navigation_goal(
         current_url=scraped_page.url,
         extracted_text=scraped_page.extracted_text,
         error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
+        utc_datetime=datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
     )
 
     json_response = await app.LLM_API_HANDLER(

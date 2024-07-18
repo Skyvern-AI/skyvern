@@ -975,7 +975,7 @@ class ForgeAgent:
             data_extraction_goal=task.data_extraction_goal,
             action_history=actions_and_results_str,
             error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
-            utc_datetime=datetime.utcnow(),
+            utc_datetime=datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
         )
 
         await app.ARTIFACT_MANAGER.create_artifact(
