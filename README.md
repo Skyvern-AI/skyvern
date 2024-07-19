@@ -250,11 +250,34 @@ More extensive documentation can be found on our [documentation website](https:/
 --->
 
 # Frequently Asked Questions (FAQs)
-### What gets us excited about Skyvern?
-
+## What gets us excited about Skyvern?
 Our focus is bringing stability to browser-based workflows. We leverage LLMs to create an AI Agent capable of interacting with websites like you or I would — all via a simple API call.
+## Skyvern Configurations
+### Skyvern Agent
+#### Supported LLMs
+| Provider | Supported Models |
+| -------- | ------- |
+| OpenAI   | gpt4-turbo, gpt-4o, gpt-4o-mini |
+| Anthropic | Claude 3 (Haiku, Sonnet, Opus), Claude 3.5 (Sonnet) |
+| Azure OpenAI | Any GPT models. Better performance with a multimodal llm (azure/gpt4-o) |
+| AWS Bedrock | Anthropic Claude 3 (Haiku, Sonnet, Opus), Claude 3.5 (Sonnet) |
 
+#### Environment Variables
+| Variable | Description | Type | Sample Value |
+| -------- | ------- | ------- | ------- |
+| `ENABLE_OPENAI`  | Register OpenAI models | Boolean | `true`, `false` |
+| `ENABLE_ANTHROPIC` | Register Anthropic models | Boolean | `true`, `false` |
+| `ENABLE_AZURE` | Register Azure OpenAI models | Boolean | `true`, `false` |
+| `ENABLE_BEDROCK` | Register AWS Bedrock models | Boolean | `true`, `false` |
+| `LLM_KEY` | The name of the model you want to use | String | Currently supported llm keys: `OPENAI_GPT4_TURBO`, `OPENAI_GPT4V`, `OPENAI_GPT4O`, `OPENAI_GPT4O_MINI`, `ANTHROPIC_CLAUDE3`, `ANTHROPIC_CLAUDE3_OPUS`, `ANTHROPIC_CLAUDE3_SONNET`, `ANTHROPIC_CLAUDE3_HAIKU`, `ANTHROPIC_CLAUDE3.5_SONNET`, `BEDROCK_ANTHROPIC_CLAUDE3_OPUS`, `BEDROCK_ANTHROPIC_CLAUDE3_SONNET`, `BEDROCK_ANTHROPIC_CLAUDE3_HAIKU`, `BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET`, `AZURE_OPENAI` |
+| `OPENAI_API_KEY` | OpenAI API Key | String | `sk-1234567890` |
+| `ANTHROPIC_API_KEY` | Anthropic API key | String | `sk-1234567890` |
+| `AZURE_API_KEY` | Azure deployment API key | String | `sk-1234567890` |
+| `AZURE_DEPLOYMENT` | Azure OpenAI Deployment Name | String | `skyvern-deployment` |
+| `AZURE_API_BASE` | Azure deployment api base url | String | `https://skyvern-deployment.openai.azure.com/` |
+| `AZURE_API_VERSION` | Azure API Version | String | `2024-02-01` |
 
+### Skyvern UI
 
 # Feature Roadmap
 This is our planned roadmap for the next few months. If you have any suggestions or would like to see a feature added, please don't hesitate to reach out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
