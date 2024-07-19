@@ -1073,7 +1073,7 @@ class ForgeAgent:
                     ],
                 }
                 for action, results in actions_and_results
-                if len(results) > 0 and not results[-1].success
+                if len(results) > 0
             ]
         )
 
