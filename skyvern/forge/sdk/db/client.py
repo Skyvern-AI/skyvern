@@ -379,7 +379,13 @@ class AgentDB:
         max_steps_per_run: int | None = None,
         organization_id: str | None = None,
     ) -> Task:
-        if status is None and extracted_information is None and failure_reason is None and errors is None:
+        if (
+            status is None
+            and extracted_information is None
+            and failure_reason is None
+            and errors is None
+            and max_steps_per_run is None
+        ):
             raise ValueError(
                 "At least one of status, extracted_information, or failure_reason must be provided to update the task"
             )
