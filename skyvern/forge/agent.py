@@ -232,20 +232,6 @@ class ForgeAgent:
             # TODO: shall we send task response here?
             return step, None, None
 
-        context = skyvern_context.current()
-        override_max_steps_per_run = context.max_steps_override if context else None
-        max_steps_per_run = (
-            override_max_steps_per_run
-            or task.max_steps_per_run
-            or organization.max_steps_per_run
-            or SettingsManager.get_settings().MAX_STEPS_PER_RUN
-        )
-        if max_steps_per_run and task.max_steps_per_run != max_steps_per_run:
-            await app.DATABASE.update_task(
-                task_id=task.task_id,
-                organization_id=organization.organization_id,
-                max_steps_per_run=max_steps_per_run,
-            )
         next_step: Step | None = None
         detailed_output: DetailedAgentStepOutput | None = None
         num_files_before = 0

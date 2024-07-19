@@ -29,9 +29,14 @@ from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Organization, Step
-from skyvern.forge.sdk.schemas.organizations import OrganizationUpdate
+from skyvern.forge.sdk.schemas.organizations import (
+    GetOrganizationAPIKeysResponse,
+    GetOrganizationsResponse,
+    OrganizationUpdate,
+)
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration, TaskGenerationBase
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.services import org_auth_service
@@ -793,6 +798,29 @@ async def update_organization(
         max_steps_per_run=org_update.max_steps_per_run,
         max_retries_per_step=org_update.max_retries_per_step,
     )
+
+
+@base_router.get("/organizations/", include_in_schema=False)
+@base_router.get("/organizations")
+async def get_organizations(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> GetOrganizationsResponse:
+    return GetOrganizationsResponse(organizations=[current_org])
+
+
+@base_router.get("/organizations/{organization_id}/apikeys/", include_in_schema=False)
+@base_router.get("/organizations/{organization_id}/apikeys")
+async def get_org_api_keys(
+    organization_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> GetOrganizationAPIKeysResponse:
+    if organization_id != current_org.organization_id:
+        raise HTTPException(status_code=403, detail="You do not have permission to access this organization")
+    api_keys = []
+    org_auth_token = await app.DATABASE.get_valid_org_auth_token(organization_id, OrganizationAuthTokenType.api)
+    if org_auth_token:
+        api_keys.append(org_auth_token)
+    return GetOrganizationAPIKeysResponse(api_keys=api_keys)
 
 
 async def validate_file_size(file: UploadFile) -> UploadFile:

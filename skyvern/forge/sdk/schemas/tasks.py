@@ -221,7 +221,6 @@ class Task(TaskRequest):
             screenshot_url=screenshot_url,
             recording_url=recording_url,
             errors=self.errors,
-            max_steps_per_run=self.max_steps_per_run,
         )
 
 
@@ -237,7 +236,6 @@ class TaskResponse(BaseModel):
     recording_url: str | None = None
     failure_reason: str | None = None
     errors: list[dict[str, Any]] = []
-    max_steps_per_run: int | None = None
 
 
 class TaskOutput(BaseModel):

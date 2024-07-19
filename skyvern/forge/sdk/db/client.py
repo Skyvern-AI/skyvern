@@ -376,7 +376,6 @@ class AgentDB:
         extracted_information: dict[str, Any] | list | str | None = None,
         failure_reason: str | None = None,
         errors: list[dict[str, Any]] | None = None,
-        max_steps_per_run: int | None = None,
         organization_id: str | None = None,
     ) -> Task:
         if status is None and extracted_information is None and failure_reason is None and errors is None:
@@ -398,8 +397,6 @@ class AgentDB:
                         task.failure_reason = failure_reason
                     if errors is not None:
                         task.errors = errors
-                    if max_steps_per_run is not None:
-                        task.max_steps_per_run = max_steps_per_run
                     await session.commit()
                     updated_task = await self.get_task(task_id, organization_id=organization_id)
                     if not updated_task:
