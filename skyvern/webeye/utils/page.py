@@ -41,7 +41,7 @@ class SkyvernFrame:
     ) -> bytes:
         try:
             await page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
-            LOG.info("Page is fully loaded, agent is about to take screenshots")
+            LOG.debug("Page is fully loaded, agent is about to take screenshots")
             start_time = time.time()
             screenshot: bytes = bytes()
             if file_path:
@@ -57,7 +57,7 @@ class SkyvernFrame:
                     animations="disabled",
                 )
             end_time = time.time()
-            LOG.info(
+            LOG.debug(
                 "Screenshot taking time",
                 screenshot_time=end_time - start_time,
                 full_page=full_page,
