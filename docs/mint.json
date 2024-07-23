@@ -61,9 +61,6 @@
       "pages": [
         "introduction",
         "getting-started/skyvern-in-action",
-        "getting-started/quickstart-skyvern-cloud",
-        "getting-started/quickstart-open-source",
-        "getting-started/supported-functionality"
       ]
     },
     {
@@ -73,7 +70,6 @@
         "running-tasks/api-spec",
         "running-tasks/webhooks-faq",
         "running-tasks/visualizing-results",
-        "running-tasks/prompting-tips",
         "running-tasks/advanced-features"
       ]
     },
