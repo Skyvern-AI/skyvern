@@ -386,11 +386,16 @@ function isInteractable(element) {
     return true;
   }
 
-  if (tagName === "div" || tagName === "img" || tagName === "span") {
+  if (
+    tagName === "div" ||
+    tagName === "img" ||
+    tagName === "span" ||
+    tagName === "a" ||
+    tagName === "i"
+  ) {
     const computedStyle = window.getComputedStyle(element);
     const hasPointer = computedStyle.cursor === "pointer";
-    const hasCursor = computedStyle.cursor === "cursor";
-    return hasPointer || hasCursor;
+    return hasPointer;
   }
 
   // support listbox and options underneath it
