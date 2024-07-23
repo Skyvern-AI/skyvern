@@ -280,10 +280,7 @@ class TaskBlock(Block):
                 try:
                     await browser_state.page.goto(self.url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
                 except Error as playright_error:
-                    LOG.warning(
-                        f"Error while navigating to url: {str(playright_error)}",
-                        exc_info=True,
-                    )
+                    LOG.warning(f"Error while navigating to url: {str(playright_error)}")
                     # Make sure the task is marked as failed in the database before raising the exception
                     exc = FailedToNavigateToUrl(url=self.url, error_message=str(playright_error))
                     await app.DATABASE.update_task(
