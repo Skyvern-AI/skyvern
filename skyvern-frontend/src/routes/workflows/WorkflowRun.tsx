@@ -41,7 +41,7 @@ function WorkflowRun() {
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client
-        .get(`/tasks?workflow_run_id=${workflowRunId}`)
+        .get(`/tasks?workflow_run_id=${workflowRunId}&page_size=200`)
         .then((response) => response.data);
     },
   });
