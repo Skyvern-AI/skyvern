@@ -16,11 +16,13 @@ from typing import Annotated, Any, Literal, Union
 import filetype
 import structlog
 from email_validator import EmailNotValidError, validate_email
+from playwright.async_api import Error
 from pydantic import BaseModel, Field
 
 from skyvern.config import settings
 from skyvern.exceptions import (
     ContextParameterValueNotFound,
+    FailedToNavigateToUrl,
     MissingBrowserStatePage,
     TaskNotFound,
     UnexpectedTaskStatus,
@@ -275,7 +277,19 @@ class TaskBlock(Block):
             )
 
             if self.url:
-                await browser_state.page.goto(self.url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+                try:
+                    await browser_state.page.goto(self.url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+                except Error as playright_error:
+                    LOG.warning(f"Error while navigating to url: {str(playright_error)}")
+                    # Make sure the task is marked as failed in the database before raising the exception
+                    exc = FailedToNavigateToUrl(url=self.url, error_message=str(playright_error))
+                    await app.DATABASE.update_task(
+                        task.task_id,
+                        status=TaskStatus.failed,
+                        organization_id=workflow.organization_id,
+                        failure_reason=str(exc),
+                    )
+                    raise exc
 
             try:
                 await app.agent.execute_step(
