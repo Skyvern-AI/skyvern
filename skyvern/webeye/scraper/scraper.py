@@ -153,6 +153,7 @@ class ScrapedPage(BaseModel):
 async def scrape_website(
     browser_state: BrowserState,
     url: str,
+    cleanup_element_tree: Callable[[str, list[dict]], Awaitable[list[dict]]],
     num_retry: int = 0,
     scrape_exclude: Callable[[Page, Frame], Awaitable[bool]] | None = None,
 ) -> ScrapedPage:
@@ -179,7 +180,7 @@ async def scrape_website(
     """
     try:
         num_retry += 1
-        return await scrape_web_unsafe(browser_state, url, scrape_exclude)
+        return await scrape_web_unsafe(browser_state, url, cleanup_element_tree, scrape_exclude)
     except Exception as e:
         # NOTE: MAX_SCRAPING_RETRIES is set to 0 in both staging and production
         if num_retry > SettingsManager.get_settings().MAX_SCRAPING_RETRIES:
@@ -197,6 +198,7 @@ async def scrape_website(
         return await scrape_website(
             browser_state,
             url,
+            cleanup_element_tree,
             num_retry=num_retry,
             scrape_exclude=scrape_exclude,
         )
@@ -231,6 +233,7 @@ async def get_frame_text(iframe: Frame) -> str:
 async def scrape_web_unsafe(
     browser_state: BrowserState,
     url: str,
+    cleanup_element_tree: Callable[[str, list[dict]], Awaitable[list[dict]]],
     scrape_exclude: Callable[[Page, Frame], Awaitable[bool]] | None = None,
 ) -> ScrapedPage:
     """
@@ -261,9 +264,7 @@ async def scrape_web_unsafe(
     screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=url, draw_boxes=True)
 
     elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
-    element_tree = cleanup_elements(copy.deepcopy(element_tree))
-
-    _build_element_links(elements)
+    element_tree = await cleanup_element_tree(url, copy.deepcopy(element_tree))
 
     id_to_css_dict = {}
     id_to_element_dict = {}
@@ -377,29 +378,6 @@ async def get_interactable_element_tree(
     return elements, element_tree
 
 
-def cleanup_elements(elements: list[dict]) -> list[dict]:
-    """
-    Remove rect and attribute.unique_id from the elements.
-    The reason we're doing it is to
-    1. reduce unnecessary data so that llm get less distrction
-    # TODO later: 2. reduce tokens sent to llm to save money
-    :param elements: List of elements to remove xpaths from.
-    :return: List of elements without xpaths.
-    """
-    queue = []
-    for element in elements:
-        queue.append(element)
-    while queue:
-        queue_ele = queue.pop(0)
-        _remove_rect(queue_ele)
-        # TODO: we can come back to test removing the unique_id
-        # from element attributes to make sure this won't increase hallucination
-        # _remove_unique_id(queue_ele)
-        if "children" in queue_ele:
-            queue.extend(queue_ele["children"])
-    return elements
-
-
 def trim_element_tree(elements: list[dict]) -> list[dict]:
     queue = []
     for element in elements:
@@ -464,11 +442,6 @@ def _trimmed_attributes(tag_name: str, attributes: dict) -> dict:
             new_attributes[key] = attributes[key]
 
     return new_attributes
-
-
-def _remove_rect(element: dict) -> None:
-    if "rect" in element:
-        del element["rect"]
 
 
 def _remove_unique_id(element: dict) -> None:

@@ -1,3 +1,5 @@
+from typing import Dict, List
+
 from playwright.async_api import Page
 
 from skyvern.exceptions import StepUnableToExecuteError
@@ -6,6 +8,11 @@ from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.sdk.models import Organization, Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.webeye.browser_factory import BrowserState
+
+
+def _remove_rect(element: dict) -> None:
+    if "rect" in element:
+        del element["rect"]
 
 
 class AgentFunction:
@@ -56,3 +63,29 @@ class AgentFunction:
         page: Page,
     ) -> list[AsyncOperation]:
         return []
+
+    async def cleanup_element_tree(
+        self,
+        url: str,
+        element_tree: List[Dict],
+    ) -> List[Dict]:
+        """
+        Remove rect and attribute.unique_id from the elements.
+        The reason we're doing it is to
+        1. reduce unnecessary data so that llm get less distrction
+        TODO later: 2. reduce tokens sent to llm to save money
+        :param elements: List of elements to remove xpaths from.
+        :return: List of elements without xpaths.
+        """
+        queue = []
+        for element in element_tree:
+            queue.append(element)
+        while queue:
+            queue_ele = queue.pop(0)
+            _remove_rect(queue_ele)
+            # TODO: we can come back to test removing the unique_id
+            # from element attributes to make sure this won't increase hallucination
+            # _remove_unique_id(queue_ele)
+            if "children" in queue_ele:
+                queue.extend(queue_ele["children"])
+        return element_tree
