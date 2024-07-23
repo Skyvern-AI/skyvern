@@ -899,6 +899,7 @@ class ForgeAgent:
         return await scrape_website(
             browser_state,
             task.url,
+            app.AGENT_FUNCTION.cleanup_element_tree,
             scrape_exclude=app.scrape_exclude,
         )
 
