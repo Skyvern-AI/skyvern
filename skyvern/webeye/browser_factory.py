@@ -235,7 +235,10 @@ class BrowserState:
                             )
                             await asyncio.sleep(5)
                         except Error as playright_error:
-                            LOG.exception(f"Error while navigating to url: {str(playright_error)}")
+                            LOG.warning(
+                                f"Error while navigating to url: {str(playright_error)}",
+                                exc_info=True,
+                            )
                             raise FailedToNavigateToUrl(url=url, error_message=str(playright_error))
                         success = True
                         LOG.info(f"Successfully went to {url}")
@@ -265,19 +268,29 @@ class BrowserState:
         if self.page is not None:
             return self.page
 
-        await self.check_and_fix_state(url=url, proxy_location=proxy_location, task_id=task_id)
+        try:
+            await self.check_and_fix_state(url=url, proxy_location=proxy_location, task_id=task_id)
+        except Exception as e:
+            error_message = str(e)
+            if "net::ERR" not in error_message:
+                raise e
+            await self.close_current_open_page()
+            await self.check_and_fix_state(url=url, proxy_location=proxy_location, task_id=task_id)
         assert self.page is not None
 
         if not await BrowserContextFactory.validate_browser_context(self.page):
-            await self._close_all_other_pages()
-            if self.browser_context is not None:
-                await self.browser_context.close()
-            self.browser_context = None
-            self.page = None
+            await self.close_current_open_page()
             await self.check_and_fix_state(url=url, proxy_location=proxy_location, task_id=task_id)
             assert self.page is not None
 
         return self.page
+
+    async def close_current_open_page(self) -> None:
+        await self._close_all_other_pages()
+        if self.browser_context is not None:
+            await self.browser_context.close()
+        self.browser_context = None
+        self.page = None
 
     async def stop_page_loading(self) -> None:
         page = self.__assert_page()
