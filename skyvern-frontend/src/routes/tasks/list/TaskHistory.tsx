@@ -144,7 +144,7 @@ function TaskHistory() {
                 }
                 const params = new URLSearchParams();
                 params.set("page", String(Math.max(1, page - 1)));
-                setSearchParams(params);
+                setSearchParams(params, { replace: true });
               }}
             />
           </PaginationItem>
@@ -156,7 +156,7 @@ function TaskHistory() {
               onClick={() => {
                 const params = new URLSearchParams();
                 params.set("page", String(page + 1));
-                setSearchParams(params);
+                setSearchParams(params, { replace: true });
               }}
             />
           </PaginationItem>
