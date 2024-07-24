@@ -23,7 +23,7 @@ function StatusBadge({ status }: Props) {
   const statusText = status === "timed_out" ? "timed out" : status;
 
   return (
-    <Badge className="h-fit" variant={variant}>
+    <Badge className="flex h-7 w-24 justify-center" variant={variant}>
       {statusText}
     </Badge>
   );

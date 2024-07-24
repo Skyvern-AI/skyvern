@@ -57,11 +57,14 @@
     --accent: 217.2 32.6% 17.5%;
     --accent-foreground: 210 40% 98%;
 
-    --warning: 40.6 96.1% 40.4%;
-    --warning-foreground: 54.5 91.7% 95.3%;
+    --destructive: 0 72.2% 50.6%; /* red-600 */
+    --destructive-foreground: 0 85.7% 97.3%; /* red-50 */
 
-    --success: 142.1 76.2% 36.3%;
-    --success-foreground: 138.5 76.5% 96.7%;
+    --warning: 40.6 96.1% 40.4%; /* yellow-600 */
+    --warning-foreground: 54.5 91.7% 95.3%; /* yellow-50 */
+
+    --success: 142.1 76.2% 36.3%; /* green-600 */
+    --success-foreground: 138.5 76.5% 96.7%; /* green-50 */
 
     --border: 215.3 25% 26.7%;
     --input: 215.3 25% 26.7%;
@@ -73,106 +76,9 @@
   * {
     @apply border-border;
   }
+
   body {
     @apply bg-background text-foreground;
-  }
-
-  [data-rmiz] {
-    position: relative;
-  }
-  [data-rmiz-ghost] {
-    position: absolute;
-    pointer-events: none;
-  }
-  [data-rmiz-btn-zoom],
-  [data-rmiz-btn-unzoom] {
-    background-color: rgba(0, 0, 0, 0.7);
-    border-radius: 50%;
-    border: none;
-    box-shadow: 0 0 1px rgba(255, 255, 255, 0.5);
-    color: #fff;
-    height: 40px;
-    margin: 0;
-    outline-offset: 2px;
-    padding: 9px;
-    touch-action: manipulation;
-    width: 40px;
-    -webkit-appearance: none;
-    -moz-appearance: none;
-    appearance: none;
-  }
-  [data-rmiz-btn-zoom]:not(:focus):not(:active) {
-    position: absolute;
-    clip: rect(0 0 0 0);
-    clip-path: inset(50%);
-    height: 1px;
-    overflow: hidden;
-    pointer-events: none;
-    white-space: nowrap;
-    width: 1px;
-  }
-  [data-rmiz-btn-zoom] {
-    position: absolute;
-    inset: 10px 10px auto auto;
-    cursor: zoom-in;
-  }
-  [data-rmiz-btn-unzoom] {
-    position: absolute;
-    inset: 20px 20px auto auto;
-    cursor: zoom-out;
-    z-index: 1;
-  }
-  [data-rmiz-content="found"] img,
-  [data-rmiz-content="found"] svg,
-  [data-rmiz-content="found"] [role="img"],
-  [data-rmiz-content="found"] [data-zoom] {
-    cursor: zoom-in;
-  }
-  [data-rmiz-modal]::backdrop {
-    display: none;
-  }
-  [data-rmiz-modal][open] {
-    position: fixed;
-    width: 100vw;
-    width: 100dvw;
-    height: 100vh;
-    height: 100dvh;
-    max-width: none;
-    max-height: none;
-    margin: 0;
-    padding: 0;
-    border: 0;
-    background: transparent;
-    overflow: hidden;
-  }
-  [data-rmiz-modal-overlay] {
-    position: absolute;
-    inset: 0;
-    transition: background-color 0.3s;
-  }
-  [data-rmiz-modal-overlay="hidden"] {
-    background-color: rgba(255, 255, 255, 0);
-  }
-  [data-rmiz-modal-overlay="visible"] {
-    @apply bg-background;
-  }
-  [data-rmiz-modal-content] {
-    position: relative;
-    width: 100%;
-    height: 100%;
-  }
-  [data-rmiz-modal-img] {
-    position: absolute;
-    cursor: zoom-out;
-    image-rendering: high-quality;
-    transform-origin: top left;
-    transition: transform 0.3s;
-  }
-  @media (prefers-reduced-motion: reduce) {
-    [data-rmiz-modal-overlay],
-    [data-rmiz-modal-img] {
-      transition-duration: 0.01ms !important;
-    }
   }
 }
 
