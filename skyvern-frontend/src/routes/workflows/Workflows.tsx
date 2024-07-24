@@ -126,7 +126,7 @@ function Workflows() {
                     "workflowsPage",
                     String(Math.max(1, workflowsPage - 1)),
                   );
-                  setSearchParams(params);
+                  setSearchParams(params, { replace: true });
                 }}
               />
             </PaginationItem>
@@ -138,7 +138,7 @@ function Workflows() {
                 onClick={() => {
                   const params = new URLSearchParams();
                   params.set("workflowsPage", String(workflowsPage + 1));
-                  setSearchParams(params);
+                  setSearchParams(params, { replace: true });
                 }}
               />
             </PaginationItem>
@@ -203,7 +203,6 @@ function Workflows() {
           <PaginationContent>
             <PaginationItem>
               <PaginationPrevious
-                href="#"
                 className={cn({ "cursor-not-allowed": workflowRunsPage === 1 })}
                 onClick={() => {
                   if (workflowRunsPage === 1) {
@@ -214,20 +213,19 @@ function Workflows() {
                     "workflowRunsPage",
                     String(Math.max(1, workflowRunsPage - 1)),
                   );
-                  setSearchParams(params);
+                  setSearchParams(params, { replace: true });
                 }}
               />
             </PaginationItem>
             <PaginationItem>
-              <PaginationLink href="#">{workflowRunsPage}</PaginationLink>
+              <PaginationLink>{workflowRunsPage}</PaginationLink>
             </PaginationItem>
             <PaginationItem>
               <PaginationNext
-                href="#"
                 onClick={() => {
                   const params = new URLSearchParams();
                   params.set("workflowRunsPage", String(workflowRunsPage + 1));
-                  setSearchParams(params);
+                  setSearchParams(params, { replace: true });
                 }}
               />
             </PaginationItem>
