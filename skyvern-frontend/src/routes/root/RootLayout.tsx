@@ -1,33 +1,57 @@
 import { Link, Outlet } from "react-router-dom";
 import { Toaster } from "@/components/ui/toaster";
 import { SideNav } from "./SideNav";
-import { DiscordLogoIcon } from "@radix-ui/react-icons";
+import {
+  DiscordLogoIcon,
+  PinLeftIcon,
+  PinRightIcon,
+} from "@radix-ui/react-icons";
 import { Logo } from "@/components/Logo";
-import { Profile } from "./Profile";
-import { useContext } from "react";
-import { UserContext } from "@/store/UserContext";
 import GitHubButton from "react-github-btn";
+import { useState } from "react";
+import { cn } from "@/util/utils";
+import { Button } from "@/components/ui/button";
 
 function RootLayout() {
-  const user = useContext(UserContext);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   return (
     <>
-      <div className="h-full w-full px-4">
-        <aside className="fixed min-h-screen w-72 shrink-0 border-r-2 px-6">
+      <div className="h-full w-full">
+        <aside
+          className={cn("fixed min-h-screen border-r-2 px-6", {
+            "w-64": !sidebarCollapsed,
+            "w-28": sidebarCollapsed,
+          })}
+        >
           <Link to={window.location.origin}>
             <div className="h-24">
               <Logo />
             </div>
           </Link>
-          <SideNav />
-          {user ? (
-            <div className="absolute bottom-2 left-0 w-72 shrink-0 px-6">
-              <Profile name={user.name} />
-            </div>
-          ) : null}
+          <SideNav collapsed={sidebarCollapsed} />
+          <div
+            className={cn("mt-auto flex min-h-16", {
+              "justify-center": sidebarCollapsed,
+              "justify-end": !sidebarCollapsed,
+            })}
+          >
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={() => {
+                setSidebarCollapsed(!sidebarCollapsed);
+              }}
+            >
+              {sidebarCollapsed ? (
+                <PinRightIcon className="h-6 w-6" />
+              ) : (
+                <PinLeftIcon className="h-6 w-6" />
+              )}
+            </Button>
+          </div>
         </aside>
-        <div className="flex h-24 items-center justify-end gap-4 px-6 pl-72">
+        <div className="flex h-24 items-center justify-end gap-4 px-6">
           <Link
             to="https://discord.com/invite/fG2XXEuQX3"
             target="_blank"
@@ -47,7 +71,11 @@ function RootLayout() {
             </GitHubButton>
           </div>
         </div>
-        <main className="pb-4 pl-72">
+        <main
+          className={cn("pb-4 pl-64", {
+            "pl-28": sidebarCollapsed,
+          })}
+        >
           <Outlet />
         </main>
       </div>
