@@ -105,7 +105,6 @@ function WorkflowPage() {
           <PaginationContent>
             <PaginationItem>
               <PaginationPrevious
-                href="#"
                 className={cn({ "cursor-not-allowed": page === 1 })}
                 onClick={() => {
                   if (page === 1) {
@@ -118,11 +117,10 @@ function WorkflowPage() {
               />
             </PaginationItem>
             <PaginationItem>
-              <PaginationLink href="#">{page}</PaginationLink>
+              <PaginationLink>{page}</PaginationLink>
             </PaginationItem>
             <PaginationItem>
               <PaginationNext
-                href="#"
                 onClick={() => {
                   const params = new URLSearchParams();
                   params.set("page", String(page + 1));
