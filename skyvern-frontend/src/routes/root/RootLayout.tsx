@@ -11,6 +11,7 @@ import GitHubButton from "react-github-btn";
 import { useState } from "react";
 import { cn } from "@/util/utils";
 import { Button } from "@/components/ui/button";
+import { LogoMinimized } from "@/components/LogoMinimized";
 
 function RootLayout() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -19,36 +20,38 @@ function RootLayout() {
     <>
       <div className="h-full w-full">
         <aside
-          className={cn("fixed min-h-screen border-r-2 px-6", {
+          className={cn("fixed h-screen min-h-screen border-r-2 px-6", {
             "w-64": !sidebarCollapsed,
             "w-28": sidebarCollapsed,
           })}
         >
-          <Link to={window.location.origin}>
-            <div className="h-24">
-              <Logo />
-            </div>
-          </Link>
-          <SideNav collapsed={sidebarCollapsed} />
-          <div
-            className={cn("mt-auto flex min-h-16", {
-              "justify-center": sidebarCollapsed,
-              "justify-end": !sidebarCollapsed,
-            })}
-          >
-            <Button
-              size="icon"
-              variant="ghost"
-              onClick={() => {
-                setSidebarCollapsed(!sidebarCollapsed);
-              }}
+          <div className="flex h-full flex-col">
+            <Link to={window.location.origin}>
+              <div className="flex h-24 items-center">
+                {sidebarCollapsed ? <LogoMinimized /> : <Logo />}
+              </div>
+            </Link>
+            <SideNav collapsed={sidebarCollapsed} />
+            <div
+              className={cn("mt-auto flex min-h-16", {
+                "justify-center": sidebarCollapsed,
+                "justify-end": !sidebarCollapsed,
+              })}
             >
-              {sidebarCollapsed ? (
-                <PinRightIcon className="h-6 w-6" />
-              ) : (
-                <PinLeftIcon className="h-6 w-6" />
-              )}
-            </Button>
+              <Button
+                size="icon"
+                variant="ghost"
+                onClick={() => {
+                  setSidebarCollapsed(!sidebarCollapsed);
+                }}
+              >
+                {sidebarCollapsed ? (
+                  <PinRightIcon className="h-6 w-6" />
+                ) : (
+                  <PinLeftIcon className="h-6 w-6" />
+                )}
+              </Button>
+            </div>
           </div>
         </aside>
         <div className="flex h-24 items-center justify-end gap-4 px-6">
