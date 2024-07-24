@@ -91,9 +91,9 @@ class SkyvernFrame:
             screenshot = await SkyvernFrame.take_screenshot(page=skyvern_page.frame, full_page=False)
             screenshots.append(screenshot)
             scroll_y_px_old = scroll_y_px
-            LOG.info("Scrolling to next page", url=url, num_screenshots=len(screenshots))
+            LOG.debug("Scrolling to next page", url=url, num_screenshots=len(screenshots))
             scroll_y_px = await skyvern_page.scroll_to_next_page(draw_boxes=draw_boxes)
-            LOG.info(
+            LOG.debug(
                 "Scrolled to next page",
                 scroll_y_px=scroll_y_px,
                 scroll_y_px_old=scroll_y_px_old,
