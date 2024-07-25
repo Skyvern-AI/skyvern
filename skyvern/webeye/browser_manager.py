@@ -25,6 +25,7 @@ class BrowserManager:
         proxy_location: ProxyLocation | None = None,
         url: str | None = None,
         task_id: str | None = None,
+        workflow_run_id: str | None = None,
     ) -> BrowserState:
         pw = await async_playwright().start()
         (
@@ -36,6 +37,7 @@ class BrowserManager:
             proxy_location=proxy_location,
             url=url,
             task_id=task_id,
+            workflow_run_id=workflow_run_id,
         )
         return BrowserState(
             pw=pw,
@@ -76,7 +78,9 @@ class BrowserManager:
             "Creating browser state for workflow run",
             workflow_run_id=workflow_run.workflow_run_id,
         )
-        browser_state = await self._create_browser_state(workflow_run.proxy_location, url=url)
+        browser_state = await self._create_browser_state(
+            workflow_run.proxy_location, url=url, workflow_run_id=workflow_run.workflow_run_id
+        )
 
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.
