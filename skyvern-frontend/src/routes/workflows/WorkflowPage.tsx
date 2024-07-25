@@ -1,5 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import { WorkflowRunApiResponse } from "@/api/types";
+import { WorkflowApiResponse, WorkflowRunApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Button } from "@/components/ui/button";
 import {
@@ -10,6 +10,7 @@ import {
   PaginationNext,
   PaginationPrevious,
 } from "@/components/ui/pagination";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   Table,
   TableBody,
@@ -52,6 +53,17 @@ function WorkflowPage() {
     },
   });
 
+  const { data: workflow, isLoading: workflowIsLoading } =
+    useQuery<WorkflowApiResponse>({
+      queryKey: ["workflow", workflowPermanentId],
+      queryFn: async () => {
+        const client = await getClient(credentialGetter);
+        return client
+          .get(`/workflows/${workflowPermanentId}`)
+          .then((response) => response.data);
+      },
+    });
+
   if (!workflowPermanentId) {
     return null; // this should never happen
   }
@@ -59,7 +71,19 @@ function WorkflowPage() {
   return (
     <div className="space-y-8">
       <header className="flex justify-between">
-        <h1 className="text-lg font-semibold">{workflowPermanentId}</h1>
+        <div className="flex flex-col gap-2">
+          {workflowIsLoading ? (
+            <>
+              <Skeleton className="h-7 w-56" />
+              <Skeleton className="h-7 w-56" />
+            </>
+          ) : (
+            <>
+              <h1 className="text-lg font-semibold">{workflow?.title}</h1>
+              <h2 className="text-sm">{workflowPermanentId}</h2>
+            </>
+          )}
+        </div>
         <Button asChild>
           <Link to="run">Create New Run</Link>
         </Button>
