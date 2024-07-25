@@ -98,7 +98,16 @@ function Workflows() {
                 return (
                   <TableRow
                     key={workflow.workflow_permanent_id}
-                    onClick={() => {
+                    onClick={(event) => {
+                      if (event.ctrlKey || event.metaKey) {
+                        window.open(
+                          window.location.origin +
+                            `/workflows/${workflow.workflow_permanent_id}`,
+                          "_blank",
+                          "noopener,noreferrer",
+                        );
+                        return;
+                      }
                       navigate(`${workflow.workflow_permanent_id}`);
                     }}
                     className="cursor-pointer"
@@ -174,7 +183,16 @@ function Workflows() {
                 return (
                   <TableRow
                     key={workflowRun.workflow_run_id}
-                    onClick={() => {
+                    onClick={(event) => {
+                      if (event.ctrlKey || event.metaKey) {
+                        window.open(
+                          window.location.origin +
+                            `/workflows/${workflowRun.workflow_permanent_id}/${workflowRun.workflow_run_id}`,
+                          "_blank",
+                          "noopener,noreferrer",
+                        );
+                        return;
+                      }
                       navigate(
                         `/workflows/${workflowRun.workflow_permanent_id}/${workflowRun.workflow_run_id}`,
                       );
