@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/pagination";
 import { cn } from "@/util/utils";
 import { WorkflowTitle } from "./WorkflowTitle";
+import { basicTimeFormat } from "@/util/timeFormat";
 
 function Workflows() {
   const credentialGetter = useCredentialGetter();
@@ -152,20 +153,21 @@ function Workflows() {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead className="w-1/4">Workflow ID</TableHead>
+              <TableHead className="w-1/5">Workflow ID</TableHead>
               <TableHead className="w-1/4">Workflow Title</TableHead>
-              <TableHead className="w-1/4">Workflow Run ID</TableHead>
-              <TableHead className="w-1/4">Status</TableHead>
+              <TableHead className="w-1/5">Workflow Run ID</TableHead>
+              <TableHead className="w-1/7">Status</TableHead>
+              <TableHead className="w-1/4">Created At</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {workflowRunsIsLoading ? (
               <TableRow>
-                <TableCell colSpan={4}>Loading...</TableCell>
+                <TableCell colSpan={5}>Loading...</TableCell>
               </TableRow>
             ) : workflowRuns?.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={4}>No workflow runs found</TableCell>
+                <TableCell colSpan={5}>No workflow runs found</TableCell>
               </TableRow>
             ) : (
               workflowRuns?.map((workflowRun) => {
@@ -179,7 +181,7 @@ function Workflows() {
                     }}
                     className="cursor-pointer"
                   >
-                    <TableCell className="w-1/4">
+                    <TableCell className="w-1/5">
                       {workflowRun.workflow_permanent_id}
                     </TableCell>
                     <TableCell className="w-1/4">
@@ -187,11 +189,14 @@ function Workflows() {
                         workflowPermanentId={workflowRun.workflow_permanent_id}
                       />
                     </TableCell>
-                    <TableCell className="w-1/4">
+                    <TableCell className="w-1/5">
                       {workflowRun.workflow_run_id}
                     </TableCell>
-                    <TableCell className="w-1/4">
+                    <TableCell className="w-1/7">
                       <StatusBadge status={workflowRun.status} />
+                    </TableCell>
+                    <TableCell className="w-1/4">
+                      {basicTimeFormat(workflowRun.created_at)}
                     </TableCell>
                   </TableRow>
                 );
