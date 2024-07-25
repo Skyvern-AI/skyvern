@@ -56,7 +56,7 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_factory import BrowserState
-from skyvern.webeye.scraper.scraper import ScrapedPage
+from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage
 from skyvern.webeye.utils.dom import AbstractSelectDropdown, DomUtil, SkyvernElement
 
 LOG = structlog.get_logger()
@@ -1056,11 +1056,22 @@ async def extract_information_for_navigation_goal(
     """
     prompt_template = "extract-information"
 
+    # TODO: we only use HTML element for now, introduce a way to switch in the future
+    element_tree_format = ElementTreeFormat.HTML
+    LOG.info(
+        "Building element tree",
+        task_id=task.task_id,
+        workflow_run_id=task.workflow_run_id,
+        format=element_tree_format,
+    )
+
+    element_tree_in_prompt: str = scraped_page.build_element_tree(element_tree_format)
+
     extract_information_prompt = prompt_engine.load_prompt(
         prompt_template,
         navigation_goal=task.navigation_goal,
         navigation_payload=task.navigation_payload,
-        elements=scraped_page.element_tree,
+        elements=element_tree_in_prompt,
         data_extraction_goal=task.data_extraction_goal,
         extracted_information_schema=task.extracted_information_schema,
         current_url=scraped_page.url,
