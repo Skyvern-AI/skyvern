@@ -12,14 +12,26 @@ import {
 } from "@/components/ui/table";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { TaskListSkeletonRows } from "../tasks/list/TaskListSkeletonRows";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { TaskActions } from "../tasks/list/TaskActions";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
+import {
+  Pagination,
+  PaginationContent,
+  PaginationItem,
+  PaginationLink,
+  PaginationNext,
+  PaginationPrevious,
+} from "@/components/ui/pagination";
+import { cn } from "@/util/utils";
 
 function WorkflowRun() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
+
   const { workflowRunId, workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
@@ -37,11 +49,13 @@ function WorkflowRun() {
   const { data: workflowTasks, isLoading: workflowTasksIsLoading } = useQuery<
     Array<TaskApiResponse>
   >({
-    queryKey: ["workflowTasks", workflowRunId],
+    queryKey: ["workflowTasks", workflowRunId, page],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
+      const params = new URLSearchParams();
+      params.append("page", String(page));
       return client
-        .get(`/tasks?workflow_run_id=${workflowRunId}&page_size=200`)
+        .get(`/tasks?workflow_run_id=${workflowRunId}`, { params })
         .then((response) => response.data);
     },
   });
@@ -90,9 +104,7 @@ function WorkflowRun() {
                 <TaskListSkeletonRows />
               ) : workflowTasks?.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={5}>
-                    This workflow run does not have any tasks
-                  </TableCell>
+                  <TableCell colSpan={5}>No tasks</TableCell>
                 </TableRow>
               ) : (
                 workflowTasks?.map((task) => {
@@ -131,6 +143,35 @@ function WorkflowRun() {
               )}
             </TableBody>
           </Table>
+          <Pagination className="pt-2">
+            <PaginationContent>
+              <PaginationItem>
+                <PaginationPrevious
+                  className={cn({ "cursor-not-allowed": page === 1 })}
+                  onClick={() => {
+                    if (page === 1) {
+                      return;
+                    }
+                    const params = new URLSearchParams();
+                    params.set("page", String(Math.max(1, page - 1)));
+                    setSearchParams(params, { replace: true });
+                  }}
+                />
+              </PaginationItem>
+              <PaginationItem>
+                <PaginationLink>{page}</PaginationLink>
+              </PaginationItem>
+              <PaginationItem>
+                <PaginationNext
+                  onClick={() => {
+                    const params = new URLSearchParams();
+                    params.set("page", String(page + 1));
+                    setSearchParams(params, { replace: true });
+                  }}
+                />
+              </PaginationItem>
+            </PaginationContent>
+          </Pagination>
         </div>
       </div>
       <div className="space-y-4">

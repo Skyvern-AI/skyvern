@@ -19,6 +19,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -63,73 +64,88 @@ function WorkflowPage() {
           <Link to="run">Create New Run</Link>
         </Button>
       </header>
-      <div>
+      <div className="space-y-4">
         <header>
           <h1 className="text-lg font-semibold">Past Runs</h1>
         </header>
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead className="w-1/2">ID</TableHead>
-              <TableHead className="w-1/2">Status</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {isLoading ? (
+        <div className="rounded-md border">
+          <Table>
+            <TableHeader>
               <TableRow>
-                <TableCell colSpan={2}>Loading...</TableCell>
+                <TableHead className="w-1/3">ID</TableHead>
+                <TableHead className="w-1/3">Status</TableHead>
+                <TableHead className="w-1/3">Created At</TableHead>
               </TableRow>
-            ) : workflowRuns?.length === 0 ? (
-              <TableRow>
-                <TableCell colSpan={2}>No workflow runs found</TableCell>
-              </TableRow>
-            ) : (
-              workflowRuns?.map((workflowRun) => (
-                <TableRow
-                  key={workflowRun.workflow_run_id}
-                  onClick={() => {
-                    navigate(`${workflowRun.workflow_run_id}`);
-                  }}
-                  className="cursor-pointer"
-                >
-                  <TableCell>{workflowRun.workflow_run_id}</TableCell>
-                  <TableCell>
-                    <StatusBadge status={workflowRun.status} />
-                  </TableCell>
+            </TableHeader>
+            <TableBody>
+              {isLoading ? (
+                <TableRow>
+                  <TableCell colSpan={3}>Loading...</TableCell>
                 </TableRow>
-              ))
-            )}
-          </TableBody>
-        </Table>
-        <Pagination className="pt-2">
-          <PaginationContent>
-            <PaginationItem>
-              <PaginationPrevious
-                className={cn({ "cursor-not-allowed": page === 1 })}
-                onClick={() => {
-                  if (page === 1) {
-                    return;
-                  }
-                  const params = new URLSearchParams();
-                  params.set("page", String(Math.max(1, page - 1)));
-                  setSearchParams(params, { replace: true });
-                }}
-              />
-            </PaginationItem>
-            <PaginationItem>
-              <PaginationLink>{page}</PaginationLink>
-            </PaginationItem>
-            <PaginationItem>
-              <PaginationNext
-                onClick={() => {
-                  const params = new URLSearchParams();
-                  params.set("page", String(page + 1));
-                  setSearchParams(params, { replace: true });
-                }}
-              />
-            </PaginationItem>
-          </PaginationContent>
-        </Pagination>
+              ) : workflowRuns?.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={3}>No workflow runs found</TableCell>
+                </TableRow>
+              ) : (
+                workflowRuns?.map((workflowRun) => (
+                  <TableRow
+                    key={workflowRun.workflow_run_id}
+                    onClick={(event) => {
+                      if (event.ctrlKey || event.metaKey) {
+                        window.open(
+                          window.location.origin +
+                            `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}`,
+                          "_blank",
+                          "noopener,noreferrer",
+                        );
+                        return;
+                      }
+                      navigate(`${workflowRun.workflow_run_id}`);
+                    }}
+                    className="cursor-pointer"
+                  >
+                    <TableCell>{workflowRun.workflow_run_id}</TableCell>
+                    <TableCell>
+                      <StatusBadge status={workflowRun.status} />
+                    </TableCell>
+                    <TableCell>
+                      {basicTimeFormat(workflowRun.created_at)}
+                    </TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+          <Pagination className="pt-2">
+            <PaginationContent>
+              <PaginationItem>
+                <PaginationPrevious
+                  className={cn({ "cursor-not-allowed": page === 1 })}
+                  onClick={() => {
+                    if (page === 1) {
+                      return;
+                    }
+                    const params = new URLSearchParams();
+                    params.set("page", String(Math.max(1, page - 1)));
+                    setSearchParams(params, { replace: true });
+                  }}
+                />
+              </PaginationItem>
+              <PaginationItem>
+                <PaginationLink>{page}</PaginationLink>
+              </PaginationItem>
+              <PaginationItem>
+                <PaginationNext
+                  onClick={() => {
+                    const params = new URLSearchParams();
+                    params.set("page", String(page + 1));
+                    setSearchParams(params, { replace: true });
+                  }}
+                />
+              </PaginationItem>
+            </PaginationContent>
+          </Pagination>
+        </div>
       </div>
     </div>
   );
