@@ -20,7 +20,7 @@ class ActionResult(BaseModel):
     interacted_with_parent: bool | None = None
 
     def __str__(self) -> str:
-        results = ["ActionResult(success={self.success}"]
+        results = [f"ActionResult(success={self.success}"]
         if self.exception_type or self.exception_message:
             results.append(f"exception_type={self.exception_type}")
             results.append(f"exception_message={self.exception_message}")
