@@ -19,7 +19,7 @@ python-multipart = "^0.0.6"
 toml = "^0.10.2"
 jinja2 = "^3.1.2"
 uvicorn = {extras = ["standard"], version = "^0.24.0.post1"}
-litellm = "1.41.15"
+litellm = "1.42.0"
 duckduckgo-search = "^3.8.0"
 selenium = "^4.13.0"
 bs4 = "^0.0.1"
