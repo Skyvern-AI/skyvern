@@ -80,18 +80,19 @@ function Workflows() {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead className="w-1/2">ID</TableHead>
-              <TableHead className="w-1/2">Title</TableHead>
+              <TableHead className="w-1/3">ID</TableHead>
+              <TableHead className="w-1/3">Title</TableHead>
+              <TableHead className="w-1/3">Created At</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {isLoading ? (
               <TableRow>
-                <TableCell colSpan={2}>Loading...</TableCell>
+                <TableCell colSpan={3}>Loading...</TableCell>
               </TableRow>
             ) : workflows?.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={2}>No workflows found</TableCell>
+                <TableCell colSpan={3}>No workflows found</TableCell>
               </TableRow>
             ) : (
               workflows?.map((workflow) => {
@@ -112,10 +113,13 @@ function Workflows() {
                     }}
                     className="cursor-pointer"
                   >
-                    <TableCell className="w-1/2">
+                    <TableCell className="w-1/3">
                       {workflow.workflow_permanent_id}
                     </TableCell>
-                    <TableCell className="w-1/2">{workflow.title}</TableCell>
+                    <TableCell className="w-1/3">{workflow.title}</TableCell>
+                    <TableCell className="w-1/3">
+                      {basicTimeFormat(workflow.created_at)}
+                    </TableCell>
                   </TableRow>
                 );
               })
@@ -162,11 +166,11 @@ function Workflows() {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead className="w-1/5">Workflow ID</TableHead>
-              <TableHead className="w-1/4">Workflow Title</TableHead>
               <TableHead className="w-1/5">Workflow Run ID</TableHead>
-              <TableHead className="w-1/7">Status</TableHead>
-              <TableHead className="w-1/4">Created At</TableHead>
+              <TableHead className="w-1/5">Workflow ID</TableHead>
+              <TableHead className="w-1/5">Workflow Title</TableHead>
+              <TableHead className="w-1/5">Status</TableHead>
+              <TableHead className="w-1/5">Created At</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -200,20 +204,20 @@ function Workflows() {
                     className="cursor-pointer"
                   >
                     <TableCell className="w-1/5">
+                      {workflowRun.workflow_run_id}
+                    </TableCell>
+                    <TableCell className="w-1/5">
                       {workflowRun.workflow_permanent_id}
                     </TableCell>
-                    <TableCell className="w-1/4">
+                    <TableCell className="w-1/5">
                       <WorkflowTitle
                         workflowPermanentId={workflowRun.workflow_permanent_id}
                       />
                     </TableCell>
                     <TableCell className="w-1/5">
-                      {workflowRun.workflow_run_id}
-                    </TableCell>
-                    <TableCell className="w-1/7">
                       <StatusBadge status={workflowRun.status} />
                     </TableCell>
-                    <TableCell className="w-1/4">
+                    <TableCell className="w-1/5">
                       {basicTimeFormat(workflowRun.created_at)}
                     </TableCell>
                   </TableRow>
