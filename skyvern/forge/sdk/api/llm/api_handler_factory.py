@@ -195,7 +195,7 @@ class LLMAPIHandlerFactory:
                 # TODO (kerem): add a retry mechanism to this call (acompletion_with_retries)
                 # TODO (kerem): use litellm fallbacks? https://litellm.vercel.app/docs/tutorials/fallbacks#how-does-completion_with_fallbacks-work
                 LOG.info("Calling LLM API", llm_key=llm_key, model=llm_config.model_name)
-                t_llm_request = time.time()
+                t_llm_request = time.perf_counter()
                 response = await litellm.acompletion(
                     model=llm_config.model_name,
                     messages=messages,
@@ -206,7 +206,7 @@ class LLMAPIHandlerFactory:
             except openai.OpenAIError as e:
                 raise LLMProviderError(llm_key) from e
             except CancelledError:
-                t_llm_cancelled = time.time()
+                t_llm_cancelled = time.perf_counter()
                 LOG.error(
                     "LLM request got cancelled",
                     llm_key=llm_key,
