@@ -1,5 +1,7 @@
 import dataclasses
 import json
+import time
+from asyncio import CancelledError
 from typing import Any
 
 import litellm
@@ -193,6 +195,7 @@ class LLMAPIHandlerFactory:
                 # TODO (kerem): add a retry mechanism to this call (acompletion_with_retries)
                 # TODO (kerem): use litellm fallbacks? https://litellm.vercel.app/docs/tutorials/fallbacks#how-does-completion_with_fallbacks-work
                 LOG.info("Calling LLM API", llm_key=llm_key, model=llm_config.model_name)
+                t_llm_request = time.time()
                 response = await litellm.acompletion(
                     model=llm_config.model_name,
                     messages=messages,
@@ -202,6 +205,15 @@ class LLMAPIHandlerFactory:
                 LOG.info("LLM API call successful", llm_key=llm_key, model=llm_config.model_name)
             except openai.OpenAIError as e:
                 raise LLMProviderError(llm_key) from e
+            except CancelledError:
+                t_llm_cancelled = time.time()
+                LOG.error(
+                    "LLM request got cancelled",
+                    llm_key=llm_key,
+                    model=llm_config.model_name,
+                    duration=t_llm_cancelled - t_llm_request,
+                )
+                raise LLMProviderError(llm_key)
             except Exception as e:
                 LOG.exception("LLM request failed unexpectedly", llm_key=llm_key)
                 raise LLMProviderError(llm_key) from e
