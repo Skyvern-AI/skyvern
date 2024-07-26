@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 import time
 import uuid
@@ -12,6 +13,7 @@ from playwright.async_api import BrowserContext, Error, Page, Playwright, async_
 from pydantic import BaseModel
 
 from skyvern.config import settings
+from skyvern.constants import REPO_ROOT_DIR
 from skyvern.exceptions import (
     FailedToNavigateToUrl,
     FailedToReloadPage,
@@ -23,12 +25,19 @@ from skyvern.exceptions import (
 from skyvern.forge.sdk.core.skyvern_context import current
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import DISABLE_PRINTER_WITH_FLAG, SkyvernFrame
 
 LOG = structlog.get_logger()
 
 
 BrowserCleanupFunc = Callable[[], None] | None
+
+
+def get_download_dir(workflow_run_id: str | None, task_id: str | None) -> str:
+    download_dir = f"{REPO_ROOT_DIR}/downloads/{workflow_run_id or task_id}"
+    LOG.info("Initializing download directory", download_dir=download_dir)
+    os.makedirs(download_dir, exist_ok=True)
+    return download_dir
 
 
 class BrowserContextCreator(Protocol):
@@ -101,7 +110,10 @@ class BrowserContextFactory:
             creator = cls._creators.get(browser_type)
             if not creator:
                 raise UnknownBrowserType(browser_type)
-            return await creator(playwright, **kwargs)
+            browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
+            # overwrite the window.print() to disable the PDF printer
+            await browser_context.add_init_script(DISABLE_PRINTER_WITH_FLAG)
+            return browser_context, browser_artifacts, cleanup_func
         except UnknownBrowserType as e:
             raise e
         except Exception as e:

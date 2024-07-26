@@ -55,9 +55,10 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
-from skyvern.webeye.browser_factory import BrowserState
+from skyvern.webeye.browser_factory import BrowserState, get_download_dir
 from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage
 from skyvern.webeye.utils.dom import AbstractSelectDropdown, DomUtil, SkyvernElement
+from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 COMMON_INPUT_TAGS = {"input", "textarea", "select"}
@@ -218,7 +219,7 @@ async def handle_click_action(
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     await asyncio.sleep(0.3)
     if action.download:
-        results = await handle_click_to_download_file_action(action, page, scraped_page)
+        results = await handle_click_to_download_file_action(action, page, scraped_page, task)
     else:
         results = await chain_click(
             task,
@@ -248,16 +249,27 @@ async def handle_click_to_download_file_action(
     action: actions.ClickAction,
     page: Page,
     scraped_page: ScrapedPage,
+    task: Task,
 ) -> list[ActionResult]:
     dom = DomUtil(scraped_page=scraped_page, page=page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     locator = skyvern_element.locator
 
     try:
-        await locator.click(
-            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
-            modifiers=["Alt"],
-        )
+        await locator.click(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+
+        await page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
+        # TODO: shall we back to the previous page ?
+        if await SkyvernFrame.get_print_triggered(page):
+            path = f"{get_download_dir(task.workflow_run_id, task.task_id)}/{uuid.uuid4()}"
+            LOG.warning(
+                "Trying to download the printed PDF",
+                path=path,
+                action=action,
+            )
+            await page.pdf(format="A4", display_header_footer=True, path=path)
+            await SkyvernFrame.reset_print_triggered(page)
+
     except Exception as e:
         LOG.exception("ClickAction with download failed", action=action, exc_info=True)
         return [ActionFailure(e, download_triggered=False)]
