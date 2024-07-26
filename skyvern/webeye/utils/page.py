@@ -28,6 +28,16 @@ def load_js_script() -> str:
         raise e
 
 
+DISABLE_PRINTER_WITH_FLAG = """
+(function() {
+    const originalPrint = window.print;
+    window.print = function() {
+        window.__printTriggered = true;
+    };
+    window.__printTriggered = false;
+})();
+"""
+
 JS_FUNCTION_DEFS = load_js_script()
 
 
@@ -102,6 +112,22 @@ class SkyvernFrame:
             await skyvern_page.remove_bounding_boxes()
         await skyvern_page.scroll_to_top(draw_boxes=False)
         return screenshots
+
+    @staticmethod
+    async def get_print_triggered(page: Page) -> bool:
+        """
+        Get print triggered on the page. Only Page instance could be printed as PDF.
+        """
+        # the flag was injected in the "window" object from the "add_init_script" when the BrowserContext initialized.
+        return await page.evaluate("window.__printTriggered")
+
+    @staticmethod
+    async def reset_print_triggered(page: Page) -> bool:
+        """
+        Get print triggered on the page. Only Page instance could be printed as PDF.
+        """
+        # the flag was injected in the "window" object from the "add_init_script" when the BrowserContext initialized.
+        return await page.evaluate("() => window.__printTriggered = false")
 
     @classmethod
     async def create_instance(cls, frame: Page | Frame) -> SkyvernFrame:
