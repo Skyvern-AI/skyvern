@@ -448,6 +448,14 @@ const isSelect2MultiChoice = (element) => {
   );
 };
 
+const isReactSelectDropdown = (element) => {
+  return (
+    element.tagName.toLowerCase() === "input" &&
+    element.className.toString().includes("select__input") &&
+    element.getAttribute("role") === "combobox"
+  );
+};
+
 const checkParentClass = (className) => {
   const targetParentClasses = ["field", "entry"];
   for (let i = 0; i < targetParentClasses.length; i++) {
@@ -687,6 +695,78 @@ async function getSelect2Options(element) {
   return selectOptions;
 }
 
+async function getReactSelectOptionElements(element) {
+  let optionList = [];
+  // wait for 2s until the element is updated with `aria-controls`
+  console.log("wait 2s for the dropdown being updated.");
+  await sleep(2000);
+
+  dropdownId = element.getAttribute("aria-controls");
+  if (!dropdownId) {
+    return optionList;
+  }
+
+  const document = element.getRootNode();
+  dropdownDiv = document.querySelector(`div[id="${dropdownId}"]`);
+  let previousOptionCount = null;
+
+  while (true) {
+    // sometimes need more time to load the options
+    console.log("wait 5s to load all options");
+    await sleep(5000); // wait 5s
+    optionList = dropdownDiv.querySelectorAll("div[role='option']");
+    if (optionList.length === 0) {
+      break;
+    }
+
+    if (
+      previousOptionCount !== null &&
+      previousOptionCount == optionList.length
+    ) {
+      break;
+    }
+    previousOptionCount = optionList.length;
+
+    lastOption = optionList[optionList.length - 1];
+    lastOption.scrollIntoView({ behavior: "instant" });
+
+    lastOption.dispatchEvent(
+      new WheelEvent("wheel", {
+        bubbles: true,
+        cancelable: true,
+        deltaX: 0,
+        deltaY: -20,
+        deltaZ: 0,
+      }),
+    );
+    lastOption.dispatchEvent(
+      new WheelEvent("wheel", {
+        bubbles: true,
+        cancelable: true,
+        deltaX: 0,
+        deltaY: 20,
+        deltaZ: 0,
+      }),
+    );
+  }
+
+  return optionList;
+}
+
+async function getReactSelectOptions(element) {
+  const optionList = await getReactSelectOptionElements(element);
+
+  let selectOptions = [];
+  for (let i = 0; i < optionList.length; i++) {
+    let ele = optionList[i];
+    selectOptions.push({
+      optionIndex: i,
+      text: removeMultipleSpaces(ele.textContent),
+    });
+  }
+  return selectOptions;
+}
+
 function getDOMElementBySkyvenElement(elementObj) {
   // if element has shadowHost set, we need to find the shadowHost element first then find the element
   if (elementObj.shadowHost) {
@@ -800,6 +880,23 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
     } else if (attrs["role"] && attrs["role"].toLowerCase() === "listbox") {
       // if "role" key is inside attrs, then get all the elements with role "option" and get their text
       selectOptions = getListboxOptions(element);
+    } else if (open_select && isReactSelectDropdown(element)) {
+      element.dispatchEvent(
+        new MouseEvent("mouseup", {
+          bubbles: true,
+          view: window,
+        }),
+      );
+
+      selectOptions = await getReactSelectOptions(element);
+
+      // click again to close
+      element.dispatchEvent(
+        new MouseEvent("mouseup", {
+          bubbles: true,
+          view: window,
+        }),
+      );
     } else if (open_select && isComboboxDropdown(element)) {
       // open combobox dropdown to get options
       element.click();

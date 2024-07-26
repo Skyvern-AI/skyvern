@@ -487,6 +487,12 @@ async def handle_select_option_action(
             action=action,
         )
         select_framework = await skyvern_element.get_select2_dropdown()
+    if await skyvern_element.is_react_select_dropdown():
+        LOG.info(
+            "This is a react select dropdown",
+            action=action,
+        )
+        select_framework = await skyvern_element.get_react_select_dropdown()
 
     if select_framework is not None:
         timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS

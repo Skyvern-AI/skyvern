@@ -124,6 +124,11 @@ class SkyvernFrame:
         js_script = "async (element) => await getSelect2Options(element)"
         return await self.frame.evaluate(js_script, element)
 
+    async def get_react_select_options(self, element: ElementHandle) -> List[Dict[str, Any]]:
+        await self.frame.evaluate(JS_FUNCTION_DEFS)
+        js_script = "async (element) => await getReactSelectOptions(element)"
+        return await self.frame.evaluate(js_script, element)
+
     async def get_combobox_options(self, element: ElementHandle) -> List[Dict[str, Any]]:
         await self.frame.evaluate(JS_FUNCTION_DEFS)
         js_script = "async (element) => await getListboxOptions(element)"

@@ -11,6 +11,7 @@ from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     ElementIsNotComboboxDropdown,
     ElementIsNotLabel,
+    ElementIsNotReactSelectDropdown,
     ElementIsNotSelect2Dropdown,
     FailedToGetCurrentValueOfDropdown,
     MissingElement,
@@ -107,6 +108,16 @@ class SkyvernElement:
             or (tag_name == "input" and "select2-input" in element_class)
         )
 
+    async def is_react_select_dropdown(self) -> bool:
+        tag_name = self.get_tag_name()
+        element_class = await self.get_attr("class")
+        if element_class is None:
+            return False
+
+        return (tag_name == InteractiveElement.INPUT and "select__input" in element_class) or (
+            tag_name == InteractiveElement.BUTTON and await self.get_attr("aria-label") == "Toggle flyout"
+        )
+
     async def is_combobox_dropdown(self) -> bool:
         tag_name = self.get_tag_name()
         role = await self.get_attr("role")
@@ -135,6 +146,7 @@ class SkyvernElement:
     async def is_selectable(self) -> bool:
         return (
             await self.is_select2_dropdown()
+            or await self.is_react_select_dropdown()
             or await self.is_combobox_dropdown()
             or self.get_tag_name() in SELECTABLE_ELEMENT
         )
@@ -167,6 +179,13 @@ class SkyvernElement:
 
         frame = await SkyvernFrame.create_instance(self.get_frame())
         return Select2Dropdown(frame, self)
+
+    async def get_react_select_dropdown(self) -> ReactSelectDropdown:
+        if not await self.is_react_select_dropdown():
+            raise ElementIsNotReactSelectDropdown(self.get_id(), self.__static_element)
+
+        frame = await SkyvernFrame.create_instance(self.get_frame())
+        return ReactSelectDropdown(frame, self)
 
     async def get_combobox_dropdown(self) -> ComboboxDropdown:
         if not await self.is_combobox_dropdown():
@@ -408,6 +427,71 @@ class Select2Dropdown(AbstractSelectDropdown):
     ) -> None:
         anchor = await self.__find_anchor(timeout=timeout)
         options = anchor.locator("li[role='option']")
+        await options.nth(index).click(timeout=timeout)
+
+
+class ReactSelectDropdown(AbstractSelectDropdown):
+    def __init__(self, skyvern_frame: SkyvernFrame, skyvern_element: SkyvernElement) -> None:
+        self.skyvern_element = skyvern_element
+        self.skyvern_frame = skyvern_frame
+
+    def __find_input_locator(self) -> Locator:
+        tag_name = self.skyvern_element.get_tag_name()
+        locator = self.skyvern_element.get_locator()
+
+        if tag_name == InteractiveElement.BUTTON:
+            return locator.locator("..").locator("..").locator("input[class~='select__input']")
+
+        return locator
+
+    async def __find_anchor(self, timeout: float) -> Locator:
+        input_locator = self.__find_input_locator()
+        anchor_id = await input_locator.get_attribute("aria-controls", timeout=timeout)
+
+        locator = self.skyvern_element.get_frame().locator(f"div[id='{anchor_id}']")
+        await locator.wait_for(state="visible", timeout=timeout)
+        cnt = await locator.count()
+        if cnt == 0:
+            raise NoDropdownAnchorErr(self.name(), self.skyvern_element.get_id())
+        if cnt > 1:
+            raise MultipleDropdownAnchorErr(self.name(), self.skyvern_element.get_id())
+        return locator
+
+    def name(self) -> str:
+        return "react-select"
+
+    async def open(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
+        await self.skyvern_element.get_locator().click(timeout=timeout)
+        await self.__find_anchor(timeout=timeout)
+
+    async def close(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
+        await self.__find_anchor(timeout=timeout)
+        await self.skyvern_element.get_locator().click(timeout=timeout)
+
+    async def get_current_value(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> str:
+        input_locator = self.__find_input_locator()
+        # TODO: only support single value now
+        value_locator = input_locator.locator("..").locator("..").locator("div[class~='select__single-value']")
+        if await value_locator.count() == 0:
+            return ""
+        try:
+            return await value_locator.text_content(timeout=timeout)
+        except Exception as e:
+            raise FailedToGetCurrentValueOfDropdown(self.name(), self.skyvern_element.get_id(), repr(e))
+
+    async def get_options(
+        self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    ) -> typing.List[SkyvernOptionType]:
+        input_locator = self.__find_input_locator()
+        element_handler = await input_locator.element_handle(timeout=timeout)
+        options = await self.skyvern_frame.get_react_select_options(element_handler)
+        return typing.cast(typing.List[SkyvernOptionType], options)
+
+    async def select_by_index(
+        self, index: int, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    ) -> None:
+        anchor = await self.__find_anchor(timeout=timeout)
+        options = anchor.locator("div[role='option']")
         await options.nth(index).click(timeout=timeout)
 
 
