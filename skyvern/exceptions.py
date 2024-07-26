@@ -313,6 +313,11 @@ class ElementIsNotSelect2Dropdown(SkyvernException):
         super().__init__(f"element[{element}] is not select2 dropdown. element_id={element_id}")
 
 
+class ElementIsNotReactSelectDropdown(SkyvernException):
+    def __init__(self, element_id: str, element: dict):
+        super().__init__(f"element[{element}] is not react select dropdown. element_id={element_id}")
+
+
 class ElementIsNotComboboxDropdown(SkyvernException):
     def __init__(self, element_id: str, element: dict):
         super().__init__(f"element[{element}] is not combobox dropdown. element_id={element_id}")
