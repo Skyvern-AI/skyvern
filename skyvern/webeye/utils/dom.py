@@ -426,7 +426,7 @@ class Select2Dropdown(AbstractSelectDropdown):
         self, index: int, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
     ) -> None:
         anchor = await self.__find_anchor(timeout=timeout)
-        options = anchor.locator("li[role='option']")
+        options = anchor.locator("ul").locator("li")
         await options.nth(index).click(timeout=timeout)
 
 
