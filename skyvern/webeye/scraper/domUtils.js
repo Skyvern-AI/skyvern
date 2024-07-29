@@ -696,6 +696,9 @@ async function getSelect2Options(element) {
 }
 
 async function getReactSelectOptionElements(element) {
+  var scrollLeft = window.scrollX;
+  var scrollTop = window.scrollY;
+
   let optionList = [];
   // wait for 2s until the element is updated with `aria-controls`
   console.log("wait 2s for the dropdown being updated.");
@@ -714,7 +717,7 @@ async function getReactSelectOptionElements(element) {
     // sometimes need more time to load the options
     console.log("wait 5s to load all options");
     await sleep(5000); // wait 5s
-    optionList = dropdownDiv.querySelectorAll("div[role='option']");
+    optionList = dropdownDiv.querySelectorAll("div[class*='select__option']");
     if (optionList.length === 0) {
       break;
     }
@@ -750,6 +753,12 @@ async function getReactSelectOptionElements(element) {
     );
   }
 
+  // scroll back to the original place
+  window.scroll({
+    top: scrollTop,
+    left: scrollLeft,
+    behavior: "instant",
+  });
   return optionList;
 }
 
@@ -887,6 +896,12 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
           view: window,
         }),
       );
+      element.dispatchEvent(
+        new MouseEvent("mousedown", {
+          bubbles: true,
+          view: window,
+        }),
+      );
 
       selectOptions = await getReactSelectOptions(element);
 
@@ -895,6 +910,19 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
         new MouseEvent("mouseup", {
           bubbles: true,
           view: window,
+        }),
+      );
+      element.dispatchEvent(
+        new MouseEvent("mousedown", {
+          bubbles: true,
+          view: window,
+        }),
+      );
+      element.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          keyCode: 27,
+          bubbles: true,
+          key: "Escape",
         }),
       );
     } else if (open_select && isComboboxDropdown(element)) {

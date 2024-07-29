@@ -440,7 +440,7 @@ class ReactSelectDropdown(AbstractSelectDropdown):
         locator = self.skyvern_element.get_locator()
 
         if tag_name == InteractiveElement.BUTTON:
-            return locator.locator("..").locator("..").locator("input[class~='select__input']")
+            return locator.locator("..").locator("..").locator("input[class*='select__input']")
 
         return locator
 
@@ -461,17 +461,18 @@ class ReactSelectDropdown(AbstractSelectDropdown):
         return "react-select"
 
     async def open(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
-        await self.skyvern_element.get_locator().click(timeout=timeout)
+        await self.skyvern_element.get_locator().focus(timeout=timeout)
+        await self.skyvern_element.get_locator().press(key="ArrowDown", timeout=timeout)
         await self.__find_anchor(timeout=timeout)
 
     async def close(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.__find_anchor(timeout=timeout)
-        await self.skyvern_element.get_locator().click(timeout=timeout)
+        await self.skyvern_element.get_locator().press(key="Escape", timeout=timeout)
 
     async def get_current_value(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> str:
         input_locator = self.__find_input_locator()
         # TODO: only support single value now
-        value_locator = input_locator.locator("..").locator("..").locator("div[class~='select__single-value']")
+        value_locator = input_locator.locator("..").locator("..").locator("div[class*='select__single-value']")
         if await value_locator.count() == 0:
             return ""
         try:
@@ -491,7 +492,7 @@ class ReactSelectDropdown(AbstractSelectDropdown):
         self, index: int, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
     ) -> None:
         anchor = await self.__find_anchor(timeout=timeout)
-        options = anchor.locator("div[role='option']")
+        options = anchor.locator("div[class*='select__option']")
         await options.nth(index).click(timeout=timeout)
 
 
