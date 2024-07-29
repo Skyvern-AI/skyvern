@@ -648,16 +648,12 @@ async function getSelect2OptionElements(element) {
 
   while (true) {
     oldOptionCount = optionList.length;
-    let newOptionList = document.querySelectorAll(
-      "[id='select2-drop'] li[role='option']",
-    );
+    let newOptionList = document.querySelectorAll("[id='select2-drop'] ul li");
     if (newOptionList.length === oldOptionCount) {
       console.log("no more options loaded, wait 5s to query again");
       // sometimes need more time to load the options, so sleep 10s and try again
       await sleep(5000); // wait 5s
-      newOptionList = document.querySelectorAll(
-        "[id='select2-drop'] li[role='option']",
-      );
+      newOptionList = document.querySelectorAll("[id='select2-drop'] ul li");
       console.log(newOptionList.length, " options found, after 5s");
     }
 
