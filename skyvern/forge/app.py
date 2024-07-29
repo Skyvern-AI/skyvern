@@ -12,7 +12,6 @@ from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.storage.factory import StorageFactory
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
-from skyvern.forge.sdk.forge_log import setup_logger
 from skyvern.forge.sdk.models import Organization
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
@@ -27,7 +26,6 @@ tracer.configure(
     },
 )
 
-setup_logger()
 SETTINGS_MANAGER = SettingsManager.get_settings()
 DATABASE = AgentDB(
     SettingsManager.get_settings().DATABASE_STRING,
