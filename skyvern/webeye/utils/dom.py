@@ -60,6 +60,9 @@ async def resolve_locator(
         child_frame = iframe_path.pop()
 
         frame_handler = await current_frame.query_selector(f"[{SKYVERN_ID_ATTR}='{child_frame}']")
+        if frame_handler is None:
+            raise NoneFrameError(frame_id=child_frame)
+
         content_frame = await frame_handler.content_frame()
         if content_frame is None:
             raise NoneFrameError(frame_id=child_frame)
