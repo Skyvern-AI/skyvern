@@ -1,17 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
 import { WorkflowApiResponse, WorkflowRunApiResponse } from "@/api/types";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useQuery } from "@tanstack/react-query";
-import { useNavigate, useSearchParams } from "react-router-dom";
-import { WorkflowsBetaAlertCard } from "./WorkflowsBetaAlertCard";
 import { StatusBadge } from "@/components/StatusBadge";
 import {
   Pagination,
@@ -21,9 +9,21 @@ import {
   PaginationNext,
   PaginationPrevious,
 } from "@/components/ui/pagination";
-import { cn } from "@/util/utils";
-import { WorkflowTitle } from "./WorkflowTitle";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { basicTimeFormat } from "@/util/timeFormat";
+import { cn } from "@/util/utils";
+import { useQuery } from "@tanstack/react-query";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { WorkflowsBetaAlertCard } from "./WorkflowsBetaAlertCard";
+import { WorkflowTitle } from "./WorkflowTitle";
 
 function Workflows() {
   const credentialGetter = useCredentialGetter();
