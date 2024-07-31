@@ -293,6 +293,14 @@ class WorkflowRunContext:
                 and isinstance(parameter.source, OutputParameter)
                 and parameter.source.key == output_parameter.key
             ):
+                if isinstance(value, dict) and "errors" in value:
+                    LOG.error(
+                        f"Output parameter {output_parameter.key} has errors. Setting ContextParameter {parameter.key} value to None"
+                    )
+                    parameter.value = None
+                    self.parameters[parameter.key] = parameter
+                    self.values[parameter.key] = parameter.value
+                    continue
                 value = (
                     value["extracted_information"]
                     if isinstance(value, dict) and "extracted_information" in value
