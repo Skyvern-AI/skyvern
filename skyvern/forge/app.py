@@ -1,5 +1,7 @@
 from typing import Awaitable, Callable
 
+from ddtrace import tracer
+from ddtrace.filters import FilterRequestsOnUrl
 from fastapi import FastAPI
 from playwright.async_api import Frame, Page
 
@@ -15,6 +17,14 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.webeye.browser_manager import BrowserManager
+
+tracer.configure(
+    settings={
+        "FILTERS": [
+            FilterRequestsOnUrl(r"http://.*/heartbeat$"),
+        ],
+    },
+)
 
 SETTINGS_MANAGER = SettingsManager.get_settings()
 DATABASE = AgentDB(
