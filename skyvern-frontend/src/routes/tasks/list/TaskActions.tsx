@@ -50,6 +50,7 @@ function createTaskTemplateRequestObject(
   return {
     title: values.title,
     description: values.description,
+    is_saved_task: true,
     webhook_callback_url: task.request.webhook_callback_url,
     proxy_location: task.request.proxy_location,
     workflow_definition: {
