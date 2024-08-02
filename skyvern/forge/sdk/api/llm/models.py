@@ -1,12 +1,18 @@
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Literal, Protocol
+from typing import Any, Awaitable, Literal, Optional, Protocol, TypedDict
 
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
 
+class LiteLLMParams(TypedDict):
+    api_key: str
+    api_version: str
+    api_base: str
+
+
 @dataclass(frozen=True)
-class LLMConfig:
+class LLMConfigBase:
     model_name: str
     required_env_vars: list[str]
     supports_vision: bool
@@ -23,6 +29,11 @@ class LLMConfig:
 
 
 @dataclass(frozen=True)
+class LLMConfig(LLMConfigBase):
+    litellm_params: Optional[LiteLLMParams] = field(default=None)
+
+
+@dataclass(frozen=True)
 class LLMRouterModelConfig:
     model_name: str
     # https://litellm.vercel.app/docs/routing
@@ -33,7 +44,7 @@ class LLMRouterModelConfig:
 
 
 @dataclass(frozen=True)
-class LLMRouterConfig(LLMConfig):
+class LLMRouterConfig(LLMConfigBase):
     model_list: list[LLMRouterModelConfig]
     # All three redis parameters are required. Even if there isn't a password, it should be an empty string.
     main_model_group: str

@@ -6,7 +6,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     MissingLLMProviderEnvVarsError,
     NoProviderEnabledError,
 )
-from skyvern.forge.sdk.api.llm.models import LLMConfig, LLMRouterConfig
+from skyvern.forge.sdk.api.llm.models import LiteLLMParams, LLMConfig, LLMRouterConfig
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.get_logger()
@@ -49,6 +49,7 @@ if not any(
         SettingsManager.get_settings().ENABLE_OPENAI,
         SettingsManager.get_settings().ENABLE_ANTHROPIC,
         SettingsManager.get_settings().ENABLE_AZURE,
+        SettingsManager.get_settings().ENABLE_AZURE_GPT4O_MINI,
         SettingsManager.get_settings().ENABLE_BEDROCK,
     ]
 ):
@@ -185,6 +186,27 @@ if SettingsManager.get_settings().ENABLE_AZURE:
                 "AZURE_API_BASE",
                 "AZURE_API_VERSION",
             ],
+            supports_vision=True,
+            add_assistant_prefix=False,
+        ),
+    )
+
+if SettingsManager.get_settings().ENABLE_AZURE_GPT4O_MINI:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT4O_MINI",
+        LLMConfig(
+            f"azure/{SettingsManager.get_settings().AZURE_GPT4O_MINI_DEPLOYMENT}",
+            [
+                "AZURE_GPT4O_MINI_DEPLOYMENT",
+                "AZURE_GPT4O_MINI_API_KEY",
+                "AZURE_GPT4O_MINI_API_BASE",
+                "AZURE_GPT4O_MINI_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=SettingsManager.get_settings().AZURE_GPT4O_MINI_API_BASE,
+                api_key=SettingsManager.get_settings().AZURE_GPT4O_MINI_API_KEY,
+                api_version=SettingsManager.get_settings().AZURE_GPT4O_MINI_API_VERSION,
+            ),
             supports_vision=True,
             add_assistant_prefix=False,
         ),

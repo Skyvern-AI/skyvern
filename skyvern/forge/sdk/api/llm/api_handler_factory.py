@@ -15,7 +15,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     InvalidLLMConfigError,
     LLMProviderError,
 )
-from skyvern.forge.sdk.api.llm.models import LLMAPIHandler, LLMRouterConfig
+from skyvern.forge.sdk.api.llm.models import LLMAPIHandler, LLMConfig, LLMRouterConfig
 from skyvern.forge.sdk.api.llm.utils import llm_messages_builder, parse_api_response
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.models import Step
@@ -147,6 +147,8 @@ class LLMAPIHandlerFactory:
         if LLMConfigRegistry.is_router_config(llm_key):
             return LLMAPIHandlerFactory.get_llm_api_handler_with_router(llm_key)
 
+        assert isinstance(llm_config, LLMConfig)
+
         async def llm_api_handler(
             prompt: str,
             step: Step | None = None,
@@ -158,6 +160,8 @@ class LLMAPIHandlerFactory:
                 parameters = LLMAPIHandlerFactory.get_api_parameters()
 
             active_parameters.update(parameters)
+            if llm_config.litellm_params:
+                active_parameters.update(llm_config.litellm_params)
 
             if step:
                 await app.ARTIFACT_MANAGER.create_artifact(
