@@ -706,7 +706,7 @@ async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) ->
     secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
 
     if secret_value == BitwardenConstants.TOTP:
-        secrets = workflow_run_context.get_secrets_from_password_manager()
+        secrets = await workflow_run_context.get_secrets_from_password_manager()
         secret_value = secrets[BitwardenConstants.TOTP]
     return secret_value if secret_value is not None else parameter
 
