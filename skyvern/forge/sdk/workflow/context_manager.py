@@ -97,11 +97,11 @@ class WorkflowRunContext:
             return self.secrets.get(secret_id_or_value)
         return None
 
-    def get_secrets_from_password_manager(self) -> dict[str, Any]:
+    async def get_secrets_from_password_manager(self) -> dict[str, Any]:
         """
         Get the secrets from the password manager. The secrets dict will contain the actual secret values.
         """
-        secret_credentials = BitwardenService.get_secret_value_from_url(
+        secret_credentials = await BitwardenService.get_secret_value_from_url(
             url=self.secrets[BitwardenConstants.URL],
             client_secret=self.secrets[BitwardenConstants.CLIENT_SECRET],
             client_id=self.secrets[BitwardenConstants.CLIENT_ID],
@@ -161,7 +161,7 @@ class WorkflowRunContext:
                     collection_id = parameter.bitwarden_collection_id
 
             try:
-                secret_credentials = BitwardenService.get_secret_value_from_url(
+                secret_credentials = await BitwardenService.get_secret_value_from_url(
                     client_id,
                     client_secret,
                     master_password,
@@ -218,7 +218,7 @@ class WorkflowRunContext:
                 collection_id = self.values[parameter.bitwarden_collection_id]
 
             try:
-                sensitive_values = BitwardenService.get_sensitive_information_from_identity(
+                sensitive_values = await BitwardenService.get_sensitive_information_from_identity(
                     client_id,
                     client_secret,
                     master_password,

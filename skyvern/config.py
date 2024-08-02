@@ -63,6 +63,12 @@ class Settings(BaseSettings):
     WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY: str = "SKYVERN_DOWNLOAD_DIRECTORY"
 
     #####################
+    # Bitwarden Configs #
+    #####################
+    BITWARDEN_TIMEOUT_SECONDS: int = 60
+    BITWARDEN_MAX_RETRIES: int = 1
+
+    #####################
     # LLM Configuration #
     #####################
     # ACTIVE LLM PROVIDER

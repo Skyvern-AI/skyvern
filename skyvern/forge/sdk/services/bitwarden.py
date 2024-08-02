@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -7,10 +8,12 @@ from enum import StrEnum
 import structlog
 import tldextract
 
+from skyvern.config import settings
 from skyvern.exceptions import (
     BitwardenListItemsError,
     BitwardenLoginError,
     BitwardenLogoutError,
+    BitwardenSyncError,
     BitwardenTOTPError,
     BitwardenUnlockError,
 )
@@ -68,7 +71,47 @@ class BitwardenService:
         return None
 
     @staticmethod
-    def get_secret_value_from_url(
+    async def get_secret_value_from_url(
+        client_id: str,
+        client_secret: str,
+        master_password: str,
+        url: str,
+        collection_id: str | None = None,
+        remaining_retries: int = settings.BITWARDEN_MAX_RETRIES,
+        fail_reasons: list[str] = [],
+    ) -> dict[str, str]:
+        """
+        Get the secret value from the Bitwarden CLI.
+        """
+        try:
+            async with asyncio.timeout(settings.BITWARDEN_TIMEOUT_SECONDS):
+                return await BitwardenService._get_secret_value_from_url(
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    master_password=master_password,
+                    url=url,
+                    collection_id=collection_id,
+                )
+        except Exception as e:
+            if remaining_retries <= 0:
+                raise BitwardenListItemsError(
+                    f"Bitwarden CLI failed after all retry attempts. Fail reasons: {fail_reasons}"
+                )
+
+            remaining_retries -= 1
+            LOG.info("Retrying to get secret value from Bitwarden", remaining_retries=remaining_retries)
+            return await BitwardenService.get_secret_value_from_url(
+                client_id=client_id,
+                client_secret=client_secret,
+                master_password=master_password,
+                url=url,
+                collection_id=collection_id,
+                remaining_retries=remaining_retries,
+                fail_reasons=fail_reasons + [f"{type(e).__name__}: {str(e)}"],
+            )
+
+    @staticmethod
+    async def _get_secret_value_from_url(
         client_id: str,
         client_secret: str,
         master_password: str,
@@ -80,6 +123,7 @@ class BitwardenService:
         """
         try:
             BitwardenService.login(client_id, client_secret)
+            BitwardenService.sync()
             session_key = BitwardenService.unlock(master_password)
 
             # Extract the domain from the URL and search for items in Bitwarden with that domain
@@ -151,7 +195,50 @@ class BitwardenService:
             BitwardenService.logout()
 
     @staticmethod
-    def get_sensitive_information_from_identity(
+    async def get_sensitive_information_from_identity(
+        client_id: str,
+        client_secret: str,
+        master_password: str,
+        collection_id: str,
+        identity_key: str,
+        identity_fields: list[str],
+        remaining_retries: int = settings.BITWARDEN_MAX_RETRIES,
+        fail_reasons: list[str] = [],
+    ) -> dict[str, str]:
+        """
+        Get the secret value from the Bitwarden CLI.
+        """
+        try:
+            async with asyncio.timeout(settings.BITWARDEN_TIMEOUT_SECONDS):
+                return await BitwardenService._get_sensitive_information_from_identity(
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    master_password=master_password,
+                    collection_id=collection_id,
+                    identity_key=identity_key,
+                    identity_fields=identity_fields,
+                )
+        except Exception as e:
+            if remaining_retries <= 0:
+                raise BitwardenListItemsError(
+                    f"Bitwarden CLI failed after all retry attempts. Fail reasons: {fail_reasons}"
+                )
+
+            remaining_retries -= 1
+            LOG.info("Retrying to get sensitive information from Bitwarden", remaining_retries=remaining_retries)
+            return await BitwardenService.get_sensitive_information_from_identity(
+                client_id=client_id,
+                client_secret=client_secret,
+                master_password=master_password,
+                collection_id=collection_id,
+                identity_key=identity_key,
+                identity_fields=identity_fields,
+                remaining_retries=remaining_retries,
+                fail_reasons=fail_reasons + [f"{type(e).__name__}: {str(e)}"],
+            )
+
+    @staticmethod
+    async def _get_sensitive_information_from_identity(
         client_id: str,
         client_secret: str,
         master_password: str,
@@ -164,6 +251,7 @@ class BitwardenService:
         """
         try:
             BitwardenService.login(client_id, client_secret)
+            BitwardenService.sync()
             session_key = BitwardenService.unlock(master_password)
 
             # Step 3: Retrieve the items
@@ -268,11 +356,23 @@ class BitwardenService:
         return session_key
 
     @staticmethod
+    def sync() -> None:
+        """
+        Sync the Bitwarden CLI.
+        """
+        sync_command = ["bw", "sync"]
+        LOG.info("Bitwarden CLI sync started")
+        sync_result = BitwardenService.run_command(sync_command)
+        LOG.info("Bitwarden CLI sync completed")
+        if sync_result.stderr:
+            raise BitwardenSyncError(sync_result.stderr)
+
+    @staticmethod
     def logout() -> None:
         """
         Log out of the Bitwarden CLI.
         """
         logout_command = ["bw", "logout"]
         logout_result = BitwardenService.run_command(logout_command)
-        if logout_result.stderr:
+        if logout_result.stderr and "You are not logged in." not in logout_result.stderr:
             raise BitwardenLogoutError(logout_result.stderr)

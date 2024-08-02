@@ -278,6 +278,11 @@ class BitwardenLogoutError(BitwardenBaseError):
         super().__init__(f"Error logging out of Bitwarden: {message}")
 
 
+class BitwardenSyncError(BitwardenBaseError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Error syncing Bitwarden: {message}")
+
+
 class UnknownElementTreeFormat(SkyvernException):
     def __init__(self, fmt: str) -> None:
         super().__init__(f"Unknown element tree format {fmt}")
