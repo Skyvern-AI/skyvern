@@ -36,6 +36,7 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
       return client
         .post(`/workflows/${workflowPermanentId}/run`, {
           data: values,
+          proxy_location: "RESIDENTIAL",
         })
         .then((response) => response.data);
     },
