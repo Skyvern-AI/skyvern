@@ -75,6 +75,7 @@ class Settings(BaseSettings):
     ENABLE_OPENAI: bool = False
     ENABLE_ANTHROPIC: bool = False
     ENABLE_AZURE: bool = False
+    ENABLE_AZURE_GPT4O_MINI: bool = False
     ENABLE_BEDROCK: bool = False
     # OPENAI
     OPENAI_API_KEY: str | None = None
@@ -85,6 +86,12 @@ class Settings(BaseSettings):
     AZURE_API_KEY: str | None = None
     AZURE_API_BASE: str | None = None
     AZURE_API_VERSION: str | None = None
+
+    # AZURE GPT-4o mini
+    AZURE_GPT4O_MINI_DEPLOYMENT: str | None = None
+    AZURE_GPT4O_MINI_API_KEY: str | None = None
+    AZURE_GPT4O_MINI_API_BASE: str | None = None
+    AZURE_GPT4O_MINI_API_VERSION: str | None = None
 
     def is_cloud_environment(self) -> bool:
         """
