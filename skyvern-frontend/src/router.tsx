@@ -18,6 +18,7 @@ import { Workflows } from "./routes/workflows/Workflows";
 import { WorkflowPage } from "./routes/workflows/WorkflowPage";
 import { WorkflowRunParameters } from "./routes/workflows/WorkflowRunParameters";
 import { RetryTask } from "./routes/tasks/create/retry/RetryTask";
+import { WorkflowRun } from "./routes/workflows/WorkflowRun";
 
 const router = createBrowserRouter([
   {
@@ -105,6 +106,10 @@ const router = createBrowserRouter([
               {
                 path: "run",
                 element: <WorkflowRunParameters />,
+              },
+              {
+                path: ":workflowRunId",
+                element: <WorkflowRun />,
               },
             ],
           },
