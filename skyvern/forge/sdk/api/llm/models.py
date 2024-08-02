@@ -6,9 +6,9 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 
 
 class LiteLLMParams(TypedDict):
-    api_key: str
-    api_version: str
-    api_base: str
+    api_key: str | None
+    api_version: str | None
+    api_base: str | None
 
 
 @dataclass(frozen=True)

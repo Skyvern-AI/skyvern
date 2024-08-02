@@ -160,8 +160,8 @@ class LLMAPIHandlerFactory:
                 parameters = LLMAPIHandlerFactory.get_api_parameters()
 
             active_parameters.update(parameters)
-            if llm_config.litellm_params:
-                active_parameters.update(llm_config.litellm_params)
+            if llm_config.litellm_params:  # type: ignore
+                active_parameters.update(llm_config.litellm_params)  # type: ignore
 
             if step:
                 await app.ARTIFACT_MANAGER.create_artifact(
