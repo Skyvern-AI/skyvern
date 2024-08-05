@@ -84,7 +84,9 @@ class BrowserManager:
 
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.
-        await browser_state.get_or_create_page(url=url, proxy_location=workflow_run.proxy_location)
+        await browser_state.get_or_create_page(
+            url=url, proxy_location=workflow_run.proxy_location, workflow_run_id=workflow_run.workflow_run_id
+        )
 
         self.pages[workflow_run.workflow_run_id] = browser_state
         return browser_state
