@@ -62,6 +62,9 @@ class Settings(BaseSettings):
     # Workflow constant parameters
     WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY: str = "SKYVERN_DOWNLOAD_DIRECTORY"
 
+    # streaming settings
+    STREAMING_FILE_BASE_PATH: str = "/tmp"
+
     #####################
     # Bitwarden Configs #
     #####################
