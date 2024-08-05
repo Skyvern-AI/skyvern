@@ -200,6 +200,7 @@ class BrowserState:
         url: str | None = None,
         proxy_location: ProxyLocation | None = None,
         task_id: str | None = None,
+        workflow_run_id: str | None = None,
     ) -> None:
         if self.pw is None:
             LOG.info("Starting playwright")
@@ -216,6 +217,7 @@ class BrowserState:
                 url=url,
                 proxy_location=proxy_location,
                 task_id=task_id,
+                workflow_run_id=workflow_run_id,
             )
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts
@@ -276,23 +278,30 @@ class BrowserState:
         url: str | None = None,
         proxy_location: ProxyLocation | None = None,
         task_id: str | None = None,
+        workflow_run_id: str | None = None,
     ) -> Page:
         if self.page is not None:
             return self.page
 
         try:
-            await self.check_and_fix_state(url=url, proxy_location=proxy_location, task_id=task_id)
+            await self.check_and_fix_state(
+                url=url, proxy_location=proxy_location, task_id=task_id, workflow_run_id=workflow_run_id
+            )
         except Exception as e:
             error_message = str(e)
             if "net::ERR" not in error_message:
                 raise e
             await self.close_current_open_page()
-            await self.check_and_fix_state(url=url, proxy_location=proxy_location, task_id=task_id)
+            await self.check_and_fix_state(
+                url=url, proxy_location=proxy_location, task_id=task_id, workflow_run_id=workflow_run_id
+            )
         assert self.page is not None
 
         if not await BrowserContextFactory.validate_browser_context(self.page):
             await self.close_current_open_page()
-            await self.check_and_fix_state(url=url, proxy_location=proxy_location, task_id=task_id)
+            await self.check_and_fix_state(
+                url=url, proxy_location=proxy_location, task_id=task_id, workflow_run_id=workflow_run_id
+            )
             assert self.page is not None
 
         return self.page
