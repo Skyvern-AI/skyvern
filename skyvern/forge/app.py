@@ -26,6 +26,9 @@ ARTIFACT_MANAGER = ArtifactManager()
 BROWSER_MANAGER = BrowserManager()
 EXPERIMENTATION_PROVIDER: BaseExperimentationProvider = NoOpExperimentationProvider()
 LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(SettingsManager.get_settings().LLM_KEY)
+SECONDARY_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
+    SETTINGS_MANAGER.SECONDARY_LLM_KEY if SETTINGS_MANAGER.SECONDARY_LLM_KEY else SETTINGS_MANAGER.LLM_KEY
+)
 WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
 WORKFLOW_SERVICE = WorkflowService()
 AGENT_FUNCTION = AgentFunction()

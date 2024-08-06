@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import typing
 from abc import ABC, abstractmethod
 from enum import StrEnum
+from random import uniform
 
 import structlog
 from playwright.async_api import Frame, FrameLocator, Locator, Page
@@ -21,11 +23,12 @@ from skyvern.exceptions import (
     MultipleDropdownAnchorErr,
     MultipleElementsFound,
     NoDropdownAnchorErr,
+    NoElementBoudingBox,
     NoneFrameError,
     SkyvernException,
 )
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.webeye.scraper.scraper import ScrapedPage
+from skyvern.webeye.scraper.scraper import IncrementalScrapePage, ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -94,6 +97,35 @@ class SkyvernElement:
     When you try to interact with these elements by python, you are supposed to use this class as an interface.
     """
 
+    @classmethod
+    async def create_from_incremental(cls, incre_page: IncrementalScrapePage, element_id: str) -> SkyvernElement:
+        element_dict = incre_page.id_to_element_dict.get(element_id)
+        if element_dict is None:
+            raise MissingElementDict(element_id)
+
+        css_selector = incre_page.id_to_css_dict.get(element_id)
+        if not css_selector:
+            raise MissingElementInCSSMap(element_id)
+
+        frame = incre_page.skyvern_frame.get_frame()
+        locator = frame.locator(css_selector)
+
+        num_elements = await locator.count()
+        if num_elements < 1:
+            LOG.warning("No elements found with css. Validation failed.", css=css_selector, element_id=element_id)
+            raise MissingElement(selector=css_selector, element_id=element_id)
+
+        elif num_elements > 1:
+            LOG.warning(
+                "Multiple elements found with css. Expected 1. Validation failed.",
+                num_elements=num_elements,
+                selector=css_selector,
+                element_id=element_id,
+            )
+            raise MultipleElementsFound(num=num_elements, selector=css_selector, element_id=element_id)
+
+        return cls(locator, frame, element_dict)
+
     def __init__(self, locator: Locator, frame: Page | Frame, static_element: dict) -> None:
         self.__static_element = static_element
         self.__frame = frame
@@ -147,12 +179,13 @@ class SkyvernElement:
         return self.__static_element.get("interactable", False)
 
     async def is_selectable(self) -> bool:
-        return (
-            await self.is_select2_dropdown()
-            or await self.is_react_select_dropdown()
-            or await self.is_combobox_dropdown()
-            or self.get_tag_name() in SELECTABLE_ELEMENT
-        )
+        return self.get_selectable() or self.get_tag_name() in SELECTABLE_ELEMENT
+
+    def get_scrollable(self) -> bool:
+        return self.__static_element.get("isScrollable", False)
+
+    def get_selectable(self) -> bool:
+        return self.__static_element.get("isSelectable", False)
 
     def get_tag_name(self) -> str:
         return self.__static_element.get("tagName", "")
@@ -293,6 +326,36 @@ class SkyvernElement:
 
     async def input_clear(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().clear(timeout=timeout)
+
+    async def move_mouse_to(
+        self, page: Page, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    ) -> tuple[float, float]:
+        bounding_box = await self.get_locator().bounding_box(timeout=timeout)
+        if not bounding_box:
+            raise NoElementBoudingBox(element_id=self.get_id())
+        x, y, width, height = bounding_box["x"], bounding_box["y"], bounding_box["width"], bounding_box["height"]
+
+        # calculate the click point, use open interval to avoid clicking on the border
+        epsilon = 0.01
+        dest_x = uniform(x + epsilon, x + width - epsilon) if width > 2 * epsilon else (x + width) / 2
+        dest_y = uniform(y + epsilon, y + height - epsilon) if height > 2 * epsilon else (y + height) / 2
+        await page.mouse.move(dest_x, dest_y)
+
+        return dest_x, dest_y
+
+    async def coordinate_click(
+        self, page: Page, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    ) -> None:
+        click_x, click_y = await self.move_mouse_to(page=page, timeout=timeout)
+        await page.mouse.click(click_x, click_y)
+
+    async def scroll_into_view(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
+        element_handler = await self.get_locator().element_handle()
+        if element_handler is None:
+            LOG.warning("element handler is None. ", element_id=self.get_id())
+            return
+        await element_handler.scroll_into_view_if_needed(timeout=timeout)
+        await asyncio.sleep(2)  # wait for scrolling into the target
 
 
 class DomUtil:

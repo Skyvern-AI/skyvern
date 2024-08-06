@@ -386,19 +386,8 @@ function isInteractable(element) {
     return true;
   }
 
-  if (
-    tagName === "div" ||
-    tagName === "img" ||
-    tagName === "span" ||
-    tagName === "a" ||
-    tagName === "i"
-  ) {
-    const computedStyle = window.getComputedStyle(element);
-    const hasPointer = computedStyle.cursor === "pointer";
-    return hasPointer;
-  }
-
   // support listbox and options underneath it
+  // div element should be checked here before the css pointer
   if (
     (tagName === "ul" || tagName === "div") &&
     element.hasAttribute("role") &&
@@ -414,7 +403,51 @@ function isInteractable(element) {
     return true;
   }
 
+  if (
+    tagName === "div" &&
+    element.hasAttribute("aria-disabled") &&
+    element.getAttribute("aria-disabled").toLowerCase() === "false"
+  ) {
+    return true;
+  }
+
+  if (
+    tagName === "div" ||
+    tagName === "img" ||
+    tagName === "span" ||
+    tagName === "a" ||
+    tagName === "i"
+  ) {
+    const computedStyle = window.getComputedStyle(element);
+    const hasPointer = computedStyle.cursor === "pointer";
+    return hasPointer;
+  }
+
   return false;
+}
+
+function isScrollable(element) {
+  const scrollHeight = element.scrollHeight || 0;
+  const clientHeight = element.clientHeight || 0;
+  const scrollWidth = element.scrollWidth || 0;
+  const clientWidth = element.clientWidth || 0;
+
+  const hasScrollableContent =
+    scrollHeight > clientHeight || scrollWidth > clientWidth;
+  const hasScrollableOverflow = isScrollableOverflow(element);
+  return hasScrollableContent && hasScrollableOverflow;
+}
+
+function isScrollableOverflow(element) {
+  const style = window.getComputedStyle(element);
+  return (
+    style.overflow === "auto" ||
+    style.overflow === "scroll" ||
+    style.overflowX === "auto" ||
+    style.overflowX === "scroll" ||
+    style.overflowY === "auto" ||
+    style.overflowY === "scroll"
+  );
 }
 
 const isComboboxDropdown = (element) => {
@@ -436,8 +469,8 @@ const isComboboxDropdown = (element) => {
 
 const isSelect2Dropdown = (element) => {
   return (
-    element.tagName.toLowerCase() === "span" &&
-    element.className.toString().includes("select2-chosen")
+    element.tagName.toLowerCase() === "a" &&
+    element.className.toString().includes("select2-choice")
   );
 };
 
@@ -805,6 +838,14 @@ function uniqueId() {
 }
 
 async function buildTreeFromBody(frame = "main.frame", open_select = false) {
+  return buildElementTree(document.body, frame, open_select);
+}
+
+async function buildElementTree(
+  starter = document.body,
+  frame = "main.frame",
+  open_select = false,
+) {
   var elements = [];
   var resultArray = [];
 
@@ -863,6 +904,13 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
       // don't trim any attr of this element if keepAllAttr=True
       keepAllAttr:
         elementTagNameLower === "svg" || element.closest("svg") !== null,
+      isSelectable:
+        elementTagNameLower === "select" ||
+        isReactSelectDropdown(element) ||
+        isComboboxDropdown(element) ||
+        isSelect2Dropdown(element) ||
+        isSelect2MultiChoice(element),
+      isScrollable: isScrollable(element),
     };
 
     let isInShadowRoot = element.getRootNode() instanceof ShadowRoot;
@@ -882,94 +930,8 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
     let selectedValue = "";
     if (elementTagNameLower === "select") {
       [selectOptions, selectedValue] = getSelectOptions(element);
-    } else if (attrs["role"] && attrs["role"].toLowerCase() === "listbox") {
-      // if "role" key is inside attrs, then get all the elements with role "option" and get their text
-      selectOptions = getListboxOptions(element);
-    } else if (open_select && isReactSelectDropdown(element)) {
-      element.dispatchEvent(
-        new MouseEvent("mouseup", {
-          bubbles: true,
-          view: window,
-        }),
-      );
-      element.dispatchEvent(
-        new MouseEvent("mousedown", {
-          bubbles: true,
-          view: window,
-        }),
-      );
-
-      selectOptions = await getReactSelectOptions(element);
-
-      // click again to close
-      element.dispatchEvent(
-        new MouseEvent("mouseup", {
-          bubbles: true,
-          view: window,
-        }),
-      );
-      element.dispatchEvent(
-        new MouseEvent("mousedown", {
-          bubbles: true,
-          view: window,
-        }),
-      );
-      element.dispatchEvent(
-        new KeyboardEvent("keydown", {
-          keyCode: 27,
-          bubbles: true,
-          key: "Escape",
-        }),
-      );
-    } else if (open_select && isComboboxDropdown(element)) {
-      // open combobox dropdown to get options
-      element.click();
-      const listBox = element
-        .getRootNode()
-        .getElementById(element.getAttribute("aria-controls"));
-      if (listBox) {
-        selectOptions = getListboxOptions(listBox);
-      }
-      // HACK: press Tab to close the dropdown
-      element.dispatchEvent(
-        new KeyboardEvent("keydown", {
-          keyCode: 9,
-          bubbles: true,
-          key: "Tab",
-        }),
-      );
-    } else if (open_select && isSelect2Dropdown(element)) {
-      // click element to show options
-      element.dispatchEvent(
-        new MouseEvent("mousedown", {
-          bubbles: true,
-          view: window,
-        }),
-      );
-
-      selectOptions = await getSelect2Options(element);
-
-      // HACK: click again to close the dropdown
-      element.dispatchEvent(
-        new MouseEvent("mousedown", {
-          bubbles: true,
-          view: window,
-        }),
-      );
-    } else if (open_select && isSelect2MultiChoice(element)) {
-      // click element to show options
-      element.click();
-      selectOptions = await getSelect2Options(element);
-
-      // HACK: press ESC to close the dropdown
-      element.dispatchEvent(
-        new KeyboardEvent("keydown", {
-          keyCode: 27,
-          bubbles: true,
-          key: "Escape",
-        }),
-      );
     }
+
     if (selectOptions) {
       elementObj.options = selectOptions;
     }
@@ -1308,9 +1270,8 @@ async function buildTreeFromBody(frame = "main.frame", open_select = false) {
     return trimmedResults;
   };
 
-  // TODO: Handle iframes
   // setup before parsing the dom
-  await processElement(document.body, null);
+  await processElement(starter, null);
 
   for (var element of elements) {
     if (
@@ -1568,6 +1529,22 @@ async function scrollToNextPage(draw_boxes) {
   return window.scrollY;
 }
 
+function scrollToElementBottom(element) {
+  element.scroll({
+    top: element.scrollHeight,
+    left: 0,
+    behavior: "instant",
+  });
+}
+
+function scrollToElementTop(element) {
+  element.scroll({
+    top: 0,
+    left: 0,
+    behavior: "instant",
+  });
+}
+
 async function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1588,4 +1565,141 @@ function findNodeById(arr, targetId, path = []) {
     }
   }
   return null;
+}
+
+function getElementDomDepth(elementNode) {
+  let depth = 0;
+  const rootElement = elementNode.getRootNode().firstElementChild;
+  while (elementNode !== rootElement && elementNode.parentElement) {
+    depth++;
+    elementNode = elementNode.parentElement;
+  }
+  return depth;
+}
+
+if (window.globalOneTimeIncrementElements === undefined) {
+  window.globalOneTimeIncrementElements = [];
+}
+
+if (window.globalObserverForDOMIncrement === undefined) {
+  window.globalObserverForDOMIncrement = new MutationObserver(function (
+    mutationsList,
+    observer,
+  ) {
+    for (const mutation of mutationsList) {
+      if (mutation.type === "attributes") {
+        if (mutation.attributeName === "style") {
+          // TODO: need to confirm that elemnent is hidden previously
+          node = mutation.target;
+          if (node.nodeType === Node.TEXT_NODE) continue;
+          const newStyle = window.getComputedStyle(node);
+          const newDisplay = newStyle.display;
+          if (newDisplay !== "none") {
+            window.globalOneTimeIncrementElements.push({
+              targetNode: node,
+              newNodes: [node],
+            });
+          }
+        }
+
+        // TODO: we maybe need to detect the visiblity change from class
+        // if (mutation.attributeName === "class") {
+        // }
+      }
+
+      if (mutation.type === "childList") {
+        let changedNode = {
+          targetNode: mutation.target, // TODO: for future usage, when we want to parse new elements into a tree
+        };
+        let newNodes = [];
+        if (mutation.addedNodes && mutation.addedNodes.length > 0) {
+          for (const node of mutation.addedNodes) {
+            // skip the text nodes, they won't be interactable
+            if (node.nodeType === Node.TEXT_NODE) continue;
+            newNodes.push(node);
+          }
+        }
+        if (newNodes.length > 0) {
+          changedNode.newNodes = newNodes;
+          window.globalOneTimeIncrementElements.push(changedNode);
+        }
+      }
+    }
+  });
+}
+
+function startGlobalIncrementalObserver() {
+  window.globalOneTimeIncrementElements = [];
+  window.globalObserverForDOMIncrement.takeRecords(); // cleanup the older data
+  window.globalObserverForDOMIncrement.observe(document.body, {
+    attributes: true,
+    attributeOldValue: true,
+    childList: true,
+    subtree: true,
+    characterData: true,
+  });
+}
+
+function stopGlobalIncrementalObserver() {
+  window.globalObserverForDOMIncrement.disconnect();
+  window.globalObserverForDOMIncrement.takeRecords(); // cleanup the older data
+  window.globalOneTimeIncrementElements = [];
+}
+
+async function getIncrementElements(frame) {
+  const domDepthMap = new Map();
+
+  for (const element of window.globalOneTimeIncrementElements) {
+    // calculate the depth of targetNode element for sorting
+    const depth = getElementDomDepth(element.targetNode);
+    let newNodesTreeList = [];
+    if (domDepthMap.has(depth)) {
+      newNodesTreeList = domDepthMap.get(depth);
+    }
+
+    for (const child of element.newNodes) {
+      const [_, newNodeTree] = await buildElementTree(child, frame, false);
+      if (newNodeTree.length > 0) {
+        newNodesTreeList.push(...newNodeTree);
+      }
+    }
+    domDepthMap.set(depth, newNodesTreeList);
+  }
+
+  // cleanup the chidren tree, remove the duplicated element
+  // search starting from the shallowest node:
+  // 1. if deeper, the node could only be the children of the shallower one or no related one.
+  // 2. if depth is same, the node could only be duplicated one or no related one.
+  const idToElement = new Map();
+  const cleanedTreeList = [];
+  const sortedDepth = Array.from(domDepthMap.keys()).sort();
+  for (let idx = 0; idx < sortedDepth.length; idx++) {
+    const depth = sortedDepth[idx];
+    const treeList = domDepthMap.get(depth);
+
+    for (const treeHeadElement of treeList) {
+      // check if the element is existed
+      if (idToElement.has(treeHeadElement.id)) {
+        continue;
+      }
+      cleanedTreeList.push(treeHeadElement);
+
+      // flatten the tree
+      let pendingElements = [treeHeadElement];
+      let curIndex = 0;
+      while (curIndex < pendingElements.length) {
+        const curElement = pendingElements[curIndex];
+        if (idToElement.has(curElement.id)) {
+          curIndex++;
+          continue;
+        }
+
+        idToElement.set(curElement.id, curElement);
+        pendingElements.push(...curElement.children);
+        curIndex++;
+      }
+    }
+  }
+
+  return [Array.from(idToElement.values()), cleanedTreeList];
 }

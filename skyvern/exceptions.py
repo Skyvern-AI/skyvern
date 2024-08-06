@@ -443,3 +443,29 @@ class WrongElementToUploadFile(SkyvernException):
 class FailedToFetchSecret(SkyvernException):
     def __init__(self) -> None:
         super().__init__("Failed to get the actual value of the secret parameter")
+
+
+class NoIncrementalElementFoundForCustomSelection(SkyvernException):
+    def __init__(self, element_id: str) -> None:
+        super().__init__(
+            f"No incremental element found, maybe try an input action or taking the select action on other elements. element_id={element_id}"
+        )
+
+
+class NoLabelOrValueForCustomSelection(SkyvernException):
+    def __init__(self, element_id: str) -> None:
+        super().__init__(
+            f"This is a custom selection, there must be invalid text for option.label or option.value. element_id={element_id}"
+        )
+
+
+class NoElementMatchedForTargetOption(SkyvernException):
+    def __init__(self, target: str, reason: str | None) -> None:
+        super().__init__(
+            f"No element matches for the target value, try another value. reason: {reason}.  target_value='{target}'."
+        )
+
+
+class NoElementBoudingBox(SkyvernException):
+    def __init__(self, element_id: str) -> None:
+        super().__init__(f"Element does not have a bounding box. element_id={element_id}")
