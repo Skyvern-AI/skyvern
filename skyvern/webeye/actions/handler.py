@@ -550,7 +550,6 @@ async def handle_select_option_action(
             )
 
         await incremental_scraped.get_incremental_element_tree(app.AGENT_FUNCTION.cleanup_element_tree)
-        # TODO: maybe take a screenshot for every tree head element to figure out which is the dropdown menu
         html = incremental_scraped.build_html_tree()
 
         target_value = action.option.label or action.option.value
