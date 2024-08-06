@@ -145,6 +145,14 @@ class SkyvernFrame:
         async with asyncio.timeout(timeout):
             return await self.frame.content()
 
+    async def scroll_to_element_bottom(self, element: ElementHandle) -> None:
+        js_script = "(element) => scrollToElementBottom(element)"
+        return await self.frame.evaluate(js_script, element)
+
+    async def scroll_to_element_top(self, element: ElementHandle) -> None:
+        js_script = "(element) => scrollToElementTop(element)"
+        return await self.frame.evaluate(js_script, element)
+
     async def get_select2_options(self, element: ElementHandle) -> List[Dict[str, Any]]:
         await self.frame.evaluate(JS_FUNCTION_DEFS)
         js_script = "async (element) => await getSelect2Options(element)"

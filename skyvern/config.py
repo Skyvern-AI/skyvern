@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
     BROWSER_LOADING_TIMEOUT_MS: int = 120000
+    OPTION_LOADING_TIMEOUT_MS: int = 600000
     MAX_STEPS_PER_RUN: int = 75
     MAX_NUM_SCREENSHOTS: int = 10
     # Ratio should be between 0 and 1.
@@ -73,6 +74,7 @@ class Settings(BaseSettings):
     #####################
     # ACTIVE LLM PROVIDER
     LLM_KEY: str = "OPENAI_GPT4O"
+    SECONDARY_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
