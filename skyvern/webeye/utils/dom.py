@@ -7,7 +7,7 @@ from enum import StrEnum
 from random import uniform
 
 import structlog
-from playwright.async_api import Frame, FrameLocator, Locator, Page
+from playwright.async_api import Frame, FrameLocator, Locator, Page, TimeoutError
 
 from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.exceptions import (
@@ -354,7 +354,15 @@ class SkyvernElement:
         if element_handler is None:
             LOG.warning("element handler is None. ", element_id=self.get_id())
             return
-        await element_handler.scroll_into_view_if_needed(timeout=timeout)
+        try:
+            await element_handler.scroll_into_view_if_needed(timeout=timeout)
+        except TimeoutError:
+            LOG.info(
+                "Timeout to execute scrolling into view, try to re-focus to locate the element",
+                element_id=self.get_id(),
+            )
+            await self.get_frame().evaluate("(element) => element.blur()", element_handler)
+            await self.get_locator().focus(timeout=timeout)
         await asyncio.sleep(2)  # wait for scrolling into the target
 
 
