@@ -1269,13 +1269,6 @@ async def extract_information_for_navigation_goal(
 
     # TODO: we only use HTML element for now, introduce a way to switch in the future
     element_tree_format = ElementTreeFormat.HTML
-    LOG.info(
-        "Building element tree",
-        task_id=task.task_id,
-        workflow_run_id=task.workflow_run_id,
-        format=element_tree_format,
-    )
-
     element_tree_in_prompt: str = scraped_page.build_element_tree(element_tree_format)
 
     extract_information_prompt = prompt_engine.load_prompt(

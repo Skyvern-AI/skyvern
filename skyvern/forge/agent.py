@@ -955,13 +955,6 @@ class ForgeAgent:
         )
         # TODO: we only use HTML element for now, introduce a way to switch in the future
         element_tree_format = ElementTreeFormat.HTML
-        LOG.info(
-            "Building element tree",
-            task_id=task.task_id,
-            workflow_run_id=task.workflow_run_id,
-            format=element_tree_format,
-        )
-
         element_tree_in_prompt: str = scraped_page.build_element_tree(element_tree_format)
         extract_action_prompt = await self._build_extract_action_prompt(
             task,
