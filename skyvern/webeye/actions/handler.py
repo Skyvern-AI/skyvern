@@ -52,6 +52,7 @@ from skyvern.webeye.actions.actions import (
     CheckboxAction,
     ClickAction,
     ScrapeResult,
+    SelectOption,
     SelectOptionAction,
     UploadFileAction,
     WebAction,
@@ -288,6 +289,8 @@ async def handle_input_text_action(
 ) -> list[ActionResult]:
     dom = DomUtil(scraped_page, page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
+    skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
+    timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
 
     current_text = await get_input_value(skyvern_element.get_tag_name(), skyvern_element.get_locator())
     if current_text == action.text:
@@ -299,6 +302,71 @@ async def handle_input_text_action(
     if text is None:
         return [ActionFailure(FailedToFetchSecret())]
 
+    # check if it's selectable
+    if skyvern_element.get_tag_name() == InteractiveElement.INPUT:
+        await skyvern_element.scroll_into_view()
+        select_action = SelectOptionAction(
+            reasoning=action.reasoning, element_id=skyvern_element.get_id(), option=SelectOption(label=text)
+        )
+        if skyvern_element.get_selectable():
+            LOG.info(
+                "Input element is selectable, doing select actions",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                element_id=skyvern_element.get_id(),
+                action=action,
+            )
+            return await handle_select_option_action(select_action, page, scraped_page, task, step)
+
+        # press arrowdown to watch if there's any options popping up
+        incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
+        await incremental_scraped.start_listen_dom_increment()
+        await skyvern_element.get_locator().focus(timeout=timeout)
+        await skyvern_element.get_locator().press("ArrowDown", timeout=timeout)
+        await asyncio.sleep(5)
+
+        incremental_element = await incremental_scraped.get_incremental_element_tree(
+            app.AGENT_FUNCTION.cleanup_element_tree
+        )
+        if len(incremental_element) == 0:
+            LOG.info(
+                "No new element detected, indicating it couldn't be a selectable auto-completion input",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                element_id=skyvern_element.get_id(),
+                action=action,
+            )
+        else:
+            try:
+                result = await select_from_dropdown(
+                    action=select_action,
+                    page=page,
+                    skyvern_frame=skyvern_frame,
+                    incremental_scraped=incremental_scraped,
+                    element_trees=incremental_element,
+                    llm_handler=app.SECONDARY_LLM_API_HANDLER,
+                    step=step,
+                    task=task,
+                )
+                if result is not None:
+                    return [result]
+                LOG.info(
+                    "No dropdown menu detected, indicating it couldn't be a selectable auto-completion input",
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    element_id=skyvern_element.get_id(),
+                    action=action,
+                )
+            except Exception as e:
+                await skyvern_element.scroll_into_view()
+                await skyvern_element.get_locator().press("Escape", timeout=timeout)
+                LOG.exception("Failed to do custom selection transformed from input action")
+                return [ActionFailure(exception=e)]
+            finally:
+                await incremental_scraped.stop_listen_dom_increment()
+
+    # force to move focus back to the element
+    await skyvern_element.get_locator().focus(timeout=timeout)
     try:
         await skyvern_element.input_clear()
     except TimeoutError:
@@ -509,7 +577,6 @@ async def handle_select_option_action(
     timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
     incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
-    llm_handler = app.SECONDARY_LLM_API_HANDLER
     is_open = False
 
     try:
@@ -531,58 +598,20 @@ async def handle_select_option_action(
         if len(incremental_element) == 0:
             raise NoIncrementalElementFoundForCustomSelection(element_id=action.element_id)
 
-        dropdown_menu_element = await locate_dropdown_meanu(
+        result = await select_from_dropdown(
+            action=action,
+            page=page,
+            skyvern_frame=skyvern_frame,
             incremental_scraped=incremental_scraped,
             element_trees=incremental_element,
-            llm_handler=llm_handler,
+            llm_handler=app.SECONDARY_LLM_API_HANDLER,
             step=step,
             task=task,
+            force_select=True,
         )
-
-        if dropdown_menu_element and dropdown_menu_element.get_scrollable():
-            await scroll_down_to_load_all_options(
-                dropdown_menu_element=dropdown_menu_element,
-                skyvern_frame=skyvern_frame,
-                page=page,
-                incremental_scraped=incremental_scraped,
-                step=step,
-                task=task,
-            )
-
-        await incremental_scraped.get_incremental_element_tree(app.AGENT_FUNCTION.cleanup_element_tree)
-        html = incremental_scraped.build_html_tree()
-
-        target_value = action.option.label or action.option.value
-        if target_value is None:
-            raise NoLabelOrValueForCustomSelection(element_id=action.element_id)
-
-        prompt = prompt_engine.load_prompt(
-            "custom-select", context_reasoning=action.reasoning, target_value=target_value, elements=html
-        )
-
-        LOG.info(
-            "Calling LLM to find the match element",
-            target_value=target_value,
-            step_id=step.step_id,
-            task_id=task.task_id,
-        )
-        json_response = await llm_handler(prompt=prompt, step=step)
-        LOG.info(
-            "LLM response for the matched element",
-            target_value=target_value,
-            response=json_response,
-            step_id=step.step_id,
-            task_id=task.task_id,
-        )
-
-        element_id: str | None = json_response.get("id", None)
-        if not element_id:
-            raise NoElementMatchedForTargetOption(target=target_value, reason=json_response.get("reasoning"))
-
-        selected_element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
-        await selected_element.scroll_into_view()
-        await selected_element.get_locator().click(timeout=timeout)
-        return [ActionSuccess()]
+        # force_select won't return None result
+        assert result is not None
+        return [result]
 
     except Exception as e:
         if is_open:
@@ -824,6 +853,80 @@ async def chain_click(
                 action=action,
             )
             return [ActionFailure(WrongElementToUploadFile(action.element_id))]
+
+
+async def select_from_dropdown(
+    action: SelectOptionAction,
+    page: Page,
+    skyvern_frame: SkyvernFrame,
+    incremental_scraped: IncrementalScrapePage,
+    element_trees: list[dict],
+    llm_handler: LLMAPIHandler,
+    step: Step,
+    task: Task,
+    force_select: bool = False,
+) -> ActionResult | None:
+    """
+    force_select is used to choose an element to click even there's no dropdown menu
+    None will be only returned when force_select is false and no dropdown menu popped
+    """
+    timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+
+    dropdown_menu_element = await locate_dropdown_meanu(
+        incremental_scraped=incremental_scraped,
+        element_trees=element_trees,
+        llm_handler=llm_handler,
+        step=step,
+        task=task,
+    )
+
+    if not force_select and dropdown_menu_element is None:
+        return None
+
+    if dropdown_menu_element and dropdown_menu_element.get_scrollable():
+        await scroll_down_to_load_all_options(
+            dropdown_menu_element=dropdown_menu_element,
+            skyvern_frame=skyvern_frame,
+            page=page,
+            incremental_scraped=incremental_scraped,
+            step=step,
+            task=task,
+        )
+
+    await incremental_scraped.get_incremental_element_tree(app.AGENT_FUNCTION.cleanup_element_tree)
+    html = incremental_scraped.build_html_tree()
+
+    target_value = action.option.label or action.option.value
+    if target_value is None:
+        raise NoLabelOrValueForCustomSelection(element_id=action.element_id)
+
+    prompt = prompt_engine.load_prompt(
+        "custom-select", context_reasoning=action.reasoning, target_value=target_value, elements=html
+    )
+
+    LOG.info(
+        "Calling LLM to find the match element",
+        target_value=target_value,
+        step_id=step.step_id,
+        task_id=task.task_id,
+    )
+    json_response = await llm_handler(prompt=prompt, step=step)
+    LOG.info(
+        "LLM response for the matched element",
+        target_value=target_value,
+        response=json_response,
+        step_id=step.step_id,
+        task_id=task.task_id,
+    )
+
+    element_id: str | None = json_response.get("id", None)
+    if not element_id:
+        raise NoElementMatchedForTargetOption(target=target_value, reason=json_response.get("reasoning"))
+
+    selected_element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
+    await selected_element.scroll_into_view()
+    await selected_element.get_locator().click(timeout=timeout)
+    return ActionSuccess()
 
 
 async def locate_dropdown_meanu(

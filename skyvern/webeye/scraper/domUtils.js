@@ -906,8 +906,6 @@ async function buildElementTree(
         elementTagNameLower === "svg" || element.closest("svg") !== null,
       isSelectable:
         elementTagNameLower === "select" ||
-        isReactSelectDropdown(element) ||
-        isComboboxDropdown(element) ||
         isSelect2Dropdown(element) ||
         isSelect2MultiChoice(element),
       isScrollable: isScrollable(element),
