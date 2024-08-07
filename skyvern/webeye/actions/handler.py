@@ -589,7 +589,7 @@ async def handle_select_option_action(
             await skyvern_element.scroll_into_view()
             await skyvern_element.coordinate_click(page=page)
             await skyvern_element.get_locator().press("Escape", timeout=timeout)
-        LOG.exception("custome select error")
+        LOG.exception("Custom select error")
         return [ActionFailure(exception=e)]
     finally:
         await incremental_scraped.stop_listen_dom_increment()
