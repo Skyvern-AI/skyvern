@@ -10,7 +10,7 @@ import structlog
 from deprecation import deprecated
 from playwright.async_api import FileChooser, Locator, Page, TimeoutError
 
-from skyvern.constants import REPO_ROOT_DIR, VERIFICATION_CODE_PLACEHOLDER, VERIFICATION_CODE_POLLING_TIMEOUT_MINS
+from skyvern.constants import REPO_ROOT_DIR, VERIFICATION_CODE_POLLING_TIMEOUT_MINS
 from skyvern.exceptions import (
     EmptySelect,
     ErrFoundSelectableElement,
@@ -618,7 +618,7 @@ async def handle_select_option_action(
             await skyvern_element.scroll_into_view()
             await skyvern_element.coordinate_click(page=page)
             await skyvern_element.get_locator().press("Escape", timeout=timeout)
-        LOG.exception("Custom select error")
+        LOG.exception("custome select error")
         return [ActionFailure(exception=e)]
     finally:
         await incremental_scraped.stop_listen_dom_increment()
@@ -711,13 +711,6 @@ async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) ->
 
     This is only used for InputTextAction, UploadFileAction, and ClickAction (if it has a file_url).
     """
-    if task.totp_verification_url and task.organization_id and VERIFICATION_CODE_PLACEHOLDER == parameter:
-        # if parameter is the secret code in the navigation playload,
-        # fetch the real verification from totp_verification_url
-        # do polling every 10 seconds to fetch the verification code
-        verification_code = await poll_verification_code(task.task_id, task.organization_id, task.totp_verification_url)
-        return verification_code
-
     if task.workflow_run_id is None:
         return parameter
 

@@ -9,6 +9,9 @@ If you see a popup in the page screenshot, prioritize actions on the popup.
 
 Reply in JSON format with the following keys:
 {
+{% if verification_code_check %}
+    "need_verification_code": bool, // Whether a verification code is needed to proceed
+{% endif %}
     "user_goal_achieved": str, // A string that describes if user goal has been completed with reasoning.
     "action_plan": str, // A string that describes the plan of actions you're going to take. Be specific and to the point. Use this as a quick summary of the actions you're going to take, and what order you're going to take them in, and how that moves you towards your overall goal. Output "COMPLETE" action in the "actions" if user goal has been achieved.
     "actions": array // An array of actions. Here's the format of each action:
