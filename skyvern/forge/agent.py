@@ -1575,8 +1575,6 @@ class ForgeAgent:
         browser_state: BrowserState,
         json_response: dict[str, Any],
     ) -> dict[str, Any]:
-        # TODO: handle verifications and resend the request if needed
-        # parse the "need_verification_code" field from the response
         need_verification_code = json_response.get("need_verification_code")
         if need_verification_code and task.totp_verification_url and task.organization_id:
             LOG.info("Need verification code", step_id=step.step_id)
