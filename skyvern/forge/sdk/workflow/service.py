@@ -729,10 +729,10 @@ class WorkflowService:
                     "Webhook failed",
                     workflow_id=workflow.workflow_id,
                     workflow_run_id=workflow_run.workflow_run_id,
+                    webhook_data=payload,
                     resp=resp,
                     resp_code=resp.status_code,
                     resp_text=resp.text,
-                    resp_json=resp.json(),
                 )
         except Exception as e:
             raise FailedToSendWebhook(
