@@ -9,7 +9,6 @@ If you see a popup in the page screenshot, prioritize actions on the popup.
 
 Reply in JSON format with the following keys:
 {
-{% if verification_code_check %}    "need_verification_code": bool, // Whether a verification code is needed to proceed.{% endif %}
     "user_goal_achieved": str, // A string that describes if user goal has been completed with reasoning.
     "action_plan": str, // A string that describes the plan of actions you're going to take. Be specific and to the point. Use this as a quick summary of the actions you're going to take, and what order you're going to take them in, and how that moves you towards your overall goal. Output "COMPLETE" action in the "actions" if user goal has been achieved.
     "actions": array // An array of actions. Here's the format of each action:
@@ -34,7 +33,8 @@ Reply in JSON format with the following keys:
             "confidence_float": float // The confidence of the error. Pick a number between 0.0 and 1.0. 0.0 means no confidence, 1.0 means full confidence
         }]
 {% endif %}
-    }],
+    }],{% if verification_code_check %}
+    "need_verification_code": bool, // Whether a verification code is needed to proceed.{% endif %}
 }
 {% if action_history %}
 Consider the action history from the last step and the screenshot together, if actions from the last step don't yield positive impact, try other actions or other action combinations.
