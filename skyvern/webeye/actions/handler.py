@@ -886,8 +886,18 @@ async def select_from_dropdown(
             task=task,
         )
 
-    await incremental_scraped.get_incremental_element_tree(app.AGENT_FUNCTION.cleanup_element_tree)
-    html = incremental_scraped.build_html_tree()
+    trimmed_element_tree = await incremental_scraped.get_incremental_element_tree(
+        app.AGENT_FUNCTION.cleanup_element_tree
+    )
+    if dropdown_menu_element:
+        # if there's a dropdown menu detected, only elements in the dropdown should be sent to LLM
+        dropdown_id = dropdown_menu_element.get_id()
+        for head_node in trimmed_element_tree:
+            if head_node.get("id") == dropdown_id:
+                trimmed_element_tree = [head_node]
+                break
+
+    html = incremental_scraped.build_html_tree(element_tree=trimmed_element_tree)
 
     target_value = action.option.label or action.option.value
     if target_value is None:
