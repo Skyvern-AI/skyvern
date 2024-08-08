@@ -12,7 +12,7 @@ PAGE_CONTENT_TIMEOUT = 300  # 5 mins
 # reserved fields for navigation payload
 SPECIAL_FIELD_VERIFICATION_CODE = "verification_code"
 
-VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 10
+VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 5
 
 
 class ScrapeType(StrEnum):
