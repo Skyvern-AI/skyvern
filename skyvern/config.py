@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     ADDITIONAL_MODULES: list[str] = []
 
     BROWSER_TYPE: str = "chromium-headful"
+    WS_ENDPOINT: str | None = None
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = None
     HAR_PATH: str | None = "./har"
