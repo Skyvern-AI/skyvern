@@ -138,12 +138,7 @@ class WorkflowRunNotFound(SkyvernException):
         super().__init__(f"WorkflowRun {workflow_run_id} not found")
 
 
-class WorkflowOrganizationMismatch(SkyvernException):
-    def __init__(self, workflow_id: str, organization_id: str) -> None:
-        super().__init__(f"Workflow {workflow_id} does not belong to organization {organization_id}")
-
-
-class MissingValueForParameter(SkyvernException):
+class MissingValueForParameter(SkyvernHTTPException):
     def __init__(self, parameter_key: str, workflow_id: str, workflow_run_id: str) -> None:
         super().__init__(
             f"Missing value for parameter {parameter_key} in workflow run {workflow_run_id} of workflow {workflow_id}"
