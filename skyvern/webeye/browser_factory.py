@@ -277,6 +277,8 @@ class BrowserState:
                     LOG.info(f"Retrying to create a new page. Retry count: {retries}")
 
     async def get_working_page(self) -> Page | None:
+        # HACK: currently, assuming the last page is always the working page.
+        # Need to refactor this logic when we want to manipulate multi pages together
         if self.__page is None or self.browser_context is None or len(self.browser_context.pages) == 0:
             return None
 
