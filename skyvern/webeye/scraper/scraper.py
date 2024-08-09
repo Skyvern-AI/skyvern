@@ -442,7 +442,7 @@ class IncrementalScrapePage:
         js_script = "() => window.globalOneTimeIncrementElements.length"
         return await self.skyvern_frame.get_frame().evaluate(js_script)
 
-    def build_html_tree(self, element_tree: list[dict] = []) -> str:
+    def build_html_tree(self, element_tree: list[dict] | None = None) -> str:
         return "".join([json_to_html(element) for element in (element_tree or self.element_tree_trimmed)])
 
 
