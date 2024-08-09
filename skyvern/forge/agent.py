@@ -1408,7 +1408,7 @@ class ForgeAgent:
         update_comparison = {
             key: {"old": getattr(step, key), "new": value}
             for key, value in updates.items()
-            if getattr(step, key) != value
+            if getattr(step, key) != value and key != "output"
         }
         LOG.info(
             "Updating step in db",
@@ -1542,7 +1542,6 @@ class ForgeAgent:
                 step_id=step.step_id,
                 step_order=step.order,
                 step_retry=step.retry_index,
-                output=step.output,
                 max_steps=max_steps_per_run,
             )
             last_step = await self.update_step(step, is_last=True)
@@ -1559,7 +1558,6 @@ class ForgeAgent:
                 step_id=step.step_id,
                 step_order=step.order,
                 step_retry=step.retry_index,
-                output=step.output,
             )
             next_step = await app.DATABASE.create_step(
                 task_id=task.task_id,
