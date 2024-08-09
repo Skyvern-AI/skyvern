@@ -754,9 +754,9 @@ async def chain_click(
     is_filechooser_trigger = False
 
     async def fc_func(fc: FileChooser) -> None:
-        await fc.set_files(files=file)
         nonlocal is_filechooser_trigger
         is_filechooser_trigger = True
+        await fc.set_files(files=file)
 
     page.on("filechooser", fc_func)
     LOG.info("Registered file chooser listener", action=action, path=file)
@@ -833,11 +833,11 @@ async def chain_click(
     finally:
         LOG.info("Remove file chooser listener", action=action)
 
-        # Sleep for 10 seconds after uploading a file to let the page process it
+        # Sleep for 15 seconds after uploading a file to let the page process it
         # Removing this breaks file uploads using the filechooser
         # KEREM DO NOT REMOVE
         if file:
-            await asyncio.sleep(10)
+            await asyncio.sleep(15)
         page.remove_listener("filechooser", fc_func)
 
         if action.file_url and not is_filechooser_trigger:
