@@ -259,7 +259,8 @@ class TaskBlock(Block):
             browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                 workflow_run=workflow_run, url=self.url
             )
-            if not browser_state.page:
+            working_page = await browser_state.get_working_page()
+            if not working_page:
                 LOG.error(
                     "BrowserState has no page",
                     workflow_run_id=workflow_run.workflow_run_id,
@@ -278,7 +279,7 @@ class TaskBlock(Block):
 
             if self.url:
                 try:
-                    await browser_state.page.goto(self.url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+                    await working_page.goto(self.url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
                 except Error as playright_error:
                     LOG.warning(f"Error while navigating to url: {str(playright_error)}")
                     # Make sure the task is marked as failed in the database before raising the exception
@@ -521,8 +522,9 @@ class CodeBlock(Block):
         # get all parameters into a dictionary
         parameter_values = {}
         maybe_browser_state = await app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
-        if maybe_browser_state and maybe_browser_state.page:
-            parameter_values["skyvern_page"] = maybe_browser_state.page
+        if maybe_browser_state:
+            if page := await maybe_browser_state.get_working_page():
+                parameter_values["skyvern_page"] = await page
 
         for parameter in self.parameters:
             value = workflow_run_context.get_value(parameter.key)

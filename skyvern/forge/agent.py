@@ -105,17 +105,18 @@ class ForgeAgent:
         task_url = task_block.url
         if task_url is None:
             browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(workflow_run=workflow_run)
-            if not browser_state.page:
+            working_page = await browser_state.get_working_page()
+            if not working_page:
                 LOG.error(
                     "BrowserState has no page",
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
                 raise MissingBrowserStatePage(workflow_run_id=workflow_run.workflow_run_id)
 
-            if browser_state.page.url == "about:blank":
+            if working_page.url == "about:blank":
                 raise InvalidWorkflowTaskURLState(workflow_run.workflow_run_id)
 
-            task_url = browser_state.page.url
+            task_url = working_page.url
 
         task = await app.DATABASE.create_task(
             url=task_url,
@@ -258,8 +259,8 @@ class ForgeAgent:
                 detailed_output,
             ) = await self._initialize_execution_state(task, step, workflow_run)
 
-            if browser_state.page:
-                self.register_async_operations(organization, task, browser_state.page)
+            if page := await browser_state.get_working_page():
+                self.register_async_operations(organization, task, page)
 
             step, detailed_output = await self.agent_step(task, step, browser_state, organization=organization)
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)
@@ -796,7 +797,8 @@ class ForgeAgent:
             return failed_step, detailed_agent_step_output.get_clean_detailed_output()
 
     async def record_artifacts_after_action(self, task: Task, step: Step, browser_state: BrowserState) -> None:
-        if not browser_state.page:
+        working_page = await browser_state.get_working_page()
+        if not working_page:
             raise BrowserStateMissingPage()
         try:
             screenshot = await browser_state.take_screenshot(full_page=True)
@@ -814,7 +816,7 @@ class ForgeAgent:
             )
 
         try:
-            skyvern_frame = await SkyvernFrame.create_instance(frame=browser_state.page)
+            skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
             html = await skyvern_frame.get_content()
             await app.ARTIFACT_MANAGER.create_artifact(
                 step=step,
@@ -830,12 +832,15 @@ class ForgeAgent:
             )
 
         try:
-            video_data = await app.BROWSER_MANAGER.get_video_data(task_id=task.task_id, browser_state=browser_state)
-            await app.ARTIFACT_MANAGER.update_artifact_data(
-                artifact_id=browser_state.browser_artifacts.video_artifact_id,
-                organization_id=task.organization_id,
-                data=video_data,
+            video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
+                task_id=task.task_id, browser_state=browser_state
             )
+            for video_artifact in video_artifacts:
+                await app.ARTIFACT_MANAGER.update_artifact_data(
+                    artifact_id=video_artifact.video_artifact_id,
+                    organization_id=task.organization_id,
+                    data=video_artifact.video_data,
+                )
         except Exception:
             LOG.error(
                 "Failed to record video after action",
@@ -854,14 +859,20 @@ class ForgeAgent:
         else:
             browser_state = await app.BROWSER_MANAGER.get_or_create_for_task(task)
         # Initialize video artifact for the task here, afterwards it'll only get updated
-        if browser_state and not browser_state.browser_artifacts.video_artifact_id:
-            video_data = await app.BROWSER_MANAGER.get_video_data(task_id=task.task_id, browser_state=browser_state)
-            video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.RECORDING,
-                data=video_data,
+        if browser_state and browser_state.browser_artifacts:
+            video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
+                task_id=task.task_id, browser_state=browser_state
             )
-            app.BROWSER_MANAGER.set_video_artifact_for_task(task, video_artifact_id)
+            for idx, video_artifact in enumerate(video_artifacts):
+                if video_artifact.video_artifact_id:
+                    continue
+                video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                    step=step,
+                    artifact_type=ArtifactType.RECORDING,
+                    data=video_artifact.video_data,
+                )
+                video_artifacts[idx].video_artifact_id = video_artifact_id
+            app.BROWSER_MANAGER.set_video_artifact_for_task(task, video_artifacts)
 
         detailed_output = DetailedAgentStepOutput(
             scraped_page=None,
@@ -1005,9 +1016,8 @@ class ForgeAgent:
         # Generate the extract action prompt
         navigation_goal = task.navigation_goal
         starting_url = task.url
-        current_url = (
-            await browser_state.page.evaluate("() => document.location.href") if browser_state.page else starting_url
-        )
+        page = await browser_state.get_working_page()
+        current_url = await page.evaluate("() => document.location.href") if page else starting_url
         final_navigation_payload = self._build_navigation_payload(
             task, expire_verification_code=expire_verification_code
         )
@@ -1346,12 +1356,14 @@ class ForgeAgent:
         browser_state = await app.BROWSER_MANAGER.cleanup_for_task(task.task_id, close_browser_on_completion)
         if browser_state:
             # Update recording artifact after closing the browser, so we can get an accurate recording
-            video_data = await app.BROWSER_MANAGER.get_video_data(task_id=task.task_id, browser_state=browser_state)
-            if video_data:
+            video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
+                task_id=task.task_id, browser_state=browser_state
+            )
+            for video_artifact in video_artifacts:
                 await app.ARTIFACT_MANAGER.update_artifact_data(
-                    artifact_id=browser_state.browser_artifacts.video_artifact_id,
+                    artifact_id=video_artifact.video_artifact_id,
                     organization_id=task.organization_id,
-                    data=video_data,
+                    data=video_artifact.video_data,
                 )
 
             har_data = await app.BROWSER_MANAGER.get_har_data(task_id=task.task_id, browser_state=browser_state)

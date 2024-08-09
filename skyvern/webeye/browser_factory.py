@@ -85,15 +85,13 @@ class BrowserContextFactory:
 
     @staticmethod
     def build_browser_artifacts(
-        video_path: str | None = None,
+        video_artifacts: list[VideoArtifact] | None = None,
         har_path: str | None = None,
-        video_artifact_id: str | None = None,
         traces_dir: str | None = None,
     ) -> BrowserArtifacts:
         return BrowserArtifacts(
-            video_path=video_path,
+            video_artifacts=video_artifacts or [],
             har_path=har_path,
-            video_artifact_id=video_artifact_id,
             traces_dir=traces_dir,
         )
 
@@ -130,9 +128,14 @@ class BrowserContextFactory:
         return await cls._validator(page)
 
 
-class BrowserArtifacts(BaseModel):
+class VideoArtifact(BaseModel):
     video_path: str | None = None
     video_artifact_id: str | None = None
+    video_data: bytes = bytes()
+
+
+class BrowserArtifacts(BaseModel):
+    video_artifacts: list[VideoArtifact] = []
     har_path: str | None = None
     traces_dir: str | None = None
 
@@ -175,24 +178,26 @@ class BrowserState:
         browser_artifacts: BrowserArtifacts = BrowserArtifacts(),
         browser_cleanup: BrowserCleanupFunc = None,
     ):
+        self.__page = page
         self.pw = pw
         self.browser_context = browser_context
-        self.page = page
         self.browser_artifacts = browser_artifacts
         self.browser_cleanup = browser_cleanup
 
-    def __assert_page(self) -> Page:
-        if self.page is not None:
-            return self.page
+    async def __assert_page(self) -> Page:
+        page = await self.get_working_page()
+        if page is not None:
+            return page
         LOG.error("BrowserState has no page")
         raise MissingBrowserStatePage()
 
     async def _close_all_other_pages(self) -> None:
-        if not self.browser_context or not self.page:
+        cur_page = await self.get_working_page()
+        if not self.browser_context or not cur_page:
             return
         pages = self.browser_context.pages
         for page in pages:
-            if page != self.page:
+            if page != cur_page:
                 await page.close()
 
     async def check_and_fix_state(
@@ -226,21 +231,22 @@ class BrowserState:
 
         assert self.browser_context is not None
 
-        if self.page is None:
+        if await self.get_working_page() is None:
             success = False
             retries = 0
 
             while not success and retries < 3:
                 try:
                     LOG.info("Creating a new page")
-                    self.page = await self.browser_context.new_page()
+                    page = await self.browser_context.new_page()
+                    await self.set_working_page(page, 0)
                     await self._close_all_other_pages()
                     LOG.info("A new page is created")
                     if url:
                         LOG.info(f"Navigating page to {url} and waiting for 5 seconds")
                         try:
                             start_time = time.time()
-                            await self.page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+                            await page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
                             end_time = time.time()
                             LOG.info(
                                 "Page loading time",
@@ -270,8 +276,31 @@ class BrowserState:
                         raise e
                     LOG.info(f"Retrying to create a new page. Retry count: {retries}")
 
-        if self.browser_artifacts.video_path is None:
-            self.browser_artifacts.video_path = await self.page.video.path() if self.page and self.page.video else None
+    async def get_working_page(self) -> Page | None:
+        if self.__page is None or self.browser_context is None or len(self.browser_context.pages) == 0:
+            return None
+
+        last_page = self.browser_context.pages[-1]
+        if self.__page == last_page:
+            return self.__page
+        await self.set_working_page(last_page, len(self.browser_context.pages) - 1)
+        return last_page
+
+    async def set_working_page(self, page: Page | None, index: int = 0) -> None:
+        self.__page = page
+        if page is None:
+            return
+        if len(self.browser_artifacts.video_artifacts) > index:
+            if self.browser_artifacts.video_artifacts[index].video_path is None:
+                self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
+            return
+
+        target_lenght = index + 1
+        self.browser_artifacts.video_artifacts.extend(
+            [VideoArtifact()] * (target_lenght - len(self.browser_artifacts.video_artifacts))
+        )
+        self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
+        return
 
     async def get_or_create_page(
         self,
@@ -280,8 +309,9 @@ class BrowserState:
         task_id: str | None = None,
         workflow_run_id: str | None = None,
     ) -> Page:
-        if self.page is not None:
-            return self.page
+        page = await self.get_working_page()
+        if page is not None:
+            return page
 
         try:
             await self.check_and_fix_state(
@@ -295,26 +325,26 @@ class BrowserState:
             await self.check_and_fix_state(
                 url=url, proxy_location=proxy_location, task_id=task_id, workflow_run_id=workflow_run_id
             )
-        assert self.page is not None
+        await self.__assert_page()
 
-        if not await BrowserContextFactory.validate_browser_context(self.page):
+        if not await BrowserContextFactory.validate_browser_context(await self.get_working_page()):
             await self.close_current_open_page()
             await self.check_and_fix_state(
                 url=url, proxy_location=proxy_location, task_id=task_id, workflow_run_id=workflow_run_id
             )
-            assert self.page is not None
+            await self.__assert_page()
 
-        return self.page
+        return page
 
     async def close_current_open_page(self) -> None:
         await self._close_all_other_pages()
         if self.browser_context is not None:
             await self.browser_context.close()
         self.browser_context = None
-        self.page = None
+        await self.set_working_page(None)
 
     async def stop_page_loading(self) -> None:
-        page = self.__assert_page()
+        page = await self.__assert_page()
         try:
             await page.evaluate("window.stop()")
         except Exception as e:
@@ -322,7 +352,7 @@ class BrowserState:
             raise FailedToStopLoadingPage(url=page.url, error_message=repr(e))
 
     async def reload_page(self) -> None:
-        page = self.__assert_page()
+        page = await self.__assert_page()
 
         LOG.info(f"Reload page {page.url} and waiting for 5 seconds")
         try:
@@ -353,5 +383,5 @@ class BrowserState:
             LOG.info("Playwright is stopped")
 
     async def take_screenshot(self, full_page: bool = False, file_path: str | None = None) -> bytes:
-        page = self.__assert_page()
+        page = await self.__assert_page()
         return await SkyvernFrame.take_screenshot(page=page, full_page=full_page, file_path=file_path)
