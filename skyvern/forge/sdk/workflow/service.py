@@ -744,16 +744,16 @@ class WorkflowService:
         self, browser_state: BrowserState, workflow: Workflow, workflow_run: WorkflowRun
     ) -> None:
         # Create recording artifact after closing the browser, so we can get an accurate recording
-        video_data = await app.BROWSER_MANAGER.get_video_data(
+        video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
             workflow_id=workflow.workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
         )
-        if video_data:
+        for video_artifact in video_artifacts:
             await app.ARTIFACT_MANAGER.update_artifact_data(
-                artifact_id=browser_state.browser_artifacts.video_artifact_id,
+                artifact_id=video_artifact.video_artifact_id,
                 organization_id=workflow.organization_id,
-                data=video_data,
+                data=video_artifact.video_data,
             )
 
     async def persist_har_data(

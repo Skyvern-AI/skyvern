@@ -6,7 +6,7 @@ from playwright.async_api import async_playwright
 from skyvern.exceptions import MissingBrowserState
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
-from skyvern.webeye.browser_factory import BrowserContextFactory, BrowserState
+from skyvern.webeye.browser_factory import BrowserContextFactory, BrowserState, VideoArtifact
 
 LOG = structlog.get_logger()
 
@@ -96,52 +96,42 @@ class BrowserManager:
             return self.pages[workflow_run_id]
         return None
 
-    def set_video_artifact_for_task(self, task: Task, artifact_id: str) -> None:
+    def set_video_artifact_for_task(self, task: Task, artifacts: list[VideoArtifact]) -> None:
         if task.workflow_run_id and task.workflow_run_id in self.pages:
-            if self.pages[task.workflow_run_id].browser_artifacts.video_artifact_id:
-                LOG.warning(
-                    "Video artifact is already set for workflow run. Overwriting",
-                    workflow_run_id=task.workflow_run_id,
-                    old_artifact_id=self.pages[task.workflow_run_id].browser_artifacts.video_artifact_id,
-                    new_artifact_id=artifact_id,
-                )
-            self.pages[task.workflow_run_id].browser_artifacts.video_artifact_id = artifact_id
+            self.pages[task.workflow_run_id].browser_artifacts.video_artifacts = artifacts
             return
         if task.task_id in self.pages:
-            if self.pages[task.task_id].browser_artifacts.video_artifact_id:
-                LOG.warning(
-                    "Video artifact is already set for task. Overwriting",
-                    task_id=task.task_id,
-                    old_artifact_id=self.pages[task.task_id].browser_artifacts.video_artifact_id,
-                    new_artifact_id=artifact_id,
-                )
-            self.pages[task.task_id].browser_artifacts.video_artifact_id = artifact_id
+            self.pages[task.task_id].browser_artifacts.video_artifacts = artifacts
             return
 
         raise MissingBrowserState(task_id=task.task_id)
 
-    async def get_video_data(
+    async def get_video_artifacts(
         self,
         browser_state: BrowserState,
         task_id: str = "",
         workflow_id: str = "",
         workflow_run_id: str = "",
-    ) -> bytes:
-        if browser_state:
-            path = browser_state.browser_artifacts.video_path
+    ) -> list[VideoArtifact]:
+        if len(browser_state.browser_artifacts.video_artifacts) == 0:
+            LOG.warning(
+                "Video data not found for task",
+                task_id=task_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+            )
+            return []
+
+        for i, video_artifact in enumerate(browser_state.browser_artifacts.video_artifacts):
+            path = video_artifact.video_path
             if path:
                 try:
                     with open(path, "rb") as f:
-                        return f.read()
+                        browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
+
                 except FileNotFoundError:
                     pass
-        LOG.warning(
-            "Video data not found for task",
-            task_id=task_id,
-            workflow_id=workflow_id,
-            workflow_run_id=workflow_run_id,
-        )
-        return b""
+        return browser_state.browser_artifacts.video_artifacts
 
     async def get_har_data(
         self,
