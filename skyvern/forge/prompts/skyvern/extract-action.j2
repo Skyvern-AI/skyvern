@@ -9,8 +9,8 @@ If you see a popup in the page screenshot, prioritize actions on the popup.
 
 Reply in JSON format with the following keys:
 {
+    "user_goal_stage": str, // A string to describe the reasoning whether user goal has been achieved or not.
     "user_goal_achieved": bool, // True if the user goal has been completed, otherwise False.
-    "user_goal_stage": str, // If user_goal_achieved is True, describe why user goal is achieved. If user_goal_achieved is False, describe why user goal is not achieved.
     "action_plan": str, // A string that describes the plan of actions you're going to take. Be specific and to the point. Use this as a quick summary of the actions you're going to take, and what order you're going to take them in, and how that moves you towards your overall goal. Output "COMPLETE" action in the "actions" if user goal has been achieved.
     "actions": array // An array of actions. Here's the format of each action:
     [{
