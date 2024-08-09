@@ -1015,7 +1015,7 @@ async def scroll_down_to_load_all_options(
         await page.mouse.wheel(0, -20)
         await page.mouse.wheel(0, 20)
         # wait for while to load new options
-        await asyncio.sleep(5)
+        await asyncio.sleep(10)
 
         current_num = await incremental_scraped.get_incremental_elements_num()
         LOG.info(
