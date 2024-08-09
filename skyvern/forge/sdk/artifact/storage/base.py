@@ -51,3 +51,11 @@ class BaseStorage(ABC):
     @abstractmethod
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
         pass
+
+    @abstractmethod
+    async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
+        pass
+
+    @abstractmethod
+    async def get_streaming_file(self, organization_id: str, file_name: str) -> bytes | None:
+        pass

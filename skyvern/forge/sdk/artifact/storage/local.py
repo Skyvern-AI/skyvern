@@ -67,6 +67,23 @@ class LocalStorage(BaseStorage):
     async def get_share_links(self, artifacts: list[Artifact]) -> list[str]:
         return [artifact.uri for artifact in artifacts]
 
+    async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
+        return
+
+    async def get_streaming_file(self, organization_id: str, file_name: str) -> bytes | None:
+        file_path = None
+        try:
+            file_path = Path(f"{SettingsManager.get_settings().STREAMING_FILE_BASE_PATH}/{organization_id}/{file_name}")
+            with open(file_path, "rb") as f:
+                return f.read()
+        except Exception:
+            LOG.exception(
+                "Failed to retrieve streaming file.",
+                organization_id=organization_id,
+                file_name=file_name,
+            )
+            return None
+
     @staticmethod
     def _parse_uri_to_path(uri: str) -> str:
         parsed_uri = urlparse(uri)
