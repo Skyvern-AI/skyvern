@@ -57,5 +57,5 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
-    async def get_streaming_file(self, organization_id: str, file_name: str) -> bytes | None:
+    async def get_streaming_file(self, organization_id: str, file_name: str, use_default: bool = True) -> bytes | None:
         pass

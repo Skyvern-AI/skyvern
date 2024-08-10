@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Awaitable, Callable
 
 import structlog
-from fastapi import APIRouter, FastAPI, Response, status
+from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
@@ -17,6 +17,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.routes.agent_protocol import base_router
+from skyvern.forge.sdk.routes.streaming import websocket_router
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.scheduler import SCHEDULER
 
@@ -30,7 +31,7 @@ class ExecutionDatePlugin(Plugin):
         return datetime.now()
 
 
-def get_agent_app(router: APIRouter = base_router) -> FastAPI:
+def get_agent_app() -> FastAPI:
     """
     Start the agent server.
     """
@@ -46,7 +47,8 @@ def get_agent_app(router: APIRouter = base_router) -> FastAPI:
         allow_headers=["*"],
     )
 
-    app.include_router(router, prefix="/api/v1")
+    app.include_router(base_router, prefix="/api/v1")
+    app.include_router(websocket_router, prefix="/api/v1/stream")
 
     app.add_middleware(
         RawContextMiddleware,

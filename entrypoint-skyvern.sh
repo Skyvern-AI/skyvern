@@ -16,5 +16,8 @@ if [ ! -f ".streamlit/secrets.toml" ]; then
     echo ".streamlit/secrets.toml file updated with organization details."
 fi
 
+xterm 2>/dev/null &
+python run_streaming.py &
+
 # Run the command and pass in all three arguments
 xvfb-run python -m skyvern.forge
