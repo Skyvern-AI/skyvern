@@ -42,13 +42,6 @@ async def task_stream(
             LOG.info("ConnectionClosedOK error while sending invalid credential message")
         return
 
-    # if organization_id in settings.ORGANIZATION_IDS_FOR_BILLING:
-    #     try:
-    #         await websocket.send_text("Organization is not allowed to stream")
-    #     except ConnectionClosedOK:
-    #         LOG.info("ConnectionClosedOK error while sending organization not allowed to stream message")
-    #     return
-
     LOG.info("Started task streaming", task_id=task_id, organization_id=organization_id)
     # timestamp last time when streaming activity happens
     last_activity_timestamp = datetime.utcnow()

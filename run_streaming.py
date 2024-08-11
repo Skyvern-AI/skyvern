@@ -17,7 +17,9 @@ async def run() -> None:
 
     while True:
         # run subprocess to take screenshot
-        subprocess.run(f"xwd -root | xwdtopnm | pnmtopng > {png_file_path}", shell=True)
+        subprocess.run(
+            f"xwd -root | xwdtopnm 2>/dev/null | pnmtopng > {png_file_path}", shell=True, env={"DISPLAY": ":99"}
+        )
 
         # upload screenshot to S3
         try:
