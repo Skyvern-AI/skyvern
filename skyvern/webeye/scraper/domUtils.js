@@ -219,7 +219,10 @@ function isElementVisible(element) {
   )
     return element.parentElement && isElementVisible(element.parentElement);
 
-  if (element.className.toString().includes("select2-offscreen")) {
+  if (
+    element.className.toString().includes("select2-offscreen") ||
+    element.className.toString().includes("select2-hidden")
+  ) {
     return false;
   }
 
@@ -468,10 +471,21 @@ const isComboboxDropdown = (element) => {
 };
 
 const isSelect2Dropdown = (element) => {
-  return (
-    element.tagName.toLowerCase() === "a" &&
-    element.className.toString().includes("select2-choice")
-  );
+  const tagName = element.tagName.toLowerCase();
+  const className = element.className.toString();
+  const role = element.getAttribute("role")
+    ? element.getAttribute("role").toLowerCase()
+    : "";
+
+  if (tagName === "a") {
+    return className.includes("select2-choice");
+  }
+
+  if (tagName === "span") {
+    return className.includes("select2-selection") && role === "combobox";
+  }
+
+  return false;
 };
 
 const isSelect2MultiChoice = (element) => {
