@@ -72,19 +72,3 @@ services:
     depends_on:
       skyvern:
         condition: service_healthy
-  
-  streamlit:
-    image: public.ecr.aws/skyvern/skyvern:latest
-    restart: on-failure
-    ports:
-      - 8501:8501
-    volumes:
-      - ./artifacts:/data/artifacts
-      - ./videos:/data/videos
-      - ./har:/data/har
-      - ./.streamlit:/app/.streamlit
-    command: ["/bin/bash", "entrypoint-streamlit.sh"]
-    depends_on:
-      skyvern:
-        condition: service_healthy
-
