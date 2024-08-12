@@ -31,6 +31,7 @@ services:
       - ./videos:/data/videos
       - ./har:/data/har
       - ./.streamlit:/app/.streamlit
+      - ./files:/tmp
     environment:
       - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
       - BROWSER_TYPE=chromium-headful
@@ -66,7 +67,8 @@ services:
       - ./videos:/data/videos
       - ./har:/data/har
       - ./.streamlit:/app/.streamlit
-    # environment:
+    environment:
+      - VITE_WSS_BASE_URL=ws://localhost:8000/api/v1
     #   - VITE_API_BASE_URL=
     #   - VITE_SKYVERN_API_KEY=
     depends_on:

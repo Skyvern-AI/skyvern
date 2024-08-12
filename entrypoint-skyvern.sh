@@ -16,5 +16,24 @@ if [ ! -f ".streamlit/secrets.toml" ]; then
     echo ".streamlit/secrets.toml file updated with organization details."
 fi
 
+_kill_xvfb_on_term() {
+  kill -TERM $xvfb
+}
+
+# Setup a trap to catch SIGTERM and relay it to child processes
+trap _kill_xvfb_on_term TERM
+
+echo "Starting Xvfb..."
+# delete the lock file if any
+rm -f /tmp/.X99-lock
+# Set display environment variable
+export DISPLAY=:99
+# Start Xvfb
+Xvfb :99 -screen 0 1920x1080x16 &
+xvfb=$!
+
+DISPLAY=:99 xterm 2>/dev/null &
+python run_streaming.py > /dev/null &
+
 # Run the command and pass in all three arguments
-xvfb-run python -m skyvern.forge
+python -m skyvern.forge

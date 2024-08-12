@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir --upgrade -r requirements.txt
 RUN pip install --no-cache-dir streamlit
 RUN playwright install-deps
 RUN playwright install
-RUN apt-get install -y xauth && apt-get clean
+RUN apt-get install -y xauth x11-apps netpbm && apt-get clean
 
 COPY . /app
 
@@ -29,6 +29,3 @@ COPY ./entrypoint-streamlit.sh /app/entrypoint-streamlit.sh
 RUN chmod +x /app/entrypoint-streamlit.sh
 
 CMD [ "/bin/bash", "/app/entrypoint-skyvern.sh" ]
-
-
-
