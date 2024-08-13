@@ -326,7 +326,7 @@ async def handle_input_text_action(
         await asyncio.sleep(5)
 
         incremental_element = await incremental_scraped.get_incremental_element_tree(
-            app.AGENT_FUNCTION.cleanup_element_tree
+            app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step)
         )
         if len(incremental_element) == 0:
             LOG.info(
@@ -593,7 +593,7 @@ async def handle_select_option_action(
         is_open = True
 
         incremental_element = await incremental_scraped.get_incremental_element_tree(
-            app.AGENT_FUNCTION.cleanup_element_tree
+            app.AGENT_FUNCTION.cleanup_element_tree_factory(step=step, task=task)
         )
         if len(incremental_element) == 0:
             raise NoIncrementalElementFoundForCustomSelection(element_id=action.element_id)
@@ -887,7 +887,7 @@ async def select_from_dropdown(
         )
 
     trimmed_element_tree = await incremental_scraped.get_incremental_element_tree(
-        app.AGENT_FUNCTION.cleanup_element_tree
+        app.AGENT_FUNCTION.cleanup_element_tree_factory(step=step, task=task)
     )
     if dropdown_menu_element:
         # if there's a dropdown menu detected, only elements in the dropdown should be sent to LLM
