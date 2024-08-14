@@ -53,7 +53,11 @@ class BitwardenService:
         if additional_env:
             env.update(additional_env)  # Update with any additional environment variables
 
-        return subprocess.run(command, capture_output=True, text=True, env=env)
+        try:
+            return subprocess.run(command, capture_output=True, text=True, env=env, timeout=60)
+        except subprocess.TimeoutExpired as e:
+            LOG.error("Bitwarden command timed out", stdout=e.stdout, stderr=e.stderr, timeout=60)
+            raise e
 
     @staticmethod
     def _extract_session_key(unlock_cmd_output: str) -> str | None:
@@ -295,9 +299,12 @@ class BitwardenService:
                 # The identity item may store sensitive information in custom fields or default fields
                 # Custom fields are prioritized over default fields
                 # TODO (kerem): Make this case insensitive?
-                if field in identity_item["fields"]:
-                    sensitive_information[field] = identity_item["fields"][field]["value"]
-                elif field in identity_item["identity"]:
+                for item in identity_item["fields"]:
+                    if item["name"] == field:
+                        sensitive_information[field] = item["value"]
+                        break
+
+                if field in identity_item["identity"] and field not in sensitive_information:
                     sensitive_information[field] = identity_item["identity"][field]
 
             return sensitive_information
