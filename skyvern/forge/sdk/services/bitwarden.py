@@ -56,7 +56,7 @@ class BitwardenService:
         try:
             return subprocess.run(command, capture_output=True, text=True, env=env, timeout=60)
         except subprocess.TimeoutExpired as e:
-            LOG.error(f"Bitwarden command timed out after 60 seconds", stdout=e.stdout, stderr=e.stderr)
+            LOG.error("Bitwarden command timed out after 60 seconds", stdout=e.stdout, stderr=e.stderr)
             raise e
 
     @staticmethod
