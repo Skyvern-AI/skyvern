@@ -270,6 +270,12 @@ function isScriptOrStyle(element) {
   return tagName === "script" || tagName === "style";
 }
 
+function hasAngularClickBinding(element) {
+  return (
+    element.hasAttribute("ng-click") || element.hasAttribute("data-ng-click")
+  );
+}
+
 function hasWidgetRole(element) {
   const role = element.getAttribute("role");
   if (!role) {
@@ -386,6 +392,10 @@ function isInteractable(element) {
     element.isContentEditable ||
     element.hasAttribute("jsaction")
   ) {
+    return true;
+  }
+
+  if (tagName === "div" && hasAngularClickBinding(element)) {
     return true;
   }
 
