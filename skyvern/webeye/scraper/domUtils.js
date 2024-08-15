@@ -303,6 +303,22 @@ function hasWidgetRole(element) {
   return widgetRoles.includes(role.toLowerCase().trim());
 }
 
+function isTableRelatedElement(element) {
+  const tagName = element.tagName.toLowerCase();
+  return [
+    "table",
+    "caption",
+    "thead",
+    "tbody",
+    "tfoot",
+    "tr",
+    "th",
+    "td",
+    "colgroup",
+    "col",
+  ].includes(tagName);
+}
+
 function isInteractableInput(element) {
   const tagName = element.tagName.toLowerCase();
   const type = element.getAttribute("type") ?? "text"; // Default is text: https://www.w3schools.com/html/html_form_input_types.asp
@@ -1050,6 +1066,10 @@ async function buildElementTree(
           elementObj = await buildElementObject(element, false);
         } else if (isParentSVG && isParentSVG.getAttribute("unique_id")) {
           // if elemnet is the children of the <svg> with an unique_id
+          elementObj = await buildElementObject(element, false);
+        } else if (isTableRelatedElement(element)) {
+          // build all table related elements into skyvern element
+          // we need these elements to preserve the DOM structure
           elementObj = await buildElementObject(element, false);
         } else {
           // character length limit for non-interactable elements should be 5000
