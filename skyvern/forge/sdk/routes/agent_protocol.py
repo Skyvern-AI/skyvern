@@ -110,6 +110,7 @@ async def check_server_status() -> Response:
     include_in_schema=False,
 )
 async def create_agent_task(
+    request: Request,
     background_tasks: BackgroundTasks,
     task: TaskRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -123,6 +124,7 @@ async def create_agent_task(
     if x_max_steps_override:
         LOG.info("Overriding max steps per run", max_steps_override=x_max_steps_override)
     await AsyncExecutorFactory.get_executor().execute_task(
+        request=request,
         background_tasks=background_tasks,
         task_id=created_task.task_id,
         organization_id=current_org.organization_id,
@@ -518,6 +520,7 @@ async def get_task_actions(
     include_in_schema=False,
 )
 async def execute_workflow(
+    request: Request,
     background_tasks: BackgroundTasks,
     workflow_id: str,  # this is the workflow_permanent_id
     workflow_request: WorkflowRequestBody,
@@ -540,6 +543,7 @@ async def execute_workflow(
     if x_max_steps_override:
         LOG.info("Overriding max steps per run", max_steps_override=x_max_steps_override)
     await AsyncExecutorFactory.get_executor().execute_workflow(
+        request=request,
         background_tasks=background_tasks,
         organization_id=current_org.organization_id,
         workflow_id=workflow_run.workflow_id,

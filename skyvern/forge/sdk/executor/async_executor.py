@@ -1,7 +1,7 @@
 import abc
 
 import structlog
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, Request
 
 from skyvern.exceptions import OrganizationNotFound
 from skyvern.forge import app
@@ -16,6 +16,7 @@ class AsyncExecutor(abc.ABC):
     @abc.abstractmethod
     async def execute_task(
         self,
+        request: Request | None,
         background_tasks: BackgroundTasks,
         task_id: str,
         organization_id: str,
@@ -28,6 +29,7 @@ class AsyncExecutor(abc.ABC):
     @abc.abstractmethod
     async def execute_workflow(
         self,
+        request: Request | None,
         background_tasks: BackgroundTasks,
         organization_id: str,
         workflow_id: str,
@@ -42,6 +44,7 @@ class AsyncExecutor(abc.ABC):
 class BackgroundTaskExecutor(AsyncExecutor):
     async def execute_task(
         self,
+        request: Request | None,
         background_tasks: BackgroundTasks,
         task_id: str,
         organization_id: str,
@@ -83,6 +86,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
 
     async def execute_workflow(
         self,
+        request: Request | None,
         background_tasks: BackgroundTasks,
         organization_id: str,
         workflow_id: str,
