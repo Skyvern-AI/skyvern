@@ -46,6 +46,10 @@ class LLMAPIHandlerFactory:
             ),
             num_retries=llm_config.num_retries,
             retry_after=llm_config.retry_delay_seconds,
+            disable_cooldowns=llm_config.disable_cooldowns,
+            allowed_fails=llm_config.allowed_fails,
+            allowed_fails_policy=llm_config.allowed_fails_policy,
+            cooldown_time=llm_config.cooldown_time,
             set_verbose=(False if SettingsManager.get_settings().is_cloud_environment() else llm_config.set_verbose),
             enable_pre_call_checks=True,
         )
