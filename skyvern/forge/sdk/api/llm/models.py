@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Literal, Optional, Protocol, TypedDict
 
+from litellm import AllowedFailsPolicy
+
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
@@ -62,6 +64,10 @@ class LLMRouterConfig(LLMConfigBase):
     num_retries: int = 1
     retry_delay_seconds: int = 15
     set_verbose: bool = False
+    disable_cooldowns: bool | None = None
+    allowed_fails: int | None = None
+    allowed_fails_policy: AllowedFailsPolicy | None = None
+    cooldown_time: float | None = None
 
 
 class LLMAPIHandler(Protocol):
