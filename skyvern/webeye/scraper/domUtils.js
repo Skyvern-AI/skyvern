@@ -877,108 +877,104 @@ function uniqueId() {
   return result;
 }
 
-async function buildTreeFromBody(frame = "main.frame", open_select = false) {
+function buildElementObject(frame, element, interactable) {
+  var element_id = element.getAttribute("unique_id") ?? uniqueId();
+  var elementTagNameLower = element.tagName.toLowerCase();
+  element.setAttribute("unique_id", element_id);
+
+  const attrs = {};
+  for (const attr of element.attributes) {
+    var attrValue = attr.value;
+    if (
+      attr.name === "required" ||
+      attr.name === "aria-required" ||
+      attr.name === "checked" ||
+      attr.name === "aria-checked" ||
+      attr.name === "selected" ||
+      attr.name === "aria-selected" ||
+      attr.name === "readonly" ||
+      attr.name === "aria-readonly"
+    ) {
+      if (attrValue && attrValue.toLowerCase() === "false") {
+        attrValue = false;
+      } else {
+        attrValue = true;
+      }
+    }
+    attrs[attr.name] = attrValue;
+  }
+
+  if (
+    checkRequiredFromStyle(element) &&
+    !attrs["required"] &&
+    !attrs["aria-required"]
+  ) {
+    attrs["required"] = true;
+  }
+
+  if (elementTagNameLower === "input" || elementTagNameLower === "textarea") {
+    if (element.type === "radio") {
+      attrs["value"] = "" + element.checked + "";
+    } else {
+      attrs["value"] = element.value;
+    }
+  }
+
+  let elementObj = {
+    id: element_id,
+    frame: frame,
+    interactable: interactable,
+    tagName: elementTagNameLower,
+    attributes: attrs,
+    text: getElementContent(element),
+    children: [],
+    rect: DomUtils.getVisibleClientRect(element, true),
+    // don't trim any attr of this element if keepAllAttr=True
+    keepAllAttr:
+      elementTagNameLower === "svg" || element.closest("svg") !== null,
+    isSelectable:
+      elementTagNameLower === "select" ||
+      isSelect2Dropdown(element) ||
+      isSelect2MultiChoice(element),
+    isScrollable: isScrollable(element),
+  };
+
+  let isInShadowRoot = element.getRootNode() instanceof ShadowRoot;
+  if (isInShadowRoot) {
+    let shadowHostEle = element.getRootNode().host;
+    let shadowHostId = shadowHostEle.getAttribute("unique_id");
+    // assign shadowHostId to the shadowHost element if it doesn't have unique_id
+    if (!shadowHostId) {
+      shadowHostId = uniqueId();
+      shadowHostEle.setAttribute("unique_id", shadowHostId);
+    }
+    elementObj.shadowHost = shadowHostId;
+  }
+
+  // get options for select element or for listbox element
+  let selectOptions = null;
+  let selectedValue = "";
+  if (elementTagNameLower === "select") {
+    [selectOptions, selectedValue] = getSelectOptions(element);
+  }
+
+  if (selectOptions) {
+    elementObj.options = selectOptions;
+  }
+  if (selectedValue) {
+    elementObj.attributes["selected"] = selectedValue;
+  }
+
+  return elementObj;
+}
+
+function buildTreeFromBody(frame = "main.frame", open_select = false) {
   return buildElementTree(document.body, frame, open_select);
 }
 
-async function buildElementTree(
-  starter = document.body,
-  frame = "main.frame",
-  open_select = false,
-) {
+function buildElementTree(starter = document.body, frame = "main.frame") {
   var elements = [];
   var resultArray = [];
-
-  async function buildElementObject(element, interactable) {
-    var element_id = element.getAttribute("unique_id") ?? uniqueId();
-    var elementTagNameLower = element.tagName.toLowerCase();
-    element.setAttribute("unique_id", element_id);
-
-    const attrs = {};
-    for (const attr of element.attributes) {
-      var attrValue = attr.value;
-      if (
-        attr.name === "required" ||
-        attr.name === "aria-required" ||
-        attr.name === "checked" ||
-        attr.name === "aria-checked" ||
-        attr.name === "selected" ||
-        attr.name === "aria-selected" ||
-        attr.name === "readonly" ||
-        attr.name === "aria-readonly"
-      ) {
-        if (attrValue && attrValue.toLowerCase() === "false") {
-          attrValue = false;
-        } else {
-          attrValue = true;
-        }
-      }
-      attrs[attr.name] = attrValue;
-    }
-
-    if (
-      checkRequiredFromStyle(element) &&
-      !attrs["required"] &&
-      !attrs["aria-required"]
-    ) {
-      attrs["required"] = true;
-    }
-
-    if (elementTagNameLower === "input" || elementTagNameLower === "textarea") {
-      if (element.type === "radio") {
-        attrs["value"] = "" + element.checked + "";
-      } else {
-        attrs["value"] = element.value;
-      }
-    }
-
-    let elementObj = {
-      id: element_id,
-      frame: frame,
-      interactable: interactable,
-      tagName: elementTagNameLower,
-      attributes: attrs,
-      text: getElementContent(element),
-      children: [],
-      rect: DomUtils.getVisibleClientRect(element, true),
-      // don't trim any attr of this element if keepAllAttr=True
-      keepAllAttr:
-        elementTagNameLower === "svg" || element.closest("svg") !== null,
-      isSelectable:
-        elementTagNameLower === "select" ||
-        isSelect2Dropdown(element) ||
-        isSelect2MultiChoice(element),
-      isScrollable: isScrollable(element),
-    };
-
-    let isInShadowRoot = element.getRootNode() instanceof ShadowRoot;
-    if (isInShadowRoot) {
-      let shadowHostEle = element.getRootNode().host;
-      let shadowHostId = shadowHostEle.getAttribute("unique_id");
-      // assign shadowHostId to the shadowHost element if it doesn't have unique_id
-      if (!shadowHostId) {
-        shadowHostId = uniqueId();
-        shadowHostEle.setAttribute("unique_id", shadowHostId);
-      }
-      elementObj.shadowHost = shadowHostId;
-    }
-
-    // get options for select element or for listbox element
-    let selectOptions = null;
-    let selectedValue = "";
-    if (elementTagNameLower === "select") {
-      [selectOptions, selectedValue] = getSelectOptions(element);
-    }
-
-    if (selectOptions) {
-      elementObj.options = selectOptions;
-    }
-    if (selectedValue) {
-      elementObj.attributes["selected"] = selectedValue;
-    }
-
-    return elementObj;
-  }
 
   function getChildElements(element) {
     if (element.childElementCount !== 0) {
@@ -987,7 +983,7 @@ async function buildElementTree(
       return [];
     }
   }
-  async function processElement(element, parentId) {
+  function processElement(element, parentId) {
     if (element === null) {
       console.log("get a null element");
       return;
@@ -1008,7 +1004,7 @@ async function buildElementTree(
 
     // Check if the element is interactable
     if (isInteractable(element)) {
-      var elementObj = await buildElementObject(element, true);
+      var elementObj = buildElementObject(frame, element, true);
       elements.push(elementObj);
       // If the element is interactable but has no interactable parent,
       // then it starts a new tree, so add it to the result array
@@ -1029,24 +1025,24 @@ async function buildElementTree(
       const children = getChildElements(element);
       for (let i = 0; i < children.length; i++) {
         const childElement = children[i];
-        await processElement(childElement, elementObj.id);
+        processElement(childElement, elementObj.id);
       }
       return elementObj;
     } else if (element.tagName.toLowerCase() === "iframe") {
-      let iframeElementObject = await buildElementObject(element, false);
+      let iframeElementObject = buildElementObject(frame, element, false);
 
       elements.push(iframeElementObject);
       resultArray.push(iframeElementObject);
     } else if (element.shadowRoot) {
       // shadow host element
-      let shadowHostElement = await buildElementObject(element, false);
+      let shadowHostElement = buildElementObject(frame, element, false);
       elements.push(shadowHostElement);
       resultArray.push(shadowHostElement);
 
       const children = getChildElements(element.shadowRoot);
       for (let i = 0; i < children.length; i++) {
         const childElement = children[i];
-        await processElement(childElement, shadowHostElement.id);
+        processElement(childElement, shadowHostElement.id);
       }
     } else {
       // For a non-interactable element, if it has direct text, we also tagged
@@ -1063,14 +1059,14 @@ async function buildElementTree(
         let isParentSVG = element.closest("svg");
         if (element.tagName.toLowerCase() === "svg") {
           // if element is <svg> we save all attributes and its children
-          elementObj = await buildElementObject(element, false);
+          elementObj = buildElementObject(frame, element, false);
         } else if (isParentSVG && isParentSVG.getAttribute("unique_id")) {
           // if elemnet is the children of the <svg> with an unique_id
-          elementObj = await buildElementObject(element, false);
+          elementObj = buildElementObject(frame, element, false);
         } else if (isTableRelatedElement(element)) {
           // build all table related elements into skyvern element
           // we need these elements to preserve the DOM structure
-          elementObj = await buildElementObject(element, false);
+          elementObj = buildElementObject(frame, element, false);
         } else {
           // character length limit for non-interactable elements should be 5000
           // we don't use element context in HTML format,
@@ -1083,7 +1079,7 @@ async function buildElementTree(
             }
           }
           if (textContent && textContent.length <= 5000) {
-            elementObj = await buildElementObject(element, false);
+            elementObj = buildElementObject(frame, element, false);
           }
         }
 
@@ -1104,7 +1100,7 @@ async function buildElementTree(
       const children = getChildElements(element);
       for (let i = 0; i < children.length; i++) {
         const childElement = children[i];
-        await processElement(childElement, parentId);
+        processElement(childElement, parentId);
       }
     }
   }
@@ -1313,7 +1309,7 @@ async function buildElementTree(
   };
 
   // setup before parsing the dom
-  await processElement(starter, null);
+  processElement(starter, null);
 
   for (var element of elements) {
     if (
@@ -1545,17 +1541,17 @@ function removeBoundingBoxes() {
   }
 }
 
-async function scrollToTop(draw_boxes) {
+function scrollToTop(draw_boxes) {
   removeBoundingBoxes();
   window.scroll({ left: 0, top: 0, behavior: "instant" });
   if (draw_boxes) {
-    var elementsAndResultArray = await buildTreeFromBody();
+    var elementsAndResultArray = buildTreeFromBody();
     drawBoundingBoxes(elementsAndResultArray[0]);
   }
   return window.scrollY;
 }
 
-async function scrollToNextPage(draw_boxes) {
+function scrollToNextPage(draw_boxes) {
   // remove bounding boxes, scroll to next page with 200px overlap, then draw bounding boxes again
   // return true if there is a next page, false otherwise
   removeBoundingBoxes();
@@ -1565,7 +1561,7 @@ async function scrollToNextPage(draw_boxes) {
     behavior: "instant",
   });
   if (draw_boxes) {
-    var elementsAndResultArray = await buildTreeFromBody();
+    var elementsAndResultArray = buildTreeFromBody();
     drawBoundingBoxes(elementsAndResultArray[0]);
   }
   return window.scrollY;
@@ -1688,7 +1684,7 @@ function stopGlobalIncrementalObserver() {
   window.globalOneTimeIncrementElements = [];
 }
 
-async function getIncrementElements(frame) {
+function getIncrementElements(frame) {
   const domDepthMap = new Map();
 
   for (const element of window.globalOneTimeIncrementElements) {
@@ -1700,7 +1696,7 @@ async function getIncrementElements(frame) {
     }
 
     for (const child of element.newNodes) {
-      const [_, newNodeTree] = await buildElementTree(child, frame, false);
+      const [_, newNodeTree] = buildElementTree(child, frame, false);
       if (newNodeTree.length > 0) {
         newNodesTreeList.push(...newNodeTree);
       }

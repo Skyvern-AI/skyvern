@@ -168,6 +168,10 @@ class SkyvernFrame:
         js_script = "async (element) => await getListboxOptions(element)"
         return await self.frame.evaluate(js_script, element)
 
+    async def parse_element_from_html(self, frame: str, element: ElementHandle, interactable: bool) -> Dict:
+        js_script = "([frame, element, interactable]) => buildElementObject(frame, element, interactable)"
+        return await self.frame.evaluate(js_script, [frame, element, interactable])
+
     async def scroll_to_top(self, draw_boxes: bool) -> float:
         """
         Scroll to the top of the page and take a screenshot.
@@ -175,7 +179,7 @@ class SkyvernFrame:
         :param page: Page instance to take the screenshot from.
         :return: Screenshot of the page.
         """
-        js_script = f"async () => await scrollToTop({str(draw_boxes).lower()})"
+        js_script = f"() => scrollToTop({str(draw_boxes).lower()})"
         scroll_y_px = await self.frame.evaluate(js_script)
         return scroll_y_px
 
@@ -186,7 +190,7 @@ class SkyvernFrame:
         :param page: Page instance to take the screenshot from.
         :return: Screenshot of the page.
         """
-        js_script = f"async () => await scrollToNextPage({str(draw_boxes).lower()})"
+        js_script = f"() => scrollToNextPage({str(draw_boxes).lower()})"
         scroll_y_px = await self.frame.evaluate(js_script)
         return scroll_y_px
 

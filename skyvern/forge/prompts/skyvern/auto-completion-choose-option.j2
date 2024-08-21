@@ -1,0 +1,37 @@
+There is an input element on a HTML page. Based on the context and information you're provided, you have two goals: 
+    - Confirm if there is an auto completion attempt showing up after the user input the current value.
+    - If available auto completion suggestions show up, help user choose the element that's the most relevant to the input value.
+
+You can confirm auto completion attempt based on the following rules:
+    - Several auto completion suggestions show up for the input value. 
+    - Some messages, like "No results", "No match", also indicate an attempt to give auto completion suggestions.
+
+Potential auto completion suggesstion could only be:
+    - Element with ID from "HTML elements". Don't hallucinate any potential option outside "HTML elements".
+
+MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
+Each interactable element is tagged with an ID.
+
+Reply in JSON format with the following keys:
+{
+    "auto_completion_attempt": bool, // True if there's any auto completion attempt based on the rules. Otherwise, it should be False.
+    "reasoning": str, // The reasoning behind the decision. Be specific, referencing input value and element ids in your reasoning. Mention why you chose the element id. Keep the reasoning short and to the point.
+    "confidence_float": float, // The confidence of the action. Pick a number between 0.0 and 1.0. 0.0 means no confidence, 1.0 means full confidence.
+    "relevance_float": float, // The relative between the input value and the element. Pick a number between 0.00 and 1.00. 0.00 means no relevance, 1.00 means full relevance, the precision is 0.01.
+    "id": str, // The id of the most relevant and interactable element to take the action. The id must be from "HTML elements". It should be null if no element is relative or there's no auto completion suggestion.
+}
+
+Context:
+```
+{{ context_reasoning }}
+```
+
+Input value:
+```
+{{ filled_value }}
+```
+
+HTML elements:
+```
+{{ elements }}
+```
