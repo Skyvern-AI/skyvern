@@ -464,3 +464,38 @@ class NoElementMatchedForTargetOption(SkyvernException):
 class NoElementBoudingBox(SkyvernException):
     def __init__(self, element_id: str) -> None:
         super().__init__(f"Element does not have a bounding box. element_id={element_id}")
+
+
+class NoIncrementalElementFoundForAutoCompletion(SkyvernException):
+    def __init__(self, element_id: str, text: str) -> None:
+        super().__init__(f"No auto completion shown up after fill in [{text}]. element_id={element_id}")
+
+
+class NoSuitableAutoCompleteOption(SkyvernException):
+    def __init__(self, reasoning: str | None, target_value: str) -> None:
+        super().__init__(
+            f"No suitable auto complete option to choose. target_value={target_value}, reasoning={reasoning}"
+        )
+
+
+class NoAutoCompleteOptionMeetCondition(SkyvernException):
+    def __init__(
+        self, reasoning: str | None, required_relevance: float, target_value: str, closest_relevance: float
+    ) -> None:
+        super().__init__(
+            f"No auto complete option meet the condition(relevance_float>{required_relevance}). reasoning={reasoning}, target_value={target_value}, closest_relevance={closest_relevance}"
+        )
+
+
+class ErrEmptyTweakValue(SkyvernException):
+    def __init__(self, reasoning: str | None, current_value: str) -> None:
+        super().__init__(
+            f"Empty tweaked value for the current value. reasoning={reasoning}, current_value={current_value}"
+        )
+
+
+class FailToFindAutocompleteOption(SkyvernException):
+    def __init__(self, current_value: str) -> None:
+        super().__init__(
+            f"Can't find a suitable auto completion for the current value, maybe retry with another reasonable value. current_value={current_value}"
+        )

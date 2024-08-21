@@ -159,6 +159,22 @@ class SkyvernElement:
         haspopup = await self.get_attr("aria-haspopup")
         return tag_name == InteractiveElement.INPUT and role == "combobox" and haspopup == "listbox"
 
+    async def is_auto_completion_input(self) -> bool:
+        tag_name = self.get_tag_name()
+        if tag_name != InteractiveElement.INPUT:
+            return False
+
+        haspopup = await self.get_attr("aria-haspopup")
+        autocomplete = await self.get_attr("aria-autocomplete")
+        if haspopup and autocomplete:
+            return True
+
+        element_id = await self.get_attr("id")
+        if element_id == "location-input":
+            return True
+
+        return False
+
     async def is_checkbox(self) -> bool:
         tag_name = self.get_tag_name()
         if tag_name != "input":
@@ -181,6 +197,9 @@ class SkyvernElement:
     async def is_selectable(self) -> bool:
         return self.get_selectable() or self.get_tag_name() in SELECTABLE_ELEMENT
 
+    def get_element_dict(self) -> dict:
+        return self.__static_element
+
     def get_scrollable(self) -> bool:
         return self.__static_element.get("isScrollable", False)
 
@@ -192,6 +211,9 @@ class SkyvernElement:
 
     def get_id(self) -> str:
         return self.__static_element.get("id", "")
+
+    def get_frame_id(self) -> str:
+        return self.__static_element.get("frame", "")
 
     def get_attributes(self) -> typing.Dict:
         return self.__static_element.get("attributes", {})
@@ -314,10 +336,15 @@ class SkyvernElement:
         if length > TEXT_PRESS_MAX_LENGTH:
             # if the text is longer than TEXT_PRESS_MAX_LENGTH characters, we will locator.fill in initial texts until the last TEXT_PRESS_MAX_LENGTH characters
             # and then type the last TEXT_PRESS_MAX_LENGTH characters with locator.press_sequentially
-            await self.get_locator().fill(text[: length - TEXT_PRESS_MAX_LENGTH])
+            await self.input_fill(text[: length - TEXT_PRESS_MAX_LENGTH])
             text = text[length - TEXT_PRESS_MAX_LENGTH :]
 
-        await self.get_locator().press_sequentially(text, delay=TEXT_INPUT_DELAY, timeout=default_timeout)
+        await self.press_fill(text, timeout=default_timeout)
+
+    async def press_fill(
+        self, text: str, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    ) -> None:
+        await self.get_locator().press_sequentially(text, delay=TEXT_INPUT_DELAY, timeout=timeout)
 
     async def input_fill(
         self, text: str, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
@@ -376,6 +403,12 @@ class DomUtil:
     def __init__(self, scraped_page: ScrapedPage, page: Page) -> None:
         self.scraped_page = scraped_page
         self.page = page
+
+    def check_id_in_dom(self, element_id: str) -> bool:
+        css_selector = self.scraped_page.id_to_css_dict.get(element_id, "")
+        if css_selector:
+            return True
+        return False
 
     async def get_skyvern_element_by_id(self, element_id: str) -> SkyvernElement:
         element = self.scraped_page.id_to_element_dict.get(element_id)

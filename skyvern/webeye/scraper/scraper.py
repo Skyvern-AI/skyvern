@@ -337,7 +337,7 @@ async def get_interactable_element_tree_in_frame(
 
         unique_id = await frame_element.get_attribute("unique_id")
 
-        frame_js_script = f"async () => await buildTreeFromBody('{unique_id}', true)"
+        frame_js_script = f"() => buildTreeFromBody('{unique_id}', true)"
 
         await frame.evaluate(JS_FUNCTION_DEFS)
         frame_elements, frame_element_tree = await frame.evaluate(frame_js_script)
@@ -373,7 +373,7 @@ async def get_interactable_element_tree(
     :return: Tuple containing the element tree and a map of element IDs to elements.
     """
     await page.evaluate(JS_FUNCTION_DEFS)
-    main_frame_js_script = "async () => await buildTreeFromBody('main.frame', true)"
+    main_frame_js_script = "() => buildTreeFromBody('main.frame', true)"
     elements, element_tree = await page.evaluate(main_frame_js_script)
 
     if len(page.main_frame.child_frames) > 0:
@@ -415,7 +415,7 @@ class IncrementalScrapePage:
                     exc_info=True,
                 )
 
-        js_script = f"async () => await getIncrementElements('{frame_id}')"
+        js_script = f"() => getIncrementElements('{frame_id}')"
         incremental_elements, incremental_tree = await frame.evaluate(js_script)
         # we listen the incremental elements seperated by frames, so all elements will be in the same SkyvernFrame
         self.id_to_css_dict, self.id_to_element_dict, _ = build_element_dict(incremental_elements)
@@ -473,7 +473,8 @@ def trim_element_tree(elements: list[dict]) -> list[dict]:
             else:
                 del queue_ele["attributes"]
         # remove the tag, don't need it in the HTML tree
-        del queue_ele["keepAllAttr"]
+        if "keepAllAttr" in queue_ele:
+            del queue_ele["keepAllAttr"]
 
         if "children" in queue_ele:
             queue.extend(queue_ele["children"])
