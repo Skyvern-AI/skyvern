@@ -87,6 +87,10 @@ if SettingsManager.get_settings().ENABLE_OPENAI:
             add_assistant_prefix=False,
         ),
     )
+    LLMConfigRegistry.register_config(
+        "OPENAI_GPT-4O-2024-08-06",
+        LLMConfig("gpt-4o-2024-08-06", ["OPENAI_API_KEY"], supports_vision=True, add_assistant_prefix=False),
+    )
 
 
 if SettingsManager.get_settings().ENABLE_ANTHROPIC:
