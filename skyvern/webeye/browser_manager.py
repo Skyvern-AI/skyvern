@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+
 import structlog
 from playwright.async_api import async_playwright
 
+from skyvern.constants import BROWSER_CLOSE_TIMEOUT
 from skyvern.exceptions import MissingBrowserState
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
@@ -164,15 +167,18 @@ class BrowserManager:
     async def cleanup_for_task(self, task_id: str, close_browser_on_completion: bool = True) -> BrowserState | None:
         LOG.info("Cleaning up for task")
         browser_state_to_close = self.pages.pop(task_id, None)
-        if browser_state_to_close:
-            # Stop tracing before closing the browser if tracing is enabled
-            if browser_state_to_close.browser_context and browser_state_to_close.browser_artifacts.traces_dir:
-                trace_path = f"{browser_state_to_close.browser_artifacts.traces_dir}/{task_id}.zip"
-                await browser_state_to_close.browser_context.tracing.stop(path=trace_path)
-                LOG.info("Stopped tracing", trace_path=trace_path)
-
-            await browser_state_to_close.close(close_browser_on_completion=close_browser_on_completion)
-        LOG.info("Task is cleaned up")
+        try:
+            if browser_state_to_close:
+                async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+                    # Stop tracing before closing the browser if tracing is enabled
+                    if browser_state_to_close.browser_context and browser_state_to_close.browser_artifacts.traces_dir:
+                        trace_path = f"{browser_state_to_close.browser_artifacts.traces_dir}/{task_id}.zip"
+                        await browser_state_to_close.browser_context.tracing.stop(path=trace_path)
+                        LOG.info("Stopped tracing", trace_path=trace_path)
+                    await browser_state_to_close.close(close_browser_on_completion=close_browser_on_completion)
+            LOG.info("Task is cleaned up")
+        except TimeoutError:
+            LOG.warning("Timeout on task cleanup")
 
         return browser_state_to_close
 
