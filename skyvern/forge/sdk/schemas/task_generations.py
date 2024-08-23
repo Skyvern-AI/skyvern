@@ -17,6 +17,7 @@ class TaskGenerationBase(BaseModel):
     llm: str | None = None
     llm_prompt: str | None = None
     llm_response: str | None = None
+    suggested_title: str | None = None
 
 
 class TaskGenerationCreate(TaskGenerationBase):

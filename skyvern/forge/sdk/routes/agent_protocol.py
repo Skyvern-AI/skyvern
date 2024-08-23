@@ -779,6 +779,7 @@ async def generate_task(
             navigation_payload=parsed_task_generation_obj.navigation_payload,
             data_extraction_goal=parsed_task_generation_obj.data_extraction_goal,
             extracted_information_schema=parsed_task_generation_obj.extracted_information_schema,
+            suggested_title=parsed_task_generation_obj.suggested_title,
             llm=SettingsManager.get_settings().LLM_KEY,
             llm_prompt=llm_prompt,
             llm_response=str(llm_response),

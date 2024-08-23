@@ -1391,6 +1391,7 @@ class AgentDB:
         navigation_payload: dict[str, Any] | None = None,
         data_extraction_goal: str | None = None,
         extracted_information_schema: dict[str, Any] | None = None,
+        suggested_title: str | None = None,
         llm: str | None = None,
         llm_prompt: str | None = None,
         llm_response: str | None = None,
@@ -1407,6 +1408,7 @@ class AgentDB:
                 llm=llm,
                 llm_prompt=llm_prompt,
                 llm_response=llm_response,
+                suggested_title=suggested_title,
             )
             session.add(new_task_generation)
             await session.commit()
