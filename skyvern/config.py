@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     # Artifact storage settings
     ARTIFACT_STORAGE_PATH: str = f"{SKYVERN_DIR}/artifacts"
     GENERATE_PRESIGNED_URLS: bool = False
+    AWS_S3_BUCKET_ARTIFACTS: str = "skyvern-artifacts"
+    AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
 
     # S3 bucket settings
     AWS_REGION: str = "us-east-1"
