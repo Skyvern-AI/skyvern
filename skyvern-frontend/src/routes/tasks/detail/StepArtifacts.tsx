@@ -53,15 +53,15 @@ function StepArtifacts({ id, stepProps }: Props) {
     (artifact) => artifact.artifact_type === ArtifactType.ActionScreenshot,
   );
 
-  const visibleElementsTree = artifacts?.find(
+  const visibleElementsTree = artifacts?.filter(
     (artifact) => artifact.artifact_type === ArtifactType.VisibleElementsTree,
   );
 
-  const llmRequest = artifacts?.find(
+  const llmRequest = artifacts?.filter(
     (artifact) => artifact.artifact_type === ArtifactType.LLMRequest,
   );
 
-  const visibleElementsTreeTrimmed = artifacts?.find(
+  const visibleElementsTreeTrimmed = artifacts?.filter(
     (artifact) =>
       artifact.artifact_type === ArtifactType.VisibleElementsTreeTrimmed,
   );
@@ -70,7 +70,7 @@ function StepArtifacts({ id, stepProps }: Props) {
     (artifact) => artifact.artifact_type === ArtifactType.LLMPrompt,
   );
 
-  const llmResponseParsed = artifacts?.find(
+  const llmResponseParsed = artifacts?.filter(
     (artifact) => artifact.artifact_type === ArtifactType.LLMResponseParsed,
   );
 
@@ -165,12 +165,12 @@ function StepArtifacts({ id, stepProps }: Props) {
       </TabsContent>
       <TabsContent value="element_tree_trimmed">
         {visibleElementsTreeTrimmed ? (
-          <JSONArtifact artifact={visibleElementsTreeTrimmed} />
+          <JSONArtifact artifacts={visibleElementsTreeTrimmed} />
         ) : null}
       </TabsContent>
       <TabsContent value="html_element_tree">
         {visibleElementsTree ? (
-          <JSONArtifact artifact={visibleElementsTree} />
+          <JSONArtifact artifacts={visibleElementsTree} />
         ) : null}
       </TabsContent>
       <TabsContent value="llm_prompt">
@@ -178,14 +178,14 @@ function StepArtifacts({ id, stepProps }: Props) {
       </TabsContent>
       <TabsContent value="llm_response_parsed">
         {llmResponseParsed ? (
-          <JSONArtifact artifact={llmResponseParsed} />
+          <JSONArtifact artifacts={llmResponseParsed} />
         ) : null}
       </TabsContent>
       <TabsContent value="html_raw">
         {htmlRaw ? <TextArtifact artifact={htmlRaw} /> : null}
       </TabsContent>
       <TabsContent value="llm_request">
-        {llmRequest ? <JSONArtifact artifact={llmRequest} /> : null}
+        {llmRequest ? <JSONArtifact artifacts={llmRequest} /> : null}
       </TabsContent>
     </Tabs>
   );
