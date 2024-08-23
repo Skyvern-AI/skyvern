@@ -90,7 +90,7 @@ function SavedTasks() {
         description: "Your template was created successfully",
       });
       queryClient.invalidateQueries({
-        queryKey: ["workflows"],
+        queryKey: ["savedTasks"],
       });
       navigate(`/create/${response.workflow_permanent_id}`);
     },
