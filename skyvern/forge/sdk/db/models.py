@@ -380,6 +380,7 @@ class TaskGenerationModel(Base):
     navigation_payload = Column(JSON)
     data_extraction_goal = Column(String)
     extracted_information_schema = Column(JSON)
+    suggested_title = Column(String)  # task title suggested by the language model
 
     llm = Column(String)  # language model to use
     llm_prompt = Column(String)  # The prompt sent to the language model
