@@ -451,46 +451,46 @@ function SavedTaskForm({ initialValues }: Props) {
             </FormItem>
           )}
         />
-        <FormField
-          control={form.control}
-          name="navigationPayload"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>
-                <div className="flex gap-2">
-                  Navigation Payload
-                  <TooltipProvider>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <InfoCircledIcon />
-                      </TooltipTrigger>
-                      <TooltipContent className="max-w-[250px]">
-                        <p>{navigationPayloadDescription}</p>
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                </div>
-              </FormLabel>
-              <FormDescription>
-                Any context Skyvern needs to complete its actions (ex. text that
-                may be required to fill out forms)
-              </FormDescription>
-              <FormControl>
-                <Textarea
-                  rows={5}
-                  placeholder="Navigation Payload"
-                  {...field}
-                  value={field.value === null ? "" : field.value}
-                />
-              </FormControl>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
         <Accordion type="single" collapsible>
           <AccordionItem value="advanced-settings">
             <AccordionTrigger>Advanced Settings</AccordionTrigger>
             <AccordionContent className="space-y-8 px-1 py-4">
+              <FormField
+                control={form.control}
+                name="navigationPayload"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>
+                      <div className="flex gap-2">
+                        Navigation Payload
+                        <TooltipProvider>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <InfoCircledIcon />
+                            </TooltipTrigger>
+                            <TooltipContent className="max-w-[250px]">
+                              <p>{navigationPayloadDescription}</p>
+                            </TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                      </div>
+                    </FormLabel>
+                    <FormDescription>
+                      Any context Skyvern needs to complete its actions (ex.
+                      text that may be required to fill out forms)
+                    </FormDescription>
+                    <FormControl>
+                      <Textarea
+                        rows={5}
+                        placeholder="Navigation Payload"
+                        {...field}
+                        value={field.value === null ? "" : field.value}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
               <FormField
                 control={form.control}
                 name="extractedInformationSchema"
