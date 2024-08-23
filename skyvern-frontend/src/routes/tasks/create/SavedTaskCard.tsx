@@ -65,7 +65,7 @@ function SavedTaskCard({ workflowId, title, url, description }: Props) {
         description: "Template deleted successfully",
       });
       queryClient.invalidateQueries({
-        queryKey: ["workflows"],
+        queryKey: ["savedTasks"],
       });
       setOpen(false);
       navigate("/create");
