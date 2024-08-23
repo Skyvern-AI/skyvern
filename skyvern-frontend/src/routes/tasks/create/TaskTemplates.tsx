@@ -67,7 +67,7 @@ function createTemplateTaskFromTaskGenerationParameters(
   values: TaskGenerationApiResponse,
 ) {
   return {
-    title: values.suggested_title,
+    title: values.suggested_title ?? "Untitled",
     description: "",
     is_saved_task: true,
     webhook_callback_url: null,
