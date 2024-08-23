@@ -244,3 +244,12 @@ export type WorkflowRunStatusApiResponse = {
   recording_url: string | null;
   outputs: Record<string, unknown> | null;
 };
+
+export type TaskGenerationApiResponse = {
+  suggested_title: string | null;
+  url: string | null;
+  navigation_goal: string | null;
+  data_extraction_goal: string | null;
+  navigation_payload: Record<string, unknown> | null;
+  extracted_information_schema: Record<string, unknown> | null;
+};

@@ -17,12 +17,14 @@ import {
   PaperPlaneIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { getClient } from "@/api/AxiosClient";
 import { AxiosError } from "axios";
 import { toast } from "@/components/ui/use-toast";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { TaskGenerationApiResponse } from "@/api/types";
+import { stringify as convertToYAML } from "yaml";
 
 const examplePrompts = [
   "What is the top post on hackernews?",
@@ -61,20 +63,113 @@ const templateSamples: {
   },
 };
 
+function createTemplateTaskFromTaskGenerationParameters(
+  values: TaskGenerationApiResponse,
+) {
+  return {
+    title: values.suggested_title,
+    description: "",
+    is_saved_task: true,
+    webhook_callback_url: null,
+    proxy_location: "RESIDENTIAL",
+    workflow_definition: {
+      parameters: [
+        {
+          parameter_type: "workflow",
+          workflow_parameter_type: "json",
+          key: "navigation_payload",
+          default_value: JSON.stringify(values.navigation_payload),
+        },
+      ],
+      blocks: [
+        {
+          block_type: "task",
+          label: values.suggested_title,
+          url: values.url,
+          navigation_goal: values.navigation_goal,
+          data_extraction_goal: values.data_extraction_goal,
+          data_schema: values.extracted_information_schema,
+        },
+      ],
+    },
+  };
+}
+
+function createTaskFromTaskGenerationParameters(
+  values: TaskGenerationApiResponse,
+) {
+  return {
+    url: values.url,
+    navigation_goal: values.navigation_goal,
+    data_extraction_goal: values.data_extraction_goal,
+    proxy_location: "RESIDENTIAL",
+    navigation_payload: values.navigation_payload,
+    extracted_information_schema: values.extracted_information_schema,
+  };
+}
+
 function TaskTemplates() {
   const navigate = useNavigate();
   const [prompt, setPrompt] = useState<string>("");
   const credentialGetter = useCredentialGetter();
+  const queryClient = useQueryClient();
 
   const getTaskFromPromptMutation = useMutation({
     mutationFn: async (prompt: string) => {
       const client = await getClient(credentialGetter);
       return client
-        .post("/generate/task", { prompt })
+        .post<
+          { prompt: string },
+          { data: TaskGenerationApiResponse }
+        >("/generate/task", { prompt })
         .then((response) => response.data);
     },
+    onError: (error: AxiosError) => {
+      toast({
+        variant: "destructive",
+        title: "Error creating task from prompt",
+        description: error.message,
+      });
+    },
+  });
+
+  const saveTaskMutation = useMutation({
+    mutationFn: async (params: TaskGenerationApiResponse) => {
+      const client = await getClient(credentialGetter);
+      const templateTask =
+        createTemplateTaskFromTaskGenerationParameters(params);
+      const yaml = convertToYAML(templateTask);
+      return client.post("/workflows", yaml, {
+        headers: {
+          "Content-Type": "text/plain",
+        },
+      });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: ["savedTasks"],
+      });
+    },
+    onError: (error: AxiosError) => {
+      toast({
+        variant: "destructive",
+        title: "Error creating task from prompt",
+        description: error.message,
+      });
+    },
+  });
+
+  const runTaskMutation = useMutation({
+    mutationFn: async (params: TaskGenerationApiResponse) => {
+      const client = await getClient(credentialGetter);
+      const data = createTaskFromTaskGenerationParameters(params);
+      return client.post<
+        ReturnType<typeof createTaskFromTaskGenerationParameters>,
+        { data: { task_id: string } }
+      >("/tasks", data);
+    },
     onSuccess: (response) => {
-      navigate("/create/sk-prompt", { state: { data: response } });
+      navigate(`/tasks/${response.data.task_id}/actions`);
     },
     onError: (error: AxiosError) => {
       toast({
@@ -119,13 +214,18 @@ function TaskTemplates() {
             placeholder="Enter your prompt..."
           />
           <div className="h-full">
-            {getTaskFromPromptMutation.isPending ? (
+            {getTaskFromPromptMutation.isPending ||
+            saveTaskMutation.isPending ||
+            runTaskMutation.isPending ? (
               <ReloadIcon className="h-6 w-6 animate-spin" />
             ) : (
               <PaperPlaneIcon
                 className="h-6 w-6 cursor-pointer"
-                onClick={() => {
-                  getTaskFromPromptMutation.mutate(prompt);
+                onClick={async () => {
+                  const taskGenerationResponse =
+                    await getTaskFromPromptMutation.mutateAsync(prompt);
+                  await saveTaskMutation.mutateAsync(taskGenerationResponse);
+                  await runTaskMutation.mutateAsync(taskGenerationResponse);
                 }}
               />
             )}
