@@ -53,7 +53,6 @@ async def resolve_locator(
         if not parent_frame:
             raise SkyvernException(f"element without frame: {frame_element}")
 
-        LOG.info(f"{frame} is a child frame of {parent_frame}")
         frame = parent_frame
 
     current_page: Page | FrameLocator = page
