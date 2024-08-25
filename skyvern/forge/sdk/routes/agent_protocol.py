@@ -16,8 +16,10 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 from pydantic import BaseModel
+import aiofiles
+from typing import AsyncGenerator
 
 from skyvern import analytics
 from skyvern.exceptions import StepNotFound
@@ -779,7 +781,6 @@ async def generate_task(
             navigation_payload=parsed_task_generation_obj.navigation_payload,
             data_extraction_goal=parsed_task_generation_obj.data_extraction_goal,
             extracted_information_schema=parsed_task_generation_obj.extracted_information_schema,
-            suggested_title=parsed_task_generation_obj.suggested_title,
             llm=SettingsManager.get_settings().LLM_KEY,
             llm_prompt=llm_prompt,
             llm_response=str(llm_response),
@@ -872,3 +873,54 @@ async def upload_file(
         status_code=200,
         media_type="application/json",
     )
+
+@base_router.get("/tasks/{task_id}/har", tags=["agent"])
+@base_router.get("/tasks/{task_id}/har/", tags=["agent"], include_in_schema=False)
+async def get_task_har(
+    task_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> StreamingResponse:
+    """
+    Get the HAR file content for a task.
+    :param task_id: The ID of the task
+    :return: The HAR file content as a streaming response
+    """
+    analytics.capture("skyvern-oss-agent-task-har-get")
+    
+    # Get the HAR artifact from the database
+    har_artifact = await app.DATABASE.get_latest_artifact(
+        task_id=task_id,
+        artifact_types=[ArtifactType.HAR],
+        organization_id=current_org.organization_id,
+    )
+    
+    if not har_artifact:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"HAR file not found for task {task_id}",
+        )
+    
+    # Get the file path from the artifact URI
+    file_path = har_artifact.uri.replace("file://", "")
+    
+    return StreamingResponse(stream_file(file_path), media_type="application/json")
+
+async def stream_file(file_path: str) -> AsyncGenerator[str, None]:
+    chunk_size = 1024 * 1024  # 1 MB chunks
+    try:
+        async with aiofiles.open(file_path, mode='r') as file:
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"HAR file not found at the specified location",
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred while reading the HAR file: {str(e)}",
+        )
