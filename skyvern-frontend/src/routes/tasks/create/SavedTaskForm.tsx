@@ -295,7 +295,7 @@ function SavedTaskForm({ initialValues }: Props) {
         description: "Changes saved successfully",
       });
       queryClient.invalidateQueries({
-        queryKey: ["workflows", template],
+        queryKey: ["savedTasks", template],
       });
     },
   });
@@ -315,12 +315,10 @@ function SavedTaskForm({ initialValues }: Props) {
           const submitter = (
             (event.nativeEvent as SubmitEvent).submitter as HTMLButtonElement
           ).value;
-          if (submitter === "save") {
-            form.handleSubmit(handleSave)(event);
-          }
           if (submitter === "create") {
             form.handleSubmit(handleCreate)(event);
           }
+          form.handleSubmit(handleSave)(event);
         }}
         className="space-y-8"
       >
