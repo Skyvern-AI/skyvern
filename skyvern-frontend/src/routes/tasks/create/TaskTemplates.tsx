@@ -67,7 +67,7 @@ function createTemplateTaskFromTaskGenerationParameters(
   values: TaskGenerationApiResponse,
 ) {
   return {
-    title: values.suggested_title ?? "Untitled",
+    title: values.suggested_title ?? "Untitled Task",
     description: "",
     is_saved_task: true,
     webhook_callback_url: null,
@@ -84,7 +84,7 @@ function createTemplateTaskFromTaskGenerationParameters(
       blocks: [
         {
           block_type: "task",
-          label: values.suggested_title,
+          label: values.suggested_title ?? "Untitled Task",
           url: values.url,
           navigation_goal: values.navigation_goal,
           data_extraction_goal: values.data_extraction_goal,
@@ -153,7 +153,7 @@ function TaskTemplates() {
     onError: (error: AxiosError) => {
       toast({
         variant: "destructive",
-        title: "Error creating task from prompt",
+        title: "Error saving task",
         description: error.message,
       });
     },
@@ -174,7 +174,7 @@ function TaskTemplates() {
     onError: (error: AxiosError) => {
       toast({
         variant: "destructive",
-        title: "Error creating task from prompt",
+        title: "Error running task",
         description: error.message,
       });
     },
