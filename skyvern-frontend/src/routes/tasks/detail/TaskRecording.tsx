@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { getRecordingURL } from "./artifactUtils";
 import { useParams } from "react-router-dom";
 import { Skeleton } from "@/components/ui/skeleton";
+import { TaskApiResponse } from "@/api/types";
 
 function TaskRecording() {
   const { taskId } = useParams();
@@ -13,11 +14,11 @@ function TaskRecording() {
     data: recordingURL,
     isLoading: taskIsLoading,
     isError: taskIsError,
-  } = useQuery<string | undefined>({
+  } = useQuery<string | null>({
     queryKey: ["task", taskId, "recordingURL"],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
-      const task = await client
+      const task: TaskApiResponse = await client
         .get(`/tasks/${taskId}`)
         .then((response) => response.data);
       return getRecordingURL(task);
@@ -39,14 +40,12 @@ function TaskRecording() {
     return <div>Error loading recording</div>;
   }
 
-  return (
+  return recordingURL ? (
     <div className="mx-auto flex">
-      {recordingURL ? (
-        <video width={800} height={450} src={recordingURL} controls />
-      ) : (
-        <div>No recording available</div>
-      )}
+      <video width={800} height={450} src={recordingURL} controls />
     </div>
+  ) : (
+    <div>No recording available for this task</div>
   );
 }
 
