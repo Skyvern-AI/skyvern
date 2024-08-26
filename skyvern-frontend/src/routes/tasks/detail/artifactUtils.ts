@@ -22,7 +22,7 @@ export function getScreenshotURL(task: TaskApiResponse) {
 
 export function getRecordingURL(task: TaskApiResponse) {
   if (!task.recording_url) {
-    return;
+    return null;
   }
   if (task.recording_url?.startsWith("file://")) {
     return `${artifactApiBaseUrl}/artifact/recording?path=${task.recording_url.slice(7)}`;
