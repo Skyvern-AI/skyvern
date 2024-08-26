@@ -1,0 +1,23 @@
+.react-flow__panel.top.center {
+  margin: 0;
+  top: 2rem;
+  width: calc(100% - 3rem);
+}
+
+.react-flow__panel.top.right {
+  margin: 0;
+  top: 7.75rem;
+  right: 1.5rem;
+}
+
+.react-flow__node-regular {
+  @apply bg-slate-elevation3;
+}
+
+.react-flow__handle-top {
+  top: 3px;
+}
+
+.react-flow__handle-bottom {
+  bottom: 3px;
+}

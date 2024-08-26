@@ -8,6 +8,7 @@ import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { toast } from "./ui/use-toast";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs";
 
 export type FileInputValue =
   | {
@@ -36,8 +37,6 @@ function showFileSizeError() {
 function FileUpload({ value, onChange }: Props) {
   const credentialGetter = useCredentialGetter();
   const [file, setFile] = useState<File | null>(null);
-  const [fileUrl, setFileUrl] = useState<string>("");
-  const [highlight, setHighlight] = useState(false);
   const inputId = useId();
 
   const uploadFileMutation = useMutation({
@@ -92,37 +91,44 @@ function FileUpload({ value, onChange }: Props) {
     onChange(null);
   }
 
-  if (value === null) {
-    return (
-      <div className="flex gap-4">
-        <div className="w-1/2">
+  const isManualUpload =
+    typeof value === "object" && value !== null && file && "s3uri" in value;
+
+  return (
+    <Tabs
+      className="h-36 w-full"
+      defaultValue="upload"
+      value={value === null ? undefined : isManualUpload ? "upload" : "fileURL"}
+      onValueChange={(value) => {
+        if (value === "upload") {
+          onChange(null);
+        } else {
+          onChange("");
+        }
+      }}
+    >
+      <TabsList className="grid w-full grid-cols-2">
+        <TabsTrigger value="upload">Upload</TabsTrigger>
+        <TabsTrigger value="fileURL">File URL</TabsTrigger>
+      </TabsList>
+      <TabsContent value="upload">
+        {isManualUpload && ( // redundant check for ts compiler
+          <div className="flex h-full items-center gap-4">
+            <a href={value.presignedUrl} className="underline">
+              <span>{file.name}</span>
+            </a>
+            <Button onClick={() => reset()}>Change</Button>
+          </div>
+        )}
+        {value === null && (
           <Label
             htmlFor={inputId}
             className={cn(
-              "flex w-full cursor-pointer items-center justify-center border border-dashed py-8",
-              {
-                "border-slate-500": highlight,
-              },
+              "flex w-full cursor-pointer items-center justify-center border border-dashed py-8 hover:border-slate-500",
             )}
-            onDragEnter={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              setHighlight(true);
-            }}
-            onDragOver={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              setHighlight(true);
-            }}
-            onDragLeave={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              setHighlight(false);
-            }}
             onDrop={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              setHighlight(false);
               if (
                 event.dataTransfer.files &&
                 event.dataTransfer.files.length > 0
@@ -155,49 +161,21 @@ function FileUpload({ value, onChange }: Props) {
               </span>
             </div>
           </Label>
-        </div>
-        <div className="flex flex-col items-center justify-center before:flex before:bg-slate-600 before:content-['']">
-          OR
-        </div>
-        <div className="w-1/2">
+        )}
+      </TabsContent>
+      <TabsContent value="fileURL">
+        <div className="space-y-2">
           <Label>File URL</Label>
-          <div className="flex gap-2">
+          {typeof value === "string" && (
             <Input
-              value={fileUrl}
-              onChange={(e) => setFileUrl(e.target.value)}
+              value={value}
+              onChange={(event) => onChange(event.target.value)}
             />
-            <Button
-              onClick={() => {
-                onChange(fileUrl);
-              }}
-            >
-              Save
-            </Button>
-          </div>
+          )}
         </div>
-      </div>
-    );
-  }
-
-  if (typeof value === "string") {
-    return (
-      <div className="flex items-center gap-4">
-        <span>{value}</span>
-        <Button onClick={() => reset()}>Change</Button>
-      </div>
-    );
-  }
-
-  if (typeof value === "object" && file && "s3uri" in value) {
-    return (
-      <div className="flex items-center gap-4">
-        <a href={value.presignedUrl} className="underline">
-          <span>{file.name}</span>
-        </a>
-        <Button onClick={() => reset()}>Change</Button>
-      </div>
-    );
-  }
+      </TabsContent>
+    </Tabs>
+  );
 }
 
 export { FileUpload };

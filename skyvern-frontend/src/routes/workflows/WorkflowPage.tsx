@@ -85,7 +85,9 @@ function WorkflowPage() {
           )}
         </div>
         <Button asChild>
-          <Link to="run">Create New Run</Link>
+          <Link to={`/workflows/${workflowPermanentId}/run`}>
+            Create New Run
+          </Link>
         </Button>
       </header>
       <div className="space-y-4">
@@ -124,7 +126,9 @@ function WorkflowPage() {
                         );
                         return;
                       }
-                      navigate(`${workflowRun.workflow_run_id}`);
+                      navigate(
+                        `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}`,
+                      );
                     }}
                     className="cursor-pointer"
                   >

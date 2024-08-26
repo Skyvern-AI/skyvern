@@ -1,11 +1,11 @@
 import { getClient } from "@/api/AxiosClient";
-import { WorkflowApiResponse, WorkflowParameterType } from "@/api/types";
+import { WorkflowApiResponse, WorkflowParameterValueType } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 import { useParams } from "react-router-dom";
 import { RunWorkflowForm } from "./RunWorkflowForm";
 
-function defaultValue(type: WorkflowParameterType) {
+function defaultValue(type: WorkflowParameterValueType) {
   switch (type) {
     case "string":
       return "";
@@ -76,8 +76,12 @@ function WorkflowRunParameters() {
 
   return (
     <div className="space-y-8">
-      <header>
-        <h1 className="text-2xl font-semibold">Workflow Run Parameters</h1>
+      <header className="space-y-5">
+        <h1 className="text-3xl">Run Parameters</h1>
+        <h2 className="text-lg text-slate-400">
+          Fill the placeholder values that you have linked throughout your
+          workflow.
+        </h2>
       </header>
       <RunWorkflowForm
         initialValues={initialValues}

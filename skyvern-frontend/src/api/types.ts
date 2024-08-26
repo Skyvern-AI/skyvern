@@ -113,7 +113,7 @@ export type ApiKeyApiResponse = {
   valid: boolean;
 };
 
-export const WorkflowParameterType = {
+export const WorkflowParameterValueType = {
   String: "string",
   Integer: "integer",
   Float: "float",
@@ -122,16 +122,28 @@ export const WorkflowParameterType = {
   FileURL: "file_url",
 } as const;
 
+export type WorkflowParameterValueType =
+  (typeof WorkflowParameterValueType)[keyof typeof WorkflowParameterValueType];
+
+export const WorkflowParameterType = {
+  Workflow: "workflow",
+  Context: "context",
+  Output: "output",
+  AWS_Secret: "aws_secret",
+  Bitwarden_Login_Credential: "bitwarden_login_credential",
+  Bitwarden_Sensitive_Information: "bitwarden_sensitive_information",
+} as const;
+
 export type WorkflowParameterType =
   (typeof WorkflowParameterType)[keyof typeof WorkflowParameterType];
 
 export type WorkflowParameter = {
-  workflow_parameter_id: string;
-  workflow_parameter_type: WorkflowParameterType;
   key: string;
   description: string | null;
+  workflow_parameter_id: string;
+  parameter_type: WorkflowParameterType;
+  workflow_parameter_type: WorkflowParameterValueType;
   workflow_id: string;
-  parameter_type: "workflow"; // TODO other values
   default_value?: string;
   created_at: string | null;
   modified_at: string | null;

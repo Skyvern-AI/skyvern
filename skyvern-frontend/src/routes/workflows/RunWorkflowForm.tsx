@@ -1,13 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
 import { WorkflowParameter } from "@/api/types";
-import {
-  Form,
-  FormControl,
-  FormDescription,
-  FormField,
-  FormItem,
-  FormLabel,
-} from "@/components/ui/form";
+import { Form, FormControl, FormField, FormItem } from "@/components/ui/form";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
@@ -15,7 +8,15 @@ import { useParams } from "react-router-dom";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/use-toast";
-import { ReloadIcon } from "@radix-ui/react-icons";
+import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 
 type Props = {
   workflowParameters: Array<WorkflowParameter>;
@@ -92,60 +93,91 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
     <div>
       <Form {...form}>
         <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-8">
-          {workflowParameters?.map((parameter) => {
-            return (
-              <FormField
-                key={parameter.key}
-                control={form.control}
-                name={parameter.key}
-                rules={{
-                  validate: (value) => {
-                    if (
-                      parameter.workflow_parameter_type === "json" &&
-                      typeof value === "string"
-                    ) {
-                      try {
-                        JSON.parse(value);
-                        return true;
-                      } catch (e) {
-                        return "Invalid JSON";
-                      }
-                    }
-                  },
-                }}
-                render={({ field }) => {
-                  return (
-                    <FormItem>
-                      <FormLabel>{parameter.key}</FormLabel>
-                      <FormControl>
-                        <WorkflowParameterInput
-                          type={parameter.workflow_parameter_type}
-                          value={field.value}
-                          onChange={field.onChange}
-                        />
-                      </FormControl>
-                      {parameter.description && (
-                        <FormDescription>
-                          {parameter.description}
-                        </FormDescription>
-                      )}
-                      {form.formState.errors[parameter.key] && (
-                        <div className="text-destructive">
-                          {form.formState.errors[parameter.key]?.message}
-                        </div>
-                      )}
-                    </FormItem>
-                  );
-                }}
-              />
-            );
-          })}
-          <Button type="submit" disabled={runWorkflowMutation.isPending}>
-            {runWorkflowMutation.isPending && (
-              <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-            )}
-            Run workflow
-          </Button>
+          <Table>
+            <TableHeader className="bg-slate-elevation2 text-slate-400 [&_tr]:border-b-0">
+              <TableRow className="rounded-lg px-6 [&_th:first-child]:pl-6 [&_th]:py-4">
+                <TableHead className="w-1/3 text-sm text-slate-400">
+                  Parameter Name
+                </TableHead>
+                <TableHead className="w-1/3 text-sm text-slate-400">
+                  Description
+                </TableHead>
+                <TableHead className="w-1/3 text-sm text-slate-400">
+                  Input
+                </TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {workflowParameters?.map((parameter) => {
+                return (
+                  <FormField
+                    key={parameter.key}
+                    control={form.control}
+                    name={parameter.key}
+                    rules={{
+                      validate: (value) => {
+                        if (
+                          parameter.workflow_parameter_type === "json" &&
+                          typeof value === "string"
+                        ) {
+                          try {
+                            JSON.parse(value);
+                            return true;
+                          } catch (e) {
+                            return "Invalid JSON";
+                          }
+                        }
+                      },
+                    }}
+                    render={({ field }) => {
+                      return (
+                        <TableRow className="[&_td:first-child]:pl-6 [&_td:last-child]:pr-6 [&_td]:py-4">
+                          <TableCell className="w-1/3">
+                            <div className="flex h-8 w-fit items-center rounded-sm bg-slate-elevation3 p-3">
+                              {parameter.key}
+                            </div>
+                          </TableCell>
+                          <TableCell className="w-1/3">
+                            <div>{parameter.description}</div>
+                          </TableCell>
+                          <TableCell className="w-1/3">
+                            <FormItem>
+                              <FormControl>
+                                <WorkflowParameterInput
+                                  type={parameter.workflow_parameter_type}
+                                  value={field.value}
+                                  onChange={field.onChange}
+                                />
+                              </FormControl>
+                              {form.formState.errors[parameter.key] && (
+                                <div className="text-destructive">
+                                  {
+                                    form.formState.errors[parameter.key]
+                                      ?.message
+                                  }
+                                </div>
+                              )}
+                            </FormItem>
+                          </TableCell>
+                        </TableRow>
+                      );
+                    }}
+                  />
+                );
+              })}
+            </TableBody>
+          </Table>
+          <div className="flex justify-end">
+            <Button type="submit" disabled={runWorkflowMutation.isPending}>
+              {runWorkflowMutation.isPending && (
+                <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+              )}
+              {!runWorkflowMutation.isPending && (
+                <PlayIcon className="mr-2 h-4 w-4" />
+              )}
+              Run workflow
+            </Button>
+          </div>
         </form>
       </Form>
     </div>
