@@ -83,6 +83,36 @@ function Workflows() {
     return <WorkflowsBetaAlertCard />;
   }
 
+  function handleRowClick(
+    event: React.MouseEvent<HTMLTableCellElement>,
+    workflowPermanentId: string,
+  ) {
+    if (event.ctrlKey || event.metaKey) {
+      window.open(
+        window.location.origin + `/workflows/${workflowPermanentId}/runs`,
+        "_blank",
+        "noopener,noreferrer",
+      );
+      return;
+    }
+    navigate(`/workflows/${workflowPermanentId}/runs`);
+  }
+
+  function handleIconClick(
+    event: React.MouseEvent<HTMLButtonElement>,
+    path: string,
+  ) {
+    if (event.ctrlKey || event.metaKey) {
+      window.open(
+        window.location.origin + path,
+        "_blank",
+        "noopener,noreferrer",
+      );
+      return;
+    }
+    navigate(path);
+  }
+
   return (
     <div className="space-y-8">
       <header>
@@ -92,42 +122,60 @@ function Workflows() {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead className="w-1/4">ID</TableHead>
-              <TableHead className="w-1/4">Status</TableHead>
-              <TableHead className="w-1/4">Created At</TableHead>
-              <TableHead className="w-1/4"></TableHead>
+              <TableHead className="w-1/3">ID</TableHead>
+              <TableHead className="w-1/3">Title</TableHead>
+              <TableHead className="w-1/3">Created At</TableHead>
+              <TableHead></TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {isLoading ? (
               <TableRow>
-                <TableCell colSpan={3}>Loading...</TableCell>
+                <TableCell colSpan={4}>Loading...</TableCell>
               </TableRow>
             ) : workflows?.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={3}>No workflows found</TableCell>
+                <TableCell colSpan={4}>No workflows found</TableCell>
               </TableRow>
             ) : (
               workflows?.map((workflow) => {
                 return (
-                  <TableRow key={workflow.workflow_permanent_id}>
-                    <TableCell className="w-1/3">
+                  <TableRow
+                    key={workflow.workflow_permanent_id}
+                    className="cursor-pointer"
+                  >
+                    <TableCell
+                      onClick={(event) => {
+                        handleRowClick(event, workflow.workflow_permanent_id);
+                      }}
+                    >
                       {workflow.workflow_permanent_id}
                     </TableCell>
-                    <TableCell className="w-1/3">{workflow.title}</TableCell>
-                    <TableCell className="w-1/3">
+                    <TableCell
+                      onClick={(event) => {
+                        handleRowClick(event, workflow.workflow_permanent_id);
+                      }}
+                    >
+                      {workflow.title}
+                    </TableCell>
+                    <TableCell
+                      onClick={(event) => {
+                        handleRowClick(event, workflow.workflow_permanent_id);
+                      }}
+                    >
                       {basicTimeFormat(workflow.created_at)}
                     </TableCell>
                     <TableCell>
-                      <div className="flex gap-2">
+                      <div className="flex justify-end gap-2">
                         <TooltipProvider>
                           <Tooltip>
                             <TooltipTrigger asChild>
                               <Button
                                 size="icon"
                                 variant="outline"
-                                onClick={() => {
-                                  navigate(
+                                onClick={(event) => {
+                                  handleIconClick(
+                                    event,
                                     `/workflows/${workflow.workflow_permanent_id}/runs`,
                                   );
                                 }}
@@ -144,8 +192,9 @@ function Workflows() {
                               <Button
                                 size="icon"
                                 variant="outline"
-                                onClick={() => {
-                                  navigate(
+                                onClick={(event) => {
+                                  handleIconClick(
+                                    event,
                                     `/workflows/${workflow.workflow_permanent_id}`,
                                   );
                                 }}
@@ -162,8 +211,9 @@ function Workflows() {
                               <Button
                                 size="icon"
                                 variant="outline"
-                                onClick={() => {
-                                  navigate(
+                                onClick={(event) => {
+                                  handleIconClick(
+                                    event,
                                     `/workflows/${workflow.workflow_permanent_id}/run`,
                                   );
                                 }}
