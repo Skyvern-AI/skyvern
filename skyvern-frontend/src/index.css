@@ -70,7 +70,11 @@
     --input: 215.3 25% 26.7%;
     --ring: 212.7 26.8% 83.9%;
 
-    --slate-elevation-2: 228 37% 11%;
+    --slate-elevation-1: 228 45% 9%;
+    --slate-elevation-2: 228 37% 10.6%;
+    --slate-elevation-3: 227 30% 12%;
+    --slate-elevation-4: 231 26% 14%;
+    --slate-elevation-5: 230 22% 16%;
   }
 }
 

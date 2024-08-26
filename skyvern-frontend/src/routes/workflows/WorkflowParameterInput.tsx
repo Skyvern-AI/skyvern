@@ -1,22 +1,34 @@
-import { WorkflowParameterType } from "@/api/types";
+import { WorkflowParameterValueType } from "@/api/types";
 import { FileInputValue, FileUpload } from "@/components/FileUpload";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
+import { CodeEditor } from "./components/CodeEditor";
 
 type Props = {
-  type: WorkflowParameterType;
+  type: WorkflowParameterValueType;
   value: unknown;
   onChange: (value: unknown) => void;
 };
 
 function WorkflowParameterInput({ type, value, onChange }: Props) {
-  if (type === "json" || type === "string") {
+  if (type === "json") {
     return (
-      <Textarea
+      <CodeEditor
+        language="json"
+        onChange={(value) => onChange(value)}
+        value={
+          typeof value === "string" ? value : JSON.stringify(value, null, 2)
+        }
+        fontSize={12}
+      />
+    );
+  }
+
+  if (type === "string") {
+    return (
+      <Input
         value={value as string}
         onChange={(e) => onChange(e.target.value)}
-        rows={5}
       />
     );
   }

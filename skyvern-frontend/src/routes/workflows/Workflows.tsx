@@ -1,6 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
 import { WorkflowApiResponse, WorkflowRunApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
+import { Button } from "@/components/ui/button";
 import {
   Pagination,
   PaginationContent,
@@ -17,9 +18,20 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
+import {
+  CounterClockwiseClockIcon,
+  Pencil2Icon,
+  PlayIcon,
+} from "@radix-ui/react-icons";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { WorkflowsBetaAlertCard } from "./WorkflowsBetaAlertCard";
@@ -80,9 +92,10 @@ function Workflows() {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead className="w-1/3">ID</TableHead>
-              <TableHead className="w-1/3">Title</TableHead>
-              <TableHead className="w-1/3">Created At</TableHead>
+              <TableHead className="w-1/4">ID</TableHead>
+              <TableHead className="w-1/4">Status</TableHead>
+              <TableHead className="w-1/4">Created At</TableHead>
+              <TableHead className="w-1/4"></TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -97,28 +110,71 @@ function Workflows() {
             ) : (
               workflows?.map((workflow) => {
                 return (
-                  <TableRow
-                    key={workflow.workflow_permanent_id}
-                    onClick={(event) => {
-                      if (event.ctrlKey || event.metaKey) {
-                        window.open(
-                          window.location.origin +
-                            `/workflows/${workflow.workflow_permanent_id}`,
-                          "_blank",
-                          "noopener,noreferrer",
-                        );
-                        return;
-                      }
-                      navigate(`${workflow.workflow_permanent_id}`);
-                    }}
-                    className="cursor-pointer"
-                  >
+                  <TableRow key={workflow.workflow_permanent_id}>
                     <TableCell className="w-1/3">
                       {workflow.workflow_permanent_id}
                     </TableCell>
                     <TableCell className="w-1/3">{workflow.title}</TableCell>
                     <TableCell className="w-1/3">
                       {basicTimeFormat(workflow.created_at)}
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex gap-2">
+                        <TooltipProvider>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                size="icon"
+                                variant="outline"
+                                onClick={() => {
+                                  navigate(
+                                    `/workflows/${workflow.workflow_permanent_id}/runs`,
+                                  );
+                                }}
+                              >
+                                <CounterClockwiseClockIcon className="h-4 w-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>View Past Runs</TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                        <TooltipProvider>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                size="icon"
+                                variant="outline"
+                                onClick={() => {
+                                  navigate(
+                                    `/workflows/${workflow.workflow_permanent_id}`,
+                                  );
+                                }}
+                              >
+                                <Pencil2Icon className="h-4 w-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>Open in Editor</TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                        <TooltipProvider>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                size="icon"
+                                variant="outline"
+                                onClick={() => {
+                                  navigate(
+                                    `/workflows/${workflow.workflow_permanent_id}/run`,
+                                  );
+                                }}
+                              >
+                                <PlayIcon className="h-4 w-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>Create New Run</TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                      </div>
                     </TableCell>
                   </TableRow>
                 );

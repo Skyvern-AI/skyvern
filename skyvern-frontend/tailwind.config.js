@@ -19,7 +19,11 @@ module.exports = {
     extend: {
       colors: {
         slate: {
+          elevation1: "hsl(var(--slate-elevation-1))",
           elevation2: "hsl(var(--slate-elevation-2))",
+          elevation3: "hsl(var(--slate-elevation-3))",
+          elevation4: "hsl(var(--slate-elevation-4))",
+          elevation5: "hsl(var(--slate-elevation-5))",
         },
         border: "hsl(var(--border))",
         input: "hsl(var(--input))",
