@@ -583,6 +583,7 @@ class ForgeAgent:
                     actions=actions,
                     action_results=[],
                     actions_and_results=[],
+                    step_exception=None,
                 )
                 return step, detailed_agent_step_output
 
@@ -776,13 +777,14 @@ class ForgeAgent:
                 step_order=step.order,
                 step_retry=step.retry_index,
             )
+            detailed_agent_step_output.step_exception = "CancelledError"
             failed_step = await self.update_step(
                 step=step,
                 status=StepStatus.failed,
                 output=detailed_agent_step_output.to_agent_step_output(),
             )
             return failed_step, detailed_agent_step_output.get_clean_detailed_output()
-        except Exception:
+        except Exception as e:
             LOG.exception(
                 "Unexpected exception in agent_step, marking step as failed",
                 task_id=task.task_id,
@@ -790,6 +792,7 @@ class ForgeAgent:
                 step_order=step.order,
                 step_retry=step.retry_index,
             )
+            detailed_agent_step_output.step_exception = e.__class__.__name__
             failed_step = await self.update_step(
                 step=step,
                 status=StepStatus.failed,
@@ -882,6 +885,7 @@ class ForgeAgent:
             actions=None,
             action_results=None,
             actions_and_results=None,
+            step_exception=None,
         )
         return step, browser_state, detailed_output
 
