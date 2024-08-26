@@ -6,6 +6,7 @@ export const ArtifactType = {
   LLMResponseParsed: "llm_response_parsed",
   VisibleElementsTree: "visible_elements_tree",
   VisibleElementsTreeTrimmed: "visible_elements_tree_trimmed",
+  VisibleElementsTreeInPrompt: "visible_elements_tree_in_prompt",
   LLMPrompt: "llm_prompt",
   LLMRequest: "llm_request",
   HTMLScrape: "html_scrape",

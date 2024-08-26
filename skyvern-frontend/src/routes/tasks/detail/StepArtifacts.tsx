@@ -17,7 +17,7 @@ import { getImageURL } from "./artifactUtils";
 import { Input } from "@/components/ui/input";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-
+import { HTMLArtifact } from "./HTMLArtifact";
 type Props = {
   id: string;
   stepProps: StepApiResponse;
@@ -61,9 +61,9 @@ function StepArtifacts({ id, stepProps }: Props) {
     (artifact) => artifact.artifact_type === ArtifactType.LLMRequest,
   );
 
-  const visibleElementsTreeTrimmed = artifacts?.filter(
+  const visibleElementsTreeInPrompt = artifacts?.find(
     (artifact) =>
-      artifact.artifact_type === ArtifactType.VisibleElementsTreeTrimmed,
+      artifact.artifact_type === ArtifactType.VisibleElementsTreeInPrompt,
   );
 
   const llmPrompt = artifacts?.find(
@@ -164,8 +164,8 @@ function StepArtifacts({ id, stepProps }: Props) {
         )}
       </TabsContent>
       <TabsContent value="element_tree_trimmed">
-        {visibleElementsTreeTrimmed ? (
-          <JSONArtifact artifacts={visibleElementsTreeTrimmed} />
+        {visibleElementsTreeInPrompt ? (
+          <HTMLArtifact artifact={visibleElementsTreeInPrompt} />
         ) : null}
       </TabsContent>
       <TabsContent value="html_element_tree">
