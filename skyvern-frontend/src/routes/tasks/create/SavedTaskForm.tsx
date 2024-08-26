@@ -210,23 +210,35 @@ function SavedTaskForm({ initialValues }: Props) {
 
   const { isDirty } = useFormState({ control: form.control });
 
-  const createTaskMutation = useMutation({
+  const createAndSaveTaskMutation = useMutation({
     mutationFn: async (formValues: SavedTaskFormValues) => {
-      const taskRequest = createTaskRequestObject(formValues);
+      const saveTaskRequest = createTaskTemplateRequestObject(formValues);
+      const yaml = convertToYAML(saveTaskRequest);
       const client = await getClient(credentialGetter);
-      const includeOverrideHeader =
-        formValues.maxSteps !== organization?.max_steps_per_run &&
-        formValues.maxSteps !== MAX_STEPS_DEFAULT;
-      return client.post<
-        ReturnType<typeof createTaskRequestObject>,
-        { data: { task_id: string } }
-      >("/tasks", taskRequest, {
-        ...(includeOverrideHeader && {
+
+      return client
+        .put(`/workflows/${template}`, yaml, {
           headers: {
-            "x-max-steps-override": formValues.maxSteps ?? MAX_STEPS_DEFAULT,
+            "Content-Type": "text/plain",
           },
-        }),
-      });
+        })
+        .then(() => {
+          const taskRequest = createTaskRequestObject(formValues);
+          const includeOverrideHeader =
+            formValues.maxSteps !== organization?.max_steps_per_run &&
+            formValues.maxSteps !== MAX_STEPS_DEFAULT;
+          return client.post<
+            ReturnType<typeof createTaskRequestObject>,
+            { data: { task_id: string } }
+          >("/tasks", taskRequest, {
+            ...(includeOverrideHeader && {
+              headers: {
+                "x-max-steps-override":
+                  formValues.maxSteps ?? MAX_STEPS_DEFAULT,
+              },
+            }),
+          });
+        });
     },
     onError: (error: AxiosError) => {
       if (error.response?.status === 402) {
@@ -266,6 +278,9 @@ function SavedTaskForm({ initialValues }: Props) {
       queryClient.invalidateQueries({
         queryKey: ["tasks"],
       });
+      queryClient.invalidateQueries({
+        queryKey: ["savedTasks"],
+      });
     },
   });
 
@@ -301,7 +316,7 @@ function SavedTaskForm({ initialValues }: Props) {
   });
 
   function handleCreate(values: SavedTaskFormValues) {
-    createTaskMutation.mutate(values);
+    createAndSaveTaskMutation.mutate(values);
   }
 
   function handleSave(values: SavedTaskFormValues) {
@@ -318,7 +333,9 @@ function SavedTaskForm({ initialValues }: Props) {
           if (submitter === "create") {
             form.handleSubmit(handleCreate)(event);
           }
-          form.handleSubmit(handleSave)(event);
+          if (submitter === "save") {
+            form.handleSubmit(handleSave)(event);
+          }
         }}
         className="space-y-8"
       >
@@ -637,9 +654,9 @@ function SavedTaskForm({ initialValues }: Props) {
             type="submit"
             name="create"
             value="create"
-            disabled={createTaskMutation.isPending}
+            disabled={createAndSaveTaskMutation.isPending}
           >
-            {createTaskMutation.isPending && (
+            {createAndSaveTaskMutation.isPending && (
               <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
             )}
             Run Task
