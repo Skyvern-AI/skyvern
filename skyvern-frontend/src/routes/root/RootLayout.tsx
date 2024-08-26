@@ -1,17 +1,13 @@
 import { Link, Outlet } from "react-router-dom";
 import { Toaster } from "@/components/ui/toaster";
 import { SideNav } from "./SideNav";
-import {
-  DiscordLogoIcon,
-  PinLeftIcon,
-  PinRightIcon,
-} from "@radix-ui/react-icons";
+import { PinLeftIcon, PinRightIcon } from "@radix-ui/react-icons";
 import { Logo } from "@/components/Logo";
-import GitHubButton from "react-github-btn";
 import { useState } from "react";
 import { cn } from "@/util/utils";
 import { Button } from "@/components/ui/button";
 import { LogoMinimized } from "@/components/LogoMinimized";
+import { Header } from "./Header";
 
 function RootLayout() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -54,26 +50,7 @@ function RootLayout() {
             </div>
           </div>
         </aside>
-        <div className="flex h-24 items-center justify-end gap-4 px-6">
-          <Link
-            to="https://discord.com/invite/fG2XXEuQX3"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <DiscordLogoIcon className="h-7 w-7" />
-          </Link>
-          <div className="h-7">
-            <GitHubButton
-              href="https://github.com/skyvern-ai/skyvern"
-              data-color-scheme="no-preference: dark; light: dark; dark: dark;"
-              data-size="large"
-              data-show-count="true"
-              aria-label="Star skyvern-ai/skyvern on GitHub"
-            >
-              Star
-            </GitHubButton>
-          </div>
-        </div>
+        <Header />
         <main
           className={cn("pb-4 pl-64", {
             "pl-28": sidebarCollapsed,
