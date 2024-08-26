@@ -18,6 +18,7 @@ from fastapi import (
 )
 from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel
+from sqlalchemy.exc import OperationalError
 
 from skyvern import analytics
 from skyvern.exceptions import StepNotFound
@@ -788,6 +789,9 @@ async def generate_task(
     except LLMProviderError:
         LOG.error("Failed to generate task", exc_info=True)
         raise HTTPException(status_code=400, detail="Failed to generate task. Please try again later.")
+    except OperationalError:
+        LOG.error("Database error when generating task", exc_info=True, user_prompt=data.prompt)
+        raise HTTPException(status_code=500, detail="Failed to generate task. Please try again later.")
 
 
 @base_router.put("/organizations/", include_in_schema=False)
