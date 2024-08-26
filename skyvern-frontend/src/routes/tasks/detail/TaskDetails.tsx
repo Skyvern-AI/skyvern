@@ -1,5 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import { Status } from "@/api/types";
+import { Status, TaskApiResponse } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -17,17 +17,34 @@ import { Textarea } from "@/components/ui/textarea";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { cn } from "@/util/utils";
-import { ReloadIcon } from "@radix-ui/react-icons";
+import { CopyIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, NavLink, Outlet, useParams } from "react-router-dom";
 import { TaskInfo } from "./TaskInfo";
 import { useTaskQuery } from "./hooks/useTaskQuery";
 import { taskIsFinalized } from "@/api/utils";
+import fetchToCurl from "fetch-to-curl";
+import { apiBaseUrl } from "@/util/env";
+import { useApiCredential } from "@/hooks/useApiCredential";
+
+function createTaskRequestObject(values: TaskApiResponse) {
+  return {
+    url: values.request.url,
+    webhook_callback_url: values.request.webhook_callback_url,
+    navigation_goal: values.request.navigation_goal,
+    data_extraction_goal: values.request.data_extraction_goal,
+    proxy_location: values.request.proxy_location,
+    error_code_mapping: values.request.error_code_mapping,
+    navigation_payload: values.request.navigation_payload,
+    extracted_information_schema: values.request.extracted_information_schema,
+  };
+}
 
 function TaskDetails() {
   const { taskId } = useParams();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
+  const apiCredential = useApiCredential();
 
   const {
     data: task,
@@ -109,43 +126,72 @@ function TaskDetails() {
           <span className="text-lg">{taskId}</span>
           {taskId && <TaskInfo id={taskId} />}
         </div>
-        {taskIsRunningOrQueued && (
-          <Dialog>
-            <DialogTrigger asChild>
-              <Button variant="destructive">Cancel</Button>
-            </DialogTrigger>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Are you sure?</DialogTitle>
-                <DialogDescription>
-                  Are you sure you want to cancel this task?
-                </DialogDescription>
-              </DialogHeader>
-              <DialogFooter>
-                <DialogClose asChild>
-                  <Button variant="secondary">Back</Button>
-                </DialogClose>
-                <Button
-                  variant="destructive"
-                  onClick={() => {
-                    cancelTaskMutation.mutate();
-                  }}
-                  disabled={cancelTaskMutation.isPending}
-                >
-                  {cancelTaskMutation.isPending && (
-                    <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-                  )}
-                  Cancel Task
-                </Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
-        )}
-        {taskHasTerminalState && (
-          <Button variant="secondary" asChild>
-            <Link to={`/create/retry/${task.task_id}`}>Rerun Task</Link>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            onClick={() => {
+              if (!task) {
+                return;
+              }
+              const curl = fetchToCurl({
+                method: "POST",
+                url: `${apiBaseUrl}/tasks`,
+                body: createTaskRequestObject(task),
+                headers: {
+                  "Content-Type": "application/json",
+                  "x-api-key": apiCredential ?? "<your-api-key>",
+                },
+              });
+              navigator.clipboard.writeText(curl);
+              toast({
+                variant: "success",
+                title: "Copied to Clipboard",
+                description:
+                  "The cURL command has been copied to your clipboard.",
+              });
+            }}
+          >
+            <CopyIcon className="mr-2 h-4 w-4" />
+            Copy as cURL
           </Button>
-        )}
+          {taskIsRunningOrQueued && (
+            <Dialog>
+              <DialogTrigger asChild>
+                <Button variant="destructive">Cancel</Button>
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Are you sure?</DialogTitle>
+                  <DialogDescription>
+                    Are you sure you want to cancel this task?
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogFooter>
+                  <DialogClose asChild>
+                    <Button variant="secondary">Back</Button>
+                  </DialogClose>
+                  <Button
+                    variant="destructive"
+                    onClick={() => {
+                      cancelTaskMutation.mutate();
+                    }}
+                    disabled={cancelTaskMutation.isPending}
+                  >
+                    {cancelTaskMutation.isPending && (
+                      <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+                    )}
+                    Cancel Task
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+          )}
+          {taskHasTerminalState && (
+            <Button variant="secondary" asChild>
+              <Link to={`/create/retry/${task.task_id}`}>Rerun Task</Link>
+            </Button>
+          )}
+        </div>
       </div>
       {taskIsLoading ? (
         <div className="flex items-center gap-2">
