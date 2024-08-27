@@ -25,7 +25,7 @@ from skyvern.exceptions import (
 from skyvern.forge.sdk.core.skyvern_context import current
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.webeye.utils.page import DISABLE_PRINTER_WITH_FLAG, SkyvernFrame
+from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
@@ -110,8 +110,6 @@ class BrowserContextFactory:
             if not creator:
                 raise UnknownBrowserType(browser_type)
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
-            # overwrite the window.print() to disable the PDF printer
-            await browser_context.add_init_script(DISABLE_PRINTER_WITH_FLAG)
             return browser_context, browser_artifacts, cleanup_func
         except UnknownBrowserType as e:
             raise e
