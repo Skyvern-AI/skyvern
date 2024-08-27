@@ -67,6 +67,7 @@ class BrowserContextFactory:
             "user_data_dir": tempfile.mkdtemp(prefix="skyvern_browser_"),
             "locale": SettingsManager.get_settings().BROWSER_LOCALE,
             "timezone_id": SettingsManager.get_settings().BROWSER_TIMEZONE,
+            "color_scheme": "no-preference",
             "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--disk-cache-size=1",
