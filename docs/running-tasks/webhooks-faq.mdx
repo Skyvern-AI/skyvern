@@ -10,16 +10,33 @@ We use Webhooks for executing tasks as the expected runtime of these jobs can ex
 
 ## How do we handle webhook authentication? (ie how can we handle callbacks?)
 
-- a python example for how to generate the signature:
+<CodeGroup>
+```python validate_skyvern_request.py
+import hmac
+from fastapi import Request
 
-```python
 def validate_skyvern_request_headers(request: Request) -> bool:
-		header_skyvern_signature = request.headers["x-skyvern-signature"]
-		payload = request.body() # this is a bytes
-		hash_obj = hmac.new(SKYVERN_API_KEY.encode("utf-8"), msg=payload, digestmod=hashlib.sha256)
+    header_skyvern_signature = request.headers["x-skyvern-signature"]
+    payload = request.body() # this is a bytes
+    hash_obj = hmac.new(SKYVERN_API_KEY.encode("utf-8"), msg=payload, digestmod=hashlib.sha256)
     client_generated_signature = hash_obj.hexdigest()
-		return header_skyvern_signature == client_generated_signature
+    return header_skyvern_signature == client_generated_signature
 ```
+
+```javascript validateSkyvernRequest.js
+const crypto = require('crypto');
+
+function validateSkyvernRequestHeaders(req) {
+    const headerSkyvernSignature = req.headers['x-skyvern-signature'];
+    const payload = req.body; // assuming req.body is a Buffer or string
+    const hash = crypto.createHmac('sha256', process.env.SKYVERN_API_KEY)
+                        .update(payload)
+                        .digest('hex');
+    return headerSkyvernSignature === hash;
+}
+```
+
+</CodeGroup>
 
 SKYVERN_API_KEY: this is the [api key](/running-tasks/introduction) specific to your organization
 
