@@ -11,7 +11,7 @@ We use Webhooks for executing tasks as the expected runtime of these jobs can ex
 ## How do we handle webhook authentication? (ie how can we handle callbacks?)
 
 <CodeGroup>
-```python validate_skyvern_request.py
+```python Python
 import hmac
 from fastapi import Request
 
@@ -23,7 +23,7 @@ def validate_skyvern_request_headers(request: Request) -> bool:
     return header_skyvern_signature == client_generated_signature
 ```
 
-```javascript validateSkyvernRequest.js
+```javascript Javascript
 const crypto = require('crypto');
 
 function validateSkyvernRequestHeaders(req) {
