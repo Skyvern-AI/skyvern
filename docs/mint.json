@@ -60,7 +60,8 @@
       "group": "Getting Started",
       "pages": [
         "introduction",
-        "getting-started/skyvern-in-action"
+        "getting-started/skyvern-in-action",
+        "getting-started/prompting-guide"
       ]
     },
     {
