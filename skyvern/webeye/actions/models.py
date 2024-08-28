@@ -71,6 +71,7 @@ class DetailedAgentStepOutput(BaseModel):
             actions_and_results=None
             if self.actions_and_results is None
             else [(action, result) for action, result in self.actions_and_results if result],
+            step_exception=self.step_exception,
         )
 
     def to_agent_step_output(self) -> AgentStepOutput:
