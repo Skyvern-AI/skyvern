@@ -172,6 +172,10 @@ class SkyvernFrame:
         js_script = "([frame, element, interactable]) => buildElementObject(frame, element, interactable)"
         return await self.frame.evaluate(js_script, [frame, element, interactable])
 
+    async def get_element_scrollable(self, element: ElementHandle) -> bool:
+        js_script = "(element) => isScrollable(element)"
+        return await self.frame.evaluate(js_script, element)
+
     async def scroll_to_top(self, draw_boxes: bool) -> float:
         """
         Scroll to the top of the page and take a screenshot.

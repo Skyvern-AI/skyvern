@@ -360,6 +360,7 @@ async def handle_input_text_action(
                 result = await select_from_dropdown(
                     action=select_action,
                     page=page,
+                    dom=dom,
                     skyvern_frame=skyvern_frame,
                     incremental_scraped=incremental_scraped,
                     element_trees=incremental_element,
@@ -378,10 +379,11 @@ async def handle_input_text_action(
                 )
             except Exception as e:
                 await skyvern_element.scroll_into_view()
-                await skyvern_element.get_locator().press("Escape", timeout=timeout)
                 LOG.exception("Failed to do custom selection transformed from input action")
                 return [ActionFailure(exception=e)]
             finally:
+                await skyvern_element.press_key("Escape")
+                await skyvern_element.blur()
                 await incremental_scraped.stop_listen_dom_increment()
 
     # force to move focus back to the element
@@ -614,12 +616,19 @@ async def handle_select_option_action(
 
     try:
         await incremental_scraped.start_listen_dom_increment()
-        await skyvern_element.get_locator().focus(timeout=timeout)
+        await skyvern_element.focus()
 
-        if tag_name == InteractiveElement.INPUT:
-            await skyvern_element.get_locator().press("ArrowDown", timeout=timeout)
-        else:
+        try:
             await skyvern_element.get_locator().click(timeout=timeout)
+        except Exception:
+            LOG.info(
+                "fail to open dropdown by clicking, try to press ArrowDown to open",
+                element_id=skyvern_element.get_id(),
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            await skyvern_element.focus()
+            await skyvern_element.press_key("ArrowDown")
 
         # wait 5s for options to load
         await asyncio.sleep(5)
@@ -634,6 +643,7 @@ async def handle_select_option_action(
         result = await select_from_dropdown(
             action=action,
             page=page,
+            dom=dom,
             skyvern_frame=skyvern_frame,
             incremental_scraped=incremental_scraped,
             element_trees=incremental_element,
@@ -1160,6 +1170,7 @@ async def input_or_auto_complete_input(
 async def select_from_dropdown(
     action: SelectOptionAction,
     page: Page,
+    dom: DomUtil,
     skyvern_frame: SkyvernFrame,
     incremental_scraped: IncrementalScrapePage,
     element_trees: list[dict],
@@ -1185,7 +1196,9 @@ async def select_from_dropdown(
     if not force_select and dropdown_menu_element is None:
         return None
 
-    if dropdown_menu_element and dropdown_menu_element.get_scrollable():
+    if dropdown_menu_element and await skyvern_frame.get_element_scrollable(
+        await dropdown_menu_element.get_element_handler()
+    ):
         await scroll_down_to_load_all_options(
             dropdown_menu_element=dropdown_menu_element,
             skyvern_frame=skyvern_frame,
@@ -1198,13 +1211,7 @@ async def select_from_dropdown(
     trimmed_element_tree = await incremental_scraped.get_incremental_element_tree(
         app.AGENT_FUNCTION.cleanup_element_tree_factory(step=step, task=task)
     )
-    if dropdown_menu_element:
-        # if there's a dropdown menu detected, only elements in the dropdown should be sent to LLM
-        dropdown_id = dropdown_menu_element.get_id()
-        for head_node in trimmed_element_tree:
-            if head_node.get("id") == dropdown_id:
-                trimmed_element_tree = [head_node]
-                break
+    trimmed_element_tree = remove_exist_elements(dom=dom, element_tree=trimmed_element_tree)
 
     html = incremental_scraped.build_html_tree(element_tree=trimmed_element_tree)
 
@@ -1319,10 +1326,12 @@ async def scroll_down_to_load_all_options(
             scroll_pace += scroll_interval
         else:
             await skyvern_frame.scroll_to_element_bottom(dropdown_menu_element_handle)
+            # wait for the options to be fully loaded
+            await asyncio.sleep(2)
 
         # scoll a little back and scoll down to trigger the loading
-        await page.mouse.wheel(0, -20)
-        await page.mouse.wheel(0, 20)
+        await page.mouse.wheel(0, -1e-5)
+        await page.mouse.wheel(0, 1e-5)
         # wait for while to load new options
         await asyncio.sleep(10)
 

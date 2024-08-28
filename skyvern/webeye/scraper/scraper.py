@@ -6,7 +6,7 @@ from enum import StrEnum
 from typing import Any, Awaitable, Callable
 
 import structlog
-from playwright.async_api import Frame, Page
+from playwright.async_api import Frame, Locator, Page
 from pydantic import BaseModel
 
 from skyvern.constants import SKYVERN_DIR, SKYVERN_ID_ATTR
@@ -388,13 +388,12 @@ async def get_interactable_element_tree(
 
 
 class IncrementalScrapePage:
-    id_to_element_dict: dict[str, dict] = {}
-    id_to_css_dict: dict[str, str]
-    elements: list[dict]
-    element_tree: list[dict]
-    element_tree_trimmed: list[dict]
-
     def __init__(self, skyvern_frame: SkyvernFrame) -> None:
+        self.id_to_element_dict: dict[str, dict] = dict()
+        self.id_to_css_dict: dict[str, str] = dict()
+        self.elements: list[dict] = list()
+        self.element_tree: list[dict] = list()
+        self.element_tree_trimmed: list[dict] = list()
         self.skyvern_frame = skyvern_frame
 
     async def get_incremental_element_tree(
@@ -403,19 +402,7 @@ class IncrementalScrapePage:
     ) -> list[dict]:
         frame = self.skyvern_frame.get_frame()
 
-        frame_id = "main.frame"
-        if isinstance(frame, Frame):
-            try:
-                frame_element = await frame.frame_element()
-                frame_id = await frame_element.get_attribute("unique_id")
-            except Exception:
-                # TODO: do we really care about the frame_id ?
-                LOG.warning(
-                    "Unable to get frame_element",
-                    exc_info=True,
-                )
-
-        js_script = f"() => getIncrementElements('{frame_id}')"
+        js_script = "() => getIncrementElements()"
         incremental_elements, incremental_tree = await frame.evaluate(js_script)
         # we listen the incremental elements seperated by frames, so all elements will be in the same SkyvernFrame
         self.id_to_css_dict, self.id_to_element_dict, _ = build_element_dict(incremental_elements)
@@ -441,6 +428,25 @@ class IncrementalScrapePage:
     async def get_incremental_elements_num(self) -> int:
         js_script = "() => window.globalOneTimeIncrementElements.length"
         return await self.skyvern_frame.get_frame().evaluate(js_script)
+
+    async def select_one_element_by_value(self, value: str) -> Locator | None:
+        for element in self.elements:
+            element_id = element.get("id", "")
+            if not element_id:
+                continue
+
+            if not element.get("interactable", False):
+                continue
+
+            text = element.get("text", "")
+            if text != value:
+                continue
+
+            locator = self.skyvern_frame.get_frame().locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
+            if await locator.count() > 0:
+                return locator
+
+        return None
 
     def build_html_tree(self, element_tree: list[dict] | None = None) -> str:
         return "".join([json_to_html(element) for element in (element_tree or self.element_tree_trimmed)])

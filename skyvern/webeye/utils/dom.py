@@ -7,7 +7,7 @@ from enum import StrEnum
 from random import uniform
 
 import structlog
-from playwright.async_api import Frame, FrameLocator, Locator, Page, TimeoutError
+from playwright.async_api import ElementHandle, Frame, FrameLocator, Locator, Page, TimeoutError
 
 from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.exceptions import (
@@ -199,9 +199,6 @@ class SkyvernElement:
     def get_element_dict(self) -> dict:
         return self.__static_element
 
-    def get_scrollable(self) -> bool:
-        return self.__static_element.get("isScrollable", False)
-
     def get_selectable(self) -> bool:
         return self.__static_element.get("isSelectable", False)
 
@@ -229,6 +226,13 @@ class SkyvernElement:
 
     def get_locator(self) -> Locator:
         return self.locator
+
+    async def get_element_handler(
+        self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    ) -> ElementHandle:
+        handler = await self.locator.element_handle(timeout=timeout)
+        assert handler is not None
+        return handler
 
     async def get_select2_dropdown(self) -> Select2Dropdown:
         if not await self.is_select2_dropdown():
@@ -328,6 +332,9 @@ class SkyvernElement:
 
         return await self.locator.get_attribute(attr_name, timeout=timeout)
 
+    async def focus(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
+        await self.get_locator().focus(timeout=timeout)
+
     async def input_sequentially(
         self, text: str, default_timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
     ) -> None:
@@ -339,6 +346,11 @@ class SkyvernElement:
             text = text[length - TEXT_PRESS_MAX_LENGTH :]
 
         await self.press_fill(text, timeout=default_timeout)
+
+    async def press_key(
+        self, key: str, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    ) -> None:
+        await self.get_locator().press(key=key, timeout=timeout)
 
     async def press_fill(
         self, text: str, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
@@ -375,11 +387,11 @@ class SkyvernElement:
         click_x, click_y = await self.move_mouse_to(page=page, timeout=timeout)
         await page.mouse.click(click_x, click_y)
 
+    async def blur(self) -> None:
+        await self.get_frame().evaluate("(element) => element.blur()", await self.get_element_handler())
+
     async def scroll_into_view(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
-        element_handler = await self.get_locator().element_handle()
-        if element_handler is None:
-            LOG.warning("element handler is None. ", element_id=self.get_id())
-            return
+        element_handler = await self.get_element_handler(timeout=timeout)
         try:
             await element_handler.scroll_into_view_if_needed(timeout=timeout)
         except TimeoutError:
@@ -387,8 +399,8 @@ class SkyvernElement:
                 "Timeout to execute scrolling into view, try to re-focus to locate the element",
                 element_id=self.get_id(),
             )
-            await self.get_frame().evaluate("(element) => element.blur()", element_handler)
-            await self.get_locator().focus(timeout=timeout)
+            await self.blur()
+            await self.focus(timeout=timeout)
         await asyncio.sleep(2)  # wait for scrolling into the target
 
 
