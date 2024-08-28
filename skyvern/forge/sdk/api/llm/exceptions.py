@@ -40,6 +40,11 @@ class LLMProviderError(BaseLLMError):
         super().__init__(f"Error while using LLMProvider {llm_key}")
 
 
+class LLMProviderErrorRetryableTask(LLMProviderError):
+    def __init__(self, llm_key: str) -> None:
+        super().__init__(f"Retryable error while using LLMProvider {llm_key}")
+
+
 class NoProviderEnabledError(BaseLLMError):
     def __init__(self) -> None:
         super().__init__(

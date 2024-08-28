@@ -14,6 +14,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     DuplicateCustomLLMProviderError,
     InvalidLLMConfigError,
     LLMProviderError,
+    LLMProviderErrorRetryableTask,
 )
 from skyvern.forge.sdk.api.llm.models import LLMAPIHandler, LLMConfig, LLMRouterConfig
 from skyvern.forge.sdk.api.llm.utils import llm_messages_builder, parse_api_response
@@ -211,8 +212,8 @@ class LLMAPIHandlerFactory:
                     **active_parameters,
                 )
                 LOG.info("LLM API call successful", llm_key=llm_key, model=llm_config.model_name)
-            except openai.OpenAIError as e:
-                raise LLMProviderError(llm_key) from e
+            except litellm.exceptions.APIError as e:
+                raise LLMProviderErrorRetryableTask(llm_key) from e
             except CancelledError:
                 t_llm_cancelled = time.perf_counter()
                 LOG.error(
