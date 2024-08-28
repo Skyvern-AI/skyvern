@@ -461,7 +461,7 @@ def trim_element_tree(elements: list[dict]) -> list[dict]:
         if "frame" in queue_ele:
             del queue_ele["frame"]
 
-        if not queue_ele.get("interactable"):
+        if "id" in queue_ele and not queue_ele.get("interactable"):
             del queue_ele["id"]
 
         if "attributes" in queue_ele:
