@@ -936,7 +936,6 @@ function buildElementObject(frame, element, interactable) {
       elementTagNameLower === "select" ||
       isSelect2Dropdown(element) ||
       isSelect2MultiChoice(element),
-    isScrollable: isScrollable(element),
   };
 
   let isInShadowRoot = element.getRootNode() instanceof ShadowRoot;
@@ -1571,7 +1570,7 @@ function scrollToElementBottom(element) {
   element.scroll({
     top: element.scrollHeight,
     left: 0,
-    behavior: "instant",
+    behavior: "smooth",
   });
 }
 
@@ -1619,11 +1618,33 @@ if (window.globalOneTimeIncrementElements === undefined) {
   window.globalOneTimeIncrementElements = [];
 }
 
+if (window.globalDomDepthMap === undefined) {
+  window.globalDomDepthMap = new Map();
+}
+
+function addIncrementalNodeToMap(parentNode, childrenNode) {
+  // calculate the depth of targetNode element for sorting
+  const depth = getElementDomDepth(parentNode);
+  let newNodesTreeList = [];
+  if (window.globalDomDepthMap.has(depth)) {
+    newNodesTreeList = window.globalDomDepthMap.get(depth);
+  }
+
+  for (const child of childrenNode) {
+    const [_, newNodeTree] = buildElementTree(child, "", false);
+    if (newNodeTree.length > 0) {
+      newNodesTreeList.push(...newNodeTree);
+    }
+  }
+  window.globalDomDepthMap.set(depth, newNodesTreeList);
+}
+
 if (window.globalObserverForDOMIncrement === undefined) {
   window.globalObserverForDOMIncrement = new MutationObserver(function (
     mutationsList,
     observer,
   ) {
+    // TODO: how to detect duplicated recreate element?
     for (const mutation of mutationsList) {
       if (mutation.type === "attributes") {
         if (mutation.attributeName === "style") {
@@ -1637,6 +1658,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
               targetNode: node,
               newNodes: [node],
             });
+            addIncrementalNodeToMap(node, [node]);
           }
         }
 
@@ -1660,6 +1682,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
         if (newNodes.length > 0) {
           changedNode.newNodes = newNodes;
           window.globalOneTimeIncrementElements.push(changedNode);
+          addIncrementalNodeToMap(changedNode.targetNode, changedNode.newNodes);
         }
       }
     }
@@ -1667,6 +1690,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
 }
 
 function startGlobalIncrementalObserver() {
+  window.globalDomDepthMap = new Map();
   window.globalOneTimeIncrementElements = [];
   window.globalObserverForDOMIncrement.takeRecords(); // cleanup the older data
   window.globalObserverForDOMIncrement.observe(document.body, {
@@ -1679,63 +1703,50 @@ function startGlobalIncrementalObserver() {
 }
 
 function stopGlobalIncrementalObserver() {
+  window.globalDomDepthMap = new Map();
   window.globalObserverForDOMIncrement.disconnect();
   window.globalObserverForDOMIncrement.takeRecords(); // cleanup the older data
   window.globalOneTimeIncrementElements = [];
 }
 
-function getIncrementElements(frame) {
-  const domDepthMap = new Map();
-
-  for (const element of window.globalOneTimeIncrementElements) {
-    // calculate the depth of targetNode element for sorting
-    const depth = getElementDomDepth(element.targetNode);
-    let newNodesTreeList = [];
-    if (domDepthMap.has(depth)) {
-      newNodesTreeList = domDepthMap.get(depth);
-    }
-
-    for (const child of element.newNodes) {
-      const [_, newNodeTree] = buildElementTree(child, frame, false);
-      if (newNodeTree.length > 0) {
-        newNodesTreeList.push(...newNodeTree);
-      }
-    }
-    domDepthMap.set(depth, newNodesTreeList);
-  }
-
+function getIncrementElements() {
   // cleanup the chidren tree, remove the duplicated element
   // search starting from the shallowest node:
   // 1. if deeper, the node could only be the children of the shallower one or no related one.
   // 2. if depth is same, the node could only be duplicated one or no related one.
   const idToElement = new Map();
   const cleanedTreeList = [];
-  const sortedDepth = Array.from(domDepthMap.keys()).sort();
+  const sortedDepth = Array.from(window.globalDomDepthMap.keys()).sort(
+    (a, b) => a - b,
+  );
   for (let idx = 0; idx < sortedDepth.length; idx++) {
     const depth = sortedDepth[idx];
-    const treeList = domDepthMap.get(depth);
+    const treeList = window.globalDomDepthMap.get(depth);
+
+    const removeDupAndConcatChildren = (element) => {
+      const children = element.children;
+      if (idToElement.has(element.id)) {
+        element = idToElement.get(element.id);
+        for (let i = 0; i < children.length; i++) {
+          const child = children[i];
+          if (!idToElement.get(child.id)) {
+            element.children.push(child);
+          }
+        }
+      }
+      idToElement.set(element.id, element);
+      for (let i = 0; i < children.length; i++) {
+        const child = children[i];
+        removeDupAndConcatChildren(child);
+      }
+    };
 
     for (const treeHeadElement of treeList) {
       // check if the element is existed
-      if (idToElement.has(treeHeadElement.id)) {
-        continue;
+      if (!idToElement.has(treeHeadElement.id)) {
+        cleanedTreeList.push(treeHeadElement);
       }
-      cleanedTreeList.push(treeHeadElement);
-
-      // flatten the tree
-      let pendingElements = [treeHeadElement];
-      let curIndex = 0;
-      while (curIndex < pendingElements.length) {
-        const curElement = pendingElements[curIndex];
-        if (idToElement.has(curElement.id)) {
-          curIndex++;
-          continue;
-        }
-
-        idToElement.set(curElement.id, curElement);
-        pendingElements.push(...curElement.children);
-        curIndex++;
-      }
+      removeDupAndConcatChildren(treeHeadElement);
     }
   }
 
