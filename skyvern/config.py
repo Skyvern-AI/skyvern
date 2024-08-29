@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     AWS_S3_BUCKET_ARTIFACTS: str = "skyvern-artifacts"
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
 
+    # Supported storage types: local, s3
+    SKYVERN_STORAGE_TYPE: str = "local"
+
     # S3 bucket settings
     AWS_REGION: str = "us-east-1"
     AWS_S3_BUCKET_UPLOADS: str = "skyvern-uploads"

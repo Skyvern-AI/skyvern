@@ -44,3 +44,13 @@ The following endpoint can be used to retrieve artifacts for a specific step:
 ```
 GET https://api.skyvern.com/api/v1/tasks/{task_id}/steps/{step_id}/artifacts
 ```
+
+## Artifacts configurations
+By default, Skyvern stores artifacts, including video recording, screenshots, llm requests and responses, html and skyvern parsed html elements locally in the `/artifacts` folder under the skyvern repository.
+You can also have skyvern to upload atrifacts to your s3 buckets. To do this, first set up these environment variables:
+- `AWS_DEFAULT_REGION`: `us-east-1`, `us-west-1`, ...
+- `AWS_ACCESS_KEY_ID`
+- `AWS_SECRET_ACCESS_KEY`
+- `SKYVERN_STORAGE_TYPE`: set it to be `s3`. The default is `local`
+
+Make sure these s3 buckets are created: `skyvern-artifacts`, `skyvern-screenshots`. These are the default bucket names skyvern uses. To customize the bucket names, change these two env variables: `AWS_S3_BUCKET_ARTIFACTS` and `AWS_S3_BUCKET_SCREENSHOTS`
