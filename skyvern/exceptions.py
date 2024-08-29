@@ -293,6 +293,11 @@ class StepUnableToExecuteError(SkyvernException):
         super().__init__(f"Step {step_id} cannot be executed and task execution is stopped. Reason: {reason}")
 
 
+class SVGConversionFailed(SkyvernException):
+    def __init__(self, svg_html: str) -> None:
+        super().__init__(f"Failed to convert SVG after max retries. svg_html={svg_html}")
+
+
 class UnsupportedActionType(SkyvernException):
     def __init__(self, action_type: str):
         super().__init__(f"Unsupport action type: {action_type}")

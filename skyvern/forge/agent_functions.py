@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import hashlib
 from typing import Awaitable, Callable, Dict, List
@@ -6,7 +7,7 @@ import structlog
 from playwright.async_api import Page
 
 from skyvern.constants import SKYVERN_ID_ATTR
-from skyvern.exceptions import StepUnableToExecuteError
+from skyvern.exceptions import StepUnableToExecuteError, SVGConversionFailed
 from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.prompts import prompt_engine
@@ -18,6 +19,9 @@ from skyvern.webeye.scraper.scraper import ELEMENT_NODE_ATTRIBUTES, json_to_html
 CleanupElementTreeFunc = Callable[[str, list[dict]], Awaitable[list[dict]]]
 
 LOG = structlog.get_logger()
+
+USELESS_SVG_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
+SVG_RETRY_ATTEMPT = 3
 
 
 def _remove_rect(element: dict) -> None:
@@ -38,8 +42,11 @@ def _remove_skyvern_attributes(element: Dict) -> Dict:
         if element_copied.get(attr):
             del element_copied[attr]
 
-    if element_copied.get("attributes") and SKYVERN_ID_ATTR in element_copied.get("attributes", {}):
-        del element_copied["attributes"][SKYVERN_ID_ATTR]
+    if "attributes" in element_copied:
+        attributes: dict = copy.deepcopy(element_copied.get("attributes", {}))
+        for key in attributes.keys():
+            if key in USELESS_SVG_ATTRIBUTE:
+                del element_copied["attributes"][key]
 
     children: List[Dict] | None = element_copied.get("children", None)
     if children is None:
@@ -80,20 +87,25 @@ async def _convert_svg_to_string(task: Task, step: Step, organization: Organizat
     else:
         LOG.debug("call LLM to convert SVG to string shape", element_id=element_id)
         svg_convert_prompt = prompt_engine.load_prompt("svg-convert", svg_element=svg_html)
-        try:
-            json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=svg_convert_prompt, step=step)
-            svg_shape = json_response.get("shape", "")
-            if not svg_shape:
-                raise Exception("Empty SVG shape replied by secondary llm")
-            LOG.info("SVG converted by LLM", element_id=element_id, shape=svg_shape)
-            await app.CACHE.set(svg_key, svg_shape)
-        except Exception:
-            LOG.exception(
-                "Failed to convert SVG to string shape by secondary llm",
-                element=element,
-                svg_html=svg_html,
-            )
-            return
+
+        for retry in range(SVG_RETRY_ATTEMPT):
+            try:
+                json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=svg_convert_prompt, step=step)
+                svg_shape = json_response.get("shape", "")
+                if not svg_shape:
+                    raise Exception("Empty SVG shape replied by secondary llm")
+                LOG.info("SVG converted by LLM", element_id=element_id, shape=svg_shape)
+                await app.CACHE.set(svg_key, svg_shape)
+                break
+            except Exception:
+                LOG.exception(
+                    "Failed to convert SVG to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
+                    element_id=element_id,
+                    retry=retry,
+                )
+                await asyncio.sleep(3)
+        else:
+            raise SVGConversionFailed(svg_html=svg_html)
 
     element["attributes"] = dict()
     element["attributes"]["alt"] = svg_shape
