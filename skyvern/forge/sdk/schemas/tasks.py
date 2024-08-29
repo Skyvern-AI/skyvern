@@ -30,7 +30,6 @@ class TaskRequest(BaseModel):
     )
     url: str = Field(
         ...,
-        min_length=1,
         description="Starting URL for the task.",
         examples=["https://www.geico.com"],
     )
