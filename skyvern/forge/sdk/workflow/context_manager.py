@@ -294,6 +294,7 @@ class WorkflowRunContext:
                 and parameter.source.key == output_parameter.key
             ):
                 if isinstance(value, dict) and "errors" in value and value["errors"]:
+                    # Is this the correct way to handle errors from task blocks?
                     LOG.error(
                         f"Output parameter {output_parameter.key} has errors. Setting ContextParameter {parameter.key} value to None"
                     )
