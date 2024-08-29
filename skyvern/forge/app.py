@@ -8,6 +8,7 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.storage.factory import StorageFactory
+from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
@@ -22,6 +23,8 @@ DATABASE = AgentDB(
     SettingsManager.get_settings().DATABASE_STRING,
     debug_enabled=SettingsManager.get_settings().DEBUG_MODE,
 )
+if SettingsManager.get_settings().SKYVERN_STORAGE_TYPE == "s3":
+    StorageFactory.set_storage(S3Storage())
 STORAGE = StorageFactory.get_storage()
 CACHE = CacheFactory.get_cache()
 ARTIFACT_MANAGER = ArtifactManager()
