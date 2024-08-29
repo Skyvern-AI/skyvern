@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 import structlog
 from playwright.async_api import async_playwright
@@ -127,13 +128,10 @@ class BrowserManager:
 
         for i, video_artifact in enumerate(browser_state.browser_artifacts.video_artifacts):
             path = video_artifact.video_path
-            if path:
-                try:
-                    with open(path, "rb") as f:
-                        browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
+            if path and os.path.exists(path=path):
+                with open(path, "rb") as f:
+                    browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
 
-                except FileNotFoundError:
-                    pass
         return browser_state.browser_artifacts.video_artifacts
 
     async def get_har_data(
@@ -145,7 +143,7 @@ class BrowserManager:
     ) -> bytes:
         if browser_state:
             path = browser_state.browser_artifacts.har_path
-            if path:
+            if path and os.path.exists(path=path):
                 with open(path, "rb") as f:
                     return f.read()
         LOG.warning(
