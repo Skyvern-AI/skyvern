@@ -108,6 +108,13 @@ class LLMAPIHandlerFactory:
                 LOG.info("LLM API call successful", llm_key=llm_key, model=llm_config.model_name)
             except litellm.exceptions.APIError as e:
                 raise LLMProviderErrorRetryableTask(llm_key) from e
+            except ValueError as e:
+                LOG.exception(
+                    "LLM token limit exceeded",
+                    llm_key=llm_key,
+                    model=main_model_group,
+                )
+                raise LLMProviderErrorRetryableTask(llm_key) from e
             except Exception as e:
                 LOG.exception(
                     "LLM request failed unexpectedly",
