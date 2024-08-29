@@ -293,7 +293,7 @@ class WorkflowRunContext:
                 and isinstance(parameter.source, OutputParameter)
                 and parameter.source.key == output_parameter.key
             ):
-                if isinstance(value, dict) and "errors" in value:
+                if isinstance(value, dict) and "errors" in value and value["errors"]:
                     LOG.error(
                         f"Output parameter {output_parameter.key} has errors. Setting ContextParameter {parameter.key} value to None"
                     )
