@@ -16,6 +16,7 @@ from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
+CleanupElementTreeFunc = Callable[[str, list[dict]], Awaitable[list[dict]]]
 
 RESERVED_ATTRIBUTES = {
     "accept",  # for input file
@@ -171,7 +172,7 @@ class ScrapedPage(BaseModel):
 async def scrape_website(
     browser_state: BrowserState,
     url: str,
-    cleanup_element_tree: Callable[[str, list[dict]], Awaitable[list[dict]]],
+    cleanup_element_tree: CleanupElementTreeFunc,
     num_retry: int = 0,
     scrape_exclude: Callable[[Page, Frame], Awaitable[bool]] | None = None,
 ) -> ScrapedPage:
@@ -251,7 +252,7 @@ async def get_frame_text(iframe: Frame) -> str:
 async def scrape_web_unsafe(
     browser_state: BrowserState,
     url: str,
-    cleanup_element_tree: Callable[[str, list[dict]], Awaitable[list[dict]]],
+    cleanup_element_tree: CleanupElementTreeFunc,
     scrape_exclude: Callable[[Page, Frame], Awaitable[bool]] | None = None,
 ) -> ScrapedPage:
     """
@@ -398,7 +399,7 @@ class IncrementalScrapePage:
 
     async def get_incremental_element_tree(
         self,
-        cleanup_element_tree: Callable[[str, list[dict]], Awaitable[list[dict]]],
+        cleanup_element_tree: CleanupElementTreeFunc,
     ) -> list[dict]:
         frame = self.skyvern_frame.get_frame()
 
@@ -429,23 +430,54 @@ class IncrementalScrapePage:
         js_script = "() => window.globalOneTimeIncrementElements.length"
         return await self.skyvern_frame.get_frame().evaluate(js_script)
 
+    async def __validate_element_by_value(self, value: str, element: dict) -> tuple[Locator | None, bool]:
+        """
+        Locator: the locator of the matched element. None if no valid element to interact;
+        bool: is_matched. True, found an intercatable alternative one; False, not found  any alternative;
+
+        If is_matched is True, but Locator is None. It means the value is matched, but the current element is non-interactable
+        """
+
+        interactable = element.get("interactable", False)
+        element_id = element.get("id", "")
+
+        parent_locator: Locator | None = None
+        if element_id:
+            parent_locator = self.skyvern_frame.get_frame().locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
+
+        # DFS to validate the children first:
+        # if the child element matched and is interactable, return the child node directly
+        # if the child element matched value but not interactable, try to interact with the parent node
+        children = element.get("children", [])
+        for child in children:
+            child_locator, is_match = await self.__validate_element_by_value(value, child)
+            if is_match:
+                if child_locator:
+                    return child_locator, True
+                if interactable and parent_locator and await parent_locator.count() > 0:
+                    return parent_locator, True
+                return None, True
+
+        if not parent_locator:
+            return None, False
+
+        text = element.get("text", "")
+        if text != value:
+            return None, False
+
+        if await parent_locator.count() == 0:
+            return None, False
+
+        if not interactable:
+            return None, True
+
+        return parent_locator, True
+
     async def select_one_element_by_value(self, value: str) -> Locator | None:
-        for element in self.elements:
-            element_id = element.get("id", "")
-            if not element_id:
-                continue
-
-            if not element.get("interactable", False):
-                continue
-
-            text = element.get("text", "")
-            if text != value:
-                continue
-
-            locator = self.skyvern_frame.get_frame().locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
-            if await locator.count() > 0:
+        for element in self.element_tree:
+            locator, _ = await self.__validate_element_by_value(value=value, element=element)
+            if locator:
                 return locator
-
         return None
 
     def build_html_tree(self, element_tree: list[dict] | None = None) -> str:

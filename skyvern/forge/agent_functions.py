@@ -1,7 +1,7 @@
 import asyncio
 import copy
 import hashlib
-from typing import Awaitable, Callable, Dict, List
+from typing import Dict, List
 
 import structlog
 from playwright.async_api import Page
@@ -14,9 +14,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.models import Organization, Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.webeye.browser_factory import BrowserState
-from skyvern.webeye.scraper.scraper import ELEMENT_NODE_ATTRIBUTES, json_to_html
-
-CleanupElementTreeFunc = Callable[[str, list[dict]], Awaitable[list[dict]]]
+from skyvern.webeye.scraper.scraper import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
 
 LOG = structlog.get_logger()
 

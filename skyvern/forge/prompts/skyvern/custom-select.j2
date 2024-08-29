@@ -13,6 +13,7 @@ Reply in JSON format with the following keys:
     "reasoning": str, // The reasoning behind the action. Be specific, referencing target value and element ids in your reasoning. Mention why you chose the element id. Keep the reasoning short and to the point.
     "confidence_float": float, // The confidence of the action. Pick a number between 0.0 and 1.0. 0.0 means no confidence, 1.0 means full confidence
     "id": str, // The id of the element to take action on. The id has to be one from the elements list
+    "value": str, // The value to select.
 }
 
 Context:

@@ -320,6 +320,36 @@ class SkyvernElement:
             index += 1
         return None
 
+    async def find_interactable_anchor_child(
+        self, dom: DomUtil, element_type: InteractiveElement
+    ) -> SkyvernElement | None:
+        index = 0
+        queue = [self]
+        while index < len(queue):
+            item = queue[index]
+            if item.is_interactable() and item.get_tag_name() == element_type:
+                return item
+
+            try:
+                for_element = await item.find_label_for(dom=dom)
+                if for_element is not None and for_element.get_tag_name() == element_type:
+                    return for_element
+            except Exception:
+                LOG.error(
+                    "Failed to find element by label-for",
+                    element=item.__static_element,
+                    exc_info=True,
+                )
+
+            children: list[dict] = item.__static_element.get("children", [])
+            for child in children:
+                child_id = child.get("id", "")
+                child_element = await dom.get_skyvern_element_by_id(child_id)
+                queue.append(child_element)
+
+            index += 1
+        return None
+
     async def get_attr(
         self,
         attr_name: str,
