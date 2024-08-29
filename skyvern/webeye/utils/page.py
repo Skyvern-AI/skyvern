@@ -145,9 +145,9 @@ class SkyvernFrame:
         async with asyncio.timeout(timeout):
             return await self.frame.content()
 
-    async def scroll_to_element_bottom(self, element: ElementHandle) -> None:
-        js_script = "(element) => scrollToElementBottom(element)"
-        return await self.frame.evaluate(js_script, element)
+    async def scroll_to_element_bottom(self, element: ElementHandle, page_by_page: bool = False) -> None:
+        js_script = "([element, page_by_page]) => scrollToElementBottom(element, page_by_page)"
+        return await self.frame.evaluate(js_script, [element, page_by_page])
 
     async def scroll_to_element_top(self, element: ElementHandle) -> None:
         js_script = "(element) => scrollToElementTop(element)"

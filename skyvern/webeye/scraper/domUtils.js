@@ -496,6 +496,17 @@ const isComboboxDropdown = (element) => {
   return role && haspopup && controls && readonly;
 };
 
+const isDropdownButton = (element) => {
+  const tagName = element.tagName.toLowerCase();
+  const type = element.getAttribute("type")
+    ? element.getAttribute("type").toLowerCase()
+    : "";
+  const haspopup = element.getAttribute("aria-haspopup")
+    ? element.getAttribute("aria-haspopup").toLowerCase()
+    : "";
+  return tagName === "button" && type === "button" && haspopup === "listbox";
+};
+
 const isSelect2Dropdown = (element) => {
   const tagName = element.tagName.toLowerCase();
   const className = element.className.toString();
@@ -934,6 +945,7 @@ function buildElementObject(frame, element, interactable) {
       elementTagNameLower === "svg" || element.closest("svg") !== null,
     isSelectable:
       elementTagNameLower === "select" ||
+      isDropdownButton(element) ||
       isSelect2Dropdown(element) ||
       isSelect2MultiChoice(element),
   };
@@ -1566,9 +1578,12 @@ function scrollToNextPage(draw_boxes) {
   return window.scrollY;
 }
 
-function scrollToElementBottom(element) {
+function scrollToElementBottom(element, page_by_page = false) {
+  const top = page_by_page
+    ? element.clientHeight + element.scrollTop
+    : element.scrollHeight;
   element.scroll({
-    top: element.scrollHeight,
+    top: top,
     left: 0,
     behavior: "smooth",
   });
