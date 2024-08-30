@@ -79,6 +79,7 @@
       "pages": [
         "workflows/introduction",
         "workflows/creating-workflows",
+        "workflows/getting-workflows",
         "workflows/running-workflows",
         "workflows/workflow-blocks"
       ]
