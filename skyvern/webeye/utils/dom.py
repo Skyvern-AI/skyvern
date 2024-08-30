@@ -34,7 +34,7 @@ from skyvern.webeye.utils.page import SkyvernFrame
 LOG = structlog.get_logger()
 
 TEXT_INPUT_DELAY = 10  # 10ms between each character input
-TEXT_PRESS_MAX_LENGTH = 10
+TEXT_PRESS_MAX_LENGTH = 20
 
 
 async def resolve_locator(
