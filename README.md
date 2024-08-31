@@ -301,6 +301,8 @@ We welcome PRs and suggestions! Don't hesitate to open a PR/issue or to reach ou
 Please have a look at our [contribution guide](CONTRIBUTING.md) and
 ["Help Wanted" issues](https://github.com/skyvern-ai/skyvern/issues?q=is%3Aopen+is%3Aissue+label%3A%22help+wanted%22) to get started!
 
+If you want to chat with the skyvern repository to get a high level overview of how it is structured, how to build off it, and how to resolve usage questions, check out [Sage](https://sage.storia.ai).
+
 # Telemetry
 
 By Default, Skyvern collects basic usage statistics to help us understand how Skyvern is being used. If you would like to opt-out of telemetry, please set the `SKYVERN_TELEMETRY` environment variable to `false`.
