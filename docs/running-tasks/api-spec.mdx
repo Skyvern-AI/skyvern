@@ -3,7 +3,7 @@ title: Tasks API
 description: 'The core building block in Skyvern'
 ---
 
-Tasks are the building block of Skyvern. They represent a single instruction to the browser to go do something using language models. Ex. “Go to alibaba and extract this information”
+Tasks are the building block of Skyvern. They represent a single instruction (goal) to the browser to go do something using language models. Ex. “Go to alibaba and extract this information”
 
 ## Request - Initiate a task 
 Request type: `POST`
@@ -47,12 +47,16 @@ POST https://api.skyvern.com/api/v1/tasks/
 ```
 
 ## Response
+Each task has an associated `task_id` -- a unique identifier you can use to look up information about any task.
 
 | Parameter | Type | Always returned? | Sample Value | Description |
 | --- | --- | --- | --- | --- |
 | task_id | String | yes | t_123456 | The task id associated with this specific task |
 
 ## Response Webhook - Task conclusion (POST)
+If a `webhook_callback_url` is specified within your task request, Skyvern will make a callback to your system letting you know that it has either finished, terminated or failed a task execution. 
+
+The following headers can be used to validate it's an authentic Skyvern request. 
 
 ### Headers
 
@@ -62,10 +66,12 @@ POST https://api.skyvern.com/api/v1/tasks/
 | x-skyvern-timestamp | String | yes | 1531420618 | Timestamp used to decode and validate the incoming webhook call<br/><br/>We’ll be using the same strategy slack uses, as defined here: https://api.slack.com/authentication/verifying-requests-from-slack#making__validating-a-request |
 
 ### Body
+These parameters are returned in the body of the `webhook_callback_url`. 
 
 | Parameter | Type | Always returned? | Sample Value | Description |
 | --- | --- | --- | --- | --- |
 | task_id | String | yes | t_123456 | The task id associated with this specific task |
+| status | String | yes | success | The status of the task | 
 | extracted_information | Object | Yes | 'price’: ‘$100.0’ | Unstructured JSON payload containing the extracted information as specified by the users’ input prompt |
 | screenshot_url | String | Yes | … url to screenshot … | Screenshot of the final page, where the data extraction occurs |
 | recording_url | String | Yes | .. url to recording … | Recording of the entire browsing session to help debug any issues |
@@ -133,7 +139,7 @@ The response is a list of Step Object.
 | output_token_count | Integer | 500 | The number of output tokens generated in this step |
 
 ## Request - Cancel A Task (POST)
-A task that's in any of thsese states can be canceled: ["created", "queued", "running"]
+A task that's in any of thsese states can be canceled: ["created", "queued", "running"]. This stops the execution of a task.
 
 Request type: `POST`
 
