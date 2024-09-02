@@ -163,9 +163,8 @@ class SkyvernElement:
         if tag_name != InteractiveElement.INPUT:
             return False
 
-        haspopup = await self.get_attr("aria-haspopup")
         autocomplete = await self.get_attr("aria-autocomplete")
-        if haspopup and autocomplete:
+        if autocomplete and autocomplete == "list":
             return True
 
         element_id = await self.get_attr("id")
