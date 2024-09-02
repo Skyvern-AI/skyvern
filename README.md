@@ -107,6 +107,7 @@ Before you begin, make sure you have the following installed:
 - [node](https://nodejs.org/en/download/)
 - [Docker](https://docs.docker.com/engine/install/)
   
+
 Note: Our setup script does these two for you, but they are here for reference.
 - [Python 3.11](https://www.python.org/downloads/)
     - `poetry env use 3.11`
@@ -263,20 +264,21 @@ Our focus is bringing stability to browser-based workflows. We leverage LLMs to 
 | AWS Bedrock | Anthropic Claude 3 (Haiku, Sonnet, Opus), Claude 3.5 (Sonnet) |
 
 #### Environment Variables
-| Variable | Description | Type | Sample Value |
+| Variable | Description| Type | Sample Value|
 | -------- | ------- | ------- | ------- |
-| `ENABLE_OPENAI`  | Register OpenAI models | Boolean | `true`, `false` |
-| `ENABLE_ANTHROPIC` | Register Anthropic models | Boolean | `true`, `false` |
+| `ENABLE_OPENAI`| Register OpenAI models | Boolean | `true`, `false` |
+| `ENABLE_ANTHROPIC` | Register Anthropic models| Boolean | `true`, `false` |
 | `ENABLE_AZURE` | Register Azure OpenAI models | Boolean | `true`, `false` |
-| `ENABLE_BEDROCK` | Register AWS Bedrock models | Boolean | `true`, `false` |
+| `ENABLE_BEDROCK` | Register AWS Bedrock models| Boolean | `true`, `false` |
 | `LLM_KEY` | The name of the model you want to use | String | Currently supported llm keys: `OPENAI_GPT4_TURBO`, `OPENAI_GPT4V`, `OPENAI_GPT4O`, `OPENAI_GPT4O_MINI`, `ANTHROPIC_CLAUDE3`, `ANTHROPIC_CLAUDE3_OPUS`, `ANTHROPIC_CLAUDE3_SONNET`, `ANTHROPIC_CLAUDE3_HAIKU`, `ANTHROPIC_CLAUDE3.5_SONNET`, `BEDROCK_ANTHROPIC_CLAUDE3_OPUS`, `BEDROCK_ANTHROPIC_CLAUDE3_SONNET`, `BEDROCK_ANTHROPIC_CLAUDE3_HAIKU`, `BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET`, `AZURE_OPENAI` |
 | `OPENAI_API_KEY` | OpenAI API Key | String | `sk-1234567890` |
-| `ANTHROPIC_API_KEY` | Anthropic API key | String | `sk-1234567890` |
+| `OPENAI_API_BASE` | OpenAI API Base, optional | String | `https://openai.api.base` |
+| `OPENAI_ORGANIZATION` | OpenAI Organization ID, optional | String | `your-org-id` |
+| `ANTHROPIC_API_KEY` | Anthropic API key| String | `sk-1234567890` |
 | `AZURE_API_KEY` | Azure deployment API key | String | `sk-1234567890` |
-| `AZURE_DEPLOYMENT` | Azure OpenAI Deployment Name | String | `skyvern-deployment` |
-| `AZURE_API_BASE` | Azure deployment api base url | String | `https://skyvern-deployment.openai.azure.com/` |
-| `AZURE_API_VERSION` | Azure API Version | String | `2024-02-01` |
-
+| `AZURE_DEPLOYMENT` | Azure OpenAI Deployment Name | String | `skyvern-deployment`|
+| `AZURE_API_BASE` | Azure deployment api base url| String | `https://skyvern-deployment.openai.azure.com/`|
+| `AZURE_API_VERSION` | Azure API Version| String | `2024-02-01`|
 ### Skyvern UI
 
 # Feature Roadmap
