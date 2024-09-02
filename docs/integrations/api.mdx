@@ -12,7 +12,7 @@ Retrieves the organization information for the current authenticated user.
 ### Endpoint
 
 ```
-GET /organizations
+GET https://api.skyvern.com/api/v1/organizations
 ```
 
 ### Authentication
@@ -55,7 +55,7 @@ The API will return a JSON object containing an array of organizations associate
 Using cURL:
 
 ```bash
-curl -X GET "https://api.skyvern.com/organizations" \
+curl -X GET "https://api.skyvern.com/api/v1/organizations" \
      -H "x-api-key: your_api_key_here"
 ```
 
@@ -64,7 +64,7 @@ Using Python with the `requests` library:
 ```python
 import requests
 
-url = "https://api.skyvern.com/organizations"
+url = "https://api.skyvern.com/api/v1/organizations"
 headers = {
     "x-api-key": "your_api_key"
 }
