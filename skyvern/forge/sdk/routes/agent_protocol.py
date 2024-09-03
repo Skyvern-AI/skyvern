@@ -55,7 +55,6 @@ from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
 base_router = APIRouter()
 
 LOG = structlog.get_logger()
-PROMPT_CACHE_WINDOW_HOURS = 24
 
 
 @base_router.post("/webhook", tags=["server"])
@@ -775,7 +774,7 @@ async def generate_task(
     # check if there's a same user_prompt within the past x Hours
     # in the future, we can use vector db to fetch similar prompts
     existing_task_generation = await app.DATABASE.get_task_generation_by_prompt_hash(
-        user_prompt_hash=user_prompt_hash, query_window_hours=PROMPT_CACHE_WINDOW_HOURS
+        user_prompt_hash=user_prompt_hash, query_window_hours=SettingsManager.get_settings().PROMPT_CACHE_WINDOW_HOURS
     )
     if existing_task_generation:
         new_task_generation = await app.DATABASE.create_task_generation(

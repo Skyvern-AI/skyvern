@@ -1423,7 +1423,7 @@ class AgentDB:
     async def get_task_generation_by_prompt_hash(
         self,
         user_prompt_hash: str,
-        query_window_hours: int = settings.PROMPT_ACTION_HISTORY_WINDOW,
+        query_window_hours: int = settings.PROMPT_CACHE_WINDOW_HOURS,
     ) -> TaskGeneration | None:
         before_time = datetime.utcnow() - timedelta(hours=query_window_hours)
         async with self.Session() as session:
