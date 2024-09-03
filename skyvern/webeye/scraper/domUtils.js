@@ -1639,7 +1639,7 @@ if (window.globalDomDepthMap === undefined) {
 
 function isClassNameIncludesHidden(className) {
   // some hidden elements are with the classname like `class="select-items select-hide"`
-  return className.includes("hide");
+  return className.toLowerCase().includes("hide");
 }
 
 function addIncrementalNodeToMap(parentNode, childrenNode) {
@@ -1669,7 +1669,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
       if (mutation.type === "attributes") {
         if (mutation.attributeName === "style") {
           // TODO: need to confirm that elemnent is hidden previously
-          node = mutation.target;
+          const node = mutation.target;
           if (node.nodeType === Node.TEXT_NODE) continue;
           const newStyle = window.getComputedStyle(node);
           const newDisplay = newStyle.display;
@@ -1682,7 +1682,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
           }
         }
         if (mutation.attributeName === "class") {
-          node = mutation.target;
+          const node = mutation.target;
           if (
             !mutation.oldValue ||
             !isClassNameIncludesHidden(mutation.oldValue)
