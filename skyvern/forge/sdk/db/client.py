@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Sequence
 
 import structlog
@@ -6,6 +6,7 @@ from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from skyvern.config import settings
 from skyvern.exceptions import WorkflowParameterNotFound
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
@@ -1386,6 +1387,7 @@ class AgentDB:
         self,
         organization_id: str,
         user_prompt: str,
+        user_prompt_hash: str,
         url: str | None = None,
         navigation_goal: str | None = None,
         navigation_payload: dict[str, Any] | None = None,
@@ -1395,11 +1397,13 @@ class AgentDB:
         llm: str | None = None,
         llm_prompt: str | None = None,
         llm_response: str | None = None,
+        source_task_generation_id: str | None = None,
     ) -> TaskGeneration:
         async with self.Session() as session:
             new_task_generation = TaskGenerationModel(
                 organization_id=organization_id,
                 user_prompt=user_prompt,
+                user_prompt_hash=user_prompt_hash,
                 url=url,
                 navigation_goal=navigation_goal,
                 navigation_payload=navigation_payload,
@@ -1409,8 +1413,27 @@ class AgentDB:
                 llm_prompt=llm_prompt,
                 llm_response=llm_response,
                 suggested_title=suggested_title,
+                source_task_generation_id=source_task_generation_id,
             )
             session.add(new_task_generation)
             await session.commit()
             await session.refresh(new_task_generation)
             return TaskGeneration.model_validate(new_task_generation)
+
+    async def get_task_generation_by_prompt_hash(
+        self,
+        user_prompt_hash: str,
+        query_window_hours: int = settings.PROMPT_ACTION_HISTORY_WINDOW,
+    ) -> TaskGeneration | None:
+        before_time = datetime.utcnow() - timedelta(hours=query_window_hours)
+        async with self.Session() as session:
+            query = (
+                select(TaskGenerationModel)
+                .filter_by(user_prompt_hash=user_prompt_hash)
+                .filter(TaskGenerationModel.llm.is_not(None))
+                .filter(TaskGenerationModel.created_at > before_time)
+            )
+            task_generation = (await session.scalars(query)).first()
+            if not task_generation:
+                return None
+            return TaskGeneration.model_validate(task_generation)

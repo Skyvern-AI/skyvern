@@ -77,6 +77,9 @@ class Settings(BaseSettings):
     BITWARDEN_TIMEOUT_SECONDS: int = 60
     BITWARDEN_MAX_RETRIES: int = 1
 
+    # task generation settings
+    PROMPT_CACHE_WINDOW_HOURS: int = 24
+
     #####################
     # LLM Configuration #
     #####################
