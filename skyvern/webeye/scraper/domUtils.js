@@ -1372,6 +1372,11 @@ function drawBoundingBoxes(elements) {
   addHintMarkersToPage(hintMarkers);
 }
 
+function buildElementsAndDrawBoundingBoxes() {
+  var elementsAndResultArray = buildTreeFromBody();
+  drawBoundingBoxes(elementsAndResultArray[0]);
+}
+
 function captchaSolvedCallback() {
   console.log("captcha solved");
   if (!window["captchaSolvedCounter"]) {
@@ -1556,8 +1561,7 @@ function scrollToTop(draw_boxes) {
   removeBoundingBoxes();
   window.scroll({ left: 0, top: 0, behavior: "instant" });
   if (draw_boxes) {
-    var elementsAndResultArray = buildTreeFromBody();
-    drawBoundingBoxes(elementsAndResultArray[0]);
+    buildElementsAndDrawBoundingBoxes();
   }
   return window.scrollY;
 }
@@ -1572,10 +1576,28 @@ function scrollToNextPage(draw_boxes) {
     behavior: "instant",
   });
   if (draw_boxes) {
-    var elementsAndResultArray = buildTreeFromBody();
-    drawBoundingBoxes(elementsAndResultArray[0]);
+    buildElementsAndDrawBoundingBoxes();
   }
   return window.scrollY;
+}
+
+function isWindowScrollable() {
+  // Check if the body's overflow style is set to hidden
+  const bodyOverflow = window.getComputedStyle(document.body).overflow;
+  const htmlOverflow = window.getComputedStyle(
+    document.documentElement,
+  ).overflow;
+
+  // Check if the document height is greater than the window height
+  const isScrollable =
+    document.documentElement.scrollHeight > window.innerHeight;
+
+  // If the overflow is set to 'hidden' or there is no content to scroll, return false
+  if (bodyOverflow === "hidden" || htmlOverflow === "hidden" || !isScrollable) {
+    return false;
+  }
+
+  return true;
 }
 
 function scrollToElementBottom(element, page_by_page = false) {

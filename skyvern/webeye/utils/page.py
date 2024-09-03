@@ -92,25 +92,37 @@ class SkyvernFrame:
         assert isinstance(skyvern_page.frame, Page)
 
         screenshots: List[bytes] = []
-        scroll_y_px_old = -30.0
-        scroll_y_px = await skyvern_page.scroll_to_top(draw_boxes=draw_boxes)
-        # Checking max number of screenshots to prevent infinite loop
-        # We are checking the difference between the old and new scroll_y_px to determine if we have reached the end of the
-        # page. If the difference is less than 25, we assume we have reached the end of the page.
-        while abs(scroll_y_px_old - scroll_y_px) > 25 and len(screenshots) < max_number:
+        if await skyvern_page.is_window_scrollable():
+            scroll_y_px_old = -30.0
+            scroll_y_px = await skyvern_page.scroll_to_top(draw_boxes=draw_boxes)
+            # Checking max number of screenshots to prevent infinite loop
+            # We are checking the difference between the old and new scroll_y_px to determine if we have reached the end of the
+            # page. If the difference is less than 25, we assume we have reached the end of the page.
+            while abs(scroll_y_px_old - scroll_y_px) > 25 and len(screenshots) < max_number:
+                screenshot = await SkyvernFrame.take_screenshot(page=skyvern_page.frame, full_page=False)
+                screenshots.append(screenshot)
+                scroll_y_px_old = scroll_y_px
+                LOG.debug("Scrolling to next page", url=url, num_screenshots=len(screenshots))
+                scroll_y_px = await skyvern_page.scroll_to_next_page(draw_boxes=draw_boxes)
+                LOG.debug(
+                    "Scrolled to next page",
+                    scroll_y_px=scroll_y_px,
+                    scroll_y_px_old=scroll_y_px_old,
+                )
+            if draw_boxes:
+                await skyvern_page.remove_bounding_boxes()
+            await skyvern_page.scroll_to_top(draw_boxes=False)
+        else:
+            if draw_boxes:
+                await skyvern_page.build_elements_and_draw_bounding_boxes()
+
+            LOG.debug("Page is not scrollable", url=url, num_screenshots=len(screenshots))
             screenshot = await SkyvernFrame.take_screenshot(page=skyvern_page.frame, full_page=False)
             screenshots.append(screenshot)
-            scroll_y_px_old = scroll_y_px
-            LOG.debug("Scrolling to next page", url=url, num_screenshots=len(screenshots))
-            scroll_y_px = await skyvern_page.scroll_to_next_page(draw_boxes=draw_boxes)
-            LOG.debug(
-                "Scrolled to next page",
-                scroll_y_px=scroll_y_px,
-                scroll_y_px_old=scroll_y_px_old,
-            )
-        if draw_boxes:
-            await skyvern_page.remove_bounding_boxes()
-        await skyvern_page.scroll_to_top(draw_boxes=False)
+
+            if draw_boxes:
+                await skyvern_page.remove_bounding_boxes()
+
         return screenshots
 
     @staticmethod
@@ -205,3 +217,11 @@ class SkyvernFrame:
         """
         js_script = "() => removeBoundingBoxes()"
         await self.frame.evaluate(js_script)
+
+    async def build_elements_and_draw_bounding_boxes(self) -> None:
+        js_script = "() => buildElementsAndDrawBoundingBoxes()"
+        await self.frame.evaluate(js_script)
+
+    async def is_window_scrollable(self) -> bool:
+        js_script = "() => isWindowScrollable()"
+        return await self.frame.evaluate(js_script)
