@@ -374,7 +374,8 @@ class TaskGenerationModel(Base):
 
     task_generation_id = Column(String, primary_key=True, default=generate_task_generation_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
-    user_prompt = Column(String, nullable=False, index=True)  # The prompt from the user
+    user_prompt = Column(String, nullable=False)
+    user_prompt_hash = Column(String, index=True)
     url = Column(String)
     navigation_goal = Column(String)
     navigation_payload = Column(JSON)
@@ -385,6 +386,8 @@ class TaskGenerationModel(Base):
     llm = Column(String)  # language model to use
     llm_prompt = Column(String)  # The prompt sent to the language model
     llm_response = Column(String)  # The response from the language model
+
+    source_task_generation_id = Column(String, index=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
