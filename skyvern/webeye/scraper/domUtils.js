@@ -1637,6 +1637,11 @@ if (window.globalDomDepthMap === undefined) {
   window.globalDomDepthMap = new Map();
 }
 
+function isClassNameIncludesHidden(className) {
+  // some hidden elements are with the classname like `class="select-items select-hide"`
+  return className.includes("hide");
+}
+
 function addIncrementalNodeToMap(parentNode, childrenNode) {
   // calculate the depth of targetNode element for sorting
   const depth = getElementDomDepth(parentNode);
@@ -1676,10 +1681,23 @@ if (window.globalObserverForDOMIncrement === undefined) {
             addIncrementalNodeToMap(node, [node]);
           }
         }
-
-        // TODO: we maybe need to detect the visiblity change from class
-        // if (mutation.attributeName === "class") {
-        // }
+        if (mutation.attributeName === "class") {
+          node = mutation.target;
+          if (
+            !mutation.oldValue ||
+            !isClassNameIncludesHidden(mutation.oldValue)
+          )
+            continue;
+          const newStyle = window.getComputedStyle(node);
+          const newDisplay = newStyle.display;
+          if (newDisplay !== "none") {
+            window.globalOneTimeIncrementElements.push({
+              targetNode: node,
+              newNodes: [node],
+            });
+            addIncrementalNodeToMap(node, [node]);
+          }
+        }
       }
 
       if (mutation.type === "childList") {
