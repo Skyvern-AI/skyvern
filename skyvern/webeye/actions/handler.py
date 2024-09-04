@@ -345,6 +345,7 @@ async def handle_input_text_action(
     if text is None:
         return [ActionFailure(FailedToFetchSecret())]
 
+    incremental_element: list[dict] = []
     # check if it's selectable
     if skyvern_element.get_tag_name() == InteractiveElement.INPUT:
         await skyvern_element.scroll_into_view()
@@ -421,28 +422,37 @@ async def handle_input_text_action(
         LOG.warning("Failed to clear the input field", action=action, exc_info=True)
         return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
 
-    # TODO: not sure if this case will trigger auto-completion
-    if tag_name not in COMMON_INPUT_TAGS:
-        await skyvern_element.input_fill(text)
+    try:
+        # TODO: not sure if this case will trigger auto-completion
+        if tag_name not in COMMON_INPUT_TAGS:
+            await skyvern_element.input_fill(text)
+            return [ActionSuccess()]
+
+        if len(text) == 0:
+            return [ActionSuccess()]
+
+        if await skyvern_element.is_auto_completion_input():
+            result = await input_or_auto_complete_input(
+                action=action,
+                page=page,
+                dom=dom,
+                text=text,
+                skyvern_element=skyvern_element,
+                step=step,
+                task=task,
+            )
+            return [result]
+
+        await skyvern_element.input_sequentially(text=text)
         return [ActionSuccess()]
-
-    if len(text) == 0:
-        return [ActionSuccess()]
-
-    if await skyvern_element.is_auto_completion_input():
-        result = await input_or_auto_complete_input(
-            action=action,
-            page=page,
-            dom=dom,
-            text=text,
-            skyvern_element=skyvern_element,
-            step=step,
-            task=task,
-        )
-        return [result]
-
-    await skyvern_element.input_sequentially(text=text)
-    return [ActionSuccess()]
+    finally:
+        # HACK: force to finish missing auto completion input
+        if len(incremental_element) > 0:
+            LOG.debug(
+                "Trigger input-selection hack, pressing Tab to choose one",
+                action=action,
+            )
+            await skyvern_element.press_key("Tab")
 
 
 async def handle_upload_file_action(
