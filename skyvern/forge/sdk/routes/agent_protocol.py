@@ -124,12 +124,7 @@ async def create_agent_task(
 
     created_task = await app.agent.create_task(task, current_org.organization_id)
     if x_max_steps_override:
-        LOG.info(
-            "Overriding max steps per run",
-            max_steps_override=x_max_steps_override,
-            organization_id=current_org.organization_id,
-            task_id=created_task.task_id,
-        )
+        LOG.info("Overriding max steps per run", max_steps_override=x_max_steps_override)
     await AsyncExecutorFactory.get_executor().execute_task(
         request=request,
         background_tasks=background_tasks,
