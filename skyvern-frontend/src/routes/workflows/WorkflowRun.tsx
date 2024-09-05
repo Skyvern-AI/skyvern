@@ -11,7 +11,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { TaskListSkeletonRows } from "../tasks/list/TaskListSkeletonRows";
 import { basicTimeFormat } from "@/util/timeFormat";
@@ -27,6 +27,10 @@ import {
   PaginationPrevious,
 } from "@/components/ui/pagination";
 import { cn } from "@/util/utils";
+import { queryClient } from "@/api/QueryClient";
+import { toast } from "@/components/ui/use-toast";
+import { Button } from "@/components/ui/button";
+import { ReloadIcon } from "@radix-ui/react-icons";
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -60,6 +64,35 @@ function WorkflowRun() {
     },
   });
 
+  const runWorkflowMutation = useMutation({
+    mutationFn: async (values: Record<string, unknown>) => {
+      const client = await getClient(credentialGetter);
+      return client
+        .post(`/workflows/${workflowPermanentId}/run`, {
+          data: values,
+          proxy_location: "RESIDENTIAL",
+        })
+        .then((response) => response.data);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: ["workflowRuns"],
+      });
+      toast({
+        variant: "success",
+        title: "Workflow run started",
+        description: "The workflow run has been started successfully",
+      });
+    },
+    onError: (error) => {
+      toast({
+        variant: "destructive",
+        title: "Failed to start workflow run",
+        description: error.message,
+      });
+    },
+  });
+
   function handleNavigate(event: React.MouseEvent, id: string) {
     if (event.ctrlKey || event.metaKey) {
       window.open(
@@ -76,13 +109,27 @@ function WorkflowRun() {
 
   return (
     <div className="space-y-8">
-      <header className="flex gap-2">
-        <h1 className="text-lg font-semibold">{workflowRunId}</h1>
-        {workflowRunIsLoading ? (
-          <Skeleton className="h-8 w-28" />
-        ) : workflowRun ? (
-          <StatusBadge status={workflowRun?.status} />
-        ) : null}
+      <header className="flex justify-between">
+        <div className="flex gap-2">
+          <h1 className="text-lg font-semibold">{workflowRunId}</h1>
+          {workflowRunIsLoading ? (
+            <Skeleton className="h-8 w-28" />
+          ) : workflowRun ? (
+            <StatusBadge status={workflowRun?.status} />
+          ) : null}
+        </div>
+        <Button
+          onClick={() => {
+            runWorkflowMutation.mutate(parameters);
+          }}
+          disabled={runWorkflowMutation.isPending}
+          variant="secondary"
+        >
+          {runWorkflowMutation.isPending && (
+            <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+          )}
+          Rerun Workflow
+        </Button>
       </header>
       <div className="space-y-4">
         <header>
