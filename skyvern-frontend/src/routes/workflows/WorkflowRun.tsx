@@ -1,6 +1,17 @@
 import { getClient } from "@/api/AxiosClient";
 import { TaskApiResponse, WorkflowRunStatusApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Pagination,
+  PaginationContent,
+  PaginationItem,
+  PaginationLink,
+  PaginationNext,
+  PaginationPrevious,
+} from "@/components/ui/pagination";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Table,
@@ -11,31 +22,16 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useMutation, useQuery } from "@tanstack/react-query";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { TaskListSkeletonRows } from "../tasks/list/TaskListSkeletonRows";
 import { basicTimeFormat } from "@/util/timeFormat";
-import { TaskActions } from "../tasks/list/TaskActions";
-import { Label } from "@/components/ui/label";
-import { Input } from "@/components/ui/input";
-import {
-  Pagination,
-  PaginationContent,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from "@/components/ui/pagination";
 import { cn } from "@/util/utils";
-import { queryClient } from "@/api/QueryClient";
-import { toast } from "@/components/ui/use-toast";
-import { Button } from "@/components/ui/button";
-import { ReloadIcon } from "@radix-ui/react-icons";
+import { useQuery } from "@tanstack/react-query";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { TaskActions } from "../tasks/list/TaskActions";
+import { TaskListSkeletonRows } from "../tasks/list/TaskListSkeletonRows";
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
-
   const { workflowRunId, workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
@@ -61,35 +57,6 @@ function WorkflowRun() {
       return client
         .get(`/tasks?workflow_run_id=${workflowRunId}`, { params })
         .then((response) => response.data);
-    },
-  });
-
-  const runWorkflowMutation = useMutation({
-    mutationFn: async (values: Record<string, unknown>) => {
-      const client = await getClient(credentialGetter);
-      return client
-        .post(`/workflows/${workflowPermanentId}/run`, {
-          data: values,
-          proxy_location: "RESIDENTIAL",
-        })
-        .then((response) => response.data);
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: ["workflowRuns"],
-      });
-      toast({
-        variant: "success",
-        title: "Workflow run started",
-        description: "The workflow run has been started successfully",
-      });
-    },
-    onError: (error) => {
-      toast({
-        variant: "destructive",
-        title: "Failed to start workflow run",
-        description: error.message,
-      });
     },
   });
 
@@ -120,14 +87,12 @@ function WorkflowRun() {
         </div>
         <Button
           onClick={() => {
-            runWorkflowMutation.mutate(parameters);
+            navigate(`/workflows/${workflowPermanentId}/run`, {
+              state: { data: parameters },
+            });
           }}
-          disabled={runWorkflowMutation.isPending}
           variant="secondary"
         >
-          {runWorkflowMutation.isPending && (
-            <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-          )}
           Rerun Workflow
         </Button>
       </header>
