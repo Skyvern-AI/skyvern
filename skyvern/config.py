@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from skyvern import constants
 from skyvern.constants import SKYVERN_DIR
 
 
@@ -47,6 +48,7 @@ class Settings(BaseSettings):
     GENERATE_PRESIGNED_URLS: bool = False
     AWS_S3_BUCKET_ARTIFACTS: str = "skyvern-artifacts"
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
+    AWS_S3_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
 
     # Supported storage types: local, s3
     SKYVERN_STORAGE_TYPE: str = "local"
@@ -70,6 +72,9 @@ class Settings(BaseSettings):
 
     # streaming settings
     STREAMING_FILE_BASE_PATH: str = "/tmp"
+
+    # Saved browser session settings
+    BROWSER_SESSION_BASE_PATH: str = f"{constants.REPO_ROOT_DIR}/browser_sessions"
 
     #####################
     # Bitwarden Configs #

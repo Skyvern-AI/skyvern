@@ -1,3 +1,5 @@
+import os
+import shutil
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -84,6 +86,38 @@ class LocalStorage(BaseStorage):
                 file_name=file_name,
             )
             return None
+
+    async def store_browser_session(self, organization_id: str, workflow_permanent_id: str, directory: str) -> None:
+        stored_folder_path = (
+            Path(SettingsManager.get_settings().BROWSER_SESSION_BASE_PATH) / organization_id / workflow_permanent_id
+        )
+        if directory == str(stored_folder_path):
+            return
+        self._create_directories_if_not_exists(stored_folder_path)
+        LOG.info(
+            "Storing browser session locally",
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            directory=directory,
+            browser_session_path=stored_folder_path,
+        )
+
+        # Copy all files from the directory to the stored folder
+        for root, _, files in os.walk(directory):
+            for file in files:
+                source_file_path = Path(root) / file
+                relative_path = source_file_path.relative_to(directory)
+                target_file_path = stored_folder_path / relative_path
+                self._create_directories_if_not_exists(target_file_path)
+                shutil.copy2(source_file_path, target_file_path)
+
+    async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
+        stored_folder_path = (
+            Path(SettingsManager.get_settings().BROWSER_SESSION_BASE_PATH) / organization_id / workflow_permanent_id
+        )
+        if not stored_folder_path.exists():
+            return None
+        return str(stored_folder_path)
 
     @staticmethod
     def _parse_uri_to_path(uri: str) -> str:

@@ -51,6 +51,7 @@ class Workflow(BaseModel):
     proxy_location: ProxyLocation | None = None
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
+    persist_browser_session: bool = False
 
     created_at: datetime
     modified_at: datetime
