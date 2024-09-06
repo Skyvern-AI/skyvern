@@ -1,3 +1,4 @@
+import hashlib
 import os
 import tempfile
 import zipfile
@@ -86,3 +87,12 @@ def get_number_of_files_in_directory(directory: Path, recursive: bool = False) -
             break
         count += len(files)
     return count
+
+
+def calculate_sha256(file_path: str) -> str:
+    """Helper function to calculate SHA256 hash of a file."""
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()

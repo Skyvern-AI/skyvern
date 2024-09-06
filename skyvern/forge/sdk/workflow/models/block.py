@@ -6,6 +6,7 @@ import os
 import smtplib
 import textwrap
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass
 from email.message import EmailMessage
 from enum import StrEnum
@@ -30,7 +31,12 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
-from skyvern.forge.sdk.api.files import download_file, download_from_s3, get_path_for_workflow_download_directory
+from skyvern.forge.sdk.api.files import (
+    calculate_sha256,
+    download_file,
+    download_from_s3,
+    get_path_for_workflow_download_directory,
+)
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.schemas.tasks import TaskOutput, TaskStatus
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -905,6 +911,8 @@ class SendEmailBlock(Block):
         else:
             msg.set_content(self.body)
 
+        file_names_by_hash: dict[str, list[str]] = defaultdict(list)
+
         for filename in self._get_file_paths(workflow_run_context, workflow_run_id):
             path = None
             try:
@@ -961,9 +969,23 @@ class SendEmailBlock(Block):
                         subtype=subtype,
                         filename=attachment_filename,
                     )
+                    file_hash = calculate_sha256(path)
+                    file_names_by_hash[file_hash].append(path)
             finally:
                 if path:
                     os.unlink(path)
+
+        # Calculate file stats based on content hashes
+        total_files = sum(len(files) for files in file_names_by_hash.values())
+        unique_files = len(file_names_by_hash)
+        duplicate_files_list = [files for files in file_names_by_hash.values() if len(files) > 1]
+
+        # Log file statistics
+        LOG.info("SendEmailBlock: Total files attached", total_files=total_files)
+        LOG.info("SendEmailBlock: Unique files (based on content) attached", unique_files=unique_files)
+        LOG.info(
+            "SendEmailBlock: Duplicate files (based on content) attached", duplicate_files_list=duplicate_files_list
+        )
 
         return msg
 
