@@ -162,6 +162,7 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         workflow_permanent_id=workflow_model.workflow_permanent_id,
         webhook_callback_url=workflow_model.webhook_callback_url,
         totp_verification_url=workflow_model.totp_verification_url,
+        persist_browser_session=workflow_model.persist_browser_session,
         proxy_location=(ProxyLocation(workflow_model.proxy_location) if workflow_model.proxy_location else None),
         version=workflow_model.version,
         is_saved_task=workflow_model.is_saved_task,

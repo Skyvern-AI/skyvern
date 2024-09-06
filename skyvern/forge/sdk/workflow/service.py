@@ -286,6 +286,7 @@ class WorkflowService:
         proxy_location: ProxyLocation | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
+        persist_browser_session: bool = False,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
         is_saved_task: bool = False,
@@ -298,6 +299,7 @@ class WorkflowService:
             proxy_location=proxy_location,
             webhook_callback_url=webhook_callback_url,
             totp_verification_url=totp_verification_url,
+            persist_browser_session=persist_browser_session,
             workflow_permanent_id=workflow_permanent_id,
             version=version,
             is_saved_task=is_saved_task,
@@ -657,6 +659,7 @@ class WorkflowService:
         tasks = await self.get_tasks_by_workflow_run_id(workflow_run.workflow_run_id)
         all_workflow_task_ids = [task.task_id for task in tasks]
         browser_state = await app.BROWSER_MANAGER.cleanup_for_workflow_run(
+            workflow,
             workflow_run.workflow_run_id,
             all_workflow_task_ids,
             close_browser_on_completion,
@@ -826,6 +829,7 @@ class WorkflowService:
                     proxy_location=request.proxy_location,
                     webhook_callback_url=request.webhook_callback_url,
                     totp_verification_url=request.totp_verification_url,
+                    persist_browser_session=request.persist_browser_session,
                     workflow_permanent_id=workflow_permanent_id,
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
@@ -839,6 +843,7 @@ class WorkflowService:
                     proxy_location=request.proxy_location,
                     webhook_callback_url=request.webhook_callback_url,
                     totp_verification_url=request.totp_verification_url,
+                    persist_browser_session=request.persist_browser_session,
                     is_saved_task=request.is_saved_task,
                 )
             # Create parameters from the request

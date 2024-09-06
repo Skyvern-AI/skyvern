@@ -22,6 +22,7 @@ from skyvern.exceptions import (
     UnknownBrowserType,
     UnknownErrorWhileCreatingBrowserContext,
 )
+from skyvern.forge import app
 from skyvern.forge.sdk.core.skyvern_context import current
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -89,11 +90,13 @@ class BrowserContextFactory:
         video_artifacts: list[VideoArtifact] | None = None,
         har_path: str | None = None,
         traces_dir: str | None = None,
+        browser_session_dir: str | None = None,
     ) -> BrowserArtifacts:
         return BrowserArtifacts(
             video_artifacts=video_artifacts or [],
             har_path=har_path,
             traces_dir=traces_dir,
+            browser_session_dir=browser_session_dir,
         )
 
     @classmethod
@@ -137,6 +140,7 @@ class BrowserArtifacts(BaseModel):
     video_artifacts: list[VideoArtifact] = []
     har_path: str | None = None
     traces_dir: str | None = None
+    browser_session_dir: str | None = None
 
 
 async def _create_headless_chromium(
@@ -386,3 +390,9 @@ class BrowserState:
     async def take_screenshot(self, full_page: bool = False, file_path: str | None = None) -> bytes:
         page = await self.__assert_page()
         return await SkyvernFrame.take_screenshot(page=page, full_page=full_page, file_path=file_path)
+
+    async def store_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
+        if self.browser_artifacts.browser_session_dir:
+            await app.STORAGE.store_browser_session(
+                organization_id, workflow_permanent_id, self.browser_artifacts.browser_session_dir
+            )

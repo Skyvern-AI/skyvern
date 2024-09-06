@@ -819,6 +819,7 @@ class AgentDB:
         proxy_location: ProxyLocation | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
+        persist_browser_session: bool = False,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
         is_saved_task: bool = False,
@@ -832,6 +833,7 @@ class AgentDB:
                 proxy_location=proxy_location,
                 webhook_callback_url=webhook_callback_url,
                 totp_verification_url=totp_verification_url,
+                persist_browser_session=persist_browser_session,
                 is_saved_task=is_saved_task,
             )
             if workflow_permanent_id:

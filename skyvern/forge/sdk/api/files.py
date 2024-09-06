@@ -75,6 +75,11 @@ def zip_files(files_path: str, zip_file_path: str) -> str:
     return zip_file_path
 
 
+def unzip_files(zip_file_path: str, output_dir: str) -> None:
+    with zipfile.ZipFile(zip_file_path, "r") as zip_ref:
+        zip_ref.extractall(output_dir)
+
+
 def get_path_for_workflow_download_directory(workflow_run_id: str) -> Path:
     return Path(f"{REPO_ROOT_DIR}/downloads/{workflow_run_id}/")
 

@@ -59,3 +59,11 @@ class BaseStorage(ABC):
     @abstractmethod
     async def get_streaming_file(self, organization_id: str, file_name: str, use_default: bool = True) -> bytes | None:
         pass
+
+    @abstractmethod
+    async def store_browser_session(self, organization_id: str, workflow_permanent_id: str, directory: str) -> None:
+        pass
+
+    @abstractmethod
+    async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
+        pass

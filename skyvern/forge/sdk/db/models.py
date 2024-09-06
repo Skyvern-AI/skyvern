@@ -180,6 +180,7 @@ class WorkflowModel(Base):
     proxy_location = Column(Enum(ProxyLocation))
     webhook_callback_url = Column(String)
     totp_verification_url = Column(String)
+    persist_browser_session = Column(Boolean, default=False, nullable=False)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
