@@ -104,12 +104,12 @@ async def task_stream(
     except ValidationError as e:
         await websocket.send_text(f"Invalid data: {e}")
     except WebSocketDisconnect:
-        LOG.info("WebSocket connection closed")
+        LOG.info("WebSocket connection closed", task_id=task_id, organization_id=organization_id)
     except ConnectionClosedOK:
-        LOG.info("ConnectionClosedOK error while streaming", exc_info=True)
+        LOG.info("ConnectionClosedOK error while streaming", task_id=task_id, organization_id=organization_id)
         return
     except Exception:
-        LOG.warning("Error while streaming", exc_info=True)
+        LOG.warning("Error while streaming", task_id=task_id, organization_id=organization_id)
         return
-    LOG.info("WebSocket connection closed successfully")
+    LOG.info("WebSocket connection closed successfully", task_id=task_id, organization_id=organization_id)
     return
