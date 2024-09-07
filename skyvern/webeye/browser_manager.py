@@ -9,7 +9,7 @@ from playwright.async_api import async_playwright
 from skyvern.constants import BROWSER_CLOSE_TIMEOUT
 from skyvern.exceptions import MissingBrowserState
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
-from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.webeye.browser_factory import BrowserContextFactory, BrowserState, VideoArtifact
 
 LOG = structlog.get_logger()
@@ -182,7 +182,6 @@ class BrowserManager:
 
     async def cleanup_for_workflow_run(
         self,
-        workflow: Workflow,
         workflow_run_id: str,
         task_ids: list[str],
         close_browser_on_completion: bool = True,
@@ -195,13 +194,6 @@ class BrowserManager:
                 trace_path = f"{browser_state_to_close.browser_artifacts.traces_dir}/{workflow_run_id}.zip"
                 await browser_state_to_close.browser_context.tracing.stop(path=trace_path)
                 LOG.info("Stopped tracing", trace_path=trace_path)
-
-            if workflow.persist_browser_session:
-                await browser_state_to_close.store_browser_session(
-                    organization_id=workflow.organization_id,
-                    workflow_permanent_id=workflow.workflow_permanent_id,
-                )
-                LOG.info("Persisted browser session for workflow run", workflow_run_id=workflow_run_id)
 
             await browser_state_to_close.close(close_browser_on_completion=close_browser_on_completion)
         for task_id in task_ids:

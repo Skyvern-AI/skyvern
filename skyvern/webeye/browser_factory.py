@@ -22,7 +22,6 @@ from skyvern.exceptions import (
     UnknownBrowserType,
     UnknownErrorWhileCreatingBrowserContext,
 )
-from skyvern.forge import app
 from skyvern.forge.sdk.core.skyvern_context import current
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -390,9 +389,3 @@ class BrowserState:
     async def take_screenshot(self, full_page: bool = False, file_path: str | None = None) -> bytes:
         page = await self.__assert_page()
         return await SkyvernFrame.take_screenshot(page=page, full_page=full_page, file_path=file_path)
-
-    async def store_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
-        if self.browser_artifacts.browser_session_dir:
-            await app.STORAGE.store_browser_session(
-                organization_id, workflow_permanent_id, self.browser_artifacts.browser_session_dir
-            )
