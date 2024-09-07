@@ -388,7 +388,6 @@ async def handle_input_text_action(
                     dom=dom,
                     skyvern_frame=skyvern_frame,
                     incremental_scraped=incremental_scraped,
-                    element_trees=incremental_element,
                     llm_handler=app.SECONDARY_LLM_API_HANDLER,
                     step=step,
                     task=task,
@@ -402,10 +401,14 @@ async def handle_input_text_action(
                     element_id=skyvern_element.get_id(),
                     action=action,
                 )
-            except Exception as e:
+            except Exception:
                 await skyvern_element.scroll_into_view()
-                LOG.exception("Failed to do custom selection transformed from input action")
-                return [ActionFailure(exception=e)]
+                LOG.warning(
+                    "Failed to do custom selection transformed from input action, continue to input text",
+                    exc_info=True,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                )
             finally:
                 await skyvern_element.press_key("Escape")
                 await skyvern_element.blur()
@@ -682,7 +685,6 @@ async def handle_select_option_action(
             dom=dom,
             skyvern_frame=skyvern_frame,
             incremental_scraped=incremental_scraped,
-            element_trees=incremental_element,
             llm_handler=app.SECONDARY_LLM_API_HANDLER,
             step=step,
             task=task,
@@ -1251,21 +1253,23 @@ async def select_from_dropdown(
     dom: DomUtil,
     skyvern_frame: SkyvernFrame,
     incremental_scraped: IncrementalScrapePage,
-    element_trees: list[dict],
     llm_handler: LLMAPIHandler,
     step: Step,
     task: Task,
     force_select: bool = False,
+    should_relevant: bool = True,
 ) -> tuple[ActionResult | None, str | None]:
     """
-    force_select is used to choose an element to click even there's no dropdown menu
-    None will be only returned when force_select is false and no dropdown menu popped
+    force_select: is used to choose an element to click even there's no dropdown menu;
+    should_relevant: only valid when force_select is "False". When "True", the chosen value must be relevant to the target value;
+    None will be only returned when:
+        1. force_select is false and no dropdown menu popped
+        2. force_select is false and match value is not relevant to the target value
     """
     timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
 
     dropdown_menu_element = await locate_dropdown_menu(
         incremental_scraped=incremental_scraped,
-        element_trees=element_trees,
         llm_handler=llm_handler,
         step=step,
         task=task,
@@ -1297,7 +1301,10 @@ async def select_from_dropdown(
         raise NoLabelOrValueForCustomSelection(element_id=action.element_id)
 
     prompt = prompt_engine.load_prompt(
-        "custom-select", context_reasoning=action.reasoning, target_value=target_value, elements=html
+        "custom-select",
+        context_reasoning=action.reasoning,
+        target_value=target_value,
+        elements=html,
     )
 
     LOG.info(
@@ -1319,6 +1326,16 @@ async def select_from_dropdown(
     element_id: str | None = json_response.get("id", None)
     if not element_id:
         raise NoElementMatchedForTargetOption(target=target_value, reason=json_response.get("reasoning"))
+
+    if not force_select and should_relevant:
+        if not json_response.get("relevant", False):
+            LOG.debug(
+                "The selected option is not relevant to the target value",
+                element_id=element_id,
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            return None, None
 
     try:
         selected_element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
@@ -1362,7 +1379,7 @@ async def select_from_dropdown_by_value(
     step: Step,
 ) -> ActionResult:
     timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    element_trees = await incremental_scraped.get_incremental_element_tree(
+    await incremental_scraped.get_incremental_element_tree(
         clean_and_remove_element_tree_factory(task=task, step=step, dom=dom),
     )
 
@@ -1373,7 +1390,6 @@ async def select_from_dropdown_by_value(
 
     dropdown_menu_element = await locate_dropdown_menu(
         incremental_scraped=incremental_scraped,
-        element_trees=element_trees,
         llm_handler=llm_handler,
         step=step,
         task=task,
@@ -1419,12 +1435,35 @@ async def select_from_dropdown_by_value(
 
 async def locate_dropdown_menu(
     incremental_scraped: IncrementalScrapePage,
-    element_trees: list[dict],
     llm_handler: LLMAPIHandler,
     step: Step,
     task: Task,
 ) -> SkyvernElement | None:
-    for idx, element_dict in enumerate(element_trees):
+    skyvern_frame = incremental_scraped.skyvern_frame
+
+    async def is_ul_or_listbox_element(element_dict: dict) -> bool:
+        element_id: str = element_dict.get("id", "")
+        try:
+            element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
+        except Exception:
+            LOG.debug(
+                "Failed to element in the incremental page",
+                element_id=element_id,
+                step_id=step.step_id,
+                task_id=task.task_id,
+                exc_info=True,
+            )
+            return False
+
+        if element.get_tag_name() == "ul":
+            return True
+
+        if await element.get_attr("role") == "listbox":
+            return True
+
+        return False
+
+    for idx, element_dict in enumerate(incremental_scraped.element_tree):
         # FIXME: confirm max to 10 nodes for now, preventing sendindg too many requests to LLM
         if idx >= 10:
             break
@@ -1432,7 +1471,7 @@ async def locate_dropdown_menu(
         element_id = element_dict.get("id")
         if not element_id:
             LOG.debug(
-                "Skip the non-interactable element for the dropdown menu confirm",
+                "Skip the element without id for the dropdown menu confirm",
                 step_id=step.step_id,
                 task_id=task.task_id,
                 element=element_dict,
@@ -1448,6 +1487,38 @@ async def locate_dropdown_menu(
                 step_id=step.step_id,
                 task_id=task.task_id,
                 exc_info=True,
+            )
+            continue
+
+        found_element_id = await head_element.find_children_element_id_by_callback(
+            cb=is_ul_or_listbox_element,
+        )
+        if found_element_id and found_element_id != element_id:
+            LOG.debug(
+                "Found 'ul or listbox' element in children list",
+                element_id=found_element_id,
+                step_id=step.step_id,
+                task_id=task.task_id,
+            )
+
+            try:
+                head_element = await SkyvernElement.create_from_incremental(incremental_scraped, found_element_id)
+                element_id = found_element_id
+            except Exception:
+                LOG.debug(
+                    "Failed to get head element by found element id, use the orignal element id",
+                    element_id=found_element_id,
+                    step_id=step.step_id,
+                    task_id=task.task_id,
+                    exc_info=True,
+                )
+
+        if not await skyvern_frame.get_element_visible(await head_element.get_element_handler()):
+            LOG.debug(
+                "Skip the element since it's invisible",
+                step_id=step.step_id,
+                task_id=task.task_id,
+                element_id=element_id,
             )
             continue
 
