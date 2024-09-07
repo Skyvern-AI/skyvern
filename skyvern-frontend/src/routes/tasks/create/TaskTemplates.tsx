@@ -189,7 +189,7 @@ function TaskTemplates() {
         </AlertTitle>
         <AlertDescription>
           <a
-            href="https://meetings.hubspot.com/suchintan"
+            href="https://meetings.hubspot.com/skyvern/demo"
             target="_blank"
             rel="noopener noreferrer"
             className="ml-auto underline underline-offset-2"

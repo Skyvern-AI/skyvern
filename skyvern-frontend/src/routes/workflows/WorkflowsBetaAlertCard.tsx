@@ -22,7 +22,7 @@ function WorkflowsBetaAlertCard() {
         </Button>
         <Button asChild>
           <a
-            href="https://meetings.hubspot.com/suchintan"
+            href="https://meetings.hubspot.com/skyvern/demo"
             target="_blank"
             rel="noopener noreferrer"
           >
