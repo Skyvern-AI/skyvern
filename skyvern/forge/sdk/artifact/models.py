@@ -54,7 +54,7 @@ class Artifact(BaseModel):
         examples=["2023-01-01T00:00:00Z"],
     )
 
-    @field_serializer('created_at', 'modified_at', when_used='json')
+    @field_serializer("created_at", "modified_at", when_used="json")
     def serialize_datetime_to_isoformat(self, value: datetime) -> str:
         return value.isoformat()
 
