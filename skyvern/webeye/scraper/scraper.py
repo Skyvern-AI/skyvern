@@ -109,6 +109,9 @@ def json_to_html(element: dict) -> str:
         for option in element.get("options", [])
     )
 
+    if element.get("purgeable", False):
+        return children_html + option_html
+
     # Check if the element is self-closing
     if tag in ["img", "input", "br", "hr", "meta", "link"] and not option_html and not children_html:
         return f'<{tag}{attributes_html if not attributes_html else " "+attributes_html}>'
@@ -338,7 +341,7 @@ async def get_interactable_element_tree_in_frame(
 
         unique_id = await frame_element.get_attribute("unique_id")
 
-        frame_js_script = f"() => buildTreeFromBody('{unique_id}', true)"
+        frame_js_script = f"() => buildTreeFromBody('{unique_id}')"
 
         await frame.evaluate(JS_FUNCTION_DEFS)
         frame_elements, frame_element_tree = await frame.evaluate(frame_js_script)
@@ -374,7 +377,7 @@ async def get_interactable_element_tree(
     :return: Tuple containing the element tree and a map of element IDs to elements.
     """
     await page.evaluate(JS_FUNCTION_DEFS)
-    main_frame_js_script = "() => buildTreeFromBody('main.frame', true)"
+    main_frame_js_script = "() => buildTreeFromBody()"
     elements, element_tree = await page.evaluate(main_frame_js_script)
 
     if len(page.main_frame.child_frames) > 0:
@@ -504,8 +507,7 @@ def trim_element_tree(elements: list[dict]) -> list[dict]:
                 del queue_ele["attributes"]
 
         if "attributes" in queue_ele and not queue_ele.get("keepAllAttr", False):
-            tag_name = queue_ele["tagName"] if "tagName" in queue_ele else ""
-            new_attributes = _trimmed_attributes(tag_name, queue_ele["attributes"])
+            new_attributes = _trimmed_attributes(queue_ele["attributes"])
             if new_attributes:
                 queue_ele["attributes"] = new_attributes
             else:
@@ -536,13 +538,10 @@ def _trimmed_base64_data(attributes: dict) -> dict:
     return new_attributes
 
 
-def _trimmed_attributes(tag_name: str, attributes: dict) -> dict:
+def _trimmed_attributes(attributes: dict) -> dict:
     new_attributes: dict = {}
 
     for key in attributes:
-        if key == "id" and tag_name in ["input", "textarea", "select"]:
-            # We don't want to remove the id attribute any of these elements in case there's a label for it
-            new_attributes[key] = attributes[key]
         if key == "role" and attributes[key] in ["listbox", "option"]:
             new_attributes[key] = attributes[key]
         if key in RESERVED_ATTRIBUTES and attributes[key]:

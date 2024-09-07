@@ -888,7 +888,7 @@ function uniqueId() {
   return result;
 }
 
-function buildElementObject(frame, element, interactable) {
+function buildElementObject(frame, element, interactable, purgeable = false) {
   var element_id = element.getAttribute("unique_id") ?? uniqueId();
   var elementTagNameLower = element.tagName.toLowerCase();
   element.setAttribute("unique_id", element_id);
@@ -940,6 +940,8 @@ function buildElementObject(frame, element, interactable) {
     text: getElementContent(element),
     children: [],
     rect: DomUtils.getVisibleClientRect(element, true),
+    // if purgeable is True, which means this element is only used for building the tree relationship
+    purgeable: purgeable,
     // don't trim any attr of this element if keepAllAttr=True
     keepAllAttr:
       elementTagNameLower === "svg" || element.closest("svg") !== null,
@@ -979,11 +981,11 @@ function buildElementObject(frame, element, interactable) {
   return elementObj;
 }
 
-function buildTreeFromBody(frame = "main.frame", open_select = false) {
-  return buildElementTree(document.body, frame, open_select);
+function buildTreeFromBody(frame = "main.frame") {
+  return buildElementTree(document.body, frame);
 }
 
-function buildElementTree(starter = document.body, frame = "main.frame") {
+function buildElementTree(starter = document.body, frame, full_tree = false) {
   var elements = [];
   var resultArray = [];
 
@@ -1078,6 +1080,23 @@ function buildElementTree(starter = document.body, frame = "main.frame") {
           // build all table related elements into skyvern element
           // we need these elements to preserve the DOM structure
           elementObj = buildElementObject(frame, element, false);
+        } else if (full_tree) {
+          // when building full tree, we only get text from element itself
+          // elements without text are purgeable
+          elementObj = buildElementObject(frame, element, false, true);
+          let textContent = "";
+          if (isElementVisible(element)) {
+            for (let i = 0; i < element.childNodes.length; i++) {
+              var node = element.childNodes[i];
+              if (node.nodeType === Node.TEXT_NODE) {
+                textContent += node.data.trim();
+              }
+            }
+          }
+          elementObj.text = textContent;
+          if (textContent.length > 0) {
+            elementObj.purgeable = false;
+          }
         } else {
           // character length limit for non-interactable elements should be 5000
           // we don't use element context in HTML format,
@@ -1673,7 +1692,7 @@ function addIncrementalNodeToMap(parentNode, childrenNode) {
   }
 
   for (const child of childrenNode) {
-    const [_, newNodeTree] = buildElementTree(child, "", false);
+    const [_, newNodeTree] = buildElementTree(child, "", true);
     if (newNodeTree.length > 0) {
       newNodesTreeList.push(...newNodeTree);
     }
