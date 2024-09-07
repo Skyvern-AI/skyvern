@@ -382,7 +382,7 @@ class ForgeAgent:
             raise
         except StepTerminationError as e:
             LOG.warning(
-                "Step cannot be executed. Task failed.",
+                "Step cannot be executed, marking task as failed",
                 task_id=task.task_id,
                 step_id=step.step_id,
                 exc_info=True,
@@ -442,7 +442,7 @@ class ForgeAgent:
             return step, detailed_output, None
         except Exception as e:
             LOG.exception(
-                "Got an unexpected exception in step, fail the task",
+                "Got an unexpected exception in step, marking task as failed",
                 task_id=task.task_id,
                 step_id=step.step_id,
             )
