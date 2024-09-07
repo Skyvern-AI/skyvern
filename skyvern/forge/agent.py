@@ -191,6 +191,7 @@ class ForgeAgent:
             task_id=task.task_id,
             url=task.url,
             proxy_location=task.proxy_location,
+            organization_id=organization_id,
         )
         return task
 
