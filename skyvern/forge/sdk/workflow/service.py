@@ -659,7 +659,6 @@ class WorkflowService:
         tasks = await self.get_tasks_by_workflow_run_id(workflow_run.workflow_run_id)
         all_workflow_task_ids = [task.task_id for task in tasks]
         browser_state = await app.BROWSER_MANAGER.cleanup_for_workflow_run(
-            workflow,
             workflow_run.workflow_run_id,
             all_workflow_task_ids,
             close_browser_on_completion,
@@ -667,6 +666,13 @@ class WorkflowService:
         if browser_state:
             await self.persist_video_data(browser_state, workflow, workflow_run)
             await self.persist_debug_artifacts(browser_state, tasks[-1], workflow, workflow_run)
+            if workflow.persist_browser_session and browser_state.browser_artifacts.browser_session_dir:
+                await app.STORAGE.store_browser_session(
+                    workflow.organization_id,
+                    workflow.workflow_permanent_id,
+                    browser_state.browser_artifacts.browser_session_dir,
+                )
+                LOG.info("Persisted browser session for workflow run", workflow_run_id=workflow_run.workflow_run_id)
 
         await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks_for_tasks(all_workflow_task_ids)
 
