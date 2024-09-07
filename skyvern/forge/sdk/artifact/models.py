@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 
 
 class ArtifactType(StrEnum):
@@ -47,14 +47,17 @@ class Artifact(BaseModel):
         ...,
         description="The creation datetime of the task.",
         examples=["2023-01-01T00:00:00Z"],
-        json_encoders={datetime: lambda v: v.isoformat()},
     )
     modified_at: datetime = Field(
         ...,
         description="The modification datetime of the task.",
         examples=["2023-01-01T00:00:00Z"],
-        json_encoders={datetime: lambda v: v.isoformat()},
     )
+
+    @field_serializer("created_at", "modified_at", when_used="json")
+    def serialize_datetime_to_isoformat(self, value: datetime) -> str:
+        return value.isoformat()
+
     artifact_id: str = Field(
         ...,
         description="The ID of the task artifact.",
