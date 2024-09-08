@@ -36,6 +36,7 @@ async def task_stream(
         organization = await get_current_org(x_api_key=apikey, authorization=token)
         organization_id = organization.organization_id
     except Exception:
+        LOG.exception("Error while getting organization", task_id=task_id)
         try:
             await websocket.send_text("Invalid credential provided")
         except ConnectionClosedOK:
@@ -109,7 +110,7 @@ async def task_stream(
         LOG.info("ConnectionClosedOK error while streaming", task_id=task_id, organization_id=organization_id)
         return
     except Exception:
-        LOG.warning("Error while streaming", task_id=task_id, organization_id=organization_id)
+        LOG.warning("Error while streaming", task_id=task_id, organization_id=organization_id, exc_info=True)
         return
     LOG.info("WebSocket connection closed successfully", task_id=task_id, organization_id=organization_id)
     return
