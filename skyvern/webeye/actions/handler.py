@@ -1931,7 +1931,13 @@ async def get_input_value(tag_name: str, locator: Locator) -> str | None:
     return await locator.inner_text()
 
 
-async def poll_verification_code(task_id: str, organization_id: str, url: str) -> str | None:
+async def poll_verification_code(
+    task_id: str,
+    organization_id: str,
+    workflow_id: str | None = None,
+    totp_verification_url: str | None = None,
+    totp_identifier: str | None = None,
+) -> str | None:
     timeout = timedelta(minutes=VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
     start_datetime = datetime.utcnow()
     timeout_datetime = start_datetime + timeout
@@ -1943,24 +1949,52 @@ async def poll_verification_code(task_id: str, organization_id: str, url: str) -
         # check timeout
         if datetime.utcnow() > timeout_datetime:
             return None
-        request_data = {
-            "task_id": task_id,
-        }
-        payload = json.dumps(request_data)
-        signature = generate_skyvern_signature(
-            payload=payload,
-            api_key=org_token.token,
-        )
-        timestamp = str(int(datetime.utcnow().timestamp()))
-        headers = {
-            "x-skyvern-timestamp": timestamp,
-            "x-skyvern-signature": signature,
-            "Content-Type": "application/json",
-        }
-        json_resp = await aiohttp_post(url=url, data=request_data, headers=headers, raise_exception=False)
-        verification_code = json_resp.get("verification_code", None)
+        verification_code = None
+        if totp_verification_url:
+            verification_code = await _get_verification_code_from_url(task_id, totp_verification_url, org_token.token)
+        elif totp_identifier:
+            verification_code = await _get_verification_code_from_db(
+                task_id, organization_id, totp_identifier, workflow_id=workflow_id
+            )
         if verification_code:
             LOG.info("Got verification code", verification_code=verification_code)
             return verification_code
 
         await asyncio.sleep(10)
+
+
+async def _get_verification_code_from_url(task_id: str, url: str, api_key: str) -> str | None:
+    request_data = {
+        "task_id": task_id,
+    }
+    payload = json.dumps(request_data)
+    signature = generate_skyvern_signature(
+        payload=payload,
+        api_key=api_key,
+    )
+    timestamp = str(int(datetime.utcnow().timestamp()))
+    headers = {
+        "x-skyvern-timestamp": timestamp,
+        "x-skyvern-signature": signature,
+        "Content-Type": "application/json",
+    }
+    json_resp = await aiohttp_post(url=url, data=request_data, headers=headers, raise_exception=False)
+    return json_resp.get("verification_code", None)
+
+
+async def _get_verification_code_from_db(
+    task_id: str,
+    organization_id: str,
+    totp_identifier: str,
+    workflow_id: str | None = None,
+) -> str | None:
+    totp_codes = await app.DATABASE.get_totp_codes(organization_id=organization_id, totp_identifier=totp_identifier)
+    for totp_code in totp_codes:
+        if totp_code.workflow_id and workflow_id and totp_code.workflow_id != workflow_id:
+            continue
+        if totp_code.task_id and totp_code.task_id != task_id:
+            continue
+        if totp_code.expired_at and totp_code.expired_at < datetime.utcnow():
+            continue
+        return totp_code.code
+    return None

@@ -22,6 +22,7 @@ from skyvern.forge.sdk.db.models import (
     StepModel,
     TaskGenerationModel,
     TaskModel,
+    TOTPCodeModel,
     WorkflowModel,
     WorkflowParameterModel,
     WorkflowRunModel,
@@ -48,6 +49,7 @@ from skyvern.forge.sdk.db.utils import (
 from skyvern.forge.sdk.models import Organization, OrganizationAuthToken, Step, StepStatus
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskStatus
+from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     BitwardenLoginCredentialParameter,
@@ -84,6 +86,7 @@ class AgentDB:
         navigation_payload: dict[str, Any] | list | str | None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
+        totp_identifier: str | None = None,
         organization_id: str | None = None,
         proxy_location: ProxyLocation | None = None,
         extracted_information_schema: dict[str, Any] | list | str | None = None,
@@ -101,6 +104,7 @@ class AgentDB:
                     title=title,
                     webhook_callback_url=webhook_callback_url,
                     totp_verification_url=totp_verification_url,
+                    totp_identifier=totp_identifier,
                     navigation_goal=navigation_goal,
                     data_extraction_goal=data_extraction_goal,
                     navigation_payload=navigation_payload,
@@ -819,6 +823,7 @@ class AgentDB:
         proxy_location: ProxyLocation | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
+        totp_identifier: str | None = None,
         persist_browser_session: bool = False,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
@@ -833,6 +838,7 @@ class AgentDB:
                 proxy_location=proxy_location,
                 webhook_callback_url=webhook_callback_url,
                 totp_verification_url=totp_verification_url,
+                totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
                 is_saved_task=is_saved_task,
             )
@@ -1001,6 +1007,7 @@ class AgentDB:
         proxy_location: ProxyLocation | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
+        totp_identifier: str | None = None,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
@@ -1012,6 +1019,7 @@ class AgentDB:
                     status="created",
                     webhook_callback_url=webhook_callback_url,
                     totp_verification_url=totp_verification_url,
+                    totp_identifier=totp_identifier,
                 )
                 session.add(workflow_run)
                 await session.commit()
@@ -1439,3 +1447,27 @@ class AgentDB:
             if not task_generation:
                 return None
             return TaskGeneration.model_validate(task_generation)
+
+    async def get_totp_codes(
+        self,
+        organization_id: str,
+        totp_identifier: str,
+        valid_lifespan_minutes: int = settings.TOTP_LIFESPAN_MINUTES,
+    ) -> list[TOTPCode]:
+        """
+        1. filter by:
+        - organization_id
+        - totp_identifier
+        2. make sure created_at is within the valid lifespan
+        3. sort by created_at desc
+        """
+        async with self.Session() as session:
+            query = (
+                select(TOTPCodeModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(totp_identifier=totp_identifier)
+                .filter(TOTPCodeModel.created_at > datetime.utcnow() - timedelta(minutes=valid_lifespan_minutes))
+                .order_by(TOTPCodeModel.created_at.desc())
+            )
+            totp_code = (await session.scalars(query)).all()
+            return [TOTPCode.model_validate(totp_code) for totp_code in totp_code]

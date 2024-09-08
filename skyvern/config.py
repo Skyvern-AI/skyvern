@@ -117,6 +117,9 @@ class Settings(BaseSettings):
     AZURE_GPT4O_MINI_API_BASE: str | None = None
     AZURE_GPT4O_MINI_API_VERSION: str | None = None
 
+    # TOTP Settings
+    TOTP_LIFESPAN_MINUTES: int = 10
+
     def is_cloud_environment(self) -> bool:
         """
         :return: True if env is not local, else False
