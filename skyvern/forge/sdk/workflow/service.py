@@ -286,6 +286,7 @@ class WorkflowService:
         proxy_location: ProxyLocation | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
+        totp_identifier: str | None = None,
         persist_browser_session: bool = False,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
@@ -299,6 +300,7 @@ class WorkflowService:
             proxy_location=proxy_location,
             webhook_callback_url=webhook_callback_url,
             totp_verification_url=totp_verification_url,
+            totp_identifier=totp_identifier,
             persist_browser_session=persist_browser_session,
             workflow_permanent_id=workflow_permanent_id,
             version=version,
@@ -397,6 +399,7 @@ class WorkflowService:
             proxy_location=workflow_request.proxy_location,
             webhook_callback_url=workflow_request.webhook_callback_url,
             totp_verification_url=workflow_request.totp_verification_url,
+            totp_identifier=workflow_request.totp_identifier,
         )
 
     async def mark_workflow_run_as_completed(self, workflow_run_id: str) -> None:
@@ -640,6 +643,7 @@ class WorkflowService:
             proxy_location=workflow_run.proxy_location,
             webhook_callback_url=workflow_run.webhook_callback_url,
             totp_verification_url=workflow_run.totp_verification_url,
+            totp_identifier=workflow_run.totp_identifier,
             created_at=workflow_run.created_at,
             modified_at=workflow_run.modified_at,
             parameters=parameters_with_value,
@@ -835,6 +839,7 @@ class WorkflowService:
                     proxy_location=request.proxy_location,
                     webhook_callback_url=request.webhook_callback_url,
                     totp_verification_url=request.totp_verification_url,
+                    totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
                     workflow_permanent_id=workflow_permanent_id,
                     version=existing_version + 1,
@@ -849,6 +854,7 @@ class WorkflowService:
                     proxy_location=request.proxy_location,
                     webhook_callback_url=request.webhook_callback_url,
                     totp_verification_url=request.totp_verification_url,
+                    totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
                     is_saved_task=request.is_saved_task,
                 )
@@ -912,7 +918,8 @@ class WorkflowService:
                         bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
                         bitwarden_client_secret_aws_secret_key=parameter.bitwarden_client_secret_aws_secret_key,
                         bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
-                        bitwarden_collection_id=parameter.bitwarden_collection_id,
+                        # TODO: remove "# type: ignore" after ensuring bitwarden_collection_id is always set
+                        bitwarden_collection_id=parameter.bitwarden_collection_id,  # type: ignore
                         bitwarden_identity_key=parameter.bitwarden_identity_key,
                         bitwarden_identity_fields=parameter.bitwarden_identity_fields,
                         key=parameter.key,
@@ -1046,6 +1053,8 @@ class WorkflowService:
                 max_retries=block_yaml.max_retries,
                 complete_on_download=block_yaml.complete_on_download,
                 continue_on_failure=block_yaml.continue_on_failure,
+                totp_verification_url=block_yaml.totp_verification_url,
+                totp_identifier=block_yaml.totp_identifier,
             )
         elif block_yaml.block_type == BlockType.FOR_LOOP:
             loop_blocks = [

@@ -122,7 +122,8 @@ class ForgeAgent:
             url=task_url,
             title=task_block.title,
             webhook_callback_url=None,
-            totp_verification_url=None,
+            totp_verification_url=task_block.totp_verification_url,
+            totp_identifier=task_block.totp_identifier,
             navigation_goal=task_block.navigation_goal,
             data_extraction_goal=task_block.data_extraction_goal,
             navigation_payload=navigation_payload,
@@ -178,6 +179,7 @@ class ForgeAgent:
             title=task_request.title,
             webhook_callback_url=task_request.webhook_callback_url,
             totp_verification_url=task_request.totp_verification_url,
+            totp_identifier=task_request.totp_identifier,
             navigation_goal=task_request.navigation_goal,
             data_extraction_goal=task_request.data_extraction_goal,
             navigation_payload=task_request.navigation_payload,
@@ -983,7 +985,7 @@ class ForgeAgent:
             task,
             browser_state,
             element_tree_in_prompt,
-            verification_code_check=bool(task.totp_verification_url),
+            verification_code_check=bool(task.totp_verification_url or task.totp_identifier),
             expire_verification_code=True,
         )
 
@@ -1055,7 +1057,7 @@ class ForgeAgent:
         final_navigation_payload = task.navigation_payload
         current_context = skyvern_context.ensure_context()
         verification_code = current_context.totp_codes.get(task.task_id)
-        if task.totp_verification_url and verification_code:
+        if (task.totp_verification_url or task.totp_identifier) and verification_code:
             if (
                 isinstance(final_navigation_payload, dict)
                 and SPECIAL_FIELD_VERIFICATION_CODE not in final_navigation_payload
@@ -1598,10 +1600,13 @@ class ForgeAgent:
         json_response: dict[str, Any],
     ) -> dict[str, Any]:
         need_verification_code = json_response.get("need_verification_code")
-        if need_verification_code and task.totp_verification_url and task.organization_id:
+        if need_verification_code and (task.totp_verification_url or task.totp_identifier) and task.organization_id:
             LOG.info("Need verification code", step_id=step.step_id)
             verification_code = await poll_verification_code(
-                task.task_id, task.organization_id, url=task.totp_verification_url
+                task.task_id,
+                task.organization_id,
+                totp_verification_url=task.totp_verification_url,
+                totp_identifier=task.totp_identifier,
             )
             current_context = skyvern_context.ensure_context()
             current_context.totp_codes[task.task_id] = verification_code

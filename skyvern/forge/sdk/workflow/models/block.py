@@ -176,6 +176,8 @@ class TaskBlock(Block):
     max_steps_per_run: int | None = None
     parameters: list[PARAMETER_TYPE] = []
     complete_on_download: bool = False
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
 
     def get_all_parameters(
         self,

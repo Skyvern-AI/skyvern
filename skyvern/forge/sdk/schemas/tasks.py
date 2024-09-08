@@ -39,6 +39,7 @@ class TaskRequest(BaseModel):
         examples=["https://my-webhook.com"],
     )
     totp_verification_url: str | None = None
+    totp_identifier: str | None = None
     navigation_goal: str | None = Field(
         default=None,
         description="The user's goal for the task.",

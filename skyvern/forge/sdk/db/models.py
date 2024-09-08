@@ -29,6 +29,7 @@ from skyvern.forge.sdk.db.id import (
     generate_step_id,
     generate_task_generation_id,
     generate_task_id,
+    generate_totp_code_id,
     generate_workflow_id,
     generate_workflow_parameter_id,
     generate_workflow_permanent_id,
@@ -49,6 +50,7 @@ class TaskModel(Base):
     status = Column(String, index=True)
     webhook_callback_url = Column(String)
     totp_verification_url = Column(String)
+    totp_identifier = Column(String)
     title = Column(String)
     url = Column(String)
     navigation_goal = Column(String)
@@ -180,6 +182,7 @@ class WorkflowModel(Base):
     proxy_location = Column(Enum(ProxyLocation))
     webhook_callback_url = Column(String)
     totp_verification_url = Column(String)
+    totp_identifier = Column(String)
     persist_browser_session = Column(Boolean, default=False, nullable=False)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
@@ -207,6 +210,7 @@ class WorkflowRunModel(Base):
     proxy_location = Column(Enum(ProxyLocation))
     webhook_callback_url = Column(String)
     totp_verification_url = Column(String)
+    totp_identifier = Column(String)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -392,3 +396,19 @@ class TaskGenerationModel(Base):
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
+
+class TOTPCodeModel(Base):
+    __tablename__ = "totp_codes"
+
+    totp_code_id = Column(String, primary_key=True, default=generate_totp_code_id)
+    totp_identifier = Column(String, nullable=False, index=True)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"))
+    task_id = Column(String, ForeignKey("tasks.task_id"))
+    workflow_id = Column(String, ForeignKey("workflows.workflow_id"))
+    content = Column(String, nullable=False)
+    code = Column(String, nullable=False)
+    source = Column(String)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    expired_at = Column(DateTime, index=True)
