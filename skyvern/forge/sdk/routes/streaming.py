@@ -89,8 +89,6 @@ async def task_stream(
 
             if task.status == TaskStatus.running:
                 file_name = f"{task_id}.png"
-                if task.workflow_run_id:
-                    file_name = f"{task.workflow_run_id}.png"
                 screenshot = await app.STORAGE.get_streaming_file(organization_id, file_name)
                 if screenshot:
                     encoded_screenshot = base64.b64encode(screenshot).decode("utf-8")
