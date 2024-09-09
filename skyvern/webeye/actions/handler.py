@@ -82,9 +82,10 @@ COMMON_INPUT_TAGS = {"input", "textarea", "select"}
 
 
 class CustomSingleSelectResult:
-    action_result: ActionResult | None = None
-    value: str | None = None
-    dropdown_menu: SkyvernElement | None = None
+    def __init__(self) -> None:
+        self.action_result: ActionResult | None = None
+        self.value: str | None = None
+        self.dropdown_menu: SkyvernElement | None = None
 
     async def is_done(self) -> bool:
         # check if the dropdown menu is still on the page
