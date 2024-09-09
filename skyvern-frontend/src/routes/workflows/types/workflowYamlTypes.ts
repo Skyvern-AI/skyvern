@@ -79,6 +79,8 @@ export type TaskBlockYAML = BlockYAMLBase & {
   max_steps_per_run?: number | null;
   parameter_keys?: Array<string> | null;
   complete_on_download?: boolean;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
 };
 
 export type CodeBlockYAML = BlockYAMLBase & {

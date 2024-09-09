@@ -112,6 +112,8 @@ function convertToNode(
           maxRetries: block.max_retries ?? null,
           maxStepsOverride: block.max_steps_per_run ?? null,
           parameterKeys: block.parameters.map((p) => p.key),
+          totpIdentifier: block.totp_identifier ?? null,
+          totpVerificationUrl: block.totp_verification_url ?? null,
         },
       };
     }
@@ -402,6 +404,8 @@ function getWorkflowBlock(
         max_steps_per_run: node.data.maxStepsOverride,
         complete_on_download: node.data.allowDownloads,
         parameter_keys: node.data.parameterKeys,
+        totp_identifier: node.data.totpIdentifier,
+        totp_verification_url: node.data.totpVerificationUrl,
       };
     }
     case "sendEmail": {
