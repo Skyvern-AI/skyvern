@@ -84,15 +84,16 @@ def build_attribute(key: str, value: Any) -> str:
     return f'{key}="{str(value)}"' if value else key
 
 
-def json_to_html(element: dict) -> str:
+def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
     attributes: dict[str, Any] = copy.deepcopy(element.get("attributes", {}))
 
-    # adding the node attribute to attributes
-    for attr in ELEMENT_NODE_ATTRIBUTES:
-        value = element.get(attr)
-        if value is None:
-            continue
-        attributes[attr] = value
+    if need_skyvern_attrs:
+        # adding the node attribute to attributes
+        for attr in ELEMENT_NODE_ATTRIBUTES:
+            value = element.get(attr)
+            if value is None:
+                continue
+            attributes[attr] = value
 
     attributes_html = " ".join(build_attribute(key, value) for key, value in attributes.items())
 
@@ -487,10 +488,8 @@ class IncrementalScrapePage:
         return "".join([json_to_html(element) for element in (element_tree or self.element_tree_trimmed)])
 
 
-def trim_element_tree(elements: list[dict]) -> list[dict]:
-    queue = []
-    for element in elements:
-        queue.append(element)
+def trim_element(element: dict) -> dict:
+    queue = [element]
     while queue:
         queue_ele = queue.pop(0)
         if "frame" in queue_ele:
@@ -524,6 +523,12 @@ def trim_element_tree(elements: list[dict]) -> list[dict]:
             element_text = str(queue_ele["text"]).strip()
             if not element_text:
                 del queue_ele["text"]
+    return element
+
+
+def trim_element_tree(elements: list[dict]) -> list[dict]:
+    for element in elements:
+        trim_element(element)
     return elements
 
 
