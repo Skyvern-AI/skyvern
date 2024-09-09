@@ -1,9 +1,11 @@
-import { Handle, NodeProps, Position } from "@xyflow/react";
+import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import type { FileParserNode } from "./types";
 import { CursorTextIcon, DotsHorizontalIcon } from "@radix-ui/react-icons";
 import { Input } from "@/components/ui/input";
+import { EditableNodeTitle } from "../components/EditableNodeTitle";
 
-function FileParserNode({ data }: NodeProps<FileParserNode>) {
+function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
+  const { updateNodeData } = useReactFlow();
   return (
     <div>
       <Handle
@@ -25,7 +27,11 @@ function FileParserNode({ data }: NodeProps<FileParserNode>) {
               <CursorTextIcon className="h-6 w-6" />
             </div>
             <div className="flex flex-col gap-1">
-              <span className="max-w-64 truncate text-base">{data.label}</span>
+              <EditableNodeTitle
+                value={data.label}
+                editable={data.editable}
+                onChange={(value) => updateNodeData(id, { label: value })}
+              />
               <span className="text-xs text-slate-400">File Parser Block</span>
             </div>
           </div>
@@ -38,11 +44,11 @@ function FileParserNode({ data }: NodeProps<FileParserNode>) {
             <span className="text-sm text-slate-400">File URL</span>
             <Input
               value={data.fileUrl}
-              onChange={() => {
+              onChange={(event) => {
                 if (!data.editable) {
                   return;
                 }
-                // TODO
+                updateNodeData(id, { fileUrl: event.target.value });
               }}
               className="nopan"
             />

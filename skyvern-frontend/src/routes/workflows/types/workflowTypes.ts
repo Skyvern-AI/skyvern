@@ -196,7 +196,7 @@ export type WorkflowBlock =
   | FileURLParserBlock;
 
 export type WorkflowDefinition = {
-  parameters: Array<WorkflowParameter>;
+  parameters: Array<Parameter>;
   blocks: Array<WorkflowBlock>;
 };
 
@@ -211,6 +211,7 @@ export type WorkflowApiResponse = {
   workflow_definition: WorkflowDefinition;
   proxy_location: string;
   webhook_callback_url: string;
+  totp_verification_url: string;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;

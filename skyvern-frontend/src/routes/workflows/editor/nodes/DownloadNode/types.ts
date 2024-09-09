@@ -7,3 +7,9 @@ export type DownloadNodeData = {
 };
 
 export type DownloadNode = Node<DownloadNodeData, "download">;
+
+export const downloadNodeDefaultData: DownloadNodeData = {
+  editable: true,
+  label: "",
+  url: "SKYVERN_DOWNLOAD_DIRECTORY",
+} as const;

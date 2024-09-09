@@ -7,3 +7,9 @@ export type LoopNodeData = {
 };
 
 export type LoopNode = Node<LoopNodeData, "loop">;
+
+export const loopNodeDefaultData: LoopNodeData = {
+  editable: true,
+  label: "",
+  loopValue: "",
+} as const;
