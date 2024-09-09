@@ -188,6 +188,27 @@ function FlowRenderer({
       ...newNodes,
       ...nodes.slice(previousNodeIndex + 1),
     ];
+
+    if (nodes.length === 0) {
+      newNodesAfter.push({
+        id: `${id}-nodeAdder`,
+        type: "nodeAdder",
+        position: { x: 0, y: 0 },
+        data: {},
+        draggable: false,
+        connectable: false,
+      });
+      newEdges.push({
+        id: `edge-0-${id}`,
+        type: "default",
+        source: id,
+        target: `${id}-nodeAdder`,
+        style: {
+          strokeWidth: 2,
+        },
+      });
+    }
+
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
   }
 
