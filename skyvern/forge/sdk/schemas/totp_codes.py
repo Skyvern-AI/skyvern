@@ -7,7 +7,6 @@ class TOTPCodeBase(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     totp_identifier: str | None = None
-    organization_id: str | None = None
     task_id: str | None = None
     workflow_id: str | None = None
     source: str | None = None
@@ -18,12 +17,12 @@ class TOTPCodeBase(BaseModel):
 
 class TOTPCodeCreate(TOTPCodeBase):
     totp_identifier: str
-    organization_id: str
     content: str
 
 
 class TOTPCode(TOTPCodeCreate):
     totp_code_id: str
     code: str
+    organization_id: str
     created_at: datetime
     modified_at: datetime
