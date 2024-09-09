@@ -1,4 +1,4 @@
-import CodeMirror from "@uiw/react-codemirror";
+import CodeMirror, { EditorView } from "@uiw/react-codemirror";
 import { json } from "@codemirror/lang-json";
 import { python } from "@codemirror/lang-python";
 import { tokyoNightStorm } from "@uiw/codemirror-theme-tokyo-night-storm";
@@ -22,7 +22,10 @@ function CodeEditor({
   className,
   fontSize = 8,
 }: Props) {
-  const extensions = language === "json" ? [json()] : [python()];
+  const extensions =
+    language === "json"
+      ? [json(), EditorView.lineWrapping]
+      : [python(), EditorView.lineWrapping];
   return (
     <CodeMirror
       value={value}

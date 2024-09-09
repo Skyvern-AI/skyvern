@@ -15,6 +15,8 @@ import type { UploadNode } from "./UploadNode/types";
 import { UploadNode as UploadNodeComponent } from "./UploadNode/UploadNode";
 import type { DownloadNode } from "./DownloadNode/types";
 import { DownloadNode as DownloadNodeComponent } from "./DownloadNode/DownloadNode";
+import type { NodeAdderNode } from "./NodeAdderNode/types";
+import { NodeAdderNode as NodeAdderNodeComponent } from "./NodeAdderNode/NodeAdderNode";
 
 export type AppNode =
   | LoopNode
@@ -24,7 +26,8 @@ export type AppNode =
   | CodeBlockNode
   | FileParserNode
   | UploadNode
-  | DownloadNode;
+  | DownloadNode
+  | NodeAdderNode;
 
 export const nodeTypes = {
   loop: memo(LoopNodeComponent),
@@ -35,4 +38,5 @@ export const nodeTypes = {
   fileParser: memo(FileParserNodeComponent),
   upload: memo(UploadNodeComponent),
   download: memo(DownloadNodeComponent),
+  nodeAdder: memo(NodeAdderNodeComponent),
 };

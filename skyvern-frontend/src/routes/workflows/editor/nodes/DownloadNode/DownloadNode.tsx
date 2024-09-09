@@ -1,10 +1,13 @@
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { DotsHorizontalIcon, DownloadIcon } from "@radix-ui/react-icons";
-import { Handle, NodeProps, Position } from "@xyflow/react";
+import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import type { DownloadNode } from "./types";
+import { EditableNodeTitle } from "../components/EditableNodeTitle";
 
-function DownloadNode({ data }: NodeProps<DownloadNode>) {
+function DownloadNode({ id, data }: NodeProps<DownloadNode>) {
+  const { updateNodeData } = useReactFlow();
+
   return (
     <div>
       <Handle
@@ -26,7 +29,11 @@ function DownloadNode({ data }: NodeProps<DownloadNode>) {
               <DownloadIcon className="h-6 w-6" />
             </div>
             <div className="flex flex-col gap-1">
-              <span className="max-w-64 truncate text-base">{data.label}</span>
+              <EditableNodeTitle
+                value={data.label}
+                editable={data.editable}
+                onChange={(value) => updateNodeData(id, { label: value })}
+              />
               <span className="text-xs text-slate-400">Download Block</span>
             </div>
           </div>
@@ -39,11 +46,11 @@ function DownloadNode({ data }: NodeProps<DownloadNode>) {
             <Label className="text-sm text-slate-400">File URL</Label>
             <Input
               value={data.url}
-              onChange={() => {
+              onChange={(event) => {
                 if (!data.editable) {
                   return;
                 }
-                // TODO
+                updateNodeData(id, { url: event.target.value });
               }}
               className="nopan"
             />

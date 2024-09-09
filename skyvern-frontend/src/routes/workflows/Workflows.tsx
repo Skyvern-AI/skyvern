@@ -31,15 +31,29 @@ import {
   CounterClockwiseClockIcon,
   Pencil2Icon,
   PlayIcon,
+  PlusIcon,
+  ReloadIcon,
 } from "@radix-ui/react-icons";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { WorkflowsBetaAlertCard } from "./WorkflowsBetaAlertCard";
 import { WorkflowTitle } from "./WorkflowTitle";
+import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
+import { stringify as convertToYAML } from "yaml";
+
+const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
+  title: "New Workflow",
+  description: "",
+  workflow_definition: {
+    blocks: [],
+    parameters: [],
+  },
+};
 
 function Workflows() {
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const workflowsPage = searchParams.get("workflowsPage")
     ? Number(searchParams.get("workflowsPage"))
@@ -79,6 +93,27 @@ function Workflows() {
     },
   });
 
+  const createNewWorkflowMutation = useMutation({
+    mutationFn: async () => {
+      const client = await getClient(credentialGetter);
+      const yaml = convertToYAML(emptyWorkflowRequest);
+      return client.post<
+        typeof emptyWorkflowRequest,
+        { data: WorkflowApiResponse }
+      >("/workflows", yaml, {
+        headers: {
+          "Content-Type": "text/plain",
+        },
+      });
+    },
+    onSuccess: (response) => {
+      queryClient.invalidateQueries({
+        queryKey: ["workflows"],
+      });
+      navigate(`/workflows/${response.data.workflow_permanent_id}`);
+    },
+  });
+
   if (workflows?.length === 0 && workflowsPage === 1) {
     return <WorkflowsBetaAlertCard />;
   }
@@ -115,8 +150,21 @@ function Workflows() {
 
   return (
     <div className="space-y-8">
-      <header>
+      <header className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Workflows</h1>
+        <Button
+          disabled={createNewWorkflowMutation.isPending}
+          onClick={() => {
+            createNewWorkflowMutation.mutate();
+          }}
+        >
+          {createNewWorkflowMutation.isPending ? (
+            <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+          ) : (
+            <PlusIcon className="mr-2 h-4 w-4" />
+          )}
+          Create Workflow
+        </Button>
       </header>
       <div className="rounded-md border">
         <Table>

@@ -1,11 +1,19 @@
 import { DotsHorizontalIcon, UpdateIcon } from "@radix-ui/react-icons";
-import { Handle, NodeProps, Position, useNodes } from "@xyflow/react";
+import {
+  Handle,
+  NodeProps,
+  Position,
+  useNodes,
+  useReactFlow,
+} from "@xyflow/react";
 import type { LoopNode } from "./types";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import type { Node } from "@xyflow/react";
+import { EditableNodeTitle } from "../components/EditableNodeTitle";
 
 function LoopNode({ id, data }: NodeProps<LoopNode>) {
+  const { updateNodeData } = useReactFlow();
   const nodes = useNodes();
   const children = nodes.filter((node) => node.parentId === id);
   const furthestDownChild: Node | null = children.reduce(
@@ -54,7 +62,11 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                   <UpdateIcon className="h-6 w-6" />
                 </div>
                 <div className="flex flex-col gap-1">
-                  <span className="text-base">{data.label}</span>
+                  <EditableNodeTitle
+                    value={data.label}
+                    editable={data.editable}
+                    onChange={(value) => updateNodeData(id, { label: value })}
+                  />
                   <span className="text-xs text-slate-400">Loop Block</span>
                 </div>
               </div>
@@ -66,11 +78,11 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
               <Label className="text-xs text-slate-300">Loop Value</Label>
               <Input
                 value={data.loopValue}
-                onChange={() => {
+                onChange={(event) => {
                   if (!data.editable) {
                     return;
                   }
-                  // TODO
+                  updateNodeData(id, { loopValue: event.target.value });
                 }}
                 placeholder="What value are you iterating over?"
                 className="nopan"

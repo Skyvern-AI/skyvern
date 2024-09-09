@@ -1,10 +1,13 @@
-import { Handle, NodeProps, Position } from "@xyflow/react";
+import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import type { CodeBlockNode } from "./types";
 import { Label } from "@/components/ui/label";
 import { CodeIcon, DotsHorizontalIcon } from "@radix-ui/react-icons";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import { EditableNodeTitle } from "../components/EditableNodeTitle";
 
-function CodeBlockNode({ data }: NodeProps<CodeBlockNode>) {
+function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
+  const { updateNodeData } = useReactFlow();
+
   return (
     <div>
       <Handle
@@ -26,8 +29,12 @@ function CodeBlockNode({ data }: NodeProps<CodeBlockNode>) {
               <CodeIcon className="h-6 w-6" />
             </div>
             <div className="flex flex-col gap-1">
-              <span className="max-w-64 truncate text-base">{data.label}</span>
-              <span className="text-xs text-slate-400">Task Block</span>
+              <EditableNodeTitle
+                value={data.label}
+                editable={data.editable}
+                onChange={(value) => updateNodeData(id, { label: value })}
+              />
+              <span className="text-xs text-slate-400">Code Block</span>
             </div>
           </div>
           <div>
@@ -39,9 +46,11 @@ function CodeBlockNode({ data }: NodeProps<CodeBlockNode>) {
           <CodeEditor
             language="python"
             value={data.code}
-            onChange={() => {
-              if (!data.editable) return;
-              // TODO
+            onChange={(value) => {
+              if (!data.editable) {
+                return;
+              }
+              updateNodeData(id, { code: value });
             }}
             className="nopan"
           />
