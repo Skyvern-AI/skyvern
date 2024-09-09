@@ -12,6 +12,8 @@ export type TaskNodeData = {
   editable: boolean;
   label: string;
   parameterKeys: Array<string>;
+  totpVerificationUrl: string | null;
+  totpIdentifier: string | null;
 };
 
 export type TaskNode = Node<TaskNodeData, "task">;
@@ -30,4 +32,6 @@ export const taskNodeDefaultData: TaskNodeData = {
   editable: true,
   label: "",
   parameterKeys: [],
+  totpVerificationUrl: null,
+  totpIdentifier: null,
 } as const;

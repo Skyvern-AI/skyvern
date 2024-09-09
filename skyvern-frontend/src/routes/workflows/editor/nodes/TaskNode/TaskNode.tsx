@@ -71,7 +71,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
     <>
       <Accordion
         type="multiple"
-        defaultValue={["content", "extraction", "limits"]}
+        defaultValue={["content", "extraction", "limits", "totp"]}
       >
         <AccordionItem value="content">
           <AccordionTrigger>Content</AccordionTrigger>
@@ -257,6 +257,47 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     />
                   </div>
                 )}
+              </div>
+            </div>
+          </AccordionContent>
+        </AccordionItem>
+        <AccordionItem value="totp">
+          <AccordionTrigger>TOTP</AccordionTrigger>
+          <AccordionContent className="pl-[1.5rem] pr-1">
+            <div className="space-y-4">
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">
+                  TOTP Verification URL
+                </Label>
+                <AutoResizingTextarea
+                  onChange={(event) => {
+                    if (!editable) {
+                      return;
+                    }
+                    updateNodeData(id, {
+                      totpVerificationUrl: event.target.value,
+                    });
+                  }}
+                  value={data.totpVerificationUrl ?? ""}
+                  placeholder="https://"
+                  className="nopan"
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">
+                  TOTP Identifier
+                </Label>
+                <AutoResizingTextarea
+                  onChange={(event) => {
+                    if (!editable) {
+                      return;
+                    }
+                    updateNodeData(id, { totpIdentifier: event.target.value });
+                  }}
+                  value={data.totpIdentifier ?? ""}
+                  placeholder="Identifier"
+                  className="nopan"
+                />
               </div>
             </div>
           </AccordionContent>
