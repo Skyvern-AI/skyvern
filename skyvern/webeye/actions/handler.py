@@ -12,7 +12,7 @@ from deprecation import deprecated
 from playwright.async_api import FileChooser, Locator, Page, TimeoutError
 from pydantic import BaseModel
 
-from skyvern.constants import REPO_ROOT_DIR, SKYVERN_ID_ATTR, VERIFICATION_CODE_POLLING_TIMEOUT_MINS
+from skyvern.constants import REPO_ROOT_DIR, SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     EmptySelect,
     ErrEmptyTweakValue,
@@ -2099,7 +2099,7 @@ async def poll_verification_code(
     totp_verification_url: str | None = None,
     totp_identifier: str | None = None,
 ) -> str | None:
-    timeout = timedelta(minutes=VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
+    timeout = timedelta(minutes=SettingsManager.get_settings().VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
     start_datetime = datetime.utcnow()
     timeout_datetime = start_datetime + timeout
     org_token = await app.DATABASE.get_valid_org_auth_token(organization_id, OrganizationAuthTokenType.api)

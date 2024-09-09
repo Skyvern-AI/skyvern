@@ -119,6 +119,7 @@ class Settings(BaseSettings):
 
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
+    VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 5
 
     def is_cloud_environment(self) -> bool:
         """
