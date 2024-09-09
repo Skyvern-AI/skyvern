@@ -985,9 +985,10 @@ class SendEmailBlock(Block):
         # Log file statistics
         LOG.info("SendEmailBlock: Total files attached", total_files=total_files)
         LOG.info("SendEmailBlock: Unique files (based on content) attached", unique_files=unique_files)
-        LOG.info(
-            "SendEmailBlock: Duplicate files (based on content) attached", duplicate_files_list=duplicate_files_list
-        )
+        if duplicate_files_list:
+            LOG.info(
+                "SendEmailBlock: Duplicate files (based on content) attached", duplicate_files_list=duplicate_files_list
+            )
 
         return msg
 
