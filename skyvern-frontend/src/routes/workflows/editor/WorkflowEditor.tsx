@@ -1,7 +1,7 @@
 import { useParams } from "react-router-dom";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { getElements } from "./workflowEditorUtils";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   BlockYAML,
   ParameterYAML,
@@ -18,6 +18,7 @@ import { AxiosError } from "axios";
 function WorkflowEditor() {
   const { workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
+  const queryClient = useQueryClient();
 
   const { data: workflow, isLoading } = useWorkflowQuery({
     workflowPermanentId,
@@ -59,6 +60,9 @@ function WorkflowEditor() {
         title: "Changes saved",
         description: "Your changes have been saved",
         variant: "success",
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["workflow", workflowPermanentId],
       });
     },
     onError: (error: AxiosError) => {
