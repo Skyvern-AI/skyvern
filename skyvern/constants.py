@@ -13,8 +13,6 @@ BROWSER_CLOSE_TIMEOUT = 180  # 3 minute
 # reserved fields for navigation payload
 SPECIAL_FIELD_VERIFICATION_CODE = "verification_code"
 
-VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 10
-
 
 class ScrapeType(StrEnum):
     NORMAL = "normal"
