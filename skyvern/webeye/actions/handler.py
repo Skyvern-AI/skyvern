@@ -1351,6 +1351,8 @@ async def sequentially_select_from_dropdown(
             should_relevant=should_relevant,
         )
         values.append(single_select_result.value)
+        # wait 1s until DOM finished updating
+        await asyncio.sleep(1)
 
         if await single_select_result.is_done():
             return single_select_result.action_result, values[-1] if len(values) > 0 else None
@@ -1384,6 +1386,12 @@ async def sequentially_select_from_dropdown(
             )
         )
         if len(secondary_increment_element) == 0:
+            LOG.info(
+                "No incremental element detected for the next level selection, going to quit the custom select mode",
+                selected_time=i + 1,
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
             return single_select_result.action_result, values[-1] if len(values) > 0 else None
 
     return single_select_result.action_result, values[-1] if len(values) > 0 else None
