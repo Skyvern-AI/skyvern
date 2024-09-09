@@ -37,7 +37,8 @@ Reply in JSON format with the following keys:
         }]
 {% endif %}
     }],{% if verification_code_check %}
-    "need_verification_code": bool, // Whether a verification code is needed to proceed.{% endif %}
+    "need_verification_code_reasoning": str, // What makes you think if the verification is needed or not needed? Any where in the website stating you need the veficiation? Is the verification code sent already?
+    "need_verification_code": bool, // Whether a verification code is needed to proceed. True only after the code is sent to the email or phone or 2FA/MFA device. If the code is not sent, return false {% endif %}
 }
 {% if action_history %}
 Consider the action history from the last step and the screenshot together, if actions from the last step don't yield positive impact, try other actions or other action combinations.
