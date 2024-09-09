@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import typing
 from abc import ABC, abstractmethod
 from enum import StrEnum
@@ -28,7 +29,7 @@ from skyvern.exceptions import (
     SkyvernException,
 )
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.webeye.scraper.scraper import IncrementalScrapePage, ScrapedPage
+from skyvern.webeye.scraper.scraper import IncrementalScrapePage, ScrapedPage, json_to_html, trim_element
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -129,6 +130,13 @@ class SkyvernElement:
         self.__static_element = static_element
         self.__frame = frame
         self.locator = locator
+
+    def build_HTML(self, need_trim_element: bool = True, need_skyvern_attrs: bool = True) -> str:
+        element_dict = self.get_element_dict()
+        if need_trim_element:
+            element_dict = trim_element(copy.deepcopy(element_dict))
+
+        return json_to_html(element_dict, need_skyvern_attrs)
 
     async def is_select2_dropdown(self) -> bool:
         tag_name = self.get_tag_name()

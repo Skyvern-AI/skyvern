@@ -1,7 +1,15 @@
 There is a screenshot from part of Web HTML page. Help me confirm it if it's an opened dropdown menu.
+An opened dropdown menu could be defined as:
+ - At least two options show on the screenshot.
 MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
 
 Reply in JSON format with the following keys:
 {
+    "reasoning": str, // the reason why it's a dropdown menu or not a dropdown menu
     "is_opened_dropdown_menu": bool, // true if it's a opened dropdown menu, otherwise false.
 }
+
+Elements on the screenshot:
+```
+{{ elements }}
+```
