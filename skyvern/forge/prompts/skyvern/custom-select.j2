@@ -2,10 +2,10 @@ You are performing a selection action on an HTML page. Assist the user in select
 
 You can identify the matching element based on the following guidelines:
   1. Select the most suitable element based on the user goal, user details, and the context.
-  2. If no option is a perfect match, choose a fallback option such as “Others” or “None of the above”.
+  2. If no option is a perfect match, and there is a fallback option such as "Others" or "None of the above" in the DOM elements, you can consider it a match.
   3. If a field is required, do not leave it blank.
-  4. If a field is required, do not select a placeholder value, such as “Please select”, “-”, or “Select…”.
-  5. Exclude loading indicators like “loading more results” as valid options.
+  4. If a field is required, do not select a placeholder value, such as "Please select", "-", or "Select…".
+  5. Exclude loading indicators like "loading more results" as valid options.
 
 MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
 Each interactable element is tagged with an ID.
