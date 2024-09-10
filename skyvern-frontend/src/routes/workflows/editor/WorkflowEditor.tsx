@@ -64,6 +64,9 @@ function WorkflowEditor() {
       queryClient.invalidateQueries({
         queryKey: ["workflow", workflowPermanentId],
       });
+      queryClient.invalidateQueries({
+        queryKey: ["workflows"],
+      });
     },
     onError: (error: AxiosError) => {
       toast({
