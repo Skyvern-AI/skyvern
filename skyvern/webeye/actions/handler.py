@@ -1120,6 +1120,8 @@ async def choose_auto_completion_dropdown(
             "auto-completion-choose-option",
             context_reasoning=action.reasoning,
             filled_value=text,
+            navigation_goal=task.navigation_goal,
+            navigation_payload_str=json.dumps(task.navigation_payload),
             elements=html,
         )
         LOG.info(
@@ -1462,27 +1464,29 @@ async def select_from_dropdown(
     prompt = prompt_engine.load_prompt(
         "custom-select",
         context_reasoning=action.reasoning,
-        target_value=target_value,
+        target_value=target_value if not force_select and should_relevant else "",
+        navigation_goal=task.navigation_goal,
+        navigation_payload_str=json.dumps(task.navigation_payload),
         elements=html,
     )
 
     LOG.info(
         "Calling LLM to find the match element",
-        target_value=target_value,
         step_id=step.step_id,
         task_id=task.task_id,
     )
     json_response = await llm_handler(prompt=prompt, step=step)
+    value: str | None = json_response.get("value", None)
+    single_select_result.value = value
+
     LOG.info(
         "LLM response for the matched element",
-        target_value=target_value,
+        matched_value=value,
         response=json_response,
         step_id=step.step_id,
         task_id=task.task_id,
     )
 
-    value: str | None = json_response.get("value", None)
-    single_select_result.value = value
     element_id: str | None = json_response.get("id", None)
     if not element_id:
         raise NoElementMatchedForTargetOption(target=target_value, reason=json_response.get("reasoning"))
