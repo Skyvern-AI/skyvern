@@ -627,15 +627,11 @@ class WorkflowService:
         ] = await self.get_output_parameter_workflow_run_output_parameter_tuples(
             workflow_id=workflow_run.workflow_id, workflow_run_id=workflow_run_id
         )
+
+        outputs = None
         if output_parameter_tuples:
             outputs = {output_parameter.key: output.value for output_parameter, output in output_parameter_tuples}
-        else:
-            LOG.error(
-                "No output parameters found for workflow run",
-                workflow_permanent_id=workflow_permanent_id,
-                workflow_run_id=workflow_run_id,
-            )
-            outputs = None
+
         return WorkflowRunStatusResponse(
             workflow_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run_id,
