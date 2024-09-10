@@ -1798,7 +1798,23 @@ function getIncrementElements() {
     const treeList = window.globalDomDepthMap.get(depth);
 
     const removeDupAndConcatChildren = (element) => {
-      const children = element.children;
+      let children = element.children;
+      for (let i = 0; i < children.length; i++) {
+        const child = children[i];
+        const domElement = document.querySelector(`[unique_id="${child.id}"]`);
+        // if the element is still on the page, we rebuild the element to update the information
+        if (domElement) {
+          let newChild = buildElementObject(
+            "",
+            domElement,
+            child.interactable,
+            child.purgeable,
+          );
+          newChild.children = child.children;
+          children[i] = newChild;
+        }
+      }
+
       if (idToElement.has(element.id)) {
         element = idToElement.get(element.id);
         for (let i = 0; i < children.length; i++) {
@@ -1815,7 +1831,22 @@ function getIncrementElements() {
       }
     };
 
-    for (const treeHeadElement of treeList) {
+    for (let treeHeadElement of treeList) {
+      const domElement = document.querySelector(
+        `[unique_id="${treeHeadElement.id}"]`,
+      );
+      // if the element is still on the page, we rebuild the element to update the information
+      if (domElement) {
+        let newHead = buildElementObject(
+          "",
+          domElement,
+          treeHeadElement.interactable,
+          treeHeadElement.purgeable,
+        );
+        newHead.children = treeHeadElement.children;
+        treeHeadElement = newHead;
+      }
+
       // check if the element is existed
       if (!idToElement.has(treeHeadElement.id)) {
         cleanedTreeList.push(treeHeadElement);

@@ -82,10 +82,11 @@ COMMON_INPUT_TAGS = {"input", "textarea", "select"}
 
 
 class CustomSingleSelectResult:
-    def __init__(self) -> None:
+    def __init__(self, skyvern_frame: SkyvernFrame) -> None:
         self.action_result: ActionResult | None = None
         self.value: str | None = None
         self.dropdown_menu: SkyvernElement | None = None
+        self.skyvern_frame = skyvern_frame
 
     async def is_done(self) -> bool:
         # check if the dropdown menu is still on the page
@@ -100,7 +101,7 @@ class CustomSingleSelectResult:
         if await self.dropdown_menu.get_locator().count() == 0:
             return True
 
-        return False
+        return not await self.skyvern_frame.get_element_visible(await self.dropdown_menu.get_element_handler())
 
 
 def is_ul_or_listbox_element_factory(
@@ -1336,7 +1337,7 @@ async def sequentially_select_from_dropdown(
     # TODO: only suport the third-level dropdown selection now
     MAX_SELECT_DEPTH = 3
     values: list[str | None] = []
-    single_select_result = CustomSingleSelectResult()
+    single_select_result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
 
     check_exist_funcs: list[CheckExistIDFunc] = [dom.check_id_in_dom]
     for i in range(MAX_SELECT_DEPTH):
@@ -1418,7 +1419,7 @@ async def select_from_dropdown(
         1. force_select is false and no dropdown menu popped
         2. force_select is false and match value is not relevant to the target value
     """
-    single_select_result = CustomSingleSelectResult()
+    single_select_result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
 
     timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
 
