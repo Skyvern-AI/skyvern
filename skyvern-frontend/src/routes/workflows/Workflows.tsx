@@ -28,7 +28,6 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import {
-  CounterClockwiseClockIcon,
   Pencil2Icon,
   PlayIcon,
   PlusIcon,
@@ -36,10 +35,10 @@ import {
 } from "@radix-ui/react-icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { WorkflowsBetaAlertCard } from "./WorkflowsBetaAlertCard";
-import { WorkflowTitle } from "./WorkflowTitle";
-import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 import { stringify as convertToYAML } from "yaml";
+import { DeleteWorkflowButton } from "./editor/DeleteWorkflowButton";
+import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
+import { WorkflowTitle } from "./WorkflowTitle";
 
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
@@ -113,10 +112,6 @@ function Workflows() {
       navigate(`/workflows/${response.data.workflow_permanent_id}`);
     },
   });
-
-  if (workflows?.length === 0 && workflowsPage === 1) {
-    return <WorkflowsBetaAlertCard />;
-  }
 
   function handleRowClick(
     event: React.MouseEvent<HTMLTableCellElement>,
@@ -224,25 +219,6 @@ function Workflows() {
                                 onClick={(event) => {
                                   handleIconClick(
                                     event,
-                                    `/workflows/${workflow.workflow_permanent_id}/runs`,
-                                  );
-                                }}
-                              >
-                                <CounterClockwiseClockIcon className="h-4 w-4" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent>View Past Runs</TooltipContent>
-                          </Tooltip>
-                        </TooltipProvider>
-                        <TooltipProvider>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Button
-                                size="icon"
-                                variant="outline"
-                                onClick={(event) => {
-                                  handleIconClick(
-                                    event,
                                     `/workflows/${workflow.workflow_permanent_id}`,
                                   );
                                 }}
@@ -272,6 +248,9 @@ function Workflows() {
                             <TooltipContent>Create New Run</TooltipContent>
                           </Tooltip>
                         </TooltipProvider>
+                        <DeleteWorkflowButton
+                          id={workflow.workflow_permanent_id}
+                        />
                       </div>
                     </TableCell>
                   </TableRow>
