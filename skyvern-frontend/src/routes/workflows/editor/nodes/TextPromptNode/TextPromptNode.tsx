@@ -1,16 +1,19 @@
-import { CursorTextIcon, DotsHorizontalIcon } from "@radix-ui/react-icons";
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
-import type { TextPromptNode } from "./types";
-import { Label } from "@/components/ui/label";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
-import { Separator } from "@/components/ui/separator";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
+import { Separator } from "@/components/ui/separator";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { CursorTextIcon } from "@radix-ui/react-icons";
+import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
+import { NodeActionMenu } from "../NodeActionMenu";
+import type { TextPromptNode } from "./types";
 
 function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
   const { updateNodeData } = useReactFlow();
   const { editable } = data;
+  const deleteNodeCallback = useDeleteNodeCallback();
 
   return (
     <div>
@@ -41,9 +44,11 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
               <span className="text-xs text-slate-400">Text Prompt Block</span>
             </div>
           </div>
-          <div>
-            <DotsHorizontalIcon className="h-6 w-6" />
-          </div>
+          <NodeActionMenu
+            onDelete={() => {
+              deleteNodeCallback(id);
+            }}
+          />
         </div>
         <div className="space-y-1">
           <Label className="text-xs text-slate-300">Prompt</Label>

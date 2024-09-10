@@ -1,4 +1,8 @@
-import { DotsHorizontalIcon, UpdateIcon } from "@radix-ui/react-icons";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { UpdateIcon } from "@radix-ui/react-icons";
+import type { Node } from "@xyflow/react";
 import {
   Handle,
   NodeProps,
@@ -6,15 +10,15 @@ import {
   useNodes,
   useReactFlow,
 } from "@xyflow/react";
-import type { LoopNode } from "./types";
-import { Label } from "@/components/ui/label";
-import { Input } from "@/components/ui/input";
-import type { Node } from "@xyflow/react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
+import { NodeActionMenu } from "../NodeActionMenu";
+import type { LoopNode } from "./types";
 
 function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const { updateNodeData } = useReactFlow();
   const nodes = useNodes();
+  const deleteNodeCallback = useDeleteNodeCallback();
+
   const children = nodes.filter((node) => node.parentId === id);
   const furthestDownChild: Node | null = children.reduce(
     (acc, child) => {
@@ -70,9 +74,11 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                   <span className="text-xs text-slate-400">Loop Block</span>
                 </div>
               </div>
-              <div>
-                <DotsHorizontalIcon className="h-6 w-6" />
-              </div>
+              <NodeActionMenu
+                onDelete={() => {
+                  deleteNodeCallback(id);
+                }}
+              />
             </div>
             <div className="space-y-1">
               <Label className="text-xs text-slate-300">Loop Value</Label>

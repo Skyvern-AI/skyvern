@@ -1,11 +1,15 @@
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
-import type { FileParserNode } from "./types";
-import { CursorTextIcon, DotsHorizontalIcon } from "@radix-ui/react-icons";
 import { Input } from "@/components/ui/input";
+import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { CursorTextIcon } from "@radix-ui/react-icons";
+import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
+import { NodeActionMenu } from "../NodeActionMenu";
+import type { FileParserNode } from "./types";
 
 function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
   const { updateNodeData } = useReactFlow();
+  const deleteNodeCallback = useDeleteNodeCallback();
+
   return (
     <div>
       <Handle
@@ -35,9 +39,11 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
               <span className="text-xs text-slate-400">File Parser Block</span>
             </div>
           </div>
-          <div>
-            <DotsHorizontalIcon className="h-6 w-6" />
-          </div>
+          <NodeActionMenu
+            onDelete={() => {
+              deleteNodeCallback(id);
+            }}
+          />
         </div>
         <div className="space-y-4">
           <div className="space-y-1">

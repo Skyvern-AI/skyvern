@@ -1,19 +1,21 @@
-import { Edge } from "@xyflow/react";
-import { AppNode } from "./nodes";
 import Dagre from "@dagrejs/dagre";
+import { Edge } from "@xyflow/react";
+import { nanoid } from "nanoid";
 import type { WorkflowBlock } from "../types/workflowTypes";
-import { nodeTypes } from "./nodes";
-import { taskNodeDefaultData } from "./nodes/TaskNode/types";
-import { LoopNode, loopNodeDefaultData } from "./nodes/LoopNode/types";
+import { BlockYAML } from "../types/workflowYamlTypes";
+import { REACT_FLOW_EDGE_Z_INDEX } from "./constants";
+import { AppNode, nodeTypes } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
-import { uploadNodeDefaultData } from "./nodes/UploadNode/types";
-import { sendEmailNodeDefaultData } from "./nodes/SendEmailNode/types";
-import { textPromptNodeDefaultData } from "./nodes/TextPromptNode/types";
 import { fileParserNodeDefaultData } from "./nodes/FileParserNode/types";
-import { BlockYAML } from "../types/workflowYamlTypes";
+import { LoopNode, loopNodeDefaultData } from "./nodes/LoopNode/types";
 import { NodeAdderNode } from "./nodes/NodeAdderNode/types";
-import { REACT_FLOW_EDGE_Z_INDEX } from "./constants";
+import { sendEmailNodeDefaultData } from "./nodes/SendEmailNode/types";
+import { taskNodeDefaultData } from "./nodes/TaskNode/types";
+import { textPromptNodeDefaultData } from "./nodes/TextPromptNode/types";
+import { uploadNodeDefaultData } from "./nodes/UploadNode/types";
+
+export const NEW_NODE_LABEL_PREFIX = "Block ";
 
 function layoutUtil(
   nodes: Array<AppNode>,
@@ -211,38 +213,84 @@ function convertToNode(
   }
 }
 
-function getElements(
+function generateNodeData(blocks: Array<WorkflowBlock>): Array<{
+  id: string;
+  previous: string | null;
+  next: string | null;
+  parentId: string | null;
+  block: WorkflowBlock;
+}> {
+  const idMap = new WeakMap<WorkflowBlock, string>();
+  const stack = [...blocks];
+
+  while (stack.length > 0) {
+    const block = stack.pop()!;
+    const id = nanoid();
+    idMap.set(block, id);
+    if (block.block_type === "for_loop") {
+      stack.push(...block.loop_blocks);
+    }
+  }
+
+  return getNodeData(blocks, idMap, null);
+}
+
+function getNodeData(
   blocks: Array<WorkflowBlock>,
-  parentId?: string,
-): { nodes: Array<AppNode>; edges: Array<Edge> } {
+  ids: WeakMap<WorkflowBlock, string>,
+  parentId: string | null,
+): Array<{
+  id: string;
+  previous: string | null;
+  next: string | null;
+  parentId: string | null;
+  block: WorkflowBlock;
+}> {
+  const data: Array<{
+    id: string;
+    previous: string | null;
+    next: string | null;
+    parentId: string | null;
+    block: WorkflowBlock;
+  }> = [];
+
+  blocks.forEach((block, index) => {
+    const id = ids.get(block)!;
+    const previous = index === 0 ? null : ids.get(blocks[index - 1]!)!;
+    const next =
+      index === blocks.length - 1 ? null : ids.get(blocks[index + 1]!)!;
+    data.push({ id, previous, next, parentId, block });
+    if (block.block_type === "for_loop") {
+      data.push(...getNodeData(block.loop_blocks, ids, id));
+    }
+  });
+
+  return data;
+}
+
+function getElements(blocks: Array<WorkflowBlock>): {
+  nodes: Array<AppNode>;
+  edges: Array<Edge>;
+} {
+  const data = generateNodeData(blocks);
   const nodes: Array<AppNode> = [];
   const edges: Array<Edge> = [];
 
-  blocks.forEach((block, index) => {
-    const id = parentId ? `${parentId}-${index}` : String(index);
-    const nextId = parentId ? `${parentId}-${index + 1}` : String(index + 1);
-    nodes.push(convertToNode({ id, parentId }, block));
-    if (block.block_type === "for_loop") {
-      const subElements = getElements(block.loop_blocks, id);
-      if (subElements.nodes.length === 0) {
-        nodes.push({
-          id: `${id}-nodeAdder`,
-          type: "nodeAdder",
-          position: { x: 0, y: 0 },
-          data: {},
-          draggable: false,
-          connectable: false,
-        });
-      }
-      nodes.push(...subElements.nodes);
-      edges.push(...subElements.edges);
-    }
-    if (index !== blocks.length - 1) {
+  data.forEach((d) => {
+    const node = convertToNode(
+      {
+        id: d.id,
+        parentId: d.parentId ?? undefined,
+      },
+      d.block,
+    );
+    nodes.push(node);
+    if (d.previous) {
       edges.push({
-        id: `edge-${id}-${nextId}`,
+        id: nanoid(),
         type: "edgeWithAddButton",
-        source: id,
-        target: nextId,
+        source: d.previous,
+        target: d.id,
         style: {
           strokeWidth: 2,
         },
@@ -252,10 +300,11 @@ function getElements(
   });
 
   if (nodes.length > 0) {
+    const lastNode = data.find((d) => d.next === null && d.parentId === null);
     edges.push({
       id: "edge-nodeAdder",
       type: "default",
-      source: nodes[nodes.length - 1]!.id,
+      source: lastNode!.id,
       target: "nodeAdder",
       style: {
         strokeWidth: 2,
@@ -277,9 +326,8 @@ function getElements(
 function createNode(
   identifiers: { id: string; parentId?: string },
   nodeType: Exclude<keyof typeof nodeTypes, "nodeAdder">,
-  labelPostfix: string, // unique label requirement
+  label: string,
 ): AppNode {
-  const label = "Block " + labelPostfix;
   const common = {
     draggable: false,
     position: { x: 0, y: 0 },
@@ -496,4 +544,21 @@ function getWorkflowBlocks(nodes: Array<AppNode>): Array<BlockYAML> {
   );
 }
 
-export { getElements, layout, createNode, getWorkflowBlocks };
+function generateNodeLabel(existingLabels: Array<string>) {
+  for (let i = 1; i < existingLabels.length + 2; i++) {
+    const label = NEW_NODE_LABEL_PREFIX + i;
+    if (!existingLabels.includes(label)) {
+      return label;
+    }
+  }
+  throw new Error("Failed to generate a new node label");
+}
+
+export {
+  createNode,
+  generateNodeData,
+  getElements,
+  getWorkflowBlocks,
+  layout,
+  generateNodeLabel,
+};
