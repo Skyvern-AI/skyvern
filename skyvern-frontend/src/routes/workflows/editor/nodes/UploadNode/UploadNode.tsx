@@ -1,12 +1,15 @@
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
-import type { UploadNode } from "./types";
-import { DotsHorizontalIcon, UploadIcon } from "@radix-ui/react-icons";
-import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { UploadIcon } from "@radix-ui/react-icons";
+import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
+import { NodeActionMenu } from "../NodeActionMenu";
+import type { UploadNode } from "./types";
 
 function UploadNode({ id, data }: NodeProps<UploadNode>) {
   const { updateNodeData } = useReactFlow();
+  const deleteNodeCallback = useDeleteNodeCallback();
 
   return (
     <div>
@@ -37,9 +40,11 @@ function UploadNode({ id, data }: NodeProps<UploadNode>) {
               <span className="text-xs text-slate-400">Upload Block</span>
             </div>
           </div>
-          <div>
-            <DotsHorizontalIcon className="h-6 w-6" />
-          </div>
+          <NodeActionMenu
+            onDelete={() => {
+              deleteNodeCallback(id);
+            }}
+          />
         </div>
         <div className="space-y-4">
           <div className="space-y-1">

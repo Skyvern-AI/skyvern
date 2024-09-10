@@ -1,12 +1,15 @@
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
-import type { CodeBlockNode } from "./types";
 import { Label } from "@/components/ui/label";
-import { CodeIcon, DotsHorizontalIcon } from "@radix-ui/react-icons";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { CodeIcon } from "@radix-ui/react-icons";
+import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
+import { NodeActionMenu } from "../NodeActionMenu";
+import type { CodeBlockNode } from "./types";
 
 function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
   const { updateNodeData } = useReactFlow();
+  const deleteNodeCallback = useDeleteNodeCallback();
 
   return (
     <div>
@@ -37,9 +40,11 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
               <span className="text-xs text-slate-400">Code Block</span>
             </div>
           </div>
-          <div>
-            <DotsHorizontalIcon className="h-6 w-6" />
-          </div>
+          <NodeActionMenu
+            onDelete={() => {
+              deleteNodeCallback(id);
+            }}
+          />
         </div>
         <div className="space-y-1">
           <Label className="text-xs text-slate-300">Code Input</Label>

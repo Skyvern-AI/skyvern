@@ -13,7 +13,12 @@ import "@xyflow/react/dist/style.css";
 import { WorkflowHeader } from "./WorkflowHeader";
 import { AppNode, nodeTypes } from "./nodes";
 import "./reactFlowOverrideStyles.css";
-import { createNode, getWorkflowBlocks, layout } from "./workflowEditorUtils";
+import {
+  createNode,
+  generateNodeLabel,
+  getWorkflowBlocks,
+  layout,
+} from "./workflowEditorUtils";
 import { useEffect, useState } from "react";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
 import { edgeTypes } from "./edges";
@@ -26,6 +31,8 @@ import {
 } from "../types/workflowYamlTypes";
 import { WorkflowParametersStateContext } from "./WorkflowParametersStateContext";
 import { WorkflowParameterValueType } from "../types/workflowTypes";
+import { DeleteNodeCallbackContext } from "@/store/DeleteNodeCallbackContext";
+import { nanoid } from "nanoid";
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -131,11 +138,12 @@ function FlowRenderer({
   }: AddNodeProps) {
     const newNodes: Array<AppNode> = [];
     const newEdges: Array<Edge> = [];
-    const index = parent
-      ? nodes.filter((node) => node.parentId === parent).length
-      : nodes.length;
-    const id = parent ? `${parent}-${index}` : String(index);
-    const node = createNode({ id, parentId: parent }, nodeType, String(index));
+    const id = nanoid();
+    const node = createNode(
+      { id, parentId: parent },
+      nodeType,
+      generateNodeLabel(nodes.map((node) => node.data.label)),
+    );
     newNodes.push(node);
     if (previous) {
       const newEdge = {
@@ -163,6 +171,7 @@ function FlowRenderer({
     }
 
     if (nodeType === "loop") {
+      // when loop node is first created it needs an adder node so nodes can be added inside the loop
       newNodes.push({
         id: `${id}-nodeAdder`,
         type: "nodeAdder",
@@ -183,6 +192,7 @@ function FlowRenderer({
       ? nodes.indexOf(previousNode)
       : nodes.length - 1;
 
+    // creating some memory for no reason, maybe check it out later
     const newNodesAfter = [
       ...nodes.slice(0, previousNodeIndex + 1),
       ...newNodes,
@@ -190,6 +200,7 @@ function FlowRenderer({
     ];
 
     if (nodes.length === 0) {
+      // if there were no nodes before, add a nodeAdder node and connect it to the new node
       newNodesAfter.push({
         id: `${id}-nodeAdder`,
         type: "nodeAdder",
@@ -212,103 +223,142 @@ function FlowRenderer({
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
   }
 
+  function deleteNode(id: string) {
+    const node = nodes.find((node) => node.id === id);
+    if (!node) {
+      return;
+    }
+    const newNodes = nodes.filter((node) => node.id !== id);
+    const newEdges = edges.flatMap((edge) => {
+      if (edge.source === id) {
+        return [];
+      }
+      if (edge.target === id) {
+        const nextEdge = edges.find((edge) => edge.source === id);
+        if (nextEdge) {
+          // connect the old incoming edge to the next node if both of them exist
+          // also take the type of the old edge for plus button edge vs default
+          return [
+            {
+              ...edge,
+              type: nextEdge.type,
+              target: nextEdge.target,
+            },
+          ];
+        }
+        return [edge];
+      }
+      return [edge];
+    });
+
+    if (newNodes.every((node) => node.type === "nodeAdder")) {
+      // No user created nodes left, so return to the empty state.
+      doLayout([], []);
+      return;
+    }
+
+    doLayout(newNodes, newEdges);
+  }
+
   return (
     <WorkflowParametersStateContext.Provider
       value={[parameters, setParameters]}
     >
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        onNodesChange={(changes) => {
-          const dimensionChanges = changes.filter(
-            (change) => change.type === "dimensions",
-          );
-          const tempNodes = [...nodes];
-          dimensionChanges.forEach((change) => {
-            const node = tempNodes.find((node) => node.id === change.id);
-            if (node) {
-              if (node.measured?.width) {
-                node.measured.width = change.dimensions?.width;
+      <DeleteNodeCallbackContext.Provider value={deleteNode}>
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          onNodesChange={(changes) => {
+            const dimensionChanges = changes.filter(
+              (change) => change.type === "dimensions",
+            );
+            const tempNodes = [...nodes];
+            dimensionChanges.forEach((change) => {
+              const node = tempNodes.find((node) => node.id === change.id);
+              if (node) {
+                if (node.measured?.width) {
+                  node.measured.width = change.dimensions?.width;
+                }
+                if (node.measured?.height) {
+                  node.measured.height = change.dimensions?.height;
+                }
               }
-              if (node.measured?.height) {
-                node.measured.height = change.dimensions?.height;
-              }
+            });
+            if (dimensionChanges.length > 0) {
+              doLayout(tempNodes, edges);
             }
-          });
-          if (dimensionChanges.length > 0) {
-            doLayout(tempNodes, edges);
-          }
-          onNodesChange(changes);
-        }}
-        onEdgesChange={onEdgesChange}
-        nodeTypes={nodeTypes}
-        edgeTypes={edgeTypes}
-        colorMode="dark"
-        fitView
-        fitViewOptions={{
-          maxZoom: 1,
-        }}
-      >
-        <Background variant={BackgroundVariant.Dots} bgColor="#020617" />
-        <Controls position="bottom-left" />
-        <Panel position="top-center" className="h-20">
-          <WorkflowHeader
-            title={title}
-            onTitleChange={setTitle}
-            parametersPanelOpen={
-              workflowPanelState.active &&
-              workflowPanelState.content === "parameters"
-            }
-            onParametersClick={() => {
-              if (
+            onNodesChange(changes);
+          }}
+          onEdgesChange={onEdgesChange}
+          nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
+          colorMode="dark"
+          fitView
+          fitViewOptions={{
+            maxZoom: 1,
+          }}
+        >
+          <Background variant={BackgroundVariant.Dots} bgColor="#020617" />
+          <Controls position="bottom-left" />
+          <Panel position="top-center" className="h-20">
+            <WorkflowHeader
+              title={title}
+              onTitleChange={setTitle}
+              parametersPanelOpen={
                 workflowPanelState.active &&
                 workflowPanelState.content === "parameters"
-              ) {
-                closeWorkflowPanel();
-              } else {
-                setWorkflowPanelState({
-                  active: true,
-                  content: "parameters",
-                });
               }
-            }}
-            onSave={() => {
-              const blocksInYAMLConvertibleJSON = getWorkflowBlocks(nodes);
-              const parametersInYAMLConvertibleJSON =
-                convertToParametersYAML(parameters);
-              handleSave(
-                parametersInYAMLConvertibleJSON,
-                blocksInYAMLConvertibleJSON,
-                title,
-              );
-            }}
-          />
-        </Panel>
-        {workflowPanelState.active && (
-          <Panel position="top-right">
-            {workflowPanelState.content === "parameters" && (
-              <WorkflowParametersPanel />
-            )}
-            {workflowPanelState.content === "nodeLibrary" && (
+              onParametersClick={() => {
+                if (
+                  workflowPanelState.active &&
+                  workflowPanelState.content === "parameters"
+                ) {
+                  closeWorkflowPanel();
+                } else {
+                  setWorkflowPanelState({
+                    active: true,
+                    content: "parameters",
+                  });
+                }
+              }}
+              onSave={() => {
+                const blocksInYAMLConvertibleJSON = getWorkflowBlocks(nodes);
+                const parametersInYAMLConvertibleJSON =
+                  convertToParametersYAML(parameters);
+                handleSave(
+                  parametersInYAMLConvertibleJSON,
+                  blocksInYAMLConvertibleJSON,
+                  title,
+                );
+              }}
+            />
+          </Panel>
+          {workflowPanelState.active && (
+            <Panel position="top-right">
+              {workflowPanelState.content === "parameters" && (
+                <WorkflowParametersPanel />
+              )}
+              {workflowPanelState.content === "nodeLibrary" && (
+                <WorkflowNodeLibraryPanel
+                  onNodeClick={(props) => {
+                    addNode(props);
+                  }}
+                />
+              )}
+            </Panel>
+          )}
+          {nodes.length === 0 && (
+            <Panel position="top-right">
               <WorkflowNodeLibraryPanel
                 onNodeClick={(props) => {
                   addNode(props);
                 }}
+                first
               />
-            )}
-          </Panel>
-        )}
-        {nodes.length === 0 && (
-          <Panel position="top-right">
-            <WorkflowNodeLibraryPanel
-              onNodeClick={(props) => {
-                addNode(props);
-              }}
-              first
-            />
-          </Panel>
-        )}
-      </ReactFlow>
+            </Panel>
+          )}
+        </ReactFlow>
+      </DeleteNodeCallbackContext.Provider>
     </WorkflowParametersStateContext.Provider>
   );
 }

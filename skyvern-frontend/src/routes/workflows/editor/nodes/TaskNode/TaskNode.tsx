@@ -16,22 +16,21 @@ import {
 } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
-import {
-  DotsHorizontalIcon,
-  ListBulletIcon,
-  MixerVerticalIcon,
-} from "@radix-ui/react-icons";
+import { ListBulletIcon, MixerVerticalIcon } from "@radix-ui/react-icons";
 import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { useState } from "react";
+import { EditableNodeTitle } from "../components/EditableNodeTitle";
+import { NodeActionMenu } from "../NodeActionMenu";
 import { TaskNodeDisplayModeSwitch } from "./TaskNodeDisplayModeSwitch";
 import { TaskNodeParametersPanel } from "./TaskNodeParametersPanel";
 import type { TaskNode, TaskNodeDisplayMode } from "./types";
-import { EditableNodeTitle } from "../components/EditableNodeTitle";
+import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 
 function TaskNode({ id, data }: NodeProps<TaskNode>) {
   const { updateNodeData } = useReactFlow();
   const [displayMode, setDisplayMode] = useState<TaskNodeDisplayMode>("basic");
   const { editable } = data;
+  const deleteNodeCallback = useDeleteNodeCallback();
 
   const basicContent = (
     <>
@@ -335,9 +334,11 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
               <span className="text-xs text-slate-400">Task Block</span>
             </div>
           </div>
-          <div>
-            <DotsHorizontalIcon className="h-6 w-6" />
-          </div>
+          <NodeActionMenu
+            onDelete={() => {
+              deleteNodeCallback(id);
+            }}
+          />
         </div>
         <div className="flex justify-between">
           <TaskNodeDisplayModeSwitch

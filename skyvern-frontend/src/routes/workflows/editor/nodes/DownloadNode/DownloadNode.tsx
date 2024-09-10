@@ -1,12 +1,15 @@
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { DotsHorizontalIcon, DownloadIcon } from "@radix-ui/react-icons";
+import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { DownloadIcon } from "@radix-ui/react-icons";
 import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
-import type { DownloadNode } from "./types";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
+import { NodeActionMenu } from "../NodeActionMenu";
+import type { DownloadNode } from "./types";
 
 function DownloadNode({ id, data }: NodeProps<DownloadNode>) {
   const { updateNodeData } = useReactFlow();
+  const deleteNodeCallback = useDeleteNodeCallback();
 
   return (
     <div>
@@ -37,9 +40,11 @@ function DownloadNode({ id, data }: NodeProps<DownloadNode>) {
               <span className="text-xs text-slate-400">Download Block</span>
             </div>
           </div>
-          <div>
-            <DotsHorizontalIcon className="h-6 w-6" />
-          </div>
+          <NodeActionMenu
+            onDelete={() => {
+              deleteNodeCallback(id);
+            }}
+          />
         </div>
         <div className="space-y-4">
           <div className="space-y-1">
