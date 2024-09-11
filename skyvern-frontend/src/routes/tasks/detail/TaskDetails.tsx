@@ -26,6 +26,7 @@ import { taskIsFinalized } from "@/api/utils";
 import fetchToCurl from "fetch-to-curl";
 import { apiBaseUrl } from "@/util/env";
 import { useApiCredential } from "@/hooks/useApiCredential";
+import { copyText } from "@/util/copyText";
 
 function createTaskRequestObject(values: TaskApiResponse) {
   return {
@@ -142,12 +143,13 @@ function TaskDetails() {
                   "x-api-key": apiCredential ?? "<your-api-key>",
                 },
               });
-              navigator.clipboard.writeText(curl);
-              toast({
-                variant: "success",
-                title: "Copied to Clipboard",
-                description:
-                  "The cURL command has been copied to your clipboard.",
+              copyText(curl).then(() => {
+                toast({
+                  variant: "success",
+                  title: "Copied to Clipboard",
+                  description:
+                    "The cURL command has been copied to your clipboard.",
+                });
               });
             }}
           >

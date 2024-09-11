@@ -47,6 +47,7 @@ import {
 import { OrganizationApiResponse } from "@/api/types";
 import { Skeleton } from "@/components/ui/skeleton";
 import { MAX_STEPS_DEFAULT } from "../constants";
+import { copyText } from "@/util/copyText";
 
 const createNewTaskFormSchema = z
   .object({
@@ -487,10 +488,11 @@ function CreateNewTaskForm({ initialValues }: Props) {
                   "x-api-key": apiCredential ?? "<your-api-key>",
                 },
               });
-              await navigator.clipboard.writeText(curl);
-              toast({
-                title: "Copied cURL",
-                description: "cURL copied to clipboard",
+              copyText(curl).then(() => {
+                toast({
+                  title: "Copied cURL",
+                  description: "cURL copied to clipboard",
+                });
               });
             }}
           >
