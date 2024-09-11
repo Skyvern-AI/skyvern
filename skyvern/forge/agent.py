@@ -1617,7 +1617,7 @@ class ForgeAgent:
                 browser_state,
                 element_tree_in_prompt,
                 verification_code_check=False,
-                expire_verification_code=False,
+                expire_verification_code=True,
             )
             return await app.LLM_API_HANDLER(
                 prompt=extract_action_prompt,
