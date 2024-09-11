@@ -28,6 +28,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import {
+  ExclamationTriangleIcon,
   Pencil2Icon,
   PlayIcon,
   PlusIcon,
@@ -39,6 +40,7 @@ import { stringify as convertToYAML } from "yaml";
 import { DeleteWorkflowButton } from "./editor/DeleteWorkflowButton";
 import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 import { WorkflowTitle } from "./WorkflowTitle";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
@@ -143,8 +145,37 @@ function Workflows() {
     navigate(path);
   }
 
+  const showExperimentalMessage =
+    workflows?.length === 0 && workflowsPage === 1;
+
   return (
     <div className="space-y-8">
+      {showExperimentalMessage && (
+        <Alert variant="default" className="bg-slate-elevation2">
+          <AlertTitle>
+            <div className="flex items-center gap-2">
+              <ExclamationTriangleIcon className="h-6 w-6" />
+              <span className="text-xl">Experimental Feature</span>
+            </div>
+          </AlertTitle>
+          <AlertDescription className="text-base text-slate-300">
+            Workflows are still in experimental mode. Please{" "}
+            {
+              <a
+                href="https://meetings.hubspot.com/skyvern/demo"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="ml-auto underline underline-offset-2"
+              >
+                book a demo
+              </a>
+            }{" "}
+            if you'd like to learn more. If you're feeling adventurous, create
+            your first workflow!
+          </AlertDescription>
+        </Alert>
+      )}
+
       <header className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Workflows</h1>
         <Button
