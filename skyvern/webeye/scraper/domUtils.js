@@ -270,6 +270,25 @@ function isScriptOrStyle(element) {
   return tagName === "script" || tagName === "style";
 }
 
+function isReadonlyElement(element) {
+  if (element.readOnly) {
+    return true;
+  }
+
+  if (element.hasAttribute("readonly")) {
+    return true;
+  }
+
+  if (element.hasAttribute("aria-readonly")) {
+    // only aria-readonly="false" should be considered as "not readonly"
+    return (
+      element.getAttribute("aria-readonly").toLowerCase().trim() !== "false"
+    );
+  }
+
+  return false;
+}
+
 function hasAngularClickBinding(element) {
   return (
     element.hasAttribute("ng-click") || element.hasAttribute("data-ng-click")
@@ -283,6 +302,10 @@ function hasWidgetRole(element) {
   }
   // https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Roles#2._widget_roles
   // Not all roles make sense for the time being so we only check for the ones that do
+  if (role.toLowerCase().trim() === "textbox") {
+    return !isReadonlyElement(element);
+  }
+
   const widgetRoles = [
     "button",
     "link",
@@ -293,7 +316,6 @@ function hasWidgetRole(element) {
     "radio",
     "tab",
     "combobox",
-    "textbox",
     "searchbox",
     "slider",
     "spinbutton",
@@ -326,6 +348,11 @@ function isInteractableInput(element) {
     // let other checks decide
     return false;
   }
+
+  if (type.toLowerCase().trim() === "text") {
+    return !isReadonlyElement(element);
+  }
+
   const clickableTypes = [
     "button",
     "checkbox",
@@ -343,7 +370,6 @@ function isInteractableInput(element) {
     "search",
     "submit",
     "tel",
-    "text",
     "time",
     "url",
     "week",
