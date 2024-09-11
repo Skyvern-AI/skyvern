@@ -197,6 +197,22 @@ class SkyvernElement:
         button_type = await self.get_attr("type")
         return button_type == "radio"
 
+    async def is_spinbtn_input(self) -> bool:
+        """
+        confirm the element is:
+        1. <input> element
+        2. role=spinbutton
+
+        Usage of <input role="spinbutton">, https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Roles/spinbutton_role
+        """
+        if self.get_tag_name() != InteractiveElement.INPUT:
+            return False
+
+        if await self.get_attr("role") == "spinbutton":
+            return True
+
+        return False
+
     def is_interactable(self) -> bool:
         return self.__static_element.get("interactable", False)
 

@@ -414,7 +414,7 @@ async def handle_input_text_action(
 
     incremental_element: list[dict] = []
     # check if it's selectable
-    if skyvern_element.get_tag_name() == InteractiveElement.INPUT:
+    if skyvern_element.get_tag_name() == InteractiveElement.INPUT and not await skyvern_element.is_spinbtn_input():
         await skyvern_element.scroll_into_view()
         select_action = SelectOptionAction(
             reasoning=action.reasoning, element_id=skyvern_element.get_id(), option=SelectOption(label=text)
@@ -483,14 +483,16 @@ async def handle_input_text_action(
 
     # force to move focus back to the element
     await skyvern_element.get_locator().focus(timeout=timeout)
-    try:
-        await skyvern_element.input_clear()
-    except TimeoutError:
-        LOG.info("None input tag clear timeout", action=action)
-        return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
-    except Exception:
-        LOG.warning("Failed to clear the input field", action=action, exc_info=True)
-        return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
+    # `Locator.clear()` on a spin button could cause the cursor moving away, and never be back
+    if not await skyvern_element.is_spinbtn_input():
+        try:
+            await skyvern_element.input_clear()
+        except TimeoutError:
+            LOG.info("None input tag clear timeout", action=action)
+            return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
+        except Exception:
+            LOG.warning("Failed to clear the input field", action=action, exc_info=True)
+            return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
 
     try:
         # TODO: not sure if this case will trigger auto-completion
