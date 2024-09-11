@@ -6,10 +6,15 @@ import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import type { CodeBlockNode } from "./types";
+import { useState } from "react";
 
 function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
   const { updateNodeData } = useReactFlow();
   const deleteNodeCallback = useDeleteNodeCallback();
+  const [label, setLabel] = useState(data.label);
+  const [inputs, setInputs] = useState({
+    code: data.code,
+  });
 
   return (
     <div>
@@ -33,9 +38,12 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
             </div>
             <div className="flex flex-col gap-1">
               <EditableNodeTitle
-                value={data.label}
+                value={label}
                 editable={data.editable}
-                onChange={(value) => updateNodeData(id, { label: value })}
+                onChange={(value) => {
+                  setLabel(value);
+                  updateNodeData(id, { label: value });
+                }}
               />
               <span className="text-xs text-slate-400">Code Block</span>
             </div>
@@ -50,11 +58,12 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
           <Label className="text-xs text-slate-300">Code Input</Label>
           <CodeEditor
             language="python"
-            value={data.code}
+            value={inputs.code}
             onChange={(value) => {
               if (!data.editable) {
                 return;
               }
+              setInputs({ ...inputs, code: value });
               updateNodeData(id, { code: value });
             }}
             className="nopan"

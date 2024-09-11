@@ -7,10 +7,27 @@ import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import type { SendEmailNode } from "./types";
+import { useState } from "react";
 
 function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
   const { updateNodeData } = useReactFlow();
   const deleteNodeCallback = useDeleteNodeCallback();
+  const [label, setLabel] = useState(data.label);
+  const [inputs, setInputs] = useState({
+    sender: data.sender,
+    recipients: data.recipients,
+    subject: data.subject,
+    body: data.body,
+    fileAttachments: data.fileAttachments,
+  });
+
+  function handleChange(key: string, value: unknown) {
+    if (!data.editable) {
+      return;
+    }
+    setInputs({ ...inputs, [key]: value });
+    updateNodeData(id, { [key]: value });
+  }
 
   return (
     <div>
@@ -34,9 +51,12 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
             </div>
             <div className="flex flex-col gap-1">
               <EditableNodeTitle
-                value={data.label}
+                value={label}
                 editable={data.editable}
-                onChange={(value) => updateNodeData(id, { label: value })}
+                onChange={(value) => {
+                  setLabel(value);
+                  updateNodeData(id, { label: value });
+                }}
               />
               <span className="text-xs text-slate-400">Send Email Block</span>
             </div>
@@ -54,9 +74,9 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
               if (!data.editable) {
                 return;
               }
-              updateNodeData(id, { sender: event.target.value });
+              handleChange("sender", event.target.value);
             }}
-            value={data.sender}
+            value={inputs.sender}
             placeholder="example@gmail.com"
             className="nopan"
           />
@@ -68,9 +88,9 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
               if (!data.editable) {
                 return;
               }
-              updateNodeData(id, { recipients: event.target.value });
+              handleChange("recipients", event.target.value);
             }}
-            value={data.recipients}
+            value={inputs.recipients}
             placeholder="example@gmail.com, example2@gmail.com..."
             className="nopan"
           />
@@ -83,9 +103,9 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
               if (!data.editable) {
                 return;
               }
-              updateNodeData(id, { subject: event.target.value });
+              handleChange("subject", event.target.value);
             }}
-            value={data.subject}
+            value={inputs.subject}
             placeholder="What is the gist?"
             className="nopan"
           />
@@ -97,9 +117,9 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
               if (!data.editable) {
                 return;
               }
-              updateNodeData(id, { body: event.target.value });
+              handleChange("body", event.target.value);
             }}
-            value={data.body}
+            value={inputs.body}
             placeholder="What would you like to say?"
             className="nopan"
           />
@@ -108,12 +128,12 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
         <div className="space-y-1">
           <Label className="text-xs text-slate-300">File Attachments</Label>
           <Input
-            value={data.fileAttachments}
+            value={inputs.fileAttachments}
             onChange={(event) => {
               if (!data.editable) {
                 return;
               }
-              updateNodeData(id, { fileAttachments: event.target.value });
+              handleChange("fileAttachments", event.target.value);
             }}
             className="nopan"
           />
