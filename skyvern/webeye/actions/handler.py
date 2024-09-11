@@ -2118,7 +2118,7 @@ async def poll_verification_code(
     if not org_token:
         LOG.error("Failed to get organization token when trying to get verification code")
         return None
-    # wait for 40 seconds to get the verification code before actually polling
+    # wait for 40 seconds to let the verification code comes in before polling
     await asyncio.sleep(SettingsManager.get_settings().VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS)
     while True:
         # check timeout
