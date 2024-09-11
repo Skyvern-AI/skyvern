@@ -13,11 +13,16 @@ import {
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import type { LoopNode } from "./types";
+import { useState } from "react";
 
 function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const { updateNodeData } = useReactFlow();
   const nodes = useNodes();
   const deleteNodeCallback = useDeleteNodeCallback();
+  const [label, setLabel] = useState(data.label);
+  const [inputs, setInputs] = useState({
+    loopValue: data.loopValue,
+  });
 
   const children = nodes.filter((node) => node.parentId === id);
   const furthestDownChild: Node | null = children.reduce(
@@ -67,9 +72,12 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                 </div>
                 <div className="flex flex-col gap-1">
                   <EditableNodeTitle
-                    value={data.label}
+                    value={label}
                     editable={data.editable}
-                    onChange={(value) => updateNodeData(id, { label: value })}
+                    onChange={(value) => {
+                      setLabel(value);
+                      updateNodeData(id, { label: value });
+                    }}
                   />
                   <span className="text-xs text-slate-400">Loop Block</span>
                 </div>
@@ -83,11 +91,12 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
             <div className="space-y-1">
               <Label className="text-xs text-slate-300">Loop Value</Label>
               <Input
-                value={data.loopValue}
+                value={inputs.loopValue}
                 onChange={(event) => {
                   if (!data.editable) {
                     return;
                   }
+                  setInputs({ ...inputs, loopValue: event.target.value });
                   updateNodeData(id, { loopValue: event.target.value });
                 }}
                 placeholder="What value are you iterating over?"

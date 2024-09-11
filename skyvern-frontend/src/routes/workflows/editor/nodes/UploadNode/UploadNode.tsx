@@ -49,16 +49,7 @@ function UploadNode({ id, data }: NodeProps<UploadNode>) {
         <div className="space-y-4">
           <div className="space-y-1">
             <Label className="text-sm text-slate-400">File Path</Label>
-            <Input
-              value={data.path}
-              onChange={(event) => {
-                if (!data.editable) {
-                  return;
-                }
-                updateNodeData(id, { path: event.target.value });
-              }}
-              className="nopan"
-            />
+            <Input value={data.path} className="nopan" disabled />
           </div>
         </div>
       </div>

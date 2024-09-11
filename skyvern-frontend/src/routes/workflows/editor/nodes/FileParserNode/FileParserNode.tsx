@@ -5,10 +5,15 @@ import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import type { FileParserNode } from "./types";
+import { useState } from "react";
 
 function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
   const { updateNodeData } = useReactFlow();
   const deleteNodeCallback = useDeleteNodeCallback();
+  const [label, setLabel] = useState(data.label);
+  const [inputs, setInputs] = useState({
+    fileUrl: data.fileUrl,
+  });
 
   return (
     <div>
@@ -32,9 +37,12 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
             </div>
             <div className="flex flex-col gap-1">
               <EditableNodeTitle
-                value={data.label}
+                value={label}
                 editable={data.editable}
-                onChange={(value) => updateNodeData(id, { label: value })}
+                onChange={(value) => {
+                  setLabel(value);
+                  updateNodeData(id, { label: value });
+                }}
               />
               <span className="text-xs text-slate-400">File Parser Block</span>
             </div>
@@ -49,11 +57,12 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
           <div className="space-y-1">
             <span className="text-sm text-slate-400">File URL</span>
             <Input
-              value={data.fileUrl}
+              value={inputs.fileUrl}
               onChange={(event) => {
                 if (!data.editable) {
                   return;
                 }
+                setInputs({ ...inputs, fileUrl: event.target.value });
                 updateNodeData(id, { fileUrl: event.target.value });
               }}
               className="nopan"

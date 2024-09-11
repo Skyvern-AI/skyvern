@@ -32,19 +32,41 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
   const { editable } = data;
   const deleteNodeCallback = useDeleteNodeCallback();
 
+  const [label, setLabel] = useState(data.label);
+  const [inputs, setInputs] = useState({
+    url: data.url,
+    navigationGoal: data.navigationGoal,
+    dataExtractionGoal: data.dataExtractionGoal,
+    dataSchema: data.dataSchema,
+    maxRetries: data.maxRetries,
+    maxStepsOverride: data.maxStepsOverride,
+    allowDownloads: data.allowDownloads,
+    errorCodeMapping: data.errorCodeMapping,
+    totpVerificationUrl: data.totpVerificationUrl,
+    totpIdentifier: data.totpIdentifier,
+  });
+
+  function handleChange(key: string, value: unknown) {
+    if (!editable) {
+      return;
+    }
+    setInputs({ ...inputs, [key]: value });
+    updateNodeData(id, { [key]: value });
+  }
+
   const basicContent = (
     <>
       <div className="space-y-1">
         <Label className="text-xs text-slate-300">URL</Label>
         <AutoResizingTextarea
-          value={data.url}
+          value={inputs.url}
           className="nopan"
           name="url"
           onChange={(event) => {
             if (!editable) {
               return;
             }
-            updateNodeData(id, { url: event.target.value });
+            handleChange("url", event.target.value);
           }}
           placeholder="https://"
         />
@@ -56,9 +78,9 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
             if (!editable) {
               return;
             }
-            updateNodeData(id, { navigationGoal: event.target.value });
+            handleChange("navigationGoal", event.target.value);
           }}
-          value={data.navigationGoal}
+          value={inputs.navigationGoal}
           placeholder="What are you looking to do?"
           className="nopan"
         />
@@ -83,9 +105,9 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     if (!editable) {
                       return;
                     }
-                    updateNodeData(id, { url: event.target.value });
+                    handleChange("url", event.target.value);
                   }}
-                  value={data.url}
+                  value={inputs.url}
                   placeholder="https://"
                   className="nopan"
                 />
@@ -97,9 +119,9 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     if (!editable) {
                       return;
                     }
-                    updateNodeData(id, { navigationGoal: event.target.value });
+                    handleChange("navigationGoal", event.target.value);
                   }}
-                  value={data.navigationGoal}
+                  value={inputs.navigationGoal}
                   placeholder="What are you looking to do?"
                   className="nopan"
                 />
@@ -120,11 +142,9 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     if (!editable) {
                       return;
                     }
-                    updateNodeData(id, {
-                      dataExtractionGoal: event.target.value,
-                    });
+                    handleChange("dataExtractionGoal", event.target.value);
                   }}
-                  value={data.dataExtractionGoal}
+                  value={inputs.dataExtractionGoal}
                   placeholder="What outputs are you looking to get?"
                   className="nopan"
                 />
@@ -133,27 +153,25 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                 <div className="flex gap-2">
                   <Label className="text-xs text-slate-300">Data Schema</Label>
                   <Checkbox
-                    checked={data.dataSchema !== "null"}
+                    checked={inputs.dataSchema !== "null"}
                     onCheckedChange={(checked) => {
                       if (!editable) {
                         return;
                       }
-                      updateNodeData(id, {
-                        dataSchema: checked ? "{}" : "null",
-                      });
+                      handleChange("dataSchema", checked ? "{}" : "null");
                     }}
                   />
                 </div>
-                {data.dataSchema !== "null" && (
+                {inputs.dataSchema !== "null" && (
                   <div>
                     <CodeEditor
                       language="json"
-                      value={data.dataSchema}
+                      value={inputs.dataSchema}
                       onChange={(value) => {
                         if (!editable) {
                           return;
                         }
-                        updateNodeData(id, { dataSchema: value });
+                        handleChange("dataSchema", value);
                       }}
                       className="nowheel nopan"
                     />
@@ -176,14 +194,12 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                   placeholder="0"
                   className="nopan w-44"
                   min="0"
-                  value={data.maxRetries ?? 0}
+                  value={inputs.maxRetries ?? 0}
                   onChange={(event) => {
                     if (!editable) {
                       return;
                     }
-                    updateNodeData(id, {
-                      maxRetries: Number(event.target.value),
-                    });
+                    handleChange("maxRetries", Number(event.target.value));
                   }}
                 />
               </div>
@@ -196,14 +212,15 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                   placeholder="0"
                   className="nopan w-44"
                   min="0"
-                  value={data.maxStepsOverride ?? 0}
+                  value={inputs.maxStepsOverride ?? 0}
                   onChange={(event) => {
                     if (!editable) {
                       return;
                     }
-                    updateNodeData(id, {
-                      maxStepsOverride: Number(event.target.value),
-                    });
+                    handleChange(
+                      "maxStepsOverride",
+                      Number(event.target.value),
+                    );
                   }}
                 />
               </div>
@@ -213,12 +230,12 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                 </Label>
                 <div className="w-44">
                   <Switch
-                    checked={data.allowDownloads}
+                    checked={inputs.allowDownloads}
                     onCheckedChange={(checked) => {
                       if (!editable) {
                         return;
                       }
-                      updateNodeData(id, { allowDownloads: checked });
+                      handleChange("allowDownloads", checked);
                     }}
                   />
                 </div>
@@ -229,28 +246,26 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     Error Messages
                   </Label>
                   <Checkbox
-                    checked={data.errorCodeMapping !== "null"}
+                    checked={inputs.errorCodeMapping !== "null"}
                     disabled={!editable}
                     onCheckedChange={(checked) => {
                       if (!editable) {
                         return;
                       }
-                      updateNodeData(id, {
-                        errorCodeMapping: checked ? "{}" : "null",
-                      });
+                      handleChange("errorCodeMapping", checked ? "{}" : "null");
                     }}
                   />
                 </div>
-                {data.errorCodeMapping !== "null" && (
+                {inputs.errorCodeMapping !== "null" && (
                   <div>
                     <CodeEditor
                       language="json"
-                      value={data.errorCodeMapping}
+                      value={inputs.errorCodeMapping}
                       onChange={(value) => {
                         if (!editable) {
                           return;
                         }
-                        updateNodeData(id, { errorCodeMapping: value });
+                        handleChange("errorCodeMapping", value);
                       }}
                       className="nowheel nopan"
                     />
@@ -273,11 +288,9 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     if (!editable) {
                       return;
                     }
-                    updateNodeData(id, {
-                      totpVerificationUrl: event.target.value,
-                    });
+                    handleChange("totpVerificationUrl", event.target.value);
                   }}
-                  value={data.totpVerificationUrl ?? ""}
+                  value={inputs.totpVerificationUrl ?? ""}
                   placeholder="https://"
                   className="nopan"
                 />
@@ -291,9 +304,9 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     if (!editable) {
                       return;
                     }
-                    updateNodeData(id, { totpIdentifier: event.target.value });
+                    handleChange("totpIdentifier", event.target.value);
                   }}
-                  value={data.totpIdentifier ?? ""}
+                  value={inputs.totpIdentifier ?? ""}
                   placeholder="Identifier"
                   className="nopan"
                 />
@@ -327,9 +340,12 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
             </div>
             <div className="flex flex-col gap-1">
               <EditableNodeTitle
-                value={data.label}
+                value={label}
                 editable={editable}
-                onChange={(value) => updateNodeData(id, { label: value })}
+                onChange={(value) => {
+                  setLabel(value);
+                  updateNodeData(id, { label: value });
+                }}
               />
               <span className="text-xs text-slate-400">Task Block</span>
             </div>

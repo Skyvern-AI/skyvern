@@ -9,11 +9,17 @@ import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import type { TextPromptNode } from "./types";
+import { useState } from "react";
 
 function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
   const { updateNodeData } = useReactFlow();
   const { editable } = data;
   const deleteNodeCallback = useDeleteNodeCallback();
+  const [label, setLabel] = useState(data.label);
+  const [inputs, setInputs] = useState({
+    prompt: data.prompt,
+    jsonSchema: data.jsonSchema,
+  });
 
   return (
     <div>
@@ -37,9 +43,12 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
             </div>
             <div className="flex flex-col gap-1">
               <EditableNodeTitle
-                value={data.label}
+                value={label}
                 editable={editable}
-                onChange={(value) => updateNodeData(id, { label: value })}
+                onChange={(value) => {
+                  setLabel(value);
+                  updateNodeData(id, { label: value });
+                }}
               />
               <span className="text-xs text-slate-400">Text Prompt Block</span>
             </div>
@@ -57,9 +66,10 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
               if (!editable) {
                 return;
               }
+              setInputs({ ...inputs, prompt: event.target.value });
               updateNodeData(id, { prompt: event.target.value });
             }}
-            value={data.prompt}
+            value={inputs.prompt}
             placeholder="What do you want to generate?"
             className="nopan"
           />
@@ -69,26 +79,31 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
           <div className="flex gap-2">
             <Label className="text-xs text-slate-300">Data Schema</Label>
             <Checkbox
-              checked={data.jsonSchema !== "null"}
+              checked={inputs.jsonSchema !== "null"}
               onCheckedChange={(checked) => {
                 if (!editable) {
                   return;
                 }
+                setInputs({
+                  ...inputs,
+                  jsonSchema: checked ? "{}" : "null",
+                });
                 updateNodeData(id, {
                   jsonSchema: checked ? "{}" : "null",
                 });
               }}
             />
           </div>
-          {data.jsonSchema !== "null" && (
+          {inputs.jsonSchema !== "null" && (
             <div>
               <CodeEditor
                 language="json"
-                value={data.jsonSchema}
+                value={inputs.jsonSchema}
                 onChange={(value) => {
                   if (!editable) {
                     return;
                   }
+                  setInputs({ ...inputs, jsonSchema: value });
                   updateNodeData(id, { jsonSchema: value });
                 }}
                 className="nowheel nopan"
