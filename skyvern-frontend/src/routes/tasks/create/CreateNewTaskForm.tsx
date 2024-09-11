@@ -488,7 +488,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                   "x-api-key": apiCredential ?? "<your-api-key>",
                 },
               });
-              await copyText(curl).then(() => {
+              copyText(curl).then(() => {
                 toast({
                   title: "Copied cURL",
                   description: "cURL copied to clipboard",

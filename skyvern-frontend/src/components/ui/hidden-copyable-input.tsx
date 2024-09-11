@@ -23,12 +23,12 @@ function HiddenCopyableInput({ value }: Props) {
           size="sm"
           variant="secondary"
           className="cursor-pointer"
-          onClick={async () => {
+          onClick={() => {
             if (hidden) {
               setHidden(false);
               return;
             }
-            await copyText(value).then(() => {
+            copyText(value).then(() => {
               setCopied(true);
               setTimeout(() => setCopied(false), 3000);
             });

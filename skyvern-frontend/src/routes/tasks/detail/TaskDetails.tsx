@@ -130,7 +130,7 @@ function TaskDetails() {
         <div className="flex items-center gap-2">
           <Button
             variant="outline"
-            onClick={async () => {
+            onClick={() => {
               if (!task) {
                 return;
               }
@@ -143,7 +143,7 @@ function TaskDetails() {
                   "x-api-key": apiCredential ?? "<your-api-key>",
                 },
               });
-              await copyText(curl).then(() => {
+              copyText(curl).then(() => {
                 toast({
                   variant: "success",
                   title: "Copied to Clipboard",
