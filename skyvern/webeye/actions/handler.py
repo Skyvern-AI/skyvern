@@ -1661,11 +1661,8 @@ async def locate_dropdown_menu(
             timeout=SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS
         )
 
-        # only for detecting the dropdown menu, better to send untrimmed HTML without skyvern attributes
-        dropdown_confirm_prompt = prompt_engine.load_prompt(
-            "opened-dropdown-confirm",
-            elements=head_element.build_HTML(need_trim_element=False, need_skyvern_attrs=False),
-        )
+        # TODO: better to send untrimmed HTML without skyvern attributes in the future
+        dropdown_confirm_prompt = prompt_engine.load_prompt("opened-dropdown-confirm")
         LOG.debug(
             "Confirm if it's an opened dropdown menu",
             step_id=step.step_id,
