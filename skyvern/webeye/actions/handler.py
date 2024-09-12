@@ -83,6 +83,7 @@ COMMON_INPUT_TAGS = {"input", "textarea", "select"}
 
 class CustomSingleSelectResult:
     def __init__(self, skyvern_frame: SkyvernFrame) -> None:
+        self.reasoning: str | None = None
         self.action_result: ActionResult | None = None
         self.value: str | None = None
         self.dropdown_menu: SkyvernElement | None = None
@@ -1339,7 +1340,7 @@ async def sequentially_select_from_dropdown(
     # TODO: only suport the third-level dropdown selection now
     MAX_SELECT_DEPTH = 3
     values: list[str | None] = []
-    single_select_result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
+    select_history: list[CustomSingleSelectResult] = []
 
     check_exist_funcs: list[CheckExistIDFunc] = [dom.check_id_in_dom]
     for i in range(MAX_SELECT_DEPTH):
@@ -1352,9 +1353,11 @@ async def sequentially_select_from_dropdown(
             check_exist_funcs=check_exist_funcs,
             step=step,
             task=task,
+            select_history=select_history,
             force_select=force_select,
             should_relevant=should_relevant,
         )
+        select_history.append(single_select_result)
         values.append(single_select_result.value)
         # wait 1s until DOM finished updating
         await asyncio.sleep(1)
@@ -1399,7 +1402,21 @@ async def sequentially_select_from_dropdown(
             )
             return single_select_result.action_result, values[-1] if len(values) > 0 else None
 
-    return single_select_result.action_result, values[-1] if len(values) > 0 else None
+    return select_history[-1].action_result if len(select_history) > 0 else None, values[-1] if len(
+        values
+    ) > 0 else None
+
+
+def build_sequential_select_history(history_list: list[CustomSingleSelectResult]) -> list[dict[str, Any]]:
+    result = [
+        {
+            "reasoning": select_result.reasoning,
+            "value": select_result.value,
+            "result": "success" if isinstance(select_result.action_result, ActionSuccess) else "failed",
+        }
+        for select_result in history_list
+    ]
+    return result
 
 
 async def select_from_dropdown(
@@ -1411,6 +1428,7 @@ async def select_from_dropdown(
     check_exist_funcs: list[CheckExistIDFunc],
     step: Step,
     task: Task,
+    select_history: list[CustomSingleSelectResult] | None = None,
     force_select: bool = False,
     should_relevant: bool = True,
 ) -> CustomSingleSelectResult:
@@ -1421,6 +1439,7 @@ async def select_from_dropdown(
         1. force_select is false and no dropdown menu popped
         2. force_select is false and match value is not relevant to the target value
     """
+    select_history = [] if select_history is None else select_history
     single_select_result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
 
     timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
@@ -1471,6 +1490,7 @@ async def select_from_dropdown(
         navigation_goal=task.navigation_goal,
         navigation_payload_str=json.dumps(task.navigation_payload),
         elements=html,
+        select_history=json.dumps(build_sequential_select_history(select_history)) if select_history else "",
     )
 
     LOG.info(
@@ -1481,6 +1501,8 @@ async def select_from_dropdown(
     json_response = await llm_handler(prompt=prompt, step=step)
     value: str | None = json_response.get("value", None)
     single_select_result.value = value
+    select_reason: str | None = json_response.get("reasoning", None)
+    single_select_result.reasoning = select_reason
 
     LOG.info(
         "LLM response for the matched element",
@@ -1656,6 +1678,31 @@ async def locate_dropdown_menu(
                 element_id=element_id,
             )
             continue
+
+        ul_or_listbox_element_id = await head_element.find_children_element_id_by_callback(
+            cb=is_ul_or_listbox_element_factory(incremental_scraped=incremental_scraped, task=task, step=step),
+        )
+
+        if ul_or_listbox_element_id:
+            try:
+                await SkyvernElement.create_from_incremental(incremental_scraped, ul_or_listbox_element_id)
+                LOG.info(
+                    "Confirm it's an opened dropdown menu since it includes <ul> or <role='listbox'>",
+                    step_id=step.step_id,
+                    task_id=task.task_id,
+                    element_id=element_id,
+                )
+                return await SkyvernElement.create_from_incremental(
+                    incre_page=incremental_scraped, element_id=element_id
+                )
+            except Exception:
+                LOG.debug(
+                    "Failed to get <ul> or <role='listbox'> element in the incremental page",
+                    element_id=element_id,
+                    step_id=step.step_id,
+                    task_id=task.task_id,
+                    exc_info=True,
+                )
 
         screenshot = await head_element.get_locator().screenshot(
             timeout=SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS
