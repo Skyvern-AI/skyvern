@@ -1,6 +1,6 @@
 import { useParams } from "react-router-dom";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
-import { getElements } from "./workflowEditorUtils";
+import { convertEchoParameters, getElements } from "./workflowEditorUtils";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   BlockYAML,
@@ -14,6 +14,11 @@ import { ReactFlowProvider } from "@xyflow/react";
 import { FlowRenderer } from "./FlowRenderer";
 import { toast } from "@/components/ui/use-toast";
 import { AxiosError } from "axios";
+import {
+  AWSSecretParameter,
+  BitwardenSensitiveInformationParameter,
+  ContextParameter,
+} from "../types/workflowTypes";
 
 function WorkflowEditor() {
   const { workflowPermanentId } = useParams();
@@ -122,8 +127,24 @@ function WorkflowEditor() {
               }
             })}
           handleSave={(parameters, blocks, title) => {
+            const filteredParameters =
+              workflow.workflow_definition.parameters.filter((parameter) => {
+                return (
+                  parameter.parameter_type === "aws_secret" ||
+                  parameter.parameter_type ===
+                    "bitwarden_sensitive_information" ||
+                  parameter.parameter_type === "context"
+                );
+              }) as Array<
+                | AWSSecretParameter
+                | BitwardenSensitiveInformationParameter
+                | ContextParameter
+              >;
+
+            const echoParameters = convertEchoParameters(filteredParameters);
+
             saveWorkflowMutation.mutate({
-              parameters,
+              parameters: [...echoParameters, ...parameters],
               blocks,
               title,
             });

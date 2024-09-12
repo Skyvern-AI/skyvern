@@ -8,6 +8,10 @@ export type SendEmailNodeData = {
   editable: boolean;
   label: string;
   sender: string;
+  smtpHostSecretParameterKey?: string;
+  smtpPortSecretParameterKey?: string;
+  smtpUsernameSecretParameterKey?: string;
+  smtpPasswordSecretParameterKey?: string;
 };
 
 export type SendEmailNode = Node<SendEmailNodeData, "sendEmail">;
