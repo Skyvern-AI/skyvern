@@ -4,7 +4,7 @@ import { Form, FormControl, FormField, FormItem } from "@/components/ui/form";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/use-toast";
@@ -17,6 +17,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { ToastAction } from "@radix-ui/react-toast";
 
 type Props = {
   workflowParameters: Array<WorkflowParameter>;
@@ -34,21 +35,33 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
   const runWorkflowMutation = useMutation({
     mutationFn: async (values: Record<string, unknown>) => {
       const client = await getClient(credentialGetter);
-      return client
-        .post(`/workflows/${workflowPermanentId}/run`, {
+      return client.post<unknown, { data: { workflow_run_id: string } }>(
+        `/workflows/${workflowPermanentId}/run`,
+        {
           data: values,
           proxy_location: "RESIDENTIAL",
-        })
-        .then((response) => response.data);
+        },
+      );
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: ["workflowRuns"],
-      });
+    onSuccess: (response) => {
       toast({
         variant: "success",
         title: "Workflow run started",
         description: "The workflow run has been started successfully",
+        action: (
+          <ToastAction altText="View">
+            <Button asChild>
+              <Link
+                to={`/workflows/${workflowPermanentId}/${response.data.workflow_run_id}`}
+              >
+                View
+              </Link>
+            </Button>
+          </ToastAction>
+        ),
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["workflowRuns"],
       });
     },
     onError: (error) => {
