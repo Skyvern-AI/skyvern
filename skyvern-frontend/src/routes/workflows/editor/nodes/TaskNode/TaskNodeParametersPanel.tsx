@@ -2,13 +2,20 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { useWorkflowParametersState } from "../../useWorkflowParametersState";
 
 type Props = {
+  availableOutputParameters: Array<string>;
   parameters: Array<string>;
   onParametersChange: (parameters: Array<string>) => void;
 };
 
-function TaskNodeParametersPanel({ parameters, onParametersChange }: Props) {
+function TaskNodeParametersPanel({
+  availableOutputParameters,
+  parameters,
+  onParametersChange,
+}: Props) {
   const [workflowParameters] = useWorkflowParametersState();
-
+  const keys = workflowParameters
+    .map((parameter) => parameter.key)
+    .concat(availableOutputParameters);
   return (
     <div className="space-y-4">
       <header className="space-y-1">
@@ -18,27 +25,25 @@ function TaskNodeParametersPanel({ parameters, onParametersChange }: Props) {
         </span>
       </header>
       <div className="space-y-2">
-        {workflowParameters.map((workflowParameter) => {
+        {keys.map((key) => {
           return (
             <div
-              key={workflowParameter.key}
+              key={key}
               className="flex items-center gap-2 rounded-sm bg-slate-elevation1 px-3 py-2"
             >
               <Checkbox
-                checked={parameters.includes(workflowParameter.key)}
+                checked={parameters.includes(key)}
                 onCheckedChange={(checked) => {
                   if (checked) {
-                    onParametersChange([...parameters, workflowParameter.key]);
+                    onParametersChange([...parameters, key]);
                   } else {
                     onParametersChange(
-                      parameters.filter(
-                        (parameter) => parameter !== workflowParameter.key,
-                      ),
+                      parameters.filter((parameterKey) => parameterKey !== key),
                     );
                   }
                 }}
               />
-              <span className="text-xs">{workflowParameter.key}</span>
+              <span className="text-xs">{key}</span>
             </div>
           );
         })}

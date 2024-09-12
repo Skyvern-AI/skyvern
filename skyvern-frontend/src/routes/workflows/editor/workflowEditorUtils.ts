@@ -616,6 +616,10 @@ function convertEchoParameters(
   });
 }
 
+function getOutputParameterKey(label: string) {
+  return label + "_output";
+}
+
 export {
   createNode,
   generateNodeData,
@@ -624,4 +628,5 @@ export {
   layout,
   generateNodeLabel,
   convertEchoParameters,
+  getOutputParameterKey,
 };
