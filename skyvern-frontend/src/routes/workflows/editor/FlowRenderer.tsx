@@ -1,3 +1,5 @@
+import { DeleteNodeCallbackContext } from "@/store/DeleteNodeCallbackContext";
+import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import {
   Background,
   BackgroundVariant,
@@ -10,8 +12,20 @@ import {
   useNodesState,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import { nanoid } from "nanoid";
+import { useEffect, useState } from "react";
+import { WorkflowParameterValueType } from "../types/workflowTypes";
+import {
+  BitwardenLoginCredentialParameterYAML,
+  BlockYAML,
+  WorkflowParameterYAML,
+} from "../types/workflowYamlTypes";
 import { WorkflowHeader } from "./WorkflowHeader";
+import { WorkflowParametersStateContext } from "./WorkflowParametersStateContext";
+import { edgeTypes } from "./edges";
 import { AppNode, nodeTypes } from "./nodes";
+import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
+import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
 import "./reactFlowOverrideStyles.css";
 import {
   createNode,
@@ -19,20 +33,6 @@ import {
   getWorkflowBlocks,
   layout,
 } from "./workflowEditorUtils";
-import { useEffect, useState } from "react";
-import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
-import { edgeTypes } from "./edges";
-import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
-import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
-import {
-  BitwardenLoginCredentialParameterYAML,
-  BlockYAML,
-  WorkflowParameterYAML,
-} from "../types/workflowYamlTypes";
-import { WorkflowParametersStateContext } from "./WorkflowParametersStateContext";
-import { WorkflowParameterValueType } from "../types/workflowTypes";
-import { DeleteNodeCallbackContext } from "@/store/DeleteNodeCallbackContext";
-import { nanoid } from "nanoid";
 
 function convertToParametersYAML(
   parameters: ParametersState,

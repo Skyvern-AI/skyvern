@@ -24,6 +24,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { useReactFlow } from "@xyflow/react";
 
 const WORKFLOW_EDIT_PANEL_WIDTH = 20 * 16;
 const WORKFLOW_EDIT_PANEL_GAP = 1 * 16;
@@ -42,6 +43,7 @@ function WorkflowParametersPanel() {
     parameter: null,
     type: "workflow",
   });
+  const { setNodes } = useReactFlow();
 
   return (
     <div className="relative w-[25rem] rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl">
@@ -142,6 +144,22 @@ function WorkflowParametersPanel() {
                                 (p) => p.key !== parameter.key,
                               ),
                             );
+                            setNodes((nodes) => {
+                              return nodes.map((node) => {
+                                if (node.type === "task") {
+                                  return {
+                                    ...node,
+                                    data: {
+                                      ...node.data,
+                                      parameterKeys: (
+                                        node.data.parameterKeys as Array<string>
+                                      ).filter((key) => key !== parameter.key),
+                                    },
+                                  };
+                                }
+                                return node;
+                              });
+                            });
                           }}
                         >
                           Delete
@@ -202,6 +220,29 @@ function WorkflowParametersPanel() {
                         return parameter;
                       }),
                     );
+                    setNodes((nodes) => {
+                      return nodes.map((node) => {
+                        if (node.type === "task") {
+                          return {
+                            ...node,
+                            data: {
+                              ...node.data,
+                              parameterKeys: (
+                                node.data.parameterKeys as Array<string>
+                              ).map((key) => {
+                                if (
+                                  key === operationPanelState.parameter?.key
+                                ) {
+                                  return editedParameter.key;
+                                }
+                                return key;
+                              }),
+                            },
+                          };
+                        }
+                        return node;
+                      });
+                    });
                     setOperationPanelState({
                       active: false,
                       operation: "edit",
