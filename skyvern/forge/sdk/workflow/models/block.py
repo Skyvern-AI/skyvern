@@ -188,16 +188,7 @@ class TaskBlock(Block):
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
 
         if self.url and workflow_run_context.has_parameter(self.url):
-            if workflow_run_context.has_value(self.url):
-                LOG.info(
-                    "Task URL is parameterized, using parameter value",
-                    task_url_parameter_value=workflow_run_context.get_value(self.url),
-                    task_url_parameter_key=self.url,
-                )
-                self.url = workflow_run_context.get_value(self.url)
-            else:
-                # if the parameter is not resolved yet, we'll add it to the list of parameters to resolve
-                # parameterization of the url would happen when the task is executed
+            if self.url not in [parameter.key for parameter in parameters]:
                 parameters.append(workflow_run_context.get_parameter(self.url))
 
         return parameters
