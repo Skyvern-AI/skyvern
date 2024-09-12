@@ -17,7 +17,15 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { ListBulletIcon, MixerVerticalIcon } from "@radix-ui/react-icons";
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
+import {
+  Edge,
+  Handle,
+  NodeProps,
+  Position,
+  useEdges,
+  useNodes,
+  useReactFlow,
+} from "@xyflow/react";
 import { useState } from "react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
@@ -25,12 +33,49 @@ import { TaskNodeDisplayModeSwitch } from "./TaskNodeDisplayModeSwitch";
 import { TaskNodeParametersPanel } from "./TaskNodeParametersPanel";
 import type { TaskNode, TaskNodeDisplayMode } from "./types";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { AppNode } from "..";
+import { getOutputParameterKey } from "../../workflowEditorUtils";
+
+function getPreviousNodeIds(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+  target: string,
+): Array<string> {
+  const nodeIds: string[] = [];
+  const node = nodes.find((node) => node.id === target);
+  if (!node) {
+    return nodeIds;
+  }
+  let current = edges.find((edge) => edge.target === target);
+  if (current) {
+    while (current) {
+      nodeIds.push(current.source);
+      current = edges.find((edge) => edge.target === current!.source);
+    }
+  }
+  if (!node.parentId) {
+    return nodeIds;
+  }
+  return [...nodeIds, ...getPreviousNodeIds(nodes, edges, node.parentId)];
+}
 
 function TaskNode({ id, data }: NodeProps<TaskNode>) {
   const { updateNodeData } = useReactFlow();
   const [displayMode, setDisplayMode] = useState<TaskNodeDisplayMode>("basic");
   const { editable } = data;
   const deleteNodeCallback = useDeleteNodeCallback();
+  const nodes = useNodes<AppNode>();
+  const edges = useEdges();
+  const previousNodeIds = getPreviousNodeIds(nodes, edges, id);
+  const previousNodes = nodes.filter((node) =>
+    previousNodeIds.includes(node.id),
+  );
+  const labels = previousNodes
+    .filter((node) => node.type !== "nodeAdder")
+    .map((node) => node.data.label);
+  const outputParameterKeys = labels.map((label) =>
+    getOutputParameterKey(label),
+  );
 
   const [label, setLabel] = useState(data.label);
   const [inputs, setInputs] = useState({
@@ -387,6 +432,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
             </PopoverTrigger>
             <PopoverContent className="w-72">
               <TaskNodeParametersPanel
+                availableOutputParameters={outputParameterKeys}
                 parameters={data.parameterKeys}
                 onParametersChange={(parameterKeys) => {
                   updateNodeData(id, { parameterKeys });

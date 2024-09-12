@@ -30,6 +30,7 @@ import "./reactFlowOverrideStyles.css";
 import {
   createNode,
   generateNodeLabel,
+  getOutputParameterKey,
   getWorkflowBlocks,
   layout,
 } from "./workflowEditorUtils";
@@ -228,6 +229,7 @@ function FlowRenderer({
     if (!node) {
       return;
     }
+    const deletedNodeLabel = node.data.label;
     const newNodes = nodes.filter((node) => node.id !== id);
     const newEdges = edges.flatMap((edge) => {
       if (edge.source === id) {
@@ -257,7 +259,24 @@ function FlowRenderer({
       return;
     }
 
-    doLayout(newNodes, newEdges);
+    // if any node was using the output parameter of the deleted node, remove it from their parameter keys
+    const newNodesWithUpdatedParameters = newNodes.map((node) => {
+      if (node.type === "task") {
+        return {
+          ...node,
+          data: {
+            ...node.data,
+            parameterKeys: node.data.parameterKeys.filter(
+              (parameter) =>
+                parameter !== getOutputParameterKey(deletedNodeLabel),
+            ),
+          },
+        };
+      }
+      return node;
+    });
+
+    doLayout(newNodesWithUpdatedParameters, newEdges);
   }
 
   return (
