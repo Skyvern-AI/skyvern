@@ -134,6 +134,7 @@ export type TaskBlock = WorkflowBlockBase & {
   max_steps_per_run?: number | null;
   parameters: Array<WorkflowParameter>;
   complete_on_download?: boolean;
+  download_suffix?: string | null;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
 };

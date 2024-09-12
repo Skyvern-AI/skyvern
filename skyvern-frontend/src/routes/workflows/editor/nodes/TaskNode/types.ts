@@ -9,6 +9,7 @@ export type TaskNodeData = {
   maxRetries: number | null;
   maxStepsOverride: number | null;
   allowDownloads: boolean;
+  downloadSuffix: string | null;
   editable: boolean;
   label: string;
   parameterKeys: Array<string>;
@@ -29,6 +30,7 @@ export const taskNodeDefaultData: TaskNodeData = {
   maxRetries: null,
   maxStepsOverride: null,
   allowDownloads: false,
+  downloadSuffix: null,
   editable: true,
   label: "",
   parameterKeys: [],

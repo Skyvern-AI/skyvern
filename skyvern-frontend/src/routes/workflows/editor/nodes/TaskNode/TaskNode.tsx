@@ -41,6 +41,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
     maxRetries: data.maxRetries,
     maxStepsOverride: data.maxStepsOverride,
     allowDownloads: data.allowDownloads,
+    downloadSuffix: data.downloadSuffix,
     errorCodeMapping: data.errorCodeMapping,
     totpVerificationUrl: data.totpVerificationUrl,
     totpIdentifier: data.totpIdentifier,
@@ -224,7 +225,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                   }}
                 />
               </div>
-              <div className="flex justify-between">
+              <div className="flex items-center justify-between">
                 <Label className="text-xs font-normal text-slate-300">
                   Allow Downloads
                 </Label>
@@ -239,6 +240,26 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     }}
                   />
                 </div>
+              </div>
+              <div className="flex items-center justify-between">
+                <Label className="text-xs font-normal text-slate-300">
+                  Download Suffix
+                </Label>
+                <Input
+                  type="text"
+                  placeholder="Suffix"
+                  className="nopan w-44"
+                  value={inputs.downloadSuffix ?? ""}
+                  onChange={(event) => {
+                    if (!editable) {
+                      return;
+                    }
+                    handleChange(
+                      "downloadSuffix",
+                      event.target.value,
+                    );
+                  }}
+                />
               </div>
               <div className="space-y-2">
                 <div className="flex gap-2">
