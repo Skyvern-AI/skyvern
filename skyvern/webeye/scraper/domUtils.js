@@ -343,38 +343,17 @@ function isTableRelatedElement(element) {
 
 function isInteractableInput(element) {
   const tagName = element.tagName.toLowerCase();
-  const type = element.getAttribute("type") ?? "text"; // Default is text: https://www.w3schools.com/html/html_form_input_types.asp
   if (tagName !== "input") {
     // let other checks decide
     return false;
   }
-
-  if (type.toLowerCase().trim() === "text") {
-    return !isReadonlyElement(element);
-  }
-
-  const clickableTypes = [
-    "button",
-    "checkbox",
-    "date",
-    "datetime-local",
-    "email",
-    "file",
-    "image",
-    "month",
-    "number",
-    "password",
-    "radio",
-    "range",
-    "reset",
-    "search",
-    "submit",
-    "tel",
-    "time",
-    "url",
-    "week",
-  ];
-  return clickableTypes.includes(type.toLowerCase().trim());
+  // Browsers default to "text" when the type is not set or is invalid
+  // Here's the list of valid types: https://developer.mozilla.org/en-US/docs/Web/HTML/Element/input#input_types
+  // Examples of unrecognized types that we've seen and caused issues because we didn't mark them interactable:
+  // "city", "state", "zip", "country"
+  // That's the reason I (Kerem) removed the valid input types check
+  var type = element.getAttribute("type")?.toLowerCase().trim() ?? "text";
+  return !isReadonlyElement(element) && type !== "hidden";
 }
 
 function isInteractable(element) {
