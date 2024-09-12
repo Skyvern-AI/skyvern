@@ -5,7 +5,8 @@ You can identify the matching element based on the following guidelines:
   2. If no option is a perfect match, and there is a fallback option such as "Others" or "None of the above" in the DOM elements, you can consider it a match.
   3. If a field is required, do not leave it blank.
   4. If a field is required, do not select a placeholder value, such as "Please select", "-", or "Select...".
-  5. Exclude loading indicators like "loading more results" as valid options.
+  5. Exclude loading indicators like "loading more results" as valid options.{% if select_history %}
+  6. The selection history displays the previously selected values for the multi-level selection. Continue to complete the entire selection process.{% endif %}
 
 MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
 Each interactable element is tagged with an ID.
@@ -43,3 +44,9 @@ HTML elements:
 ```
 {{ elements }}
 ```
+{% if select_history %}
+Select History:
+```
+{{ select_history }}
+```
+{% endif %}
