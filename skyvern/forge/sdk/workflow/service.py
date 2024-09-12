@@ -1048,6 +1048,7 @@ class WorkflowService:
                 max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
                 complete_on_download=block_yaml.complete_on_download,
+                download_suffix=block_yaml.download_suffix,
                 continue_on_failure=block_yaml.continue_on_failure,
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,

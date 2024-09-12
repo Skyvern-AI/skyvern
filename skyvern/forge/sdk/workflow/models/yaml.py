@@ -111,6 +111,7 @@ class TaskBlockYAML(BlockYAML):
     max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
     complete_on_download: bool = False
+    download_suffix: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
 

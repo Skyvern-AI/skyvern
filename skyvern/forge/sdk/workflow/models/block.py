@@ -176,6 +176,7 @@ class TaskBlock(Block):
     max_steps_per_run: int | None = None
     parameters: list[PARAMETER_TYPE] = []
     complete_on_download: bool = False
+    download_suffix: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
 
@@ -249,6 +250,16 @@ class TaskBlock(Block):
                 )
                 self.url = task_url_parameter_value
 
+        if self.download_suffix and workflow_run_context.has_parameter(self.download_suffix):
+            download_suffix_parameter_value = workflow_run_context.get_value(self.download_suffix)
+            if download_suffix_parameter_value:
+                LOG.info(
+                    "Download prefix is parameterized, using parameter value",
+                    download_suffix_parameter_value=download_suffix_parameter_value,
+                    download_suffix_parameter_key=self.download_suffix,
+                )
+                self.download_suffix = download_suffix_parameter_value
+
         # TODO (kerem) we should always retry on terminated. We should make a distinction between retriable and
         # non-retryable terminations
         while will_retry:
@@ -306,7 +317,7 @@ class TaskBlock(Block):
                     task=task,
                     step=step,
                     workflow_run=workflow_run,
-                    complete_on_download=self.complete_on_download,
+                    task_block=self,
                 )
             except Exception as e:
                 # Make sure the task is marked as failed in the database before raising the exception
@@ -472,7 +483,10 @@ class ForLoopBlock(Block):
                 workflow_run_context.set_value(context_parameter.key, context_parameter.value)
             block_outputs = []
             for block_idx, loop_block in enumerate(self.loop_blocks):
+                original_loop_block = loop_block
+                loop_block = loop_block.copy()
                 block_output = await loop_block.execute_safe(workflow_run_id=workflow_run_id)
+                loop_block = original_loop_block
                 block_outputs.append(block_output)
                 if not block_output.success and not loop_block.continue_on_failure:
                     LOG.info(

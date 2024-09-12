@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import random
+import string
 from asyncio.exceptions import CancelledError
 from datetime import datetime
 from typing import Any, Tuple
@@ -30,7 +32,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.files import get_number_of_files_in_directory, get_path_for_workflow_download_directory
+from skyvern.forge.sdk.api.files import get_path_for_workflow_download_directory, list_files_in_directory, rename_file
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
@@ -209,9 +211,7 @@ class ForgeAgent:
         api_key: str | None = None,
         workflow_run: WorkflowRun | None = None,
         close_browser_on_completion: bool = True,
-        # If complete_on_download is True and there is a workflow run, the task will be marked as completed
-        # if a download happens during the step execution.
-        complete_on_download: bool = False,
+        task_block: TaskBlock | None = None,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
         refreshed_task = await app.DATABASE.get_task(task_id=task.task_id, organization_id=organization.organization_id)
         if refreshed_task:
@@ -247,10 +247,10 @@ class ForgeAgent:
             )
         next_step: Step | None = None
         detailed_output: DetailedAgentStepOutput | None = None
-        num_files_before = 0
+        list_files_before: list[str] = []
         try:
             if task.workflow_run_id:
-                num_files_before = get_number_of_files_in_directory(
+                list_files_before = list_files_in_directory(
                     get_path_for_workflow_download_directory(task.workflow_run_id)
                 )
             # Check some conditions before executing the step, throw an exception if the step can't be executed
@@ -269,16 +269,24 @@ class ForgeAgent:
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)
             retry = False
 
-            if complete_on_download and task.workflow_run_id:
-                num_files_after = get_number_of_files_in_directory(
-                    get_path_for_workflow_download_directory(task.workflow_run_id)
-                )
-                if num_files_after > num_files_before:
+            if task_block and task_block.complete_on_download and task.workflow_run_id:
+                workflow_download_directory = get_path_for_workflow_download_directory(task.workflow_run_id)
+                list_files_after = list_files_in_directory(workflow_download_directory)
+                if len(list_files_after) > len(list_files_before):
+                    files_to_rename = list(set(list_files_after) - set(list_files_before))
+                    for file in files_to_rename:
+                        random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+                        random_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
+                        if task_block.download_suffix:
+                            random_file_name = f"{random_file_name}-{task_block.download_suffix}"
+                        rename_file(os.path.join(workflow_download_directory, file), random_file_name)
+
                     LOG.info(
                         "Task marked as completed due to download",
                         task_id=task.task_id,
-                        num_files_before=num_files_before,
-                        num_files_after=num_files_after,
+                        num_files_before=len(list_files_before),
+                        num_files_after=len(list_files_after),
+                        new_files=files_to_rename,
                     )
                     last_step = await self.update_step(step, is_last=True)
                     completed_task = await self.update_task(
@@ -352,7 +360,7 @@ class ForgeAgent:
                     next_step,
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
-                    complete_on_download=complete_on_download,
+                    task_block=task_block,
                 )
             elif SettingsManager.get_settings().execute_all_steps() and next_step:
                 return await self.execute_step(
@@ -361,7 +369,7 @@ class ForgeAgent:
                     next_step,
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
-                    complete_on_download=complete_on_download,
+                    task_block=task_block,
                 )
             else:
                 LOG.info(
