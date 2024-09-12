@@ -112,6 +112,9 @@ class SkyvernFrame:
             if draw_boxes:
                 await skyvern_page.remove_bounding_boxes()
             await skyvern_page.scroll_to_top(draw_boxes=False)
+            # wait until animation ends, which is triggered by scrolling
+            LOG.debug("Waiting for 2 seconds until animation ends.")
+            await asyncio.sleep(2)
         else:
             if draw_boxes:
                 await skyvern_page.build_elements_and_draw_bounding_boxes()
