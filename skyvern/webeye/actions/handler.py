@@ -418,7 +418,11 @@ async def handle_input_text_action(
     if skyvern_element.get_tag_name() == InteractiveElement.INPUT and not await skyvern_element.is_spinbtn_input():
         await skyvern_element.scroll_into_view()
         select_action = SelectOptionAction(
-            reasoning=action.reasoning, element_id=skyvern_element.get_id(), option=SelectOption(label=text)
+            field_information=action.field_information,
+            required_field=action.required_field,
+            reasoning=action.reasoning,
+            element_id=skyvern_element.get_id(),
+            option=SelectOption(label=text),
         )
         if skyvern_element.get_selectable():
             LOG.info(
@@ -685,7 +689,13 @@ async def handle_select_option_action(
                 tag_name=selectable_child.get_tag_name(),
                 element_id=selectable_child.get_id(),
             )
-            select_action = SelectOptionAction(element_id=selectable_child.get_id(), option=action.option)
+            select_action = SelectOptionAction(
+                reasoning=action.reasoning,
+                field_information=action.field_information,
+                required_field=action.required_field,
+                element_id=selectable_child.get_id(),
+                option=action.option,
+            )
             return await handle_select_option_action(select_action, page, scraped_page, task, step)
 
     if tag_name == InteractiveElement.SELECT:
@@ -1122,7 +1132,7 @@ async def choose_auto_completion_dropdown(
         html = incremental_scraped.build_html_tree(incremental_element)
         auto_completion_confirm_prompt = prompt_engine.load_prompt(
             "auto-completion-choose-option",
-            context_reasoning=action.reasoning,
+            field_information=action.field_information,
             filled_value=text,
             navigation_goal=task.navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
@@ -1241,7 +1251,7 @@ async def input_or_auto_complete_input(
 
         prompt = prompt_engine.load_prompt(
             "auto-completion-potential-answers",
-            context_reasoning=context_reasoning,
+            field_information=action.field_information,
             current_value=current_value,
         )
 
@@ -1296,7 +1306,7 @@ async def input_or_auto_complete_input(
             )
             prompt = prompt_engine.load_prompt(
                 "auto-completion-tweak-value",
-                context_reasoning=context_reasoning,
+                field_information=action.field_information,
                 current_value=current_value,
                 tried_values=json.dumps(tried_values),
                 popped_up_elements="".join([json_to_html(element) for element in whole_new_elements]),
@@ -1310,7 +1320,7 @@ async def input_or_auto_complete_input(
                 "Ask LLM tweaked the current value with a new value",
                 step_id=step.step_id,
                 task_id=task.task_id,
-                reasoning=context_reasoning,
+                field_information=action.field_information,
                 current_value=current_value,
                 new_value=new_current_value,
             )
@@ -1485,7 +1495,8 @@ async def select_from_dropdown(
 
     prompt = prompt_engine.load_prompt(
         "custom-select",
-        context_reasoning=action.reasoning,
+        field_information=action.field_information,
+        required_field=action.required_field,
         target_value=target_value if not force_select and should_relevant else "",
         navigation_goal=task.navigation_goal,
         navigation_payload_str=json.dumps(task.navigation_payload),
