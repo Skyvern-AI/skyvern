@@ -254,10 +254,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     if (!editable) {
                       return;
                     }
-                    handleChange(
-                      "downloadSuffix",
-                      event.target.value,
-                    );
+                    handleChange("downloadSuffix", event.target.value);
                   }}
                 />
               </div>
