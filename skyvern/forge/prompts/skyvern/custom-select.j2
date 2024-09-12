@@ -22,7 +22,7 @@ Reply in JSON format with the following keys:
 
 Context:
 ```
-{{ context_reasoning }}
+Select an option for "{{ field_information }}". It's {{ "a required" if required_field else "an optional" }} field.
 ```
 {% if target_value %}
 Target value:
