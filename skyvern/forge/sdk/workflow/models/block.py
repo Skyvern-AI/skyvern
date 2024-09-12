@@ -1,5 +1,4 @@
 import abc
-import asyncio
 import csv
 import json
 import os
@@ -537,7 +536,7 @@ class CodeBlock(Block):
         maybe_browser_state = await app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
         if maybe_browser_state:
             if page := await maybe_browser_state.get_working_page():
-                parameter_values["skyvern_page"] = await page
+                parameter_values["skyvern_page"] = page
 
         for parameter in self.parameters:
             value = workflow_run_context.get_value(parameter.key)
@@ -547,9 +546,13 @@ class CodeBlock(Block):
             else:
                 parameter_values[parameter.key] = value
 
-        # Add asyncio and the current event loop to the parameter_values
-        parameter_values["asyncio"] = asyncio
+        # Import builtins and other modules that might be useful in the user code and add them to the parameter_values
+        import asyncio
+        import datetime
+
         parameter_values["__builtins__"] = __builtins__  # Include builtins for exec context
+        parameter_values["asyncio"] = asyncio
+        parameter_values["datetime"] = datetime
 
         local_variables: dict[str, Any] = {}
         result_container: dict[str, Any] = {}
