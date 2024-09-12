@@ -37,7 +37,7 @@ export type BitwardenSensitiveInformationParameter = WorkflowParameterBase & {
   bitwarden_master_password_aws_secret_key: string;
   bitwarden_collection_id: string;
   bitwarden_identity_key: string;
-  bitwarden_identity_fields: string;
+  bitwarden_identity_fields: Array<string>;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
@@ -171,10 +171,10 @@ export type UploadToS3Block = WorkflowBlockBase & {
 
 export type SendEmailBlock = WorkflowBlockBase & {
   block_type: "send_email";
-  smtp_host: AWSSecretParameter;
-  smtp_port: AWSSecretParameter;
-  smtp_username: AWSSecretParameter;
-  smtp_password: AWSSecretParameter;
+  smtp_host?: AWSSecretParameter;
+  smtp_port?: AWSSecretParameter;
+  smtp_username?: AWSSecretParameter;
+  smtp_password?: AWSSecretParameter;
   sender: string;
   recipients: Array<string>;
   subject: string;

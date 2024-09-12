@@ -15,7 +15,11 @@ export type WorkflowDefinitionYAML = {
 
 export type ParameterYAML =
   | WorkflowParameterYAML
-  | BitwardenLoginCredentialParameterYAML;
+  | BitwardenLoginCredentialParameterYAML
+  | AWSSecretParameterYAML
+  | ContextParameterYAML
+  | OutputParameterYAML
+  | BitwardenSensitiveInformationParameterYAML;
 
 export type ParameterYAMLBase = {
   parameter_type: string;
@@ -36,6 +40,30 @@ export type BitwardenLoginCredentialParameterYAML = ParameterYAMLBase & {
   bitwarden_client_id_aws_secret_key: "SKYVERN_BITWARDEN_CLIENT_ID";
   bitwarden_client_secret_aws_secret_key: "SKYVERN_BITWARDEN_CLIENT_SECRET";
   bitwarden_master_password_aws_secret_key: "SKYVERN_BITWARDEN_MASTER_PASSWORD";
+};
+
+export type AWSSecretParameterYAML = ParameterYAMLBase & {
+  parameter_type: "aws_secret";
+  aws_key: string;
+};
+
+export type BitwardenSensitiveInformationParameterYAML = ParameterYAMLBase & {
+  parameter_type: "bitwarden_sensitive_information";
+  bitwarden_collection_id: string;
+  bitwarden_identity_key: string;
+  bitwarden_identity_fields: Array<string>;
+  bitwarden_client_id_aws_secret_key: string;
+  bitwarden_client_secret_aws_secret_key: string;
+  bitwarden_master_password_aws_secret_key: string;
+};
+
+export type ContextParameterYAML = ParameterYAMLBase & {
+  parameter_type: "context";
+  source_parameter_key: string;
+};
+
+export type OutputParameterYAML = ParameterYAMLBase & {
+  parameter_type: "output";
 };
 
 const BlockTypes = {

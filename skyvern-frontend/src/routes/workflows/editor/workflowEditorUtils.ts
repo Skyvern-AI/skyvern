@@ -2,7 +2,7 @@ import Dagre from "@dagrejs/dagre";
 import { Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
 import type { WorkflowBlock } from "../types/workflowTypes";
-import { BlockYAML } from "../types/workflowYamlTypes";
+import { BlockYAML, ParameterYAML } from "../types/workflowYamlTypes";
 import { REACT_FLOW_EDGE_Z_INDEX } from "./constants";
 import { AppNode, nodeTypes } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
@@ -145,6 +145,10 @@ function convertToNode(
           recipients: block.recipients.join(", "),
           subject: block.subject,
           sender: block.sender,
+          smtpHostSecretParameterKey: block.smtp_host?.key,
+          smtpPortSecretParameterKey: block.smtp_port?.key,
+          smtpUsernameSecretParameterKey: block.smtp_username?.key,
+          smtpPasswordSecretParameterKey: block.smtp_password?.key,
         },
       };
     }
@@ -467,6 +471,12 @@ function getWorkflowBlock(
         recipients: node.data.recipients.split(","),
         subject: node.data.subject,
         sender: node.data.sender,
+        smtp_host_secret_parameter_key: node.data.smtpHostSecretParameterKey,
+        smtp_port_secret_parameter_key: node.data.smtpPortSecretParameterKey,
+        smtp_username_secret_parameter_key:
+          node.data.smtpUsernameSecretParameterKey,
+        smtp_password_secret_parameter_key:
+          node.data.smtpPasswordSecretParameterKey,
       };
     }
     case "codeBlock": {
@@ -556,6 +566,56 @@ function generateNodeLabel(existingLabels: Array<string>) {
   throw new Error("Failed to generate a new node label");
 }
 
+import type {
+  AWSSecretParameter,
+  BitwardenSensitiveInformationParameter,
+  ContextParameter,
+} from "../types/workflowTypes";
+
+/**
+ * If a parameter is not displayed in the editor, we should echo its value back when saved.
+ */
+function convertEchoParameters(
+  parameters: Array<
+    | ContextParameter
+    | BitwardenSensitiveInformationParameter
+    | AWSSecretParameter
+  >,
+): Array<ParameterYAML> {
+  return parameters.map((parameter) => {
+    if (parameter.parameter_type === "aws_secret") {
+      return {
+        key: parameter.key,
+        parameter_type: "aws_secret",
+        aws_key: parameter.aws_key,
+      };
+    }
+    if (parameter.parameter_type === "bitwarden_sensitive_information") {
+      return {
+        key: parameter.key,
+        parameter_type: "bitwarden_sensitive_information",
+        bitwarden_collection_id: parameter.bitwarden_collection_id,
+        bitwarden_identity_key: parameter.bitwarden_identity_key,
+        bitwarden_identity_fields: parameter.bitwarden_identity_fields,
+        bitwarden_client_id_aws_secret_key:
+          parameter.bitwarden_client_id_aws_secret_key,
+        bitwarden_client_secret_aws_secret_key:
+          parameter.bitwarden_client_secret_aws_secret_key,
+        bitwarden_master_password_aws_secret_key:
+          parameter.bitwarden_master_password_aws_secret_key,
+      };
+    }
+    if (parameter.parameter_type === "context") {
+      return {
+        key: parameter.key,
+        parameter_type: "context",
+        source_parameter_key: parameter.source.key,
+      };
+    }
+    throw new Error("Unknown parameter type");
+  });
+}
+
 export {
   createNode,
   generateNodeData,
@@ -563,4 +623,5 @@ export {
   getWorkflowBlocks,
   layout,
   generateNodeLabel,
+  convertEchoParameters,
 };
