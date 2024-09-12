@@ -173,7 +173,7 @@ function FlowRenderer({
     if (nodeType === "loop") {
       // when loop node is first created it needs an adder node so nodes can be added inside the loop
       newNodes.push({
-        id: `${id}-nodeAdder`,
+        id: nanoid(),
         type: "nodeAdder",
         parentId: id,
         position: { x: 0, y: 0 },
