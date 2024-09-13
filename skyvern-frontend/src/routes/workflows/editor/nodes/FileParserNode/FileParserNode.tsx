@@ -1,15 +1,24 @@
 import { Input } from "@/components/ui/input";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { CursorTextIcon } from "@radix-ui/react-icons";
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
+import {
+  Handle,
+  NodeProps,
+  Position,
+  useNodes,
+  useReactFlow,
+} from "@xyflow/react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import type { FileParserNode } from "./types";
 import { useState } from "react";
+import { getUpdatedNodesAfterLabelUpdateForParameterKeys } from "../../workflowEditorUtils";
+import { AppNode } from "..";
 
 function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
-  const { updateNodeData } = useReactFlow();
+  const { updateNodeData, setNodes } = useReactFlow();
   const deleteNodeCallback = useDeleteNodeCallback();
+  const nodes = useNodes();
   const [label, setLabel] = useState(data.label);
   const [inputs, setInputs] = useState({
     fileUrl: data.fileUrl,
@@ -42,6 +51,13 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
                 onChange={(value) => {
                   setLabel(value);
                   updateNodeData(id, { label: value });
+                  setNodes(
+                    getUpdatedNodesAfterLabelUpdateForParameterKeys(
+                      id,
+                      value,
+                      nodes as Array<AppNode>,
+                    ),
+                  );
                 }}
               />
               <span className="text-xs text-slate-400">File Parser Block</span>

@@ -2,14 +2,25 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { DownloadIcon } from "@radix-ui/react-icons";
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
+import {
+  Handle,
+  NodeProps,
+  Position,
+  useNodes,
+  useReactFlow,
+} from "@xyflow/react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import type { DownloadNode } from "./types";
+import { useState } from "react";
+import { getUpdatedNodesAfterLabelUpdateForParameterKeys } from "../../workflowEditorUtils";
+import { AppNode } from "..";
 
 function DownloadNode({ id, data }: NodeProps<DownloadNode>) {
-  const { updateNodeData } = useReactFlow();
+  const { updateNodeData, setNodes } = useReactFlow();
+  const nodes = useNodes();
   const deleteNodeCallback = useDeleteNodeCallback();
+  const [label, setLabel] = useState(data.label);
 
   return (
     <div>
@@ -33,9 +44,19 @@ function DownloadNode({ id, data }: NodeProps<DownloadNode>) {
             </div>
             <div className="flex flex-col gap-1">
               <EditableNodeTitle
-                value={data.label}
+                value={label}
                 editable={data.editable}
-                onChange={(value) => updateNodeData(id, { label: value })}
+                onChange={(value) => {
+                  setLabel(value);
+                  updateNodeData(id, { label: value });
+                  setNodes(
+                    getUpdatedNodesAfterLabelUpdateForParameterKeys(
+                      id,
+                      value,
+                      nodes as Array<AppNode>,
+                    ),
+                  );
+                }}
               />
               <span className="text-xs text-slate-400">Download Block</span>
             </div>

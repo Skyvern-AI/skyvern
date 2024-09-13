@@ -14,6 +14,7 @@ import { sendEmailNodeDefaultData } from "./nodes/SendEmailNode/types";
 import { taskNodeDefaultData } from "./nodes/TaskNode/types";
 import { textPromptNodeDefaultData } from "./nodes/TextPromptNode/types";
 import { uploadNodeDefaultData } from "./nodes/UploadNode/types";
+import type { Node } from "@xyflow/react";
 
 export const NEW_NODE_LABEL_PREFIX = "Block ";
 
@@ -620,6 +621,42 @@ function getOutputParameterKey(label: string) {
   return label + "_output";
 }
 
+function getUpdatedNodesAfterLabelUpdateForParameterKeys(
+  id: string,
+  newLabel: string,
+  nodes: Array<Node>,
+): Array<Node> {
+  const labelUpdatedNode = nodes.find((node) => node.id === id);
+  if (!labelUpdatedNode) {
+    return nodes;
+  }
+  const oldLabel = labelUpdatedNode.data.label as string;
+  return nodes.map((node) => {
+    if (node.type === "task") {
+      return {
+        ...node,
+        data: {
+          ...node.data,
+          parameterKeys: (node.data.parameterKeys as Array<string>).map(
+            (key) =>
+              key === getOutputParameterKey(oldLabel)
+                ? getOutputParameterKey(newLabel)
+                : key,
+          ),
+          label: node.id === id ? newLabel : node.data.label,
+        },
+      };
+    }
+    return {
+      ...node,
+      data: {
+        ...node.data,
+        label: node.id === id ? newLabel : node.data.label,
+      },
+    };
+  });
+}
+
 export {
   createNode,
   generateNodeData,
@@ -629,4 +666,5 @@ export {
   generateNodeLabel,
   convertEchoParameters,
   getOutputParameterKey,
+  getUpdatedNodesAfterLabelUpdateForParameterKeys,
 };
