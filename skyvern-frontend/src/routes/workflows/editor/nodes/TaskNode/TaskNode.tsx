@@ -23,7 +23,10 @@ import {
 } from "@xyflow/react";
 import { useState } from "react";
 import { AppNode } from "..";
-import { getOutputParameterKey } from "../../workflowEditorUtils";
+import {
+  getOutputParameterKey,
+  getUpdatedNodesAfterLabelUpdateForParameterKeys,
+} from "../../workflowEditorUtils";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { TaskNodeDisplayModeSwitch } from "./TaskNodeDisplayModeSwitch";
@@ -54,7 +57,7 @@ function getPreviousNodeIds(
 }
 
 function TaskNode({ id, data }: NodeProps<TaskNode>) {
-  const { updateNodeData } = useReactFlow();
+  const { updateNodeData, setNodes } = useReactFlow();
   const [displayMode, setDisplayMode] = useState<TaskNodeDisplayMode>("basic");
   const { editable } = data;
   const deleteNodeCallback = useDeleteNodeCallback();
@@ -419,7 +422,13 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                 editable={editable}
                 onChange={(value) => {
                   setLabel(value);
-                  updateNodeData(id, { label: value });
+                  setNodes(
+                    getUpdatedNodesAfterLabelUpdateForParameterKeys(
+                      id,
+                      value,
+                      nodes as Array<AppNode>,
+                    ),
+                  );
                 }}
               />
               <span className="text-xs text-slate-400">Task Block</span>

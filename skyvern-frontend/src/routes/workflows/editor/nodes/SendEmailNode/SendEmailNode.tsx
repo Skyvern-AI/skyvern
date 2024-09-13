@@ -3,14 +3,23 @@ import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { EnvelopeClosedIcon } from "@radix-ui/react-icons";
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
+import {
+  Handle,
+  NodeProps,
+  Position,
+  useNodes,
+  useReactFlow,
+} from "@xyflow/react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import type { SendEmailNode } from "./types";
 import { useState } from "react";
+import { getUpdatedNodesAfterLabelUpdateForParameterKeys } from "../../workflowEditorUtils";
+import { AppNode } from "..";
 
 function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
-  const { updateNodeData } = useReactFlow();
+  const { updateNodeData, setNodes } = useReactFlow();
+  const nodes = useNodes();
   const deleteNodeCallback = useDeleteNodeCallback();
   const [label, setLabel] = useState(data.label);
   const [inputs, setInputs] = useState({
@@ -56,6 +65,13 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
                 onChange={(value) => {
                   setLabel(value);
                   updateNodeData(id, { label: value });
+                  setNodes(
+                    getUpdatedNodesAfterLabelUpdateForParameterKeys(
+                      id,
+                      value,
+                      nodes as Array<AppNode>,
+                    ),
+                  );
                 }}
               />
               <span className="text-xs text-slate-400">Send Email Block</span>

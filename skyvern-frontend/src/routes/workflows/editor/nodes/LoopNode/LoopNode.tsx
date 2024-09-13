@@ -14,9 +14,11 @@ import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import type { LoopNode } from "./types";
 import { useState } from "react";
+import { getUpdatedNodesAfterLabelUpdateForParameterKeys } from "../../workflowEditorUtils";
+import { AppNode } from "..";
 
 function LoopNode({ id, data }: NodeProps<LoopNode>) {
-  const { updateNodeData } = useReactFlow();
+  const { updateNodeData, setNodes } = useReactFlow();
   const nodes = useNodes();
   const deleteNodeCallback = useDeleteNodeCallback();
   const [label, setLabel] = useState(data.label);
@@ -77,6 +79,13 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                     onChange={(value) => {
                       setLabel(value);
                       updateNodeData(id, { label: value });
+                      setNodes(
+                        getUpdatedNodesAfterLabelUpdateForParameterKeys(
+                          id,
+                          value,
+                          nodes as Array<AppNode>,
+                        ),
+                      );
                     }}
                   />
                   <span className="text-xs text-slate-400">Loop Block</span>
