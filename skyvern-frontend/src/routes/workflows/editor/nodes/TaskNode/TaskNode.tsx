@@ -5,18 +5,13 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
-import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
-import { ListBulletIcon, MixerVerticalIcon } from "@radix-ui/react-icons";
+import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { ListBulletIcon } from "@radix-ui/react-icons";
 import {
   Edge,
   Handle,
@@ -27,14 +22,13 @@ import {
   useReactFlow,
 } from "@xyflow/react";
 import { useState } from "react";
+import { AppNode } from "..";
+import { getOutputParameterKey } from "../../workflowEditorUtils";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { TaskNodeDisplayModeSwitch } from "./TaskNodeDisplayModeSwitch";
 import { TaskNodeParametersPanel } from "./TaskNodeParametersPanel";
 import type { TaskNode, TaskNodeDisplayMode } from "./types";
-import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
-import { AppNode } from "..";
-import { getOutputParameterKey } from "../../workflowEditorUtils";
 
 function getPreviousNodeIds(
   nodes: Array<AppNode>,
@@ -131,6 +125,15 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
           className="nopan"
         />
       </div>
+      <div className="space-y-1">
+        <TaskNodeParametersPanel
+          availableOutputParameters={outputParameterKeys}
+          parameters={data.parameterKeys}
+          onParametersChange={(parameterKeys) => {
+            updateNodeData(id, { parameterKeys });
+          }}
+        />
+      </div>
     </>
   );
 
@@ -170,6 +173,15 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                   value={inputs.navigationGoal}
                   placeholder="What are you looking to do?"
                   className="nopan"
+                />
+              </div>
+              <div className="space-y-1">
+                <TaskNodeParametersPanel
+                  availableOutputParameters={outputParameterKeys}
+                  parameters={data.parameterKeys}
+                  onParametersChange={(parameterKeys) => {
+                    updateNodeData(id, { parameterKeys });
+                  }}
                 />
               </div>
             </div>
@@ -419,28 +431,10 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
             }}
           />
         </div>
-        <div className="flex justify-between">
-          <TaskNodeDisplayModeSwitch
-            value={displayMode}
-            onChange={setDisplayMode}
-          />
-          <Popover>
-            <PopoverTrigger asChild>
-              <Button size="icon" variant="outline">
-                <MixerVerticalIcon />
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent className="w-72">
-              <TaskNodeParametersPanel
-                availableOutputParameters={outputParameterKeys}
-                parameters={data.parameterKeys}
-                onParametersChange={(parameterKeys) => {
-                  updateNodeData(id, { parameterKeys });
-                }}
-              />
-            </PopoverContent>
-          </Popover>
-        </div>
+        <TaskNodeDisplayModeSwitch
+          value={displayMode}
+          onChange={setDisplayMode}
+        />
 
         {displayMode === "basic" && basicContent}
         {displayMode === "advanced" && advancedContent}
