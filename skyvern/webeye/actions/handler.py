@@ -451,6 +451,7 @@ async def handle_input_text_action(
                 element_id=skyvern_element.get_id(),
                 action=action,
             )
+            await incremental_scraped.stop_listen_dom_increment()
         else:
             try:
                 # TODO: we don't select by value for the auto completion detect case
