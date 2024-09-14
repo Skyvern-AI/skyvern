@@ -219,9 +219,11 @@ function isElementVisible(element) {
   )
     return element.parentElement && isElementVisible(element.parentElement);
 
+  const className = element.className.toString();
   if (
-    element.className.toString().includes("select2-offscreen") ||
-    element.className.toString().includes("select2-hidden")
+    className.includes("select2-offscreen") ||
+    className.includes("select2-hidden") ||
+    className.includes("ui-select-offscreen")
   ) {
     return false;
   }
@@ -543,6 +545,36 @@ const isReactSelectDropdown = (element) => {
     element.className.toString().includes("select__input") &&
     element.getAttribute("role") === "combobox"
   );
+};
+
+function hasNgAttribute(element) {
+  for (let attr of element.attributes) {
+    if (attr.name.startsWith("ng-")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const isAngularDropdown = (element) => {
+  if (!hasNgAttribute(element)) {
+    return false;
+  }
+
+  const tagName = element.tagName.toLowerCase();
+  // TODO: some angular might use <span> to trigger dropdown menu
+  // if (tagName === "span") {
+  //   ...
+  // }
+
+  if (tagName === "input") {
+    const ariaLabel = element.hasAttribute("aria-label")
+      ? element.getAttribute("aria-label").toLowerCase()
+      : "";
+    return ariaLabel.includes("select") || ariaLabel.includes("choose");
+  }
+
+  return false;
 };
 
 const checkParentClass = (className) => {
@@ -953,6 +985,7 @@ function buildElementObject(frame, element, interactable, purgeable = false) {
     isSelectable:
       elementTagNameLower === "select" ||
       isDropdownButton(element) ||
+      isAngularDropdown(element) ||
       isSelect2Dropdown(element) ||
       isSelect2MultiChoice(element),
   };
