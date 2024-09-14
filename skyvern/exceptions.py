@@ -452,11 +452,9 @@ class NoIncrementalElementFoundForCustomSelection(SkyvernException):
         )
 
 
-class NoLabelOrValueForCustomSelection(SkyvernException):
-    def __init__(self, element_id: str) -> None:
-        super().__init__(
-            f"This is a custom selection, there must be invalid text for option.label or option.value. element_id={element_id}"
-        )
+class NoAvaiableOptionFoundForCustomSelection(SkyvernException):
+    def __init__(self, reason: str | None) -> None:
+        super().__init__(f"No avalable option to select. reason: {reason}.")
 
 
 class NoElementMatchedForTargetOption(SkyvernException):
