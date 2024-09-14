@@ -29,7 +29,7 @@ from skyvern.exceptions import (
     MissingFileUrl,
     MultipleElementsFound,
     NoAutoCompleteOptionMeetCondition,
-    NoAvaiableOptionFoundForCustomSelection,
+    NoAvailableOptionFoundForCustomSelection,
     NoElementMatchedForTargetOption,
     NoIncrementalElementFoundForAutoCompletion,
     NoIncrementalElementFoundForCustomSelection,
@@ -1550,7 +1550,7 @@ async def select_from_dropdown(
 
     element_id: str | None = json_response.get("id", None)
     if not element_id:
-        raise NoAvaiableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
+        raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
 
     if not force_select and target_value:
         if not json_response.get("relevant", False):
