@@ -454,7 +454,7 @@ class NoIncrementalElementFoundForCustomSelection(SkyvernException):
 
 class NoAvailableOptionFoundForCustomSelection(SkyvernException):
     def __init__(self, reason: str | None) -> None:
-        super().__init__(f"No avalable option to select. reason: {reason}.")
+        super().__init__(f"No available option to select. reason: {reason}.")
 
 
 class NoElementMatchedForTargetOption(SkyvernException):
