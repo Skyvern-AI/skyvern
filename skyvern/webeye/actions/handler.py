@@ -29,10 +29,10 @@ from skyvern.exceptions import (
     MissingFileUrl,
     MultipleElementsFound,
     NoAutoCompleteOptionMeetCondition,
+    NoAvailableOptionFoundForCustomSelection,
     NoElementMatchedForTargetOption,
     NoIncrementalElementFoundForAutoCompletion,
     NoIncrementalElementFoundForCustomSelection,
-    NoLabelOrValueForCustomSelection,
     NoSuitableAutoCompleteOption,
     OptionIndexOutOfBound,
     WrongElementToUploadFile,
@@ -58,6 +58,7 @@ from skyvern.webeye.actions.actions import (
     ActionType,
     CheckboxAction,
     ClickAction,
+    InputOrSelectContext,
     ScrapeResult,
     SelectOption,
     SelectOptionAction,
@@ -418,8 +419,6 @@ async def handle_input_text_action(
     if skyvern_element.get_tag_name() == InteractiveElement.INPUT and not await skyvern_element.is_spinbtn_input():
         await skyvern_element.scroll_into_view()
         select_action = SelectOptionAction(
-            field_information=action.field_information,
-            required_field=action.required_field,
             reasoning=action.reasoning,
             element_id=skyvern_element.get_id(),
             option=SelectOption(label=text),
@@ -464,6 +463,7 @@ async def handle_input_text_action(
                     llm_handler=app.SECONDARY_LLM_API_HANDLER,
                     step=step,
                     task=task,
+                    target_value=text,
                 )
                 if result is not None:
                     return [result]
@@ -692,8 +692,6 @@ async def handle_select_option_action(
             )
             select_action = SelectOptionAction(
                 reasoning=action.reasoning,
-                field_information=action.field_information,
-                required_field=action.required_field,
                 element_id=selectable_child.get_id(),
                 option=action.option,
             )
@@ -1069,7 +1067,7 @@ async def chain_click(
 
 
 async def choose_auto_completion_dropdown(
-    action: actions.InputTextAction,
+    context: InputOrSelectContext,
     page: Page,
     dom: DomUtil,
     text: str,
@@ -1133,7 +1131,7 @@ async def choose_auto_completion_dropdown(
         html = incremental_scraped.build_html_tree(incremental_element)
         auto_completion_confirm_prompt = prompt_engine.load_prompt(
             "auto-completion-choose-option",
-            field_information=action.field_information,
+            field_information=context.field,
             filled_value=text,
             navigation_goal=task.navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
@@ -1211,6 +1209,22 @@ async def input_or_auto_complete_input(
         element_id=skyvern_element.get_id(),
     )
 
+    prompt = prompt_engine.load_prompt(
+        "parse-input-or-select-context",
+        element_id=action.element_id,
+        action_reasoning=action.reasoning,
+        elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
+    )
+
+    json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+    input_or_select_context = InputOrSelectContext.model_validate(json_response)
+    LOG.info(
+        "Parsed input/select context",
+        context=input_or_select_context,
+        task_id=task.task_id,
+        step_id=step.step_id,
+    )
+
     # 1. press the orignal text to see if there's a match
     # 2. call LLM to find 5 potential values based on the orginal text
     # 3. try each potential values from #2
@@ -1219,7 +1233,6 @@ async def input_or_auto_complete_input(
     # FIXME: try the whole loop for twice now, to prevent too many LLM calls
     MAX_AUTO_COMPLETE_ATTEMP = 2
     current_attemp = 0
-    context_reasoning = action.reasoning
     current_value = text
     result = AutoCompletionResult()
 
@@ -1235,7 +1248,7 @@ async def input_or_auto_complete_input(
             input_value=current_value,
         )
         result = await choose_auto_completion_dropdown(
-            action=action,
+            context=input_or_select_context,
             page=page,
             dom=dom,
             text=current_value,
@@ -1252,7 +1265,7 @@ async def input_or_auto_complete_input(
 
         prompt = prompt_engine.load_prompt(
             "auto-completion-potential-answers",
-            field_information=action.field_information,
+            field_information=input_or_select_context.field,
             current_value=current_value,
         )
 
@@ -1282,7 +1295,7 @@ async def input_or_auto_complete_input(
                 input_value=value,
             )
             result = await choose_auto_completion_dropdown(
-                action=action,
+                context=input_or_select_context,
                 page=page,
                 dom=dom,
                 text=value,
@@ -1307,7 +1320,7 @@ async def input_or_auto_complete_input(
             )
             prompt = prompt_engine.load_prompt(
                 "auto-completion-tweak-value",
-                field_information=action.field_information,
+                field_information=input_or_select_context.field,
                 current_value=current_value,
                 tried_values=json.dumps(tried_values),
                 popped_up_elements="".join([json_to_html(element) for element in whole_new_elements]),
@@ -1321,7 +1334,7 @@ async def input_or_auto_complete_input(
                 "Ask LLM tweaked the current value with a new value",
                 step_id=step.step_id,
                 task_id=task.task_id,
-                field_information=action.field_information,
+                field_information=input_or_select_context.field,
                 current_value=current_value,
                 new_value=new_current_value,
             )
@@ -1341,12 +1354,27 @@ async def sequentially_select_from_dropdown(
     step: Step,
     task: Task,
     force_select: bool = False,
-    should_relevant: bool = True,
+    target_value: str = "",
 ) -> tuple[ActionResult | None, str | None]:
     """
     TODO: support to return all values retrieved from the sequentially select
     Only return the last value today
     """
+
+    prompt = prompt_engine.load_prompt(
+        "parse-input-or-select-context",
+        action_reasoning=action.reasoning,
+        element_id=action.element_id,
+        elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
+    )
+    json_response = await llm_handler(prompt=prompt, step=step)
+    input_or_select_context = InputOrSelectContext.model_validate(json_response)
+    LOG.info(
+        "Parsed input/select context",
+        context=input_or_select_context,
+        task_id=task.task_id,
+        step_id=step.step_id,
+    )
 
     # TODO: only suport the third-level dropdown selection now
     MAX_SELECT_DEPTH = 3
@@ -1356,7 +1384,7 @@ async def sequentially_select_from_dropdown(
     check_exist_funcs: list[CheckExistIDFunc] = [dom.check_id_in_dom]
     for i in range(MAX_SELECT_DEPTH):
         single_select_result = await select_from_dropdown(
-            action=action,
+            context=input_or_select_context,
             page=page,
             skyvern_frame=skyvern_frame,
             incremental_scraped=incremental_scraped,
@@ -1366,7 +1394,7 @@ async def sequentially_select_from_dropdown(
             task=task,
             select_history=select_history,
             force_select=force_select,
-            should_relevant=should_relevant,
+            target_value=target_value,
         )
         select_history.append(single_select_result)
         values.append(single_select_result.value)
@@ -1431,7 +1459,7 @@ def build_sequential_select_history(history_list: list[CustomSingleSelectResult]
 
 
 async def select_from_dropdown(
-    action: SelectOptionAction,
+    context: InputOrSelectContext,
     page: Page,
     skyvern_frame: SkyvernFrame,
     incremental_scraped: IncrementalScrapePage,
@@ -1441,11 +1469,11 @@ async def select_from_dropdown(
     task: Task,
     select_history: list[CustomSingleSelectResult] | None = None,
     force_select: bool = False,
-    should_relevant: bool = True,
+    target_value: str = "",
 ) -> CustomSingleSelectResult:
     """
     force_select: is used to choose an element to click even there's no dropdown menu;
-    should_relevant: only valid when force_select is "False". When "True", the chosen value must be relevant to the target value;
+    targe_value: only valid when force_select is "False". When target_value is not empty, the matched option must be relevent to target value;
     None will be only returned when:
         1. force_select is false and no dropdown menu popped
         2. force_select is false and match value is not relevant to the target value
@@ -1490,15 +1518,11 @@ async def select_from_dropdown(
 
     html = incremental_scraped.build_html_tree(element_tree=trimmed_element_tree)
 
-    target_value = action.option.label or action.option.value
-    if target_value is None:
-        raise NoLabelOrValueForCustomSelection(element_id=action.element_id)
-
     prompt = prompt_engine.load_prompt(
         "custom-select",
-        field_information=action.field_information,
-        required_field=action.required_field,
-        target_value=target_value if not force_select and should_relevant else "",
+        field_information=context.field,
+        required_field=context.is_required,
+        target_value="" if force_select else target_value,
         navigation_goal=task.navigation_goal,
         navigation_payload_str=json.dumps(task.navigation_payload),
         elements=html,
@@ -1526,11 +1550,11 @@ async def select_from_dropdown(
 
     element_id: str | None = json_response.get("id", None)
     if not element_id:
-        raise NoElementMatchedForTargetOption(target=target_value, reason=json_response.get("reasoning"))
+        raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
 
-    if not force_select and should_relevant:
+    if not force_select and target_value:
         if not json_response.get("relevant", False):
-            LOG.debug(
+            LOG.info(
                 "The selected option is not relevant to the target value",
                 element_id=element_id,
                 task_id=task.task_id,

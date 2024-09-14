@@ -43,10 +43,16 @@ class SelectOption(BaseModel):
         return f"SelectOption(label={self.label}, value={self.value}, index={self.index})"
 
 
+class InputOrSelectContext(BaseModel):
+    field: str | None = None
+    is_required: bool | None = None
+
+    def __repr__(self) -> str:
+        return f"InputOrSelectContext(field={self.field}, is_required={self.is_required})"
+
+
 class Action(BaseModel):
     action_type: ActionType
-    field_information: str | None = None
-    required_field: bool | None = None
     confidence_float: float | None = None
     description: str | None = None
     reasoning: str | None = None
@@ -162,8 +168,6 @@ def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None
 
     reasoning = action["reasoning"] if "reasoning" in action else None
     confidence_float = action["confidence_float"] if "confidence_float" in action else None
-    field_information = action["field_information"] if "field_information" in action else None
-    required_field = action["required_field"] if "required_field" in action else None
 
     if "action_type" not in action or action["action_type"] is None:
         return NullAction(reasoning=reasoning, confidence_float=confidence_float)
@@ -181,8 +185,6 @@ def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None
     if action_type == ActionType.CLICK:
         file_url = action["file_url"] if "file_url" in action else None
         return ClickAction(
-            field_information=field_information,
-            required_field=required_field,
             element_id=element_id,
             reasoning=reasoning,
             confidence_float=confidence_float,
@@ -192,8 +194,6 @@ def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None
 
     if action_type == ActionType.INPUT_TEXT:
         return InputTextAction(
-            field_information=field_information,
-            required_field=required_field,
             element_id=element_id,
             text=action["text"],
             reasoning=reasoning,
@@ -203,8 +203,6 @@ def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None
     if action_type == ActionType.UPLOAD_FILE:
         # TODO: see if the element is a file input element. if it's not, convert this action into a click action
         return UploadFileAction(
-            field_information=field_information,
-            required_field=required_field,
             element_id=element_id,
             confidence_float=confidence_float,
             file_url=action["file_url"],
@@ -214,8 +212,6 @@ def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None
     # This action is not used in the current implementation. Click actions are used instead.
     if action_type == ActionType.DOWNLOAD_FILE:
         return DownloadFileAction(
-            field_information=field_information,
-            required_field=required_field,
             element_id=element_id,
             file_name=action["file_name"],
             reasoning=reasoning,
@@ -232,8 +228,6 @@ def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None
         if label is None and value is None and index is None:
             raise ValueError("At least one of 'label', 'value', or 'index' must be provided for a SelectOption")
         return SelectOptionAction(
-            field_information=field_information,
-            required_field=required_field,
             element_id=element_id,
             option=SelectOption(
                 label=label,
@@ -246,8 +240,6 @@ def parse_action(action: Dict[str, Any], data_extraction_goal: str | None = None
 
     if action_type == ActionType.CHECKBOX:
         return CheckboxAction(
-            field_information=field_information,
-            required_field=required_field,
             element_id=element_id,
             is_checked=action["is_checked"],
             reasoning=reasoning,
