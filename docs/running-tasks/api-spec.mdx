@@ -107,14 +107,15 @@ has to be ≥1 |
 | Parameter | Type | Sample Value | Description |
 | --- | --- | --- | --- |
 | request | JSON |  | Includes the initial request sent to create the task. Fields included: url,webhook_callback_url,navigation_goal,data_extraction_goal,navigation_payload,proxy_location,extracted_information_schema  |
-| task_id | String | t_123 | The id of the task you want to check the status of |
-| status | String | SUCCESS / FAILURE / IN_PROGRESS | String indicating the status of this task |
+| task_id | String | tsk_123 | The id of the task you want to check the status of |
+| status | String | created / queued / running / completed / terminated / failed / canceled | String indicating the status of this task. created: the initial state when the task is created; queued: the task has been enqueued and is waiting to be picked up by a worker to execute; running: the task is being executed; completed: the task has successfully completed; terminated: the agent doesn't believe the task could be completed so it terminated the task; failed: the task failed due to a specific reason; canceled: the task is canceled by the user |
 | created_at | Timestamp | 2022-11-22T22:55:55 | Timestamp indicating when the task was created. |
 | modified_at | Timestamp | 2022-11-22T22:55:55 | Timestamp indicating when the task was last updated. Used to detect long-running tasks. |
-| extracted_information | Object | Yes | 'price’: ‘$100.0’ |
-| screenshot_url | String | Yes | … url to screenshot … |
-| recording_url | String | Yes | .. url to recording … |
-| failure_reason | String | No | “Failed to pass this page - missing information: invalid password” |
+| extracted_information | Object | 'price’: ‘$100.0’ |  |
+| screenshot_url | String | "https://skyvern-artifacts.s3.amazonaws.com/production/tsk_123/...screenshot_final.png" | … url to screenshot … |
+| recording_url | String | "https://skyvern-artifacts.s3.amazonaws.com/production/tsk_123/...recording.webm" | ... url to recording … |
+| action_screenshot_urls | List[str] | ["https://skyvern-artifacts.s3.amazonaws.com/production/tsk_123/step_2...action.png", "https://skyvern-artifacts.s3.amazonaws.com/production/tsk_123/step_0...action.png", "https://skyvern-artifacts.s3.amazonaws.com/production/tsk_123/step_0...action.png"] | 3 screenshots for the lastest 3 actions that Skyvern took. |
+| failure_reason | String | “Failed to pass this page - missing information: invalid password” | The reason why the task failed. Examples: "Max steps per task (10) exceeded ..." - by default, a task as a cap on the number of steps per task for budget control. This can be configured in your organization settings page; "Max retries per step (3) exceeded..." - this means Skyvern ran into some internal failures. Skyvern Agent is not perfect and doesn't have 100% web coverage today. When it runs into pages it cannot navigate through or take actions on, this failure_reason shows up. (Currently we're improving Skyvern's abilility as well as the failure_reason to show better errors to help generate better feedbacks to your failure) |
 
 ## Request - List Steps (GET)
 Each task is made up of "steps" which are the individual actions Skyvern takes to complete the task. You can use this endpoint to get all the steps of the task.
