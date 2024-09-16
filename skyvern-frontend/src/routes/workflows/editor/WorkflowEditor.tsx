@@ -1,6 +1,10 @@
 import { useParams } from "react-router-dom";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
-import { convertEchoParameters, getElements } from "./workflowEditorUtils";
+import {
+  convertEchoParameters,
+  getAdditionalParametersForEmailBlock,
+  getElements,
+} from "./workflowEditorUtils";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   BlockYAML,
@@ -143,8 +147,21 @@ function WorkflowEditor() {
 
             const echoParameters = convertEchoParameters(filteredParameters);
 
+            const overallParameters = [
+              ...parameters,
+              ...echoParameters,
+            ] as Array<ParameterYAML>;
+
+            // if there is an email node, we need to add the email aws secret parameters
+            const emailAwsSecretParameters =
+              getAdditionalParametersForEmailBlock(blocks, overallParameters);
+
             saveWorkflowMutation.mutate({
-              parameters: [...echoParameters, ...parameters],
+              parameters: [
+                ...echoParameters,
+                ...parameters,
+                ...emailAwsSecretParameters,
+              ],
               blocks,
               title,
             });

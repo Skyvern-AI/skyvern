@@ -23,7 +23,6 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
   const deleteNodeCallback = useDeleteNodeCallback();
   const [label, setLabel] = useState(data.label);
   const [inputs, setInputs] = useState({
-    sender: data.sender,
     recipients: data.recipients,
     subject: data.subject,
     body: data.body,
@@ -84,20 +83,6 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
           />
         </div>
         <div className="space-y-1">
-          <Label className="text-xs text-slate-300">Sender</Label>
-          <Input
-            onChange={(event) => {
-              if (!data.editable) {
-                return;
-              }
-              handleChange("sender", event.target.value);
-            }}
-            value={inputs.sender}
-            placeholder="example@gmail.com"
-            className="nopan"
-          />
-        </div>
-        <div className="space-y-1">
           <Label className="text-xs text-slate-300">Recipients</Label>
           <Input
             onChange={(event) => {
@@ -151,6 +136,7 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
               }
               handleChange("fileAttachments", event.target.value);
             }}
+            disabled
             className="nopan"
           />
         </div>
