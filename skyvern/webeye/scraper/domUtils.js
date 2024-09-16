@@ -418,8 +418,10 @@ function isInteractable(element) {
     return true;
   }
 
-  if (tagName === "div" && hasAngularClickBinding(element)) {
-    return true;
+  if (tagName === "div" || tagName === "span") {
+    if (hasAngularClickBinding(element)) {
+      return true;
+    }
   }
 
   // support listbox and options underneath it
@@ -562,12 +564,7 @@ const isAngularDropdown = (element) => {
   }
 
   const tagName = element.tagName.toLowerCase();
-  // TODO: some angular might use <span> to trigger dropdown menu
-  // if (tagName === "span") {
-  //   ...
-  // }
-
-  if (tagName === "input") {
+  if (tagName === "input" || tagName === "span") {
     const ariaLabel = element.hasAttribute("aria-label")
       ? element.getAttribute("aria-label").toLowerCase()
       : "";
