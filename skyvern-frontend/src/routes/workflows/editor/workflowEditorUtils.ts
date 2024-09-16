@@ -316,6 +316,32 @@ function getElements(blocks: Array<WorkflowBlock>): {
     }
   });
 
+  const loopBlocks = data.filter((d) => d.block.block_type === "for_loop");
+  loopBlocks.forEach((block) => {
+    const children = data.filter((b) => b.parentId === block.id);
+    const lastChild = children.find((c) => c.next === null);
+    nodes.push({
+      id: `${block.id}-nodeAdder`,
+      type: "nodeAdder",
+      position: { x: 0, y: 0 },
+      data: {},
+      draggable: false,
+      connectable: false,
+      parentId: block.id,
+    });
+    if (lastChild) {
+      edges.push({
+        id: `${block.id}-nodeAdder-edge`,
+        type: "default",
+        source: lastChild.id,
+        target: `${block.id}-nodeAdder`,
+        style: {
+          strokeWidth: 2,
+        },
+      });
+    }
+  });
+
   if (nodes.length > 0) {
     const lastNode = data.find((d) => d.next === null && d.parentId === null);
     edges.push({
