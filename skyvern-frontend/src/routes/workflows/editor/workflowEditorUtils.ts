@@ -3,7 +3,18 @@ import { Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
 import type { WorkflowBlock } from "../types/workflowTypes";
 import { BlockYAML, ParameterYAML } from "../types/workflowYamlTypes";
-import { REACT_FLOW_EDGE_Z_INDEX } from "./constants";
+import {
+  EMAIL_BLOCK_SENDER,
+  REACT_FLOW_EDGE_Z_INDEX,
+  SMTP_HOST_AWS_KEY,
+  SMTP_HOST_PARAMETER_KEY,
+  SMTP_PASSWORD_AWS_KEY,
+  SMTP_PASSWORD_PARAMETER_KEY,
+  SMTP_PORT_AWS_KEY,
+  SMTP_PORT_PARAMETER_KEY,
+  SMTP_USERNAME_AWS_KEY,
+  SMTP_USERNAME_PARAMETER_KEY,
+} from "./constants";
 import { AppNode, nodeTypes } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
@@ -471,7 +482,7 @@ function getWorkflowBlock(
         file_attachments: node.data.fileAttachments.split(","),
         recipients: node.data.recipients.split(","),
         subject: node.data.subject,
-        sender: node.data.sender,
+        sender: node.data.sender === "" ? EMAIL_BLOCK_SENDER : node.data.sender,
         smtp_host_secret_parameter_key: node.data.smtpHostSecretParameterKey,
         smtp_port_secret_parameter_key: node.data.smtpPortSecretParameterKey,
         smtp_username_secret_parameter_key:
@@ -657,6 +668,52 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
   });
 }
 
+const sendEmailExpectedParameters = [
+  {
+    key: SMTP_HOST_PARAMETER_KEY,
+    aws_key: SMTP_HOST_AWS_KEY,
+    parameter_type: "aws_secret",
+  },
+  {
+    key: SMTP_PORT_PARAMETER_KEY,
+    aws_key: SMTP_PORT_AWS_KEY,
+    parameter_type: "aws_secret",
+  },
+  {
+    key: SMTP_USERNAME_PARAMETER_KEY,
+    aws_key: SMTP_USERNAME_AWS_KEY,
+    parameter_type: "aws_secret",
+  },
+  {
+    key: SMTP_PASSWORD_PARAMETER_KEY,
+    aws_key: SMTP_PASSWORD_AWS_KEY,
+    parameter_type: "aws_secret",
+  },
+] as const;
+
+function getAdditionalParametersForEmailBlock(
+  blocks: Array<BlockYAML>,
+  parameters: Array<ParameterYAML>,
+): Array<ParameterYAML> {
+  const emailBlocks = blocks.filter(
+    (block) => block.block_type === "send_email",
+  );
+  if (emailBlocks.length === 0) {
+    return [];
+  }
+  const sendEmailParameters = sendEmailExpectedParameters.flatMap(
+    (parameter) => {
+      const existingParameter = parameters.find((p) => p.key === parameter.key);
+      if (existingParameter) {
+        return [];
+      }
+      return [parameter];
+    },
+  );
+
+  return sendEmailParameters;
+}
+
 export {
   createNode,
   generateNodeData,
@@ -667,4 +724,5 @@ export {
   convertEchoParameters,
   getOutputParameterKey,
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
+  getAdditionalParametersForEmailBlock,
 };
