@@ -133,7 +133,7 @@ In the “Configure”, set up these in order to make a POST request to Skyvern�
     - content: choose `Body Plain` after clicking the “+” sign
     - source: email
 - Headers:
-    - x-api-key: {your Skyvern API key}
+    - x-api-key: `Your Skyvern API Key`
 
 <p align="center">
   <img src="images/totp/create_zap_webhook_complete.png"/>
@@ -141,6 +141,7 @@ In the “Configure”, set up these in order to make a POST request to Skyvern�
 Click Continue
 
 **Step 2. Add forwarding email and create a filter in Gmail**
+
 Go to Gmail Settings → Forwarding and POP/IMAP (https://mail.google.com/mail/u/0/#settings/fwdandpop) → click “Add a forwarding address” → enter the zapier email address you just created. There might be some verifications, including a verification email from Zapier, you have to complete here.
 
 After setting up the forwarding email address, go to “Filters and Blocked Addresses” (https://mail.google.com/mail/u/0/#settings/filters). Click “Create a new filter” and set up your email filtering rule for your TOTP (2FA/MFA) emails. Click “Create filter”. Check “Forward it to” and pick the new email address and update filter.
@@ -150,9 +151,10 @@ After setting up the forwarding email address, go to “Filters and Blocked Addr
 </p>
 
 **Step 3. Test it end to end!**
+
 You can forward any previous TOTP (2FA/MFA) email to the Zapier email address you created in Step 1.
 
-In Zapier: under the “Test” of the Webhooks action, send a request to test it out. If your test is sccessful, you should see a `A request was sent to Webhooks by Zapier` message
+In Zapier: under the “Test” of the Webhooks action, send a request to test it out. If your test is successful, you should see a `A request was sent to Webhooks by Zapier` message
 
 <p align="center">
   <img src="images/totp/test_end_to_end.png"/>
