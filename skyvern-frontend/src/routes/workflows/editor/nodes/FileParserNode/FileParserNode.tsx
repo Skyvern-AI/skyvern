@@ -12,13 +12,16 @@ import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import type { FileParserNode } from "./types";
 import { useState } from "react";
-import { getUpdatedNodesAfterLabelUpdateForParameterKeys } from "../../workflowEditorUtils";
+import {
+  getLabelForExistingNode,
+  getUpdatedNodesAfterLabelUpdateForParameterKeys,
+} from "../../workflowEditorUtils";
 import { AppNode } from "..";
 
 function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
   const { updateNodeData, setNodes } = useReactFlow();
   const deleteNodeCallback = useDeleteNodeCallback();
-  const nodes = useNodes();
+  const nodes = useNodes<AppNode>();
   const [label, setLabel] = useState(data.label);
   const [inputs, setInputs] = useState({
     fileUrl: data.fileUrl,
@@ -49,16 +52,22 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
                 value={label}
                 editable={data.editable}
                 onChange={(value) => {
-                  setLabel(value);
-                  updateNodeData(id, { label: value });
+                  const existingLabels = nodes.map((n) => n.data.label);
+                  const newLabel = getLabelForExistingNode(
+                    value,
+                    existingLabels,
+                  );
+                  setLabel(newLabel);
                   setNodes(
                     getUpdatedNodesAfterLabelUpdateForParameterKeys(
                       id,
-                      value,
+                      newLabel,
                       nodes as Array<AppNode>,
                     ),
                   );
                 }}
+                titleClassName="text-base"
+                inputClassName="text-base"
               />
               <span className="text-xs text-slate-400">File Parser Block</span>
             </div>
