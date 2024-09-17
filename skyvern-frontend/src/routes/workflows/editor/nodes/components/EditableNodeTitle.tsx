@@ -32,7 +32,7 @@ function EditableNodeTitle({ value, editable, onChange, className }: Props) {
     <Input
       disabled={!editable}
       ref={ref}
-      className={cn("w-fit min-w-fit max-w-64 border-0 px-0", className)}
+      className={cn("nopan w-fit min-w-fit max-w-64 border-0 px-0", className)}
       onBlur={(event) => {
         if (!editable) {
           event.currentTarget.value = value;
