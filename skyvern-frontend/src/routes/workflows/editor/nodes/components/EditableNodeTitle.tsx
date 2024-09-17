@@ -1,4 +1,10 @@
 import { Input } from "@/components/ui/input";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/util/utils";
 import { useLayoutEffect, useRef } from "react";
 
@@ -29,33 +35,41 @@ function EditableNodeTitle({ value, editable, onChange, className }: Props) {
   }
 
   return (
-    <Input
-      disabled={!editable}
-      ref={ref}
-      className={cn("nopan w-fit min-w-fit max-w-64 border-0 px-0", className)}
-      onBlur={(event) => {
-        if (!editable) {
-          event.currentTarget.value = value;
-          return;
-        }
-        onChange(event.target.value);
-      }}
-      onKeyDown={(event) => {
-        if (!editable) {
-          return;
-        }
-        if (event.key === "Enter") {
-          event.currentTarget.blur();
-        }
-        if (event.key === "Escape") {
-          event.currentTarget.value = value;
-          event.currentTarget.blur();
-        }
-        setSize();
-      }}
-      onInput={setSize}
-      defaultValue={value}
-    />
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Input
+            disabled={!editable}
+            ref={ref}
+            size={1}
+            className={cn("nopan w-min border-0 p-0", className)}
+            onBlur={(event) => {
+              if (!editable) {
+                event.currentTarget.value = value;
+                return;
+              }
+              onChange(event.target.value);
+            }}
+            onKeyDown={(event) => {
+              if (!editable) {
+                return;
+              }
+              if (event.key === "Enter") {
+                event.currentTarget.blur();
+              }
+              if (event.key === "Escape") {
+                event.currentTarget.value = value;
+                event.currentTarget.blur();
+              }
+              setSize();
+            }}
+            onInput={setSize}
+            defaultValue={value}
+          />
+        </TooltipTrigger>
+        <TooltipContent>Click to edit</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
 
