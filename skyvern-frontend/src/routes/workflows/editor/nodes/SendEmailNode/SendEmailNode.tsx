@@ -14,12 +14,15 @@ import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import type { SendEmailNode } from "./types";
 import { useState } from "react";
-import { getUpdatedNodesAfterLabelUpdateForParameterKeys } from "../../workflowEditorUtils";
+import {
+  getLabelForExistingNode,
+  getUpdatedNodesAfterLabelUpdateForParameterKeys,
+} from "../../workflowEditorUtils";
 import { AppNode } from "..";
 
 function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
   const { updateNodeData, setNodes } = useReactFlow();
-  const nodes = useNodes();
+  const nodes = useNodes<AppNode>();
   const deleteNodeCallback = useDeleteNodeCallback();
   const [label, setLabel] = useState(data.label);
   const [inputs, setInputs] = useState({
@@ -62,16 +65,22 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
                 value={label}
                 editable={data.editable}
                 onChange={(value) => {
-                  setLabel(value);
-                  updateNodeData(id, { label: value });
+                  const existingLabels = nodes.map((n) => n.data.label);
+                  const newLabel = getLabelForExistingNode(
+                    value,
+                    existingLabels,
+                  );
+                  setLabel(newLabel);
                   setNodes(
                     getUpdatedNodesAfterLabelUpdateForParameterKeys(
                       id,
-                      value,
+                      newLabel,
                       nodes as Array<AppNode>,
                     ),
                   );
                 }}
+                titleClassName="text-base"
+                inputClassName="text-base"
               />
               <span className="text-xs text-slate-400">Send Email Block</span>
             </div>

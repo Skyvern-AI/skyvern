@@ -56,7 +56,8 @@ function WorkflowHeader({
           editable={true}
           onChange={onTitleChange}
           value={title}
-          className="text-3xl"
+          titleClassName="text-3xl"
+          inputClassName="text-3xl"
         />
       </div>
       <div className="flex h-full w-1/3 items-center justify-end gap-4 p-4">

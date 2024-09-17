@@ -24,6 +24,7 @@ import {
 import { useState } from "react";
 import { AppNode } from "..";
 import {
+  getLabelForExistingNode,
   getOutputParameterKey,
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
 } from "../../workflowEditorUtils";
@@ -421,15 +422,22 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                 value={label}
                 editable={editable}
                 onChange={(value) => {
-                  setLabel(value);
+                  const existingLabels = nodes.map((n) => n.data.label);
+                  const newLabel = getLabelForExistingNode(
+                    value,
+                    existingLabels,
+                  );
+                  setLabel(newLabel);
                   setNodes(
                     getUpdatedNodesAfterLabelUpdateForParameterKeys(
                       id,
-                      value,
+                      newLabel,
                       nodes as Array<AppNode>,
                     ),
                   );
                 }}
+                titleClassName="text-base"
+                inputClassName="text-base"
               />
               <span className="text-xs text-slate-400">Task Block</span>
             </div>

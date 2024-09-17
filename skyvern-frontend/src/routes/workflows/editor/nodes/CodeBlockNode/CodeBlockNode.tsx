@@ -13,12 +13,15 @@ import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import type { CodeBlockNode } from "./types";
 import { useState } from "react";
-import { getUpdatedNodesAfterLabelUpdateForParameterKeys } from "../../workflowEditorUtils";
+import {
+  getLabelForExistingNode,
+  getUpdatedNodesAfterLabelUpdateForParameterKeys,
+} from "../../workflowEditorUtils";
 import { AppNode } from "..";
 
 function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
   const { updateNodeData, setNodes } = useReactFlow();
-  const nodes = useNodes();
+  const nodes = useNodes<AppNode>();
   const deleteNodeCallback = useDeleteNodeCallback();
   const [label, setLabel] = useState(data.label);
   const [inputs, setInputs] = useState({
@@ -50,16 +53,22 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
                 value={label}
                 editable={data.editable}
                 onChange={(value) => {
-                  setLabel(value);
-                  updateNodeData(id, { label: value });
+                  const existingLabels = nodes.map((n) => n.data.label);
+                  const newLabel = getLabelForExistingNode(
+                    value,
+                    existingLabels,
+                  );
+                  setLabel(newLabel);
                   setNodes(
                     getUpdatedNodesAfterLabelUpdateForParameterKeys(
                       id,
-                      value,
+                      newLabel,
                       nodes as Array<AppNode>,
                     ),
                   );
                 }}
+                titleClassName="text-base"
+                inputClassName="text-base"
               />
               <span className="text-xs text-slate-400">Code Block</span>
             </div>

@@ -740,6 +740,19 @@ function getAdditionalParametersForEmailBlock(
   return sendEmailParameters;
 }
 
+function getLabelForExistingNode(label: string, existingLabels: Array<string>) {
+  if (!existingLabels.includes(label)) {
+    return label;
+  }
+  for (let i = 2; i < existingLabels.length + 1; i++) {
+    const candidate = `${label} (${i})`;
+    if (!existingLabels.includes(candidate)) {
+      return candidate;
+    }
+  }
+  return label;
+}
+
 export {
   createNode,
   generateNodeData,
@@ -751,4 +764,5 @@ export {
   getOutputParameterKey,
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
   getAdditionalParametersForEmailBlock,
+  getLabelForExistingNode,
 };

@@ -13,12 +13,15 @@ import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import type { DownloadNode } from "./types";
 import { useState } from "react";
-import { getUpdatedNodesAfterLabelUpdateForParameterKeys } from "../../workflowEditorUtils";
+import {
+  getLabelForExistingNode,
+  getUpdatedNodesAfterLabelUpdateForParameterKeys,
+} from "../../workflowEditorUtils";
 import { AppNode } from "..";
 
 function DownloadNode({ id, data }: NodeProps<DownloadNode>) {
-  const { updateNodeData, setNodes } = useReactFlow();
-  const nodes = useNodes();
+  const { setNodes } = useReactFlow();
+  const nodes = useNodes<AppNode>();
   const deleteNodeCallback = useDeleteNodeCallback();
   const [label, setLabel] = useState(data.label);
 
@@ -47,16 +50,22 @@ function DownloadNode({ id, data }: NodeProps<DownloadNode>) {
                 value={label}
                 editable={data.editable}
                 onChange={(value) => {
-                  setLabel(value);
-                  updateNodeData(id, { label: value });
+                  const existingLabels = nodes.map((n) => n.data.label);
+                  const newLabel = getLabelForExistingNode(
+                    value,
+                    existingLabels,
+                  );
+                  setLabel(newLabel);
                   setNodes(
                     getUpdatedNodesAfterLabelUpdateForParameterKeys(
                       id,
-                      value,
+                      newLabel,
                       nodes as Array<AppNode>,
                     ),
                   );
                 }}
+                titleClassName="text-base"
+                inputClassName="text-base"
               />
               <span className="text-xs text-slate-400">Download Block</span>
             </div>
