@@ -87,41 +87,41 @@ This setup requires a Zapier pro plan account.
 
 Go to https://zapier.com/app/home and create new Zaps
 <p align="center">
-  <img src="images/totp/create_zap.png"/>
+  <img src="/images/totp/create_zap.png"/>
 </p>
 
 In the newly created Zap draft, Click the “Trigger” button
 <p align="center">
-  <img src="images/totp/create_zap_trigger.png"/>
+  <img src="/images/totp/create_zap_trigger.png"/>
 </p>
 
 Click `Email by Zapier`
 <p align="center">
-  <img src="images/totp/create_zap_trigger.png"/>
+  <img src="/images/totp/create_zap_trigger.png"/>
 </p>
 
 In the Email “Setup”, pick `New Inbound Email` in the `Trigger event` selection. Click `Continue` to complete the “Setup”
 <p align="center">
-  <img src="images/totp/create_zap_email_setup.png"/>
+  <img src="/images/totp/create_zap_email_setup.png"/>
 </p>
 
 In Email “Configure”, create an email address which will be used to forward emails for TOTP codes. Click “Continue”.
 <p align="center">
-  <img src="images/totp/create_zap_input_email.png"/>
+  <img src="/images/totp/create_zap_input_email.png"/>
 </p>
 
 Let’s add the Action to complete the Zapier setup before coming back to test it. Click the “Action” button and add `Webhooks by Zapier`
 <p align="center">
-  <img src="images/totp/create_zap_action.png"/>
+  <img src="/images/totp/create_zap_action.png"/>
 </p>
 
 <p align="center">
-  <img src="images/totp/create_zap_webhook.png"/>
+  <img src="/images/totp/create_zap_webhook.png"/>
 </p>
 
 In the Setup, choose “POST” under the `Action event` selection. Then click “Continue”.
 <p align="center">
-  <img src="images/totp/create_zap_action_event_post.png"/>
+  <img src="/images/totp/create_zap_action_event_post.png"/>
 </p>
 
 In the “Configure”, set up these in order to make a POST request to Skyvern’s TOTP API:
@@ -136,7 +136,7 @@ In the “Configure”, set up these in order to make a POST request to Skyvern�
     - x-api-key: `Your Skyvern API Key`
 
 <p align="center">
-  <img src="images/totp/create_zap_webhook_complete.png"/>
+  <img src="/images/totp/create_zap_webhook_complete.png"/>
 </p>
 Click Continue
 
@@ -147,7 +147,7 @@ Go to Gmail Settings → Forwarding and POP/IMAP (https://mail.google.com/mail/u
 After setting up the forwarding email address, go to “Filters and Blocked Addresses” (https://mail.google.com/mail/u/0/#settings/filters). Click “Create a new filter” and set up your email filtering rule for your TOTP (2FA/MFA) emails. Click “Create filter”. Check “Forward it to” and pick the new email address and update filter.
 
 <p align="center">
-  <img src="images/totp/create_email_forwarding.png"/>
+  <img src="/images/totp/create_email_forwarding.png"/>
 </p>
 
 **Step 3. Test it end to end!**
@@ -157,5 +157,5 @@ You can forward any previous TOTP (2FA/MFA) email to the Zapier email address yo
 In Zapier: under the “Test” of the Webhooks action, send a request to test it out. If your test is successful, you should see a `A request was sent to Webhooks by Zapier` message
 
 <p align="center">
-  <img src="images/totp/test_end_to_end.png"/>
+  <img src="/images/totp/test_end_to_end.png"/>
 </p>
