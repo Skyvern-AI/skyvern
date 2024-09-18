@@ -25,11 +25,15 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useReactFlow } from "@xyflow/react";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 
 const WORKFLOW_EDIT_PANEL_WIDTH = 20 * 16;
 const WORKFLOW_EDIT_PANEL_GAP = 1 * 16;
 
 function WorkflowParametersPanel() {
+  const setHasChanges = useWorkflowHasChangesStore(
+    (state) => state.setHasChanges,
+  );
   const [workflowParameters, setWorkflowParameters] =
     useWorkflowParametersState();
   const [operationPanelState, setOperationPanelState] = useState<{
@@ -144,6 +148,7 @@ function WorkflowParametersPanel() {
                                 (p) => p.key !== parameter.key,
                               ),
                             );
+                            setHasChanges(true);
                             setNodes((nodes) => {
                               return nodes.map((node) => {
                                 if (node.type === "task") {
@@ -187,6 +192,7 @@ function WorkflowParametersPanel() {
                 type={operationPanelState.type}
                 onSave={(parameter) => {
                   setWorkflowParameters([...workflowParameters, parameter]);
+                  setHasChanges(true);
                   setOperationPanelState({
                     active: false,
                     operation: "add",
@@ -210,6 +216,7 @@ function WorkflowParametersPanel() {
                   type={operationPanelState.type}
                   initialValues={operationPanelState.parameter}
                   onSave={(editedParameter) => {
+                    setHasChanges(true);
                     setWorkflowParameters(
                       workflowParameters.map((parameter) => {
                         if (
