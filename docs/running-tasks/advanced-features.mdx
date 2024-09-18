@@ -75,10 +75,10 @@ Request data:
 | --- | --- | --- | --- | --- |
 | totp_identifier | yes | string | An email address or phone number which received the code | this is a required field as this is the best way for skyvern to know what the identifier  |
 | content | yes | string |  | the email content of a 2FA email; the text message for the verification code |
-| task_id | no | string | tsk_22222222 | if passed, this will be used to help skyvern locate the totp code more accurately |
+| task_id | no | string | tsk_22222222 | used to help skyvern locate the totp code more accurately for your task |
 | workflow_id | no | string | wpid_12345 | used to help better locate the totp code accurately for your workflow |
 | source | no | string | email, phone, app, etc |  |
-| expired_at | no | string |  | if provided, skyvern uses this time to decide if the code is valid or not |
+| expired_at | no | timestamp | 2024-09-18T05:15:02 | The expiration time of the code. If provided, skyvern uses it to decide if the code is valid |
 
 #### Forwarding Your Email To Skyvern (Gmail + Zapier)
 This setup requires a Zapier pro plan account.
