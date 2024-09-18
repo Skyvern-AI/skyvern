@@ -14,10 +14,18 @@ import {
 import "@xyflow/react/dist/style.css";
 import { nanoid } from "nanoid";
 import { useEffect, useState } from "react";
-import { WorkflowParameterValueType } from "../types/workflowTypes";
+import {
+  AWSSecretParameter,
+  BitwardenSensitiveInformationParameter,
+  ContextParameter,
+  WorkflowApiResponse,
+  WorkflowParameterValueType,
+} from "../types/workflowTypes";
 import {
   BitwardenLoginCredentialParameterYAML,
   BlockYAML,
+  ParameterYAML,
+  WorkflowCreateYAMLRequest,
   WorkflowParameterYAML,
 } from "../types/workflowYamlTypes";
 import { WorkflowHeader } from "./WorkflowHeader";
@@ -28,12 +36,32 @@ import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
 import "./reactFlowOverrideStyles.css";
 import {
+  convertEchoParameters,
   createNode,
   generateNodeLabel,
+  getAdditionalParametersForEmailBlock,
   getOutputParameterKey,
   getWorkflowBlocks,
   layout,
 } from "./workflowEditorUtils";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { useBlocker, useParams } from "react-router-dom";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { getClient } from "@/api/AxiosClient";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { stringify as convertToYAML } from "yaml";
+import { toast } from "@/components/ui/use-toast";
+import { AxiosError } from "axios";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+import { ReloadIcon } from "@radix-ui/react-icons";
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -85,13 +113,7 @@ type Props = {
   initialNodes: Array<AppNode>;
   initialEdges: Array<Edge>;
   initialParameters: ParametersState;
-  handleSave: (
-    parameters: Array<
-      WorkflowParameterYAML | BitwardenLoginCredentialParameterYAML
-    >,
-    blocks: Array<BlockYAML>,
-    title: string,
-  ) => void;
+  workflow: WorkflowApiResponse;
 };
 
 export type AddNodeProps = {
@@ -107,8 +129,11 @@ function FlowRenderer({
   initialEdges,
   initialNodes,
   initialParameters,
-  handleSave,
+  workflow,
 }: Props) {
+  const { workflowPermanentId } = useParams();
+  const credentialGetter = useCredentialGetter();
+  const queryClient = useQueryClient();
   const { workflowPanelState, setWorkflowPanelState, closeWorkflowPanel } =
     useWorkflowPanelStore();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
@@ -116,6 +141,66 @@ function FlowRenderer({
   const [parameters, setParameters] = useState(initialParameters);
   const [title, setTitle] = useState(initialTitle);
   const nodesInitialized = useNodesInitialized();
+  const { hasChanges, setHasChanges } = useWorkflowHasChangesStore();
+  const blocker = useBlocker(({ currentLocation, nextLocation }) => {
+    return hasChanges && nextLocation.pathname !== currentLocation.pathname;
+  });
+
+  const saveWorkflowMutation = useMutation({
+    mutationFn: async (data: {
+      parameters: Array<ParameterYAML>;
+      blocks: Array<BlockYAML>;
+      title: string;
+    }) => {
+      if (!workflowPermanentId) {
+        return;
+      }
+      const client = await getClient(credentialGetter);
+      const requestBody: WorkflowCreateYAMLRequest = {
+        title: data.title,
+        description: workflow.description,
+        proxy_location: workflow.proxy_location,
+        webhook_callback_url: workflow.webhook_callback_url,
+        totp_verification_url: workflow.totp_verification_url,
+        workflow_definition: {
+          parameters: data.parameters,
+          blocks: data.blocks,
+        },
+        is_saved_task: workflow.is_saved_task,
+      };
+      const yaml = convertToYAML(requestBody);
+      return client.put<string, WorkflowApiResponse>(
+        `/workflows/${workflowPermanentId}`,
+        yaml,
+        {
+          headers: {
+            "Content-Type": "text/plain",
+          },
+        },
+      );
+    },
+    onSuccess: () => {
+      toast({
+        title: "Changes saved",
+        description: "Your changes have been saved",
+        variant: "success",
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["workflow", workflowPermanentId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["workflows"],
+      });
+      setHasChanges(false);
+    },
+    onError: (error: AxiosError) => {
+      toast({
+        title: "Error",
+        description: error.message,
+        variant: "destructive",
+      });
+    },
+  });
 
   function doLayout(nodes: Array<AppNode>, edges: Array<Edge>) {
     const layoutedElements = layout(nodes, edges);
@@ -129,6 +214,47 @@ function FlowRenderer({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodesInitialized]);
+
+  async function handleSave() {
+    const blocks = getWorkflowBlocks(nodes);
+    const parametersInYAMLConvertibleJSON = convertToParametersYAML(parameters);
+    const filteredParameters = workflow.workflow_definition.parameters.filter(
+      (parameter) => {
+        return (
+          parameter.parameter_type === "aws_secret" ||
+          parameter.parameter_type === "bitwarden_sensitive_information" ||
+          parameter.parameter_type === "context"
+        );
+      },
+    ) as Array<
+      | AWSSecretParameter
+      | BitwardenSensitiveInformationParameter
+      | ContextParameter
+    >;
+
+    const echoParameters = convertEchoParameters(filteredParameters);
+
+    const overallParameters = [
+      ...parameters,
+      ...echoParameters,
+    ] as Array<ParameterYAML>;
+
+    // if there is an email node, we need to add the email aws secret parameters
+    const emailAwsSecretParameters = getAdditionalParametersForEmailBlock(
+      blocks,
+      overallParameters,
+    );
+
+    return saveWorkflowMutation.mutateAsync({
+      parameters: [
+        ...echoParameters,
+        ...parametersInYAMLConvertibleJSON,
+        ...emailAwsSecretParameters,
+      ],
+      blocks,
+      title,
+    });
+  }
 
   function addNode({
     nodeType,
@@ -220,7 +346,7 @@ function FlowRenderer({
         },
       });
     }
-
+    setHasChanges(true);
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
   }
 
@@ -275,110 +401,160 @@ function FlowRenderer({
       }
       return node;
     });
-
+    setHasChanges(true);
     doLayout(newNodesWithUpdatedParameters, newEdges);
   }
 
   return (
-    <WorkflowParametersStateContext.Provider
-      value={[parameters, setParameters]}
-    >
-      <DeleteNodeCallbackContext.Provider value={deleteNode}>
-        <ReactFlow
-          nodes={nodes}
-          edges={edges}
-          onNodesChange={(changes) => {
-            const dimensionChanges = changes.filter(
-              (change) => change.type === "dimensions",
-            );
-            const tempNodes = [...nodes];
-            dimensionChanges.forEach((change) => {
-              const node = tempNodes.find((node) => node.id === change.id);
-              if (node) {
-                if (node.measured?.width) {
-                  node.measured.width = change.dimensions?.width;
+    <>
+      <Dialog
+        open={blocker.state === "blocked"}
+        onOpenChange={(open) => {
+          if (!open) {
+            blocker.reset?.();
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Unsaved Changes</DialogTitle>
+            <DialogDescription>
+              Your workflow has unsaved changes. Do you want to save them before
+              leaving?
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="secondary"
+              onClick={() => {
+                blocker.proceed?.();
+              }}
+            >
+              Continue without saving
+            </Button>
+            <Button
+              onClick={() => {
+                handleSave().then(() => {
+                  blocker.proceed?.();
+                });
+              }}
+              disabled={saveWorkflowMutation.isPending}
+            >
+              {saveWorkflowMutation.isPending && (
+                <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+              )}
+              Save changes
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <WorkflowParametersStateContext.Provider
+        value={[parameters, setParameters]}
+      >
+        <DeleteNodeCallbackContext.Provider value={deleteNode}>
+          <ReactFlow
+            nodes={nodes}
+            edges={edges}
+            onNodesChange={(changes) => {
+              const dimensionChanges = changes.filter(
+                (change) => change.type === "dimensions",
+              );
+              const tempNodes = [...nodes];
+              dimensionChanges.forEach((change) => {
+                const node = tempNodes.find((node) => node.id === change.id);
+                if (node) {
+                  if (node.measured?.width) {
+                    node.measured.width = change.dimensions?.width;
+                  }
+                  if (node.measured?.height) {
+                    node.measured.height = change.dimensions?.height;
+                  }
                 }
-                if (node.measured?.height) {
-                  node.measured.height = change.dimensions?.height;
-                }
+              });
+              if (dimensionChanges.length > 0) {
+                doLayout(tempNodes, edges);
               }
-            });
-            if (dimensionChanges.length > 0) {
-              doLayout(tempNodes, edges);
-            }
-            onNodesChange(changes);
-          }}
-          onEdgesChange={onEdgesChange}
-          nodeTypes={nodeTypes}
-          edgeTypes={edgeTypes}
-          colorMode="dark"
-          fitView
-          fitViewOptions={{
-            maxZoom: 1,
-          }}
-        >
-          <Background variant={BackgroundVariant.Dots} bgColor="#020617" />
-          <Controls position="bottom-left" />
-          <Panel position="top-center" className="h-20">
-            <WorkflowHeader
-              title={title}
-              onTitleChange={setTitle}
-              parametersPanelOpen={
-                workflowPanelState.active &&
-                workflowPanelState.content === "parameters"
+              if (
+                changes.some((change) => {
+                  return (
+                    change.type === "add" ||
+                    change.type === "remove" ||
+                    change.type === "replace"
+                  );
+                })
+              ) {
+                setHasChanges(true);
               }
-              onParametersClick={() => {
-                if (
+              onNodesChange(changes);
+            }}
+            onEdgesChange={onEdgesChange}
+            nodeTypes={nodeTypes}
+            edgeTypes={edgeTypes}
+            colorMode="dark"
+            fitView
+            fitViewOptions={{
+              maxZoom: 1,
+            }}
+          >
+            <Background variant={BackgroundVariant.Dots} bgColor="#020617" />
+            <Controls position="bottom-left" />
+            <Panel position="top-center" className="h-20">
+              <WorkflowHeader
+                title={title}
+                onTitleChange={(newTitle) => {
+                  setTitle(newTitle);
+                  setHasChanges(true);
+                }}
+                parametersPanelOpen={
                   workflowPanelState.active &&
                   workflowPanelState.content === "parameters"
-                ) {
-                  closeWorkflowPanel();
-                } else {
-                  setWorkflowPanelState({
-                    active: true,
-                    content: "parameters",
-                  });
                 }
-              }}
-              onSave={() => {
-                const blocksInYAMLConvertibleJSON = getWorkflowBlocks(nodes);
-                const parametersInYAMLConvertibleJSON =
-                  convertToParametersYAML(parameters);
-                handleSave(
-                  parametersInYAMLConvertibleJSON,
-                  blocksInYAMLConvertibleJSON,
-                  title,
-                );
-              }}
-            />
-          </Panel>
-          {workflowPanelState.active && (
-            <Panel position="top-right">
-              {workflowPanelState.content === "parameters" && (
-                <WorkflowParametersPanel />
-              )}
-              {workflowPanelState.content === "nodeLibrary" && (
+                onParametersClick={() => {
+                  if (
+                    workflowPanelState.active &&
+                    workflowPanelState.content === "parameters"
+                  ) {
+                    closeWorkflowPanel();
+                  } else {
+                    setWorkflowPanelState({
+                      active: true,
+                      content: "parameters",
+                    });
+                  }
+                }}
+                onSave={async () => {
+                  await handleSave();
+                }}
+              />
+            </Panel>
+            {workflowPanelState.active && (
+              <Panel position="top-right">
+                {workflowPanelState.content === "parameters" && (
+                  <WorkflowParametersPanel />
+                )}
+                {workflowPanelState.content === "nodeLibrary" && (
+                  <WorkflowNodeLibraryPanel
+                    onNodeClick={(props) => {
+                      addNode(props);
+                    }}
+                  />
+                )}
+              </Panel>
+            )}
+            {nodes.length === 0 && (
+              <Panel position="top-right">
                 <WorkflowNodeLibraryPanel
                   onNodeClick={(props) => {
                     addNode(props);
                   }}
+                  first
                 />
-              )}
-            </Panel>
-          )}
-          {nodes.length === 0 && (
-            <Panel position="top-right">
-              <WorkflowNodeLibraryPanel
-                onNodeClick={(props) => {
-                  addNode(props);
-                }}
-                first
-              />
-            </Panel>
-          )}
-        </ReactFlow>
-      </DeleteNodeCallbackContext.Provider>
-    </WorkflowParametersStateContext.Provider>
+              </Panel>
+            )}
+          </ReactFlow>
+        </DeleteNodeCallbackContext.Provider>
+      </WorkflowParametersStateContext.Provider>
+    </>
   );
 }
 
