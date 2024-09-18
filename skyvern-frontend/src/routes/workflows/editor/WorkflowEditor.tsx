@@ -23,14 +23,23 @@ import {
   BitwardenSensitiveInformationParameter,
   ContextParameter,
 } from "../types/workflowTypes";
+import { useSidebarStore } from "@/store/SidebarStore";
+import { useMountEffect } from "@/hooks/useMountEffect";
 
 function WorkflowEditor() {
   const { workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
+  const setCollapsed = useSidebarStore((state) => {
+    return state.setCollapsed;
+  });
 
   const { data: workflow, isLoading } = useWorkflowQuery({
     workflowPermanentId,
+  });
+
+  useMountEffect(() => {
+    setCollapsed(true);
   });
 
   const saveWorkflowMutation = useMutation({
