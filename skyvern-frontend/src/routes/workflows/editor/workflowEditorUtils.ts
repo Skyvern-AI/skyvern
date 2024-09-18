@@ -658,6 +658,17 @@ function getOutputParameterKey(label: string) {
   return label + "_output";
 }
 
+function isOutputParameterKey(value: string) {
+  return value.endsWith("_output");
+}
+
+function getBlockNameOfOutputParameterKey(value: string) {
+  if (isOutputParameterKey(value)) {
+    return value.substring(0, value.length - 7);
+  }
+  return value;
+}
+
 function getUpdatedNodesAfterLabelUpdateForParameterKeys(
   id: string,
   newLabel: string,
@@ -765,4 +776,6 @@ export {
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
   getAdditionalParametersForEmailBlock,
   getLabelForExistingNode,
+  isOutputParameterKey,
+  getBlockNameOfOutputParameterKey,
 };
