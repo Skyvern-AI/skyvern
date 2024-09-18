@@ -42,7 +42,6 @@ function EditableNodeTitle({
             <HorizontallyResizingInput
               disabled={!editable}
               size={1}
-              autoFocus
               className={cn("nopan w-min border-0 p-0", inputClassName)}
               onBlur={(event) => {
                 if (!editable) {

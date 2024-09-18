@@ -1,6 +1,4 @@
-import { Checkbox } from "@/components/ui/checkbox";
-import { useWorkflowParametersState } from "../../useWorkflowParametersState";
-import { Label } from "@/components/ui/label";
+import { MultiSelect } from "@/components/ui/multi-select";
 import {
   Tooltip,
   TooltipContent,
@@ -8,6 +6,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { QuestionMarkCircledIcon } from "@radix-ui/react-icons";
+import { useWorkflowParametersState } from "../../useWorkflowParametersState";
 
 type Props = {
   availableOutputParameters: Array<string>;
@@ -25,15 +24,12 @@ function TaskNodeParametersPanel({
     .map((parameter) => parameter.key)
     .concat(availableOutputParameters);
 
-  function toggleParameter(key: string) {
-    if (parameters.includes(key)) {
-      onParametersChange(
-        parameters.filter((parameterKey) => parameterKey !== key),
-      );
-    } else {
-      onParametersChange([...parameters, key]);
-    }
-  }
+  const options = keys.map((key) => {
+    return {
+      label: key,
+      value: key,
+    };
+  });
 
   return (
     <div className="space-y-4">
@@ -50,33 +46,13 @@ function TaskNodeParametersPanel({
           </Tooltip>
         </TooltipProvider>
       </header>
-      <div className="flex flex-wrap gap-2">
-        {keys.map((key) => {
-          return (
-            <div
-              key={key}
-              className="flex cursor-pointer items-center gap-2 rounded-sm bg-slate-elevation1 px-3 py-2"
-              id={key}
-            >
-              <Checkbox
-                checked={parameters.includes(key)}
-                onCheckedChange={() => {
-                  toggleParameter(key);
-                }}
-              />
-              <Label
-                htmlFor={key}
-                className="cursor-pointer text-xs"
-                onClick={() => {
-                  toggleParameter(key);
-                }}
-              >
-                {key}
-              </Label>
-            </div>
-          );
-        })}
-      </div>
+      <MultiSelect
+        defaultValue={parameters}
+        value={parameters}
+        onValueChange={onParametersChange}
+        options={options}
+        maxCount={50}
+      />
     </div>
   );
 }
