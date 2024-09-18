@@ -502,3 +502,9 @@ class FailToFindAutocompleteOption(SkyvernException):
         super().__init__(
             f"Can't find a suitable auto completion for the current value, maybe retry with another reasonable value. current_value={current_value}"
         )
+
+
+class IllegitComplete(SkyvernException):
+    def __init__(self, data: dict | None = None) -> None:
+        data_str = f", data={data}" if data else ""
+        super().__init__(f"Illegit complete{data_str}")
