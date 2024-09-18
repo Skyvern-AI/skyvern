@@ -47,7 +47,6 @@ function TaskNodeParametersPanel({
         </TooltipProvider>
       </header>
       <MultiSelect
-        defaultValue={parameters}
         value={parameters}
         onValueChange={onParametersChange}
         options={options}
