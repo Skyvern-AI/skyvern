@@ -3,45 +3,45 @@ import { Toaster } from "@/components/ui/toaster";
 import { SideNav } from "./SideNav";
 import { PinLeftIcon, PinRightIcon } from "@radix-ui/react-icons";
 import { Logo } from "@/components/Logo";
-import { useState } from "react";
 import { cn } from "@/util/utils";
 import { Button } from "@/components/ui/button";
 import { LogoMinimized } from "@/components/LogoMinimized";
 import { Header } from "./Header";
+import { useSidebarStore } from "@/store/SidebarStore";
 
 function RootLayout() {
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const { collapsed, setCollapsed } = useSidebarStore();
 
   return (
     <>
       <div className="h-full w-full">
         <aside
           className={cn("fixed h-screen min-h-screen border-r-2 px-6", {
-            "w-64": !sidebarCollapsed,
-            "w-28": sidebarCollapsed,
+            "w-64": !collapsed,
+            "w-28": collapsed,
           })}
         >
           <div className="flex h-full flex-col">
             <Link to={window.location.origin}>
               <div className="flex h-24 items-center">
-                {sidebarCollapsed ? <LogoMinimized /> : <Logo />}
+                {collapsed ? <LogoMinimized /> : <Logo />}
               </div>
             </Link>
-            <SideNav collapsed={sidebarCollapsed} />
+            <SideNav collapsed={collapsed} />
             <div
               className={cn("mt-auto flex min-h-16", {
-                "justify-center": sidebarCollapsed,
-                "justify-end": !sidebarCollapsed,
+                "justify-center": collapsed,
+                "justify-end": !collapsed,
               })}
             >
               <Button
                 size="icon"
                 variant="ghost"
                 onClick={() => {
-                  setSidebarCollapsed(!sidebarCollapsed);
+                  setCollapsed(!collapsed);
                 }}
               >
-                {sidebarCollapsed ? (
+                {collapsed ? (
                   <PinRightIcon className="h-6 w-6" />
                 ) : (
                   <PinLeftIcon className="h-6 w-6" />
@@ -53,7 +53,7 @@ function RootLayout() {
         <Header />
         <main
           className={cn("pb-4 pl-64", {
-            "pl-28": sidebarCollapsed,
+            "pl-28": collapsed,
           })}
         >
           <Outlet />
