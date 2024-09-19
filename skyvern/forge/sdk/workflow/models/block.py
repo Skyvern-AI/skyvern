@@ -917,7 +917,7 @@ class SendEmailBlock(Block):
         if self.body and workflow_run_context.has_parameter(self.body) and workflow_run_context.has_value(self.body):
             # We're purposely not decrypting the body parameter value here because we don't want to expose secrets
             body_parameter_value = workflow_run_context.get_value(self.body)
-            msg.set_content(body_parameter_value)
+            msg.set_content(str(body_parameter_value))
         else:
             msg.set_content(self.body)
 
