@@ -30,6 +30,7 @@ RESERVED_ATTRIBUTES = {
     "checked",
     "data-original-title",  # for bootstrap tooltip
     "data-ui",
+    "disabled",  # for button
     "for",
     "href",  # For a tags
     "maxlength",
