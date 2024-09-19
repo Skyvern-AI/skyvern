@@ -770,7 +770,7 @@ async function getSelect2OptionElements(element) {
     if (newOptionList.length === oldOptionCount) {
       console.log("no more options loaded, wait 5s to query again");
       // sometimes need more time to load the options, so sleep 10s and try again
-      await sleep(5000); // wait 5s
+      await globalSleep(5000); // wait 5s
       newOptionList = document.querySelectorAll("[id='select2-drop'] ul li");
       console.log(newOptionList.length, " options found, after 5s");
     }
@@ -816,7 +816,7 @@ async function getReactSelectOptionElements(element) {
   let optionList = [];
   // wait for 2s until the element is updated with `aria-controls`
   console.log("wait 2s for the dropdown being updated.");
-  await sleep(2000);
+  await globalSleep(2000);
 
   dropdownId = element.getAttribute("aria-controls");
   if (!dropdownId) {
@@ -830,7 +830,7 @@ async function getReactSelectOptionElements(element) {
   while (true) {
     // sometimes need more time to load the options
     console.log("wait 5s to load all options");
-    await sleep(5000); // wait 5s
+    await globalSleep(5000); // wait 5s
     optionList = dropdownDiv.querySelectorAll("div[class*='select__option']");
     if (optionList.length === 0) {
       break;
@@ -1674,7 +1674,7 @@ function scrollToElementTop(element) {
   });
 }
 
-async function sleep(ms) {
+async function globalSleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
