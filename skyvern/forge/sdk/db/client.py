@@ -852,6 +852,23 @@ class AgentDB:
             await session.refresh(workflow)
             return convert_to_workflow(workflow, self.debug_enabled)
 
+    async def soft_delete_workflow_by_id(self, workflow_id: str, organization_id: str) -> None:
+        try:
+            async with self.Session() as session:
+                # soft delete the workflow by setting the deleted_at field to the current time
+                update_deleted_at_query = (
+                    update(WorkflowModel)
+                    .where(WorkflowModel.workflow_id == workflow_id)
+                    .where(WorkflowModel.organization_id == organization_id)
+                    .where(WorkflowModel.deleted_at.is_(None))
+                    .values(deleted_at=datetime.utcnow())
+                )
+                await session.execute(update_deleted_at_query)
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in soft_delete_workflow_by_id", exc_info=True)
+            raise
+
     async def get_workflow(self, workflow_id: str, organization_id: str | None = None) -> Workflow | None:
         try:
             async with self.Session() as session:
@@ -872,13 +889,12 @@ class AgentDB:
         workflow_permanent_id: str,
         organization_id: str | None = None,
         version: int | None = None,
+        exclude_deleted: bool = True,
     ) -> Workflow | None:
         try:
-            get_workflow_query = (
-                select(WorkflowModel)
-                .filter_by(workflow_permanent_id=workflow_permanent_id)
-                .filter(WorkflowModel.deleted_at.is_(None))
-            )
+            get_workflow_query = select(WorkflowModel).filter_by(workflow_permanent_id=workflow_permanent_id)
+            if exclude_deleted:
+                get_workflow_query = get_workflow_query.filter(WorkflowModel.deleted_at.is_(None))
             if organization_id:
                 get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
             if version:

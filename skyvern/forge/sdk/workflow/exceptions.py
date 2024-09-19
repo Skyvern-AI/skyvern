@@ -20,6 +20,22 @@ class WorkflowDefinitionHasDuplicateBlockLabels(BaseWorkflowHTTPException):
         )
 
 
+class FailedToCreateWorkflow(BaseWorkflowHTTPException):
+    def __init__(self, error_message: str) -> None:
+        super().__init__(
+            f"Failed to create workflow. Error: {error_message}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+class FailedToUpdateWorkflow(BaseWorkflowHTTPException):
+    def __init__(self, workflow_permanent_id: str, error_message: str) -> None:
+        super().__init__(
+            f"Failed to update workflow with ID {workflow_permanent_id}. Error: {error_message}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
 class OutputParameterKeyCollisionError(BaseWorkflowHTTPException):
     def __init__(self, key: str, retry_count: int | None = None) -> None:
         message = f"Output parameter key {key} already exists in the context manager."

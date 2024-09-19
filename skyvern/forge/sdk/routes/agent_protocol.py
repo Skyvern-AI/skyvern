@@ -43,6 +43,7 @@ from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, Task
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.workflow.exceptions import FailedToCreateWorkflow, FailedToUpdateWorkflow
 from skyvern.forge.sdk.workflow.models.workflow import (
     RunWorkflowResponse,
     Workflow,
@@ -664,10 +665,14 @@ async def create_workflow(
     except yaml.YAMLError:
         raise HTTPException(status_code=422, detail="Invalid YAML")
 
-    workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
-    return await app.WORKFLOW_SERVICE.create_workflow_from_request(
-        organization_id=current_org.organization_id, request=workflow_create_request
-    )
+    try:
+        workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
+        return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+            organization_id=current_org.organization_id, request=workflow_create_request
+        )
+    except Exception as e:
+        LOG.error("Failed to create workflow", exc_info=True)
+        raise FailedToCreateWorkflow(str(e))
 
 
 @base_router.put(
@@ -704,12 +709,16 @@ async def update_workflow(
     except yaml.YAMLError:
         raise HTTPException(status_code=422, detail="Invalid YAML")
 
-    workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
-    return await app.WORKFLOW_SERVICE.create_workflow_from_request(
-        organization_id=current_org.organization_id,
-        request=workflow_create_request,
-        workflow_permanent_id=workflow_permanent_id,
-    )
+    try:
+        workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
+        return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+            organization_id=current_org.organization_id,
+            request=workflow_create_request,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+    except Exception as e:
+        LOG.exception("Failed to update workflow", workflow_permanent_id=workflow_permanent_id)
+        raise FailedToUpdateWorkflow(workflow_permanent_id, f"<{type(e).__name__}: {str(e)}>")
 
 
 @base_router.delete("/workflows/{workflow_permanent_id}")
