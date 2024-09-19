@@ -318,11 +318,13 @@ class WorkflowService:
         workflow_permanent_id: str,
         organization_id: str | None = None,
         version: int | None = None,
+        exclude_deleted: bool = True,
     ) -> Workflow:
         workflow = await app.DATABASE.get_workflow_by_permanent_id(
             workflow_permanent_id,
             organization_id=organization_id,
             version=version,
+            exclude_deleted=exclude_deleted,
         )
         if not workflow:
             raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
@@ -373,6 +375,16 @@ class WorkflowService:
     ) -> None:
         await app.DATABASE.soft_delete_workflow_by_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
+
+    async def delete_workflow_by_id(
+        self,
+        workflow_id: str,
+        organization_id: str,
+    ) -> None:
+        await app.DATABASE.soft_delete_workflow_by_id(
+            workflow_id=workflow_id,
             organization_id=organization_id,
         )
 
@@ -820,11 +832,13 @@ class WorkflowService:
             organization_id=organization_id,
             title=request.title,
         )
+        new_workflow_id: str | None = None
         try:
             if workflow_permanent_id:
                 existing_latest_workflow = await self.get_workflow_by_permanent_id(
                     workflow_permanent_id=workflow_permanent_id,
                     organization_id=organization_id,
+                    exclude_deleted=False,
                 )
                 existing_version = existing_latest_workflow.version
                 workflow = await self.create_workflow(
@@ -854,6 +868,8 @@ class WorkflowService:
                     persist_browser_session=request.persist_browser_session,
                     is_saved_task=request.is_saved_task,
                 )
+            # Keeping track of the new workflow id to delete it if an error occurs during the creation process
+            new_workflow_id = workflow.workflow_id
             # Create parameters from the request
             parameters: dict[str, PARAMETER_TYPE] = {}
             duplicate_parameter_keys = set()
@@ -991,7 +1007,11 @@ class WorkflowService:
             )
             return workflow
         except Exception as e:
-            LOG.exception(f"Failed to create workflow from request, title: {request.title}")
+            if new_workflow_id:
+                LOG.error(f"Failed to create workflow from request, deleting workflow {new_workflow_id}")
+                await self.delete_workflow_by_id(workflow_id=new_workflow_id, organization_id=organization_id)
+            else:
+                LOG.exception(f"Failed to create workflow from request, title: {request.title}")
             raise e
 
     @staticmethod
