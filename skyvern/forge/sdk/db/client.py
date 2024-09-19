@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta
 from typing import Any, Sequence
 
@@ -1110,7 +1111,7 @@ class AgentDB:
                     workflow_id=workflow_id,
                     workflow_parameter_type=workflow_parameter_type,
                     key=key,
-                    default_value=default_value,
+                    default_value=json.dumps(default_value),
                     description=description,
                 )
                 session.add(workflow_parameter)
