@@ -240,6 +240,20 @@ class TaskBlock(Block):
                 )
                 self.url = task_url_parameter_value
 
+        if (
+            self.totp_identifier
+            and workflow_run_context.has_parameter(self.totp_identifier)
+            and workflow_run_context.has_value(self.totp_identifier)
+        ):
+            totp_identifier_parameter_value = workflow_run_context.get_value(self.totp_identifier)
+            if totp_identifier_parameter_value:
+                LOG.info(
+                    "TOTP identifier is parameterized, using parameter value",
+                    totp_identifier_parameter_value=totp_identifier_parameter_value,
+                    totp_identifier_parameter_key=self.totp_identifier,
+                )
+                self.totp_identifier = totp_identifier_parameter_value
+
         if self.download_suffix and workflow_run_context.has_parameter(self.download_suffix):
             download_suffix_parameter_value = workflow_run_context.get_value(self.download_suffix)
             if download_suffix_parameter_value:
