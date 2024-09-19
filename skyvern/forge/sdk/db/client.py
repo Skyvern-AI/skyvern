@@ -1123,11 +1123,16 @@ class AgentDB:
     ) -> WorkflowParameter:
         try:
             async with self.Session() as session:
+                default_value = (
+                    json.dumps(default_value)
+                    if workflow_parameter_type == WorkflowParameterType.JSON
+                    else default_value
+                )
                 workflow_parameter = WorkflowParameterModel(
                     workflow_id=workflow_id,
                     workflow_parameter_type=workflow_parameter_type,
                     key=key,
-                    default_value=json.dumps(default_value),
+                    default_value=default_value,
                     description=description,
                 )
                 session.add(workflow_parameter)
