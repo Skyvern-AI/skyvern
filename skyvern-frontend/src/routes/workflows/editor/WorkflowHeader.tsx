@@ -3,11 +3,16 @@ import { Button } from "@/components/ui/button";
 import {
   ChevronDownIcon,
   ChevronUpIcon,
-  ExitIcon,
   PlayIcon,
 } from "@radix-ui/react-icons";
 import { useNavigate, useParams } from "react-router-dom";
 import { EditableNodeTitle } from "./nodes/components/EditableNodeTitle";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 type Props = {
   title: string;
@@ -28,30 +33,8 @@ function WorkflowHeader({
   const navigate = useNavigate();
 
   return (
-    <div className="flex h-full w-full bg-slate-elevation2">
-      <div className="flex h-full w-1/3 items-center pl-6">
-        <div className="flex">
-          <div
-            className="cursor-pointer rounded-full p-2 hover:bg-slate-elevation5"
-            onClick={() => {
-              navigate("/workflows");
-            }}
-          >
-            <ExitIcon className="h-6 w-6" />
-          </div>
-          <div>
-            <div
-              className="cursor-pointer rounded-full p-2 hover:bg-slate-elevation5"
-              onClick={() => {
-                onSave();
-              }}
-            >
-              <SaveIcon />
-            </div>
-          </div>
-        </div>
-      </div>
-      <div className="flex h-full w-1/3 items-center justify-center p-1">
+    <div className="flex h-full w-full justify-between bg-slate-elevation2 px-6 py-5">
+      <div className="flex h-full items-center">
         <EditableNodeTitle
           editable={true}
           onChange={onTitleChange}
@@ -60,7 +43,23 @@ function WorkflowHeader({
           inputClassName="text-3xl"
         />
       </div>
-      <div className="flex h-full w-1/3 items-center justify-end gap-4 p-4">
+      <div className="flex h-full w-1/3 items-center justify-end gap-4">
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                size="icon"
+                variant="tertiary"
+                onClick={() => {
+                  onSave();
+                }}
+              >
+                <SaveIcon />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Save</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
         <Button variant="secondary" size="lg" onClick={onParametersClick}>
           <span className="mr-2">Parameters</span>
           {parametersPanelOpen ? (
