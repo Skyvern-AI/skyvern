@@ -50,6 +50,7 @@ function WorkflowHeader({
               <Button
                 size="icon"
                 variant="tertiary"
+                className="size-10"
                 onClick={() => {
                   onSave();
                 }}
@@ -60,7 +61,7 @@ function WorkflowHeader({
             <TooltipContent>Save</TooltipContent>
           </Tooltip>
         </TooltipProvider>
-        <Button variant="secondary" size="lg" onClick={onParametersClick}>
+        <Button variant="tertiary" size="lg" onClick={onParametersClick}>
           <span className="mr-2">Parameters</span>
           {parametersPanelOpen ? (
             <ChevronUpIcon className="h-6 w-6" />
