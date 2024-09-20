@@ -84,6 +84,8 @@ class InteractiveElement(StrEnum):
 
 
 SELECTABLE_ELEMENT = [InteractiveElement.INPUT, InteractiveElement.SELECT]
+RAW_INPUT_TYPE_VALUE = ["number", "url", "tel", "email", "username", "password"]
+RAW_INPUT_NAME_VALUE = ["name", "email", "username", "password", "phone"]
 
 
 class SkyvernOptionType(typing.TypedDict):
@@ -196,6 +198,23 @@ class SkyvernElement:
 
         button_type = await self.get_attr("type")
         return button_type == "radio"
+
+    async def is_raw_input(self) -> bool:
+        if self.get_tag_name() != InteractiveElement.INPUT:
+            return False
+
+        if await self.is_spinbtn_input():
+            return True
+
+        input_type = str(await self.get_attr("type"))
+        if input_type.lower() in RAW_INPUT_TYPE_VALUE:
+            return True
+
+        name = str(await self.get_attr("name"))
+        if name.lower() in RAW_INPUT_NAME_VALUE:
+            return True
+
+        return False
 
     async def is_spinbtn_input(self) -> bool:
         """
