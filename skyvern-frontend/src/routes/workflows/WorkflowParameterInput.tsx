@@ -3,6 +3,8 @@ import { FileInputValue, FileUpload } from "@/components/FileUpload";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { CodeEditor } from "./components/CodeEditor";
+import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
+import { Label } from "@/components/ui/label";
 
 type Props = {
   type: WorkflowParameterValueType;
@@ -26,7 +28,7 @@ function WorkflowParameterInput({ type, value, onChange }: Props) {
 
   if (type === "string") {
     return (
-      <Input
+      <AutoResizingTextarea
         value={value as string}
         onChange={(e) => onChange(e.target.value)}
       />
@@ -55,12 +57,16 @@ function WorkflowParameterInput({ type, value, onChange }: Props) {
   }
 
   if (type === "boolean") {
+    const checked = typeof value === "boolean" ? value : Boolean(value);
     return (
-      <Checkbox
-        checked={value as boolean}
-        onCheckedChange={(checked) => onChange(checked)}
-        className="block"
-      />
+      <div className="flex items-center gap-2">
+        <Checkbox
+          checked={checked}
+          onCheckedChange={(checked) => onChange(checked)}
+          className="block"
+        />
+        <Label>{value ? "True" : "False"}</Label>
+      </div>
     );
   }
 

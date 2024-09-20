@@ -30,7 +30,7 @@ export type ParameterYAMLBase = {
 export type WorkflowParameterYAML = ParameterYAMLBase & {
   parameter_type: "workflow";
   workflow_parameter_type: string;
-  default_value: string | null;
+  default_value?: unknown;
 };
 
 export type BitwardenLoginCredentialParameterYAML = ParameterYAMLBase & {

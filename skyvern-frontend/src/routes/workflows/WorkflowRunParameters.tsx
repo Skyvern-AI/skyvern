@@ -45,10 +45,6 @@ function WorkflowRunParameters() {
     ? location.state.data
     : workflowParameters?.reduce(
         (acc, curr) => {
-          if (curr.workflow_parameter_type === "file_url") {
-            acc[curr.key] = null;
-            return acc;
-          }
           if (curr.workflow_parameter_type === "json") {
             if (typeof curr.default_value === "string") {
               acc[curr.key] = curr.default_value;
@@ -58,6 +54,13 @@ function WorkflowRunParameters() {
               acc[curr.key] = JSON.stringify(curr.default_value, null, 2);
               return acc;
             }
+          }
+          if (
+            curr.default_value &&
+            curr.workflow_parameter_type === "boolean"
+          ) {
+            acc[curr.key] = Boolean(curr.default_value);
+            return acc;
           }
           if (curr.default_value) {
             acc[curr.key] = curr.default_value;

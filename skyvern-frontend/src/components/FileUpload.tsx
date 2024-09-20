@@ -150,7 +150,7 @@ function FileUpload({ value, onChange }: Props) {
               accept=".csv"
               className="hidden"
             />
-            <div className="flex max-w-full gap-2 truncate">
+            <div className="flex max-w-full gap-2 px-2">
               {uploadFileMutation.isPending && (
                 <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
               )}
