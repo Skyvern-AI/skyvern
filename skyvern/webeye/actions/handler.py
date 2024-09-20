@@ -416,7 +416,7 @@ async def handle_input_text_action(
 
     incremental_element: list[dict] = []
     # check if it's selectable
-    if skyvern_element.get_tag_name() == InteractiveElement.INPUT and not await skyvern_element.is_spinbtn_input():
+    if skyvern_element.get_tag_name() == InteractiveElement.INPUT and not await skyvern_element.is_raw_input():
         await skyvern_element.scroll_into_view()
         select_action = SelectOptionAction(
             reasoning=action.reasoning,
