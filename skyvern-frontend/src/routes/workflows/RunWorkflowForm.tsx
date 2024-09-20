@@ -1,5 +1,4 @@
 import { getClient } from "@/api/AxiosClient";
-import { WorkflowParameter } from "@/api/types";
 import { Form, FormControl, FormField, FormItem } from "@/components/ui/form";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -22,6 +21,7 @@ import fetchToCurl from "fetch-to-curl";
 import { apiBaseUrl } from "@/util/env";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { copyText } from "@/util/copyText";
+import { WorkflowParameter } from "./types/workflowTypes";
 
 type Props = {
   workflowParameters: Array<WorkflowParameter>;
@@ -151,6 +151,9 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
                           } catch (e) {
                             return "Invalid JSON";
                           }
+                        }
+                        if (value === null) {
+                          return "This field is required";
                         }
                       },
                     }}
