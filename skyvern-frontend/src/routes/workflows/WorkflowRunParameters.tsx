@@ -1,9 +1,12 @@
 import { getClient } from "@/api/AxiosClient";
-import { WorkflowApiResponse, WorkflowParameterValueType } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 import { useLocation, useParams } from "react-router-dom";
 import { RunWorkflowForm } from "./RunWorkflowForm";
+import {
+  WorkflowApiResponse,
+  WorkflowParameterValueType,
+} from "./types/workflowTypes";
 
 function defaultValue(type: WorkflowParameterValueType) {
   switch (type) {
