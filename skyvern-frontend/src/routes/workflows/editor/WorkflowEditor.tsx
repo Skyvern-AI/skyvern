@@ -59,6 +59,7 @@ function WorkflowEditor() {
                   key: parameter.key,
                   parameterType: "workflow",
                   dataType: parameter.workflow_parameter_type,
+                  defaultValue: parameter.default_value,
                 };
               } else {
                 return {

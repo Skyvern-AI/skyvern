@@ -13,6 +13,10 @@ import {
 } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import { ParametersState } from "../FlowRenderer";
+import { Checkbox } from "@/components/ui/checkbox";
+import { getDefaultValueForParameterType } from "../workflowEditorUtils";
+import { WorkflowParameterInput } from "../../WorkflowParameterInput";
+import { toast } from "@/components/ui/use-toast";
 
 type Props = {
   type: "workflow" | "credential";
@@ -56,6 +60,21 @@ function WorkflowParameterEditPanel({
         : "string",
     );
 
+  const [defaultValueState, setDefaultValueState] = useState<{
+    hasDefaultValue: boolean;
+    defaultValue: unknown;
+  }>(
+    initialValues.parameterType === "workflow"
+      ? {
+          hasDefaultValue: initialValues.defaultValue !== null,
+          defaultValue: initialValues.defaultValue ?? null,
+        }
+      : {
+          hasDefaultValue: false,
+          defaultValue: null,
+        },
+  );
+
   return (
     <div className="space-y-4">
       <header className="flex items-center justify-between">
@@ -76,28 +95,90 @@ function WorkflowParameterEditPanel({
         />
       </div>
       {type === "workflow" && (
-        <div className="space-y-1">
-          <Label className="text-xs">Value Type</Label>
-          <Select
-            value={parameterType}
-            onValueChange={(value) =>
-              setParameterType(value as WorkflowParameterValueType)
-            }
-          >
-            <SelectTrigger className="w-full">
-              <SelectValue placeholder="Select a type" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectGroup>
-                {workflowParameterTypeOptions.map((option) => (
-                  <SelectItem key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectGroup>
-            </SelectContent>
-          </Select>
-        </div>
+        <>
+          <div className="space-y-1">
+            <Label className="text-xs">Value Type</Label>
+            <Select
+              value={parameterType}
+              onValueChange={(value) => {
+                setParameterType(value as WorkflowParameterValueType);
+                setDefaultValueState((state) => {
+                  return {
+                    ...state,
+                    defaultValue: getDefaultValueForParameterType(
+                      value as WorkflowParameterValueType,
+                    ),
+                  };
+                });
+              }}
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue placeholder="Select a type" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  {workflowParameterTypeOptions.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-4">
+            <div className="flex items-center gap-2">
+              <Checkbox
+                checked={defaultValueState.hasDefaultValue}
+                onCheckedChange={(checked) => {
+                  if (!checked) {
+                    setDefaultValueState({
+                      hasDefaultValue: false,
+                      defaultValue: null,
+                    });
+                    return;
+                  }
+                  setDefaultValueState({
+                    hasDefaultValue: true,
+                    defaultValue:
+                      getDefaultValueForParameterType(parameterType),
+                  });
+                }}
+              />
+              <Label className="text-xs text-slate-300">
+                Use Default Value
+              </Label>
+            </div>
+            {defaultValueState.hasDefaultValue && (
+              <WorkflowParameterInput
+                onChange={(value) => {
+                  if (
+                    parameterType === "file_url" &&
+                    typeof value === "object" &&
+                    value &&
+                    "s3uri" in value
+                  ) {
+                    setDefaultValueState((state) => {
+                      return {
+                        ...state,
+                        defaultValue: value,
+                      };
+                    });
+                    return;
+                  }
+                  setDefaultValueState((state) => {
+                    return {
+                      ...state,
+                      defaultValue: value,
+                    };
+                  });
+                }}
+                type={parameterType}
+                value={defaultValueState.defaultValue}
+              />
+            )}
+          </div>
+        </>
       )}
       {type === "credential" && (
         <>
@@ -121,11 +202,32 @@ function WorkflowParameterEditPanel({
         <Button
           onClick={() => {
             if (type === "workflow") {
+              if (
+                parameterType === "json" &&
+                typeof defaultValueState.defaultValue === "string"
+              ) {
+                try {
+                  JSON.parse(defaultValueState.defaultValue);
+                } catch (e) {
+                  toast({
+                    variant: "destructive",
+                    title: "Failed to save parameters",
+                    description: "Invalid JSON for default value",
+                  });
+                  return;
+                }
+              }
+              const defaultValue =
+                parameterType === "json" &&
+                typeof defaultValueState.defaultValue === "string"
+                  ? JSON.parse(defaultValueState.defaultValue)
+                  : defaultValueState.defaultValue;
               onSave({
                 key,
                 parameterType: "workflow",
                 dataType: parameterType,
                 description,
+                defaultValue: defaultValue,
               });
             }
             if (type === "credential") {

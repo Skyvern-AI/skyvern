@@ -1,7 +1,10 @@
 import Dagre from "@dagrejs/dagre";
 import { Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
-import type { WorkflowBlock } from "../types/workflowTypes";
+import type {
+  WorkflowBlock,
+  WorkflowParameterValueType,
+} from "../types/workflowTypes";
 import { BlockYAML, ParameterYAML } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -764,6 +767,29 @@ function getLabelForExistingNode(label: string, existingLabels: Array<string>) {
   return label;
 }
 
+function getDefaultValueForParameterType(
+  parameterType: WorkflowParameterValueType,
+): unknown {
+  switch (parameterType) {
+    case "json": {
+      return "{}";
+    }
+    case "string": {
+      return "";
+    }
+    case "boolean": {
+      return false;
+    }
+    case "float":
+    case "integer": {
+      return 0;
+    }
+    case "file_url": {
+      return null;
+    }
+  }
+}
+
 export {
   createNode,
   generateNodeData,
@@ -778,4 +804,5 @@ export {
   getLabelForExistingNode,
   isOutputParameterKey,
   getBlockNameOfOutputParameterKey,
+  getDefaultValueForParameterType,
 };

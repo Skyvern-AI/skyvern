@@ -73,7 +73,9 @@ function convertToParametersYAML(
         key: parameter.key,
         description: parameter.description || null,
         workflow_parameter_type: parameter.dataType,
-        default_value: null,
+        ...(parameter.defaultValue === null
+          ? {}
+          : { default_value: parameter.defaultValue }),
       };
     } else {
       return {
@@ -98,6 +100,7 @@ export type ParametersState = Array<
       parameterType: "workflow";
       dataType: WorkflowParameterValueType;
       description?: string;
+      defaultValue: unknown;
     }
   | {
       key: string;

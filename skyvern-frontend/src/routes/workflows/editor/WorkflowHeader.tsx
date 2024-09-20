@@ -43,7 +43,7 @@ function WorkflowHeader({
           inputClassName="text-3xl"
         />
       </div>
-      <div className="flex h-full w-1/3 items-center justify-end gap-4">
+      <div className="flex h-full items-center justify-end gap-4">
         <TooltipProvider>
           <Tooltip>
             <TooltipTrigger asChild>
