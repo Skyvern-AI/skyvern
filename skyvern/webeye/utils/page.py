@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Dict, List
+from typing import Dict, List
 
 import structlog
 from playwright._impl._errors import TimeoutError
@@ -166,21 +166,6 @@ class SkyvernFrame:
 
     async def scroll_to_element_top(self, element: ElementHandle) -> None:
         js_script = "(element) => scrollToElementTop(element)"
-        return await self.frame.evaluate(js_script, element)
-
-    async def get_select2_options(self, element: ElementHandle) -> List[Dict[str, Any]]:
-        await self.frame.evaluate(JS_FUNCTION_DEFS)
-        js_script = "async (element) => await getSelect2Options(element)"
-        return await self.frame.evaluate(js_script, element)
-
-    async def get_react_select_options(self, element: ElementHandle) -> List[Dict[str, Any]]:
-        await self.frame.evaluate(JS_FUNCTION_DEFS)
-        js_script = "async (element) => await getReactSelectOptions(element)"
-        return await self.frame.evaluate(js_script, element)
-
-    async def get_combobox_options(self, element: ElementHandle) -> List[Dict[str, Any]]:
-        await self.frame.evaluate(JS_FUNCTION_DEFS)
-        js_script = "async (element) => await getListboxOptions(element)"
         return await self.frame.evaluate(js_script, element)
 
     async def parse_element_from_html(self, frame: str, element: ElementHandle, interactable: bool) -> Dict:
