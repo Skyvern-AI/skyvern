@@ -46,6 +46,7 @@ from skyvern.webeye.actions.actions import (
     Action,
     ActionType,
     CompleteAction,
+    DecisiveAction,
     UserDefinedError,
     WebAction,
     parse_actions,
@@ -265,7 +266,9 @@ class ForgeAgent:
             if page := await browser_state.get_working_page():
                 self.register_async_operations(organization, task, page)
 
-            step, detailed_output = await self.agent_step(task, step, browser_state, organization=organization)
+            step, detailed_output = await self.agent_step(
+                task, step, browser_state, organization=organization, task_block=task_block
+            )
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)
             retry = False
 
@@ -514,6 +517,7 @@ class ForgeAgent:
         step: Step,
         browser_state: BrowserState,
         organization: Organization | None = None,
+        task_block: TaskBlock | None = None,
     ) -> tuple[Step, DetailedAgentStepOutput]:
         detailed_agent_step_output = DetailedAgentStepOutput(
             scraped_page=None,
@@ -773,13 +777,27 @@ class ForgeAgent:
                 step_retry=step.retry_index,
                 action_results=action_results,
             )
-            if app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                "CHECK_USER_GOAL_SUCCESS_EVERY_STEP",
-                task.workflow_run_id or task.task_id,
-                properties={
-                    "organization_id": task.organization_id,
-                    "organization_created_at": str(organization.created_at) if organization else None,
-                },
+
+            # Check if Skyvern already returned a complete action, if so, don't run user goal check
+            has_decisive_action = False
+            if detailed_agent_step_output and detailed_agent_step_output.actions_and_results:
+                for action, results in detailed_agent_step_output.actions_and_results:
+                    if isinstance(action, DecisiveAction):
+                        has_decisive_action = True
+                        break
+
+            task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
+            if (
+                not has_decisive_action
+                and not task_completes_on_download
+                and app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                    "CHECK_USER_GOAL_SUCCESS_EVERY_STEP",
+                    task.workflow_run_id or task.task_id,
+                    properties={
+                        "organization_id": task.organization_id,
+                        "organization_created_at": str(organization.created_at) if organization else None,
+                    },
+                )
             ):
                 LOG.info("Checking if user goal is achieved after re-scraping the page")
                 # Check if navigation goal is achieved after re-scraping the page
@@ -803,6 +821,7 @@ class ForgeAgent:
                     if result_tuple is not None:
                         complete_action, action_results = result_tuple
                         detailed_agent_step_output.actions_and_results.append((complete_action, action_results))
+                        await self.record_artifacts_after_action(task, step, browser_state)
             # If no action errors return the agent state and output
             completed_step = await self.update_step(
                 step=step,
@@ -846,12 +865,6 @@ class ForgeAgent:
         page: Page, scraped_page: ScrapedPage, task: Task, step: Step
     ) -> tuple[CompleteAction, list[ActionResult]] | None:
         try:
-            # Check if Skyvern already returned a complete action, if so, don't run verification
-            if step.output and step.output.actions_and_results:
-                for action, results in step.output.actions_and_results:
-                    if isinstance(action, CompleteAction):
-                        return None
-
             verification_prompt = prompt_engine.load_prompt(
                 "check-user-goal",
                 navigation_goal=task.navigation_goal,
