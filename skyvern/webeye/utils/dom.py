@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import typing
-from abc import ABC, abstractmethod
 from enum import StrEnum
 from random import uniform
 
@@ -12,25 +11,18 @@ from playwright.async_api import ElementHandle, Frame, FrameLocator, Locator, Pa
 
 from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.exceptions import (
-    ElementIsNotComboboxDropdown,
     ElementIsNotLabel,
-    ElementIsNotReactSelectDropdown,
-    ElementIsNotSelect2Dropdown,
-    FailedToGetCurrentValueOfDropdown,
     MissingElement,
     MissingElementDict,
     MissingElementInCSSMap,
     MissingElementInIframe,
-    MultipleDropdownAnchorErr,
     MultipleElementsFound,
-    NoDropdownAnchorErr,
     NoElementBoudingBox,
     NoneFrameError,
     SkyvernException,
 )
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, ScrapedPage, json_to_html, trim_element
-from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
@@ -276,27 +268,6 @@ class SkyvernElement:
         assert handler is not None
         return handler
 
-    async def get_select2_dropdown(self) -> Select2Dropdown:
-        if not await self.is_select2_dropdown():
-            raise ElementIsNotSelect2Dropdown(self.get_id(), self.__static_element)
-
-        frame = await SkyvernFrame.create_instance(self.get_frame())
-        return Select2Dropdown(frame, self)
-
-    async def get_react_select_dropdown(self) -> ReactSelectDropdown:
-        if not await self.is_react_select_dropdown():
-            raise ElementIsNotReactSelectDropdown(self.get_id(), self.__static_element)
-
-        frame = await SkyvernFrame.create_instance(self.get_frame())
-        return ReactSelectDropdown(frame, self)
-
-    async def get_combobox_dropdown(self) -> ComboboxDropdown:
-        if not await self.is_combobox_dropdown():
-            raise ElementIsNotComboboxDropdown(self.get_id(), self.__static_element)
-
-        frame = await SkyvernFrame.create_instance(self.get_frame())
-        return ComboboxDropdown(frame, self)
-
     def find_element_id_in_label_children(self, element_type: InteractiveElement) -> str | None:
         tag_name = self.get_tag_name()
         if tag_name != "label":
@@ -540,212 +511,3 @@ class DomUtil:
             raise MultipleElementsFound(num=num_elements, selector=css, element_id=element_id)
 
         return SkyvernElement(locator, frame_content, element)
-
-
-class AbstractSelectDropdown(ABC):
-    @abstractmethod
-    def name(self) -> str:
-        pass
-
-    @abstractmethod
-    async def open(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
-        pass
-
-    @abstractmethod
-    async def close(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
-        pass
-
-    @abstractmethod
-    async def get_current_value(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> str:
-        pass
-
-    @abstractmethod
-    async def get_options(
-        self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> typing.List[SkyvernOptionType]:
-        pass
-
-    @abstractmethod
-    async def select_by_index(
-        self, index: int, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> None:
-        pass
-
-
-class Select2Dropdown(AbstractSelectDropdown):
-    def __init__(self, skyvern_frame: SkyvernFrame, skyvern_element: SkyvernElement) -> None:
-        self.skyvern_element = skyvern_element
-        self.skyvern_frame = skyvern_frame
-
-    async def __find_anchor(self, timeout: float) -> Locator:
-        locator = self.skyvern_element.get_frame().locator("[id='select2-drop']")
-        await locator.wait_for(state="visible", timeout=timeout)
-        cnt = await locator.count()
-        if cnt == 0:
-            raise NoDropdownAnchorErr(self.name(), self.skyvern_element.get_id())
-        if cnt > 1:
-            raise MultipleDropdownAnchorErr(self.name(), self.skyvern_element.get_id())
-        return locator
-
-    def name(self) -> str:
-        return "select2"
-
-    async def open(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
-        await self.skyvern_element.get_locator().click(timeout=timeout)
-        await self.__find_anchor(timeout=timeout)
-
-    async def close(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
-        anchor = await self.__find_anchor(timeout=timeout)
-        await anchor.press("Escape", timeout=timeout)
-
-    async def get_current_value(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> str:
-        tag_name = self.skyvern_element.get_tag_name()
-        if tag_name == "input":
-            # TODO: this is multiple options case, we haven't fully supported it yet.
-            return ""
-
-        # check SkyvernElement.is_select2_dropdown() method, only <a> and <span> element left
-        # we should make sure the locator is on <a>, so we're able to find the [class="select2-chosen"] child
-        locator = self.skyvern_element.get_locator()
-        if tag_name == "span":
-            locator = locator.locator("..")
-        elif tag_name == "a":
-            pass
-        else:
-            raise FailedToGetCurrentValueOfDropdown(
-                self.name(), self.skyvern_element.get_id(), "invalid element of select2"
-            )
-
-        try:
-            return await locator.locator("span[class='select2-chosen']").text_content(timeout=timeout)
-        except Exception as e:
-            raise FailedToGetCurrentValueOfDropdown(self.name(), self.skyvern_element.get_id(), repr(e))
-
-    async def get_options(
-        self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> typing.List[SkyvernOptionType]:
-        anchor = await self.__find_anchor(timeout=timeout)
-        element_handler = await anchor.element_handle(timeout=timeout)
-        options = await self.skyvern_frame.get_select2_options(element_handler)
-        return typing.cast(typing.List[SkyvernOptionType], options)
-
-    async def select_by_index(
-        self, index: int, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> None:
-        anchor = await self.__find_anchor(timeout=timeout)
-        options = anchor.locator("ul").locator("li")
-        await options.nth(index).click(timeout=timeout)
-
-
-class ReactSelectDropdown(AbstractSelectDropdown):
-    def __init__(self, skyvern_frame: SkyvernFrame, skyvern_element: SkyvernElement) -> None:
-        self.skyvern_element = skyvern_element
-        self.skyvern_frame = skyvern_frame
-
-    def __find_input_locator(self) -> Locator:
-        tag_name = self.skyvern_element.get_tag_name()
-        locator = self.skyvern_element.get_locator()
-
-        if tag_name == InteractiveElement.BUTTON:
-            return locator.locator("..").locator("..").locator("input[class*='select__input']")
-
-        return locator
-
-    async def __find_anchor(self, timeout: float) -> Locator:
-        input_locator = self.__find_input_locator()
-        anchor_id = await input_locator.get_attribute("aria-controls", timeout=timeout)
-
-        locator = self.skyvern_element.get_frame().locator(f"div[id='{anchor_id}']")
-        await locator.wait_for(state="visible", timeout=timeout)
-        cnt = await locator.count()
-        if cnt == 0:
-            raise NoDropdownAnchorErr(self.name(), self.skyvern_element.get_id())
-        if cnt > 1:
-            raise MultipleDropdownAnchorErr(self.name(), self.skyvern_element.get_id())
-        return locator
-
-    def name(self) -> str:
-        return "react-select"
-
-    async def open(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
-        await self.skyvern_element.get_locator().focus(timeout=timeout)
-        await self.skyvern_element.get_locator().press(key="ArrowDown", timeout=timeout)
-        await self.__find_anchor(timeout=timeout)
-
-    async def close(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
-        await self.__find_anchor(timeout=timeout)
-        await self.skyvern_element.get_locator().press(key="Escape", timeout=timeout)
-
-    async def get_current_value(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> str:
-        input_locator = self.__find_input_locator()
-        # TODO: only support single value now
-        value_locator = input_locator.locator("..").locator("..").locator("div[class*='select__single-value']")
-        if await value_locator.count() == 0:
-            return ""
-        try:
-            return await value_locator.text_content(timeout=timeout)
-        except Exception as e:
-            raise FailedToGetCurrentValueOfDropdown(self.name(), self.skyvern_element.get_id(), repr(e))
-
-    async def get_options(
-        self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> typing.List[SkyvernOptionType]:
-        input_locator = self.__find_input_locator()
-        element_handler = await input_locator.element_handle(timeout=timeout)
-        options = await self.skyvern_frame.get_react_select_options(element_handler)
-        return typing.cast(typing.List[SkyvernOptionType], options)
-
-    async def select_by_index(
-        self, index: int, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> None:
-        anchor = await self.__find_anchor(timeout=timeout)
-        options = anchor.locator("div[class*='select__option']")
-        await options.nth(index).click(timeout=timeout)
-
-
-class ComboboxDropdown(AbstractSelectDropdown):
-    def __init__(self, skyvern_frame: SkyvernFrame, skyvern_element: SkyvernElement) -> None:
-        self.skyvern_element = skyvern_element
-        self.skyvern_frame = skyvern_frame
-
-    async def __find_anchor(self, timeout: float) -> Locator:
-        control_id = await self.skyvern_element.get_attr("aria-controls", timeout=timeout)
-        locator = self.skyvern_element.get_frame().locator(f"[id='{control_id}']")
-        await locator.wait_for(state="visible", timeout=timeout)
-        cnt = await locator.count()
-        if cnt == 0:
-            raise NoDropdownAnchorErr(self.name(), self.skyvern_element.get_id())
-        if cnt > 1:
-            raise MultipleDropdownAnchorErr(self.name(), self.skyvern_element.get_id())
-        return locator
-
-    def name(self) -> str:
-        return "combobox"
-
-    async def open(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
-        await self.skyvern_element.get_locator().click(timeout=timeout)
-        await self.__find_anchor(timeout=timeout)
-
-    async def close(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
-        await self.skyvern_element.get_locator().press("Tab", timeout=timeout)
-
-    async def get_current_value(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> str:
-        try:
-            return await self.skyvern_element.get_attr("value", dynamic=True, timeout=timeout)
-        except Exception as e:
-            raise FailedToGetCurrentValueOfDropdown(self.name(), self.skyvern_element.get_id(), repr(e))
-
-    async def get_options(
-        self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> typing.List[SkyvernOptionType]:
-        anchor = await self.__find_anchor(timeout=timeout)
-        element_handler = await anchor.element_handle()
-        options = await self.skyvern_frame.get_combobox_options(element_handler)
-        return typing.cast(typing.List[SkyvernOptionType], options)
-
-    async def select_by_index(
-        self, index: int, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> None:
-        anchor = await self.__find_anchor(timeout=timeout)
-        options = anchor.locator("li[role='option']")
-        await options.nth(index).click(timeout=timeout)

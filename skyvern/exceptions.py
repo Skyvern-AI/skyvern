@@ -313,21 +313,6 @@ class ElementIsNotLabel(SkyvernException):
         super().__init__(f"<{tag_name}> element is not <label>")
 
 
-class ElementIsNotSelect2Dropdown(SkyvernException):
-    def __init__(self, element_id: str, element: dict):
-        super().__init__(f"element[{element}] is not select2 dropdown. element_id={element_id}")
-
-
-class ElementIsNotReactSelectDropdown(SkyvernException):
-    def __init__(self, element_id: str, element: dict):
-        super().__init__(f"element[{element}] is not react select dropdown. element_id={element_id}")
-
-
-class ElementIsNotComboboxDropdown(SkyvernException):
-    def __init__(self, element_id: str, element: dict):
-        super().__init__(f"element[{element}] is not combobox dropdown. element_id={element_id}")
-
-
 class NoneFrameError(SkyvernException):
     def __init__(self, frame_id: str):
         super().__init__(f"frame content is none. frame_id={frame_id}")
@@ -409,23 +394,6 @@ class ErrFoundSelectableElement(SkyvernException):
 class NoSelectableElementFound(SkyvernException):
     def __init__(self, element_id: str):
         super().__init__(f"No selectable elements found in the children list. element_id={element_id}")
-
-
-class NoDropdownAnchorErr(SkyvernException):
-    def __init__(self, dropdowm_type: str, element_id: str):
-        super().__init__(f"No {dropdowm_type} dropdown found. element_id={element_id}")
-
-
-class MultipleDropdownAnchorErr(SkyvernException):
-    def __init__(self, dropdowm_type: str, element_id: str):
-        super().__init__(f"Multiple {dropdowm_type} dropdown found. element_id={element_id}")
-
-
-class FailedToGetCurrentValueOfDropdown(SkyvernException):
-    def __init__(self, dropdowm_type: str, element_id: str, fail_reason: str):
-        super().__init__(
-            f"Failed to get current value of {dropdowm_type} dropdown. element_id={element_id}, failure_reason={fail_reason}"
-        )
 
 
 class HttpException(SkyvernException):
