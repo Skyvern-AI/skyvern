@@ -88,6 +88,7 @@ async def _convert_svg_to_string(task: Task, step: Step, organization: Organizat
         LOG.debug("SVG loaded from cache", element_id=element_id, shape=svg_shape)
     else:
         if len(svg_html) > settings.SVG_MAX_LENGTH:
+            # TODO: implement a fallback solution for "too large" case, maybe convert by screenshot
             LOG.warning(
                 "SVG element is too large to convert, going to drop the svg element.",
                 element_id=element_id,
