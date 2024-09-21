@@ -69,7 +69,8 @@ export const job_application = {
     name: "John Doe",
     email: "john.doe@gmail.com",
     phone: "123-456-7890",
-    resume_url: "https://www.msnlabs.com/img/resume-sample.pdf",
+    resume_url:
+      "https://writing.colostate.edu/guides/documents/resume/functionalSample.pdf",
     cover_letter: "Generate a compelling cover letter for me",
   },
 };
@@ -279,12 +280,52 @@ export function getSample(sample: SampleCase) {
       return bci_seguros;
     }
     case "job_application": {
-      return job_application;
+      // copy the object to avoid modifying the original. Update job_application.navigationPayload.email to a random email
+      const email = generateUniqueEmail();
+      const phone = generatePhoneNumber();
+      return {
+        ...job_application,
+        navigationPayload: {
+          ...job_application.navigationPayload,
+          email,
+          phone,
+        },
+      };
     }
     case "blank": {
       return blank;
     }
   }
+}
+
+function generateUniqueEmail() {
+  // Define the characters to use for the random part
+  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let randomString = "";
+
+  // Generate a random string of 8 characters
+  for (let i = 0; i < 8; i++) {
+    const randomIndex = Math.floor(Math.random() * chars.length);
+    randomString += chars[randomIndex];
+  }
+
+  // Concatenate with '@example.com'
+  const email = randomString + "@example.com";
+  return email;
+}
+
+function generatePhoneNumber() {
+  let phoneNumber = "";
+
+  // The first digit should be between 1 and 9 (it can't be 0)
+  phoneNumber += Math.floor(Math.random() * 9) + 1;
+
+  // The remaining 9 digits can be between 0 and 9
+  for (let i = 0; i < 9; i++) {
+    phoneNumber += Math.floor(Math.random() * 10);
+  }
+
+  return phoneNumber;
 }
 
 function transformKV([key, value]: [string, unknown]) {
