@@ -196,7 +196,6 @@ class AgentFunction:
                 queue_ele = queue.pop(0)
                 _remove_rect(queue_ele)
                 await _convert_svg_to_string(task, step, organization, queue_ele)
-
                 # TODO: we can come back to test removing the unique_id
                 # from element attributes to make sure this won't increase hallucination
                 # _remove_unique_id(queue_ele)
