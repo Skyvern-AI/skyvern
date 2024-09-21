@@ -122,6 +122,8 @@ class Settings(BaseSettings):
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
     VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 5
 
+    SVG_MAX_LENGTH: int = 100000
+
     def is_cloud_environment(self) -> bool:
         """
         :return: True if env is not local, else False

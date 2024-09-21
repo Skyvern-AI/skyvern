@@ -6,6 +6,7 @@ from typing import Dict, List
 import structlog
 from playwright.async_api import Page
 
+from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.exceptions import StepUnableToExecuteError, SVGConversionFailed
 from skyvern.forge import app
@@ -62,6 +63,9 @@ async def _convert_svg_to_string(task: Task, step: Step, organization: Organizat
     if element.get("tagName") != "svg":
         return
 
+    if element.get("isDropped", False):
+        return
+
     element_id = element.get("id", "")
     svg_element = _remove_skyvern_attributes(element)
     svg_html = json_to_html(svg_element)
@@ -83,6 +87,17 @@ async def _convert_svg_to_string(task: Task, step: Step, organization: Organizat
     if svg_shape:
         LOG.debug("SVG loaded from cache", element_id=element_id, shape=svg_shape)
     else:
+        if len(svg_html) > settings.SVG_MAX_LENGTH:
+            # TODO: implement a fallback solution for "too large" case, maybe convert by screenshot
+            LOG.warning(
+                "SVG element is too large to convert, going to drop the svg element.",
+                element_id=element_id,
+                length=len(svg_html),
+            )
+            del element["children"]
+            element["isDropped"] = True
+            return
+
         LOG.debug("call LLM to convert SVG to string shape", element_id=element_id)
         svg_convert_prompt = prompt_engine.load_prompt("svg-convert", svg_element=svg_html)
 
