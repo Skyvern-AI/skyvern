@@ -86,6 +86,12 @@ def build_attribute(key: str, value: Any) -> str:
 
 
 def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
+    """
+    if element is flagged as dropped, the html format is empty
+    """
+    if element.get("isDropped", False):
+        return ""
+
     attributes: dict[str, Any] = copy.deepcopy(element.get("attributes", {}))
 
     if need_skyvern_attrs:

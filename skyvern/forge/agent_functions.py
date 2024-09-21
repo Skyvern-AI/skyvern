@@ -63,12 +63,12 @@ async def _convert_svg_to_string(task: Task, step: Step, organization: Organizat
     if element.get("tagName") != "svg":
         return
 
+    if element.get("isDropped", False):
+        return
+
     element_id = element.get("id", "")
     svg_element = _remove_skyvern_attributes(element)
     svg_html = json_to_html(svg_element)
-    if len(svg_html) > settings.SVG_MAX_LENGTH:
-        LOG.warning("SVG element is too large to convert", element_id=element_id, length=len(svg_html))
-        return
     hash_object = hashlib.sha256()
     hash_object.update(svg_html.encode("utf-8"))
     svg_hash = hash_object.hexdigest()
@@ -87,6 +87,16 @@ async def _convert_svg_to_string(task: Task, step: Step, organization: Organizat
     if svg_shape:
         LOG.debug("SVG loaded from cache", element_id=element_id, shape=svg_shape)
     else:
+        if len(svg_html) > settings.SVG_MAX_LENGTH:
+            LOG.warning(
+                "SVG element is too large to convert, going to drop the svg element.",
+                element_id=element_id,
+                length=len(svg_html),
+            )
+            del element["children"]
+            element["isDropped"] = True
+            return
+
         LOG.debug("call LLM to convert SVG to string shape", element_id=element_id)
         svg_convert_prompt = prompt_engine.load_prompt("svg-convert", svg_element=svg_html)
 
@@ -185,16 +195,8 @@ class AgentFunction:
             while queue:
                 queue_ele = queue.pop(0)
                 _remove_rect(queue_ele)
+                await _convert_svg_to_string(task, step, organization, queue_ele)
 
-                # still WIP
-                if queue_ele.get("tagName") == "svg":
-                    element_id = queue_ele.get("id", "")
-                    svg_element = _remove_skyvern_attributes(queue_ele)
-                    svg_html = json_to_html(svg_element)
-                    if len(svg_html) > settings.SVG_MAX_LENGTH:
-                        LOG.warning("SVG element is too large to convert", element_id=element_id, length=len(svg_html))
-                    else:
-                        await _convert_svg_to_string(task, step, organization, queue_ele)
                 # TODO: we can come back to test removing the unique_id
                 # from element attributes to make sure this won't increase hallucination
                 # _remove_unique_id(queue_ele)
