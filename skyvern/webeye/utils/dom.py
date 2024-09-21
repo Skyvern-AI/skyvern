@@ -132,34 +132,6 @@ class SkyvernElement:
 
         return json_to_html(element_dict, need_skyvern_attrs)
 
-    async def is_select2_dropdown(self) -> bool:
-        tag_name = self.get_tag_name()
-        element_class = await self.get_attr("class")
-        if element_class is None:
-            return False
-        return (
-            (tag_name == "a" and "select2-choice" in element_class)
-            or (tag_name == "span" and "select2-chosen" in element_class)
-            or (tag_name == "span" and "select2-arrow" in element_class)
-            or (tag_name == "input" and "select2-input" in element_class)
-        )
-
-    async def is_react_select_dropdown(self) -> bool:
-        tag_name = self.get_tag_name()
-        element_class = await self.get_attr("class")
-        if element_class is None:
-            return False
-
-        return (tag_name == InteractiveElement.INPUT and "select__input" in element_class) or (
-            tag_name == InteractiveElement.BUTTON and await self.get_attr("aria-label") == "Toggle flyout"
-        )
-
-    async def is_combobox_dropdown(self) -> bool:
-        tag_name = self.get_tag_name()
-        role = await self.get_attr("role")
-        haspopup = await self.get_attr("aria-haspopup")
-        return tag_name == InteractiveElement.INPUT and role == "combobox" and haspopup == "listbox"
-
     async def is_auto_completion_input(self) -> bool:
         tag_name = self.get_tag_name()
         if tag_name != InteractiveElement.INPUT:
