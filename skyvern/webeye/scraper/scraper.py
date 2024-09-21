@@ -249,6 +249,19 @@ async def get_frame_text(iframe: Frame) -> str:
         if child_frame.is_detached():
             continue
 
+        try:
+            child_frame_element = await child_frame.frame_element()
+        except Exception:
+            LOG.warning(
+                "Unable to get child_frame_element",
+                exc_info=True,
+            )
+            continue
+
+        # it will get stuck when we `frame.evaluate()` on an invisible iframe
+        if not await child_frame_element.is_visible():
+            continue
+
         text += await get_frame_text(child_frame)
 
     return text
@@ -339,6 +352,10 @@ async def get_interactable_element_tree_in_frame(
                 "Unable to get frame_element",
                 exc_info=True,
             )
+            continue
+
+        # it will get stuck when we `frame.evaluate()` on an invisible iframe
+        if not await frame_element.is_visible():
             continue
 
         unique_id = await frame_element.get_attribute("unique_id")
