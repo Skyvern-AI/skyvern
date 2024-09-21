@@ -1740,9 +1740,12 @@ async def locate_dropdown_menu(
                     exc_info=True,
                 )
 
+        # sometimes taking screenshot might scroll away, need to scroll back after the screenshot
+        x, y = await skyvern_frame.get_scroll_x_y()
         screenshot = await head_element.get_locator().screenshot(
             timeout=SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS
         )
+        await skyvern_frame.scroll_to_x_y(x, y)
 
         # TODO: better to send untrimmed HTML without skyvern attributes in the future
         dropdown_confirm_prompt = prompt_engine.load_prompt("opened-dropdown-confirm")
