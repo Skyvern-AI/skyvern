@@ -1476,6 +1476,14 @@ function scrollToTop(draw_boxes) {
   return window.scrollY;
 }
 
+function getScrollXY() {
+  return [window.scrollX, window.scrollY];
+}
+
+function scrollToXY(x, y) {
+  window.scroll({ left: x, top: y, behavior: "instant" });
+}
+
 function scrollToNextPage(draw_boxes) {
   // remove bounding boxes, scroll to next page with 200px overlap, then draw bounding boxes again
   // return true if there is a next page, false otherwise

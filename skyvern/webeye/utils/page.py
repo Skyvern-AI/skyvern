@@ -160,6 +160,14 @@ class SkyvernFrame:
         async with asyncio.timeout(timeout):
             return await self.frame.content()
 
+    async def get_scroll_x_y(self) -> tuple[int, int]:
+        js_script = "() => getScrollXY()"
+        return await self.frame.evaluate(js_script)
+
+    async def scroll_to_x_y(self, x: int, y: int) -> None:
+        js_script = "([x, y]) => scrollToXY(x, y)"
+        return await self.frame.evaluate(js_script, [x, y])
+
     async def scroll_to_element_bottom(self, element: ElementHandle, page_by_page: bool = False) -> None:
         js_script = "([element, page_by_page]) => scrollToElementBottom(element, page_by_page)"
         return await self.frame.evaluate(js_script, [element, page_by_page])
