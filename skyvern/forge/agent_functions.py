@@ -6,6 +6,7 @@ from typing import Dict, List
 import structlog
 from playwright.async_api import Page
 
+from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.exceptions import StepUnableToExecuteError, SVGConversionFailed
 from skyvern.forge import app
@@ -65,6 +66,9 @@ async def _convert_svg_to_string(task: Task, step: Step, organization: Organizat
     element_id = element.get("id", "")
     svg_element = _remove_skyvern_attributes(element)
     svg_html = json_to_html(svg_element)
+    if len(svg_html) > settings.SVG_MAX_LENGTH:
+        LOG.warning("SVG element is too large to convert", element_id=element_id, length=len(svg_html))
+        return
     hash_object = hashlib.sha256()
     hash_object.update(svg_html.encode("utf-8"))
     svg_hash = hash_object.hexdigest()
@@ -181,7 +185,16 @@ class AgentFunction:
             while queue:
                 queue_ele = queue.pop(0)
                 _remove_rect(queue_ele)
-                await _convert_svg_to_string(task, step, organization, queue_ele)
+
+                # still WIP
+                if queue_ele.get("tagName") == "svg":
+                    element_id = queue_ele.get("id", "")
+                    svg_element = _remove_skyvern_attributes(queue_ele)
+                    svg_html = json_to_html(svg_element)
+                    if len(svg_html) > settings.SVG_MAX_LENGTH:
+                        LOG.warning("SVG element is too large to convert", element_id=element_id, length=len(svg_html))
+                    else:
+                        await _convert_svg_to_string(task, step, organization, queue_ele)
                 # TODO: we can come back to test removing the unique_id
                 # from element attributes to make sure this won't increase hallucination
                 # _remove_unique_id(queue_ele)
