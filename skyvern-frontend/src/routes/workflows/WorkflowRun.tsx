@@ -80,6 +80,7 @@ function WorkflowRun() {
       return false;
     },
     placeholderData: keepPreviousData,
+    refetchOnMount: workflowRun?.status === Status.Running,
   });
 
   function handleNavigate(event: React.MouseEvent, id: string) {
