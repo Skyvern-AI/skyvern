@@ -1252,9 +1252,23 @@ function buildElementTree(starter = document.body, frame, full_tree = false) {
     }
 
     let ctxList = [];
-    ctxList = getContextByLinked(element, ctxList);
-    ctxList = getContextByParent(element, ctxList);
-    ctxList = getContextByTable(element, ctxList);
+    try {
+      ctxList = getContextByLinked(element, ctxList);
+    } catch (e) {
+      console.error("failed to get context by linked: ", e);
+    }
+
+    try {
+      ctxList = getContextByParent(element, ctxList);
+    } catch (e) {
+      console.error("failed to get context by parent: ", e);
+    }
+
+    try {
+      ctxList = getContextByTable(element, ctxList);
+    } catch (e) {
+      console.error("failed to get context by table: ", e);
+    }
     const context = ctxList.join(";");
     if (context && context.length <= 5000) {
       element.context = context;
