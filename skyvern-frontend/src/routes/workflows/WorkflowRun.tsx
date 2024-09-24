@@ -1,5 +1,9 @@
 import { getClient } from "@/api/AxiosClient";
-import { TaskApiResponse, WorkflowRunStatusApiResponse } from "@/api/types";
+import {
+  Status,
+  TaskApiResponse,
+  WorkflowRunStatusApiResponse,
+} from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -24,7 +28,7 @@ import {
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { TaskActions } from "../tasks/list/TaskActions";
 import { TaskListSkeletonRows } from "../tasks/list/TaskListSkeletonRows";
@@ -44,6 +48,17 @@ function WorkflowRun() {
           .get(`/workflows/${workflowPermanentId}/runs/${workflowRunId}`)
           .then((response) => response.data);
       },
+      refetchInterval: (query) => {
+        if (
+          query.state.data?.status === Status.Running ||
+          query.state.data?.status === Status.Queued ||
+          query.state.data?.status === Status.Created
+        ) {
+          return 5000;
+        }
+        return false;
+      },
+      placeholderData: keepPreviousData,
     });
 
   const { data: workflowTasks, isLoading: workflowTasksIsLoading } = useQuery<
@@ -58,6 +73,13 @@ function WorkflowRun() {
         .get(`/tasks?workflow_run_id=${workflowRunId}`, { params })
         .then((response) => response.data);
     },
+    refetchInterval: () => {
+      if (workflowRun?.status === Status.Running) {
+        return 5000;
+      }
+      return false;
+    },
+    placeholderData: keepPreviousData,
   });
 
   function handleNavigate(event: React.MouseEvent, id: string) {
