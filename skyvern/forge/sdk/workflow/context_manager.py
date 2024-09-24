@@ -276,8 +276,7 @@ class WorkflowRunContext:
         self, parameter: OutputParameter, value: dict[str, Any] | list | str | None
     ) -> None:
         if parameter.key in self.values:
-            LOG.warning(f"Output parameter {parameter.output_parameter_id} already has a registered value")
-            return
+            LOG.warning(f"Output parameter {parameter.output_parameter_id} already has a registered value, overwriting")
 
         self.values[parameter.key] = value
         await self.set_parameter_values_for_output_parameter_dependent_blocks(parameter, value)

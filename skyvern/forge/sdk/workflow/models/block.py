@@ -87,19 +87,11 @@ class Block(BaseModel, abc.ABC):
         workflow_run_id: str,
         value: dict[str, Any] | list | str | None = None,
     ) -> None:
-        if workflow_run_context.has_value(self.output_parameter.key):
-            LOG.warning(
-                "Output parameter value already recorded",
-                output_parameter_id=self.output_parameter.output_parameter_id,
-                workflow_run_id=workflow_run_id,
-            )
-            return
-
         await workflow_run_context.register_output_parameter_value_post_execution(
             parameter=self.output_parameter,
             value=value,
         )
-        await app.DATABASE.create_workflow_run_output_parameter(
+        await app.DATABASE.create_or_update_workflow_run_output_parameter(
             workflow_run_id=workflow_run_id,
             output_parameter_id=self.output_parameter.output_parameter_id,
             value=value,
