@@ -416,13 +416,14 @@ async def handle_input_text_action(
     incremental_element: list[dict] = []
     # check if it's selectable
     if skyvern_element.get_tag_name() == InteractiveElement.INPUT and not await skyvern_element.is_raw_input():
+        select_action = SelectOptionAction(
+            reasoning=action.reasoning,
+            element_id=skyvern_element.get_id(),
+            option=SelectOption(label=text),
+        )
+
         await skyvern_element.scroll_into_view()
         if skyvern_element.get_selectable():
-            select_action = SelectOptionAction(
-                reasoning=action.reasoning,
-                element_id=skyvern_element.get_id(),
-                option=SelectOption(label=text),
-            )
             LOG.info(
                 "Input element is selectable, doing select actions",
                 task_id=task.task_id,
