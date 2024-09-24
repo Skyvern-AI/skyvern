@@ -457,8 +457,13 @@ function isInteractable(element) {
     tagName === "i"
   ) {
     const computedStyle = window.getComputedStyle(element);
-    const hasPointer = computedStyle.cursor === "pointer";
-    return hasPointer;
+    if (computedStyle.cursor === "pointer") {
+      return true;
+    }
+    // FIXME: hardcode to fix the bug about hover style now
+    if (element.className.toString().includes("hover:cursor-pointer")) {
+      return true;
+    }
   }
 
   return false;
