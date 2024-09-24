@@ -1264,7 +1264,7 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
-    async def create_workflow_run_output_parameter(
+    async def create_or_update_workflow_run_output_parameter(
         self,
         workflow_run_id: str,
         output_parameter_id: str,
@@ -1272,6 +1272,24 @@ class AgentDB:
     ) -> WorkflowRunOutputParameter:
         try:
             async with self.Session() as session:
+                # check if the workflow run output parameter already exists
+                # if it does, update the value
+                if workflow_run_output_parameter := (
+                    await session.scalars(
+                        select(WorkflowRunOutputParameterModel)
+                        .filter_by(workflow_run_id=workflow_run_id)
+                        .filter_by(output_parameter_id=output_parameter_id)
+                    )
+                ).first():
+                    LOG.info(
+                        f"Updating existing workflow run output parameter with {workflow_run_output_parameter.workflow_run_id} - {workflow_run_output_parameter.output_parameter_id}"
+                    )
+                    workflow_run_output_parameter.value = value
+                    await session.commit()
+                    await session.refresh(workflow_run_output_parameter)
+                    return convert_to_workflow_run_output_parameter(workflow_run_output_parameter, self.debug_enabled)
+
+                # if it does not exist, create a new one
                 workflow_run_output_parameter = WorkflowRunOutputParameterModel(
                     workflow_run_id=workflow_run_id,
                     output_parameter_id=output_parameter_id,
@@ -1282,6 +1300,33 @@ class AgentDB:
                 await session.refresh(workflow_run_output_parameter)
                 return convert_to_workflow_run_output_parameter(workflow_run_output_parameter, self.debug_enabled)
 
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def update_workflow_run_output_parameter(
+        self,
+        workflow_run_id: str,
+        output_parameter_id: str,
+        value: dict[str, Any] | list | str | None,
+    ) -> WorkflowRunOutputParameter:
+        try:
+            async with self.Session() as session:
+                workflow_run_output_parameter = (
+                    await session.scalars(
+                        select(WorkflowRunOutputParameterModel)
+                        .filter_by(workflow_run_id=workflow_run_id)
+                        .filter_by(output_parameter_id=output_parameter_id)
+                    )
+                ).first()
+                if not workflow_run_output_parameter:
+                    raise NotFoundError(
+                        f"WorkflowRunOutputParameter not found for {workflow_run_id} and {output_parameter_id}"
+                    )
+                workflow_run_output_parameter.value = value
+                await session.commit()
+                await session.refresh(workflow_run_output_parameter)
+                return convert_to_workflow_run_output_parameter(workflow_run_output_parameter, self.debug_enabled)
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
