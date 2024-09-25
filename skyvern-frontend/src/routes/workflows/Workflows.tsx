@@ -111,7 +111,7 @@ function Workflows() {
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
       });
-      navigate(`/workflows/${response.data.workflow_permanent_id}`);
+      navigate(`/workflows/${response.data.workflow_permanent_id}/edit`);
     },
   });
 
@@ -250,7 +250,7 @@ function Workflows() {
                                 onClick={(event) => {
                                   handleIconClick(
                                     event,
-                                    `/workflows/${workflow.workflow_permanent_id}`,
+                                    `/workflows/${workflow.workflow_permanent_id}/edit`,
                                   );
                                 }}
                               >
