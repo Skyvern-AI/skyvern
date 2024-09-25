@@ -33,7 +33,7 @@ function WorkflowHeader({
   const navigate = useNavigate();
 
   return (
-    <div className="flex h-full w-full justify-between bg-slate-elevation2 px-6 py-5">
+    <div className="flex h-full w-full justify-between rounded-xl bg-slate-elevation2 px-6 py-5">
       <div className="flex h-full items-center">
         <EditableNodeTitle
           editable={true}
