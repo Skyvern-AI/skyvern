@@ -248,12 +248,16 @@ function isElementVisible(element) {
     return false;
   }
 
-  // if the center point of the element is not in the page, we tag it as an interactable element
-  const center_x = (rect.left + rect.width) / 2;
-  const center_y = (rect.top + rect.height) / 2;
-  if (center_x < 0 || center_y < 0) {
+  // if the center point of the element is not in the page, we tag it as an non-interactable element
+  // FIXME: sometimes there could be an overflow element blocking the default scrolling, making Y coordinate be wrong. So we currently only check for X
+  const center_x = (rect.left + rect.width) / 2 + window.scrollX;
+  if (center_x < 0) {
     return false;
   }
+  // const center_y = (rect.top + rect.height) / 2 + window.scrollY;
+  // if (center_x < 0 || center_y < 0) {
+  //   return false;
+  // }
 
   return true;
 }
