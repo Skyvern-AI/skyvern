@@ -15,7 +15,7 @@ import { NodeActionMenu } from "../NodeActionMenu";
 import type { LoopNode } from "./types";
 import { useState } from "react";
 import {
-  getLabelForExistingNode,
+  getUniqueLabelForExistingNode,
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
 } from "../../workflowEditorUtils";
 import { AppNode } from "..";
@@ -81,8 +81,9 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                     editable={data.editable}
                     onChange={(value) => {
                       const existingLabels = nodes.map((n) => n.data.label);
-                      const newLabel = getLabelForExistingNode(
-                        value,
+                      const labelWithoutWhitespace = value.replace(/\s+/g, "_");
+                      const newLabel = getUniqueLabelForExistingNode(
+                        labelWithoutWhitespace,
                         existingLabels,
                       );
                       setLabel(newLabel);

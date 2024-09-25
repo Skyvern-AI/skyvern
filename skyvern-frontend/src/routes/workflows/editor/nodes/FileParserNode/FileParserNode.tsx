@@ -13,7 +13,7 @@ import { NodeActionMenu } from "../NodeActionMenu";
 import type { FileParserNode } from "./types";
 import { useState } from "react";
 import {
-  getLabelForExistingNode,
+  getUniqueLabelForExistingNode,
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
 } from "../../workflowEditorUtils";
 import { AppNode } from "..";
@@ -53,8 +53,9 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
                 editable={data.editable}
                 onChange={(value) => {
                   const existingLabels = nodes.map((n) => n.data.label);
-                  const newLabel = getLabelForExistingNode(
-                    value,
+                  const labelWithoutWhitespace = value.replace(/\s+/g, "_");
+                  const newLabel = getUniqueLabelForExistingNode(
+                    labelWithoutWhitespace,
                     existingLabels,
                   );
                   setLabel(newLabel);
