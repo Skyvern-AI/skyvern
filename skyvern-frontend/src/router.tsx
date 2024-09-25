@@ -102,6 +102,10 @@ const router = createBrowserRouter([
             children: [
               {
                 index: true,
+                element: <Navigate to="runs" />,
+              },
+              {
+                path: "edit",
                 element: <WorkflowEditor />,
               },
               {
