@@ -24,7 +24,7 @@ import {
 import { useState } from "react";
 import { AppNode } from "..";
 import {
-  getLabelForExistingNode,
+  getUniqueLabelForExistingNode,
   getOutputParameterKey,
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
 } from "../../workflowEditorUtils";
@@ -423,8 +423,9 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                 editable={editable}
                 onChange={(value) => {
                   const existingLabels = nodes.map((n) => n.data.label);
-                  const newLabel = getLabelForExistingNode(
-                    value,
+                  const labelWithoutWhitespace = value.replace(/\s+/g, "_");
+                  const newLabel = getUniqueLabelForExistingNode(
+                    labelWithoutWhitespace,
                     existingLabels,
                   );
                   setLabel(newLabel);

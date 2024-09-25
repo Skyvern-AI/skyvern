@@ -30,7 +30,7 @@ import { textPromptNodeDefaultData } from "./nodes/TextPromptNode/types";
 import { uploadNodeDefaultData } from "./nodes/UploadNode/types";
 import type { Node } from "@xyflow/react";
 
-export const NEW_NODE_LABEL_PREFIX = "Block ";
+export const NEW_NODE_LABEL_PREFIX = "block_";
 
 function layoutUtil(
   nodes: Array<AppNode>,
@@ -754,12 +754,15 @@ function getAdditionalParametersForEmailBlock(
   return sendEmailParameters;
 }
 
-function getLabelForExistingNode(label: string, existingLabels: Array<string>) {
+function getUniqueLabelForExistingNode(
+  label: string,
+  existingLabels: Array<string>,
+) {
   if (!existingLabels.includes(label)) {
     return label;
   }
   for (let i = 2; i < existingLabels.length + 1; i++) {
-    const candidate = `${label} (${i})`;
+    const candidate = `${label}_${i}`;
     if (!existingLabels.includes(candidate)) {
       return candidate;
     }
@@ -801,7 +804,7 @@ export {
   getOutputParameterKey,
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
   getAdditionalParametersForEmailBlock,
-  getLabelForExistingNode,
+  getUniqueLabelForExistingNode,
   isOutputParameterKey,
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,
