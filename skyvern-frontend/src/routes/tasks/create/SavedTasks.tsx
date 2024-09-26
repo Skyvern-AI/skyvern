@@ -15,6 +15,8 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { stringify as convertToYAML } from "yaml";
 import { SavedTaskCard } from "./SavedTaskCard";
+import { useState } from "react";
+import { cn } from "@/util/utils";
 
 function createEmptyTaskTemplate() {
   return {
@@ -49,6 +51,7 @@ function createEmptyTaskTemplate() {
 function SavedTasks() {
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
+  const [hovering, setHovering] = useState(false);
 
   const { data } = useQuery<Array<WorkflowApiResponse>>({
     queryKey: ["savedTasks"],
@@ -99,20 +102,36 @@ function SavedTasks() {
   return (
     <div className="grid grid-cols-4 gap-4">
       <Card
-        onClick={() => {
-          if (mutation.isPending) {
-            return;
-          }
-          mutation.mutate();
-        }}
+        className="border-0"
+        onMouseEnter={() => setHovering(true)}
+        onMouseLeave={() => setHovering(false)}
+        onMouseOver={() => setHovering(true)}
+        onMouseOut={() => setHovering(false)}
       >
-        <CardHeader>
-          <CardTitle>New Template</CardTitle>
-          <CardDescription className="overflow-hidden text-ellipsis whitespace-nowrap">
+        <CardHeader
+          className={cn("rounded-t-md bg-slate-elevation1", {
+            "bg-slate-900": hovering,
+          })}
+        >
+          <CardTitle className="font-normal">New Template</CardTitle>
+          <CardDescription className="overflow-hidden text-ellipsis whitespace-nowrap text-slate-400">
             Create your own template
           </CardDescription>
         </CardHeader>
-        <CardContent className="flex h-48 cursor-pointer items-center justify-center hover:bg-muted/40">
+        <CardContent
+          className={cn(
+            "flex h-36 cursor-pointer items-center justify-center rounded-b-md bg-slate-elevation3 p-4 text-sm text-slate-300",
+            {
+              "bg-slate-800": hovering,
+            },
+          )}
+          onClick={() => {
+            if (mutation.isPending) {
+              return;
+            }
+            mutation.mutate();
+          }}
+        >
           {!mutation.isPending && <PlusIcon className="h-12 w-12" />}
           {mutation.isPending && (
             <ReloadIcon className="h-12 w-12 animate-spin" />
