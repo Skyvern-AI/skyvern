@@ -14,7 +14,6 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from "@/components/ui/dialog";
 import {
   DropdownMenu,
@@ -26,6 +25,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { cn } from "@/util/utils";
 import { DotsHorizontalIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
@@ -43,6 +43,7 @@ function SavedTaskCard({ workflowId, title, url, description }: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const [hovering, setHovering] = useState(false);
 
   const deleteTaskMutation = useMutation({
     mutationFn: async (id: string) => {
@@ -73,29 +74,42 @@ function SavedTaskCard({ workflowId, title, url, description }: Props) {
   });
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center justify-between">
+    <Card
+      className="border-0"
+      onMouseEnter={() => setHovering(true)}
+      onMouseLeave={() => setHovering(false)}
+      onMouseOver={() => setHovering(true)}
+      onMouseOut={() => setHovering(false)}
+    >
+      <CardHeader
+        className={cn("rounded-t-md bg-slate-elevation1", {
+          "bg-slate-900": hovering,
+        })}
+      >
+        <CardTitle className="flex items-center justify-between font-normal">
           <span className="overflow-hidden text-ellipsis whitespace-nowrap">
             {title}
           </span>
-          <Dialog open={open} onOpenChange={setOpen}>
-            <DropdownMenu>
+          <Dialog
+            open={open}
+            onOpenChange={() => {
+              setOpen(false);
+            }}
+          >
+            <DropdownMenu modal={false}>
               <DropdownMenuTrigger asChild>
                 <DotsHorizontalIcon className="cursor-pointer" />
               </DropdownMenuTrigger>
               <DropdownMenuContent className="w-56">
                 <DropdownMenuLabel>Template Actions</DropdownMenuLabel>
                 <DropdownMenuSeparator />
-                <DialogTrigger asChild>
-                  <DropdownMenuItem
-                    onSelect={() => {
-                      setOpen(true);
-                    }}
-                  >
-                    Delete Template
-                  </DropdownMenuItem>
-                </DialogTrigger>
+                <DropdownMenuItem
+                  onSelect={() => {
+                    setOpen(true);
+                  }}
+                >
+                  Delete Template
+                </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
             <DialogContent>
@@ -106,7 +120,12 @@ function SavedTaskCard({ workflowId, title, url, description }: Props) {
                 </DialogDescription>
               </DialogHeader>
               <DialogFooter>
-                <Button variant="secondary" onClick={() => setOpen(false)}>
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    setOpen(false);
+                  }}
+                >
                   Cancel
                 </Button>
                 <Button
@@ -125,12 +144,17 @@ function SavedTaskCard({ workflowId, title, url, description }: Props) {
             </DialogContent>
           </Dialog>
         </CardTitle>
-        <CardDescription className="overflow-hidden text-ellipsis whitespace-nowrap">
+        <CardDescription className="overflow-hidden text-ellipsis whitespace-nowrap text-slate-400">
           {url}
         </CardDescription>
       </CardHeader>
       <CardContent
-        className="h-48 cursor-pointer overflow-scroll hover:bg-muted/40"
+        className={cn(
+          "h-36 cursor-pointer overflow-scroll rounded-b-md bg-slate-elevation3 p-4 text-sm text-slate-300",
+          {
+            "bg-slate-800": hovering,
+          },
+        )}
         onClick={() => {
           navigate(workflowId);
         }}
