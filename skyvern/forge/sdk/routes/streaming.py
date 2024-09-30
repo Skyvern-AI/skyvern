@@ -10,7 +10,7 @@ from websockets.exceptions import ConnectionClosedOK
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.org_auth_service import get_current_org
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 
 LOG = structlog.get_logger()
 websocket_router = APIRouter()
@@ -204,7 +204,7 @@ async def workflow_run_streaming(
                 )
                 return
 
-            if WorkflowRun.status == WorkflowRunStatus.running:
+            if workflow_run.status == WorkflowRunStatus.running:
                 file_name = f"{workflow_run_id}.png"
                 screenshot = await app.STORAGE.get_streaming_file(organization_id, file_name)
                 if screenshot:
