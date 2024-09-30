@@ -28,62 +28,9 @@ import { useState } from "react";
 import { useForm, useFormState } from "react-hook-form";
 import { Link, useParams } from "react-router-dom";
 import { stringify as convertToYAML } from "yaml";
-import { z } from "zod";
 import { MAX_STEPS_DEFAULT } from "../constants";
 import { TaskFormSection } from "./TaskFormSection";
-
-const savedTaskFormSchema = z
-  .object({
-    title: z.string().min(1, "Title is required"),
-    description: z.string(),
-    url: z.string().url({
-      message: "Invalid URL",
-    }),
-    proxyLocation: z.string().or(z.null()).optional(),
-    webhookCallbackUrl: z.string().or(z.null()).optional(),
-    navigationGoal: z.string().or(z.null()).optional(),
-    dataExtractionGoal: z.string().or(z.null()).optional(),
-    navigationPayload: z.string().or(z.null()).optional(),
-    extractedInformationSchema: z.string().or(z.null()).optional(),
-    maxSteps: z.number().optional(),
-    totpVerificationUrl: z.string().or(z.null()).optional(),
-    totpIdentifier: z.string().or(z.null()).optional(),
-  })
-  .superRefine(
-    (
-      { navigationGoal, dataExtractionGoal, extractedInformationSchema },
-      ctx,
-    ) => {
-      if (!navigationGoal && !dataExtractionGoal) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message:
-            "At least one of navigation goal or data extraction goal must be provided",
-          path: ["navigationGoal"],
-        });
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message:
-            "At least one of navigation goal or data extraction goal must be provided",
-          path: ["dataExtractionGoal"],
-        });
-        return z.NEVER;
-      }
-      if (extractedInformationSchema) {
-        try {
-          JSON.parse(extractedInformationSchema);
-        } catch (e) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            message: "Invalid JSON",
-            path: ["extractedInformationSchema"],
-          });
-        }
-      }
-    },
-  );
-
-export type SavedTaskFormValues = z.infer<typeof savedTaskFormSchema>;
+import { savedTaskFormSchema, SavedTaskFormValues } from "./taskFormTypes";
 
 type Props = {
   initialValues: SavedTaskFormValues;
@@ -105,17 +52,26 @@ function createTaskRequestObject(formValues: SavedTaskFormValues) {
     }
   }
 
+  let errorCodeMapping = null;
+  if (formValues.errorCodeMapping) {
+    try {
+      errorCodeMapping = JSON.parse(formValues.errorCodeMapping);
+    } catch (e) {
+      errorCodeMapping = formValues.errorCodeMapping;
+    }
+  }
+
   return {
     url: formValues.url,
     webhook_callback_url: transform(formValues.webhookCallbackUrl),
     navigation_goal: transform(formValues.navigationGoal),
     data_extraction_goal: transform(formValues.dataExtractionGoal),
     proxy_location: transform(formValues.proxyLocation),
-    error_code_mapping: null,
     navigation_payload: transform(formValues.navigationPayload),
     extracted_information_schema: extractedInformationSchema,
     totp_verification_url: transform(formValues.totpVerificationUrl),
     totp_identifier: transform(formValues.totpIdentifier),
+    error_code_mapping: errorCodeMapping,
   };
 }
 
@@ -128,6 +84,15 @@ function createTaskTemplateRequestObject(values: SavedTaskFormValues) {
       );
     } catch (e) {
       extractedInformationSchema = values.extractedInformationSchema;
+    }
+  }
+
+  let errorCodeMapping = null;
+  if (values.errorCodeMapping) {
+    try {
+      errorCodeMapping = JSON.parse(values.errorCodeMapping);
+    } catch (e) {
+      errorCodeMapping = values.errorCodeMapping;
     }
   }
 
@@ -154,9 +119,10 @@ function createTaskTemplateRequestObject(values: SavedTaskFormValues) {
           navigation_goal: values.navigationGoal,
           data_extraction_goal: values.dataExtractionGoal,
           data_schema: extractedInformationSchema,
-          max_steps_per_run: values.maxSteps,
+          max_steps_per_run: values.maxStepsOverride,
           totp_verification_url: values.totpVerificationUrl,
           totp_identifier: values.totpIdentifier,
+          error_code_mapping: errorCodeMapping,
         },
       ],
     },
@@ -178,7 +144,7 @@ function SavedTaskForm({ initialValues }: Props) {
     defaultValues: initialValues,
     values: {
       ...initialValues,
-      maxSteps: initialValues.maxSteps ?? MAX_STEPS_DEFAULT,
+      maxStepsOverride: initialValues.maxStepsOverride ?? MAX_STEPS_DEFAULT,
     },
   });
 
@@ -199,7 +165,7 @@ function SavedTaskForm({ initialValues }: Props) {
         .then(() => {
           const taskRequest = createTaskRequestObject(formValues);
           const includeOverrideHeader =
-            formValues.maxSteps !== MAX_STEPS_DEFAULT;
+            formValues.maxStepsOverride !== MAX_STEPS_DEFAULT;
           return client.post<
             ReturnType<typeof createTaskRequestObject>,
             { data: { task_id: string } }
@@ -207,7 +173,7 @@ function SavedTaskForm({ initialValues }: Props) {
             ...(includeOverrideHeader && {
               headers: {
                 "x-max-steps-override":
-                  formValues.maxSteps ?? MAX_STEPS_DEFAULT,
+                  formValues.maxStepsOverride ?? MAX_STEPS_DEFAULT,
               },
             }),
           });
@@ -523,8 +489,9 @@ function SavedTaskForm({ initialValues }: Props) {
           onClick={() => setSection("advanced")}
           hasError={
             typeof errors.navigationPayload !== "undefined" ||
-            typeof errors.maxSteps !== "undefined" ||
-            typeof errors.webhookCallbackUrl !== "undefined"
+            typeof errors.maxStepsOverride !== "undefined" ||
+            typeof errors.webhookCallbackUrl !== "undefined" ||
+            typeof errors.errorCodeMapping !== "undefined"
           }
         >
           {section === "advanced" && (
@@ -567,7 +534,7 @@ function SavedTaskForm({ initialValues }: Props) {
                 />
                 <FormField
                   control={form.control}
-                  name="maxSteps"
+                  name="maxStepsOverride"
                   render={({ field }) => (
                     <FormItem>
                       <div className="flex gap-16">
@@ -627,6 +594,39 @@ function SavedTaskForm({ initialValues }: Props) {
                     </FormItem>
                   )}
                 />
+                <Separator />
+                <FormField
+                  control={form.control}
+                  name="errorCodeMapping"
+                  render={({ field }) => (
+                    <FormItem>
+                      <div className="flex gap-16">
+                        <FormLabel>
+                          <div className="w-72">
+                            <h1 className="text-lg">Error Messages</h1>
+                            <h2 className="text-base text-slate-400">
+                              Specify any error outputs you would like to be
+                              notified about
+                            </h2>
+                          </div>
+                        </FormLabel>
+                        <div className="w-full">
+                          <FormControl>
+                            <CodeEditor
+                              {...field}
+                              language="json"
+                              fontSize={12}
+                              minHeight="96px"
+                              value={field.value === null ? "" : field.value}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </div>
+                      </div>
+                    </FormItem>
+                  )}
+                />
+                <Separator />
                 <FormField
                   control={form.control}
                   name="totpVerificationUrl"

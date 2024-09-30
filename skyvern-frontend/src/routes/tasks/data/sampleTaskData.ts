@@ -1,11 +1,16 @@
+import { CreateNewTaskFormValues } from "../create/taskFormTypes";
 import { SampleCase } from "../types";
 
 export const blank = {
   url: "https://www.example.com",
-  navigationGoal: null,
-  dataExtractionGoal: null,
+  navigationGoal: "",
+  dataExtractionGoal: "",
   navigationPayload: null,
   extractedInformationSchema: null,
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
 };
 
 export const bci_seguros = {
@@ -30,6 +35,10 @@ export const bci_seguros = {
     "km approx a recorrer": "28,000",
   },
   extractedInformationSchema: null,
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
 };
 
 export const california_edd = {
@@ -47,6 +56,10 @@ export const california_edd = {
     phone_number: "412-444-1234",
   },
   extractedInformationSchema: null,
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
 };
 
 export const finditparts = {
@@ -59,6 +72,10 @@ export const finditparts = {
     product_id: "W01-377-8537",
   },
   extractedInformationSchema: null,
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
 };
 
 export const job_application = {
@@ -73,6 +90,10 @@ export const job_application = {
       "https://writing.colostate.edu/guides/documents/resume/functionalSample.pdf",
     cover_letter: "Generate a compelling cover letter for me",
   },
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
 };
 
 export const geico = {
@@ -263,6 +284,10 @@ export const geico = {
     },
     type: "object",
   },
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
 };
 
 export function getSample(sample: SampleCase) {
@@ -329,15 +354,14 @@ function generatePhoneNumber() {
 }
 
 function transformKV([key, value]: [string, unknown]) {
-  if (value === null) {
-    return [key, ""];
-  }
-  if (typeof value === "object") {
+  if (value !== null && typeof value === "object") {
     return [key, JSON.stringify(value, null, 2)];
   }
   return [key, value];
 }
 
-export function getSampleForInitialFormValues(sample: SampleCase) {
+export function getSampleForInitialFormValues(
+  sample: SampleCase,
+): CreateNewTaskFormValues {
   return Object.fromEntries(Object.entries(getSample(sample)).map(transformKV));
 }

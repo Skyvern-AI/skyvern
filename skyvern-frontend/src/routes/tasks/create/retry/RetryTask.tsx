@@ -35,6 +35,9 @@ function RetryTask() {
         webhookCallbackUrl: task.request.webhook_callback_url,
         totpIdentifier: task.request.totp_identifier,
         totpVerificationUrl: task.request.totp_verification_url,
+        errorCodeMapping: task.request.error_code_mapping
+          ? JSON.stringify(task.request.error_code_mapping, null, 2)
+          : "",
       }}
     />
   );

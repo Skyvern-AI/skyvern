@@ -1,4 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
+import { CreateTaskRequest } from "@/api/types";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { Button } from "@/components/ui/button";
 import {
@@ -10,6 +11,7 @@ import {
   FormMessage,
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
+import { Separator } from "@/components/ui/separator";
 import { useToast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -25,69 +27,24 @@ import fetchToCurl from "fetch-to-curl";
 import { useState } from "react";
 import { useForm, useFormState } from "react-hook-form";
 import { Link } from "react-router-dom";
-import { z } from "zod";
 import { MAX_STEPS_DEFAULT } from "../constants";
 import { TaskFormSection } from "./TaskFormSection";
-
-const createNewTaskFormSchema = z
-  .object({
-    url: z.string().url({
-      message: "Invalid URL",
-    }),
-    webhookCallbackUrl: z.string().or(z.null()).optional(),
-    navigationGoal: z.string().or(z.null()).optional(),
-    dataExtractionGoal: z.string().or(z.null()).optional(),
-    navigationPayload: z.string().or(z.null()).optional(),
-    extractedInformationSchema: z.string().or(z.null()).optional(),
-    maxStepsOverride: z.number().optional(),
-    totpVerificationUrl: z.string().or(z.null()).optional(),
-    totpIdentifier: z.string().or(z.null()).optional(),
-  })
-  .superRefine(
-    (
-      { navigationGoal, dataExtractionGoal, extractedInformationSchema },
-      ctx,
-    ) => {
-      if (!navigationGoal && !dataExtractionGoal) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message:
-            "At least one of navigation goal or data extraction goal must be provided",
-          path: ["navigationGoal"],
-        });
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message:
-            "At least one of navigation goal or data extraction goal must be provided",
-          path: ["dataExtractionGoal"],
-        });
-        return z.NEVER;
-      }
-      if (extractedInformationSchema) {
-        try {
-          JSON.parse(extractedInformationSchema);
-        } catch (e) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            message: "Invalid JSON",
-            path: ["extractedInformationSchema"],
-          });
-        }
-      }
-    },
-  );
-
-export type CreateNewTaskFormValues = z.infer<typeof createNewTaskFormSchema>;
+import {
+  createNewTaskFormSchema,
+  CreateNewTaskFormValues,
+} from "./taskFormTypes";
 
 type Props = {
   initialValues: CreateNewTaskFormValues;
 };
 
-function transform(value: unknown) {
+function transform<T>(value: T): T | null {
   return value === "" ? null : value;
 }
 
-function createTaskRequestObject(formValues: CreateNewTaskFormValues) {
+function createTaskRequestObject(
+  formValues: CreateNewTaskFormValues,
+): CreateTaskRequest {
   let extractedInformationSchema = null;
   if (formValues.extractedInformationSchema) {
     try {
@@ -98,8 +55,17 @@ function createTaskRequestObject(formValues: CreateNewTaskFormValues) {
       extractedInformationSchema = formValues.extractedInformationSchema;
     }
   }
+  let errorCodeMapping = null;
+  if (formValues.errorCodeMapping) {
+    try {
+      errorCodeMapping = JSON.parse(formValues.errorCodeMapping);
+    } catch (e) {
+      errorCodeMapping = formValues.errorCodeMapping;
+    }
+  }
 
   return {
+    title: null,
     url: formValues.url,
     webhook_callback_url: transform(formValues.webhookCallbackUrl),
     navigation_goal: transform(formValues.navigationGoal),
@@ -109,6 +75,7 @@ function createTaskRequestObject(formValues: CreateNewTaskFormValues) {
     extracted_information_schema: extractedInformationSchema,
     totp_verification_url: transform(formValues.totpVerificationUrl),
     totp_identifier: transform(formValues.totpIdentifier),
+    error_code_mapping: errorCodeMapping,
   };
 }
 
@@ -334,12 +301,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                               language="json"
                               fontSize={12}
                               minHeight="96px"
-                              value={
-                                field.value === null ||
-                                typeof field.value === "undefined"
-                                  ? ""
-                                  : field.value
-                              }
+                              value={field.value === null ? "" : field.value}
                             />
                           </FormControl>
                           <FormMessage />
@@ -362,7 +324,8 @@ function CreateNewTaskForm({ initialValues }: Props) {
           hasError={
             typeof errors.navigationPayload !== "undefined" ||
             typeof errors.maxStepsOverride !== "undefined" ||
-            typeof errors.webhookCallbackUrl !== "undefined"
+            typeof errors.webhookCallbackUrl !== "undefined" ||
+            typeof errors.errorCodeMapping !== "undefined"
           }
         >
           {section === "advanced" && (
@@ -389,12 +352,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                               language="json"
                               fontSize={12}
                               minHeight="96px"
-                              value={
-                                field.value === null ||
-                                typeof field.value === "undefined"
-                                  ? ""
-                                  : field.value
-                              }
+                              value={field.value === null ? "" : field.value}
                             />
                           </FormControl>
                           <FormMessage />
@@ -465,6 +423,39 @@ function CreateNewTaskForm({ initialValues }: Props) {
                     </FormItem>
                   )}
                 />
+                <Separator />
+                <FormField
+                  control={form.control}
+                  name="errorCodeMapping"
+                  render={({ field }) => (
+                    <FormItem>
+                      <div className="flex gap-16">
+                        <FormLabel>
+                          <div className="w-72">
+                            <h1 className="text-lg">Error Messages</h1>
+                            <h2 className="text-base text-slate-400">
+                              Specify any error outputs you would like to be
+                              notified about
+                            </h2>
+                          </div>
+                        </FormLabel>
+                        <div className="w-full">
+                          <FormControl>
+                            <CodeEditor
+                              {...field}
+                              language="json"
+                              fontSize={12}
+                              minHeight="96px"
+                              value={field.value === null ? "" : field.value}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </div>
+                      </div>
+                    </FormItem>
+                  )}
+                />
+                <Separator />
                 <FormField
                   control={form.control}
                   name="totpVerificationUrl"

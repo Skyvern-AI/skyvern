@@ -47,8 +47,10 @@ function CreateNewTaskFormPage() {
   ).default_value;
 
   const dataSchema = data.workflow_definition.blocks[0].data_schema;
+  const errorCodeMapping =
+    data.workflow_definition.blocks[0].error_code_mapping;
 
-  const maxSteps = data.workflow_definition.blocks[0].max_steps_per_run;
+  const maxStepsOverride = data.workflow_definition.blocks[0].max_steps_per_run;
 
   return (
     <SavedTaskForm
@@ -63,10 +65,11 @@ function CreateNewTaskFormPage() {
           data.workflow_definition.blocks[0].data_extraction_goal,
         extractedInformationSchema: JSON.stringify(dataSchema, null, 2),
         navigationPayload,
-        maxSteps,
+        maxStepsOverride,
         totpIdentifier: data.workflow_definition.blocks[0].totp_identifier,
         totpVerificationUrl:
           data.workflow_definition.blocks[0].totp_verification_url,
+        errorCodeMapping: JSON.stringify(errorCodeMapping, null, 2),
       }}
     />
   );

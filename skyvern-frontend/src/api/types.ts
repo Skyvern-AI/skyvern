@@ -67,28 +67,31 @@ export type StepApiResponse = {
 };
 
 export type TaskApiResponse = {
-  request: {
-    title: string | null;
-    url: string;
-    webhook_callback_url: string;
-    navigation_goal: string | null;
-    data_extraction_goal: string | null;
-    navigation_payload: string | object; // stringified JSON
-    error_code_mapping: null;
-    proxy_location: string;
-    extracted_information_schema: string | object;
-    totp_verification_url: string | null;
-    totp_identifier: string | null;
-  };
+  request: CreateTaskRequest;
   task_id: string;
   status: Status;
   created_at: string; // ISO 8601
   modified_at: string; // ISO 8601
-  extracted_information: unknown;
+  extracted_information: Record<string, unknown> | string | null;
   screenshot_url: string | null;
   recording_url: string | null;
   failure_reason: string | null;
-  errors: unknown[];
+  errors: Array<Record<string, unknown>>;
+  max_steps_per_run: number | null;
+};
+
+export type CreateTaskRequest = {
+  title: string | null;
+  url: string;
+  webhook_callback_url: string | null;
+  navigation_goal: string | null;
+  data_extraction_goal: string | null;
+  navigation_payload: Record<string, unknown> | string | null;
+  extracted_information_schema: Record<string, unknown> | string | null;
+  error_code_mapping: Record<string, string> | null;
+  proxy_location: string | null;
+  totp_verification_url: string | null;
+  totp_identifier: string | null;
 };
 
 export type User = {
