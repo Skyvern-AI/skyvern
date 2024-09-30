@@ -32,12 +32,27 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { TaskActions } from "../tasks/list/TaskActions";
 import { TaskListSkeletonRows } from "../tasks/list/TaskListSkeletonRows";
+import { useEffect, useState } from "react";
+import { statusIsNotFinalized, statusIsRunningOrQueued } from "../tasks/types";
+import { envCredential } from "@/util/env";
+import { toast } from "@/components/ui/use-toast";
+
+type StreamMessage = {
+  task_id: string;
+  status: string;
+  screenshot?: string;
+};
+
+let socket: WebSocket | null = null;
+
+const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const { workflowRunId, workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
+  const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const navigate = useNavigate();
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
     useQuery<WorkflowRunStatusApiResponse>({
@@ -49,11 +64,10 @@ function WorkflowRun() {
           .then((response) => response.data);
       },
       refetchInterval: (query) => {
-        if (
-          query.state.data?.status === Status.Running ||
-          query.state.data?.status === Status.Queued ||
-          query.state.data?.status === Status.Created
-        ) {
+        if (!query.state.data) {
+          return false;
+        }
+        if (statusIsNotFinalized(query.state.data)) {
           return 5000;
         }
         return false;
@@ -82,6 +96,114 @@ function WorkflowRun() {
     placeholderData: keepPreviousData,
     refetchOnMount: workflowRun?.status === Status.Running,
   });
+
+  const workflowRunIsRunningOrQueued =
+    workflowRun && statusIsRunningOrQueued(workflowRun);
+
+  useEffect(() => {
+    if (!workflowRunIsRunningOrQueued) {
+      return;
+    }
+
+    async function run() {
+      // Create WebSocket connection.
+      let credential = null;
+      if (credentialGetter) {
+        const token = await credentialGetter();
+        credential = `?token=Bearer ${token}`;
+      } else {
+        credential = `?apikey=${envCredential}`;
+      }
+      if (socket) {
+        socket.close();
+      }
+      socket = new WebSocket(
+        `${wssBaseUrl}/stream/workflow_runs/${workflowRunId}${credential}`,
+      );
+      // Listen for messages
+      socket.addEventListener("message", (event) => {
+        try {
+          const message: StreamMessage = JSON.parse(event.data);
+          if (message.screenshot) {
+            setStreamImgSrc(message.screenshot);
+          }
+          if (
+            message.status === "completed" ||
+            message.status === "failed" ||
+            message.status === "terminated"
+          ) {
+            socket?.close();
+            if (
+              message.status === "failed" ||
+              message.status === "terminated"
+            ) {
+              toast({
+                title: "Run Failed",
+                description: "The workflow run has failed.",
+                variant: "destructive",
+              });
+            } else if (message.status === "completed") {
+              toast({
+                title: "Run Completed",
+                description: "The workflow run has been completed.",
+                variant: "success",
+              });
+            }
+          }
+        } catch (e) {
+          console.error("Failed to parse message", e);
+        }
+      });
+
+      socket.addEventListener("close", () => {
+        socket = null;
+      });
+    }
+    run();
+
+    return () => {
+      if (socket) {
+        socket.close();
+        socket = null;
+      }
+    };
+  }, [credentialGetter, workflowRunId, workflowRunIsRunningOrQueued]);
+
+  function getStream() {
+    if (workflowRun?.status === Status.Created) {
+      return (
+        <div className="flex h-full w-full flex-col items-center justify-center gap-8 bg-slate-900 py-8 text-lg">
+          <span>Workflow has been created.</span>
+          <span>Stream will start when the workflow is running.</span>
+        </div>
+      );
+    }
+    if (workflowRun?.status === Status.Queued) {
+      return (
+        <div className="flex h-full w-full flex-col items-center justify-center gap-8 bg-slate-900 py-8 text-lg">
+          <span>Your workflow run is queued.</span>
+          <span>Stream will start when the workflow is running.</span>
+        </div>
+      );
+    }
+
+    if (workflowRun?.status === Status.Running && streamImgSrc.length === 0) {
+      return (
+        <div className="flex h-full w-full items-center justify-center bg-slate-900 py-8 text-lg">
+          Starting the stream...
+        </div>
+      );
+    }
+
+    if (workflowRun?.status === Status.Running && streamImgSrc.length > 0) {
+      return (
+        <div className="h-full w-full">
+          <img src={`data:image/png;base64,${streamImgSrc}`} />
+        </div>
+      );
+    }
+    return null;
+  }
 
   function handleNavigate(event: React.MouseEvent, id: string) {
     if (event.ctrlKey || event.metaKey) {
@@ -119,6 +241,7 @@ function WorkflowRun() {
           Rerun Workflow
         </Button>
       </header>
+      {getStream()}
       <div className="space-y-4">
         <header>
           <h2 className="text-lg font-semibold">Tasks</h2>
