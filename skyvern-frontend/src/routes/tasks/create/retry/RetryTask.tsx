@@ -33,6 +33,8 @@ function RetryTask() {
                 2,
               ),
         webhookCallbackUrl: task.request.webhook_callback_url,
+        totpIdentifier: task.request.totp_identifier,
+        totpVerificationUrl: task.request.totp_verification_url,
       }}
     />
   );

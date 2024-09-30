@@ -77,6 +77,8 @@ export type TaskApiResponse = {
     error_code_mapping: null;
     proxy_location: string;
     extracted_information_schema: string | object;
+    totp_verification_url: string | null;
+    totp_identifier: string | null;
   };
   task_id: string;
   status: Status;
