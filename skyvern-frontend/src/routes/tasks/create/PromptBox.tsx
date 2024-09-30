@@ -145,14 +145,9 @@ function PromptBox() {
           <span className="text-2xl">
             What task would you like to accomplish?
           </span>
-          <div
-            className="flex w-[35rem] max-w-xl items-center rounded-xl border border-slate-700 py-2 pr-4"
-            style={{
-              background: "rgba(248, 250, 252, 0.05)",
-            }}
-          >
+          <div className="flex w-[35rem] max-w-xl items-center rounded-xl bg-slate-700 py-2 pr-4">
             <Textarea
-              className="min-h-0 resize-none rounded-xl border-transparent px-4 text-slate-400 hover:border-transparent focus-visible:ring-0"
+              className="min-h-0 resize-none rounded-xl border-transparent px-4 hover:border-transparent focus-visible:ring-0"
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
               placeholder="Enter your prompt..."
