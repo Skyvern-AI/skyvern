@@ -15,6 +15,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/use-toast";
 import { envCredential } from "@/util/env";
+import { statusIsNotFinalized, statusIsRunningOrQueued } from "../types";
 
 type StreamMessage = {
   task_id: string;
@@ -51,18 +52,18 @@ function TaskActions() {
       return client.get(`/tasks/${taskId}`).then((response) => response.data);
     },
     refetchInterval: (query) => {
-      if (
-        query.state.data?.status === Status.Running ||
-        query.state.data?.status === Status.Queued
-      ) {
+      if (!query.state.data) {
+        return false;
+      }
+      if (statusIsNotFinalized(query.state.data)) {
         return 5000;
       }
       return false;
     },
     placeholderData: keepPreviousData,
   });
-  const taskIsRunningOrQueued =
-    task?.status === Status.Running || task?.status === Status.Queued;
+  const taskIsNotFinalized = task && statusIsNotFinalized(task);
+  const taskIsRunningOrQueued = task && statusIsRunningOrQueued(task);
 
   useEffect(() => {
     if (!taskIsRunningOrQueued) {
@@ -135,10 +136,10 @@ function TaskActions() {
   }, [credentialGetter, taskId, taskIsRunningOrQueued]);
 
   useEffect(() => {
-    if (!taskIsLoading && taskIsRunningOrQueued) {
+    if (!taskIsLoading && taskIsNotFinalized) {
       setSelectedAction("stream");
     }
-  }, [taskIsLoading, taskIsRunningOrQueued]);
+  }, [taskIsLoading, taskIsNotFinalized]);
 
   const { data: steps, isLoading: stepsIsLoading } = useQuery<
     Array<StepApiResponse>
@@ -151,8 +152,8 @@ function TaskActions() {
         .then((response) => response.data);
     },
     enabled: !!task,
-    refetchOnWindowFocus: taskIsRunningOrQueued,
-    refetchInterval: taskIsRunningOrQueued ? 5000 : false,
+    refetchOnWindowFocus: taskIsNotFinalized,
+    refetchInterval: taskIsNotFinalized ? 5000 : false,
     placeholderData: keepPreviousData,
   });
 
@@ -198,6 +199,14 @@ function TaskActions() {
     actions?.[actions.length - selectedAction - 1];
 
   function getStream() {
+    if (task?.status === Status.Created) {
+      return (
+        <div className="flex h-full w-full flex-col items-center justify-center gap-4 bg-slate-900 text-lg">
+          <span>Task has been created.</span>
+          <span>Stream will start when the task is running.</span>
+        </div>
+      );
+    }
     if (task?.status === Status.Queued) {
       return (
         <div className="flex h-full w-full flex-col items-center justify-center gap-4 bg-slate-900 text-lg">
@@ -242,13 +251,13 @@ function TaskActions() {
         activeIndex={selectedAction}
         data={actions ?? []}
         onActiveIndexChange={setSelectedAction}
-        showStreamOption={taskIsRunningOrQueued}
+        showStreamOption={Boolean(taskIsNotFinalized)}
         onNext={() => {
           if (!actions) {
             return;
           }
           setSelectedAction((prev) => {
-            if (taskIsRunningOrQueued) {
+            if (taskIsNotFinalized) {
               if (actions.length === 0) {
                 return "stream";
               }
@@ -271,7 +280,7 @@ function TaskActions() {
             return;
           }
           setSelectedAction((prev) => {
-            if (taskIsRunningOrQueued) {
+            if (taskIsNotFinalized) {
               if (actions.length === 0) {
                 return "stream";
               }
