@@ -33,6 +33,8 @@ function CreateNewTaskFromPrompt() {
           ),
           navigationPayload: JSON.stringify(state.navigation_payload, null, 2),
           webhookCallbackUrl: "",
+          totpIdentifier: null,
+          totpVerificationUrl: null,
         }}
       />
     </section>

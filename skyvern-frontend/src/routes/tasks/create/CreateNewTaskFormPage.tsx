@@ -64,6 +64,9 @@ function CreateNewTaskFormPage() {
         extractedInformationSchema: JSON.stringify(dataSchema, null, 2),
         navigationPayload,
         maxSteps,
+        totpIdentifier: data.workflow_definition.blocks[0].totp_identifier,
+        totpVerificationUrl:
+          data.workflow_definition.blocks[0].totp_verification_url,
       }}
     />
   );
