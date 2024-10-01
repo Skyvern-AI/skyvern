@@ -29,13 +29,19 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import {
+  Link,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 import { TaskActions } from "../tasks/list/TaskActions";
 import { TaskListSkeletonRows } from "../tasks/list/TaskListSkeletonRows";
 import { useEffect, useState } from "react";
 import { statusIsNotFinalized, statusIsRunningOrQueued } from "../tasks/types";
 import { envCredential } from "@/util/env";
 import { toast } from "@/components/ui/use-toast";
+import { Pencil2Icon, PlayIcon } from "@radix-ui/react-icons";
 
 type StreamMessage = {
   task_id: string;
@@ -230,16 +236,25 @@ function WorkflowRun() {
             <StatusBadge status={workflowRun?.status} />
           ) : null}
         </div>
-        <Button
-          onClick={() => {
-            navigate(`/workflows/${workflowPermanentId}/run`, {
-              state: { data: parameters },
-            });
-          }}
-          variant="secondary"
-        >
-          Rerun Workflow
-        </Button>
+        <div className="flex gap-2">
+          <Button asChild variant="secondary">
+            <Link to={`/workflows/${workflowPermanentId}/edit`}>
+              <Pencil2Icon className="mr-2 h-4 w-4" />
+              Edit Workflow
+            </Link>
+          </Button>
+          <Button asChild>
+            <Link
+              to={`/workflows/${workflowPermanentId}/run`}
+              state={{
+                data: parameters,
+              }}
+            >
+              <PlayIcon className="mr-2 h-4 w-4" />
+              Rerun Workflow
+            </Link>
+          </Button>
+        </div>
       </header>
       {getStream()}
       <div className="space-y-4">
