@@ -82,14 +82,13 @@ class BitwardenService:
         url: str,
         collection_id: str | None = None,
         remaining_retries: int = settings.BITWARDEN_MAX_RETRIES,
-        timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
         fail_reasons: list[str] = [],
     ) -> dict[str, str]:
         """
         Get the secret value from the Bitwarden CLI.
         """
         try:
-            async with asyncio.timeout(timeout):
+            async with asyncio.timeout(settings.BITWARDEN_TIMEOUT_SECONDS):
                 return await BitwardenService._get_secret_value_from_url(
                     client_id=client_id,
                     client_secret=client_secret,
@@ -112,8 +111,6 @@ class BitwardenService:
                 url=url,
                 collection_id=collection_id,
                 remaining_retries=remaining_retries,
-                # Double the timeout for the next retry
-                timeout=timeout * 2,
                 fail_reasons=fail_reasons + [f"{type(e).__name__}: {str(e)}"],
             )
 
@@ -210,14 +207,13 @@ class BitwardenService:
         identity_key: str,
         identity_fields: list[str],
         remaining_retries: int = settings.BITWARDEN_MAX_RETRIES,
-        timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
         fail_reasons: list[str] = [],
     ) -> dict[str, str]:
         """
         Get the secret value from the Bitwarden CLI.
         """
         try:
-            async with asyncio.timeout(timeout):
+            async with asyncio.timeout(settings.BITWARDEN_TIMEOUT_SECONDS):
                 return await BitwardenService._get_sensitive_information_from_identity(
                     client_id=client_id,
                     client_secret=client_secret,
@@ -242,8 +238,6 @@ class BitwardenService:
                 identity_key=identity_key,
                 identity_fields=identity_fields,
                 remaining_retries=remaining_retries,
-                # Double the timeout for the next retry
-                timeout=timeout * 2,
                 fail_reasons=fail_reasons + [f"{type(e).__name__}: {str(e)}"],
             )
 
