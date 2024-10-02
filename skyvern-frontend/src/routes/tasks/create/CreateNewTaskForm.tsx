@@ -79,14 +79,16 @@ function createTaskRequestObject(
   };
 }
 
+type Section = "base" | "extraction" | "advanced";
+
 function CreateNewTaskForm({ initialValues }: Props) {
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const credentialGetter = useCredentialGetter();
   const apiCredential = useApiCredential();
-  const [section, setSection] = useState<"base" | "extraction" | "advanced">(
+  const [activeSections, setActiveSections] = useState<Array<Section>>([
     "base",
-  );
+  ]);
   const [showAdvancedBaseContent, setShowAdvancedBaseContent] = useState(false);
 
   const form = useForm<CreateNewTaskFormValues>({
@@ -163,22 +165,34 @@ function CreateNewTaskForm({ initialValues }: Props) {
     mutation.mutate(values);
   }
 
+  function isActive(section: Section) {
+    return activeSections.includes(section);
+  }
+
+  function toggleSection(section: Section) {
+    if (isActive(section)) {
+      setActiveSections(activeSections.filter((s) => s !== section));
+    } else {
+      setActiveSections([...activeSections, section]);
+    }
+  }
+
   return (
     <Form {...form}>
       <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
         <TaskFormSection
           index={1}
           title="Base Content"
-          active={section === "base"}
+          active={isActive("base")}
           onClick={() => {
-            setSection("base");
+            toggleSection("base");
           }}
           hasError={
             typeof errors.url !== "undefined" ||
             typeof errors.navigationGoal !== "undefined"
           }
         >
-          {section === "base" && (
+          {isActive("base") && (
             <div className="space-y-6">
               <div className="space-y-4">
                 <FormField
@@ -302,16 +316,16 @@ function CreateNewTaskForm({ initialValues }: Props) {
         <TaskFormSection
           index={2}
           title="Extraction"
-          active={section === "extraction"}
+          active={isActive("extraction")}
           onClick={() => {
-            setSection("extraction");
+            toggleSection("extraction");
           }}
           hasError={
             typeof errors.dataExtractionGoal !== "undefined" ||
             typeof errors.extractedInformationSchema !== "undefined"
           }
         >
-          {section === "extraction" && (
+          {isActive("extraction") && (
             <div className="space-y-6">
               <div className="space-y-4">
                 <FormField
@@ -379,9 +393,9 @@ function CreateNewTaskForm({ initialValues }: Props) {
         <TaskFormSection
           index={3}
           title="Advanced Settings"
-          active={section === "advanced"}
+          active={isActive("advanced")}
           onClick={() => {
-            setSection("advanced");
+            toggleSection("advanced");
           }}
           hasError={
             typeof errors.navigationPayload !== "undefined" ||
@@ -390,7 +404,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
             typeof errors.errorCodeMapping !== "undefined"
           }
         >
-          {section === "advanced" && (
+          {isActive("advanced") && (
             <div className="space-y-6">
               <div className="space-y-4">
                 <FormField

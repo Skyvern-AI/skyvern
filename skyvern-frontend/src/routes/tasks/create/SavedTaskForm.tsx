@@ -129,15 +129,17 @@ function createTaskTemplateRequestObject(values: SavedTaskFormValues) {
   };
 }
 
+type Section = "base" | "extraction" | "advanced";
+
 function SavedTaskForm({ initialValues }: Props) {
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const credentialGetter = useCredentialGetter();
   const apiCredential = useApiCredential();
   const { template } = useParams();
-  const [section, setSection] = useState<"base" | "extraction" | "advanced">(
+  const [activeSections, setActiveSections] = useState<Array<Section>>([
     "base",
-  );
+  ]);
   const [showAdvancedBaseContent, setShowAdvancedBaseContent] = useState(false);
 
   const form = useForm<SavedTaskFormValues>({
@@ -263,6 +265,18 @@ function SavedTaskForm({ initialValues }: Props) {
     saveTaskMutation.mutate(values);
   }
 
+  function isActive(section: Section) {
+    return activeSections.includes(section);
+  }
+
+  function toggleSection(section: Section) {
+    if (isActive(section)) {
+      setActiveSections(activeSections.filter((s) => s !== section));
+    } else {
+      setActiveSections([...activeSections, section]);
+    }
+  }
+
   return (
     <Form {...form}>
       <form
@@ -282,8 +296,10 @@ function SavedTaskForm({ initialValues }: Props) {
         <TaskFormSection
           index={1}
           title="Base Content"
-          active={section === "base"}
-          onClick={() => setSection("base")}
+          active={isActive("base")}
+          onClick={() => {
+            toggleSection("base");
+          }}
           hasError={
             typeof errors.navigationGoal !== "undefined" ||
             typeof errors.title !== "undefined" ||
@@ -291,7 +307,7 @@ function SavedTaskForm({ initialValues }: Props) {
             typeof errors.description !== "undefined"
           }
         >
-          {section === "base" && (
+          {isActive("base") && (
             <div className="space-y-6">
               <div className="space-y-4">
                 <FormField
@@ -467,14 +483,16 @@ function SavedTaskForm({ initialValues }: Props) {
         <TaskFormSection
           index={2}
           title="Extraction"
-          active={section === "extraction"}
-          onClick={() => setSection("extraction")}
+          active={isActive("extraction")}
+          onClick={() => {
+            toggleSection("extraction");
+          }}
           hasError={
             typeof errors.extractedInformationSchema !== "undefined" ||
             typeof errors.dataExtractionGoal !== "undefined"
           }
         >
-          {section === "extraction" && (
+          {isActive("extraction") && (
             <div className="space-y-6">
               <div className="space-y-4">
                 <FormField
@@ -547,8 +565,10 @@ function SavedTaskForm({ initialValues }: Props) {
         <TaskFormSection
           index={3}
           title="Advanced Settings"
-          active={section === "advanced"}
-          onClick={() => setSection("advanced")}
+          active={isActive("advanced")}
+          onClick={() => {
+            toggleSection("advanced");
+          }}
           hasError={
             typeof errors.navigationPayload !== "undefined" ||
             typeof errors.maxStepsOverride !== "undefined" ||
@@ -556,7 +576,7 @@ function SavedTaskForm({ initialValues }: Props) {
             typeof errors.errorCodeMapping !== "undefined"
           }
         >
-          {section === "advanced" && (
+          {isActive("advanced") && (
             <div className="space-y-6">
               <div className="space-y-4">
                 <FormField
