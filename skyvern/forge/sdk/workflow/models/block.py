@@ -868,16 +868,27 @@ class SendEmailBlock(Block):
                 )
 
             # if the file path is a directory, add all files in the directory, skip directories, limit to 10 files
-            if os.path.exists(path) and os.path.isdir(path):
-                for file in os.listdir(path):
-                    if os.path.isdir(os.path.join(path, file)):
-                        LOG.warning("SendEmailBlock: Skipping directory", file=file)
-                        continue
-                    file_path = os.path.join(path, file)
-                    file_paths.append(file_path)
-            else:
-                # covers the case where the file path is a single file, a url, or an S3 uri
+            if os.path.exists(path):
+                if os.path.isdir(path):
+                    for file in os.listdir(path):
+                        if os.path.isdir(os.path.join(path, file)):
+                            LOG.warning("SendEmailBlock: Skipping directory", file=file)
+                            continue
+                        file_path = os.path.join(path, file)
+                        file_paths.append(file_path)
+                else:
+                    # covers the case where the file path is a single file
+                    file_paths.append(path)
+            # check if path is a url, or an S3 uri
+            elif (
+                path.startswith("http://")
+                or path.startswith("https://")
+                or path.startswith("s3://")
+                or path.startswith("www.")
+            ):
                 file_paths.append(path)
+            else:
+                LOG.warning("SendEmailBlock: File not found", file_path=path)
 
         return file_paths
 
