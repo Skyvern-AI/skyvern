@@ -87,6 +87,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
   const [section, setSection] = useState<"base" | "extraction" | "advanced">(
     "base",
   );
+  const [showAdvancedBaseContent, setShowAdvancedBaseContent] = useState(false);
 
   const form = useForm<CreateNewTaskFormValues>({
     resolver: zodResolver(createNewTaskFormSchema),
@@ -233,6 +234,67 @@ function CreateNewTaskForm({ initialValues }: Props) {
                     </FormItem>
                   )}
                 />
+                {showAdvancedBaseContent ? (
+                  <div className="border-t border-dashed pt-4">
+                    <FormField
+                      control={form.control}
+                      name="navigationPayload"
+                      render={({ field }) => (
+                        <FormItem>
+                          <div className="flex gap-16">
+                            <FormLabel>
+                              <div className="w-72">
+                                <h1 className="text-lg">Navigation Payload</h1>
+                                <h2 className="text-base text-slate-400">
+                                  Specify important parameters, routes, or
+                                  states
+                                </h2>
+                              </div>
+                              <Button
+                                className="mt-4"
+                                type="button"
+                                variant="tertiary"
+                                onClick={() => {
+                                  setShowAdvancedBaseContent(false);
+                                }}
+                                size="sm"
+                              >
+                                Hide Advanced Settings
+                              </Button>
+                            </FormLabel>
+                            <div className="w-full">
+                              <FormControl>
+                                <CodeEditor
+                                  {...field}
+                                  language="json"
+                                  fontSize={12}
+                                  minHeight="96px"
+                                  value={
+                                    field.value === null ? "" : field.value
+                                  }
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </div>
+                          </div>
+                        </FormItem>
+                      )}
+                    />
+                  </div>
+                ) : (
+                  <div>
+                    <Button
+                      type="button"
+                      variant="tertiary"
+                      onClick={() => {
+                        setShowAdvancedBaseContent(true);
+                      }}
+                      size="sm"
+                    >
+                      Show Advanced Settings
+                    </Button>
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -331,36 +393,6 @@ function CreateNewTaskForm({ initialValues }: Props) {
           {section === "advanced" && (
             <div className="space-y-6">
               <div className="space-y-4">
-                <FormField
-                  control={form.control}
-                  name="navigationPayload"
-                  render={({ field }) => (
-                    <FormItem>
-                      <div className="flex gap-16">
-                        <FormLabel>
-                          <div className="w-72">
-                            <h1 className="text-lg">Navigation Payload</h1>
-                            <h2 className="text-base text-slate-400">
-                              Specify important parameters, routes, or states
-                            </h2>
-                          </div>
-                        </FormLabel>
-                        <div className="w-full">
-                          <FormControl>
-                            <CodeEditor
-                              {...field}
-                              language="json"
-                              fontSize={12}
-                              minHeight="96px"
-                              value={field.value === null ? "" : field.value}
-                            />
-                          </FormControl>
-                          <FormMessage />
-                        </div>
-                      </div>
-                    </FormItem>
-                  )}
-                />
                 <FormField
                   control={form.control}
                   name="maxStepsOverride"
