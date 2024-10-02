@@ -5,6 +5,7 @@ import structlog
 
 from skyvern.exceptions import BitwardenBaseError, WorkflowRunContextNotInitialized
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
+from skyvern.forge.sdk.models import Organization
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
 from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -106,6 +107,8 @@ class WorkflowRunContext:
             client_secret=self.secrets[BitwardenConstants.CLIENT_SECRET],
             client_id=self.secrets[BitwardenConstants.CLIENT_ID],
             master_password=self.secrets[BitwardenConstants.MASTER_PASSWORD],
+            bw_organization_id=self.secrets[BitwardenConstants.BW_ORGANIZATION_ID],
+            bw_collection_ids=self.secrets[BitwardenConstants.BW_COLLECTION_IDS],
         )
         return secret_credentials
 
@@ -117,6 +120,7 @@ class WorkflowRunContext:
         self,
         aws_client: AsyncAWSClient,
         parameter: PARAMETER_TYPE,
+        organization: Organization,
     ) -> None:
         if parameter.parameter_type == ParameterType.WORKFLOW:
             LOG.error(f"Workflow parameters are set while initializing context manager. Parameter key: {parameter.key}")
@@ -165,10 +169,14 @@ class WorkflowRunContext:
                     client_id,
                     client_secret,
                     master_password,
+                    organization.bw_organization_id,
+                    organization.bw_collection_ids,
                     url,
                     collection_id=collection_id,
                 )
                 if secret_credentials:
+                    self.secrets[BitwardenConstants.BW_ORGANIZATION_ID] = organization.bw_organization_id
+                    self.secrets[BitwardenConstants.BW_COLLECTION_IDS] = organization.bw_collection_ids
                     self.secrets[BitwardenConstants.URL] = url
                     self.secrets[BitwardenConstants.CLIENT_SECRET] = client_secret
                     self.secrets[BitwardenConstants.CLIENT_ID] = client_id
@@ -223,11 +231,15 @@ class WorkflowRunContext:
                     client_id,
                     client_secret,
                     master_password,
+                    organization.bw_organization_id,
+                    organization.bw_collection_ids,
                     collection_id,
                     bitwarden_identity_key,
                     parameter.bitwarden_identity_fields,
                 )
                 if sensitive_values:
+                    self.secrets[BitwardenConstants.BW_ORGANIZATION_ID] = organization.bw_organization_id
+                    self.secrets[BitwardenConstants.BW_COLLECTION_IDS] = organization.bw_collection_ids
                     self.secrets[BitwardenConstants.IDENTITY_KEY] = bitwarden_identity_key
                     self.secrets[BitwardenConstants.CLIENT_SECRET] = client_secret
                     self.secrets[BitwardenConstants.CLIENT_ID] = client_id
@@ -333,6 +345,7 @@ class WorkflowRunContext:
         self,
         aws_client: AsyncAWSClient,
         parameters: list[PARAMETER_TYPE],
+        organization: Organization,
     ) -> None:
         # Sort the parameters so that ContextParameter and BitwardenLoginCredentialParameter are processed last
         # ContextParameter should be processed at the end since it requires the source parameter to be set
@@ -369,7 +382,7 @@ class WorkflowRunContext:
                 )
 
             self.parameters[parameter.key] = parameter
-            await self.register_parameter_value(aws_client, parameter)
+            await self.register_parameter_value(aws_client, parameter, organization)
 
 
 class WorkflowContextManager:
@@ -410,6 +423,9 @@ class WorkflowContextManager:
         self,
         workflow_run_id: str,
         parameters: list[PARAMETER_TYPE],
+        organization: Organization,
     ) -> None:
         self._validate_workflow_run_context(workflow_run_id)
-        await self.workflow_run_contexts[workflow_run_id].register_block_parameters(self.aws_client, parameters)
+        await self.workflow_run_contexts[workflow_run_id].register_block_parameters(
+            self.aws_client, parameters, organization
+        )
