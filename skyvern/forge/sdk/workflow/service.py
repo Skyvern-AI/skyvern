@@ -12,7 +12,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.models import Organization, Step
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskStatus
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
@@ -150,9 +150,10 @@ class WorkflowService:
         self,
         workflow_run_id: str,
         api_key: str,
-        organization_id: str | None = None,
+        organization: Organization,
     ) -> WorkflowRun:
         """Execute a workflow."""
+        organization_id = organization.organization_id
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id)
         workflow = await self.get_workflow(workflow_id=workflow_run.workflow_id, organization_id=organization_id)
 
@@ -181,7 +182,7 @@ class WorkflowService:
             try:
                 parameters = block.get_all_parameters(workflow_run_id)
                 await app.WORKFLOW_CONTEXT_MANAGER.register_block_parameters_for_workflow_run(
-                    workflow_run_id, parameters
+                    workflow_run_id, parameters, organization
                 )
                 LOG.info(
                     f"Executing root block {block.block_type} at index {block_idx} for workflow run {workflow_run_id}",

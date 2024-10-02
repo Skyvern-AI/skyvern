@@ -10,6 +10,7 @@ import tldextract
 
 from skyvern.config import settings
 from skyvern.exceptions import (
+    BitwardenAccessDeniedError,
     BitwardenListItemsError,
     BitwardenLoginError,
     BitwardenLogoutError,
@@ -29,6 +30,9 @@ def is_valid_email(email: str | None) -> bool:
 
 
 class BitwardenConstants(StrEnum):
+    BW_ORGANIZATION_ID = "BW_ORGANIZATION_ID"
+    BW_COLLECTION_IDS = "BW_COLLECTION_IDS"
+
     CLIENT_ID = "BW_CLIENT_ID"
     CLIENT_SECRET = "BW_CLIENT_SECRET"
     MASTER_PASSWORD = "BW_MASTER_PASSWORD"
@@ -79,6 +83,8 @@ class BitwardenService:
         client_id: str,
         client_secret: str,
         master_password: str,
+        bw_organization_id: str | None,
+        bw_collection_ids: list[str] | None,
         url: str,
         collection_id: str | None = None,
         remaining_retries: int = settings.BITWARDEN_MAX_RETRIES,
@@ -94,6 +100,8 @@ class BitwardenService:
                     client_id=client_id,
                     client_secret=client_secret,
                     master_password=master_password,
+                    bw_organization_id=bw_organization_id,
+                    bw_collection_ids=bw_collection_ids,
                     url=url,
                     collection_id=collection_id,
                 )
@@ -109,6 +117,8 @@ class BitwardenService:
                 client_id=client_id,
                 client_secret=client_secret,
                 master_password=master_password,
+                bw_organization_id=bw_organization_id,
+                bw_collection_ids=bw_collection_ids,
                 url=url,
                 collection_id=collection_id,
                 remaining_retries=remaining_retries,
@@ -122,12 +132,16 @@ class BitwardenService:
         client_id: str,
         client_secret: str,
         master_password: str,
+        bw_organization_id: str | None,
+        bw_collection_ids: list[str] | None,
         url: str,
         collection_id: str | None = None,
     ) -> dict[str, str]:
         """
         Get the secret value from the Bitwarden CLI.
         """
+        if not bw_organization_id and bw_collection_ids and collection_id not in bw_collection_ids:
+            raise BitwardenAccessDeniedError()
         try:
             BitwardenService.login(client_id, client_secret)
             BitwardenService.sync()
@@ -144,7 +158,13 @@ class BitwardenService:
                 "--session",
                 session_key,
             ]
-            if collection_id:
+            if bw_organization_id:
+                LOG.info(
+                    "Organization ID is provided, filtering items by organization ID",
+                    bw_organization_id=bw_organization_id,
+                )
+                list_command.extend(["--organizationid", bw_organization_id])
+            elif collection_id:
                 LOG.info("Collection ID is provided, filtering items by collection ID", collection_id=collection_id)
                 list_command.extend(["--collectionid", collection_id])
             items_result = BitwardenService.run_command(list_command)
@@ -158,11 +178,26 @@ class BitwardenService:
             except json.JSONDecodeError:
                 raise BitwardenListItemsError("Failed to parse items JSON. Output: " + items_result.stdout)
 
+            # Since Bitwarden can't AND multiple filters, we only use organization id in the list command
+            # but we still need to filter the items by collection id here
+            if bw_organization_id and collection_id:
+                filtered_items = []
+                for item in items:
+                    if "collectionIds" in item and collection_id in item["collectionIds"]:
+                        filtered_items.append(item)
+                items = filtered_items
+
             if not items:
                 collection_id_str = f" in collection with ID: {collection_id}" if collection_id else ""
                 raise BitwardenListItemsError(f"No items found in Bitwarden for URL: {url}{collection_id_str}")
 
+            # TODO (kerem): To make this more robust, we need to store the item id of the totp login item
+            # and use it here to get the TOTP code for that specific item
             totp_command = ["bw", "get", "totp", url, "--session", session_key]
+            if bw_organization_id:
+                # We need to add this filter because the TOTP command fails if there are multiple results
+                # For now, we require that the bitwarden organization id has only one totp login item for the domain
+                totp_command.extend(["--organizationid", bw_organization_id])
             totp_result = BitwardenService.run_command(totp_command)
 
             if totp_result.stderr and "Event post failed" not in totp_result.stderr:
@@ -208,6 +243,8 @@ class BitwardenService:
         client_id: str,
         client_secret: str,
         master_password: str,
+        bw_organization_id: str | None,
+        bw_collection_ids: list[str] | None,
         collection_id: str,
         identity_key: str,
         identity_fields: list[str],
@@ -224,6 +261,8 @@ class BitwardenService:
                     client_id=client_id,
                     client_secret=client_secret,
                     master_password=master_password,
+                    bw_organization_id=bw_organization_id,
+                    bw_collection_ids=bw_collection_ids,
                     collection_id=collection_id,
                     identity_key=identity_key,
                     identity_fields=identity_fields,
@@ -240,6 +279,8 @@ class BitwardenService:
                 client_id=client_id,
                 client_secret=client_secret,
                 master_password=master_password,
+                bw_organization_id=bw_organization_id,
+                bw_collection_ids=bw_collection_ids,
                 collection_id=collection_id,
                 identity_key=identity_key,
                 identity_fields=identity_fields,
@@ -257,10 +298,14 @@ class BitwardenService:
         collection_id: str,
         identity_key: str,
         identity_fields: list[str],
+        bw_organization_id: str | None,
+        bw_collection_ids: list[str] | None,
     ) -> dict[str, str]:
         """
         Get the sensitive information from the Bitwarden CLI.
         """
+        if not bw_organization_id and bw_collection_ids and collection_id not in bw_collection_ids:
+            raise BitwardenAccessDeniedError()
         try:
             BitwardenService.login(client_id, client_secret)
             BitwardenService.sync()
@@ -278,6 +323,8 @@ class BitwardenService:
                 "--collectionid",
                 collection_id,
             ]
+            if bw_organization_id:
+                list_command.extend(["--organizationid", bw_organization_id])
             items_result = BitwardenService.run_command(list_command)
 
             # Parse the items and extract sensitive information

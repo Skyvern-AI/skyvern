@@ -111,6 +111,8 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
         max_steps_per_run=org_model.max_steps_per_run,
         max_retries_per_step=org_model.max_retries_per_step,
         domain=org_model.domain,
+        bw_organization_id=org_model.bw_organization_id,
+        bw_collection_ids=org_model.bw_collection_ids,
         created_at=org_model.created_at,
         modified_at=org_model.modified_at,
     )

@@ -131,6 +131,8 @@ class Organization(BaseModel):
     max_steps_per_run: int | None = None
     max_retries_per_step: int | None = None
     domain: str | None = None
+    bw_organization_id: str | None = None
+    bw_collection_ids: list[str] | None = None
 
     created_at: datetime
     modified_at: datetime

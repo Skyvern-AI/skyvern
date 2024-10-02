@@ -99,8 +99,14 @@ class BackgroundTaskExecutor(AsyncExecutor):
             "Executing workflow using background task executor",
             workflow_run_id=workflow_run_id,
         )
+
+        organization = await app.DATABASE.get_organization(organization_id)
+        if organization is None:
+            raise OrganizationNotFound(organization_id)
+
         background_tasks.add_task(
             app.WORKFLOW_SERVICE.execute_workflow,
             workflow_run_id=workflow_run_id,
             api_key=api_key,
+            organization=organization,
         )

@@ -109,6 +109,8 @@ class OrganizationModel(Base):
     max_steps_per_run = Column(Integer, nullable=True)
     max_retries_per_step = Column(Integer, nullable=True)
     domain = Column(String, nullable=True, index=True)
+    bw_organization_id = Column(String, nullable=True, default=None)
+    bw_collection_ids = Column(JSON, nullable=True, default=None)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
