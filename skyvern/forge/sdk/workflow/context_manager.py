@@ -182,15 +182,16 @@ class WorkflowRunContext:
                     # password secret
                     password_secret_id = f"{random_secret_id}_password"
                     self.secrets[password_secret_id] = secret_credentials[BitwardenConstants.PASSWORD]
-
-                    totp_secret_id = f"{random_secret_id}_totp"
-                    self.secrets[totp_secret_id] = BitwardenConstants.TOTP
-
                     self.values[parameter.key] = {
                         "username": username_secret_id,
                         "password": password_secret_id,
-                        "totp": totp_secret_id,
                     }
+
+                    if BitwardenConstants.TOTP in secret_credentials and secret_credentials[BitwardenConstants.TOTP]:
+                        totp_secret_id = f"{random_secret_id}_totp"
+                        self.secrets[totp_secret_id] = BitwardenConstants.TOTP
+                        self.values[parameter.key]["totp"] = totp_secret_id
+
             except BitwardenBaseError as e:
                 LOG.error(f"Failed to get secret from Bitwarden. Error: {e}")
                 raise e

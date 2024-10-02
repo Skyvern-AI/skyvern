@@ -177,11 +177,13 @@ class BitwardenService:
                 {
                     BitwardenConstants.USERNAME: item["login"]["username"],
                     BitwardenConstants.PASSWORD: item["login"]["password"],
-                    BitwardenConstants.TOTP: totp_code,
                 }
                 for item in items
                 if "login" in item
             ]
+            if totp_code:
+                for credential in credentials:
+                    credential[BitwardenConstants.TOTP] = totp_code
 
             if len(credentials) == 0:
                 return {}
