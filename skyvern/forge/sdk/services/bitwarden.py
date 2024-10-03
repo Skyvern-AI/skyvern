@@ -193,7 +193,7 @@ class BitwardenService:
 
             # TODO (kerem): To make this more robust, we need to store the item id of the totp login item
             # and use it here to get the TOTP code for that specific item
-            totp_command = ["bw", "get", "totp", url, "--session", session_key]
+            totp_command = ["bw", "get", "totp", domain, "--session", session_key]
             if bw_organization_id:
                 # We need to add this filter because the TOTP command fails if there are multiple results
                 # For now, we require that the bitwarden organization id has only one totp login item for the domain
