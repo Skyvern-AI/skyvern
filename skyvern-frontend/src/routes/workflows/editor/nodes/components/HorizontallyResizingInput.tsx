@@ -1,7 +1,7 @@
 import { Input } from "@/components/ui/input";
 import { useLayoutEffect, useRef } from "react";
 
-type Props = React.ComponentProps<typeof Input>;
+type Props = React.ComponentPropsWithoutRef<typeof Input>;
 
 function HorizontallyResizingInput(props: Props) {
   const ref = useRef<HTMLInputElement>(null);

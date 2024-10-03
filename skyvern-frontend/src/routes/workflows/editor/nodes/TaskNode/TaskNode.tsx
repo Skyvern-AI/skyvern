@@ -11,6 +11,7 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { ListBulletIcon } from "@radix-ui/react-icons";
 import {
   Edge,
@@ -23,11 +24,7 @@ import {
 } from "@xyflow/react";
 import { useState } from "react";
 import { AppNode } from "..";
-import {
-  getUniqueLabelForExistingNode,
-  getOutputParameterKey,
-  getUpdatedNodesAfterLabelUpdateForParameterKeys,
-} from "../../workflowEditorUtils";
+import { getOutputParameterKey } from "../../workflowEditorUtils";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { TaskNodeDisplayModeSwitch } from "./TaskNodeDisplayModeSwitch";
@@ -58,7 +55,7 @@ function getPreviousNodeIds(
 }
 
 function TaskNode({ id, data }: NodeProps<TaskNode>) {
-  const { updateNodeData, setNodes } = useReactFlow();
+  const { updateNodeData } = useReactFlow();
   const [displayMode, setDisplayMode] = useState<TaskNodeDisplayMode>("basic");
   const { editable } = data;
   const deleteNodeCallback = useDeleteNodeCallback();
@@ -75,7 +72,11 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
     getOutputParameterKey(label),
   );
 
-  const [label, setLabel] = useState(data.label);
+  const [label, setLabel] = useNodeLabelChangeHandler({
+    id,
+    initialValue: data.label,
+  });
+
   const [inputs, setInputs] = useState({
     url: data.url,
     navigationGoal: data.navigationGoal,
@@ -421,22 +422,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
               <EditableNodeTitle
                 value={label}
                 editable={editable}
-                onChange={(value) => {
-                  const existingLabels = nodes.map((n) => n.data.label);
-                  const labelWithoutWhitespace = value.replace(/\s+/g, "_");
-                  const newLabel = getUniqueLabelForExistingNode(
-                    labelWithoutWhitespace,
-                    existingLabels,
-                  );
-                  setLabel(newLabel);
-                  setNodes(
-                    getUpdatedNodesAfterLabelUpdateForParameterKeys(
-                      id,
-                      newLabel,
-                      nodes as Array<AppNode>,
-                    ),
-                  );
-                }}
+                onChange={setLabel}
                 titleClassName="text-base"
                 inputClassName="text-base"
               />
