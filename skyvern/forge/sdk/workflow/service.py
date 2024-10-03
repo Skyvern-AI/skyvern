@@ -534,6 +534,28 @@ class WorkflowService:
             description=description,
         )
 
+    async def create_bitwarden_credit_card_data_parameter(
+        self,
+        workflow_id: str,
+        bitwarden_client_id_aws_secret_key: str,
+        bitwarden_client_secret_aws_secret_key: str,
+        bitwarden_master_password_aws_secret_key: str,
+        bitwarden_collection_id: str,
+        bitwarden_item_id: str,
+        key: str,
+        description: str | None = None,
+    ) -> Parameter:
+        return await app.DATABASE.create_bitwarden_credit_card_data_parameter(
+            workflow_id=workflow_id,
+            bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
+            bitwarden_client_secret_aws_secret_key=bitwarden_client_secret_aws_secret_key,
+            bitwarden_master_password_aws_secret_key=bitwarden_master_password_aws_secret_key,
+            bitwarden_collection_id=bitwarden_collection_id,
+            bitwarden_item_id=bitwarden_item_id,
+            key=key,
+            description=description,
+        )
+
     async def create_output_parameter(
         self, workflow_id: str, key: str, description: str | None = None
     ) -> OutputParameter:
@@ -824,10 +846,11 @@ class WorkflowService:
 
     async def create_workflow_from_request(
         self,
-        organization_id: str,
+        organization: Organization,
         request: WorkflowCreateYAMLRequest,
         workflow_permanent_id: str | None = None,
     ) -> Workflow:
+        organization_id = organization.organization_id
         LOG.info(
             "Creating workflow from request",
             organization_id=organization_id,
@@ -935,6 +958,21 @@ class WorkflowService:
                         bitwarden_collection_id=parameter.bitwarden_collection_id,  # type: ignore
                         bitwarden_identity_key=parameter.bitwarden_identity_key,
                         bitwarden_identity_fields=parameter.bitwarden_identity_fields,
+                        key=parameter.key,
+                        description=parameter.description,
+                    )
+                elif parameter.parameter_type == ParameterType.BITWARDEN_CREDIT_CARD_DATA:
+                    if not organization.bw_organization_id and not organization.bw_collection_ids:
+                        raise InvalidWorkflowDefinition(
+                            message="To use credit card data parameters, please contact us at support@skyvern.com"
+                        )
+                    parameters[parameter.key] = await self.create_bitwarden_credit_card_data_parameter(
+                        workflow_id=workflow.workflow_id,
+                        bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
+                        bitwarden_client_secret_aws_secret_key=parameter.bitwarden_client_secret_aws_secret_key,
+                        bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
+                        bitwarden_collection_id=parameter.bitwarden_collection_id,
+                        bitwarden_item_id=parameter.bitwarden_item_id,
                         key=parameter.key,
                         description=parameter.description,
                     )

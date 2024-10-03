@@ -281,9 +281,9 @@ class BitwardenSyncError(BitwardenBaseError):
 class BitwardenAccessDeniedError(BitwardenBaseError):
     def __init__(self) -> None:
         super().__init__(
-            "Current organization does not have access to the specified Bitwarden collection. \
-                          Contact Skyvern support to enable access. This is a security layer on top of Bitwarden, \
-                          Skyvern team needs to let your Skyvern account access the Bitwarden collection."
+            "Current organization does not have access to the specified Bitwarden collection. "
+            "Contact Skyvern support to enable access. This is a security layer on top of Bitwarden, "
+            "Skyvern team needs to let your Skyvern account access the Bitwarden collection."
         )
 
 

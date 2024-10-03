@@ -668,7 +668,7 @@ async def create_workflow(
     try:
         workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
-            organization_id=current_org.organization_id, request=workflow_create_request
+            organization=current_org, request=workflow_create_request
         )
     except Exception as e:
         LOG.error("Failed to create workflow", exc_info=True)
@@ -712,7 +712,7 @@ async def update_workflow(
     try:
         workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
-            organization_id=current_org.organization_id,
+            organization=current_org,
             request=workflow_create_request,
             workflow_permanent_id=workflow_permanent_id,
         )

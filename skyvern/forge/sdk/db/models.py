@@ -21,6 +21,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.id import (
     generate_artifact_id,
     generate_aws_secret_parameter_id,
+    generate_bitwarden_credit_card_data_parameter_id,
     generate_bitwarden_login_credential_parameter_id,
     generate_bitwarden_sensitive_information_parameter_id,
     generate_org_id,
@@ -330,6 +331,28 @@ class BitwardenSensitiveInformationParameterModel(Base):
         onupdate=datetime.datetime.utcnow,
         nullable=False,
     )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class BitwardenCreditCardDataParameterModel(Base):
+    __tablename__ = "bitwarden_credit_card_data_parameters"
+
+    bitwarden_credit_card_data_parameter_id = Column(
+        String,
+        primary_key=True,
+        index=True,
+        default=generate_bitwarden_credit_card_data_parameter_id,
+    )
+    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), index=True, nullable=False)
+    key = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    bitwarden_client_id_aws_secret_key = Column(String, nullable=False)
+    bitwarden_client_secret_aws_secret_key = Column(String, nullable=False)
+    bitwarden_master_password_aws_secret_key = Column(String, nullable=False)
+    bitwarden_collection_id = Column(String, nullable=False)
+    bitwarden_item_id = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
 
 
