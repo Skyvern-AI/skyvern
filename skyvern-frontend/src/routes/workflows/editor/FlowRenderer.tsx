@@ -17,13 +17,13 @@ import { useEffect, useState } from "react";
 import {
   AWSSecretParameter,
   BitwardenSensitiveInformationParameter,
-  ContextParameter,
   WorkflowApiResponse,
   WorkflowParameterValueType,
 } from "../types/workflowTypes";
 import {
   BitwardenLoginCredentialParameterYAML,
   BlockYAML,
+  ContextParameterYAML,
   ParameterYAML,
   WorkflowCreateYAMLRequest,
   WorkflowParameterYAML,
@@ -65,7 +65,11 @@ import { ReloadIcon } from "@radix-ui/react-icons";
 
 function convertToParametersYAML(
   parameters: ParametersState,
-): Array<WorkflowParameterYAML | BitwardenLoginCredentialParameterYAML> {
+): Array<
+  | WorkflowParameterYAML
+  | BitwardenLoginCredentialParameterYAML
+  | ContextParameterYAML
+> {
   return parameters.map((parameter) => {
     if (parameter.parameterType === "workflow") {
       return {
@@ -76,6 +80,13 @@ function convertToParametersYAML(
         ...(parameter.defaultValue === null
           ? {}
           : { default_value: parameter.defaultValue }),
+      };
+    } else if (parameter.parameterType === "context") {
+      return {
+        parameter_type: "context",
+        key: parameter.key,
+        description: parameter.description || null,
+        source_parameter_key: parameter.sourceParameterKey,
       };
     } else {
       return {
@@ -99,7 +110,7 @@ export type ParametersState = Array<
       key: string;
       parameterType: "workflow";
       dataType: WorkflowParameterValueType;
-      description?: string;
+      description?: string | null;
       defaultValue: unknown;
     }
   | {
@@ -107,7 +118,13 @@ export type ParametersState = Array<
       parameterType: "credential";
       collectionId: string;
       urlParameterKey: string;
-      description?: string;
+      description?: string | null;
+    }
+  | {
+      key: string;
+      parameterType: "context";
+      sourceParameterKey: string;
+      description?: string | null;
     }
 >;
 
@@ -225,15 +242,10 @@ function FlowRenderer({
       (parameter) => {
         return (
           parameter.parameter_type === "aws_secret" ||
-          parameter.parameter_type === "bitwarden_sensitive_information" ||
-          parameter.parameter_type === "context"
+          parameter.parameter_type === "bitwarden_sensitive_information"
         );
       },
-    ) as Array<
-      | AWSSecretParameter
-      | BitwardenSensitiveInformationParameter
-      | ContextParameter
-    >;
+    ) as Array<AWSSecretParameter | BitwardenSensitiveInformationParameter>;
 
     const echoParameters = convertEchoParameters(filteredParameters);
 

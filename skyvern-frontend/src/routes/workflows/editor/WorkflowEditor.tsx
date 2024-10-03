@@ -51,7 +51,8 @@ function WorkflowEditor() {
             .filter(
               (parameter) =>
                 parameter.parameter_type === "workflow" ||
-                parameter.parameter_type === "bitwarden_login_credential",
+                parameter.parameter_type === "bitwarden_login_credential" ||
+                parameter.parameter_type === "context",
             )
             .map((parameter) => {
               if (parameter.parameter_type === "workflow") {
@@ -60,6 +61,14 @@ function WorkflowEditor() {
                   parameterType: "workflow",
                   dataType: parameter.workflow_parameter_type,
                   defaultValue: parameter.default_value,
+                  description: parameter.description,
+                };
+              } else if (parameter.parameter_type === "context") {
+                return {
+                  key: parameter.key,
+                  parameterType: "context",
+                  sourceParameterKey: parameter.source.key,
+                  description: parameter.description,
                 };
               } else {
                 return {
@@ -67,6 +76,7 @@ function WorkflowEditor() {
                   parameterType: "credential",
                   collectionId: parameter.bitwarden_collection_id,
                   urlParameterKey: parameter.url_parameter_key,
+                  description: parameter.description,
                 };
               }
             })}

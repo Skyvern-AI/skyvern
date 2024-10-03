@@ -1,29 +1,19 @@
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { UploadIcon } from "@radix-ui/react-icons";
-import {
-  Handle,
-  NodeProps,
-  Position,
-  useNodes,
-  useReactFlow,
-} from "@xyflow/react";
+import { Handle, NodeProps, Position } from "@xyflow/react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import type { UploadNode } from "./types";
-import { useState } from "react";
-import {
-  getUniqueLabelForExistingNode,
-  getUpdatedNodesAfterLabelUpdateForParameterKeys,
-} from "../../workflowEditorUtils";
-import { AppNode } from "..";
 
 function UploadNode({ id, data }: NodeProps<UploadNode>) {
-  const { setNodes } = useReactFlow();
-  const nodes = useNodes<AppNode>();
   const deleteNodeCallback = useDeleteNodeCallback();
-  const [label, setLabel] = useState(data.label);
+  const [label, setLabel] = useNodeLabelChangeHandler({
+    id,
+    initialValue: data.label,
+  });
 
   return (
     <div>
@@ -49,22 +39,7 @@ function UploadNode({ id, data }: NodeProps<UploadNode>) {
               <EditableNodeTitle
                 value={label}
                 editable={data.editable}
-                onChange={(value) => {
-                  const existingLabels = nodes.map((n) => n.data.label);
-                  const labelWithoutWhitespace = value.replace(/\s+/g, "_");
-                  const newLabel = getUniqueLabelForExistingNode(
-                    labelWithoutWhitespace,
-                    existingLabels,
-                  );
-                  setLabel(newLabel);
-                  setNodes(
-                    getUpdatedNodesAfterLabelUpdateForParameterKeys(
-                      id,
-                      newLabel,
-                      nodes as Array<AppNode>,
-                    ),
-                  );
-                }}
+                onChange={setLabel}
                 titleClassName="text-base"
                 inputClassName="text-base"
               />

@@ -40,7 +40,7 @@ function WorkflowParametersPanel() {
     active: boolean;
     operation: "add" | "edit";
     parameter?: ParametersState[number] | null;
-    type: "workflow" | "credential";
+    type: "workflow" | "credential" | "context";
   }>({
     active: false,
     operation: "add",
@@ -90,6 +90,17 @@ function WorkflowParametersPanel() {
               }}
             >
               Credential Parameter
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              onClick={() => {
+                setOperationPanelState({
+                  active: true,
+                  operation: "add",
+                  type: "context",
+                });
+              }}
+            >
+              Context Parameter
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
@@ -213,6 +224,7 @@ function WorkflowParametersPanel() {
             operationPanelState.parameter && (
               <div className="w-80 rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl">
                 <WorkflowParameterEditPanel
+                  key={operationPanelState.parameter?.key}
                   type={operationPanelState.type}
                   initialValues={operationPanelState.parameter}
                   onSave={(editedParameter) => {
@@ -223,6 +235,16 @@ function WorkflowParametersPanel() {
                           parameter.key === operationPanelState.parameter?.key
                         ) {
                           return editedParameter;
+                        }
+                        if (
+                          parameter.parameterType === "context" &&
+                          parameter.sourceParameterKey ===
+                            operationPanelState.parameter?.key
+                        ) {
+                          return {
+                            ...parameter,
+                            sourceParameterKey: editedParameter.key,
+                          };
                         }
                         return parameter;
                       }),

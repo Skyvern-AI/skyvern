@@ -56,7 +56,7 @@ export type WorkflowParameter = WorkflowParameterBase & {
 
 export type ContextParameter = WorkflowParameterBase & {
   parameter_type: "context";
-  source: WorkflowParameter;
+  source: OutputParameter | ContextParameter | WorkflowParameter;
   value: unknown;
 };
 

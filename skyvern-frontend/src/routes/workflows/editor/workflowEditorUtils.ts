@@ -612,6 +612,7 @@ import type {
   BitwardenSensitiveInformationParameter,
   ContextParameter,
 } from "../types/workflowTypes";
+import { ParametersState } from "./FlowRenderer";
 
 /**
  * If a parameter is not displayed in the editor, we should echo its value back when saved.
@@ -644,13 +645,6 @@ function convertEchoParameters(
           parameter.bitwarden_client_secret_aws_secret_key,
         bitwarden_master_password_aws_secret_key:
           parameter.bitwarden_master_password_aws_secret_key,
-      };
-    }
-    if (parameter.parameter_type === "context") {
-      return {
-        key: parameter.key,
-        parameter_type: "context",
-        source_parameter_key: parameter.source.key,
       };
     }
     throw new Error("Unknown parameter type");
@@ -705,6 +699,33 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
         label: node.id === id ? newLabel : node.data.label,
       },
     };
+  });
+}
+
+function getUpdatedParametersAfterLabelUpdateForSourceParameterKey(
+  id: string,
+  newLabel: string,
+  nodes: Array<Node>,
+  parameters: ParametersState,
+): ParametersState {
+  const node = nodes.find((node) => node.id === id);
+  if (!node) {
+    return parameters;
+  }
+  const oldLabel = node.data.label as string;
+  const oldOutputParameterKey = getOutputParameterKey(oldLabel);
+  const newOutputParameterKey = getOutputParameterKey(newLabel);
+  return parameters.map((parameter) => {
+    if (parameter.parameterType === "context") {
+      return {
+        ...parameter,
+        sourceParameterKey:
+          parameter.sourceParameterKey === oldOutputParameterKey
+            ? newOutputParameterKey
+            : oldOutputParameterKey,
+      };
+    }
+    return parameter;
   });
 }
 
@@ -808,4 +829,5 @@ export {
   isOutputParameterKey,
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,
+  getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
 };

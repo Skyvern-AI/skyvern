@@ -17,9 +17,10 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { getDefaultValueForParameterType } from "../workflowEditorUtils";
 import { WorkflowParameterInput } from "../../WorkflowParameterInput";
 import { toast } from "@/components/ui/use-toast";
+import { SourceParameterKeySelector } from "../../components/SourceParameterKeySelector";
 
 type Props = {
-  type: "workflow" | "credential";
+  type: "workflow" | "credential" | "context";
   onClose: () => void;
   onSave: (value: ParametersState[number]) => void;
   initialValues: ParametersState[number];
@@ -32,6 +33,16 @@ const workflowParameterTypeOptions = [
   { label: "file", value: WorkflowParameterValueType.FileURL },
   { label: "JSON", value: WorkflowParameterValueType.JSON },
 ];
+
+function header(type: "workflow" | "credential" | "context") {
+  if (type === "workflow") {
+    return "Edit Workflow Parameter";
+  }
+  if (type === "credential") {
+    return "Edit Credential Parameter";
+  }
+  return "Edit Context Parameter";
+}
 
 function WorkflowParameterEditPanel({
   type,
@@ -46,7 +57,7 @@ function WorkflowParameterEditPanel({
       : "",
   );
   const [description, setDescription] = useState(
-    initialValues.description || "",
+    initialValues.description ?? "",
   );
   const [collectionId, setCollectionId] = useState(
     initialValues.parameterType === "credential"
@@ -75,12 +86,18 @@ function WorkflowParameterEditPanel({
         },
   );
 
+  const [sourceParameterKey, setSourceParameterKey] = useState<
+    string | undefined
+  >(
+    initialValues.parameterType === "context"
+      ? initialValues.sourceParameterKey
+      : undefined,
+  );
+
   return (
     <div className="space-y-4">
       <header className="flex items-center justify-between">
-        <span>
-          Edit {type === "workflow" ? "Workflow" : "Credential"} Parameter
-        </span>
+        <span>{header(type)}</span>
         <Cross2Icon className="h-6 w-6 cursor-pointer" onClick={onClose} />
       </header>
       <div className="space-y-1">
@@ -198,6 +215,15 @@ function WorkflowParameterEditPanel({
           </div>
         </>
       )}
+      {type === "context" && (
+        <div className="space-y-1">
+          <Label className="text-xs text-slate-300">Source Parameter</Label>
+          <SourceParameterKeySelector
+            value={sourceParameterKey}
+            onChange={setSourceParameterKey}
+          />
+        </div>
+      )}
       <div className="flex justify-end">
         <Button
           onClick={() => {
@@ -236,6 +262,22 @@ function WorkflowParameterEditPanel({
                 parameterType: "credential",
                 urlParameterKey,
                 collectionId,
+                description,
+              });
+            }
+            if (type === "context") {
+              if (!sourceParameterKey) {
+                toast({
+                  variant: "destructive",
+                  title: "Failed to save parameters",
+                  description: "Source parameter key is required",
+                });
+                return;
+              }
+              onSave({
+                key,
+                parameterType: "context",
+                sourceParameterKey,
                 description,
               });
             }
