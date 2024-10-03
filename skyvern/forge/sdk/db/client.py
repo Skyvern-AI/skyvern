@@ -15,6 +15,7 @@ from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import (
     ArtifactModel,
     AWSSecretParameterModel,
+    BitwardenCreditCardDataParameterModel,
     BitwardenLoginCredentialParameterModel,
     BitwardenSensitiveInformationParameterModel,
     OrganizationAuthTokenModel,
@@ -53,6 +54,7 @@ from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
+    BitwardenCreditCardDataParameter,
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
     OutputParameter,
@@ -1217,6 +1219,33 @@ class AgentDB:
             await session.commit()
             await session.refresh(bitwarden_sensitive_information_parameter)
             return convert_to_bitwarden_sensitive_information_parameter(bitwarden_sensitive_information_parameter)
+
+    async def create_bitwarden_credit_card_data_parameter(
+        self,
+        workflow_id: str,
+        bitwarden_client_id_aws_secret_key: str,
+        bitwarden_client_secret_aws_secret_key: str,
+        bitwarden_master_password_aws_secret_key: str,
+        bitwarden_collection_id: str,
+        bitwarden_item_id: str,
+        key: str,
+        description: str | None = None,
+    ) -> BitwardenCreditCardDataParameter:
+        async with self.Session() as session:
+            bitwarden_credit_card_data_parameter = BitwardenCreditCardDataParameterModel(
+                workflow_id=workflow_id,
+                bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
+                bitwarden_client_secret_aws_secret_key=bitwarden_client_secret_aws_secret_key,
+                bitwarden_master_password_aws_secret_key=bitwarden_master_password_aws_secret_key,
+                bitwarden_collection_id=bitwarden_collection_id,
+                bitwarden_item_id=bitwarden_item_id,
+                key=key,
+                description=description,
+            )
+            session.add(bitwarden_credit_card_data_parameter)
+            await session.commit()
+            await session.refresh(bitwarden_credit_card_data_parameter)
+            return BitwardenCreditCardDataParameter.model_validate(bitwarden_credit_card_data_parameter)
 
     async def create_output_parameter(
         self,

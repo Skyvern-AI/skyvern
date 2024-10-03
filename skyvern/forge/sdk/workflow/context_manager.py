@@ -203,7 +203,6 @@ class WorkflowRunContext:
             except BitwardenBaseError as e:
                 LOG.error(f"Failed to get secret from Bitwarden. Error: {e}")
                 raise e
-        # TODO (kerem): Implement this
         elif parameter.parameter_type == ParameterType.BITWARDEN_SENSITIVE_INFORMATION:
             try:
                 # Get the Bitwarden login credentials from AWS secrets
@@ -255,6 +254,73 @@ class WorkflowRunContext:
 
             except BitwardenBaseError as e:
                 LOG.error(f"Failed to get sensitive information from Bitwarden. Error: {e}")
+                raise e
+        elif parameter.parameter_type == ParameterType.BITWARDEN_CREDIT_CARD_DATA:
+            try:
+                # Get the Bitwarden login credentials from AWS secrets
+                client_id = await aws_client.get_secret(parameter.bitwarden_client_id_aws_secret_key)
+                client_secret = await aws_client.get_secret(parameter.bitwarden_client_secret_aws_secret_key)
+                master_password = await aws_client.get_secret(parameter.bitwarden_master_password_aws_secret_key)
+            except Exception as e:
+                LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
+                raise e
+
+            if self.has_parameter(parameter.bitwarden_item_id) and self.has_value(parameter.bitwarden_item_id):
+                item_id = self.values[parameter.bitwarden_item_id]
+            else:
+                item_id = parameter.bitwarden_item_id
+
+            if self.has_parameter(parameter.bitwarden_collection_id) and self.has_value(
+                parameter.bitwarden_collection_id
+            ):
+                collection_id = self.values[parameter.bitwarden_collection_id]
+            else:
+                collection_id = parameter.bitwarden_collection_id
+
+            try:
+                credit_card_data = await BitwardenService.get_credit_card_data(
+                    client_id,
+                    client_secret,
+                    master_password,
+                    organization.bw_organization_id,
+                    organization.bw_collection_ids,
+                    collection_id,
+                    item_id,
+                )
+                if not credit_card_data:
+                    raise ValueError("Credit card data not found in Bitwarden")
+
+                self.secrets[BitwardenConstants.CLIENT_ID] = client_id
+                self.secrets[BitwardenConstants.CLIENT_SECRET] = client_secret
+                self.secrets[BitwardenConstants.MASTER_PASSWORD] = master_password
+                self.secrets[BitwardenConstants.ITEM_ID] = item_id
+
+                fields_to_obfuscate = {
+                    BitwardenConstants.CREDIT_CARD_NUMBER: "card_number",
+                    BitwardenConstants.CREDIT_CARD_CVV: "card_cvv",
+                }
+
+                pass_through_fields = {
+                    BitwardenConstants.CREDIT_CARD_HOLDER_NAME: "card_holder_name",
+                    BitwardenConstants.CREDIT_CARD_EXPIRATION_MONTH: "card_exp_month",
+                    BitwardenConstants.CREDIT_CARD_EXPIRATION_YEAR: "card_exp_year",
+                    BitwardenConstants.CREDIT_CARD_BRAND: "card_brand",
+                }
+
+                parameter_value: dict[str, Any] = {
+                    field_name: credit_card_data[field_key] for field_key, field_name in pass_through_fields.items()
+                }
+
+                for data_key, secret_suffix in fields_to_obfuscate.items():
+                    random_secret_id = self.generate_random_secret_id()
+                    secret_id = f"{random_secret_id}_{secret_suffix}"
+                    self.secrets[secret_id] = credit_card_data[data_key]
+                    parameter_value[secret_suffix] = secret_id
+
+                self.values[parameter.key] = parameter_value
+
+            except BitwardenBaseError as e:
+                LOG.error(f"Failed to get credit card data from Bitwarden. Error: {e}")
                 raise e
         elif isinstance(parameter, ContextParameter):
             if isinstance(parameter.source, WorkflowParameter):
