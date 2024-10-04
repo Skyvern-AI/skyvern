@@ -37,3 +37,7 @@ export const taskNodeDefaultData: TaskNodeData = {
   totpVerificationUrl: null,
   totpIdentifier: null,
 } as const;
+
+export function isTaskNode(node: Node): node is TaskNode {
+  return node.type === "task";
+}

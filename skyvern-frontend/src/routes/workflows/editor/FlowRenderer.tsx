@@ -63,6 +63,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { isLoopNode, LoopNode } from "./nodes/LoopNode/types";
+import { isTaskNode } from "./nodes/TaskNode/types";
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -433,6 +434,40 @@ function FlowRenderer({
     doLayout(newNodesWithUpdatedParameters, newEdges);
   }
 
+  function getWorkflowErrors(): Array<string> {
+    const errors: Array<string> = [];
+
+    // check loop node parameters
+    const loopNodes: Array<LoopNode> = nodes.filter(isLoopNode);
+    const emptyLoopNodes = loopNodes.filter(
+      (node: LoopNode) => node.data.loopValue === "",
+    );
+    if (emptyLoopNodes.length > 0) {
+      emptyLoopNodes.forEach((node) => {
+        errors.push(
+          `${node.data.label}: Loop value parameter must be selected`,
+        );
+      });
+    }
+
+    // check task node json fields
+    const taskNodes = nodes.filter(isTaskNode);
+    taskNodes.forEach((node) => {
+      try {
+        JSON.parse(node.data.dataSchema);
+      } catch {
+        errors.push(`${node.data.label}: Data schema is not valid JSON`);
+      }
+      try {
+        JSON.parse(node.data.errorCodeMapping);
+      } catch {
+        errors.push(`${node.data.label}: Error messages is not valid JSON`);
+      }
+    });
+
+    return errors;
+  }
+
   return (
     <>
       <Dialog
@@ -551,6 +586,21 @@ function FlowRenderer({
                   }
                 }}
                 onSave={async () => {
+                  const errors = getWorkflowErrors();
+                  if (errors.length > 0) {
+                    toast({
+                      title: "Can not save workflow because of errors:",
+                      description: (
+                        <div className="space-y-2">
+                          {errors.map((error) => (
+                            <p key={error}>{error}</p>
+                          ))}
+                        </div>
+                      ),
+                      variant: "destructive",
+                    });
+                    return;
+                  }
                   // TODO might need to abstract this out or find different way to handle errors
                   const loopNodes: Array<LoopNode> = nodes.filter(isLoopNode);
                   const emptyLoopNodes = loopNodes.filter(
