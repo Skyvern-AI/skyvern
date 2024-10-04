@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from skyvern.config import settings
 from skyvern.exceptions import (
     ContextParameterValueNotFound,
+    DisabledBlockExecutionError,
     FailedToNavigateToUrl,
     MissingBrowserStatePage,
     TaskNotFound,
@@ -534,6 +535,7 @@ class CodeBlock(Block):
         return self.parameters
 
     async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+        raise DisabledBlockExecutionError("CodeBlock is disabled")
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
 
