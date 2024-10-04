@@ -1,5 +1,11 @@
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { UpdateIcon } from "@radix-ui/react-icons";
@@ -8,11 +14,13 @@ import {
   Handle,
   NodeProps,
   Position,
+  useEdges,
   useNodes,
   useReactFlow,
 } from "@xyflow/react";
-import { useState } from "react";
 import { AppNode } from "..";
+import { useWorkflowParametersState } from "../../useWorkflowParametersState";
+import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import type { LoopNode } from "./types";
@@ -20,14 +28,19 @@ import type { LoopNode } from "./types";
 function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const { updateNodeData } = useReactFlow();
   const nodes = useNodes<AppNode>();
+  const edges = useEdges();
   const [label, setLabel] = useNodeLabelChangeHandler({
     id,
     initialValue: data.label,
   });
   const deleteNodeCallback = useDeleteNodeCallback();
-  const [inputs, setInputs] = useState({
-    loopValue: data.loopValue,
-  });
+
+  const [workflowParameters] = useWorkflowParametersState();
+  const parameters = workflowParameters.filter(
+    (parameter) => parameter.parameterType !== "credential",
+  );
+  const parameterKeys = parameters.map((parameter) => parameter.key);
+  const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
 
   const children = nodes.filter((node) => node.parentId === id);
   const furthestDownChild: Node | null = children.reduce(
@@ -93,19 +106,28 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
               />
             </div>
             <div className="space-y-1">
-              <Label className="text-xs text-slate-300">Loop Value</Label>
-              <Input
-                value={inputs.loopValue}
-                onChange={(event) => {
-                  if (!data.editable) {
-                    return;
-                  }
-                  setInputs({ ...inputs, loopValue: event.target.value });
-                  updateNodeData(id, { loopValue: event.target.value });
+              <Label className="text-xs text-slate-300">
+                Loop Value Parameter
+              </Label>
+              <Select
+                value={data.loopValue}
+                onValueChange={(value) => {
+                  updateNodeData(id, { loopValue: value });
                 }}
-                placeholder="What value are you iterating over?"
-                className="nopan"
-              />
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select a parameter" />
+                </SelectTrigger>
+                <SelectContent>
+                  {[...parameterKeys, ...outputParameterKeys].map(
+                    (parameterKey) => (
+                      <SelectItem key={parameterKey} value={parameterKey}>
+                        {parameterKey}
+                      </SelectItem>
+                    ),
+                  )}
+                </SelectContent>
+              </Select>
             </div>
           </div>
         </div>
