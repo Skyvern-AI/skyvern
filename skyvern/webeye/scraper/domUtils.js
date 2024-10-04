@@ -264,7 +264,22 @@ function isElementVisible(element) {
 
 function isHidden(element) {
   const style = getElementComputedStyle(element);
-  return style?.display === "none" || element.hidden;
+  if (style?.display === "none") {
+    return true;
+  }
+  if (element.hidden) {
+    if (
+      style?.cursor === "pointer" &&
+      element.tagName.toLowerCase() === "input" &&
+      (element.type === "submit" || element.type === "button")
+    ) {
+      // there are cases where the input is a "submit" button and the cursor is a pointer but the element has the hidden attr.
+      // such an element is not really hidden
+      return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 function isHiddenOrDisabled(element) {
