@@ -13,6 +13,11 @@ class SkyvernHTTPException(SkyvernException):
         super().__init__(message)
 
 
+class DisabledBlockExecutionError(SkyvernHTTPException):
+    def __init__(self, message: str | None = None):
+        super().__init__(message, status_code=status.HTTP_400_BAD_REQUEST)
+
+
 class InvalidOpenAIResponseFormat(SkyvernException):
     def __init__(self, message: str | None = None):
         super().__init__(f"Invalid response format: {message}")
