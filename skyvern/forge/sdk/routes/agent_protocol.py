@@ -671,7 +671,7 @@ async def create_workflow(
             organization=current_org, request=workflow_create_request
         )
     except Exception as e:
-        LOG.error("Failed to create workflow", exc_info=True)
+        LOG.error("Failed to create workflow", exc_info=True, organization_id=current_org.organization_id)
         raise FailedToCreateWorkflow(str(e))
 
 
