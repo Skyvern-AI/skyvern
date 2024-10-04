@@ -62,6 +62,7 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { ReloadIcon } from "@radix-ui/react-icons";
+import { isLoopNode, LoopNode } from "./nodes/LoopNode/types";
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -414,6 +415,18 @@ function FlowRenderer({
           },
         };
       }
+      if (node.type === "loop") {
+        return {
+          ...node,
+          data: {
+            ...node.data,
+            loopValue:
+              node.data.loopValue === getOutputParameterKey(deletedNodeLabel)
+                ? ""
+                : node.data.loopValue,
+          },
+        };
+      }
       return node;
     });
     setHasChanges(true);
@@ -538,6 +551,19 @@ function FlowRenderer({
                   }
                 }}
                 onSave={async () => {
+                  // TODO might need to abstract this out or find different way to handle errors
+                  const loopNodes: Array<LoopNode> = nodes.filter(isLoopNode);
+                  const emptyLoopNodes = loopNodes.filter(
+                    (node: LoopNode) => node.data.loopValue === "",
+                  );
+                  if (emptyLoopNodes.length > 0) {
+                    toast({
+                      title: "Can not save workflow because of errors",
+                      description: `${emptyLoopNodes.map((node) => node.data.label).join(", ")}: Loop value cannot be empty`,
+                      variant: "destructive",
+                    });
+                    return;
+                  }
                   await handleSave();
                 }}
               />
