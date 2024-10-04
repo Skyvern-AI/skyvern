@@ -13,3 +13,7 @@ export const loopNodeDefaultData: LoopNodeData = {
   label: "",
   loopValue: "",
 } as const;
+
+export function isLoopNode(node: Node): node is LoopNode {
+  return node.type === "loop";
+}
