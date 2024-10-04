@@ -105,7 +105,7 @@ function WorkflowParametersPanel() {
           </DropdownMenuContent>
         </DropdownMenu>
 
-        <section className="space-y-2">
+        <section className="max-h-[600px] space-y-2 overflow-y-scroll">
           {workflowParameters.map((parameter) => {
             return (
               <div
