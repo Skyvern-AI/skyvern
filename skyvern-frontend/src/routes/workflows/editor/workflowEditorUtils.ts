@@ -677,6 +677,9 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
   }
   const oldLabel = labelUpdatedNode.data.label as string;
   return nodes.map((node) => {
+    if (node.type === "nodeAdder") {
+      return node;
+    }
     if (node.type === "task") {
       return {
         ...node,
@@ -689,6 +692,18 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
                 : key,
           ),
           label: node.id === id ? newLabel : node.data.label,
+        },
+      };
+    }
+    if (node.type === "loop") {
+      return {
+        ...node,
+        data: {
+          ...node.data,
+          loopValue:
+            node.data.loopValue === getOutputParameterKey(oldLabel)
+              ? getOutputParameterKey(newLabel)
+              : node.data.loopValue,
         },
       };
     }
@@ -814,6 +829,48 @@ function getDefaultValueForParameterType(
   }
 }
 
+function getPreviousNodeIds(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+  target: string,
+): Array<string> {
+  const nodeIds: string[] = [];
+  const node = nodes.find((node) => node.id === target);
+  if (!node) {
+    return nodeIds;
+  }
+  let current = edges.find((edge) => edge.target === target);
+  if (current) {
+    while (current) {
+      nodeIds.push(current.source);
+      current = edges.find((edge) => edge.target === current!.source);
+    }
+  }
+  if (!node.parentId) {
+    return nodeIds;
+  }
+  return [...nodeIds, ...getPreviousNodeIds(nodes, edges, node.parentId)];
+}
+
+function getAvailableOutputParameterKeys(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+  id: string,
+): Array<string> {
+  const previousNodeIds = getPreviousNodeIds(nodes, edges, id);
+  const previousNodes = nodes.filter((node) =>
+    previousNodeIds.includes(node.id),
+  );
+  const labels = previousNodes
+    .filter((node) => node.type !== "nodeAdder")
+    .map((node) => node.data.label);
+  const outputParameterKeys = labels.map((label) =>
+    getOutputParameterKey(label),
+  );
+
+  return outputParameterKeys;
+}
+
 export {
   createNode,
   generateNodeData,
@@ -830,4 +887,6 @@ export {
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,
   getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
+  getPreviousNodeIds,
+  getAvailableOutputParameterKeys,
 };

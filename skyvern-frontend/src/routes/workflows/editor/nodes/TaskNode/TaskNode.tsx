@@ -14,7 +14,6 @@ import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCal
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { ListBulletIcon } from "@radix-ui/react-icons";
 import {
-  Edge,
   Handle,
   NodeProps,
   Position,
@@ -24,35 +23,12 @@ import {
 } from "@xyflow/react";
 import { useState } from "react";
 import { AppNode } from "..";
-import { getOutputParameterKey } from "../../workflowEditorUtils";
+import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { TaskNodeDisplayModeSwitch } from "./TaskNodeDisplayModeSwitch";
 import { TaskNodeParametersPanel } from "./TaskNodeParametersPanel";
 import type { TaskNode, TaskNodeDisplayMode } from "./types";
-
-function getPreviousNodeIds(
-  nodes: Array<AppNode>,
-  edges: Array<Edge>,
-  target: string,
-): Array<string> {
-  const nodeIds: string[] = [];
-  const node = nodes.find((node) => node.id === target);
-  if (!node) {
-    return nodeIds;
-  }
-  let current = edges.find((edge) => edge.target === target);
-  if (current) {
-    while (current) {
-      nodeIds.push(current.source);
-      current = edges.find((edge) => edge.target === current!.source);
-    }
-  }
-  if (!node.parentId) {
-    return nodeIds;
-  }
-  return [...nodeIds, ...getPreviousNodeIds(nodes, edges, node.parentId)];
-}
 
 function TaskNode({ id, data }: NodeProps<TaskNode>) {
   const { updateNodeData } = useReactFlow();
@@ -61,16 +37,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
   const deleteNodeCallback = useDeleteNodeCallback();
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
-  const previousNodeIds = getPreviousNodeIds(nodes, edges, id);
-  const previousNodes = nodes.filter((node) =>
-    previousNodeIds.includes(node.id),
-  );
-  const labels = previousNodes
-    .filter((node) => node.type !== "nodeAdder")
-    .map((node) => node.data.label);
-  const outputParameterKeys = labels.map((label) =>
-    getOutputParameterKey(label),
-  );
+  const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
 
   const [label, setLabel] = useNodeLabelChangeHandler({
     id,
