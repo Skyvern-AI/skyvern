@@ -1,6 +1,5 @@
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import {
-  CodeIcon,
   Cross2Icon,
   CursorTextIcon,
   DownloadIcon,
@@ -44,12 +43,13 @@ const nodeLibraryItems: Array<{
     title: "Send Email Block",
     description: "Sends an email",
   },
-  {
-    nodeType: "codeBlock",
-    icon: <CodeIcon className="h-6 w-6" />,
-    title: "Code Block",
-    description: "Executes Python code",
-  },
+  // temporarily removed
+  // {
+  //   nodeType: "codeBlock",
+  //   icon: <CodeIcon className="h-6 w-6" />,
+  //   title: "Code Block",
+  //   description: "Executes Python code",
+  // },
   {
     nodeType: "fileParser",
     icon: <FileIcon className="h-6 w-6" />,
