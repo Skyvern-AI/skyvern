@@ -323,7 +323,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
           </AccordionContent>
         </AccordionItem>
         <AccordionItem value="totp">
-          <AccordionTrigger>TOTP</AccordionTrigger>
+          <AccordionTrigger>Two Factor Authentication</AccordionTrigger>
           <AccordionContent className="pl-[1.5rem] pr-1">
             <div className="space-y-4">
               <div className="space-y-1">
