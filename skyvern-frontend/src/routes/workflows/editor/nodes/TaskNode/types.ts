@@ -41,3 +41,11 @@ export const taskNodeDefaultData: TaskNodeData = {
 export function isTaskNode(node: Node): node is TaskNode {
   return node.type === "task";
 }
+export const helpTooltipContent = {
+  base: "Tell Skyvern what to do. This is the core of your task block, so make sure your prompt tells Skyvern when it has completed its task, any guardrails, and if there are cases where it should terminate the task early. Define placeholder values using the “parameters” drop down that you predefine or redefine run-to-run. This allows you to make a workflow generalizable to a variety of use cases that change with every run.",
+  extraction:
+    "Tell Skyvern what to extract and how it should be formatted, if applicable.",
+  limits:
+    "Give Skyvern limitations, such as number of retries on failure, the number of maximum steps, the option to download and append suffix identifiers, and return message for errors Skyvern encounters.",
+  totp: "Link your internal TOTP storage system to relay 2FA codes we encounter straight to Skyvern. If you have multiple tasks running simultaneously, make sure to link an identifier so Skyvern knows which TOTP URL goes with which task.",
+};
