@@ -29,20 +29,33 @@ import { NodeActionMenu } from "../NodeActionMenu";
 import { TaskNodeDisplayModeSwitch } from "./TaskNodeDisplayModeSwitch";
 import { TaskNodeParametersPanel } from "./TaskNodeParametersPanel";
 import type { TaskNode, TaskNodeDisplayMode } from "./types";
+import { useParams } from "react-router-dom";
+
+function getLocalStorageKey(workflowPermanentId: string, label: string) {
+  return `skyvern-task-block-${workflowPermanentId}-${label}`;
+}
 
 function TaskNode({ id, data }: NodeProps<TaskNode>) {
   const { updateNodeData } = useReactFlow();
-  const [displayMode, setDisplayMode] = useState<TaskNodeDisplayMode>("basic");
+  const { workflowPermanentId } = useParams();
   const { editable } = data;
   const deleteNodeCallback = useDeleteNodeCallback();
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
-
   const [label, setLabel] = useNodeLabelChangeHandler({
     id,
     initialValue: data.label,
   });
+
+  const [displayMode, setDisplayMode] = useState<TaskNodeDisplayMode>(
+    workflowPermanentId &&
+      localStorage.getItem(getLocalStorageKey(workflowPermanentId, label))
+      ? (localStorage.getItem(
+          getLocalStorageKey(workflowPermanentId, label),
+        ) as TaskNodeDisplayMode)
+      : "basic",
+  );
 
   const [inputs, setInputs] = useState({
     url: data.url,
@@ -404,7 +417,15 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
         </div>
         <TaskNodeDisplayModeSwitch
           value={displayMode}
-          onChange={setDisplayMode}
+          onChange={(mode) => {
+            setDisplayMode(mode);
+            if (workflowPermanentId) {
+              localStorage.setItem(
+                getLocalStorageKey(workflowPermanentId, label),
+                mode,
+              );
+            }
+          }}
         />
 
         {displayMode === "basic" && basicContent}
