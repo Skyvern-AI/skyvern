@@ -1047,7 +1047,10 @@ class WorkflowService:
             return workflow
         except Exception as e:
             if new_workflow_id:
-                LOG.error(f"Failed to create workflow from request, deleting workflow {new_workflow_id}")
+                LOG.error(
+                    f"Failed to create workflow from request, deleting workflow {new_workflow_id}",
+                    organization_id=organization_id,
+                )
                 await self.delete_workflow_by_id(workflow_id=new_workflow_id, organization_id=organization_id)
             else:
                 LOG.exception(f"Failed to create workflow from request, title: {request.title}")
