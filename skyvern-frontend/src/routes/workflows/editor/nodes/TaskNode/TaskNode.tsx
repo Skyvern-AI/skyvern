@@ -1,4 +1,5 @@
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
+import { HelpTooltip } from "@/components/HelpTooltip";
 import {
   Accordion,
   AccordionContent,
@@ -28,7 +29,11 @@ import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { TaskNodeDisplayModeSwitch } from "./TaskNodeDisplayModeSwitch";
 import { TaskNodeParametersPanel } from "./TaskNodeParametersPanel";
-import type { TaskNode, TaskNodeDisplayMode } from "./types";
+import {
+  helpTooltipContent,
+  type TaskNode,
+  type TaskNodeDisplayMode,
+} from "./types";
 import { useParams } from "react-router-dom";
 
 function getLocalStorageKey(workflowPermanentId: string, label: string) {
@@ -124,12 +129,16 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
 
   const advancedContent = (
     <>
-      <Accordion
-        type="multiple"
-        defaultValue={["content", "extraction", "limits", "totp"]}
-      >
+      <Accordion type="multiple" defaultValue={["content"]}>
         <AccordionItem value="content">
-          <AccordionTrigger>Content</AccordionTrigger>
+          <AccordionTrigger>
+            <div className="flex w-full items-center justify-between">
+              <div>Content</div>
+              <div>
+                <HelpTooltip content={helpTooltipContent["base"]} />
+              </div>
+            </div>
+          </AccordionTrigger>
           <AccordionContent className="pl-[1.5rem] pr-1">
             <div className="space-y-4">
               <div className="space-y-1">
@@ -173,7 +182,14 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
           </AccordionContent>
         </AccordionItem>
         <AccordionItem value="extraction">
-          <AccordionTrigger>Extraction</AccordionTrigger>
+          <AccordionTrigger>
+            <div className="flex w-full items-center justify-between">
+              <div>Extraction</div>
+              <div>
+                <HelpTooltip content={helpTooltipContent["extraction"]} />
+              </div>
+            </div>
+          </AccordionTrigger>
           <AccordionContent className="pl-[1.5rem] pr-1">
             <div className="space-y-4">
               <div className="space-y-1">
@@ -225,7 +241,14 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
           </AccordionContent>
         </AccordionItem>
         <AccordionItem value="limits">
-          <AccordionTrigger>Limits</AccordionTrigger>
+          <AccordionTrigger>
+            <div className="flex w-full items-center justify-between">
+              <div>Limits</div>
+              <div>
+                <HelpTooltip content={helpTooltipContent["limits"]} />
+              </div>
+            </div>
+          </AccordionTrigger>
           <AccordionContent className="pl-[1.5rem] pr-1 pt-1">
             <div className="space-y-4">
               <div className="flex items-center justify-between">
@@ -269,7 +292,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
               </div>
               <div className="flex items-center justify-between">
                 <Label className="text-xs font-normal text-slate-300">
-                  Allow Downloads
+                  Complete on Download
                 </Label>
                 <div className="w-44">
                   <Switch
@@ -336,7 +359,14 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
           </AccordionContent>
         </AccordionItem>
         <AccordionItem value="totp">
-          <AccordionTrigger>Two Factor Authentication</AccordionTrigger>
+          <AccordionTrigger>
+            <div className="flex w-full items-center justify-between">
+              <div>Two-Factor Authentication</div>
+              <div>
+                <HelpTooltip content={helpTooltipContent["totp"]} />
+              </div>
+            </div>
+          </AccordionTrigger>
           <AccordionContent className="pl-[1.5rem] pr-1">
             <div className="space-y-4">
               <div className="space-y-1">
@@ -351,13 +381,13 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     handleChange("totpVerificationUrl", event.target.value);
                   }}
                   value={inputs.totpVerificationUrl ?? ""}
-                  placeholder="https://"
+                  placeholder="Link your 2FA storage endpoint"
                   className="nopan"
                 />
               </div>
               <div className="space-y-1">
                 <Label className="text-xs text-slate-300">
-                  TOTP Identifier
+                  Unique Identifier
                 </Label>
                 <AutoResizingTextarea
                   onChange={(event) => {
@@ -367,7 +397,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     handleChange("totpIdentifier", event.target.value);
                   }}
                   value={inputs.totpIdentifier ?? ""}
-                  placeholder="Identifier"
+                  placeholder="Add an ID that links your TOTP to the task"
                   className="nopan"
                 />
               </div>
@@ -415,19 +445,23 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
             }}
           />
         </div>
-        <TaskNodeDisplayModeSwitch
-          value={displayMode}
-          onChange={(mode) => {
-            setDisplayMode(mode);
-            if (workflowPermanentId) {
-              localStorage.setItem(
-                getLocalStorageKey(workflowPermanentId, label),
-                mode,
-              );
-            }
-          }}
-        />
-
+        <div className="flex items-center justify-between">
+          <TaskNodeDisplayModeSwitch
+            value={displayMode}
+            onChange={(mode) => {
+              setDisplayMode(mode);
+              if (workflowPermanentId) {
+                localStorage.setItem(
+                  getLocalStorageKey(workflowPermanentId, label),
+                  mode,
+                );
+              }
+            }}
+          />
+          {displayMode === "basic" && (
+            <HelpTooltip content={helpTooltipContent["base"]} />
+          )}
+        </div>
         {displayMode === "basic" && basicContent}
         {displayMode === "advanced" && advancedContent}
       </div>
