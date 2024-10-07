@@ -383,6 +383,7 @@ async def get_agent_tasks(
     task_status: Annotated[list[TaskStatus] | None, Query()] = None,
     workflow_run_id: Annotated[str | None, Query()] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    only_standalone_tasks: bool = Query(False),
 ) -> Response:
     """
     Get all tasks.
@@ -390,16 +391,23 @@ async def get_agent_tasks(
     :param page_size: Page size, defaults to 10
     :param task_status: Task status filter
     :param workflow_run_id: Workflow run id filter
+    :param only_standalone_tasks: Only standalone tasks, tasks which are part of a workflow run will be filtered out
     :return: List of tasks with pagination without steps populated. Steps can be populated by calling the
         get_agent_task endpoint.
     """
     analytics.capture("skyvern-oss-agent-tasks-get")
+    if only_standalone_tasks and workflow_run_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="only_standalone_tasks and workflow_run_id cannot be used together",
+        )
     tasks = await app.DATABASE.get_tasks(
         page,
         page_size,
         task_status=task_status,
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
+        only_standalone_tasks=only_standalone_tasks,
     )
     return ORJSONResponse([task.to_task_response().model_dump() for task in tasks])
 
