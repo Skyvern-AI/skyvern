@@ -438,6 +438,7 @@ class AgentDB:
         task_status: list[TaskStatus] | None = None,
         workflow_run_id: str | None = None,
         organization_id: str | None = None,
+        only_standalone_tasks: bool = False,
     ) -> list[Task]:
         """
         Get all tasks.
@@ -445,6 +446,7 @@ class AgentDB:
         :param page_size:
         :param task_status:
         :param workflow_run_id:
+        :param only_standalone_tasks:
         :return:
         """
         if page < 1:
@@ -458,6 +460,8 @@ class AgentDB:
                     query = query.filter(TaskModel.status.in_(task_status))
                 if workflow_run_id:
                     query = query.filter(TaskModel.workflow_run_id == workflow_run_id)
+                if only_standalone_tasks:
+                    query = query.filter(TaskModel.workflow_run_id.is_(None))
                 query = query.order_by(TaskModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
                 tasks = (await session.scalars(query)).all()
                 return [convert_to_task(task, debug_enabled=self.debug_enabled) for task in tasks]
