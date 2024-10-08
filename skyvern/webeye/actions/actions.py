@@ -46,9 +46,10 @@ class SelectOption(BaseModel):
 class InputOrSelectContext(BaseModel):
     field: str | None = None
     is_required: bool | None = None
+    is_search_bar: bool | None = None  # don't trigger custom-selection logic when it's a search bar
 
     def __repr__(self) -> str:
-        return f"InputOrSelectContext(field={self.field}, is_required={self.is_required})"
+        return f"InputOrSelectContext(field={self.field}, is_required={self.is_required}, is_search_bar={self.is_search_bar})"
 
 
 class Action(BaseModel):
