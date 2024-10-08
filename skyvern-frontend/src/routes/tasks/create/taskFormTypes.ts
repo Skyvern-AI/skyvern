@@ -9,7 +9,7 @@ const createNewTaskFormSchemaBase = z.object({
   dataExtractionGoal: z.string().or(z.null()),
   navigationPayload: z.string().or(z.null()),
   extractedInformationSchema: z.string().or(z.null()),
-  maxStepsOverride: z.number().optional(),
+  maxStepsOverride: z.number().or(z.null()).optional(),
   totpVerificationUrl: z.string().or(z.null()),
   totpIdentifier: z.string().or(z.null()),
   errorCodeMapping: z.string().or(z.null()),

@@ -30,6 +30,9 @@ import { NodeActionMenu } from "../NodeActionMenu";
 import { TaskNodeDisplayModeSwitch } from "./TaskNodeDisplayModeSwitch";
 import { TaskNodeParametersPanel } from "./TaskNodeParametersPanel";
 import {
+  dataSchemaExampleValue,
+  errorMappingExampleValue,
+  fieldPlaceholders,
   helpTooltipContent,
   type TaskNode,
   type TaskNodeDisplayMode,
@@ -90,7 +93,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
         <Label className="text-xs text-slate-300">URL</Label>
         <AutoResizingTextarea
           value={inputs.url}
-          className="nopan"
+          className="nopan text-xs"
           name="url"
           onChange={(event) => {
             if (!editable) {
@@ -98,7 +101,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
             }
             handleChange("url", event.target.value);
           }}
-          placeholder="https://"
+          placeholder={fieldPlaceholders["url"]}
         />
       </div>
       <div className="space-y-1">
@@ -111,8 +114,8 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
             handleChange("navigationGoal", event.target.value);
           }}
           value={inputs.navigationGoal}
-          placeholder="What are you looking to do?"
-          className="nopan"
+          placeholder={fieldPlaceholders["navigationGoal"]}
+          className="nopan text-xs"
         />
       </div>
       <div className="space-y-1">
@@ -151,8 +154,8 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     handleChange("url", event.target.value);
                   }}
                   value={inputs.url}
-                  placeholder="https://"
-                  className="nopan"
+                  placeholder={fieldPlaceholders["url"]}
+                  className="nopan text-xs"
                 />
               </div>
               <div className="space-y-1">
@@ -165,8 +168,8 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     handleChange("navigationGoal", event.target.value);
                   }}
                   value={inputs.navigationGoal}
-                  placeholder="What are you looking to do?"
-                  className="nopan"
+                  placeholder={fieldPlaceholders["navigationGoal"]}
+                  className="nopan text-xs"
                 />
               </div>
               <div className="space-y-1">
@@ -204,8 +207,8 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     handleChange("dataExtractionGoal", event.target.value);
                   }}
                   value={inputs.dataExtractionGoal}
-                  placeholder="What outputs are you looking to get?"
-                  className="nopan"
+                  placeholder={fieldPlaceholders["dataExtractionGoal"]}
+                  className="nopan text-xs"
                 />
               </div>
               <div className="space-y-2">
@@ -217,7 +220,12 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       if (!editable) {
                         return;
                       }
-                      handleChange("dataSchema", checked ? "{}" : "null");
+                      handleChange(
+                        "dataSchema",
+                        checked
+                          ? JSON.stringify(dataSchemaExampleValue, null, 2)
+                          : "null",
+                      );
                     }}
                   />
                 </div>
@@ -257,15 +265,19 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                 </Label>
                 <Input
                   type="number"
-                  placeholder="0"
-                  className="nopan w-44"
+                  placeholder={fieldPlaceholders["maxRetries"]}
+                  className="nopan w-44 text-xs"
                   min="0"
-                  value={inputs.maxRetries ?? 0}
+                  value={inputs.maxRetries ?? ""}
                   onChange={(event) => {
                     if (!editable) {
                       return;
                     }
-                    handleChange("maxRetries", Number(event.target.value));
+                    const value =
+                      event.target.value === ""
+                        ? null
+                        : Number(event.target.value);
+                    handleChange("maxRetries", value);
                   }}
                 />
               </div>
@@ -275,18 +287,19 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                 </Label>
                 <Input
                   type="number"
-                  placeholder="0"
-                  className="nopan w-44"
+                  placeholder={fieldPlaceholders["maxStepsOverride"]}
+                  className="nopan w-44 text-xs"
                   min="0"
-                  value={inputs.maxStepsOverride ?? 0}
+                  value={inputs.maxStepsOverride ?? ""}
                   onChange={(event) => {
                     if (!editable) {
                       return;
                     }
-                    handleChange(
-                      "maxStepsOverride",
-                      Number(event.target.value),
-                    );
+                    const value =
+                      event.target.value === ""
+                        ? null
+                        : Number(event.target.value);
+                    handleChange("maxStepsOverride", value);
                   }}
                 />
               </div>
@@ -308,12 +321,12 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
               </div>
               <div className="flex items-center justify-between">
                 <Label className="text-xs font-normal text-slate-300">
-                  Download Suffix
+                  File Suffix
                 </Label>
                 <Input
                   type="text"
-                  placeholder="Suffix"
-                  className="nopan w-44"
+                  placeholder={fieldPlaceholders["downloadSuffix"]}
+                  className="nopan w-44 text-xs"
                   value={inputs.downloadSuffix ?? ""}
                   onChange={(event) => {
                     if (!editable) {
@@ -335,7 +348,12 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       if (!editable) {
                         return;
                       }
-                      handleChange("errorCodeMapping", checked ? "{}" : "null");
+                      handleChange(
+                        "errorCodeMapping",
+                        checked
+                          ? JSON.stringify(errorMappingExampleValue, null, 2)
+                          : "null",
+                      );
                     }}
                   />
                 </div>
@@ -381,8 +399,8 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     handleChange("totpVerificationUrl", event.target.value);
                   }}
                   value={inputs.totpVerificationUrl ?? ""}
-                  placeholder="Link your 2FA storage endpoint"
-                  className="nopan"
+                  placeholder={fieldPlaceholders["totpVerificationUrl"]}
+                  className="nopan text-xs"
                 />
               </div>
               <div className="space-y-1">
@@ -397,8 +415,8 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     handleChange("totpIdentifier", event.target.value);
                   }}
                   value={inputs.totpIdentifier ?? ""}
-                  placeholder="Add an ID that links your TOTP to the task"
-                  className="nopan"
+                  placeholder={fieldPlaceholders["totpIdentifier"]}
+                  className="nopan text-xs"
                 />
               </div>
             </div>
