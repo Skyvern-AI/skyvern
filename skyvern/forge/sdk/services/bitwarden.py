@@ -157,7 +157,7 @@ class BitwardenService:
             BitwardenService.sync()
             session_key = BitwardenService.unlock(master_password)
 
-            # Extract the domain from the URL and search for items in Bitwarden with that domain
+            # Extract the domain(with suffix) from the URL and search for items in Bitwarden with that domain
             domain = tldextract.extract(url).registered_domain
             list_command = [
                 "bw",
