@@ -198,6 +198,7 @@ export const ActionTypes = {
   UploadFile: "upload_file",
   complete: "complete",
   wait: "wait",
+  terminate: "terminate",
 } as const;
 
 export type ActionType = (typeof ActionTypes)[keyof typeof ActionTypes];
@@ -211,6 +212,7 @@ export const ReadableActionTypes: {
   upload_file: "Upload File",
   complete: "Complete",
   wait: "Wait",
+  terminate: "Terminate",
 };
 
 export type Option = {
