@@ -75,7 +75,7 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
             }}
             value={inputs.prompt}
             placeholder="What do you want to generate?"
-            className="nopan"
+            className="nopan text-xs"
           />
         </div>
         <Separator />

@@ -55,7 +55,7 @@ function DownloadNode({ id, data }: NodeProps<DownloadNode>) {
         <div className="space-y-4">
           <div className="space-y-1">
             <Label className="text-sm text-slate-400">File URL</Label>
-            <Input value={data.url} disabled className="nopan" />
+            <Input value={data.url} disabled className="nopan text-xs" />
           </div>
         </div>
       </div>
