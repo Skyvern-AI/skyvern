@@ -537,7 +537,12 @@ const isDropdownButton = (element) => {
   const haspopup = element.getAttribute("aria-haspopup")
     ? element.getAttribute("aria-haspopup").toLowerCase()
     : "";
-  return tagName === "button" && type === "button" && haspopup === "listbox";
+  const hasExpanded = element.hasAttribute("aria-expanded");
+  return (
+    tagName === "button" &&
+    type === "button" &&
+    (hasExpanded || haspopup === "listbox")
+  );
 };
 
 const isSelect2Dropdown = (element) => {
@@ -1641,6 +1646,16 @@ if (window.globalObserverForDOMIncrement === undefined) {
     // TODO: how to detect duplicated recreate element?
     for (const mutation of mutationsList) {
       if (mutation.type === "attributes") {
+        if (mutation.attributeName === "hidden") {
+          const node = mutation.target;
+          if (!node.hidden) {
+            window.globalOneTimeIncrementElements.push({
+              targetNode: node,
+              newNodes: [node],
+            });
+            addIncrementalNodeToMap(node, [node]);
+          }
+        }
         if (mutation.attributeName === "style") {
           // TODO: need to confirm that elemnent is hidden previously
           const node = mutation.target;
