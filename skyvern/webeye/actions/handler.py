@@ -466,7 +466,7 @@ async def handle_input_text_action(
                 if result is not None:
                     return [result]
                 LOG.info(
-                    "No dropdown menu detected, indicating it couldn't be a selectable auto-completion input",
+                    "It might not be a selectable auto-completion input, exit the custom selection mode",
                     task_id=task.task_id,
                     step_id=step.step_id,
                     element_id=skyvern_element.get_id(),
@@ -508,7 +508,7 @@ async def handle_input_text_action(
             return [ActionSuccess()]
 
         if await skyvern_element.is_auto_completion_input():
-            result = await input_or_auto_complete_input(
+            if result := await input_or_auto_complete_input(
                 action=action,
                 page=page,
                 dom=dom,
@@ -516,8 +516,8 @@ async def handle_input_text_action(
                 skyvern_element=skyvern_element,
                 step=step,
                 task=task,
-            )
-            return [result]
+            ):
+                return [result]
 
         await skyvern_element.input_sequentially(text=text)
         return [ActionSuccess()]
@@ -1198,7 +1198,7 @@ async def input_or_auto_complete_input(
     skyvern_element: SkyvernElement,
     step: Step,
     task: Task,
-) -> ActionResult:
+) -> ActionResult | None:
     LOG.info(
         "Trigger auto completion",
         task_id=task.task_id,
@@ -1256,6 +1256,15 @@ async def input_or_auto_complete_input(
         )
         if isinstance(result.action_result, ActionSuccess):
             return ActionSuccess()
+
+        if input_or_select_context.is_search_bar:
+            LOG.info(
+                "Stop generating potential values for the auto-completion since it's a search bar",
+                context=input_or_select_context,
+                step_id=step.step_id,
+                task_id=task.task_id,
+            )
+            return None
 
         tried_values.append(current_value)
         whole_new_elements.extend(result.incremental_elements)
@@ -1372,6 +1381,15 @@ async def sequentially_select_from_dropdown(
         task_id=task.task_id,
         step_id=step.step_id,
     )
+
+    if not force_select and input_or_select_context.is_search_bar:
+        LOG.info(
+            "Exit custom selection mode since it's a non-force search bar",
+            context=input_or_select_context,
+            task_id=task.task_id,
+            step_id=step.step_id,
+        )
+        return None, None
 
     # TODO: only suport the third-level dropdown selection now
     MAX_SELECT_DEPTH = 3
