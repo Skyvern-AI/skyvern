@@ -843,11 +843,7 @@ function buildElementObject(frame, element, interactable, purgeable = false) {
   }
 
   if (elementTagNameLower === "input" || elementTagNameLower === "textarea") {
-    if (element.type === "radio") {
-      attrs["value"] = "" + element.checked + "";
-    } else {
-      attrs["value"] = element.value;
-    }
+    attrs["value"] = element.value;
   }
 
   let elementObj = {
