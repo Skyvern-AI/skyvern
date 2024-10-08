@@ -21,7 +21,7 @@ import { apiBaseUrl } from "@/util/env";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { ToastAction } from "@radix-ui/react-toast";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import fetchToCurl from "fetch-to-curl";
 import { useState } from "react";
@@ -31,6 +31,7 @@ import { stringify as convertToYAML } from "yaml";
 import { MAX_STEPS_DEFAULT } from "../constants";
 import { TaskFormSection } from "./TaskFormSection";
 import { savedTaskFormSchema, SavedTaskFormValues } from "./taskFormTypes";
+import { OrganizationApiResponse } from "@/api/types";
 
 type Props = {
   initialValues: SavedTaskFormValues;
@@ -142,12 +143,24 @@ function SavedTaskForm({ initialValues }: Props) {
   ]);
   const [showAdvancedBaseContent, setShowAdvancedBaseContent] = useState(false);
 
+  const { data: organizations } = useQuery<Array<OrganizationApiResponse>>({
+    queryKey: ["organizations"],
+    queryFn: async () => {
+      const client = await getClient(credentialGetter);
+      return await client
+        .get("/organizations")
+        .then((response) => response.data.organizations);
+    },
+  });
+
+  const organization = organizations?.[0];
+
   const form = useForm<SavedTaskFormValues>({
     resolver: zodResolver(savedTaskFormSchema),
     defaultValues: initialValues,
     values: {
       ...initialValues,
-      maxStepsOverride: initialValues.maxStepsOverride ?? MAX_STEPS_DEFAULT,
+      maxStepsOverride: initialValues.maxStepsOverride ?? null,
     },
   });
 
@@ -168,6 +181,7 @@ function SavedTaskForm({ initialValues }: Props) {
         .then(() => {
           const taskRequest = createTaskRequestObject(formValues);
           const includeOverrideHeader =
+            formValues.maxStepsOverride !== null &&
             formValues.maxStepsOverride !== MAX_STEPS_DEFAULT;
           return client.post<
             ReturnType<typeof createTaskRequestObject>,
@@ -404,8 +418,8 @@ function SavedTaskForm({ initialValues }: Props) {
                         <div className="w-full">
                           <FormControl>
                             <AutoResizingTextarea
-                              placeholder="Use terms like complete or terminate to give completion directions"
                               {...field}
+                              placeholder="Tell Skyvern what to do."
                               value={field.value === null ? "" : field.value}
                             />
                           </FormControl>
@@ -512,8 +526,8 @@ function SavedTaskForm({ initialValues }: Props) {
                         <div className="w-full">
                           <FormControl>
                             <AutoResizingTextarea
-                              placeholder="e.g. Extract the product price..."
                               {...field}
+                              placeholder="What data do you need to extract?"
                               value={field.value === null ? "" : field.value}
                             />
                           </FormControl>
@@ -600,9 +614,14 @@ function SavedTaskForm({ initialValues }: Props) {
                               {...field}
                               type="number"
                               min={1}
-                              value={field.value}
+                              value={field.value ?? ""}
+                              placeholder={`Default: ${organization?.max_steps_per_run ?? MAX_STEPS_DEFAULT}`}
                               onChange={(event) => {
-                                field.onChange(parseInt(event.target.value));
+                                const value =
+                                  event.target.value === ""
+                                    ? null
+                                    : Number(event.target.value);
+                                field.onChange(value);
                               }}
                             />
                           </FormControl>
@@ -630,8 +649,8 @@ function SavedTaskForm({ initialValues }: Props) {
                         <div className="w-full">
                           <FormControl>
                             <Input
-                              placeholder="https://"
                               {...field}
+                              placeholder="https://"
                               value={field.value === null ? "" : field.value}
                             />
                           </FormControl>
@@ -689,8 +708,8 @@ function SavedTaskForm({ initialValues }: Props) {
                         <div className="w-full">
                           <FormControl>
                             <Input
-                              placeholder="https://"
                               {...field}
+                              placeholder="Provide your 2FA endpoint"
                               value={field.value === null ? "" : field.value}
                             />
                           </FormControl>
@@ -715,8 +734,8 @@ function SavedTaskForm({ initialValues }: Props) {
                         <div className="w-full">
                           <FormControl>
                             <Input
-                              placeholder="Idenfitifer"
                               {...field}
+                              placeholder="Add an ID that links your TOTP to the task"
                               value={field.value === null ? "" : field.value}
                             />
                           </FormControl>

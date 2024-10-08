@@ -68,7 +68,7 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
                 setInputs({ ...inputs, fileUrl: event.target.value });
                 updateNodeData(id, { fileUrl: event.target.value });
               }}
-              className="nopan"
+              className="nopan text-xs"
             />
           </div>
         </div>

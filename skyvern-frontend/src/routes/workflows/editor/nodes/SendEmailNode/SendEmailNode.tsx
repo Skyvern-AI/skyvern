@@ -80,7 +80,7 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
             }}
             value={inputs.recipients}
             placeholder="example@gmail.com, example2@gmail.com..."
-            className="nopan"
+            className="nopan text-xs"
           />
         </div>
         <Separator />
@@ -95,7 +95,7 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
             }}
             value={inputs.subject}
             placeholder="What is the gist?"
-            className="nopan"
+            className="nopan text-xs"
           />
         </div>
         <div className="space-y-1">
@@ -109,7 +109,7 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
             }}
             value={inputs.body}
             placeholder="What would you like to say?"
-            className="nopan"
+            className="nopan text-xs"
           />
         </div>
         <Separator />
@@ -124,7 +124,7 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
               handleChange("fileAttachments", event.target.value);
             }}
             disabled
-            className="nopan"
+            className="nopan text-xs"
           />
         </div>
       </div>
