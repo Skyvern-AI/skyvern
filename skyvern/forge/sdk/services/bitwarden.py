@@ -158,7 +158,7 @@ class BitwardenService:
             session_key = BitwardenService.unlock(master_password)
 
             # Extract the domain from the URL and search for items in Bitwarden with that domain
-            domain = tldextract.extract(url).domain
+            domain = tldextract.extract(url).registered_domain
             list_command = [
                 "bw",
                 "list",
