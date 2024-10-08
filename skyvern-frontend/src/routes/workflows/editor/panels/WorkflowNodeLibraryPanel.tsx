@@ -106,6 +106,9 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
         </header>
         <div className="space-y-2">
           {nodeLibraryItems.map((item) => {
+            if (workflowPanelData?.disableLoop && item.nodeType === "loop") {
+              return null;
+            }
             return (
               <div
                 key={item.nodeType}

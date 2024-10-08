@@ -8,6 +8,7 @@ type WorkflowPanelState = {
     next?: string | null;
     parent?: string;
     connectingEdgeType?: string;
+    disableLoop?: boolean;
   };
 };
 
