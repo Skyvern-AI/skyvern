@@ -39,9 +39,13 @@ import { TaskActions } from "../tasks/list/TaskActions";
 import { TaskListSkeletonRows } from "../tasks/list/TaskListSkeletonRows";
 import { useEffect, useState } from "react";
 import { statusIsNotFinalized, statusIsRunningOrQueued } from "../tasks/types";
-import { envCredential } from "@/util/env";
+import { apiBaseUrl, envCredential } from "@/util/env";
 import { toast } from "@/components/ui/use-toast";
-import { Pencil2Icon, PlayIcon } from "@radix-ui/react-icons";
+import { CopyIcon, Pencil2Icon, PlayIcon } from "@radix-ui/react-icons";
+import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
+import fetchToCurl from "fetch-to-curl";
+import { useApiCredential } from "@/hooks/useApiCredential";
+import { copyText } from "@/util/copyText";
 
 type StreamMessage = {
   task_id: string;
@@ -60,6 +64,12 @@ function WorkflowRun() {
   const credentialGetter = useCredentialGetter();
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const navigate = useNavigate();
+  const apiCredential = useApiCredential();
+
+  const { data: workflow, isLoading: workflowIsLoading } = useWorkflowQuery({
+    workflowPermanentId,
+  });
+
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
     useQuery<WorkflowRunStatusApiResponse>({
       queryKey: ["workflowRun", workflowPermanentId, workflowRunId],
@@ -228,15 +238,56 @@ function WorkflowRun() {
   return (
     <div className="space-y-8">
       <header className="flex justify-between">
-        <div className="flex gap-2">
-          <h1 className="text-lg font-semibold">{workflowRunId}</h1>
-          {workflowRunIsLoading ? (
-            <Skeleton className="h-8 w-28" />
-          ) : workflowRun ? (
-            <StatusBadge status={workflowRun?.status} />
-          ) : null}
+        <div className="space-y-3">
+          <div className="flex items-center gap-2">
+            <h1 className="text-3xl">{workflowRunId}</h1>
+            {workflowRunIsLoading ? (
+              <Skeleton className="h-8 w-28" />
+            ) : workflowRun ? (
+              <StatusBadge status={workflowRun?.status} />
+            ) : null}
+          </div>
+          <h2 className="text-2xl text-slate-400">
+            {workflowIsLoading ? (
+              <Skeleton className="h-8 w-48" />
+            ) : (
+              workflow?.title
+            )}
+          </h2>
         </div>
+
         <div className="flex gap-2">
+          <Button
+            variant="secondary"
+            onClick={() => {
+              if (!workflowRun) {
+                return;
+              }
+              const curl = fetchToCurl({
+                method: "POST",
+                url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
+                body: {
+                  data: workflowRun?.parameters,
+                  proxy_location: "RESIDENTIAL",
+                },
+                headers: {
+                  "Content-Type": "application/json",
+                  "x-api-key": apiCredential ?? "<your-api-key>",
+                },
+              });
+              copyText(curl).then(() => {
+                toast({
+                  variant: "success",
+                  title: "Copied to Clipboard",
+                  description:
+                    "The cURL command has been copied to your clipboard.",
+                });
+              });
+            }}
+          >
+            <CopyIcon className="mr-2 h-4 w-4" />
+            Copy as cURL
+          </Button>
           <Button asChild variant="secondary">
             <Link to={`/workflows/${workflowPermanentId}/edit`}>
               <Pencil2Icon className="mr-2 h-4 w-4" />
