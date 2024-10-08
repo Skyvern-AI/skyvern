@@ -27,6 +27,7 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
         className="rounded-full bg-slate-50 p-2"
         onClick={() => {
           const previous = edges.find((edge) => edge.target === id)?.source;
+          const disableLoop = Boolean(parentId);
           setWorkflowPanelState({
             active: true,
             content: "nodeLibrary",
@@ -35,6 +36,7 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
               next: id,
               parent: parentId,
               connectingEdgeType: "default",
+              disableLoop,
             },
           });
         }}
