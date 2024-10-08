@@ -508,8 +508,12 @@ function getWorkflowBlock(
         block_type: "send_email",
         label: node.data.label,
         body: node.data.body,
-        file_attachments: node.data.fileAttachments.split(","),
-        recipients: node.data.recipients.split(","),
+        file_attachments: node.data.fileAttachments
+          .split(",")
+          .map((attachment) => attachment.trim()),
+        recipients: node.data.recipients
+          .split(",")
+          .map((recipient) => recipient.trim()),
         subject: node.data.subject,
         sender: node.data.sender === "" ? EMAIL_BLOCK_SENDER : node.data.sender,
         smtp_host_secret_parameter_key: node.data.smtpHostSecretParameterKey,
