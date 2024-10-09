@@ -19,7 +19,7 @@ import { SubmitEvent } from "@/types";
 import { copyText } from "@/util/copyText";
 import { apiBaseUrl } from "@/util/env";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { ReloadIcon } from "@radix-ui/react-icons";
+import { CopyIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { ToastAction } from "@radix-ui/react-toast";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
@@ -775,7 +775,8 @@ function SavedTaskForm({ initialValues }: Props) {
               });
             }}
           >
-            Copy cURL
+            <CopyIcon className="mr-2 h-4 w-4" />
+            cURL
           </Button>
           <Button
             type="submit"
