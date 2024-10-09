@@ -61,7 +61,7 @@ class TaskModel(Base):
     failure_reason = Column(String)
     proxy_location = Column(Enum(ProxyLocation))
     extracted_information_schema = Column(JSON)
-    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"))
+    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), index=True)
     order = Column(Integer, nullable=True)
     retry = Column(Integer, nullable=True)
     error_code_mapping = Column(JSON, nullable=True)
