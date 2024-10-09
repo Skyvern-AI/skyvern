@@ -10,6 +10,7 @@ type Props = {
   language: "python" | "json";
   disabled?: boolean;
   minHeight?: string;
+  maxHeight?: string;
   className?: string;
   fontSize?: number;
 };
@@ -18,6 +19,7 @@ function CodeEditor({
   value,
   onChange,
   minHeight,
+  maxHeight,
   language,
   className,
   fontSize = 8,
@@ -33,6 +35,7 @@ function CodeEditor({
       extensions={extensions}
       theme={tokyoNightStorm}
       minHeight={minHeight}
+      maxHeight={maxHeight}
       className={cn("cursor-auto", className)}
       style={{
         fontSize: fontSize,

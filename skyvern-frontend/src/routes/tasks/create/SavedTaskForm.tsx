@@ -464,6 +464,7 @@ function SavedTaskForm({ initialValues }: Props) {
                                   language="json"
                                   fontSize={12}
                                   minHeight="96px"
+                                  maxHeight="500px"
                                   value={
                                     field.value === null ? "" : field.value
                                   }
@@ -558,6 +559,7 @@ function SavedTaskForm({ initialValues }: Props) {
                               language="json"
                               fontSize={14}
                               minHeight="96px"
+                              maxHeight="500px"
                               value={
                                 field.value === null ||
                                 typeof field.value === "undefined"
@@ -683,6 +685,7 @@ function SavedTaskForm({ initialValues }: Props) {
                               language="json"
                               fontSize={12}
                               minHeight="96px"
+                              maxHeight="500px"
                               value={field.value === null ? "" : field.value}
                             />
                           </FormControl>
