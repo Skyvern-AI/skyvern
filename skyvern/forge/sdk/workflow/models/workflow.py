@@ -62,10 +62,22 @@ class Workflow(BaseModel):
 
 class WorkflowRunStatus(StrEnum):
     created = "created"
+    queued = "queued"
     running = "running"
     failed = "failed"
     terminated = "terminated"
+    canceled = "canceled"
+    timed_out = "timed_out"
     completed = "completed"
+
+    def is_final(self) -> bool:
+        return self in [
+            WorkflowRunStatus.failed,
+            WorkflowRunStatus.terminated,
+            WorkflowRunStatus.canceled,
+            WorkflowRunStatus.timed_out,
+            WorkflowRunStatus.completed,
+        ]
 
 
 class WorkflowRun(BaseModel):

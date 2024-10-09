@@ -1,5 +1,4 @@
 import json
-from collections import Counter
 from datetime import datetime
 
 import requests
@@ -13,7 +12,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Organization, Step
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskStatus
+from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
     InvalidWorkflowDefinition,
@@ -21,6 +20,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     WorkflowDefinitionHasReservedParameterKeys,
 )
 from skyvern.forge.sdk.workflow.models.block import (
+    BlockStatus,
     BlockType,
     BlockTypeVar,
     CodeBlock,
@@ -191,7 +191,18 @@ class WorkflowService:
                     block_idx=block_idx,
                 )
                 block_result = await block.execute_safe(workflow_run_id=workflow_run_id)
-                if not block_result.success:
+                if block_result.status == BlockStatus.canceled:
+                    LOG.info(
+                        f"Block with type {block.block_type} at index {block_idx} was canceled for workflow run {workflow_run_id}, cancelling workflow run",
+                        block_type=block.block_type,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        block_idx=block_idx,
+                        block_result=block_result,
+                    )
+                    await self.mark_workflow_run_as_canceled(workflow_run_id=workflow_run.workflow_run_id)
+                    # We're not sending a webhook here because the workflow run is manually marked as canceled.
+                    return workflow_run
+                elif block_result.status == BlockStatus.failed:
                     LOG.error(
                         f"Block with type {block.block_type} at index {block_idx} failed for workflow run {workflow_run_id}",
                         block_type=block.block_type,
@@ -216,7 +227,31 @@ class WorkflowService:
                             api_key=api_key,
                         )
                         return workflow_run
-
+                elif block_result.status == BlockStatus.terminated:
+                    LOG.info(
+                        f"Block with type {block.block_type} at index {block_idx} was terminated for workflow run {workflow_run_id}, marking workflow run as terminated",
+                        block_type=block.block_type,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        block_idx=block_idx,
+                        block_result=block_result,
+                    )
+                    if block.continue_on_failure:
+                        LOG.warning(
+                            f"Block with type {block.block_type} at index {block_idx} was terminated for workflow run {workflow_run_id}, but will continue executing the workflow run",
+                            block_type=block.block_type,
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            block_idx=block_idx,
+                            block_result=block_result,
+                            continue_on_failure=block.continue_on_failure,
+                        )
+                    else:
+                        await self.mark_workflow_run_as_terminated(workflow_run_id=workflow_run.workflow_run_id)
+                        await self.send_workflow_response(
+                            workflow=workflow,
+                            workflow_run=workflow_run,
+                            api_key=api_key,
+                        )
+                        return workflow_run
             except Exception:
                 LOG.exception(
                     f"Error while executing workflow run {workflow_run.workflow_run_id}",
@@ -228,54 +263,6 @@ class WorkflowService:
 
         await self.mark_workflow_run_as_completed(workflow_run_id=workflow_run.workflow_run_id)
         await self.send_workflow_response(workflow=workflow, workflow_run=workflow_run, api_key=api_key)
-        return workflow_run
-
-    async def handle_workflow_status(self, workflow_run: WorkflowRun, tasks: list[Task]) -> WorkflowRun:
-        task_counts_by_status = Counter(task.status for task in tasks)
-
-        # Create a mapping of status to (action, log_func, log_message)
-        status_action_mapping = {
-            TaskStatus.running: (
-                None,
-                LOG.error,
-                "has running tasks, this should not happen",
-            ),
-            TaskStatus.terminated: (
-                self.mark_workflow_run_as_terminated,
-                LOG.warning,
-                "has terminated tasks, marking as terminated",
-            ),
-            TaskStatus.failed: (
-                self.mark_workflow_run_as_failed,
-                LOG.warning,
-                "has failed tasks, marking as failed",
-            ),
-            TaskStatus.completed: (
-                self.mark_workflow_run_as_completed,
-                LOG.info,
-                "tasks are completed, marking as completed",
-            ),
-        }
-
-        for status, (action, log_func, log_message) in status_action_mapping.items():
-            if task_counts_by_status.get(status, 0) > 0:
-                if action is not None:
-                    await action(workflow_run_id=workflow_run.workflow_run_id)
-                if log_func and log_message:
-                    log_func(
-                        f"Workflow run {workflow_run.workflow_run_id} {log_message}",
-                        workflow_run_id=workflow_run.workflow_run_id,
-                        task_counts_by_status=task_counts_by_status,
-                    )
-                return workflow_run
-
-        # Handle unexpected state
-        LOG.error(
-            f"Workflow run {workflow_run.workflow_run_id} has tasks in an unexpected state, marking as failed",
-            workflow_run_id=workflow_run.workflow_run_id,
-            task_counts_by_status=task_counts_by_status,
-        )
-        await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
         return workflow_run
 
     async def create_workflow(
@@ -457,6 +444,17 @@ class WorkflowService:
         await app.DATABASE.update_workflow_run(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.terminated,
+        )
+
+    async def mark_workflow_run_as_canceled(self, workflow_run_id: str) -> None:
+        LOG.info(
+            f"Marking workflow run {workflow_run_id} as canceled",
+            workflow_run_id=workflow_run_id,
+            workflow_status="canceled",
+        )
+        await app.DATABASE.update_workflow_run(
+            workflow_run_id=workflow_run_id,
+            status=WorkflowRunStatus.canceled,
         )
 
     async def get_workflow_run(self, workflow_run_id: str) -> WorkflowRun:
