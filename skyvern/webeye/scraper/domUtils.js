@@ -206,6 +206,13 @@ function isElementStyleVisibilityVisible(element, style) {
   )
     return false;
   if (style.visibility !== "visible") return false;
+
+  // TODO: support style.clipPath and style.clipRule?
+  // if element is clipped with rect(0px, 0px, 0px, 0px), it means it's invisible on the page
+  if (style.clip === "rect(0px, 0px, 0px, 0px)") {
+    return false;
+  }
+
   return true;
 }
 
@@ -473,7 +480,8 @@ function isInteractable(element) {
     tagName === "img" ||
     tagName === "span" ||
     tagName === "a" ||
-    tagName === "i"
+    tagName === "i" ||
+    tagName === "li"
   ) {
     const computedStyle = window.getComputedStyle(element);
     if (computedStyle.cursor === "pointer") {
