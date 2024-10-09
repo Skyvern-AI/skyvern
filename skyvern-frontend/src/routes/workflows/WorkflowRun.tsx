@@ -286,12 +286,12 @@ function WorkflowRun() {
             }}
           >
             <CopyIcon className="mr-2 h-4 w-4" />
-            Copy as cURL
+            Copy cURL
           </Button>
           <Button asChild variant="secondary">
             <Link to={`/workflows/${workflowPermanentId}/edit`}>
               <Pencil2Icon className="mr-2 h-4 w-4" />
-              Edit Workflow
+              Edit
             </Link>
           </Button>
           <Button asChild>
@@ -302,7 +302,7 @@ function WorkflowRun() {
               }}
             >
               <PlayIcon className="mr-2 h-4 w-4" />
-              Rerun Workflow
+              Rerun
             </Link>
           </Button>
         </div>
