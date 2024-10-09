@@ -57,7 +57,7 @@ export const fieldPlaceholders = {
   dataExtractionGoal: "What data do you need to extract?",
   maxRetries: "Default: 3",
   maxStepsOverride: "Default: 10",
-  downloadSuffix: "Suffix for file downloads",
+  downloadSuffix: "Add an ID for downloaded files",
   label: "Task",
   totpVerificationUrl: "Provide your 2FA endpoint",
   totpIdentifier: "Add an ID that links your TOTP to the task",

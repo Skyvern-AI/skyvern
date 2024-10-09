@@ -266,7 +266,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                 <Input
                   type="number"
                   placeholder={fieldPlaceholders["maxRetries"]}
-                  className="nopan w-44 text-xs"
+                  className="nopan w-52 text-xs"
                   min="0"
                   value={inputs.maxRetries ?? ""}
                   onChange={(event) => {
@@ -288,7 +288,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                 <Input
                   type="number"
                   placeholder={fieldPlaceholders["maxStepsOverride"]}
-                  className="nopan w-44 text-xs"
+                  className="nopan w-52 text-xs"
                   min="0"
                   value={inputs.maxStepsOverride ?? ""}
                   onChange={(event) => {
@@ -307,7 +307,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                 <Label className="text-xs font-normal text-slate-300">
                   Complete on Download
                 </Label>
-                <div className="w-44">
+                <div className="w-52">
                   <Switch
                     checked={inputs.allowDownloads}
                     onCheckedChange={(checked) => {
@@ -326,7 +326,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                 <Input
                   type="text"
                   placeholder={fieldPlaceholders["downloadSuffix"]}
-                  className="nopan w-44 text-xs"
+                  className="nopan w-52 text-xs"
                   value={inputs.downloadSuffix ?? ""}
                   onChange={(event) => {
                     if (!editable) {
