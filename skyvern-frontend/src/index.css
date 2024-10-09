@@ -95,3 +95,13 @@ body,
 #root {
   min-height: 100vh;
 }
+
+/* CodeMirror override styles */
+
+.cm-editor {
+  @apply rounded-md;
+}
+
+.cm-gutters {
+  @apply rounded-md;
+}
