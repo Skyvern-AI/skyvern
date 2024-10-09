@@ -10,6 +10,7 @@ import { AxiosError } from "axios";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { stringify as convertToYAML } from "yaml";
+import { ScrollArea, ScrollBar } from "@/components/ui/scroll-area";
 
 function createTaskFromTaskGenerationParameters(
   values: TaskGenerationApiResponse,
@@ -176,21 +177,24 @@ function PromptBox() {
           </div>
         </div>
       </div>
-      <div className="flex gap-4 overflow-x-scroll rounded-sm bg-slate-elevation1 p-4">
-        {examplePrompts.map((examplePrompt) => {
-          return (
-            <div
-              key={examplePrompt}
-              className="cursor-pointer whitespace-nowrap rounded-sm bg-slate-elevation3 px-4 py-3 hover:bg-slate-elevation5"
-              onClick={() => {
-                setPrompt(examplePrompt);
-              }}
-            >
-              {examplePrompt}
-            </div>
-          );
-        })}
-      </div>
+      <ScrollArea>
+        <div className="flex gap-4 rounded-sm bg-slate-elevation1 p-4">
+          {examplePrompts.map((examplePrompt) => {
+            return (
+              <div
+                key={examplePrompt}
+                className="cursor-pointer whitespace-nowrap rounded-sm bg-slate-elevation3 px-4 py-3 hover:bg-slate-elevation5"
+                onClick={() => {
+                  setPrompt(examplePrompt);
+                }}
+              >
+                {examplePrompt}
+              </div>
+            );
+          })}
+        </div>
+        <ScrollBar orientation="horizontal" />
+      </ScrollArea>
     </div>
   );
 }
