@@ -31,6 +31,7 @@ function RunningTasks() {
         })
         .then((response) => response.data);
     },
+    refetchOnMount: true,
   });
 
   if (runningTasks?.length === 0) {
