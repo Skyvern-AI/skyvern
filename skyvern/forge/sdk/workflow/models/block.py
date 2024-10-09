@@ -68,11 +68,19 @@ class BlockType(StrEnum):
     FILE_URL_PARSER = "file_url_parser"
 
 
+class BlockStatus(StrEnum):
+    completed = "completed"
+    failed = "failed"
+    terminated = "terminated"
+    canceled = "canceled"
+
+
 @dataclass(frozen=True)
 class BlockResult:
     success: bool
     output_parameter: OutputParameter
     output_parameter_value: dict[str, Any] | list | str | None = None
+    status: BlockStatus | None = None
 
 
 class Block(BaseModel, abc.ABC):
@@ -107,11 +115,13 @@ class Block(BaseModel, abc.ABC):
         self,
         success: bool,
         output_parameter_value: dict[str, Any] | list | str | None = None,
+        status: BlockStatus | None = None,
     ) -> BlockResult:
         return BlockResult(
             success=success,
             output_parameter=self.output_parameter,
             output_parameter_value=output_parameter_value,
+            status=status,
         )
 
     @classmethod
@@ -144,7 +154,7 @@ class Block(BaseModel, abc.ABC):
             workflow_run_context = self.get_workflow_run_context(workflow_run_id)
             if not workflow_run_context.has_value(self.output_parameter.key):
                 await self.record_output_parameter_value(workflow_run_context, workflow_run_id)
-            return self.build_block_result(success=False)
+            return self.build_block_result(success=False, status=BlockStatus.failed)
 
     @abc.abstractmethod
     def get_all_parameters(
@@ -333,6 +343,12 @@ class TaskBlock(Block):
             if not updated_task.status.is_final():
                 raise UnexpectedTaskStatus(task_id=updated_task.task_id, status=updated_task.status)
 
+            block_status_mapping = {
+                TaskStatus.completed: BlockStatus.completed,
+                TaskStatus.terminated: BlockStatus.terminated,
+                TaskStatus.failed: BlockStatus.failed,
+                TaskStatus.canceled: BlockStatus.canceled,
+            }
             if updated_task.status == TaskStatus.completed or updated_task.status == TaskStatus.terminated:
                 LOG.info(
                     "Task completed",
@@ -346,7 +362,23 @@ class TaskBlock(Block):
                 task_output = TaskOutput.from_task(updated_task)
                 output_parameter_value = task_output.model_dump()
                 await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_parameter_value)
-                return self.build_block_result(success=success, output_parameter_value=output_parameter_value)
+                return self.build_block_result(
+                    success=success,
+                    output_parameter_value=output_parameter_value,
+                    status=block_status_mapping[updated_task.status],
+                )
+            elif updated_task.status == TaskStatus.canceled:
+                LOG.info(
+                    "Task canceled, cancelling block",
+                    task_id=updated_task.task_id,
+                    task_status=updated_task.status,
+                    workflow_run_id=workflow_run_id,
+                    workflow_id=workflow.workflow_id,
+                    organization_id=workflow.organization_id,
+                )
+                return self.build_block_result(
+                    success=False, output_parameter_value=None, status=block_status_mapping[updated_task.status]
+                )
             else:
                 current_retry += 1
                 will_retry = current_retry <= self.max_retries
@@ -368,10 +400,14 @@ class TaskBlock(Block):
                     await self.record_output_parameter_value(
                         workflow_run_context, workflow_run_id, output_parameter_value
                     )
-                    return self.build_block_result(success=False, output_parameter_value=output_parameter_value)
+                    return self.build_block_result(
+                        success=False,
+                        output_parameter_value=output_parameter_value,
+                        status=block_status_mapping[updated_task.status],
+                    )
 
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id)
-        return self.build_block_result(success=False)
+        return self.build_block_result(success=False, status=BlockStatus.failed)
 
 
 class ForLoopBlock(Block):
@@ -455,7 +491,7 @@ class ForLoopBlock(Block):
             return [parameter_value]
 
     async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
-        outputs_with_loop_values = []
+        outputs_with_loop_values: list[list[dict[str, Any]]] = []
         success = False
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         loop_over_values = self.get_loop_over_parameter_values(workflow_run_context)
@@ -467,13 +503,13 @@ class ForLoopBlock(Block):
         )
         if not loop_over_values or len(loop_over_values) == 0:
             LOG.info(
-                "No loop_over values found",
+                "No loop_over values found, terminating block",
                 block_type=self.block_type,
                 workflow_run_id=workflow_run_id,
                 num_loop_over_values=len(loop_over_values),
             )
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, [])
-            return self.build_block_result(success=False)
+            return self.build_block_result(success=False, status=BlockStatus.terminated)
         for loop_idx, loop_over_value in enumerate(loop_over_values):
             context_parameters_with_value = self.get_loop_block_context_parameters(workflow_run_id, loop_over_value)
             for context_parameter in context_parameters_with_value:
@@ -483,6 +519,21 @@ class ForLoopBlock(Block):
                 original_loop_block = loop_block
                 loop_block = loop_block.copy()
                 block_output = await loop_block.execute_safe(workflow_run_id=workflow_run_id)
+                if block_output.status == BlockStatus.canceled:
+                    LOG.info(
+                        f"ForLoopBlock: Block with type {loop_block.block_type} at index {block_idx} was canceled for workflow run {workflow_run_id}, canceling for loop",
+                        block_type=loop_block.block_type,
+                        workflow_run_id=workflow_run_id,
+                        block_idx=block_idx,
+                        block_result=block_output,
+                    )
+                    await self.record_output_parameter_value(
+                        workflow_run_context, workflow_run_id, outputs_with_loop_values
+                    )
+                    return self.build_block_result(
+                        success=False, output_parameter_value=outputs_with_loop_values, status=BlockStatus.canceled
+                    )
+
                 loop_block = original_loop_block
                 block_outputs.append(block_output)
                 if not block_output.success and not loop_block.continue_on_failure:
@@ -518,8 +569,16 @@ class ForLoopBlock(Block):
                 )
                 break
 
+        is_any_block_terminated = any([block_output.status == BlockStatus.terminated for block_output in block_outputs])
+        for_loop_block_status = BlockStatus.completed
+        if is_any_block_terminated:
+            for_loop_block_status = BlockStatus.terminated
+        elif not success:
+            for_loop_block_status = BlockStatus.failed
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, outputs_with_loop_values)
-        return self.build_block_result(success=success, output_parameter_value=outputs_with_loop_values)
+        return self.build_block_result(
+            success=success, output_parameter_value=outputs_with_loop_values, status=for_loop_block_status
+        )
 
 
 class CodeBlock(Block):
@@ -578,7 +637,7 @@ async def user_code():
 
         result = {"result": result_container.get("result")}
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result)
-        return self.build_block_result(success=True, output_parameter_value=result)
+        return self.build_block_result(success=True, output_parameter_value=result, status=BlockStatus.completed)
 
 
 class TextPromptBlock(Block):
@@ -640,7 +699,7 @@ class TextPromptBlock(Block):
 
         response = await self.send_prompt(self.prompt, parameter_values)
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response)
-        return self.build_block_result(success=True, output_parameter_value=response)
+        return self.build_block_result(success=True, output_parameter_value=response, status=BlockStatus.completed)
 
 
 class DownloadToS3Block(Block):
@@ -697,7 +756,7 @@ class DownloadToS3Block(Block):
 
         LOG.info("DownloadToS3Block: File downloaded and uploaded to S3", uri=uri)
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, uri)
-        return self.build_block_result(success=True, output_parameter_value=uri)
+        return self.build_block_result(success=True, output_parameter_value=uri, status=BlockStatus.completed)
 
 
 class UploadToS3Block(Block):
@@ -771,7 +830,7 @@ class UploadToS3Block(Block):
 
         LOG.info("UploadToS3Block: File(s) uploaded to S3", file_path=self.path)
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, s3_uris)
-        return self.build_block_result(success=True, output_parameter_value=s3_uris)
+        return self.build_block_result(success=True, output_parameter_value=s3_uris, status=BlockStatus.completed)
 
 
 class SendEmailBlock(Block):
@@ -1039,14 +1098,14 @@ class SendEmailBlock(Block):
             LOG.error("SendEmailBlock: Failed to send email", exc_info=True)
             result_dict = {"success": False, "error": str(e)}
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
-            return self.build_block_result(success=False, output_parameter_value=result_dict)
+            return self.build_block_result(success=False, output_parameter_value=result_dict, status=BlockStatus.failed)
         finally:
             if smtp_host:
                 smtp_host.quit()
 
         result_dict = {"success": True}
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
-        return self.build_block_result(success=True, output_parameter_value=result_dict)
+        return self.build_block_result(success=True, output_parameter_value=result_dict, status=BlockStatus.completed)
 
 
 class FileType(StrEnum):
@@ -1109,7 +1168,7 @@ class FileParserBlock(Block):
                     parsed_data.append(row)
         # Record the parsed data
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, parsed_data)
-        return self.build_block_result(success=True, output_parameter_value=parsed_data)
+        return self.build_block_result(success=True, output_parameter_value=parsed_data, status=BlockStatus.completed)
 
 
 BlockSubclasses = Union[
