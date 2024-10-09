@@ -59,6 +59,9 @@ function createTemplateTaskFromTaskGenerationParameters(
 const examplePrompts = [
   "What is the top post on hackernews?",
   "Navigate to Google Finance and search for AAPL",
+  "What is the top NYT bestseller?",
+  "What is the top ranked football team?",
+  "Find the top selling electrical connector on finditparts",
 ];
 
 function PromptBox() {
@@ -173,12 +176,12 @@ function PromptBox() {
           </div>
         </div>
       </div>
-      <div className="flex gap-4 rounded-sm bg-slate-elevation1 p-4">
+      <div className="flex gap-4 overflow-x-scroll rounded-sm bg-slate-elevation1 p-4">
         {examplePrompts.map((examplePrompt) => {
           return (
             <div
               key={examplePrompt}
-              className="cursor-pointer rounded-sm bg-slate-elevation3 px-4 py-3 hover:bg-slate-elevation5"
+              className="cursor-pointer whitespace-nowrap rounded-sm bg-slate-elevation3 px-4 py-3 hover:bg-slate-elevation5"
               onClick={() => {
                 setPrompt(examplePrompt);
               }}
