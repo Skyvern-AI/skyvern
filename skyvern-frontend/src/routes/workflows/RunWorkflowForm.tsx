@@ -227,7 +227,7 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
               }}
             >
               <CopyIcon className="mr-2 h-4 w-4" />
-              Copy as cURL
+              cURL
             </Button>
             <Button type="submit" disabled={runWorkflowMutation.isPending}>
               {runWorkflowMutation.isPending && (

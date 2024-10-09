@@ -286,7 +286,7 @@ function WorkflowRun() {
             }}
           >
             <CopyIcon className="mr-2 h-4 w-4" />
-            Copy cURL
+            cURL
           </Button>
           <Button asChild variant="secondary">
             <Link to={`/workflows/${workflowPermanentId}/edit`}>

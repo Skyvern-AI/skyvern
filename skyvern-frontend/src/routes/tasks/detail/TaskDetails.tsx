@@ -154,7 +154,7 @@ function TaskDetails() {
             }}
           >
             <CopyIcon className="mr-2 h-4 w-4" />
-            Copy cURL
+            cURL
           </Button>
           {taskIsRunningOrQueued && (
             <Dialog>
