@@ -156,7 +156,7 @@ function ScrollableActionList({
           <ArrowDownIcon />
         </Button>
       </div>
-      <ScrollArea>
+      <ScrollArea className="w-full">
         <ScrollAreaViewport className="h-full w-full rounded-[inherit]">
           <div className="w-full space-y-4 px-4 pb-4">
             {showStreamOption && (
