@@ -26,6 +26,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useReactFlow } from "@xyflow/react";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 
 const WORKFLOW_EDIT_PANEL_WIDTH = 20 * 16;
 const WORKFLOW_EDIT_PANEL_GAP = 1 * 16;
@@ -105,89 +106,96 @@ function WorkflowParametersPanel() {
           </DropdownMenuContent>
         </DropdownMenu>
 
-        <section className="max-h-[600px] space-y-2 overflow-y-scroll">
-          {workflowParameters.map((parameter) => {
-            return (
-              <div
-                key={parameter.key}
-                className="flex items-center justify-between rounded-md bg-slate-elevation1 px-3 py-2"
-              >
-                <div className="flex items-center gap-4">
-                  <span className="text-sm">{parameter.key}</span>
-                  {parameter.parameterType === "workflow" ? (
-                    <span className="text-sm text-slate-400">
-                      {parameter.dataType}
-                    </span>
-                  ) : (
-                    <span className="text-sm text-slate-400">
-                      {parameter.parameterType}
-                    </span>
-                  )}
-                </div>
-                <div className="flex items-center gap-2">
-                  <MixerVerticalIcon
-                    className="cursor-pointer"
-                    onClick={() => {
-                      setOperationPanelState({
-                        active: true,
-                        operation: "edit",
-                        parameter: parameter,
-                        type: parameter.parameterType,
-                      });
-                    }}
-                  />
-                  <Dialog>
-                    <DialogTrigger>
-                      <GarbageIcon className="size-4 cursor-pointer text-destructive-foreground text-red-600" />
-                    </DialogTrigger>
-                    <DialogContent>
-                      <DialogHeader>
-                        <DialogTitle>Are you sure?</DialogTitle>
-                        <DialogDescription>
-                          This parameter will be deleted.
-                        </DialogDescription>
-                      </DialogHeader>
-                      <DialogFooter>
-                        <DialogClose asChild>
-                          <Button variant="secondary">Cancel</Button>
-                        </DialogClose>
-                        <Button
-                          variant="destructive"
-                          onClick={() => {
-                            setWorkflowParameters(
-                              workflowParameters.filter(
-                                (p) => p.key !== parameter.key,
-                              ),
-                            );
-                            setHasChanges(true);
-                            setNodes((nodes) => {
-                              return nodes.map((node) => {
-                                if (node.type === "task") {
-                                  return {
-                                    ...node,
-                                    data: {
-                                      ...node.data,
-                                      parameterKeys: (
-                                        node.data.parameterKeys as Array<string>
-                                      ).filter((key) => key !== parameter.key),
-                                    },
-                                  };
-                                }
-                                return node;
-                              });
-                            });
-                          }}
-                        >
-                          Delete
-                        </Button>
-                      </DialogFooter>
-                    </DialogContent>
-                  </Dialog>
-                </div>
-              </div>
-            );
-          })}
-        </section>
+        <ScrollArea>
+          <ScrollAreaViewport className="max-h-[600px]">
+            <section className="space-y-2">
+              {workflowParameters.map((parameter) => {
+                return (
+                  <div
+                    key={parameter.key}
+                    className="flex items-center justify-between rounded-md bg-slate-elevation1 px-3 py-2"
+                  >
+                    <div className="flex items-center gap-4">
+                      <span className="text-sm">{parameter.key}</span>
+                      {parameter.parameterType === "workflow" ? (
+                        <span className="text-sm text-slate-400">
+                          {parameter.dataType}
+                        </span>
+                      ) : (
+                        <span className="text-sm text-slate-400">
+                          {parameter.parameterType}
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <MixerVerticalIcon
+                        className="cursor-pointer"
+                        onClick={() => {
+                          setOperationPanelState({
+                            active: true,
+                            operation: "edit",
+                            parameter: parameter,
+                            type: parameter.parameterType,
+                          });
+                        }}
+                      />
+                      <Dialog>
+                        <DialogTrigger>
+                          <GarbageIcon className="size-4 cursor-pointer text-destructive-foreground text-red-600" />
+                        </DialogTrigger>
+                        <DialogContent>
+                          <DialogHeader>
+                            <DialogTitle>Are you sure?</DialogTitle>
+                            <DialogDescription>
+                              This parameter will be deleted.
+                            </DialogDescription>
+                          </DialogHeader>
+                          <DialogFooter>
+                            <DialogClose asChild>
+                              <Button variant="secondary">Cancel</Button>
+                            </DialogClose>
+                            <Button
+                              variant="destructive"
+                              onClick={() => {
+                                setWorkflowParameters(
+                                  workflowParameters.filter(
+                                    (p) => p.key !== parameter.key,
+                                  ),
+                                );
+                                setHasChanges(true);
+                                setNodes((nodes) => {
+                                  return nodes.map((node) => {
+                                    if (node.type === "task") {
+                                      return {
+                                        ...node,
+                                        data: {
+                                          ...node.data,
+                                          parameterKeys: (
+                                            node.data
+                                              .parameterKeys as Array<string>
+                                          ).filter(
+                                            (key) => key !== parameter.key,
+                                          ),
+                                        },
+                                      };
+                                    }
+                                    return node;
+                                  });
+                                });
+                              }}
+                            >
+                              Delete
+                            </Button>
+                          </DialogFooter>
+                        </DialogContent>
+                      </Dialog>
+                    </div>
+                  </div>
+                );
+              })}
+            </section>
+          </ScrollAreaViewport>
+        </ScrollArea>
       </div>
       {operationPanelState.active && (
         <div
