@@ -178,6 +178,10 @@ class SkyvernElement:
         if name.lower() in RAW_INPUT_NAME_VALUE:
             return True
 
+        # if input has these attrs, it expects user to type and input sth
+        if await self.get_attr("min") or await self.get_attr("max") or await self.get_attr("step"):
+            return True
+
         return False
 
     async def is_spinbtn_input(self) -> bool:
