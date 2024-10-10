@@ -704,7 +704,7 @@ function SavedTaskForm({ initialValues }: Props) {
                       <div className="flex gap-16">
                         <FormLabel>
                           <div className="w-72">
-                            <h1 className="text-lg">TOTP Verification URL</h1>
+                            <h1 className="text-lg">2FA Verification URL</h1>
                             <h2 className="text-base text-slate-400"></h2>
                           </div>
                         </FormLabel>
@@ -730,7 +730,7 @@ function SavedTaskForm({ initialValues }: Props) {
                       <div className="flex gap-16">
                         <FormLabel>
                           <div className="w-72">
-                            <h1 className="text-lg">TOTP Identifier</h1>
+                            <h1 className="text-lg">2FA Identifier</h1>
                             <h2 className="text-base text-slate-400"></h2>
                           </div>
                         </FormLabel>
