@@ -26,10 +26,12 @@ function RunningTasks() {
         .get("/tasks", {
           params: {
             task_status: "running",
+            only_standalone_tasks: "true",
           },
         })
         .then((response) => response.data);
     },
+    refetchOnMount: true,
   });
 
   if (runningTasks?.length === 0) {

@@ -1,3 +1,5 @@
+import { Status } from "@/api/types";
+
 export const sampleCases = [
   "blank",
   "geico",
@@ -8,3 +10,19 @@ export const sampleCases = [
 ] as const;
 
 export type SampleCase = (typeof sampleCases)[number];
+
+export function statusIsNotFinalized({ status }: { status: Status }): boolean {
+  return (
+    status === Status.Created ||
+    status === Status.Queued ||
+    status === Status.Running
+  );
+}
+
+export function statusIsRunningOrQueued({
+  status,
+}: {
+  status: Status;
+}): boolean {
+  return status === Status.Queued || status === Status.Running;
+}

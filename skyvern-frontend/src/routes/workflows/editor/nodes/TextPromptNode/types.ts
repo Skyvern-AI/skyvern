@@ -2,9 +2,16 @@ import type { Node } from "@xyflow/react";
 
 export type TextPromptNodeData = {
   prompt: string;
-  jsonSchema: Record<string, unknown> | null;
+  jsonSchema: string;
   editable: boolean;
   label: string;
 };
 
 export type TextPromptNode = Node<TextPromptNodeData, "textPrompt">;
+
+export const textPromptNodeDefaultData: TextPromptNodeData = {
+  editable: true,
+  label: "",
+  prompt: "",
+  jsonSchema: "null",
+} as const;

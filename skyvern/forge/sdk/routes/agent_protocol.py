@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import uuid
 from typing import Annotated, Any
 
@@ -42,6 +43,7 @@ from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, Task
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.workflow.exceptions import FailedToCreateWorkflow, FailedToUpdateWorkflow
 from skyvern.forge.sdk.workflow.models.workflow import (
     RunWorkflowResponse,
     Workflow,
@@ -123,7 +125,12 @@ async def create_agent_task(
 
     created_task = await app.agent.create_task(task, current_org.organization_id)
     if x_max_steps_override:
-        LOG.info("Overriding max steps per run", max_steps_override=x_max_steps_override)
+        LOG.info(
+            "Overriding max steps per run",
+            max_steps_override=x_max_steps_override,
+            organization_id=current_org.organization_id,
+            task_id=created_task.task_id,
+        )
     await AsyncExecutorFactory.get_executor().execute_task(
         request=request,
         background_tasks=background_tasks,
@@ -376,6 +383,7 @@ async def get_agent_tasks(
     task_status: Annotated[list[TaskStatus] | None, Query()] = None,
     workflow_run_id: Annotated[str | None, Query()] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    only_standalone_tasks: bool = Query(False),
 ) -> Response:
     """
     Get all tasks.
@@ -383,16 +391,23 @@ async def get_agent_tasks(
     :param page_size: Page size, defaults to 10
     :param task_status: Task status filter
     :param workflow_run_id: Workflow run id filter
+    :param only_standalone_tasks: Only standalone tasks, tasks which are part of a workflow run will be filtered out
     :return: List of tasks with pagination without steps populated. Steps can be populated by calling the
         get_agent_task endpoint.
     """
     analytics.capture("skyvern-oss-agent-tasks-get")
+    if only_standalone_tasks and workflow_run_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="only_standalone_tasks and workflow_run_id cannot be used together",
+        )
     tasks = await app.DATABASE.get_tasks(
         page,
         page_size,
         task_status=task_status,
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
+        only_standalone_tasks=only_standalone_tasks,
     )
     return ORJSONResponse([task.to_task_response().model_dump() for task in tasks])
 
@@ -658,10 +673,14 @@ async def create_workflow(
     except yaml.YAMLError:
         raise HTTPException(status_code=422, detail="Invalid YAML")
 
-    workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
-    return await app.WORKFLOW_SERVICE.create_workflow_from_request(
-        organization_id=current_org.organization_id, request=workflow_create_request
-    )
+    try:
+        workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
+        return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+            organization=current_org, request=workflow_create_request
+        )
+    except Exception as e:
+        LOG.error("Failed to create workflow", exc_info=True, organization_id=current_org.organization_id)
+        raise FailedToCreateWorkflow(str(e))
 
 
 @base_router.put(
@@ -698,12 +717,16 @@ async def update_workflow(
     except yaml.YAMLError:
         raise HTTPException(status_code=422, detail="Invalid YAML")
 
-    workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
-    return await app.WORKFLOW_SERVICE.create_workflow_from_request(
-        organization_id=current_org.organization_id,
-        request=workflow_create_request,
-        workflow_permanent_id=workflow_permanent_id,
-    )
+    try:
+        workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
+        return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+            organization=current_org,
+            request=workflow_create_request,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+    except Exception as e:
+        LOG.exception("Failed to update workflow", workflow_permanent_id=workflow_permanent_id)
+        raise FailedToUpdateWorkflow(workflow_permanent_id, f"<{type(e).__name__}: {str(e)}>")
 
 
 @base_router.delete("/workflows/{workflow_permanent_id}")
@@ -766,6 +789,32 @@ async def generate_task(
     data: GenerateTaskRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> TaskGeneration:
+    user_prompt = data.prompt
+    hash_object = hashlib.sha256()
+    hash_object.update(user_prompt.encode("utf-8"))
+    user_prompt_hash = hash_object.hexdigest()
+    # check if there's a same user_prompt within the past x Hours
+    # in the future, we can use vector db to fetch similar prompts
+    existing_task_generation = await app.DATABASE.get_task_generation_by_prompt_hash(
+        user_prompt_hash=user_prompt_hash, query_window_hours=SettingsManager.get_settings().PROMPT_CACHE_WINDOW_HOURS
+    )
+    if existing_task_generation:
+        new_task_generation = await app.DATABASE.create_task_generation(
+            organization_id=current_org.organization_id,
+            user_prompt=data.prompt,
+            user_prompt_hash=user_prompt_hash,
+            url=existing_task_generation.url,
+            navigation_goal=existing_task_generation.navigation_goal,
+            navigation_payload=existing_task_generation.navigation_payload,
+            data_extraction_goal=existing_task_generation.data_extraction_goal,
+            extracted_information_schema=existing_task_generation.extracted_information_schema,
+            llm=existing_task_generation.llm,
+            llm_prompt=existing_task_generation.llm_prompt,
+            llm_response=existing_task_generation.llm_response,
+            source_task_generation_id=existing_task_generation.task_generation_id,
+        )
+        return new_task_generation
+
     llm_prompt = prompt_engine.load_prompt("generate-task", user_prompt=data.prompt)
     try:
         llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt)
@@ -775,6 +824,7 @@ async def generate_task(
         task_generation = await app.DATABASE.create_task_generation(
             organization_id=current_org.organization_id,
             user_prompt=data.prompt,
+            user_prompt_hash=user_prompt_hash,
             url=parsed_task_generation_obj.url,
             navigation_goal=parsed_task_generation_obj.navigation_goal,
             navigation_payload=parsed_task_generation_obj.navigation_payload,

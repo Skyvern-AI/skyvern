@@ -16,6 +16,7 @@ from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
+CleanupElementTreeFunc = Callable[[str, list[dict]], Awaitable[list[dict]]]
 
 RESERVED_ATTRIBUTES = {
     "accept",  # for input file
@@ -29,6 +30,7 @@ RESERVED_ATTRIBUTES = {
     "checked",
     "data-original-title",  # for bootstrap tooltip
     "data-ui",
+    "disabled",  # for button
     "for",
     "href",  # For a tags
     "maxlength",
@@ -83,15 +85,22 @@ def build_attribute(key: str, value: Any) -> str:
     return f'{key}="{str(value)}"' if value else key
 
 
-def json_to_html(element: dict) -> str:
+def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
+    """
+    if element is flagged as dropped, the html format is empty
+    """
+    if element.get("isDropped", False):
+        return ""
+
     attributes: dict[str, Any] = copy.deepcopy(element.get("attributes", {}))
 
-    # adding the node attribute to attributes
-    for attr in ELEMENT_NODE_ATTRIBUTES:
-        value = element.get(attr)
-        if value is None:
-            continue
-        attributes[attr] = value
+    if need_skyvern_attrs:
+        # adding the node attribute to attributes
+        for attr in ELEMENT_NODE_ATTRIBUTES:
+            value = element.get(attr)
+            if value is None:
+                continue
+            attributes[attr] = value
 
     attributes_html = " ".join(build_attribute(key, value) for key, value in attributes.items())
 
@@ -107,6 +116,9 @@ def json_to_html(element: dict) -> str:
         f'<option index="{option.get("optionIndex")}">{option.get("text")}</option>'
         for option in element.get("options", [])
     )
+
+    if element.get("purgeable", False):
+        return children_html + option_html
 
     # Check if the element is self-closing
     if tag in ["img", "input", "br", "hr", "meta", "link"] and not option_html and not children_html:
@@ -171,7 +183,7 @@ class ScrapedPage(BaseModel):
 async def scrape_website(
     browser_state: BrowserState,
     url: str,
-    cleanup_element_tree: Callable[[str, list[dict]], Awaitable[list[dict]]],
+    cleanup_element_tree: CleanupElementTreeFunc,
     num_retry: int = 0,
     scrape_exclude: Callable[[Page, Frame], Awaitable[bool]] | None = None,
 ) -> ScrapedPage:
@@ -243,6 +255,19 @@ async def get_frame_text(iframe: Frame) -> str:
         if child_frame.is_detached():
             continue
 
+        try:
+            child_frame_element = await child_frame.frame_element()
+        except Exception:
+            LOG.warning(
+                "Unable to get child_frame_element",
+                exc_info=True,
+            )
+            continue
+
+        # it will get stuck when we `frame.evaluate()` on an invisible iframe
+        if not await child_frame_element.is_visible():
+            continue
+
         text += await get_frame_text(child_frame)
 
     return text
@@ -251,7 +276,7 @@ async def get_frame_text(iframe: Frame) -> str:
 async def scrape_web_unsafe(
     browser_state: BrowserState,
     url: str,
-    cleanup_element_tree: Callable[[str, list[dict]], Awaitable[list[dict]]],
+    cleanup_element_tree: CleanupElementTreeFunc,
     scrape_exclude: Callable[[Page, Frame], Awaitable[bool]] | None = None,
 ) -> ScrapedPage:
     """
@@ -335,9 +360,13 @@ async def get_interactable_element_tree_in_frame(
             )
             continue
 
+        # it will get stuck when we `frame.evaluate()` on an invisible iframe
+        if not await frame_element.is_visible():
+            continue
+
         unique_id = await frame_element.get_attribute("unique_id")
 
-        frame_js_script = f"() => buildTreeFromBody('{unique_id}', true)"
+        frame_js_script = f"() => buildTreeFromBody('{unique_id}')"
 
         await frame.evaluate(JS_FUNCTION_DEFS)
         frame_elements, frame_element_tree = await frame.evaluate(frame_js_script)
@@ -373,7 +402,7 @@ async def get_interactable_element_tree(
     :return: Tuple containing the element tree and a map of element IDs to elements.
     """
     await page.evaluate(JS_FUNCTION_DEFS)
-    main_frame_js_script = "() => buildTreeFromBody('main.frame', true)"
+    main_frame_js_script = "() => buildTreeFromBody()"
     elements, element_tree = await page.evaluate(main_frame_js_script)
 
     if len(page.main_frame.child_frames) > 0:
@@ -398,7 +427,7 @@ class IncrementalScrapePage:
 
     async def get_incremental_element_tree(
         self,
-        cleanup_element_tree: Callable[[str, list[dict]], Awaitable[list[dict]]],
+        cleanup_element_tree: CleanupElementTreeFunc,
     ) -> list[dict]:
         frame = self.skyvern_frame.get_frame()
 
@@ -429,33 +458,62 @@ class IncrementalScrapePage:
         js_script = "() => window.globalOneTimeIncrementElements.length"
         return await self.skyvern_frame.get_frame().evaluate(js_script)
 
+    async def __validate_element_by_value(self, value: str, element: dict) -> tuple[Locator | None, bool]:
+        """
+        Locator: the locator of the matched element. None if no valid element to interact;
+        bool: is_matched. True, found an intercatable alternative one; False, not found  any alternative;
+
+        If is_matched is True, but Locator is None. It means the value is matched, but the current element is non-interactable
+        """
+
+        interactable = element.get("interactable", False)
+        element_id = element.get("id", "")
+
+        parent_locator: Locator | None = None
+        if element_id:
+            parent_locator = self.skyvern_frame.get_frame().locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
+
+        # DFS to validate the children first:
+        # if the child element matched and is interactable, return the child node directly
+        # if the child element matched value but not interactable, try to interact with the parent node
+        children = element.get("children", [])
+        for child in children:
+            child_locator, is_match = await self.__validate_element_by_value(value, child)
+            if is_match:
+                if child_locator:
+                    return child_locator, True
+                if interactable and parent_locator and await parent_locator.count() > 0:
+                    return parent_locator, True
+                return None, True
+
+        if not parent_locator:
+            return None, False
+
+        text = element.get("text", "")
+        if text != value:
+            return None, False
+
+        if await parent_locator.count() == 0:
+            return None, False
+
+        if not interactable:
+            return None, True
+
+        return parent_locator, True
+
     async def select_one_element_by_value(self, value: str) -> Locator | None:
-        for element in self.elements:
-            element_id = element.get("id", "")
-            if not element_id:
-                continue
-
-            if not element.get("interactable", False):
-                continue
-
-            text = element.get("text", "")
-            if text != value:
-                continue
-
-            locator = self.skyvern_frame.get_frame().locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
-            if await locator.count() > 0:
+        for element in self.element_tree:
+            locator, _ = await self.__validate_element_by_value(value=value, element=element)
+            if locator:
                 return locator
-
         return None
 
     def build_html_tree(self, element_tree: list[dict] | None = None) -> str:
         return "".join([json_to_html(element) for element in (element_tree or self.element_tree_trimmed)])
 
 
-def trim_element_tree(elements: list[dict]) -> list[dict]:
-    queue = []
-    for element in elements:
-        queue.append(element)
+def trim_element(element: dict) -> dict:
+    queue = [element]
     while queue:
         queue_ele = queue.pop(0)
         if "frame" in queue_ele:
@@ -472,8 +530,7 @@ def trim_element_tree(elements: list[dict]) -> list[dict]:
                 del queue_ele["attributes"]
 
         if "attributes" in queue_ele and not queue_ele.get("keepAllAttr", False):
-            tag_name = queue_ele["tagName"] if "tagName" in queue_ele else ""
-            new_attributes = _trimmed_attributes(tag_name, queue_ele["attributes"])
+            new_attributes = _trimmed_attributes(queue_ele["attributes"])
             if new_attributes:
                 queue_ele["attributes"] = new_attributes
             else:
@@ -490,6 +547,12 @@ def trim_element_tree(elements: list[dict]) -> list[dict]:
             element_text = str(queue_ele["text"]).strip()
             if not element_text:
                 del queue_ele["text"]
+    return element
+
+
+def trim_element_tree(elements: list[dict]) -> list[dict]:
+    for element in elements:
+        trim_element(element)
     return elements
 
 
@@ -504,13 +567,10 @@ def _trimmed_base64_data(attributes: dict) -> dict:
     return new_attributes
 
 
-def _trimmed_attributes(tag_name: str, attributes: dict) -> dict:
+def _trimmed_attributes(attributes: dict) -> dict:
     new_attributes: dict = {}
 
     for key in attributes:
-        if key == "id" and tag_name in ["input", "textarea", "select"]:
-            # We don't want to remove the id attribute any of these elements in case there's a label for it
-            new_attributes[key] = attributes[key]
         if key == "role" and attributes[key] in ["listbox", "option"]:
             new_attributes[key] = attributes[key]
         if key in RESERVED_ATTRIBUTES and attributes[key]:

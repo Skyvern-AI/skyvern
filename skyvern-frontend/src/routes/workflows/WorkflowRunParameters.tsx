@@ -1,9 +1,12 @@
 import { getClient } from "@/api/AxiosClient";
-import { WorkflowApiResponse, WorkflowParameterValueType } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
-import { useParams } from "react-router-dom";
+import { useLocation, useParams } from "react-router-dom";
 import { RunWorkflowForm } from "./RunWorkflowForm";
+import {
+  WorkflowApiResponse,
+  WorkflowParameterValueType,
+} from "./types/workflowTypes";
 
 function defaultValue(type: WorkflowParameterValueType) {
   switch (type) {
@@ -25,6 +28,7 @@ function defaultValue(type: WorkflowParameterValueType) {
 function WorkflowRunParameters() {
   const credentialGetter = useCredentialGetter();
   const { workflowPermanentId } = useParams();
+  const location = useLocation();
 
   const { data: workflow, isFetching } = useQuery<WorkflowApiResponse>({
     queryKey: ["workflow", workflowPermanentId],
@@ -40,31 +44,36 @@ function WorkflowRunParameters() {
     (parameter) => parameter.parameter_type === "workflow",
   );
 
-  const initialValues = workflowParameters?.reduce(
-    (acc, curr) => {
-      if (curr.workflow_parameter_type === "file_url") {
-        acc[curr.key] = null;
-        return acc;
-      }
-      if (curr.workflow_parameter_type === "json") {
-        if (typeof curr.default_value === "string") {
-          acc[curr.key] = curr.default_value;
+  const initialValues = location.state?.data
+    ? location.state.data
+    : workflowParameters?.reduce(
+        (acc, curr) => {
+          if (curr.workflow_parameter_type === "json") {
+            if (typeof curr.default_value === "string") {
+              acc[curr.key] = curr.default_value;
+              return acc;
+            }
+            if (curr.default_value) {
+              acc[curr.key] = JSON.stringify(curr.default_value, null, 2);
+              return acc;
+            }
+          }
+          if (
+            curr.default_value &&
+            curr.workflow_parameter_type === "boolean"
+          ) {
+            acc[curr.key] = Boolean(curr.default_value);
+            return acc;
+          }
+          if (curr.default_value) {
+            acc[curr.key] = curr.default_value;
+            return acc;
+          }
+          acc[curr.key] = defaultValue(curr.workflow_parameter_type);
           return acc;
-        }
-        if (curr.default_value) {
-          acc[curr.key] = JSON.stringify(curr.default_value, null, 2);
-          return acc;
-        }
-      }
-      if (curr.default_value) {
-        acc[curr.key] = curr.default_value;
-        return acc;
-      }
-      acc[curr.key] = defaultValue(curr.workflow_parameter_type);
-      return acc;
-    },
-    {} as Record<string, unknown>,
-  );
+        },
+        {} as Record<string, unknown>,
+      );
 
   if (isFetching) {
     return <div>Getting workflow parameters...</div>;

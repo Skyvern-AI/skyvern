@@ -21,6 +21,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.id import (
     generate_artifact_id,
     generate_aws_secret_parameter_id,
+    generate_bitwarden_credit_card_data_parameter_id,
     generate_bitwarden_login_credential_parameter_id,
     generate_bitwarden_sensitive_information_parameter_id,
     generate_org_id,
@@ -29,6 +30,7 @@ from skyvern.forge.sdk.db.id import (
     generate_step_id,
     generate_task_generation_id,
     generate_task_id,
+    generate_totp_code_id,
     generate_workflow_id,
     generate_workflow_parameter_id,
     generate_workflow_permanent_id,
@@ -49,6 +51,7 @@ class TaskModel(Base):
     status = Column(String, index=True)
     webhook_callback_url = Column(String)
     totp_verification_url = Column(String)
+    totp_identifier = Column(String)
     title = Column(String)
     url = Column(String)
     navigation_goal = Column(String)
@@ -58,7 +61,7 @@ class TaskModel(Base):
     failure_reason = Column(String)
     proxy_location = Column(Enum(ProxyLocation))
     extracted_information_schema = Column(JSON)
-    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"))
+    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), index=True)
     order = Column(Integer, nullable=True)
     retry = Column(Integer, nullable=True)
     error_code_mapping = Column(JSON, nullable=True)
@@ -107,6 +110,8 @@ class OrganizationModel(Base):
     max_steps_per_run = Column(Integer, nullable=True)
     max_retries_per_step = Column(Integer, nullable=True)
     domain = Column(String, nullable=True, index=True)
+    bw_organization_id = Column(String, nullable=True, default=None)
+    bw_collection_ids = Column(JSON, nullable=True, default=None)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -180,6 +185,8 @@ class WorkflowModel(Base):
     proxy_location = Column(Enum(ProxyLocation))
     webhook_callback_url = Column(String)
     totp_verification_url = Column(String)
+    totp_identifier = Column(String)
+    persist_browser_session = Column(Boolean, default=False, nullable=False)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -206,6 +213,7 @@ class WorkflowRunModel(Base):
     proxy_location = Column(Enum(ProxyLocation))
     webhook_callback_url = Column(String)
     totp_verification_url = Column(String)
+    totp_identifier = Column(String)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -326,6 +334,28 @@ class BitwardenSensitiveInformationParameterModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
+class BitwardenCreditCardDataParameterModel(Base):
+    __tablename__ = "bitwarden_credit_card_data_parameters"
+
+    bitwarden_credit_card_data_parameter_id = Column(
+        String,
+        primary_key=True,
+        index=True,
+        default=generate_bitwarden_credit_card_data_parameter_id,
+    )
+    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), index=True, nullable=False)
+    key = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    bitwarden_client_id_aws_secret_key = Column(String, nullable=False)
+    bitwarden_client_secret_aws_secret_key = Column(String, nullable=False)
+    bitwarden_master_password_aws_secret_key = Column(String, nullable=False)
+    bitwarden_collection_id = Column(String, nullable=False)
+    bitwarden_item_id = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)
+
+
 class WorkflowRunParameterModel(Base):
     __tablename__ = "workflow_run_parameters"
 
@@ -374,7 +404,8 @@ class TaskGenerationModel(Base):
 
     task_generation_id = Column(String, primary_key=True, default=generate_task_generation_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
-    user_prompt = Column(String, nullable=False, index=True)  # The prompt from the user
+    user_prompt = Column(String, nullable=False)
+    user_prompt_hash = Column(String, index=True)
     url = Column(String)
     navigation_goal = Column(String)
     navigation_payload = Column(JSON)
@@ -386,5 +417,23 @@ class TaskGenerationModel(Base):
     llm_prompt = Column(String)  # The prompt sent to the language model
     llm_response = Column(String)  # The response from the language model
 
+    source_task_generation_id = Column(String, index=True)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
+
+class TOTPCodeModel(Base):
+    __tablename__ = "totp_codes"
+
+    totp_code_id = Column(String, primary_key=True, default=generate_totp_code_id)
+    totp_identifier = Column(String, nullable=False, index=True)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"))
+    task_id = Column(String, ForeignKey("tasks.task_id"))
+    workflow_id = Column(String, ForeignKey("workflows.workflow_id"))
+    content = Column(String, nullable=False)
+    code = Column(String, nullable=False)
+    source = Column(String)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    expired_at = Column(DateTime, index=True)

@@ -30,7 +30,6 @@ class TaskRequest(BaseModel):
     )
     url: str = Field(
         ...,
-        min_length=1,
         description="Starting URL for the task.",
         examples=["https://www.geico.com"],
     )
@@ -40,6 +39,7 @@ class TaskRequest(BaseModel):
         examples=["https://my-webhook.com"],
     )
     totp_verification_url: str | None = None
+    totp_identifier: str | None = None
     navigation_goal: str | None = Field(
         default=None,
         description="The user's goal for the task.",
@@ -224,6 +224,7 @@ class Task(TaskRequest):
             recording_url=recording_url,
             errors=self.errors,
             max_steps_per_run=self.max_steps_per_run,
+            workflow_run_id=self.workflow_run_id,
         )
 
 
@@ -240,6 +241,7 @@ class TaskResponse(BaseModel):
     failure_reason: str | None = None
     errors: list[dict[str, Any]] = []
     max_steps_per_run: int | None = None
+    workflow_run_id: str | None = None
 
 
 class TaskOutput(BaseModel):

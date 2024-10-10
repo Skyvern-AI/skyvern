@@ -1,4 +1,5 @@
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
 from typing import Any, Sequence
 
 import structlog
@@ -6,6 +7,7 @@ from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from skyvern.config import settings
 from skyvern.exceptions import WorkflowParameterNotFound
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
@@ -13,6 +15,7 @@ from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import (
     ArtifactModel,
     AWSSecretParameterModel,
+    BitwardenCreditCardDataParameterModel,
     BitwardenLoginCredentialParameterModel,
     BitwardenSensitiveInformationParameterModel,
     OrganizationAuthTokenModel,
@@ -21,6 +24,7 @@ from skyvern.forge.sdk.db.models import (
     StepModel,
     TaskGenerationModel,
     TaskModel,
+    TOTPCodeModel,
     WorkflowModel,
     WorkflowParameterModel,
     WorkflowRunModel,
@@ -47,8 +51,10 @@ from skyvern.forge.sdk.db.utils import (
 from skyvern.forge.sdk.models import Organization, OrganizationAuthToken, Step, StepStatus
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskStatus
+from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
+    BitwardenCreditCardDataParameter,
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
     OutputParameter,
@@ -83,6 +89,7 @@ class AgentDB:
         navigation_payload: dict[str, Any] | list | str | None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
+        totp_identifier: str | None = None,
         organization_id: str | None = None,
         proxy_location: ProxyLocation | None = None,
         extracted_information_schema: dict[str, Any] | list | str | None = None,
@@ -100,6 +107,7 @@ class AgentDB:
                     title=title,
                     webhook_callback_url=webhook_callback_url,
                     totp_verification_url=totp_verification_url,
+                    totp_identifier=totp_identifier,
                     navigation_goal=navigation_goal,
                     data_extraction_goal=data_extraction_goal,
                     navigation_payload=navigation_payload,
@@ -430,6 +438,7 @@ class AgentDB:
         task_status: list[TaskStatus] | None = None,
         workflow_run_id: str | None = None,
         organization_id: str | None = None,
+        only_standalone_tasks: bool = False,
     ) -> list[Task]:
         """
         Get all tasks.
@@ -437,6 +446,7 @@ class AgentDB:
         :param page_size:
         :param task_status:
         :param workflow_run_id:
+        :param only_standalone_tasks:
         :return:
         """
         if page < 1:
@@ -450,6 +460,8 @@ class AgentDB:
                     query = query.filter(TaskModel.status.in_(task_status))
                 if workflow_run_id:
                     query = query.filter(TaskModel.workflow_run_id == workflow_run_id)
+                if only_standalone_tasks:
+                    query = query.filter(TaskModel.workflow_run_id.is_(None))
                 query = query.order_by(TaskModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
                 tasks = (await session.scalars(query)).all()
                 return [convert_to_task(task, debug_enabled=self.debug_enabled) for task in tasks]
@@ -818,6 +830,8 @@ class AgentDB:
         proxy_location: ProxyLocation | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
+        totp_identifier: str | None = None,
+        persist_browser_session: bool = False,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
         is_saved_task: bool = False,
@@ -831,6 +845,8 @@ class AgentDB:
                 proxy_location=proxy_location,
                 webhook_callback_url=webhook_callback_url,
                 totp_verification_url=totp_verification_url,
+                totp_identifier=totp_identifier,
+                persist_browser_session=persist_browser_session,
                 is_saved_task=is_saved_task,
             )
             if workflow_permanent_id:
@@ -841,6 +857,23 @@ class AgentDB:
             await session.commit()
             await session.refresh(workflow)
             return convert_to_workflow(workflow, self.debug_enabled)
+
+    async def soft_delete_workflow_by_id(self, workflow_id: str, organization_id: str) -> None:
+        try:
+            async with self.Session() as session:
+                # soft delete the workflow by setting the deleted_at field to the current time
+                update_deleted_at_query = (
+                    update(WorkflowModel)
+                    .where(WorkflowModel.workflow_id == workflow_id)
+                    .where(WorkflowModel.organization_id == organization_id)
+                    .where(WorkflowModel.deleted_at.is_(None))
+                    .values(deleted_at=datetime.utcnow())
+                )
+                await session.execute(update_deleted_at_query)
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in soft_delete_workflow_by_id", exc_info=True)
+            raise
 
     async def get_workflow(self, workflow_id: str, organization_id: str | None = None) -> Workflow | None:
         try:
@@ -862,13 +895,12 @@ class AgentDB:
         workflow_permanent_id: str,
         organization_id: str | None = None,
         version: int | None = None,
+        exclude_deleted: bool = True,
     ) -> Workflow | None:
         try:
-            get_workflow_query = (
-                select(WorkflowModel)
-                .filter_by(workflow_permanent_id=workflow_permanent_id)
-                .filter(WorkflowModel.deleted_at.is_(None))
-            )
+            get_workflow_query = select(WorkflowModel).filter_by(workflow_permanent_id=workflow_permanent_id)
+            if exclude_deleted:
+                get_workflow_query = get_workflow_query.filter(WorkflowModel.deleted_at.is_(None))
             if organization_id:
                 get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
             if version:
@@ -998,6 +1030,7 @@ class AgentDB:
         proxy_location: ProxyLocation | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
+        totp_identifier: str | None = None,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
@@ -1009,6 +1042,7 @@ class AgentDB:
                     status="created",
                     webhook_callback_url=webhook_callback_url,
                     totp_verification_url=totp_verification_url,
+                    totp_identifier=totp_identifier,
                 )
                 session.add(workflow_run)
                 await session.commit()
@@ -1095,6 +1129,11 @@ class AgentDB:
     ) -> WorkflowParameter:
         try:
             async with self.Session() as session:
+                default_value = (
+                    json.dumps(default_value)
+                    if workflow_parameter_type == WorkflowParameterType.JSON
+                    else default_value
+                )
                 workflow_parameter = WorkflowParameterModel(
                     workflow_id=workflow_id,
                     workflow_parameter_type=workflow_parameter_type,
@@ -1185,6 +1224,33 @@ class AgentDB:
             await session.refresh(bitwarden_sensitive_information_parameter)
             return convert_to_bitwarden_sensitive_information_parameter(bitwarden_sensitive_information_parameter)
 
+    async def create_bitwarden_credit_card_data_parameter(
+        self,
+        workflow_id: str,
+        bitwarden_client_id_aws_secret_key: str,
+        bitwarden_client_secret_aws_secret_key: str,
+        bitwarden_master_password_aws_secret_key: str,
+        bitwarden_collection_id: str,
+        bitwarden_item_id: str,
+        key: str,
+        description: str | None = None,
+    ) -> BitwardenCreditCardDataParameter:
+        async with self.Session() as session:
+            bitwarden_credit_card_data_parameter = BitwardenCreditCardDataParameterModel(
+                workflow_id=workflow_id,
+                bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
+                bitwarden_client_secret_aws_secret_key=bitwarden_client_secret_aws_secret_key,
+                bitwarden_master_password_aws_secret_key=bitwarden_master_password_aws_secret_key,
+                bitwarden_collection_id=bitwarden_collection_id,
+                bitwarden_item_id=bitwarden_item_id,
+                key=key,
+                description=description,
+            )
+            session.add(bitwarden_credit_card_data_parameter)
+            await session.commit()
+            await session.refresh(bitwarden_credit_card_data_parameter)
+            return BitwardenCreditCardDataParameter.model_validate(bitwarden_credit_card_data_parameter)
+
     async def create_output_parameter(
         self,
         workflow_id: str,
@@ -1231,7 +1297,7 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
-    async def create_workflow_run_output_parameter(
+    async def create_or_update_workflow_run_output_parameter(
         self,
         workflow_run_id: str,
         output_parameter_id: str,
@@ -1239,6 +1305,24 @@ class AgentDB:
     ) -> WorkflowRunOutputParameter:
         try:
             async with self.Session() as session:
+                # check if the workflow run output parameter already exists
+                # if it does, update the value
+                if workflow_run_output_parameter := (
+                    await session.scalars(
+                        select(WorkflowRunOutputParameterModel)
+                        .filter_by(workflow_run_id=workflow_run_id)
+                        .filter_by(output_parameter_id=output_parameter_id)
+                    )
+                ).first():
+                    LOG.info(
+                        f"Updating existing workflow run output parameter with {workflow_run_output_parameter.workflow_run_id} - {workflow_run_output_parameter.output_parameter_id}"
+                    )
+                    workflow_run_output_parameter.value = value
+                    await session.commit()
+                    await session.refresh(workflow_run_output_parameter)
+                    return convert_to_workflow_run_output_parameter(workflow_run_output_parameter, self.debug_enabled)
+
+                # if it does not exist, create a new one
                 workflow_run_output_parameter = WorkflowRunOutputParameterModel(
                     workflow_run_id=workflow_run_id,
                     output_parameter_id=output_parameter_id,
@@ -1249,6 +1333,33 @@ class AgentDB:
                 await session.refresh(workflow_run_output_parameter)
                 return convert_to_workflow_run_output_parameter(workflow_run_output_parameter, self.debug_enabled)
 
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def update_workflow_run_output_parameter(
+        self,
+        workflow_run_id: str,
+        output_parameter_id: str,
+        value: dict[str, Any] | list | str | None,
+    ) -> WorkflowRunOutputParameter:
+        try:
+            async with self.Session() as session:
+                workflow_run_output_parameter = (
+                    await session.scalars(
+                        select(WorkflowRunOutputParameterModel)
+                        .filter_by(workflow_run_id=workflow_run_id)
+                        .filter_by(output_parameter_id=output_parameter_id)
+                    )
+                ).first()
+                if not workflow_run_output_parameter:
+                    raise NotFoundError(
+                        f"WorkflowRunOutputParameter not found for {workflow_run_id} and {output_parameter_id}"
+                    )
+                workflow_run_output_parameter.value = value
+                await session.commit()
+                await session.refresh(workflow_run_output_parameter)
+                return convert_to_workflow_run_output_parameter(workflow_run_output_parameter, self.debug_enabled)
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -1386,6 +1497,7 @@ class AgentDB:
         self,
         organization_id: str,
         user_prompt: str,
+        user_prompt_hash: str,
         url: str | None = None,
         navigation_goal: str | None = None,
         navigation_payload: dict[str, Any] | None = None,
@@ -1395,11 +1507,13 @@ class AgentDB:
         llm: str | None = None,
         llm_prompt: str | None = None,
         llm_response: str | None = None,
+        source_task_generation_id: str | None = None,
     ) -> TaskGeneration:
         async with self.Session() as session:
             new_task_generation = TaskGenerationModel(
                 organization_id=organization_id,
                 user_prompt=user_prompt,
+                user_prompt_hash=user_prompt_hash,
                 url=url,
                 navigation_goal=navigation_goal,
                 navigation_payload=navigation_payload,
@@ -1409,8 +1523,51 @@ class AgentDB:
                 llm_prompt=llm_prompt,
                 llm_response=llm_response,
                 suggested_title=suggested_title,
+                source_task_generation_id=source_task_generation_id,
             )
             session.add(new_task_generation)
             await session.commit()
             await session.refresh(new_task_generation)
             return TaskGeneration.model_validate(new_task_generation)
+
+    async def get_task_generation_by_prompt_hash(
+        self,
+        user_prompt_hash: str,
+        query_window_hours: int = settings.PROMPT_CACHE_WINDOW_HOURS,
+    ) -> TaskGeneration | None:
+        before_time = datetime.utcnow() - timedelta(hours=query_window_hours)
+        async with self.Session() as session:
+            query = (
+                select(TaskGenerationModel)
+                .filter_by(user_prompt_hash=user_prompt_hash)
+                .filter(TaskGenerationModel.llm.is_not(None))
+                .filter(TaskGenerationModel.created_at > before_time)
+            )
+            task_generation = (await session.scalars(query)).first()
+            if not task_generation:
+                return None
+            return TaskGeneration.model_validate(task_generation)
+
+    async def get_totp_codes(
+        self,
+        organization_id: str,
+        totp_identifier: str,
+        valid_lifespan_minutes: int = settings.TOTP_LIFESPAN_MINUTES,
+    ) -> list[TOTPCode]:
+        """
+        1. filter by:
+        - organization_id
+        - totp_identifier
+        2. make sure created_at is within the valid lifespan
+        3. sort by created_at desc
+        """
+        async with self.Session() as session:
+            query = (
+                select(TOTPCodeModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(totp_identifier=totp_identifier)
+                .filter(TOTPCodeModel.created_at > datetime.utcnow() - timedelta(minutes=valid_lifespan_minutes))
+                .order_by(TOTPCodeModel.created_at.desc())
+            )
+            totp_code = (await session.scalars(query)).all()
+            return [TOTPCode.model_validate(totp_code) for totp_code in totp_code]

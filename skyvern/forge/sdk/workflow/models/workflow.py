@@ -15,6 +15,7 @@ class WorkflowRequestBody(BaseModel):
     proxy_location: ProxyLocation | None = None
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
+    totp_identifier: str | None = None
 
 
 class RunWorkflowResponse(BaseModel):
@@ -51,6 +52,8 @@ class Workflow(BaseModel):
     proxy_location: ProxyLocation | None = None
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    persist_browser_session: bool = False
 
     created_at: datetime
     modified_at: datetime
@@ -59,10 +62,22 @@ class Workflow(BaseModel):
 
 class WorkflowRunStatus(StrEnum):
     created = "created"
+    queued = "queued"
     running = "running"
     failed = "failed"
     terminated = "terminated"
+    canceled = "canceled"
+    timed_out = "timed_out"
     completed = "completed"
+
+    def is_final(self) -> bool:
+        return self in [
+            WorkflowRunStatus.failed,
+            WorkflowRunStatus.terminated,
+            WorkflowRunStatus.canceled,
+            WorkflowRunStatus.timed_out,
+            WorkflowRunStatus.completed,
+        ]
 
 
 class WorkflowRun(BaseModel):
@@ -74,6 +89,7 @@ class WorkflowRun(BaseModel):
     proxy_location: ProxyLocation | None = None
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
+    totp_identifier: str | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -100,6 +116,7 @@ class WorkflowRunStatusResponse(BaseModel):
     proxy_location: ProxyLocation | None = None
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
+    totp_identifier: str | None = None
     created_at: datetime
     modified_at: datetime
     parameters: dict[str, Any]

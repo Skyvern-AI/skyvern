@@ -52,7 +52,7 @@
     {
       "name": "Book a demo",
       "icon": "calendar",
-      "url": "https://meetings.hubspot.com/suchintan"
+      "url": "https://meetings.hubspot.com/skyvern/demo"
     }
   ],
   "navigation": [
@@ -60,7 +60,8 @@
       "group": "Getting Started",
       "pages": [
         "introduction",
-        "getting-started/skyvern-in-action"
+        "getting-started/skyvern-in-action",
+        "getting-started/prompting-guide"
       ]
     },
     {
@@ -78,6 +79,7 @@
       "pages": [
         "workflows/introduction",
         "workflows/creating-workflows",
+        "workflows/getting-workflows",
         "workflows/running-workflows",
         "workflows/workflow-blocks"
       ]
@@ -91,6 +93,7 @@
       ]
     }
   ],
+  "feedback.thumbsRating": true,
   "footerSocials": {
     "twitter": "https://twitter.com/skyvernai",
     "github": "https://github.com/skyvern-ai/skyvern/",

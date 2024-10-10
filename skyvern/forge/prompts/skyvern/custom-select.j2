@@ -1,31 +1,52 @@
-You are doing a select action on HTML page. Help to click the best match element for the target value among HTML elements based on the context.
-You can find the match element based on the following attempts:
-  1. Find the semantically most similar element
-  2. Reconsider if target value is reasonable based on context and the options in the HTML elements. If it doesn't make sense, you can tweak the target value into a reasonable one.
-  3. Find the element, which semantically is the superset of target value. Like "Others", "None of them matched"
-  4. If the field is required, don't leave it blank and don't choose the semantical placeholder value, like "Please select", "-", "Select...".
+You are performing a {{ "multi-level selection" if select_history else "selection" }} action on an HTML page. Assist the user in selecting the most appropriate option to advance toward their goal, considering the context, user details, and the DOM elements provided in the list.
+
+You can identify the matching element based on the following guidelines:
+  1. Select the most suitable element based on the user goal, user details, and the context.
+  2. If no option is a perfect match, and there is a fallback option such as "Others" or "None of the above" in the DOM elements, you can consider it a match.
+  3. If a field is required, do not leave it blank.
+  4. If a field is required, do not select a placeholder value, such as "Please select", "-", or "Select...".
+  5. Exclude loading indicators like "loading more results" as valid options.{% if select_history %}
+  6. The selection history displays the previously selected values for the multi-level selection. Continue to complete the entire selection process.{% endif %}
 
 MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
 Each interactable element is tagged with an ID.
 
 Reply in JSON format with the following keys:
 {
-    "reasoning": str, // The reasoning behind the action. Be specific, referencing target value and element ids in your reasoning. Mention why you chose the element id. Keep the reasoning short and to the point.
+    "reasoning": str, // The reasoning behind the action. Be specific, referencing the value and the element id in your reasoning. Mention why you chose the element id. Keep the reasoning short and to the point.
     "confidence_float": float, // The confidence of the action. Pick a number between 0.0 and 1.0. 0.0 means no confidence, 1.0 means full confidence
     "id": str, // The id of the element to take action on. The id has to be one from the elements list
+    "value": str, // The value to select.{% if target_value %}
+    "relevant": bool, // True if the value you select is relevant to the target value, otherwise False.{% endif %}
 }
 
 Context:
 ```
-{{ context_reasoning }}
+Select an option for "{{ field_information }}". It's {{ "a required" if required_field else "an optional" }} field.
 ```
-
+{% if target_value %}
 Target value:
 ```
 {{ target_value }}
+```
+{% endif %}
+User goal:
+```
+{{ navigation_goal }}
+```
+
+User details:
+```
+{{ navigation_payload_str }}
 ```
 
 HTML elements:
 ```
 {{ elements }}
 ```
+{% if select_history %}
+Select History:
+```
+{{ select_history }}
+```
+{% endif %}

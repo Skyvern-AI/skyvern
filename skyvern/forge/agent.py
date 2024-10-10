@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import random
+import string
 from asyncio.exceptions import CancelledError
 from datetime import datetime
 from typing import Any, Tuple
@@ -30,7 +32,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.files import get_number_of_files_in_directory, get_path_for_workflow_download_directory
+from skyvern.forge.sdk.api.files import get_path_for_workflow_download_directory, list_files_in_directory, rename_file
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
@@ -44,11 +46,12 @@ from skyvern.webeye.actions.actions import (
     Action,
     ActionType,
     CompleteAction,
+    DecisiveAction,
     UserDefinedError,
     WebAction,
     parse_actions,
 )
-from skyvern.webeye.actions.handler import ActionHandler, poll_verification_code
+from skyvern.webeye.actions.handler import ActionHandler, handle_complete_action, poll_verification_code
 from skyvern.webeye.actions.models import AgentStepOutput, DetailedAgentStepOutput
 from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.browser_factory import BrowserState
@@ -122,7 +125,8 @@ class ForgeAgent:
             url=task_url,
             title=task_block.title,
             webhook_callback_url=None,
-            totp_verification_url=None,
+            totp_verification_url=task_block.totp_verification_url,
+            totp_identifier=task_block.totp_identifier,
             navigation_goal=task_block.navigation_goal,
             data_extraction_goal=task_block.data_extraction_goal,
             navigation_payload=navigation_payload,
@@ -178,6 +182,7 @@ class ForgeAgent:
             title=task_request.title,
             webhook_callback_url=task_request.webhook_callback_url,
             totp_verification_url=task_request.totp_verification_url,
+            totp_identifier=task_request.totp_identifier,
             navigation_goal=task_request.navigation_goal,
             data_extraction_goal=task_request.data_extraction_goal,
             navigation_payload=task_request.navigation_payload,
@@ -191,6 +196,7 @@ class ForgeAgent:
             task_id=task.task_id,
             url=task.url,
             proxy_location=task.proxy_location,
+            organization_id=organization_id,
         )
         return task
 
@@ -206,9 +212,7 @@ class ForgeAgent:
         api_key: str | None = None,
         workflow_run: WorkflowRun | None = None,
         close_browser_on_completion: bool = True,
-        # If complete_on_download is True and there is a workflow run, the task will be marked as completed
-        # if a download happens during the step execution.
-        complete_on_download: bool = False,
+        task_block: TaskBlock | None = None,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
         refreshed_task = await app.DATABASE.get_task(task_id=task.task_id, organization_id=organization.organization_id)
         if refreshed_task:
@@ -244,10 +248,10 @@ class ForgeAgent:
             )
         next_step: Step | None = None
         detailed_output: DetailedAgentStepOutput | None = None
-        num_files_before = 0
+        list_files_before: list[str] = []
         try:
             if task.workflow_run_id:
-                num_files_before = get_number_of_files_in_directory(
+                list_files_before = list_files_in_directory(
                     get_path_for_workflow_download_directory(task.workflow_run_id)
                 )
             # Check some conditions before executing the step, throw an exception if the step can't be executed
@@ -262,20 +266,30 @@ class ForgeAgent:
             if page := await browser_state.get_working_page():
                 self.register_async_operations(organization, task, page)
 
-            step, detailed_output = await self.agent_step(task, step, browser_state, organization=organization)
+            step, detailed_output = await self.agent_step(
+                task, step, browser_state, organization=organization, task_block=task_block
+            )
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)
             retry = False
 
-            if complete_on_download and task.workflow_run_id:
-                num_files_after = get_number_of_files_in_directory(
-                    get_path_for_workflow_download_directory(task.workflow_run_id)
-                )
-                if num_files_after > num_files_before:
+            if task_block and task_block.complete_on_download and task.workflow_run_id:
+                workflow_download_directory = get_path_for_workflow_download_directory(task.workflow_run_id)
+                list_files_after = list_files_in_directory(workflow_download_directory)
+                if len(list_files_after) > len(list_files_before):
+                    files_to_rename = list(set(list_files_after) - set(list_files_before))
+                    for file in files_to_rename:
+                        random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+                        random_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
+                        if task_block.download_suffix:
+                            random_file_name = f"{random_file_name}-{task_block.download_suffix}"
+                        rename_file(os.path.join(workflow_download_directory, file), random_file_name)
+
                     LOG.info(
                         "Task marked as completed due to download",
                         task_id=task.task_id,
-                        num_files_before=num_files_before,
-                        num_files_after=num_files_after,
+                        num_files_before=len(list_files_before),
+                        num_files_after=len(list_files_after),
+                        new_files=files_to_rename,
                     )
                     last_step = await self.update_step(step, is_last=True)
                     completed_task = await self.update_task(
@@ -349,7 +363,7 @@ class ForgeAgent:
                     next_step,
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
-                    complete_on_download=complete_on_download,
+                    task_block=task_block,
                 )
             elif SettingsManager.get_settings().execute_all_steps() and next_step:
                 return await self.execute_step(
@@ -358,7 +372,7 @@ class ForgeAgent:
                     next_step,
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
-                    complete_on_download=complete_on_download,
+                    task_block=task_block,
                 )
             else:
                 LOG.info(
@@ -381,7 +395,7 @@ class ForgeAgent:
             raise
         except StepTerminationError as e:
             LOG.warning(
-                "Step cannot be executed. Task failed.",
+                "Step cannot be executed, marking task as failed",
                 task_id=task.task_id,
                 step_id=step.step_id,
                 exc_info=True,
@@ -441,7 +455,7 @@ class ForgeAgent:
             return step, detailed_output, None
         except Exception as e:
             LOG.exception(
-                "Got an unexpected exception in step, fail the task",
+                "Got an unexpected exception in step, marking task as failed",
                 task_id=task.task_id,
                 step_id=step.step_id,
             )
@@ -503,6 +517,7 @@ class ForgeAgent:
         step: Step,
         browser_state: BrowserState,
         organization: Organization | None = None,
+        task_block: TaskBlock | None = None,
     ) -> tuple[Step, DetailedAgentStepOutput]:
         detailed_agent_step_output = DetailedAgentStepOutput(
             scraped_page=None,
@@ -762,6 +777,51 @@ class ForgeAgent:
                 step_retry=step.retry_index,
                 action_results=action_results,
             )
+
+            # Check if Skyvern already returned a complete action, if so, don't run user goal check
+            has_decisive_action = False
+            if detailed_agent_step_output and detailed_agent_step_output.actions_and_results:
+                for action, results in detailed_agent_step_output.actions_and_results:
+                    if isinstance(action, DecisiveAction):
+                        has_decisive_action = True
+                        break
+
+            task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
+            if (
+                not has_decisive_action
+                and not task_completes_on_download
+                and app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                    "CHECK_USER_GOAL_SUCCESS_EVERY_STEP",
+                    task.workflow_run_id or task.task_id,
+                    properties={
+                        "organization_id": task.organization_id,
+                        "organization_created_at": str(organization.created_at) if organization else None,
+                    },
+                )
+            ):
+                LOG.info("Checking if user goal is achieved after re-scraping the page")
+                # Check if navigation goal is achieved after re-scraping the page
+                new_scraped_page = await self._scrape_with_type(
+                    task=task,
+                    step=step,
+                    browser_state=browser_state,
+                    scrape_type=ScrapeType.NORMAL,
+                    organization=organization,
+                )
+                if new_scraped_page is None:
+                    LOG.warning("Failed to scrape the page before checking user goal success, skipping check...")
+                else:
+                    working_page = await browser_state.get_working_page()
+                    result_tuple = await self.check_user_goal_success(
+                        page=working_page,
+                        scraped_page=new_scraped_page,
+                        task=task,
+                        step=step,
+                    )
+                    if result_tuple is not None:
+                        complete_action, action_results = result_tuple
+                        detailed_agent_step_output.actions_and_results.append((complete_action, action_results))
+                        await self.record_artifacts_after_action(task, step, browser_state)
             # If no action errors return the agent state and output
             completed_step = await self.update_step(
                 step=step,
@@ -799,6 +859,49 @@ class ForgeAgent:
                 output=detailed_agent_step_output.to_agent_step_output(),
             )
             return failed_step, detailed_agent_step_output.get_clean_detailed_output()
+
+    @staticmethod
+    async def check_user_goal_success(
+        page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+    ) -> tuple[CompleteAction, list[ActionResult]] | None:
+        try:
+            verification_prompt = prompt_engine.load_prompt(
+                "check-user-goal",
+                navigation_goal=task.navigation_goal,
+                navigation_payload=task.navigation_payload,
+                elements=scraped_page.build_element_tree(ElementTreeFormat.HTML),
+            )
+            screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=page.url)
+
+            verification_llm_api_handler = app.SECONDARY_LLM_API_HANDLER
+
+            verification_response = await verification_llm_api_handler(
+                prompt=verification_prompt, step=step, screenshots=screenshots
+            )
+            if "user_goal_achieved" not in verification_response or "reasoning" not in verification_response:
+                LOG.error(
+                    "Invalid LLM response for user goal success verification, skipping verification",
+                    verification_response=verification_response,
+                )
+                return None
+
+            user_goal_achieved: bool = verification_response["user_goal_achieved"]
+            complete_action = CompleteAction(
+                reasoning=verification_response["reasoning"],
+                data_extraction_goal=task.data_extraction_goal,
+            )
+            # We don't want to return a complete action if the user goal is not achieved since we're checking at every step
+            if not user_goal_achieved:
+                return None
+
+            LOG.info("User goal achieved, executing complete action")
+            action_results = await handle_complete_action(complete_action, page, scraped_page, task, step)
+
+            return complete_action, action_results
+
+        except Exception:
+            LOG.error("LLM verification failed for complete action, skipping LLM verification", exc_info=True)
+            return None
 
     async def record_artifacts_after_action(self, task: Task, step: Step, browser_state: BrowserState) -> None:
         working_page = await browser_state.get_working_page()
@@ -982,7 +1085,7 @@ class ForgeAgent:
             task,
             browser_state,
             element_tree_in_prompt,
-            verification_code_check=bool(task.totp_verification_url),
+            verification_code_check=bool(task.totp_verification_url or task.totp_identifier),
             expire_verification_code=True,
         )
 
@@ -1054,7 +1157,7 @@ class ForgeAgent:
         final_navigation_payload = task.navigation_payload
         current_context = skyvern_context.ensure_context()
         verification_code = current_context.totp_codes.get(task.task_id)
-        if task.totp_verification_url and verification_code:
+        if (task.totp_verification_url or task.totp_identifier) and verification_code:
             if (
                 isinstance(final_navigation_payload, dict)
                 and SPECIAL_FIELD_VERIFICATION_CODE not in final_navigation_payload
@@ -1597,10 +1700,13 @@ class ForgeAgent:
         json_response: dict[str, Any],
     ) -> dict[str, Any]:
         need_verification_code = json_response.get("need_verification_code")
-        if need_verification_code and task.totp_verification_url and task.organization_id:
+        if need_verification_code and (task.totp_verification_url or task.totp_identifier) and task.organization_id:
             LOG.info("Need verification code", step_id=step.step_id)
             verification_code = await poll_verification_code(
-                task.task_id, task.organization_id, url=task.totp_verification_url
+                task.task_id,
+                task.organization_id,
+                totp_verification_url=task.totp_verification_url,
+                totp_identifier=task.totp_identifier,
             )
             current_context = skyvern_context.ensure_context()
             current_context.totp_codes[task.task_id] = verification_code
@@ -1611,7 +1717,7 @@ class ForgeAgent:
                 browser_state,
                 element_tree_in_prompt,
                 verification_code_check=False,
-                expire_verification_code=False,
+                expire_verification_code=True,
             )
             return await app.LLM_API_HANDLER(
                 prompt=extract_action_prompt,

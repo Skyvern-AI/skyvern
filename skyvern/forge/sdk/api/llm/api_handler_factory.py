@@ -5,7 +5,6 @@ from asyncio import CancelledError
 from typing import Any
 
 import litellm
-import openai
 import structlog
 
 from skyvern.forge import app
@@ -107,8 +106,15 @@ class LLMAPIHandlerFactory:
                 LOG.info("Calling LLM API", llm_key=llm_key, model=llm_config.model_name)
                 response = await router.acompletion(model=main_model_group, messages=messages, **parameters)
                 LOG.info("LLM API call successful", llm_key=llm_key, model=llm_config.model_name)
-            except openai.OpenAIError as e:
-                raise LLMProviderError(llm_key) from e
+            except litellm.exceptions.APIError as e:
+                raise LLMProviderErrorRetryableTask(llm_key) from e
+            except ValueError as e:
+                LOG.exception(
+                    "LLM token limit exceeded",
+                    llm_key=llm_key,
+                    model=main_model_group,
+                )
+                raise LLMProviderErrorRetryableTask(llm_key) from e
             except Exception as e:
                 LOG.exception(
                     "LLM request failed unexpectedly",

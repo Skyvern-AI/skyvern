@@ -1,10 +1,25 @@
-import { Handle, NodeProps, Position } from "@xyflow/react";
-import type { CodeBlockNode } from "./types";
 import { Label } from "@/components/ui/label";
-import { CodeIcon, DotsHorizontalIcon } from "@radix-ui/react-icons";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
+import { CodeIcon } from "@radix-ui/react-icons";
+import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
+import { useState } from "react";
+import { EditableNodeTitle } from "../components/EditableNodeTitle";
+import { NodeActionMenu } from "../NodeActionMenu";
+import type { CodeBlockNode } from "./types";
 
-function CodeBlockNode({ data }: NodeProps<CodeBlockNode>) {
+function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
+  const { updateNodeData } = useReactFlow();
+  const deleteNodeCallback = useDeleteNodeCallback();
+  const [label, setLabel] = useNodeLabelChangeHandler({
+    id,
+    initialValue: data.label,
+  });
+  const [inputs, setInputs] = useState({
+    code: data.code,
+  });
+
   return (
     <div>
       <Handle
@@ -26,22 +41,33 @@ function CodeBlockNode({ data }: NodeProps<CodeBlockNode>) {
               <CodeIcon className="h-6 w-6" />
             </div>
             <div className="flex flex-col gap-1">
-              <span className="max-w-64 truncate text-base">{data.label}</span>
-              <span className="text-xs text-slate-400">Task Block</span>
+              <EditableNodeTitle
+                value={label}
+                editable={data.editable}
+                onChange={setLabel}
+                titleClassName="text-base"
+                inputClassName="text-base"
+              />
+              <span className="text-xs text-slate-400">Code Block</span>
             </div>
           </div>
-          <div>
-            <DotsHorizontalIcon className="h-6 w-6" />
-          </div>
+          <NodeActionMenu
+            onDelete={() => {
+              deleteNodeCallback(id);
+            }}
+          />
         </div>
         <div className="space-y-1">
           <Label className="text-xs text-slate-300">Code Input</Label>
           <CodeEditor
             language="python"
-            value={data.code}
-            onChange={() => {
-              if (!data.editable) return;
-              // TODO
+            value={inputs.code}
+            onChange={(value) => {
+              if (!data.editable) {
+                return;
+              }
+              setInputs({ ...inputs, code: value });
+              updateNodeData(id, { code: value });
             }}
             className="nopan"
           />

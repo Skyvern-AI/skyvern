@@ -3,7 +3,7 @@ import GitHubButton from "react-github-btn";
 import { Link, useMatch } from "react-router-dom";
 
 function Header() {
-  const match = useMatch("/workflows/:workflowPermanentId");
+  const match = useMatch("/workflows/:workflowPermanentId/edit");
 
   if (match) {
     return null;

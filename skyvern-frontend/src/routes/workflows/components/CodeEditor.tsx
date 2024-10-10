@@ -1,4 +1,4 @@
-import CodeMirror from "@uiw/react-codemirror";
+import CodeMirror, { EditorView } from "@uiw/react-codemirror";
 import { json } from "@codemirror/lang-json";
 import { python } from "@codemirror/lang-python";
 import { tokyoNightStorm } from "@uiw/codemirror-theme-tokyo-night-storm";
@@ -10,6 +10,7 @@ type Props = {
   language: "python" | "json";
   disabled?: boolean;
   minHeight?: string;
+  maxHeight?: string;
   className?: string;
   fontSize?: number;
 };
@@ -18,11 +19,15 @@ function CodeEditor({
   value,
   onChange,
   minHeight,
+  maxHeight,
   language,
   className,
   fontSize = 8,
 }: Props) {
-  const extensions = language === "json" ? [json()] : [python()];
+  const extensions =
+    language === "json"
+      ? [json(), EditorView.lineWrapping]
+      : [python(), EditorView.lineWrapping];
   return (
     <CodeMirror
       value={value}
@@ -30,6 +35,7 @@ function CodeEditor({
       extensions={extensions}
       theme={tokyoNightStorm}
       minHeight={minHeight}
+      maxHeight={maxHeight}
       className={cn("cursor-auto", className)}
       style={{
         fontSize: fontSize,

@@ -16,18 +16,20 @@ class SkyvernClient:
         self.base_url = base_url
         self.credentials = credentials
 
-    def generate_curl_params(self, task_request_body: TaskRequest) -> PreparedRequest:
+    def generate_curl_params(self, task_request_body: TaskRequest, max_steps: int | None = None) -> PreparedRequest:
         url = f"{self.base_url}/tasks"
         payload = task_request_body.model_dump()
         headers = {
             "Content-Type": "application/json",
             "x-api-key": self.credentials,
         }
+        if max_steps is not None:
+            headers["x-max-steps-override"] = str(max_steps)
 
         return url, payload, headers
 
-    def create_task(self, task_request_body: TaskRequest) -> str | None:
-        url, payload, headers = self.generate_curl_params(task_request_body)
+    def create_task(self, task_request_body: TaskRequest, max_steps: int | None = None) -> str | None:
+        url, payload, headers = self.generate_curl_params(task_request_body, max_steps=max_steps)
 
         response = requests.post(url, headers=headers, data=json.dumps(payload))
         if "task_id" not in response.json():

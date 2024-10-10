@@ -1,3 +1,4 @@
+import hashlib
 import os
 import tempfile
 import zipfile
@@ -74,15 +75,48 @@ def zip_files(files_path: str, zip_file_path: str) -> str:
     return zip_file_path
 
 
+def unzip_files(zip_file_path: str, output_dir: str) -> None:
+    with zipfile.ZipFile(zip_file_path, "r") as zip_ref:
+        zip_ref.extractall(output_dir)
+
+
 def get_path_for_workflow_download_directory(workflow_run_id: str) -> Path:
     return Path(f"{REPO_ROOT_DIR}/downloads/{workflow_run_id}/")
 
 
-def get_number_of_files_in_directory(directory: Path, recursive: bool = False) -> int:
-    count = 0
+def list_files_in_directory(directory: Path, recursive: bool = False) -> list[str]:
+    listed_files: list[str] = []
     for root, dirs, files in os.walk(directory):
+        listed_files.extend([os.path.join(root, file) for file in files])
         if not recursive:
-            count += len(files)
             break
-        count += len(files)
-    return count
+
+    return listed_files
+
+
+def get_number_of_files_in_directory(directory: Path, recursive: bool = False) -> int:
+    return len(list_files_in_directory(directory, recursive))
+
+
+def sanitize_filename(filename: str) -> str:
+    return "".join(c for c in filename if c.isalnum() or c in ["-", "_", "."])
+
+
+def rename_file(file_path: str, new_file_name: str) -> str:
+    try:
+        new_file_name = sanitize_filename(new_file_name)
+        new_file_path = os.path.join(os.path.dirname(file_path), new_file_name)
+        os.rename(file_path, new_file_path)
+        return new_file_path
+    except Exception:
+        LOG.exception(f"Failed to rename file {file_path} to {new_file_name}")
+        return file_path
+
+
+def calculate_sha256(file_path: str) -> str:
+    """Helper function to calculate SHA256 hash of a file."""
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()

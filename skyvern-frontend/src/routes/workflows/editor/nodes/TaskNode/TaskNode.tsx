@@ -1,50 +1,130 @@
-import { Handle, NodeProps, Position } from "@xyflow/react";
-import { useState } from "react";
-import { DotsHorizontalIcon, ListBulletIcon } from "@radix-ui/react-icons";
-import { TaskNodeDisplayModeSwitch } from "./TaskNodeDisplayModeSwitch";
-import type { TaskNodeDisplayMode } from "./types";
-import type { TaskNode } from "./types";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
-import { Label } from "@/components/ui/label";
+import { HelpTooltip } from "@/components/HelpTooltip";
 import {
   Accordion,
   AccordionContent,
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
-import { DataSchema } from "../../../components/DataSchema";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { TaskNodeErrorMapping } from "./TaskNodeErrorMapping";
+import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
+import { ListBulletIcon } from "@radix-ui/react-icons";
+import {
+  Handle,
+  NodeProps,
+  Position,
+  useEdges,
+  useNodes,
+  useReactFlow,
+} from "@xyflow/react";
+import { useState } from "react";
+import { AppNode } from "..";
+import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
+import { EditableNodeTitle } from "../components/EditableNodeTitle";
+import { NodeActionMenu } from "../NodeActionMenu";
+import { TaskNodeDisplayModeSwitch } from "./TaskNodeDisplayModeSwitch";
+import { TaskNodeParametersPanel } from "./TaskNodeParametersPanel";
+import {
+  dataSchemaExampleValue,
+  errorMappingExampleValue,
+  fieldPlaceholders,
+  helpTooltipContent,
+  type TaskNode,
+  type TaskNodeDisplayMode,
+} from "./types";
+import { useParams } from "react-router-dom";
 
-function TaskNode({ data }: NodeProps<TaskNode>) {
-  const [displayMode, setDisplayMode] = useState<TaskNodeDisplayMode>("basic");
+function getLocalStorageKey(workflowPermanentId: string, label: string) {
+  return `skyvern-task-block-${workflowPermanentId}-${label}`;
+}
+
+function TaskNode({ id, data }: NodeProps<TaskNode>) {
+  const { updateNodeData } = useReactFlow();
+  const { workflowPermanentId } = useParams();
   const { editable } = data;
+  const deleteNodeCallback = useDeleteNodeCallback();
+  const nodes = useNodes<AppNode>();
+  const edges = useEdges();
+  const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
+  const [label, setLabel] = useNodeLabelChangeHandler({
+    id,
+    initialValue: data.label,
+  });
+
+  const [displayMode, setDisplayMode] = useState<TaskNodeDisplayMode>(
+    workflowPermanentId &&
+      localStorage.getItem(getLocalStorageKey(workflowPermanentId, label))
+      ? (localStorage.getItem(
+          getLocalStorageKey(workflowPermanentId, label),
+        ) as TaskNodeDisplayMode)
+      : "basic",
+  );
+
+  const [inputs, setInputs] = useState({
+    url: data.url,
+    navigationGoal: data.navigationGoal,
+    dataExtractionGoal: data.dataExtractionGoal,
+    dataSchema: data.dataSchema,
+    maxRetries: data.maxRetries,
+    maxStepsOverride: data.maxStepsOverride,
+    allowDownloads: data.allowDownloads,
+    downloadSuffix: data.downloadSuffix,
+    errorCodeMapping: data.errorCodeMapping,
+    totpVerificationUrl: data.totpVerificationUrl,
+    totpIdentifier: data.totpIdentifier,
+  });
+
+  function handleChange(key: string, value: unknown) {
+    if (!editable) {
+      return;
+    }
+    setInputs({ ...inputs, [key]: value });
+    updateNodeData(id, { [key]: value });
+  }
 
   const basicContent = (
     <>
       <div className="space-y-1">
         <Label className="text-xs text-slate-300">URL</Label>
         <AutoResizingTextarea
-          value={data.url}
-          className="nopan"
-          onChange={() => {
-            if (!editable) return;
-            // TODO
+          value={inputs.url}
+          className="nopan text-xs"
+          name="url"
+          onChange={(event) => {
+            if (!editable) {
+              return;
+            }
+            handleChange("url", event.target.value);
           }}
-          placeholder="https://"
+          placeholder={fieldPlaceholders["url"]}
         />
       </div>
       <div className="space-y-1">
         <Label className="text-xs text-slate-300">Goal</Label>
         <AutoResizingTextarea
-          onChange={() => {
-            if (!editable) return;
-            // TODO
+          onChange={(event) => {
+            if (!editable) {
+              return;
+            }
+            handleChange("navigationGoal", event.target.value);
           }}
-          value={data.navigationGoal}
-          placeholder="What are you looking to do?"
-          className="nopan"
+          value={inputs.navigationGoal}
+          placeholder={fieldPlaceholders["navigationGoal"]}
+          className="nopan text-xs"
+        />
+      </div>
+      <div className="space-y-1">
+        <TaskNodeParametersPanel
+          availableOutputParameters={outputParameterKeys}
+          parameters={data.parameterKeys}
+          onParametersChange={(parameterKeys) => {
+            updateNodeData(id, { parameterKeys });
+          }}
         />
       </div>
     </>
@@ -52,43 +132,67 @@ function TaskNode({ data }: NodeProps<TaskNode>) {
 
   const advancedContent = (
     <>
-      <Accordion
-        type="multiple"
-        defaultValue={["content", "extraction", "limits"]}
-      >
+      <Accordion type="multiple" defaultValue={["content"]}>
         <AccordionItem value="content">
-          <AccordionTrigger>Content</AccordionTrigger>
+          <AccordionTrigger>
+            <div className="flex w-full items-center justify-between">
+              <div>Content</div>
+              <div>
+                <HelpTooltip content={helpTooltipContent["base"]} />
+              </div>
+            </div>
+          </AccordionTrigger>
           <AccordionContent className="pl-[1.5rem] pr-1">
             <div className="space-y-4">
               <div className="space-y-1">
                 <Label className="text-xs text-slate-300">URL</Label>
                 <AutoResizingTextarea
-                  onChange={() => {
-                    if (!editable) return;
-                    // TODO
+                  onChange={(event) => {
+                    if (!editable) {
+                      return;
+                    }
+                    handleChange("url", event.target.value);
                   }}
-                  value={data.url}
-                  placeholder="https://"
-                  className="nopan"
+                  value={inputs.url}
+                  placeholder={fieldPlaceholders["url"]}
+                  className="nopan text-xs"
                 />
               </div>
               <div className="space-y-1">
                 <Label className="text-xs text-slate-300">Goal</Label>
                 <AutoResizingTextarea
-                  onChange={() => {
-                    if (!editable) return;
-                    // TODO
+                  onChange={(event) => {
+                    if (!editable) {
+                      return;
+                    }
+                    handleChange("navigationGoal", event.target.value);
                   }}
-                  value={data.navigationGoal}
-                  placeholder="What are you looking to do?"
-                  className="nopan"
+                  value={inputs.navigationGoal}
+                  placeholder={fieldPlaceholders["navigationGoal"]}
+                  className="nopan text-xs"
+                />
+              </div>
+              <div className="space-y-1">
+                <TaskNodeParametersPanel
+                  availableOutputParameters={outputParameterKeys}
+                  parameters={data.parameterKeys}
+                  onParametersChange={(parameterKeys) => {
+                    updateNodeData(id, { parameterKeys });
+                  }}
                 />
               </div>
             </div>
           </AccordionContent>
         </AccordionItem>
         <AccordionItem value="extraction">
-          <AccordionTrigger>Extraction</AccordionTrigger>
+          <AccordionTrigger>
+            <div className="flex w-full items-center justify-between">
+              <div>Extraction</div>
+              <div>
+                <HelpTooltip content={helpTooltipContent["extraction"]} />
+              </div>
+            </div>
+          </AccordionTrigger>
           <AccordionContent className="pl-[1.5rem] pr-1">
             <div className="space-y-4">
               <div className="space-y-1">
@@ -96,28 +200,64 @@ function TaskNode({ data }: NodeProps<TaskNode>) {
                   Data Extraction Goal
                 </Label>
                 <AutoResizingTextarea
-                  onChange={() => {
-                    if (!editable) return;
-                    // TODO
+                  onChange={(event) => {
+                    if (!editable) {
+                      return;
+                    }
+                    handleChange("dataExtractionGoal", event.target.value);
                   }}
-                  value={data.dataExtractionGoal}
-                  placeholder="What outputs are you looking to get?"
-                  className="nopan"
+                  value={inputs.dataExtractionGoal}
+                  placeholder={fieldPlaceholders["dataExtractionGoal"]}
+                  className="nopan text-xs"
                 />
               </div>
-              <DataSchema
-                value={data.dataSchema}
-                onChange={() => {
-                  if (!editable) return;
-                  // TODO
-                }}
-              />
+              <div className="space-y-2">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">Data Schema</Label>
+                  <Checkbox
+                    checked={inputs.dataSchema !== "null"}
+                    onCheckedChange={(checked) => {
+                      if (!editable) {
+                        return;
+                      }
+                      handleChange(
+                        "dataSchema",
+                        checked
+                          ? JSON.stringify(dataSchemaExampleValue, null, 2)
+                          : "null",
+                      );
+                    }}
+                  />
+                </div>
+                {inputs.dataSchema !== "null" && (
+                  <div>
+                    <CodeEditor
+                      language="json"
+                      value={inputs.dataSchema}
+                      onChange={(value) => {
+                        if (!editable) {
+                          return;
+                        }
+                        handleChange("dataSchema", value);
+                      }}
+                      className="nowheel nopan"
+                    />
+                  </div>
+                )}
+              </div>
             </div>
           </AccordionContent>
         </AccordionItem>
         <AccordionItem value="limits">
-          <AccordionTrigger>Limits</AccordionTrigger>
-          <AccordionContent className="pl-[1.5rem] pr-1">
+          <AccordionTrigger>
+            <div className="flex w-full items-center justify-between">
+              <div>Limits</div>
+              <div>
+                <HelpTooltip content={helpTooltipContent["limits"]} />
+              </div>
+            </div>
+          </AccordionTrigger>
+          <AccordionContent className="pl-[1.5rem] pr-1 pt-1">
             <div className="space-y-4">
               <div className="flex items-center justify-between">
                 <Label className="text-xs font-normal text-slate-300">
@@ -125,12 +265,19 @@ function TaskNode({ data }: NodeProps<TaskNode>) {
                 </Label>
                 <Input
                   type="number"
-                  placeholder="0"
-                  className="nopan w-44"
-                  value={data.maxRetries ?? 0}
-                  onChange={() => {
-                    if (!editable) return;
-                    // TODO
+                  placeholder={fieldPlaceholders["maxRetries"]}
+                  className="nopan w-52 text-xs"
+                  min="0"
+                  value={inputs.maxRetries ?? ""}
+                  onChange={(event) => {
+                    if (!editable) {
+                      return;
+                    }
+                    const value =
+                      event.target.value === ""
+                        ? null
+                        : Number(event.target.value);
+                    handleChange("maxRetries", value);
                   }}
                 />
               </div>
@@ -140,36 +287,136 @@ function TaskNode({ data }: NodeProps<TaskNode>) {
                 </Label>
                 <Input
                   type="number"
-                  placeholder="0"
-                  className="nopan w-44"
-                  value={data.maxStepsOverride ?? 0}
-                  onChange={() => {
-                    if (!editable) return;
-                    // TODO
+                  placeholder={fieldPlaceholders["maxStepsOverride"]}
+                  className="nopan w-52 text-xs"
+                  min="0"
+                  value={inputs.maxStepsOverride ?? ""}
+                  onChange={(event) => {
+                    if (!editable) {
+                      return;
+                    }
+                    const value =
+                      event.target.value === ""
+                        ? null
+                        : Number(event.target.value);
+                    handleChange("maxStepsOverride", value);
                   }}
                 />
               </div>
-              <div className="flex justify-between">
+              <div className="flex items-center justify-between">
                 <Label className="text-xs font-normal text-slate-300">
-                  Allow Downloads
+                  Complete on Download
                 </Label>
-                <div className="w-44">
+                <div className="w-52">
                   <Switch
-                    checked={data.allowDownloads}
-                    onCheckedChange={() => {
-                      if (!editable) return;
-                      // TODO
+                    checked={inputs.allowDownloads}
+                    onCheckedChange={(checked) => {
+                      if (!editable) {
+                        return;
+                      }
+                      handleChange("allowDownloads", checked);
                     }}
                   />
                 </div>
               </div>
-              <TaskNodeErrorMapping
-                value={data.errorCodeMapping}
-                onChange={() => {
-                  if (!editable) return;
-                  // TODO
-                }}
-              />
+              <div className="flex items-center justify-between">
+                <Label className="text-xs font-normal text-slate-300">
+                  File Suffix
+                </Label>
+                <Input
+                  type="text"
+                  placeholder={fieldPlaceholders["downloadSuffix"]}
+                  className="nopan w-52 text-xs"
+                  value={inputs.downloadSuffix ?? ""}
+                  onChange={(event) => {
+                    if (!editable) {
+                      return;
+                    }
+                    handleChange("downloadSuffix", event.target.value);
+                  }}
+                />
+              </div>
+              <div className="space-y-2">
+                <div className="flex gap-2">
+                  <Label className="text-xs font-normal text-slate-300">
+                    Error Messages
+                  </Label>
+                  <Checkbox
+                    checked={inputs.errorCodeMapping !== "null"}
+                    disabled={!editable}
+                    onCheckedChange={(checked) => {
+                      if (!editable) {
+                        return;
+                      }
+                      handleChange(
+                        "errorCodeMapping",
+                        checked
+                          ? JSON.stringify(errorMappingExampleValue, null, 2)
+                          : "null",
+                      );
+                    }}
+                  />
+                </div>
+                {inputs.errorCodeMapping !== "null" && (
+                  <div>
+                    <CodeEditor
+                      language="json"
+                      value={inputs.errorCodeMapping}
+                      onChange={(value) => {
+                        if (!editable) {
+                          return;
+                        }
+                        handleChange("errorCodeMapping", value);
+                      }}
+                      className="nowheel nopan"
+                    />
+                  </div>
+                )}
+              </div>
+            </div>
+          </AccordionContent>
+        </AccordionItem>
+        <AccordionItem value="totp">
+          <AccordionTrigger>
+            <div className="flex w-full items-center justify-between">
+              <div>Two-Factor Authentication</div>
+              <div>
+                <HelpTooltip content={helpTooltipContent["totp"]} />
+              </div>
+            </div>
+          </AccordionTrigger>
+          <AccordionContent className="pl-[1.5rem] pr-1">
+            <div className="space-y-4">
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">
+                  2FA Verification URL
+                </Label>
+                <AutoResizingTextarea
+                  onChange={(event) => {
+                    if (!editable) {
+                      return;
+                    }
+                    handleChange("totpVerificationUrl", event.target.value);
+                  }}
+                  value={inputs.totpVerificationUrl ?? ""}
+                  placeholder={fieldPlaceholders["totpVerificationUrl"]}
+                  className="nopan text-xs"
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">2FA Identifier</Label>
+                <AutoResizingTextarea
+                  onChange={(event) => {
+                    if (!editable) {
+                      return;
+                    }
+                    handleChange("totpIdentifier", event.target.value);
+                  }}
+                  value={inputs.totpIdentifier ?? ""}
+                  placeholder={fieldPlaceholders["totpIdentifier"]}
+                  className="nopan text-xs"
+                />
+              </div>
             </div>
           </AccordionContent>
         </AccordionItem>
@@ -198,18 +445,39 @@ function TaskNode({ data }: NodeProps<TaskNode>) {
               <ListBulletIcon className="h-6 w-6" />
             </div>
             <div className="flex flex-col gap-1">
-              <span className="max-w-64 truncate text-base">{data.label}</span>
+              <EditableNodeTitle
+                value={label}
+                editable={editable}
+                onChange={setLabel}
+                titleClassName="text-base"
+                inputClassName="text-base"
+              />
               <span className="text-xs text-slate-400">Task Block</span>
             </div>
           </div>
-          <div>
-            <DotsHorizontalIcon className="h-6 w-6" />
-          </div>
+          <NodeActionMenu
+            onDelete={() => {
+              deleteNodeCallback(id);
+            }}
+          />
         </div>
-        <TaskNodeDisplayModeSwitch
-          value={displayMode}
-          onChange={setDisplayMode}
-        />
+        <div className="flex items-center justify-between">
+          <TaskNodeDisplayModeSwitch
+            value={displayMode}
+            onChange={(mode) => {
+              setDisplayMode(mode);
+              if (workflowPermanentId) {
+                localStorage.setItem(
+                  getLocalStorageKey(workflowPermanentId, label),
+                  mode,
+                );
+              }
+            }}
+          />
+          {displayMode === "basic" && (
+            <HelpTooltip content={helpTooltipContent["base"]} />
+          )}
+        </div>
         {displayMode === "basic" && basicContent}
         {displayMode === "advanced" && advancedContent}
       </div>

@@ -46,9 +46,7 @@ class BitwardenSensitiveInformationParameterYAML(ParameterYAML):
     # Parameter 1 of Literal[...] cannot be of type "Any"
     # This pattern already works in block.py but since the ParameterType is not defined in this file, mypy is not able
     # to infer the type of the parameter_type attribute.
-    parameter_type: Literal[ParameterType.BITWARDEN_SENSITIVE_INFORMATION] = (
-        ParameterType.BITWARDEN_SENSITIVE_INFORMATION
-    )  # type: ignore
+    parameter_type: Literal["bitwarden_sensitive_information"] = ParameterType.BITWARDEN_SENSITIVE_INFORMATION  # type: ignore
 
     # bitwarden cli required fields
     bitwarden_client_id_aws_secret_key: str
@@ -61,6 +59,21 @@ class BitwardenSensitiveInformationParameterYAML(ParameterYAML):
     bitwarden_identity_key: str
     # fields to extract from the Bitwarden Identity. Custom fields are prioritized over default identity fields
     bitwarden_identity_fields: list[str]
+
+
+class BitwardenCreditCardDataParameterYAML(ParameterYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the ParameterType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    parameter_type: Literal[ParameterType.BITWARDEN_CREDIT_CARD_DATA] = ParameterType.BITWARDEN_CREDIT_CARD_DATA  # type: ignore
+    # bitwarden cli required fields
+    bitwarden_client_id_aws_secret_key: str
+    bitwarden_client_secret_aws_secret_key: str
+    bitwarden_master_password_aws_secret_key: str
+    # bitwarden ids for the credit card item
+    bitwarden_collection_id: str
+    bitwarden_item_id: str
 
 
 class WorkflowParameterYAML(ParameterYAML):
@@ -113,6 +126,9 @@ class TaskBlockYAML(BlockYAML):
     max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
     complete_on_download: bool = False
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
 
 
 class ForLoopBlockYAML(BlockYAML):
@@ -195,6 +211,7 @@ PARAMETER_YAML_SUBCLASSES = (
     AWSSecretParameterYAML
     | BitwardenLoginCredentialParameterYAML
     | BitwardenSensitiveInformationParameterYAML
+    | BitwardenCreditCardDataParameterYAML
     | WorkflowParameterYAML
     | ContextParameterYAML
     | OutputParameterYAML
@@ -225,5 +242,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     proxy_location: ProxyLocation | None = None
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    persist_browser_session: bool = False
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False

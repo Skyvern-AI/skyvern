@@ -37,7 +37,7 @@ export type BitwardenSensitiveInformationParameter = WorkflowParameterBase & {
   bitwarden_master_password_aws_secret_key: string;
   bitwarden_collection_id: string;
   bitwarden_identity_key: string;
-  bitwarden_identity_fields: string;
+  bitwarden_identity_fields: Array<string>;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
@@ -56,7 +56,7 @@ export type WorkflowParameter = WorkflowParameterBase & {
 
 export type ContextParameter = WorkflowParameterBase & {
   parameter_type: "context";
-  source: WorkflowParameter;
+  source: OutputParameter | ContextParameter | WorkflowParameter;
   value: unknown;
 };
 
@@ -134,6 +134,9 @@ export type TaskBlock = WorkflowBlockBase & {
   max_steps_per_run?: number | null;
   parameters: Array<WorkflowParameter>;
   complete_on_download?: boolean;
+  download_suffix?: string | null;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
 };
 
 export type ForLoopBlock = WorkflowBlockBase & {
@@ -168,10 +171,10 @@ export type UploadToS3Block = WorkflowBlockBase & {
 
 export type SendEmailBlock = WorkflowBlockBase & {
   block_type: "send_email";
-  smtp_host: AWSSecretParameter;
-  smtp_port: AWSSecretParameter;
-  smtp_username: AWSSecretParameter;
-  smtp_password: AWSSecretParameter;
+  smtp_host?: AWSSecretParameter;
+  smtp_port?: AWSSecretParameter;
+  smtp_username?: AWSSecretParameter;
+  smtp_password?: AWSSecretParameter;
   sender: string;
   recipients: Array<string>;
   subject: string;
@@ -196,7 +199,7 @@ export type WorkflowBlock =
   | FileURLParserBlock;
 
 export type WorkflowDefinition = {
-  parameters: Array<WorkflowParameter>;
+  parameters: Array<Parameter>;
   blocks: Array<WorkflowBlock>;
 };
 
@@ -211,6 +214,7 @@ export type WorkflowApiResponse = {
   workflow_definition: WorkflowDefinition;
   proxy_location: string;
   webhook_callback_url: string;
+  totp_verification_url: string;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;

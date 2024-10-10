@@ -1,10 +1,20 @@
-import { Handle, NodeProps, Position } from "@xyflow/react";
-import type { UploadNode } from "./types";
-import { DotsHorizontalIcon, UploadIcon } from "@radix-ui/react-icons";
-import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
+import { UploadIcon } from "@radix-ui/react-icons";
+import { Handle, NodeProps, Position } from "@xyflow/react";
+import { EditableNodeTitle } from "../components/EditableNodeTitle";
+import { NodeActionMenu } from "../NodeActionMenu";
+import type { UploadNode } from "./types";
 
-function UploadNode({ data }: NodeProps<UploadNode>) {
+function UploadNode({ id, data }: NodeProps<UploadNode>) {
+  const deleteNodeCallback = useDeleteNodeCallback();
+  const [label, setLabel] = useNodeLabelChangeHandler({
+    id,
+    initialValue: data.label,
+  });
+
   return (
     <div>
       <Handle
@@ -26,27 +36,26 @@ function UploadNode({ data }: NodeProps<UploadNode>) {
               <UploadIcon className="h-6 w-6" />
             </div>
             <div className="flex flex-col gap-1">
-              <span className="max-w-64 truncate text-base">{data.label}</span>
+              <EditableNodeTitle
+                value={label}
+                editable={data.editable}
+                onChange={setLabel}
+                titleClassName="text-base"
+                inputClassName="text-base"
+              />
               <span className="text-xs text-slate-400">Upload Block</span>
             </div>
           </div>
-          <div>
-            <DotsHorizontalIcon className="h-6 w-6" />
-          </div>
+          <NodeActionMenu
+            onDelete={() => {
+              deleteNodeCallback(id);
+            }}
+          />
         </div>
         <div className="space-y-4">
           <div className="space-y-1">
             <Label className="text-sm text-slate-400">File Path</Label>
-            <Input
-              value={data.path}
-              onChange={() => {
-                if (!data.editable) {
-                  return;
-                }
-                // TODO
-              }}
-              className="nopan"
-            />
+            <Input value={data.path} className="nopan text-xs" disabled />
           </div>
         </div>
       </div>

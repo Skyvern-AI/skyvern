@@ -49,6 +49,7 @@ function TaskHistory() {
       params.append("task_status", "terminated");
       params.append("task_status", "timed_out");
       params.append("task_status", "canceled");
+      params.append("only_standalone_tasks", "true");
 
       return client
         .get("/tasks", {

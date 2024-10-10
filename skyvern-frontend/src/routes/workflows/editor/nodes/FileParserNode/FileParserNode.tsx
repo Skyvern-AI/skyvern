@@ -1,9 +1,24 @@
-import { Handle, NodeProps, Position } from "@xyflow/react";
-import type { FileParserNode } from "./types";
-import { CursorTextIcon, DotsHorizontalIcon } from "@radix-ui/react-icons";
 import { Input } from "@/components/ui/input";
+import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
+import { CursorTextIcon } from "@radix-ui/react-icons";
+import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
+import { useState } from "react";
+import { EditableNodeTitle } from "../components/EditableNodeTitle";
+import { NodeActionMenu } from "../NodeActionMenu";
+import type { FileParserNode } from "./types";
 
-function FileParserNode({ data }: NodeProps<FileParserNode>) {
+function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
+  const { updateNodeData } = useReactFlow();
+  const deleteNodeCallback = useDeleteNodeCallback();
+  const [inputs, setInputs] = useState({
+    fileUrl: data.fileUrl,
+  });
+  const [label, setLabel] = useNodeLabelChangeHandler({
+    id,
+    initialValue: data.label,
+  });
+
   return (
     <div>
       <Handle
@@ -25,26 +40,35 @@ function FileParserNode({ data }: NodeProps<FileParserNode>) {
               <CursorTextIcon className="h-6 w-6" />
             </div>
             <div className="flex flex-col gap-1">
-              <span className="max-w-64 truncate text-base">{data.label}</span>
+              <EditableNodeTitle
+                value={label}
+                editable={data.editable}
+                onChange={setLabel}
+                titleClassName="text-base"
+                inputClassName="text-base"
+              />
               <span className="text-xs text-slate-400">File Parser Block</span>
             </div>
           </div>
-          <div>
-            <DotsHorizontalIcon className="h-6 w-6" />
-          </div>
+          <NodeActionMenu
+            onDelete={() => {
+              deleteNodeCallback(id);
+            }}
+          />
         </div>
         <div className="space-y-4">
           <div className="space-y-1">
             <span className="text-sm text-slate-400">File URL</span>
             <Input
-              value={data.fileUrl}
-              onChange={() => {
+              value={inputs.fileUrl}
+              onChange={(event) => {
                 if (!data.editable) {
                   return;
                 }
-                // TODO
+                setInputs({ ...inputs, fileUrl: event.target.value });
+                updateNodeData(id, { fileUrl: event.target.value });
               }}
-              className="nopan"
+              className="nopan text-xs"
             />
           </div>
         </div>

@@ -31,10 +31,15 @@ function CreateNewTaskFormPage() {
 
   if (sampleCases.includes(template as SampleCase)) {
     return (
-      <CreateNewTaskForm
-        key={template}
-        initialValues={getSampleForInitialFormValues(template as SampleCase)}
-      />
+      <div className="space-y-4">
+        <header>
+          <h1 className="text-3xl">Create New Task</h1>
+        </header>
+        <CreateNewTaskForm
+          key={template}
+          initialValues={getSampleForInitialFormValues(template as SampleCase)}
+        />
+      </div>
     );
   }
 
@@ -47,25 +52,36 @@ function CreateNewTaskFormPage() {
   ).default_value;
 
   const dataSchema = data.workflow_definition.blocks[0].data_schema;
+  const errorCodeMapping =
+    data.workflow_definition.blocks[0].error_code_mapping;
 
-  const maxSteps = data.workflow_definition.blocks[0].max_steps_per_run;
+  const maxStepsOverride = data.workflow_definition.blocks[0].max_steps_per_run;
 
   return (
-    <SavedTaskForm
-      initialValues={{
-        title: data.title,
-        description: data.description,
-        webhookCallbackUrl: data.webhook_callback_url,
-        proxyLocation: data.proxy_location,
-        url: data.workflow_definition.blocks[0].url,
-        navigationGoal: data.workflow_definition.blocks[0].navigation_goal,
-        dataExtractionGoal:
-          data.workflow_definition.blocks[0].data_extraction_goal,
-        extractedInformationSchema: JSON.stringify(dataSchema, null, 2),
-        navigationPayload,
-        maxSteps,
-      }}
-    />
+    <div className="space-y-4">
+      <header>
+        <h1 className="text-3xl">Edit Task Template</h1>
+      </header>
+      <SavedTaskForm
+        initialValues={{
+          title: data.title,
+          description: data.description,
+          webhookCallbackUrl: data.webhook_callback_url,
+          proxyLocation: data.proxy_location,
+          url: data.workflow_definition.blocks[0].url,
+          navigationGoal: data.workflow_definition.blocks[0].navigation_goal,
+          dataExtractionGoal:
+            data.workflow_definition.blocks[0].data_extraction_goal,
+          extractedInformationSchema: JSON.stringify(dataSchema, null, 2),
+          navigationPayload,
+          maxStepsOverride,
+          totpIdentifier: data.workflow_definition.blocks[0].totp_identifier,
+          totpVerificationUrl:
+            data.workflow_definition.blocks[0].totp_verification_url,
+          errorCodeMapping: JSON.stringify(errorCodeMapping, null, 2),
+        }}
+      />
+    </div>
   );
 }
 

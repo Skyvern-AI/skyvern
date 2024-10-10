@@ -7,3 +7,9 @@ export type CodeBlockNodeData = {
 };
 
 export type CodeBlockNode = Node<CodeBlockNodeData, "codeBlock">;
+
+export const codeBlockNodeDefaultData: CodeBlockNodeData = {
+  editable: true,
+  label: "",
+  code: "",
+} as const;

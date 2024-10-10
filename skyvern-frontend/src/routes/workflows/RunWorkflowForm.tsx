@@ -1,14 +1,13 @@
 import { getClient } from "@/api/AxiosClient";
-import { WorkflowParameter } from "@/api/types";
 import { Form, FormControl, FormField, FormItem } from "@/components/ui/form";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/use-toast";
-import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import {
   Table,
   TableBody,
@@ -17,11 +16,48 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { ToastAction } from "@radix-ui/react-toast";
+import fetchToCurl from "fetch-to-curl";
+import { apiBaseUrl } from "@/util/env";
+import { useApiCredential } from "@/hooks/useApiCredential";
+import { copyText } from "@/util/copyText";
+import { WorkflowParameter } from "./types/workflowTypes";
 
 type Props = {
   workflowParameters: Array<WorkflowParameter>;
   initialValues: Record<string, unknown>;
 };
+
+function parseValuesForWorkflowRun(
+  values: Record<string, unknown>,
+  workflowParameters: Array<WorkflowParameter>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(values).map(([key, value]) => {
+      const parameter = workflowParameters?.find(
+        (parameter) => parameter.key === key,
+      );
+      if (parameter?.workflow_parameter_type === "json") {
+        try {
+          return [key, JSON.parse(value as string)];
+        } catch {
+          console.error("Invalid JSON"); // this should never happen, it should fall to form error
+          return [key, value];
+        }
+      }
+      // can improve this via the type system maybe
+      if (
+        parameter?.workflow_parameter_type === "file_url" &&
+        value !== null &&
+        typeof value === "object" &&
+        "s3uri" in value
+      ) {
+        return [key, value.s3uri];
+      }
+      return [key, value];
+    }),
+  );
+}
 
 function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
   const { workflowPermanentId } = useParams();
@@ -30,25 +66,38 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
   const form = useForm({
     defaultValues: initialValues,
   });
+  const apiCredential = useApiCredential();
 
   const runWorkflowMutation = useMutation({
     mutationFn: async (values: Record<string, unknown>) => {
       const client = await getClient(credentialGetter);
-      return client
-        .post(`/workflows/${workflowPermanentId}/run`, {
+      return client.post<unknown, { data: { workflow_run_id: string } }>(
+        `/workflows/${workflowPermanentId}/run`,
+        {
           data: values,
           proxy_location: "RESIDENTIAL",
-        })
-        .then((response) => response.data);
+        },
+      );
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: ["workflowRuns"],
-      });
+    onSuccess: (response) => {
       toast({
         variant: "success",
         title: "Workflow run started",
         description: "The workflow run has been started successfully",
+        action: (
+          <ToastAction altText="View">
+            <Button asChild>
+              <Link
+                to={`/workflows/${workflowPermanentId}/${response.data.workflow_run_id}`}
+              >
+                View
+              </Link>
+            </Button>
+          </ToastAction>
+        ),
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["workflowRuns"],
       });
     },
     onError: (error) => {
@@ -61,31 +110,7 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
   });
 
   function onSubmit(values: Record<string, unknown>) {
-    const parsedValues = Object.fromEntries(
-      Object.entries(values).map(([key, value]) => {
-        const parameter = workflowParameters?.find(
-          (parameter) => parameter.key === key,
-        );
-        if (parameter?.workflow_parameter_type === "json") {
-          try {
-            return [key, JSON.parse(value as string)];
-          } catch {
-            console.error("Invalid JSON"); // this should never happen, it should fall to form error
-            return [key, value];
-          }
-        }
-        // can improve this via the type system maybe
-        if (
-          parameter?.workflow_parameter_type === "file_url" &&
-          value !== null &&
-          typeof value === "object" &&
-          "s3uri" in value
-        ) {
-          return [key, value.s3uri];
-        }
-        return [key, value];
-      }),
-    );
+    const parsedValues = parseValuesForWorkflowRun(values, workflowParameters);
     runWorkflowMutation.mutate(parsedValues);
   }
 
@@ -127,6 +152,9 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
                             return "Invalid JSON";
                           }
                         }
+                        if (value === null) {
+                          return "This field is required";
+                        }
                       },
                     }}
                     render={({ field }) => {
@@ -167,7 +195,40 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
               })}
             </TableBody>
           </Table>
-          <div className="flex justify-end">
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={() => {
+                const parsedValues = parseValuesForWorkflowRun(
+                  form.getValues(),
+                  workflowParameters,
+                );
+                const curl = fetchToCurl({
+                  method: "POST",
+                  url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
+                  body: {
+                    data: parsedValues,
+                    proxy_location: "RESIDENTIAL",
+                  },
+                  headers: {
+                    "Content-Type": "application/json",
+                    "x-api-key": apiCredential ?? "<your-api-key>",
+                  },
+                });
+                copyText(curl).then(() => {
+                  toast({
+                    variant: "success",
+                    title: "Copied to Clipboard",
+                    description:
+                      "The cURL command has been copied to your clipboard.",
+                  });
+                });
+              }}
+            >
+              <CopyIcon className="mr-2 h-4 w-4" />
+              cURL
+            </Button>
             <Button type="submit" disabled={runWorkflowMutation.isPending}>
               {runWorkflowMutation.isPending && (
                 <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />

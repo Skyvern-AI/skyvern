@@ -13,6 +13,11 @@ class SkyvernHTTPException(SkyvernException):
         super().__init__(message)
 
 
+class DisabledBlockExecutionError(SkyvernHTTPException):
+    def __init__(self, message: str | None = None):
+        super().__init__(message, status_code=status.HTTP_400_BAD_REQUEST)
+
+
 class InvalidOpenAIResponseFormat(SkyvernException):
     def __init__(self, message: str | None = None):
         super().__init__(f"Invalid response format: {message}")
@@ -278,6 +283,15 @@ class BitwardenSyncError(BitwardenBaseError):
         super().__init__(f"Error syncing Bitwarden: {message}")
 
 
+class BitwardenAccessDeniedError(BitwardenBaseError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Current organization does not have access to the specified Bitwarden collection. "
+            "Contact Skyvern support to enable access. This is a security layer on top of Bitwarden, "
+            "Skyvern team needs to let your Skyvern account access the Bitwarden collection."
+        )
+
+
 class UnknownElementTreeFormat(SkyvernException):
     def __init__(self, fmt: str) -> None:
         super().__init__(f"Unknown element tree format {fmt}")
@@ -293,6 +307,11 @@ class StepUnableToExecuteError(SkyvernException):
         super().__init__(f"Step {step_id} cannot be executed and task execution is stopped. Reason: {reason}")
 
 
+class SVGConversionFailed(SkyvernException):
+    def __init__(self, svg_html: str) -> None:
+        super().__init__(f"Failed to convert SVG after max retries. svg_html={svg_html}")
+
+
 class UnsupportedActionType(SkyvernException):
     def __init__(self, action_type: str):
         super().__init__(f"Unsupport action type: {action_type}")
@@ -306,21 +325,6 @@ class InvalidElementForTextInput(SkyvernException):
 class ElementIsNotLabel(SkyvernException):
     def __init__(self, tag_name: str):
         super().__init__(f"<{tag_name}> element is not <label>")
-
-
-class ElementIsNotSelect2Dropdown(SkyvernException):
-    def __init__(self, element_id: str, element: dict):
-        super().__init__(f"element[{element}] is not select2 dropdown. element_id={element_id}")
-
-
-class ElementIsNotReactSelectDropdown(SkyvernException):
-    def __init__(self, element_id: str, element: dict):
-        super().__init__(f"element[{element}] is not react select dropdown. element_id={element_id}")
-
-
-class ElementIsNotComboboxDropdown(SkyvernException):
-    def __init__(self, element_id: str, element: dict):
-        super().__init__(f"element[{element}] is not combobox dropdown. element_id={element_id}")
 
 
 class NoneFrameError(SkyvernException):
@@ -406,23 +410,6 @@ class NoSelectableElementFound(SkyvernException):
         super().__init__(f"No selectable elements found in the children list. element_id={element_id}")
 
 
-class NoDropdownAnchorErr(SkyvernException):
-    def __init__(self, dropdowm_type: str, element_id: str):
-        super().__init__(f"No {dropdowm_type} dropdown found. element_id={element_id}")
-
-
-class MultipleDropdownAnchorErr(SkyvernException):
-    def __init__(self, dropdowm_type: str, element_id: str):
-        super().__init__(f"Multiple {dropdowm_type} dropdown found. element_id={element_id}")
-
-
-class FailedToGetCurrentValueOfDropdown(SkyvernException):
-    def __init__(self, dropdowm_type: str, element_id: str, fail_reason: str):
-        super().__init__(
-            f"Failed to get current value of {dropdowm_type} dropdown. element_id={element_id}, failure_reason={fail_reason}"
-        )
-
-
 class HttpException(SkyvernException):
     def __init__(self, status_code: int, url: str, msg: str | None = None) -> None:
         super().__init__(f"HTTP Exception, status_code={status_code}, url={url}" + (f", msg={msg}" if msg else ""))
@@ -447,11 +434,9 @@ class NoIncrementalElementFoundForCustomSelection(SkyvernException):
         )
 
 
-class NoLabelOrValueForCustomSelection(SkyvernException):
-    def __init__(self, element_id: str) -> None:
-        super().__init__(
-            f"This is a custom selection, there must be invalid text for option.label or option.value. element_id={element_id}"
-        )
+class NoAvailableOptionFoundForCustomSelection(SkyvernException):
+    def __init__(self, reason: str | None) -> None:
+        super().__init__(f"No available option to select. reason: {reason}.")
 
 
 class NoElementMatchedForTargetOption(SkyvernException):
@@ -499,3 +484,9 @@ class FailToFindAutocompleteOption(SkyvernException):
         super().__init__(
             f"Can't find a suitable auto completion for the current value, maybe retry with another reasonable value. current_value={current_value}"
         )
+
+
+class IllegitComplete(SkyvernException):
+    def __init__(self, data: dict | None = None) -> None:
+        data_str = f", data={data}" if data else ""
+        super().__init__(f"Illegit complete{data_str}")

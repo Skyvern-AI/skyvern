@@ -17,7 +17,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { cn } from "@/util/utils";
-import { CopyIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, NavLink, Outlet, useParams } from "react-router-dom";
 import { TaskInfo } from "./TaskInfo";
@@ -26,6 +26,7 @@ import { taskIsFinalized } from "@/api/utils";
 import fetchToCurl from "fetch-to-curl";
 import { apiBaseUrl } from "@/util/env";
 import { useApiCredential } from "@/hooks/useApiCredential";
+import { copyText } from "@/util/copyText";
 
 function createTaskRequestObject(values: TaskApiResponse) {
   return {
@@ -128,7 +129,7 @@ function TaskDetails() {
         </div>
         <div className="flex items-center gap-2">
           <Button
-            variant="outline"
+            variant="secondary"
             onClick={() => {
               if (!task) {
                 return;
@@ -142,17 +143,18 @@ function TaskDetails() {
                   "x-api-key": apiCredential ?? "<your-api-key>",
                 },
               });
-              navigator.clipboard.writeText(curl);
-              toast({
-                variant: "success",
-                title: "Copied to Clipboard",
-                description:
-                  "The cURL command has been copied to your clipboard.",
+              copyText(curl).then(() => {
+                toast({
+                  variant: "success",
+                  title: "Copied to Clipboard",
+                  description:
+                    "The cURL command has been copied to your clipboard.",
+                });
               });
             }}
           >
             <CopyIcon className="mr-2 h-4 w-4" />
-            Copy as cURL
+            cURL
           </Button>
           {taskIsRunningOrQueued && (
             <Dialog>
@@ -187,8 +189,11 @@ function TaskDetails() {
             </Dialog>
           )}
           {taskHasTerminalState && (
-            <Button variant="secondary" asChild>
-              <Link to={`/create/retry/${task.task_id}`}>Rerun Task</Link>
+            <Button asChild>
+              <Link to={`/create/retry/${task.task_id}`}>
+                <PlayIcon className="mr-2 h-4 w-4" />
+                Rerun
+              </Link>
             </Button>
           )}
         </div>

@@ -1,11 +1,16 @@
+import { CreateNewTaskFormValues } from "../create/taskFormTypes";
 import { SampleCase } from "../types";
 
 export const blank = {
   url: "https://www.example.com",
-  navigationGoal: null,
-  dataExtractionGoal: null,
+  navigationGoal: "",
+  dataExtractionGoal: "",
   navigationPayload: null,
   extractedInformationSchema: null,
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
 };
 
 export const bci_seguros = {
@@ -30,6 +35,10 @@ export const bci_seguros = {
     "km approx a recorrer": "28,000",
   },
   extractedInformationSchema: null,
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
 };
 
 export const california_edd = {
@@ -47,6 +56,10 @@ export const california_edd = {
     phone_number: "412-444-1234",
   },
   extractedInformationSchema: null,
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
 };
 
 export const finditparts = {
@@ -59,6 +72,10 @@ export const finditparts = {
     product_id: "W01-377-8537",
   },
   extractedInformationSchema: null,
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
 };
 
 export const job_application = {
@@ -69,9 +86,14 @@ export const job_application = {
     name: "John Doe",
     email: "john.doe@gmail.com",
     phone: "123-456-7890",
-    resume_url: "https://www.msnlabs.com/img/resume-sample.pdf",
+    resume_url:
+      "https://writing.colostate.edu/guides/documents/resume/functionalSample.pdf",
     cover_letter: "Generate a compelling cover letter for me",
   },
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
 };
 
 export const geico = {
@@ -262,6 +284,10 @@ export const geico = {
     },
     type: "object",
   },
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
 };
 
 export function getSample(sample: SampleCase) {
@@ -279,7 +305,17 @@ export function getSample(sample: SampleCase) {
       return bci_seguros;
     }
     case "job_application": {
-      return job_application;
+      // copy the object to avoid modifying the original. Update job_application.navigationPayload.email to a random email
+      const email = generateUniqueEmail();
+      const phone = generatePhoneNumber();
+      return {
+        ...job_application,
+        navigationPayload: {
+          ...job_application.navigationPayload,
+          email,
+          phone,
+        },
+      };
     }
     case "blank": {
       return blank;
@@ -287,16 +323,45 @@ export function getSample(sample: SampleCase) {
   }
 }
 
-function transformKV([key, value]: [string, unknown]) {
-  if (value === null) {
-    return [key, ""];
+function generateUniqueEmail() {
+  // Define the characters to use for the random part
+  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let randomString = "";
+
+  // Generate a random string of 8 characters
+  for (let i = 0; i < 8; i++) {
+    const randomIndex = Math.floor(Math.random() * chars.length);
+    randomString += chars[randomIndex];
   }
-  if (typeof value === "object") {
+
+  // Concatenate with '@example.com'
+  const email = randomString + "@example.com";
+  return email;
+}
+
+function generatePhoneNumber() {
+  let phoneNumber = "";
+
+  // The first digit should be between 1 and 9 (it can't be 0)
+  phoneNumber += Math.floor(Math.random() * 9) + 1;
+
+  // The remaining 9 digits can be between 0 and 9
+  for (let i = 0; i < 9; i++) {
+    phoneNumber += Math.floor(Math.random() * 10);
+  }
+
+  return phoneNumber;
+}
+
+function transformKV([key, value]: [string, unknown]) {
+  if (value !== null && typeof value === "object") {
     return [key, JSON.stringify(value, null, 2)];
   }
   return [key, value];
 }
 
-export function getSampleForInitialFormValues(sample: SampleCase) {
+export function getSampleForInitialFormValues(
+  sample: SampleCase,
+): CreateNewTaskFormValues {
   return Object.fromEntries(Object.entries(getSample(sample)).map(transformKV));
 }

@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from skyvern import constants
 from skyvern.constants import SKYVERN_DIR
 
 
@@ -45,6 +46,12 @@ class Settings(BaseSettings):
     # Artifact storage settings
     ARTIFACT_STORAGE_PATH: str = f"{SKYVERN_DIR}/artifacts"
     GENERATE_PRESIGNED_URLS: bool = False
+    AWS_S3_BUCKET_ARTIFACTS: str = "skyvern-artifacts"
+    AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
+    AWS_S3_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
+
+    # Supported storage types: local, s3
+    SKYVERN_STORAGE_TYPE: str = "local"
 
     # S3 bucket settings
     AWS_REGION: str = "us-east-1"
@@ -66,11 +73,17 @@ class Settings(BaseSettings):
     # streaming settings
     STREAMING_FILE_BASE_PATH: str = "/tmp"
 
+    # Saved browser session settings
+    BROWSER_SESSION_BASE_PATH: str = f"{constants.REPO_ROOT_DIR}/browser_sessions"
+
     #####################
     # Bitwarden Configs #
     #####################
     BITWARDEN_TIMEOUT_SECONDS: int = 60
     BITWARDEN_MAX_RETRIES: int = 1
+
+    # task generation settings
+    PROMPT_CACHE_WINDOW_HOURS: int = 24
 
     #####################
     # LLM Configuration #
@@ -103,6 +116,13 @@ class Settings(BaseSettings):
     AZURE_GPT4O_MINI_API_KEY: str | None = None
     AZURE_GPT4O_MINI_API_BASE: str | None = None
     AZURE_GPT4O_MINI_API_VERSION: str | None = None
+
+    # TOTP Settings
+    TOTP_LIFESPAN_MINUTES: int = 10
+    VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
+    VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 5
+
+    SVG_MAX_LENGTH: int = 100000
 
     def is_cloud_environment(self) -> bool:
         """

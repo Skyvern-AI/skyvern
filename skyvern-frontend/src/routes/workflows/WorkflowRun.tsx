@@ -1,6 +1,21 @@
 import { getClient } from "@/api/AxiosClient";
-import { TaskApiResponse, WorkflowRunStatusApiResponse } from "@/api/types";
+import {
+  Status,
+  TaskApiResponse,
+  WorkflowRunStatusApiResponse,
+} from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Pagination,
+  PaginationContent,
+  PaginationItem,
+  PaginationLink,
+  PaginationNext,
+  PaginationPrevious,
+} from "@/components/ui/pagination";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Table,
@@ -11,30 +26,50 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useQuery } from "@tanstack/react-query";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { TaskListSkeletonRows } from "../tasks/list/TaskListSkeletonRows";
 import { basicTimeFormat } from "@/util/timeFormat";
-import { TaskActions } from "../tasks/list/TaskActions";
-import { Label } from "@/components/ui/label";
-import { Input } from "@/components/ui/input";
-import {
-  Pagination,
-  PaginationContent,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from "@/components/ui/pagination";
 import { cn } from "@/util/utils";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import {
+  Link,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
+import { TaskActions } from "../tasks/list/TaskActions";
+import { TaskListSkeletonRows } from "../tasks/list/TaskListSkeletonRows";
+import { useEffect, useState } from "react";
+import { statusIsNotFinalized, statusIsRunningOrQueued } from "../tasks/types";
+import { apiBaseUrl, envCredential } from "@/util/env";
+import { toast } from "@/components/ui/use-toast";
+import { CopyIcon, Pencil2Icon, PlayIcon } from "@radix-ui/react-icons";
+import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
+import fetchToCurl from "fetch-to-curl";
+import { useApiCredential } from "@/hooks/useApiCredential";
+import { copyText } from "@/util/copyText";
+
+type StreamMessage = {
+  task_id: string;
+  status: string;
+  screenshot?: string;
+};
+
+let socket: WebSocket | null = null;
+
+const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
-
   const { workflowRunId, workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
+  const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const navigate = useNavigate();
+  const apiCredential = useApiCredential();
+
+  const { data: workflow, isLoading: workflowIsLoading } = useWorkflowQuery({
+    workflowPermanentId,
+  });
+
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
     useQuery<WorkflowRunStatusApiResponse>({
       queryKey: ["workflowRun", workflowPermanentId, workflowRunId],
@@ -44,6 +79,16 @@ function WorkflowRun() {
           .get(`/workflows/${workflowPermanentId}/runs/${workflowRunId}`)
           .then((response) => response.data);
       },
+      refetchInterval: (query) => {
+        if (!query.state.data) {
+          return false;
+        }
+        if (statusIsNotFinalized(query.state.data)) {
+          return 5000;
+        }
+        return false;
+      },
+      placeholderData: keepPreviousData,
     });
 
   const { data: workflowTasks, isLoading: workflowTasksIsLoading } = useQuery<
@@ -58,7 +103,123 @@ function WorkflowRun() {
         .get(`/tasks?workflow_run_id=${workflowRunId}`, { params })
         .then((response) => response.data);
     },
+    refetchInterval: () => {
+      if (workflowRun?.status === Status.Running) {
+        return 5000;
+      }
+      return false;
+    },
+    placeholderData: keepPreviousData,
+    refetchOnMount: workflowRun?.status === Status.Running,
   });
+
+  const workflowRunIsRunningOrQueued =
+    workflowRun && statusIsRunningOrQueued(workflowRun);
+
+  useEffect(() => {
+    if (!workflowRunIsRunningOrQueued) {
+      return;
+    }
+
+    async function run() {
+      // Create WebSocket connection.
+      let credential = null;
+      if (credentialGetter) {
+        const token = await credentialGetter();
+        credential = `?token=Bearer ${token}`;
+      } else {
+        credential = `?apikey=${envCredential}`;
+      }
+      if (socket) {
+        socket.close();
+      }
+      socket = new WebSocket(
+        `${wssBaseUrl}/stream/workflow_runs/${workflowRunId}${credential}`,
+      );
+      // Listen for messages
+      socket.addEventListener("message", (event) => {
+        try {
+          const message: StreamMessage = JSON.parse(event.data);
+          if (message.screenshot) {
+            setStreamImgSrc(message.screenshot);
+          }
+          if (
+            message.status === "completed" ||
+            message.status === "failed" ||
+            message.status === "terminated"
+          ) {
+            socket?.close();
+            if (
+              message.status === "failed" ||
+              message.status === "terminated"
+            ) {
+              toast({
+                title: "Run Failed",
+                description: "The workflow run has failed.",
+                variant: "destructive",
+              });
+            } else if (message.status === "completed") {
+              toast({
+                title: "Run Completed",
+                description: "The workflow run has been completed.",
+                variant: "success",
+              });
+            }
+          }
+        } catch (e) {
+          console.error("Failed to parse message", e);
+        }
+      });
+
+      socket.addEventListener("close", () => {
+        socket = null;
+      });
+    }
+    run();
+
+    return () => {
+      if (socket) {
+        socket.close();
+        socket = null;
+      }
+    };
+  }, [credentialGetter, workflowRunId, workflowRunIsRunningOrQueued]);
+
+  function getStream() {
+    if (workflowRun?.status === Status.Created) {
+      return (
+        <div className="flex h-full w-full flex-col items-center justify-center gap-8 bg-slate-900 py-8 text-lg">
+          <span>Workflow has been created.</span>
+          <span>Stream will start when the workflow is running.</span>
+        </div>
+      );
+    }
+    if (workflowRun?.status === Status.Queued) {
+      return (
+        <div className="flex h-full w-full flex-col items-center justify-center gap-8 bg-slate-900 py-8 text-lg">
+          <span>Your workflow run is queued.</span>
+          <span>Stream will start when the workflow is running.</span>
+        </div>
+      );
+    }
+
+    if (workflowRun?.status === Status.Running && streamImgSrc.length === 0) {
+      return (
+        <div className="flex h-full w-full items-center justify-center bg-slate-900 py-8 text-lg">
+          Starting the stream...
+        </div>
+      );
+    }
+
+    if (workflowRun?.status === Status.Running && streamImgSrc.length > 0) {
+      return (
+        <div className="h-full w-full">
+          <img src={`data:image/png;base64,${streamImgSrc}`} />
+        </div>
+      );
+    }
+    return null;
+  }
 
   function handleNavigate(event: React.MouseEvent, id: string) {
     if (event.ctrlKey || event.metaKey) {
@@ -76,14 +237,77 @@ function WorkflowRun() {
 
   return (
     <div className="space-y-8">
-      <header className="flex gap-2">
-        <h1 className="text-lg font-semibold">{workflowRunId}</h1>
-        {workflowRunIsLoading ? (
-          <Skeleton className="h-8 w-28" />
-        ) : workflowRun ? (
-          <StatusBadge status={workflowRun?.status} />
-        ) : null}
+      <header className="flex justify-between">
+        <div className="space-y-3">
+          <div className="flex items-center gap-2">
+            <h1 className="text-3xl">{workflowRunId}</h1>
+            {workflowRunIsLoading ? (
+              <Skeleton className="h-8 w-28" />
+            ) : workflowRun ? (
+              <StatusBadge status={workflowRun?.status} />
+            ) : null}
+          </div>
+          <h2 className="text-2xl text-slate-400">
+            {workflowIsLoading ? (
+              <Skeleton className="h-8 w-48" />
+            ) : (
+              workflow?.title
+            )}
+          </h2>
+        </div>
+
+        <div className="flex gap-2">
+          <Button
+            variant="secondary"
+            onClick={() => {
+              if (!workflowRun) {
+                return;
+              }
+              const curl = fetchToCurl({
+                method: "POST",
+                url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
+                body: {
+                  data: workflowRun?.parameters,
+                  proxy_location: "RESIDENTIAL",
+                },
+                headers: {
+                  "Content-Type": "application/json",
+                  "x-api-key": apiCredential ?? "<your-api-key>",
+                },
+              });
+              copyText(curl).then(() => {
+                toast({
+                  variant: "success",
+                  title: "Copied to Clipboard",
+                  description:
+                    "The cURL command has been copied to your clipboard.",
+                });
+              });
+            }}
+          >
+            <CopyIcon className="mr-2 h-4 w-4" />
+            cURL
+          </Button>
+          <Button asChild variant="secondary">
+            <Link to={`/workflows/${workflowPermanentId}/edit`}>
+              <Pencil2Icon className="mr-2 h-4 w-4" />
+              Edit
+            </Link>
+          </Button>
+          <Button asChild>
+            <Link
+              to={`/workflows/${workflowPermanentId}/run`}
+              state={{
+                data: parameters,
+              }}
+            >
+              <PlayIcon className="mr-2 h-4 w-4" />
+              Rerun
+            </Link>
+          </Button>
+        </div>
       </header>
+      {getStream()}
       <div className="space-y-4">
         <header>
           <h2 className="text-lg font-semibold">Tasks</h2>

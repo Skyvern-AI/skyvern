@@ -19,6 +19,9 @@
     --secondary: 210 40% 96.1%;
     --secondary-foreground: 222.2 47.4% 11.2%;
 
+    --tertiary: 227.6 11.6% 48.8%;
+    --tertiary-foreground: 213 27% 84%;
+
     --muted: 210 40% 96.1%;
     --muted-foreground: 215.4 16.3% 46.9%;
 
@@ -91,4 +94,14 @@
 body,
 #root {
   min-height: 100vh;
+}
+
+/* CodeMirror override styles */
+
+.cm-editor {
+  @apply rounded-md;
+}
+
+.cm-gutters {
+  @apply rounded-md;
 }

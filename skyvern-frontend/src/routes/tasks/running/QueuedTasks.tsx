@@ -26,10 +26,12 @@ function QueuedTasks() {
         .get("/tasks", {
           params: {
             task_status: "queued",
+            only_standalone_tasks: "true",
           },
         })
         .then((response) => response.data);
     },
+    refetchOnMount: true,
   });
 
   function handleNavigate(event: React.MouseEvent, id: string) {

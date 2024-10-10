@@ -43,6 +43,15 @@ class SelectOption(BaseModel):
         return f"SelectOption(label={self.label}, value={self.value}, index={self.index})"
 
 
+class InputOrSelectContext(BaseModel):
+    field: str | None = None
+    is_required: bool | None = None
+    is_search_bar: bool | None = None  # don't trigger custom-selection logic when it's a search bar
+
+    def __repr__(self) -> str:
+        return f"InputOrSelectContext(field={self.field}, is_required={self.is_required}, is_search_bar={self.is_search_bar})"
+
+
 class Action(BaseModel):
     action_type: ActionType
     confidence_float: float | None = None

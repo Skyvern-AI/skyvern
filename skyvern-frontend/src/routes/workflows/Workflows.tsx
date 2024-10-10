@@ -28,18 +28,33 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import {
-  CounterClockwiseClockIcon,
+  ExclamationTriangleIcon,
   Pencil2Icon,
   PlayIcon,
+  PlusIcon,
+  ReloadIcon,
 } from "@radix-ui/react-icons";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { WorkflowsBetaAlertCard } from "./WorkflowsBetaAlertCard";
+import { stringify as convertToYAML } from "yaml";
+import { DeleteWorkflowButton } from "./editor/DeleteWorkflowButton";
+import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 import { WorkflowTitle } from "./WorkflowTitle";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+
+const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
+  title: "New Workflow",
+  description: "",
+  workflow_definition: {
+    blocks: [],
+    parameters: [],
+  },
+};
 
 function Workflows() {
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const workflowsPage = searchParams.get("workflowsPage")
     ? Number(searchParams.get("workflowsPage"))
@@ -79,9 +94,26 @@ function Workflows() {
     },
   });
 
-  if (workflows?.length === 0 && workflowsPage === 1) {
-    return <WorkflowsBetaAlertCard />;
-  }
+  const createNewWorkflowMutation = useMutation({
+    mutationFn: async () => {
+      const client = await getClient(credentialGetter);
+      const yaml = convertToYAML(emptyWorkflowRequest);
+      return client.post<
+        typeof emptyWorkflowRequest,
+        { data: WorkflowApiResponse }
+      >("/workflows", yaml, {
+        headers: {
+          "Content-Type": "text/plain",
+        },
+      });
+    },
+    onSuccess: (response) => {
+      queryClient.invalidateQueries({
+        queryKey: ["workflows"],
+      });
+      navigate(`/workflows/${response.data.workflow_permanent_id}/edit`);
+    },
+  });
 
   function handleRowClick(
     event: React.MouseEvent<HTMLTableCellElement>,
@@ -113,10 +145,52 @@ function Workflows() {
     navigate(path);
   }
 
+  const showExperimentalMessage =
+    workflows?.length === 0 && workflowsPage === 1;
+
   return (
     <div className="space-y-8">
-      <header>
+      {showExperimentalMessage && (
+        <Alert variant="default" className="bg-slate-elevation2">
+          <AlertTitle>
+            <div className="flex items-center gap-2">
+              <ExclamationTriangleIcon className="h-6 w-6" />
+              <span className="text-xl">Experimental Feature</span>
+            </div>
+          </AlertTitle>
+          <AlertDescription className="text-base text-slate-300">
+            Workflows are still in experimental mode. Please{" "}
+            {
+              <a
+                href="https://meetings.hubspot.com/skyvern/demo"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="ml-auto underline underline-offset-2"
+              >
+                book a demo
+              </a>
+            }{" "}
+            if you'd like to learn more. If you're feeling adventurous, create
+            your first workflow!
+          </AlertDescription>
+        </Alert>
+      )}
+
+      <header className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Workflows</h1>
+        <Button
+          disabled={createNewWorkflowMutation.isPending}
+          onClick={() => {
+            createNewWorkflowMutation.mutate();
+          }}
+        >
+          {createNewWorkflowMutation.isPending ? (
+            <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+          ) : (
+            <PlusIcon className="mr-2 h-4 w-4" />
+          )}
+          Create Workflow
+        </Button>
       </header>
       <div className="rounded-md border">
         <Table>
@@ -176,26 +250,7 @@ function Workflows() {
                                 onClick={(event) => {
                                   handleIconClick(
                                     event,
-                                    `/workflows/${workflow.workflow_permanent_id}/runs`,
-                                  );
-                                }}
-                              >
-                                <CounterClockwiseClockIcon className="h-4 w-4" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent>View Past Runs</TooltipContent>
-                          </Tooltip>
-                        </TooltipProvider>
-                        <TooltipProvider>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Button
-                                size="icon"
-                                variant="outline"
-                                onClick={(event) => {
-                                  handleIconClick(
-                                    event,
-                                    `/workflows/${workflow.workflow_permanent_id}`,
+                                    `/workflows/${workflow.workflow_permanent_id}/edit`,
                                   );
                                 }}
                               >
@@ -224,6 +279,9 @@ function Workflows() {
                             <TooltipContent>Create New Run</TooltipContent>
                           </Tooltip>
                         </TooltipProvider>
+                        <DeleteWorkflowButton
+                          id={workflow.workflow_permanent_id}
+                        />
                       </div>
                     </TableCell>
                   </TableRow>

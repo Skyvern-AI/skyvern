@@ -206,6 +206,13 @@ function isElementStyleVisibilityVisible(element, style) {
   )
     return false;
   if (style.visibility !== "visible") return false;
+
+  // TODO: support style.clipPath and style.clipRule?
+  // if element is clipped with rect(0px, 0px, 0px, 0px), it means it's invisible on the page
+  if (style.clip === "rect(0px, 0px, 0px, 0px)") {
+    return false;
+  }
+
   return true;
 }
 
@@ -219,9 +226,11 @@ function isElementVisible(element) {
   )
     return element.parentElement && isElementVisible(element.parentElement);
 
+  const className = element.className.toString();
   if (
-    element.className.toString().includes("select2-offscreen") ||
-    element.className.toString().includes("select2-hidden")
+    className.includes("select2-offscreen") ||
+    className.includes("select2-hidden") ||
+    className.includes("ui-select-offscreen")
   ) {
     return false;
   }
@@ -246,19 +255,38 @@ function isElementVisible(element) {
     return false;
   }
 
-  // if the center point of the element is not in the page, we tag it as an interactable element
-  const center_x = (rect.left + rect.width) / 2;
-  const center_y = (rect.top + rect.height) / 2;
-  if (center_x < 0 || center_y < 0) {
+  // if the center point of the element is not in the page, we tag it as an non-interactable element
+  // FIXME: sometimes there could be an overflow element blocking the default scrolling, making Y coordinate be wrong. So we currently only check for X
+  const center_x = (rect.left + rect.width) / 2 + window.scrollX;
+  if (center_x < 0) {
     return false;
   }
+  // const center_y = (rect.top + rect.height) / 2 + window.scrollY;
+  // if (center_x < 0 || center_y < 0) {
+  //   return false;
+  // }
 
   return true;
 }
 
 function isHidden(element) {
   const style = getElementComputedStyle(element);
-  return style?.display === "none" || element.hidden;
+  if (style?.display === "none") {
+    return true;
+  }
+  if (element.hidden) {
+    if (
+      style?.cursor === "pointer" &&
+      element.tagName.toLowerCase() === "input" &&
+      (element.type === "submit" || element.type === "button")
+    ) {
+      // there are cases where the input is a "submit" button and the cursor is a pointer but the element has the hidden attr.
+      // such an element is not really hidden
+      return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 function isHiddenOrDisabled(element) {
@@ -268,6 +296,25 @@ function isHiddenOrDisabled(element) {
 function isScriptOrStyle(element) {
   const tagName = element.tagName.toLowerCase();
   return tagName === "script" || tagName === "style";
+}
+
+function isReadonlyElement(element) {
+  if (element.readOnly) {
+    return true;
+  }
+
+  if (element.hasAttribute("readonly")) {
+    return true;
+  }
+
+  if (element.hasAttribute("aria-readonly")) {
+    // only aria-readonly="false" should be considered as "not readonly"
+    return (
+      element.getAttribute("aria-readonly").toLowerCase().trim() !== "false"
+    );
+  }
+
+  return false;
 }
 
 function hasAngularClickBinding(element) {
@@ -283,6 +330,10 @@ function hasWidgetRole(element) {
   }
   // https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Roles#2._widget_roles
   // Not all roles make sense for the time being so we only check for the ones that do
+  if (role.toLowerCase().trim() === "textbox") {
+    return !isReadonlyElement(element);
+  }
+
   const widgetRoles = [
     "button",
     "link",
@@ -293,7 +344,6 @@ function hasWidgetRole(element) {
     "radio",
     "tab",
     "combobox",
-    "textbox",
     "searchbox",
     "slider",
     "spinbutton",
@@ -321,34 +371,17 @@ function isTableRelatedElement(element) {
 
 function isInteractableInput(element) {
   const tagName = element.tagName.toLowerCase();
-  const type = element.getAttribute("type") ?? "text"; // Default is text: https://www.w3schools.com/html/html_form_input_types.asp
   if (tagName !== "input") {
     // let other checks decide
     return false;
   }
-  const clickableTypes = [
-    "button",
-    "checkbox",
-    "date",
-    "datetime-local",
-    "email",
-    "file",
-    "image",
-    "month",
-    "number",
-    "password",
-    "radio",
-    "range",
-    "reset",
-    "search",
-    "submit",
-    "tel",
-    "text",
-    "time",
-    "url",
-    "week",
-  ];
-  return clickableTypes.includes(type.toLowerCase().trim());
+  // Browsers default to "text" when the type is not set or is invalid
+  // Here's the list of valid types: https://developer.mozilla.org/en-US/docs/Web/HTML/Element/input#input_types
+  // Examples of unrecognized types that we've seen and caused issues because we didn't mark them interactable:
+  // "city", "state", "zip", "country"
+  // That's the reason I (Kerem) removed the valid input types check
+  var type = element.getAttribute("type")?.toLowerCase().trim() ?? "text";
+  return !isReadonlyElement(element) && type !== "hidden";
 }
 
 function isInteractable(element) {
@@ -411,8 +444,10 @@ function isInteractable(element) {
     return true;
   }
 
-  if (tagName === "div" && hasAngularClickBinding(element)) {
-    return true;
+  if (tagName === "div" || tagName === "span") {
+    if (hasAngularClickBinding(element)) {
+      return true;
+    }
   }
 
   // support listbox and options underneath it
@@ -445,11 +480,17 @@ function isInteractable(element) {
     tagName === "img" ||
     tagName === "span" ||
     tagName === "a" ||
-    tagName === "i"
+    tagName === "i" ||
+    tagName === "li"
   ) {
     const computedStyle = window.getComputedStyle(element);
-    const hasPointer = computedStyle.cursor === "pointer";
-    return hasPointer;
+    if (computedStyle.cursor === "pointer") {
+      return true;
+    }
+    // FIXME: hardcode to fix the bug about hover style now
+    if (element.className.toString().includes("hover:cursor-pointer")) {
+      return true;
+    }
   }
 
   return false;
@@ -496,6 +537,22 @@ const isComboboxDropdown = (element) => {
   return role && haspopup && controls && readonly;
 };
 
+const isDropdownButton = (element) => {
+  const tagName = element.tagName.toLowerCase();
+  const type = element.getAttribute("type")
+    ? element.getAttribute("type").toLowerCase()
+    : "";
+  const haspopup = element.getAttribute("aria-haspopup")
+    ? element.getAttribute("aria-haspopup").toLowerCase()
+    : "";
+  const hasExpanded = element.hasAttribute("aria-expanded");
+  return (
+    tagName === "button" &&
+    type === "button" &&
+    (hasExpanded || haspopup === "listbox")
+  );
+};
+
 const isSelect2Dropdown = (element) => {
   const tagName = element.tagName.toLowerCase();
   const className = element.className.toString();
@@ -527,6 +584,31 @@ const isReactSelectDropdown = (element) => {
     element.className.toString().includes("select__input") &&
     element.getAttribute("role") === "combobox"
   );
+};
+
+function hasNgAttribute(element) {
+  for (let attr of element.attributes) {
+    if (attr.name.startsWith("ng-")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const isAngularDropdown = (element) => {
+  if (!hasNgAttribute(element)) {
+    return false;
+  }
+
+  const tagName = element.tagName.toLowerCase();
+  if (tagName === "input" || tagName === "span") {
+    const ariaLabel = element.hasAttribute("aria-label")
+      ? element.getAttribute("aria-label").toLowerCase()
+      : "";
+    return ariaLabel.includes("select") || ariaLabel.includes("choose");
+  }
+
+  return false;
 };
 
 const checkParentClass = (className) => {
@@ -700,151 +782,6 @@ function getSelectOptions(element) {
   return [selectOptions, removeMultipleSpaces(selectedOption.textContent)];
 }
 
-function getListboxOptions(element) {
-  // get all the elements with role="option" under the element
-  var optionElements = element.querySelectorAll('[role="option"]');
-  let selectOptions = [];
-  for (var i = 0; i < optionElements.length; i++) {
-    let ele = optionElements[i];
-
-    selectOptions.push({
-      optionIndex: i,
-      text: removeMultipleSpaces(getVisibleText(ele)),
-    });
-  }
-  return selectOptions;
-}
-
-async function getSelect2OptionElements(element) {
-  let optionList = [];
-  const document = element.getRootNode();
-
-  while (true) {
-    oldOptionCount = optionList.length;
-    let newOptionList = document.querySelectorAll("[id='select2-drop'] ul li");
-    if (newOptionList.length === oldOptionCount) {
-      console.log("no more options loaded, wait 5s to query again");
-      // sometimes need more time to load the options, so sleep 10s and try again
-      await sleep(5000); // wait 5s
-      newOptionList = document.querySelectorAll("[id='select2-drop'] ul li");
-      console.log(newOptionList.length, " options found, after 5s");
-    }
-
-    optionList = newOptionList;
-    if (optionList.length === 0 || optionList.length === oldOptionCount) {
-      break;
-    }
-
-    lastOption = optionList[optionList.length - 1];
-    if (!lastOption.className.toString().includes("select2-more-results")) {
-      break;
-    }
-    lastOption.scrollIntoView();
-  }
-
-  return optionList;
-}
-
-async function getSelect2Options(element) {
-  const optionList = await getSelect2OptionElements(element);
-
-  let selectOptions = [];
-  for (let i = 0; i < optionList.length; i++) {
-    let ele = optionList[i];
-    if (ele.className.toString().includes("select2-more-results")) {
-      continue;
-    }
-
-    selectOptions.push({
-      optionIndex: i,
-      text: removeMultipleSpaces(ele.textContent),
-    });
-  }
-
-  return selectOptions;
-}
-
-async function getReactSelectOptionElements(element) {
-  var scrollLeft = window.scrollX;
-  var scrollTop = window.scrollY;
-
-  let optionList = [];
-  // wait for 2s until the element is updated with `aria-controls`
-  console.log("wait 2s for the dropdown being updated.");
-  await sleep(2000);
-
-  dropdownId = element.getAttribute("aria-controls");
-  if (!dropdownId) {
-    return optionList;
-  }
-
-  const document = element.getRootNode();
-  dropdownDiv = document.querySelector(`div[id="${dropdownId}"]`);
-  let previousOptionCount = null;
-
-  while (true) {
-    // sometimes need more time to load the options
-    console.log("wait 5s to load all options");
-    await sleep(5000); // wait 5s
-    optionList = dropdownDiv.querySelectorAll("div[class*='select__option']");
-    if (optionList.length === 0) {
-      break;
-    }
-
-    if (
-      previousOptionCount !== null &&
-      previousOptionCount == optionList.length
-    ) {
-      break;
-    }
-    previousOptionCount = optionList.length;
-
-    lastOption = optionList[optionList.length - 1];
-    lastOption.scrollIntoView({ behavior: "instant" });
-
-    lastOption.dispatchEvent(
-      new WheelEvent("wheel", {
-        bubbles: true,
-        cancelable: true,
-        deltaX: 0,
-        deltaY: -20,
-        deltaZ: 0,
-      }),
-    );
-    lastOption.dispatchEvent(
-      new WheelEvent("wheel", {
-        bubbles: true,
-        cancelable: true,
-        deltaX: 0,
-        deltaY: 20,
-        deltaZ: 0,
-      }),
-    );
-  }
-
-  // scroll back to the original place
-  window.scroll({
-    top: scrollTop,
-    left: scrollLeft,
-    behavior: "instant",
-  });
-  return optionList;
-}
-
-async function getReactSelectOptions(element) {
-  const optionList = await getReactSelectOptionElements(element);
-
-  let selectOptions = [];
-  for (let i = 0; i < optionList.length; i++) {
-    let ele = optionList[i];
-    selectOptions.push({
-      optionIndex: i,
-      text: removeMultipleSpaces(ele.textContent),
-    });
-  }
-  return selectOptions;
-}
-
 function getDOMElementBySkyvenElement(elementObj) {
   // if element has shadowHost set, we need to find the shadowHost element first then find the element
   if (elementObj.shadowHost) {
@@ -877,7 +814,7 @@ function uniqueId() {
   return result;
 }
 
-function buildElementObject(frame, element, interactable) {
+function buildElementObject(frame, element, interactable, purgeable = false) {
   var element_id = element.getAttribute("unique_id") ?? uniqueId();
   var elementTagNameLower = element.tagName.toLowerCase();
   element.setAttribute("unique_id", element_id);
@@ -893,7 +830,8 @@ function buildElementObject(frame, element, interactable) {
       attr.name === "selected" ||
       attr.name === "aria-selected" ||
       attr.name === "readonly" ||
-      attr.name === "aria-readonly"
+      attr.name === "aria-readonly" ||
+      attr.name === "disabled"
     ) {
       if (attrValue && attrValue.toLowerCase() === "false") {
         attrValue = false;
@@ -913,11 +851,7 @@ function buildElementObject(frame, element, interactable) {
   }
 
   if (elementTagNameLower === "input" || elementTagNameLower === "textarea") {
-    if (element.type === "radio") {
-      attrs["value"] = "" + element.checked + "";
-    } else {
-      attrs["value"] = element.value;
-    }
+    attrs["value"] = element.value;
   }
 
   let elementObj = {
@@ -929,11 +863,15 @@ function buildElementObject(frame, element, interactable) {
     text: getElementContent(element),
     children: [],
     rect: DomUtils.getVisibleClientRect(element, true),
+    // if purgeable is True, which means this element is only used for building the tree relationship
+    purgeable: purgeable,
     // don't trim any attr of this element if keepAllAttr=True
     keepAllAttr:
       elementTagNameLower === "svg" || element.closest("svg") !== null,
     isSelectable:
       elementTagNameLower === "select" ||
+      isDropdownButton(element) ||
+      isAngularDropdown(element) ||
       isSelect2Dropdown(element) ||
       isSelect2MultiChoice(element),
   };
@@ -967,11 +905,11 @@ function buildElementObject(frame, element, interactable) {
   return elementObj;
 }
 
-function buildTreeFromBody(frame = "main.frame", open_select = false) {
-  return buildElementTree(document.body, frame, open_select);
+function buildTreeFromBody(frame = "main.frame") {
+  return buildElementTree(document.body, frame);
 }
 
-function buildElementTree(starter = document.body, frame = "main.frame") {
+function buildElementTree(starter = document.body, frame, full_tree = false) {
   var elements = [];
   var resultArray = [];
 
@@ -1066,6 +1004,23 @@ function buildElementTree(starter = document.body, frame = "main.frame") {
           // build all table related elements into skyvern element
           // we need these elements to preserve the DOM structure
           elementObj = buildElementObject(frame, element, false);
+        } else if (full_tree) {
+          // when building full tree, we only get text from element itself
+          // elements without text are purgeable
+          elementObj = buildElementObject(frame, element, false, true);
+          let textContent = "";
+          if (isElementVisible(element)) {
+            for (let i = 0; i < element.childNodes.length; i++) {
+              var node = element.childNodes[i];
+              if (node.nodeType === Node.TEXT_NODE) {
+                textContent += node.data.trim();
+              }
+            }
+          }
+          elementObj.text = textContent;
+          if (textContent.length > 0) {
+            elementObj.purgeable = false;
+          }
         } else {
           // character length limit for non-interactable elements should be 5000
           // we don't use element context in HTML format,
@@ -1325,9 +1280,23 @@ function buildElementTree(starter = document.body, frame = "main.frame") {
     }
 
     let ctxList = [];
-    ctxList = getContextByLinked(element, ctxList);
-    ctxList = getContextByParent(element, ctxList);
-    ctxList = getContextByTable(element, ctxList);
+    try {
+      ctxList = getContextByLinked(element, ctxList);
+    } catch (e) {
+      console.error("failed to get context by linked: ", e);
+    }
+
+    try {
+      ctxList = getContextByParent(element, ctxList);
+    } catch (e) {
+      console.error("failed to get context by parent: ", e);
+    }
+
+    try {
+      ctxList = getContextByTable(element, ctxList);
+    } catch (e) {
+      console.error("failed to get context by table: ", e);
+    }
     const context = ctxList.join(";");
     if (context && context.length <= 5000) {
       element.context = context;
@@ -1358,6 +1327,11 @@ function drawBoundingBoxes(elements) {
   var groups = groupElementsVisually(elements);
   var hintMarkers = createHintMarkersForGroups(groups);
   addHintMarkersToPage(hintMarkers);
+}
+
+function buildElementsAndDrawBoundingBoxes() {
+  var elementsAndResultArray = buildTreeFromBody();
+  drawBoundingBoxes(elementsAndResultArray[0]);
 }
 
 function captchaSolvedCallback() {
@@ -1544,10 +1518,17 @@ function scrollToTop(draw_boxes) {
   removeBoundingBoxes();
   window.scroll({ left: 0, top: 0, behavior: "instant" });
   if (draw_boxes) {
-    var elementsAndResultArray = buildTreeFromBody();
-    drawBoundingBoxes(elementsAndResultArray[0]);
+    buildElementsAndDrawBoundingBoxes();
   }
   return window.scrollY;
+}
+
+function getScrollXY() {
+  return [window.scrollX, window.scrollY];
+}
+
+function scrollToXY(x, y) {
+  window.scroll({ left: x, top: y, behavior: "instant" });
 }
 
 function scrollToNextPage(draw_boxes) {
@@ -1560,15 +1541,36 @@ function scrollToNextPage(draw_boxes) {
     behavior: "instant",
   });
   if (draw_boxes) {
-    var elementsAndResultArray = buildTreeFromBody();
-    drawBoundingBoxes(elementsAndResultArray[0]);
+    buildElementsAndDrawBoundingBoxes();
   }
   return window.scrollY;
 }
 
-function scrollToElementBottom(element) {
+function isWindowScrollable() {
+  // Check if the body's overflow style is set to hidden
+  const bodyOverflow = window.getComputedStyle(document.body).overflow;
+  const htmlOverflow = window.getComputedStyle(
+    document.documentElement,
+  ).overflow;
+
+  // Check if the document height is greater than the window height
+  const isScrollable =
+    document.documentElement.scrollHeight > window.innerHeight;
+
+  // If the overflow is set to 'hidden' or there is no content to scroll, return false
+  if (bodyOverflow === "hidden" || htmlOverflow === "hidden" || !isScrollable) {
+    return false;
+  }
+
+  return true;
+}
+
+function scrollToElementBottom(element, page_by_page = false) {
+  const top = page_by_page
+    ? element.clientHeight + element.scrollTop
+    : element.scrollHeight;
   element.scroll({
-    top: element.scrollHeight,
+    top: top,
     left: 0,
     behavior: "smooth",
   });
@@ -1580,10 +1582,6 @@ function scrollToElementTop(element) {
     left: 0,
     behavior: "instant",
   });
-}
-
-async function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // Helper method for debugging
@@ -1622,6 +1620,11 @@ if (window.globalDomDepthMap === undefined) {
   window.globalDomDepthMap = new Map();
 }
 
+function isClassNameIncludesHidden(className) {
+  // some hidden elements are with the classname like `class="select-items select-hide"`
+  return className.toLowerCase().includes("hide");
+}
+
 function addIncrementalNodeToMap(parentNode, childrenNode) {
   // calculate the depth of targetNode element for sorting
   const depth = getElementDomDepth(parentNode);
@@ -1631,7 +1634,7 @@ function addIncrementalNodeToMap(parentNode, childrenNode) {
   }
 
   for (const child of childrenNode) {
-    const [_, newNodeTree] = buildElementTree(child, "", false);
+    const [_, newNodeTree] = buildElementTree(child, "", true);
     if (newNodeTree.length > 0) {
       newNodesTreeList.push(...newNodeTree);
     }
@@ -1647,9 +1650,19 @@ if (window.globalObserverForDOMIncrement === undefined) {
     // TODO: how to detect duplicated recreate element?
     for (const mutation of mutationsList) {
       if (mutation.type === "attributes") {
+        if (mutation.attributeName === "hidden") {
+          const node = mutation.target;
+          if (!node.hidden) {
+            window.globalOneTimeIncrementElements.push({
+              targetNode: node,
+              newNodes: [node],
+            });
+            addIncrementalNodeToMap(node, [node]);
+          }
+        }
         if (mutation.attributeName === "style") {
           // TODO: need to confirm that elemnent is hidden previously
-          node = mutation.target;
+          const node = mutation.target;
           if (node.nodeType === Node.TEXT_NODE) continue;
           const newStyle = window.getComputedStyle(node);
           const newDisplay = newStyle.display;
@@ -1661,10 +1674,23 @@ if (window.globalObserverForDOMIncrement === undefined) {
             addIncrementalNodeToMap(node, [node]);
           }
         }
-
-        // TODO: we maybe need to detect the visiblity change from class
-        // if (mutation.attributeName === "class") {
-        // }
+        if (mutation.attributeName === "class") {
+          const node = mutation.target;
+          if (
+            !mutation.oldValue ||
+            !isClassNameIncludesHidden(mutation.oldValue)
+          )
+            continue;
+          const newStyle = window.getComputedStyle(node);
+          const newDisplay = newStyle.display;
+          if (newDisplay !== "none") {
+            window.globalOneTimeIncrementElements.push({
+              targetNode: node,
+              newNodes: [node],
+            });
+            addIncrementalNodeToMap(node, [node]);
+          }
+        }
       }
 
       if (mutation.type === "childList") {
@@ -1724,7 +1750,23 @@ function getIncrementElements() {
     const treeList = window.globalDomDepthMap.get(depth);
 
     const removeDupAndConcatChildren = (element) => {
-      const children = element.children;
+      let children = element.children;
+      for (let i = 0; i < children.length; i++) {
+        const child = children[i];
+        const domElement = document.querySelector(`[unique_id="${child.id}"]`);
+        // if the element is still on the page, we rebuild the element to update the information
+        if (domElement) {
+          let newChild = buildElementObject(
+            "",
+            domElement,
+            child.interactable,
+            child.purgeable,
+          );
+          newChild.children = child.children;
+          children[i] = newChild;
+        }
+      }
+
       if (idToElement.has(element.id)) {
         element = idToElement.get(element.id);
         for (let i = 0; i < children.length; i++) {
@@ -1741,7 +1783,22 @@ function getIncrementElements() {
       }
     };
 
-    for (const treeHeadElement of treeList) {
+    for (let treeHeadElement of treeList) {
+      const domElement = document.querySelector(
+        `[unique_id="${treeHeadElement.id}"]`,
+      );
+      // if the element is still on the page, we rebuild the element to update the information
+      if (domElement) {
+        let newHead = buildElementObject(
+          "",
+          domElement,
+          treeHeadElement.interactable,
+          treeHeadElement.purgeable,
+        );
+        newHead.children = treeHeadElement.children;
+        treeHeadElement = newHead;
+      }
+
       // check if the element is existed
       if (!idToElement.has(treeHeadElement.id)) {
         cleanedTreeList.push(treeHeadElement);

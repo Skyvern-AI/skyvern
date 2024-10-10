@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ParameterType(StrEnum):
@@ -13,6 +13,7 @@ class ParameterType(StrEnum):
     AWS_SECRET = "aws_secret"
     BITWARDEN_LOGIN_CREDENTIAL = "bitwarden_login_credential"
     BITWARDEN_SENSITIVE_INFORMATION = "bitwarden_sensitive_information"
+    BITWARDEN_CREDIT_CARD_DATA = "bitwarden_credit_card_data"
     OUTPUT = "output"
 
 
@@ -86,6 +87,25 @@ class BitwardenSensitiveInformationParameter(Parameter):
     deleted_at: datetime | None = None
 
 
+class BitwardenCreditCardDataParameter(Parameter):
+    model_config = ConfigDict(from_attributes=True)
+    parameter_type: Literal[ParameterType.BITWARDEN_CREDIT_CARD_DATA] = ParameterType.BITWARDEN_CREDIT_CARD_DATA
+    # parameter fields
+    bitwarden_credit_card_data_parameter_id: str
+    workflow_id: str
+    # bitwarden cli required fields
+    bitwarden_client_id_aws_secret_key: str
+    bitwarden_client_secret_aws_secret_key: str
+    bitwarden_master_password_aws_secret_key: str
+    # bitwarden ids for the credit card item
+    bitwarden_collection_id: str
+    bitwarden_item_id: str
+
+    created_at: datetime
+    modified_at: datetime
+    deleted_at: datetime | None = None
+
+
 class WorkflowParameterType(StrEnum):
     STRING = "string"
     INTEGER = "integer"
@@ -150,6 +170,7 @@ ParameterSubclasses = Union[
     AWSSecretParameter,
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
+    BitwardenCreditCardDataParameter,
     OutputParameter,
 ]
 PARAMETER_TYPE = Annotated[ParameterSubclasses, Field(discriminator="parameter_type")]
