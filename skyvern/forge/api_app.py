@@ -19,7 +19,6 @@ from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.routes.agent_protocol import base_router
 from skyvern.forge.sdk.routes.streaming import websocket_router
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.scheduler import SCHEDULER
 
 LOG = structlog.get_logger()
 
@@ -64,8 +63,6 @@ def get_agent_app() -> FastAPI:
     @app.on_event("startup")
     def start_scheduler() -> None:
         LOG.info("Starting the skyvern scheduler.")
-        SCHEDULER.start()
-
         LOG.info("Server startup complete. Skyvern is now online")
 
     @app.exception_handler(NotFoundError)
