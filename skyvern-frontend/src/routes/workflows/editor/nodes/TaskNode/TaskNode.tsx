@@ -389,7 +389,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
             <div className="space-y-4">
               <div className="space-y-1">
                 <Label className="text-xs text-slate-300">
-                  TOTP Verification URL
+                  2FA Verification URL
                 </Label>
                 <AutoResizingTextarea
                   onChange={(event) => {
@@ -404,9 +404,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                 />
               </div>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">
-                  Unique Identifier
-                </Label>
+                <Label className="text-xs text-slate-300">2FA Identifier</Label>
                 <AutoResizingTextarea
                   onChange={(event) => {
                     if (!editable) {
