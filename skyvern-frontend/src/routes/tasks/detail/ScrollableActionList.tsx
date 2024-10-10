@@ -2,6 +2,7 @@ import { getClient } from "@/api/AxiosClient";
 import { Action, ActionTypes, ReadableActionTypes } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import {
   Tooltip,
@@ -155,29 +156,33 @@ function ScrollableActionList({
           <ArrowDownIcon />
         </Button>
       </div>
-      <div className="w-full space-y-4 overflow-y-scroll px-4 pb-4">
-        {showStreamOption && (
-          <div
-            key="stream"
-            ref={(element) => {
-              refs.current[data.length] = element;
-            }}
-            className={cn(
-              "flex cursor-pointer rounded-lg border p-4 shadow-md hover:border-slate-300",
-              {
-                "border-slate-300": activeIndex === "stream",
-              },
+      <ScrollArea>
+        <ScrollAreaViewport className="h-full w-full rounded-[inherit]">
+          <div className="w-full space-y-4 px-4 pb-4">
+            {showStreamOption && (
+              <div
+                key="stream"
+                ref={(element) => {
+                  refs.current[data.length] = element;
+                }}
+                className={cn(
+                  "flex cursor-pointer rounded-lg border p-4 shadow-md hover:border-slate-300",
+                  {
+                    "border-slate-300": activeIndex === "stream",
+                  },
+                )}
+                onClick={() => onActiveIndexChange("stream")}
+              >
+                <div className="flex items-center gap-2 text-lg">
+                  <DotFilledIcon className="h-6 w-6 text-red-500" />
+                  Live
+                </div>
+              </div>
             )}
-            onClick={() => onActiveIndexChange("stream")}
-          >
-            <div className="flex items-center gap-2 text-lg">
-              <DotFilledIcon className="h-6 w-6 text-red-500" />
-              Live
-            </div>
+            {getReverseActions()}
           </div>
-        )}
-        {getReverseActions()}
-      </div>
+        </ScrollAreaViewport>
+      </ScrollArea>
     </div>
   );
 }
