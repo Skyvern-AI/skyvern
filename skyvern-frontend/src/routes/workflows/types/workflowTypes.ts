@@ -219,3 +219,9 @@ export type WorkflowApiResponse = {
   modified_at: string;
   deleted_at: string | null;
 };
+
+export function isOutputParameter(
+  parameter: Parameter,
+): parameter is OutputParameter {
+  return parameter.parameter_type === "output";
+}

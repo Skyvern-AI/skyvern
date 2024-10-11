@@ -2,10 +2,25 @@ import Dagre from "@dagrejs/dagre";
 import { Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
 import type {
+  OutputParameter,
+  Parameter,
+  WorkflowApiResponse,
   WorkflowBlock,
   WorkflowParameterValueType,
 } from "../types/workflowTypes";
-import { BlockYAML, ParameterYAML } from "../types/workflowYamlTypes";
+import {
+  BlockYAML,
+  CodeBlockYAML,
+  DownloadToS3BlockYAML,
+  FileUrlParserBlockYAML,
+  ForLoopBlockYAML,
+  ParameterYAML,
+  SendEmailBlockYAML,
+  TaskBlockYAML,
+  TextPromptBlockYAML,
+  UploadToS3BlockYAML,
+  WorkflowCreateYAMLRequest,
+} from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
   REACT_FLOW_EDGE_Z_INDEX,
@@ -494,7 +509,9 @@ function getWorkflowBlock(
           string,
           string
         > | null,
-        max_retries: node.data.maxRetries ?? undefined,
+        ...(node.data.maxRetries !== null && {
+          max_retries: node.data.maxRetries,
+        }),
         max_steps_per_run: node.data.maxStepsOverride,
         complete_on_download: node.data.allowDownloads,
         download_suffix: node.data.downloadSuffix,
@@ -875,6 +892,187 @@ function getAvailableOutputParameterKeys(
   return outputParameterKeys;
 }
 
+function convertParameters(
+  parameters: Array<Exclude<Parameter, OutputParameter>>,
+): Array<ParameterYAML> {
+  return parameters.map((parameter) => {
+    const base = {
+      key: parameter.key,
+      description: parameter.description,
+    };
+    switch (parameter.parameter_type) {
+      case "aws_secret": {
+        return {
+          ...base,
+          parameter_type: "aws_secret",
+          aws_key: parameter.aws_key,
+        };
+      }
+      case "bitwarden_login_credential": {
+        return {
+          ...base,
+          parameter_type: "bitwarden_login_credential",
+          bitwarden_collection_id: parameter.bitwarden_collection_id,
+          url_parameter_key: parameter.url_parameter_key,
+          bitwarden_client_id_aws_secret_key: "SKYVERN_BITWARDEN_CLIENT_ID",
+          bitwarden_client_secret_aws_secret_key:
+            "SKYVERN_BITWARDEN_CLIENT_SECRET",
+          bitwarden_master_password_aws_secret_key:
+            "SKYVERN_BITWARDEN_MASTER_PASSWORD",
+        };
+      }
+      case "bitwarden_sensitive_information": {
+        return {
+          ...base,
+          parameter_type: "bitwarden_sensitive_information",
+          bitwarden_collection_id: parameter.bitwarden_collection_id,
+          bitwarden_identity_key: parameter.bitwarden_identity_key,
+          bitwarden_identity_fields: parameter.bitwarden_identity_fields,
+          bitwarden_client_id_aws_secret_key:
+            parameter.bitwarden_client_id_aws_secret_key,
+          bitwarden_client_secret_aws_secret_key:
+            parameter.bitwarden_client_secret_aws_secret_key,
+          bitwarden_master_password_aws_secret_key:
+            parameter.bitwarden_master_password_aws_secret_key,
+        };
+      }
+      case "context": {
+        return {
+          ...base,
+          parameter_type: "context",
+          source_parameter_key: parameter.source.key,
+        };
+      }
+      case "workflow": {
+        return {
+          ...base,
+          parameter_type: "workflow",
+          workflow_parameter_type: parameter.workflow_parameter_type,
+          default_value: parameter.default_value,
+        };
+      }
+    }
+  });
+}
+
+function convertBlocks(blocks: Array<WorkflowBlock>): Array<BlockYAML> {
+  return blocks.map((block) => {
+    const base = {
+      label: block.label,
+      continue_on_failure: block.continue_on_failure,
+    };
+    switch (block.block_type) {
+      case "task": {
+        const blockYaml: TaskBlockYAML = {
+          ...base,
+          block_type: "task",
+          url: block.url,
+          navigation_goal: block.navigation_goal,
+          data_extraction_goal: block.data_extraction_goal,
+          data_schema: block.data_schema,
+          error_code_mapping: block.error_code_mapping,
+          max_retries: block.max_retries,
+          max_steps_per_run: block.max_steps_per_run,
+          complete_on_download: block.complete_on_download,
+          download_suffix: block.download_suffix,
+          parameter_keys: block.parameters.map((p) => p.key),
+          totp_identifier: block.totp_identifier,
+          totp_verification_url: block.totp_verification_url,
+        };
+        return blockYaml;
+      }
+      case "for_loop": {
+        const blockYaml: ForLoopBlockYAML = {
+          ...base,
+          block_type: "for_loop",
+          loop_over_parameter_key: block.loop_over.key,
+          loop_blocks: convertBlocks(block.loop_blocks),
+        };
+        return blockYaml;
+      }
+      case "code": {
+        const blockYaml: CodeBlockYAML = {
+          ...base,
+          block_type: "code",
+          code: block.code,
+        };
+        return blockYaml;
+      }
+      case "text_prompt": {
+        const blockYaml: TextPromptBlockYAML = {
+          ...base,
+          block_type: "text_prompt",
+          llm_key: block.llm_key,
+          prompt: block.prompt,
+          json_schema: block.json_schema,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
+      case "download_to_s3": {
+        const blockYaml: DownloadToS3BlockYAML = {
+          ...base,
+          block_type: "download_to_s3",
+          url: block.url,
+        };
+        return blockYaml;
+      }
+      case "upload_to_s3": {
+        const blockYaml: UploadToS3BlockYAML = {
+          ...base,
+          block_type: "upload_to_s3",
+          path: block.path,
+        };
+        return blockYaml;
+      }
+      case "file_url_parser": {
+        const blockYaml: FileUrlParserBlockYAML = {
+          ...base,
+          block_type: "file_url_parser",
+          file_url: block.file_url,
+          file_type: block.file_type,
+        };
+        return blockYaml;
+      }
+      case "send_email": {
+        const blockYaml: SendEmailBlockYAML = {
+          ...base,
+          block_type: "send_email",
+          smtp_host_secret_parameter_key: block.smtp_host?.key,
+          smtp_port_secret_parameter_key: block.smtp_port?.key,
+          smtp_username_secret_parameter_key: block.smtp_username?.key,
+          smtp_password_secret_parameter_key: block.smtp_password?.key,
+          sender: block.sender,
+          recipients: block.recipients,
+          subject: block.subject,
+          body: block.body,
+          file_attachments: block.file_attachments,
+        };
+        return blockYaml;
+      }
+    }
+  });
+}
+
+function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
+  const title = `Copy of ${workflow.title}`;
+  const userParameters = workflow.workflow_definition.parameters.filter(
+    (parameter) => parameter.parameter_type !== "output",
+  );
+  return {
+    title: title,
+    description: workflow.description,
+    proxy_location: workflow.proxy_location,
+    webhook_callback_url: workflow.webhook_callback_url,
+    totp_verification_url: workflow.totp_verification_url,
+    workflow_definition: {
+      parameters: convertParameters(userParameters),
+      blocks: convertBlocks(workflow.workflow_definition.blocks),
+    },
+    is_saved_task: workflow.is_saved_task,
+  };
+}
+
 export {
   createNode,
   generateNodeData,
@@ -893,4 +1091,5 @@ export {
   getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
   getPreviousNodeIds,
   getAvailableOutputParameterKeys,
+  convert,
 };
