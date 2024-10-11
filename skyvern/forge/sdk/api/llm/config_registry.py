@@ -210,6 +210,7 @@ if SettingsManager.get_settings().ENABLE_AZURE_GPT4O_MINI:
                 api_base=SettingsManager.get_settings().AZURE_GPT4O_MINI_API_BASE,
                 api_key=SettingsManager.get_settings().AZURE_GPT4O_MINI_API_KEY,
                 api_version=SettingsManager.get_settings().AZURE_GPT4O_MINI_API_VERSION,
+                model_info={"model_name": "azure/gpt-4o-mini"},
             ),
             supports_vision=True,
             add_assistant_prefix=False,
