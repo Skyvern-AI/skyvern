@@ -19,7 +19,7 @@ import { SubmitEvent } from "@/types";
 import { copyText } from "@/util/copyText";
 import { apiBaseUrl } from "@/util/env";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { CopyIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { ToastAction } from "@radix-ui/react-toast";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
@@ -796,10 +796,12 @@ function SavedTaskForm({ initialValues }: Props) {
             value="create"
             disabled={createAndSaveTaskMutation.isPending}
           >
-            {createAndSaveTaskMutation.isPending && (
+            {createAndSaveTaskMutation.isPending ? (
               <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <PlayIcon className="mr-2 h-4 w-4" />
             )}
-            Run Task
+            Run
           </Button>
         </div>
       </form>
