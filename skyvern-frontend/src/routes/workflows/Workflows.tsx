@@ -37,10 +37,10 @@ import {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { stringify as convertToYAML } from "yaml";
-import { DeleteWorkflowButton } from "./editor/DeleteWorkflowButton";
 import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 import { WorkflowTitle } from "./WorkflowTitle";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { WorkflowActions } from "./WorkflowActions";
 
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
@@ -279,9 +279,7 @@ function Workflows() {
                             <TooltipContent>Create New Run</TooltipContent>
                           </Tooltip>
                         </TooltipProvider>
-                        <DeleteWorkflowButton
-                          id={workflow.workflow_permanent_id}
-                        />
+                        <WorkflowActions id={workflow.workflow_permanent_id} />
                       </div>
                     </TableCell>
                   </TableRow>
