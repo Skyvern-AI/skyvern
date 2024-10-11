@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Literal, Optional, Protocol, TypedDict
+from typing import Any, Awaitable, Literal, Optional, Protocol
 
 from litellm import AllowedFailsPolicy
 
@@ -7,10 +7,12 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
 
-class LiteLLMParams(TypedDict):
+@dataclass
+class LiteLLMParams:
     api_key: str | None
     api_version: str | None
     api_base: str | None
+    model_info: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
