@@ -89,7 +89,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
 
   const basicContent = (
     <>
-      <div className="space-y-1">
+      <div className="space-y-2">
         <Label className="text-xs text-slate-300">URL</Label>
         <AutoResizingTextarea
           value={inputs.url}
@@ -104,8 +104,11 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
           placeholder={fieldPlaceholders["url"]}
         />
       </div>
-      <div className="space-y-1">
-        <Label className="text-xs text-slate-300">Goal</Label>
+      <div className="space-y-2">
+        <div className="flex gap-2">
+          <Label className="text-xs text-slate-300">Goal</Label>
+          <HelpTooltip content={helpTooltipContent["navigationGoal"]} />
+        </div>
         <AutoResizingTextarea
           onChange={(event) => {
             if (!editable) {
@@ -118,7 +121,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
           className="nopan text-xs"
         />
       </div>
-      <div className="space-y-1">
+      <div className="space-y-2">
         <TaskNodeParametersPanel
           availableOutputParameters={outputParameterKeys}
           parameters={data.parameterKeys}
@@ -134,17 +137,10 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
     <>
       <Accordion type="multiple" defaultValue={["content"]}>
         <AccordionItem value="content">
-          <AccordionTrigger>
-            <div className="flex w-full items-center justify-between">
-              <div>Content</div>
-              <div>
-                <HelpTooltip content={helpTooltipContent["base"]} />
-              </div>
-            </div>
-          </AccordionTrigger>
+          <AccordionTrigger>Content</AccordionTrigger>
           <AccordionContent className="pl-[1.5rem] pr-1">
             <div className="space-y-4">
-              <div className="space-y-1">
+              <div className="space-y-2">
                 <Label className="text-xs text-slate-300">URL</Label>
                 <AutoResizingTextarea
                   onChange={(event) => {
@@ -158,8 +154,11 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                   className="nopan text-xs"
                 />
               </div>
-              <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Goal</Label>
+              <div className="space-y-2">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">Goal</Label>
+                  <HelpTooltip content={helpTooltipContent["navigationGoal"]} />
+                </div>
                 <AutoResizingTextarea
                   onChange={(event) => {
                     if (!editable) {
@@ -172,7 +171,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                   className="nopan text-xs"
                 />
               </div>
-              <div className="space-y-1">
+              <div className="space-y-2">
                 <TaskNodeParametersPanel
                   availableOutputParameters={outputParameterKeys}
                   parameters={data.parameterKeys}
@@ -185,20 +184,18 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
           </AccordionContent>
         </AccordionItem>
         <AccordionItem value="extraction">
-          <AccordionTrigger>
-            <div className="flex w-full items-center justify-between">
-              <div>Extraction</div>
-              <div>
-                <HelpTooltip content={helpTooltipContent["extraction"]} />
-              </div>
-            </div>
-          </AccordionTrigger>
+          <AccordionTrigger>Extraction</AccordionTrigger>
           <AccordionContent className="pl-[1.5rem] pr-1">
             <div className="space-y-4">
-              <div className="space-y-1">
-                <Label className="text-xs text-slate-300">
-                  Data Extraction Goal
-                </Label>
+              <div className="space-y-2">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    Data Extraction Goal
+                  </Label>
+                  <HelpTooltip
+                    content={helpTooltipContent["dataExtractionGoal"]}
+                  />
+                </div>
                 <AutoResizingTextarea
                   onChange={(event) => {
                     if (!editable) {
@@ -212,8 +209,13 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                 />
               </div>
               <div className="space-y-2">
-                <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">Data Schema</Label>
+                <div className="flex gap-4">
+                  <div className="flex gap-2">
+                    <Label className="text-xs text-slate-300">
+                      Data Schema
+                    </Label>
+                    <HelpTooltip content={helpTooltipContent["dataSchema"]} />
+                  </div>
                   <Checkbox
                     checked={inputs.dataSchema !== "null"}
                     onCheckedChange={(checked) => {
@@ -249,20 +251,16 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
           </AccordionContent>
         </AccordionItem>
         <AccordionItem value="limits">
-          <AccordionTrigger>
-            <div className="flex w-full items-center justify-between">
-              <div>Limits</div>
-              <div>
-                <HelpTooltip content={helpTooltipContent["limits"]} />
-              </div>
-            </div>
-          </AccordionTrigger>
+          <AccordionTrigger>Limits</AccordionTrigger>
           <AccordionContent className="pl-[1.5rem] pr-1 pt-1">
             <div className="space-y-4">
               <div className="flex items-center justify-between">
-                <Label className="text-xs font-normal text-slate-300">
-                  Max Retries
-                </Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs font-normal text-slate-300">
+                    Max Retries
+                  </Label>
+                  <HelpTooltip content={helpTooltipContent["maxRetries"]} />
+                </div>
                 <Input
                   type="number"
                   placeholder={fieldPlaceholders["maxRetries"]}
@@ -282,9 +280,14 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                 />
               </div>
               <div className="flex items-center justify-between">
-                <Label className="text-xs font-normal text-slate-300">
-                  Max Steps Override
-                </Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs font-normal text-slate-300">
+                    Max Steps Override
+                  </Label>
+                  <HelpTooltip
+                    content={helpTooltipContent["maxStepsOverride"]}
+                  />
+                </div>
                 <Input
                   type="number"
                   placeholder={fieldPlaceholders["maxStepsOverride"]}
@@ -304,9 +307,14 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                 />
               </div>
               <div className="flex items-center justify-between">
-                <Label className="text-xs font-normal text-slate-300">
-                  Complete on Download
-                </Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs font-normal text-slate-300">
+                    Complete on Download
+                  </Label>
+                  <HelpTooltip
+                    content={helpTooltipContent["completeOnDownload"]}
+                  />
+                </div>
                 <div className="w-52">
                   <Switch
                     checked={inputs.allowDownloads}
@@ -320,9 +328,12 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                 </div>
               </div>
               <div className="flex items-center justify-between">
-                <Label className="text-xs font-normal text-slate-300">
-                  File Suffix
-                </Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs font-normal text-slate-300">
+                    File Suffix
+                  </Label>
+                  <HelpTooltip content={helpTooltipContent["fileSuffix"]} />
+                </div>
                 <Input
                   type="text"
                   placeholder={fieldPlaceholders["downloadSuffix"]}
@@ -337,10 +348,15 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                 />
               </div>
               <div className="space-y-2">
-                <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
-                    Error Messages
-                  </Label>
+                <div className="flex gap-4">
+                  <div className="flex gap-2">
+                    <Label className="text-xs font-normal text-slate-300">
+                      Error Messages
+                    </Label>
+                    <HelpTooltip
+                      content={helpTooltipContent["errorCodeMapping"]}
+                    />
+                  </div>
                   <Checkbox
                     checked={inputs.errorCodeMapping !== "null"}
                     disabled={!editable}
@@ -377,20 +393,18 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
           </AccordionContent>
         </AccordionItem>
         <AccordionItem value="totp">
-          <AccordionTrigger>
-            <div className="flex w-full items-center justify-between">
-              <div>Two-Factor Authentication</div>
-              <div>
-                <HelpTooltip content={helpTooltipContent["totp"]} />
-              </div>
-            </div>
-          </AccordionTrigger>
+          <AccordionTrigger>Two-Factor Authentication</AccordionTrigger>
           <AccordionContent className="pl-[1.5rem] pr-1">
             <div className="space-y-4">
-              <div className="space-y-1">
-                <Label className="text-xs text-slate-300">
-                  2FA Verification URL
-                </Label>
+              <div className="space-y-2">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    2FA Verification URL
+                  </Label>
+                  <HelpTooltip
+                    content={helpTooltipContent["totpVerificationUrl"]}
+                  />
+                </div>
                 <AutoResizingTextarea
                   onChange={(event) => {
                     if (!editable) {
@@ -403,8 +417,13 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                   className="nopan text-xs"
                 />
               </div>
-              <div className="space-y-1">
-                <Label className="text-xs text-slate-300">2FA Identifier</Label>
+              <div className="space-y-2">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">
+                    2FA Identifier
+                  </Label>
+                  <HelpTooltip content={helpTooltipContent["totpIdentifier"]} />
+                </div>
                 <AutoResizingTextarea
                   onChange={(event) => {
                     if (!editable) {
