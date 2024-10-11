@@ -19,7 +19,7 @@ import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { copyText } from "@/util/copyText";
 import { apiBaseUrl } from "@/util/env";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { CopyIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { ToastAction } from "@radix-ui/react-toast";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
@@ -608,7 +608,8 @@ function CreateNewTaskForm({ initialValues }: Props) {
             {mutation.isPending && (
               <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
             )}
-            Create
+            <PlayIcon className="mr-2 h-4 w-4" />
+            Run
           </Button>
         </div>
       </form>
