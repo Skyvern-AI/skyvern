@@ -573,7 +573,7 @@ def _trimmed_attributes(attributes: dict) -> dict:
     for key in attributes:
         if key == "role" and attributes[key] in ["listbox", "option"]:
             new_attributes[key] = attributes[key]
-        if key in RESERVED_ATTRIBUTES and attributes[key]:
+        if key in RESERVED_ATTRIBUTES:
             new_attributes[key] = attributes[key]
 
     return new_attributes
