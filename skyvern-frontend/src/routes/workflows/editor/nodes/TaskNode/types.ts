@@ -49,6 +49,27 @@ export const helpTooltipContent = {
   limits:
     "Give Skyvern limitations, such as number of retries on failure, the number of maximum steps, the option to download and append suffix identifiers, and return message for errors Skyvern encounters.",
   totp: "Link your internal TOTP storage system to relay 2FA codes we encounter straight to Skyvern. If you have multiple tasks running simultaneously, make sure to link an identifier so Skyvern knows which TOTP URL goes with which task.",
+  navigationGoal:
+    "Give Skyvern an objective. Make sure to include when the task is complete, when it should self-terminate, and any guardrails.",
+  parameters:
+    "Define placeholder values using the “parameters” drop down that you predefine or redefine run-to-run.",
+  dataExtractionGoal:
+    "Tell Skyvern what data you would like to scrape at the end of your run.",
+  dataSchema: "Specify a format for extracted data in JSON.",
+  maxRetries:
+    "Specify how many times you would like a step within a task to retry upon failure.",
+  maxStepsOverride:
+    "Specify the maximum number of steps a task can take in total.",
+  completeOnDownload:
+    "Allow Skyvern to auto-complete the task when it downloads a file.",
+  fileSuffix:
+    "If you allow complete on download, you can opt-in to add a suffix identifier.",
+  errorCodeMapping:
+    "Knowing about why a task terminated can be important, specify error messages here.",
+  totpVerificationUrl:
+    "If you have an internal system for storing TOTP codes, link the endpoint here.",
+  totpIdentifier:
+    "If you are running multiple tasks or workflows at once, you will need to give the task an identifier to know that this TOTP goes with this task.",
 } as const;
 
 export const fieldPlaceholders = {
