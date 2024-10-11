@@ -46,6 +46,7 @@ import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
 import fetchToCurl from "fetch-to-curl";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { copyText } from "@/util/copyText";
+import { ZoomableImage } from "@/components/ZoomableImage";
 
 type StreamMessage = {
   task_id: string;
@@ -214,7 +215,7 @@ function WorkflowRun() {
     if (workflowRun?.status === Status.Running && streamImgSrc.length > 0) {
       return (
         <div className="h-full w-full">
-          <img src={`data:image/png;base64,${streamImgSrc}`} />
+          <ZoomableImage src={`data:image/png;base64,${streamImgSrc}`} />
         </div>
       );
     }

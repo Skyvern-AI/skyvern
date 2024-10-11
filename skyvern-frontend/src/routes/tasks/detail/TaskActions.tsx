@@ -16,6 +16,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/use-toast";
 import { envCredential } from "@/util/env";
 import { statusIsNotFinalized, statusIsRunningOrQueued } from "../types";
+import { ZoomableImage } from "@/components/ZoomableImage";
 
 type StreamMessage = {
   task_id: string;
@@ -227,7 +228,7 @@ function TaskActions() {
     if (task?.status === Status.Running && streamImgSrc.length > 0) {
       return (
         <div className="h-full w-full">
-          <img src={`data:image/png;base64,${streamImgSrc}`} />
+          <ZoomableImage src={`data:image/png;base64,${streamImgSrc}`} />
         </div>
       );
     }
