@@ -31,7 +31,6 @@ services:
       - ./videos:/data/videos
       - ./har:/data/har
       - ./.streamlit:/app/.streamlit
-      - ./files:/tmp
     environment:
       - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
       - BROWSER_TYPE=chromium-headful
