@@ -7,7 +7,6 @@ export const sampleCases = [
   "california_edd",
   "bci_seguros",
   "job_application",
-  "contact_us_forms",
 ] as const;
 
 export type SampleCase = (typeof sampleCases)[number];

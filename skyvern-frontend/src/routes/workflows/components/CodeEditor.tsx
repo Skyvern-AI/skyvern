@@ -6,7 +6,7 @@ import { cn } from "@/util/utils";
 
 type Props = {
   value: string;
-  onChange: (value: string) => void;
+  onChange?: (value: string) => void;
   language: "python" | "json";
   disabled?: boolean;
   minHeight?: string;
