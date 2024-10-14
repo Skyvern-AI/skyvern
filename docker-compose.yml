@@ -37,6 +37,7 @@ services:
       - ENABLE_OPENAI=true
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - LLM_KEY=${LLM_KEY}
+      - LOG_LEVEL=${LOG_LEVEL}
       # If you want to use other LLM provider, like azure and anthropic:
       # - ENABLE_ANTHROPIC=true
       # - LLM_KEY=ANTHROPIC_CLAUDE3_OPUS
