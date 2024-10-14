@@ -174,3 +174,6 @@ files/
 node_modules
 .env.backup
 .env.old
+
+## Replit
+.replit

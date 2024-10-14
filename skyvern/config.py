@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     ENV: str = "local"
     EXECUTE_ALL_STEPS: bool = True
     JSON_LOGGING: bool = False
-    LOG_LEVEL: str = "INFO"
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
 
