@@ -16,19 +16,6 @@ import {
   ScrollBar,
 } from "@/components/ui/scroll-area";
 
-function createTaskFromTaskGenerationParameters(
-  values: TaskGenerationApiResponse,
-) {
-  return {
-    url: values.url,
-    navigation_goal: values.navigation_goal,
-    data_extraction_goal: values.data_extraction_goal,
-    proxy_location: "RESIDENTIAL",
-    navigation_payload: values.navigation_payload,
-    extracted_information_schema: values.extracted_information_schema,
-  };
-}
-
 function createTemplateTaskFromTaskGenerationParameters(
   values: TaskGenerationApiResponse,
 ) {
@@ -120,27 +107,6 @@ function PromptBox() {
     },
   });
 
-  const runTaskMutation = useMutation({
-    mutationFn: async (params: TaskGenerationApiResponse) => {
-      const client = await getClient(credentialGetter);
-      const data = createTaskFromTaskGenerationParameters(params);
-      return client.post<
-        ReturnType<typeof createTaskFromTaskGenerationParameters>,
-        { data: { task_id: string } }
-      >("/tasks", data);
-    },
-    onSuccess: (response) => {
-      navigate(`/tasks/${response.data.task_id}/actions`);
-    },
-    onError: (error: AxiosError) => {
-      toast({
-        variant: "destructive",
-        title: "Error running task",
-        description: error.message,
-      });
-    },
-  });
-
   return (
     <div>
       <div
@@ -163,8 +129,7 @@ function PromptBox() {
             />
             <div className="h-full">
               {getTaskFromPromptMutation.isPending ||
-              saveTaskMutation.isPending ||
-              runTaskMutation.isPending ? (
+              saveTaskMutation.isPending ? (
                 <ReloadIcon className="h-6 w-6 animate-spin" />
               ) : (
                 <PaperPlaneIcon
@@ -173,7 +138,11 @@ function PromptBox() {
                     const taskGenerationResponse =
                       await getTaskFromPromptMutation.mutateAsync(prompt);
                     await saveTaskMutation.mutateAsync(taskGenerationResponse);
-                    await runTaskMutation.mutateAsync(taskGenerationResponse);
+                    navigate("/create/from-prompt", {
+                      state: {
+                        data: taskGenerationResponse,
+                      },
+                    });
                   }}
                 />
               )}
