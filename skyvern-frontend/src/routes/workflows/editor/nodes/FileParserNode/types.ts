@@ -13,3 +13,8 @@ export const fileParserNodeDefaultData: FileParserNodeData = {
   label: "",
   fileUrl: "",
 } as const;
+
+export const helpTooltipContent = {
+  fileUrl:
+    "Since we're in beta this section isn't fully customizable yet, contact us if you'd like to integrate it into your workflow.",
+} as const;

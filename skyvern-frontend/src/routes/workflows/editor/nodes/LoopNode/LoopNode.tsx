@@ -23,7 +23,8 @@ import { useWorkflowParametersState } from "../../useWorkflowParametersState";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
-import type { LoopNode } from "./types";
+import { helpTooltipContent, type LoopNode } from "./types";
+import { HelpTooltip } from "@/components/HelpTooltip";
 
 function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const { updateNodeData } = useReactFlow();
@@ -105,10 +106,13 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                 }}
               />
             </div>
-            <div className="space-y-1">
-              <Label className="text-xs text-slate-300">
-                Loop Value Parameter
-              </Label>
+            <div className="space-y-2">
+              <div className="flex gap-2">
+                <Label className="text-xs text-slate-300">
+                  Loop Value Parameter
+                </Label>
+                <HelpTooltip content={helpTooltipContent["loopValue"]} />
+              </div>
               <Select
                 value={data.loopValue}
                 onValueChange={(value) => {
@@ -116,7 +120,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                 }}
               >
                 <SelectTrigger>
-                  <SelectValue placeholder="Select a parameter" />
+                  <SelectValue placeholder="Select the parameter to iterate over" />
                 </SelectTrigger>
                 <SelectContent>
                   {[...parameterKeys, ...outputParameterKeys].map(

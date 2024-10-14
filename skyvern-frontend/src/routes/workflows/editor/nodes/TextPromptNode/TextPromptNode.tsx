@@ -10,7 +10,8 @@ import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { useState } from "react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
-import type { TextPromptNode } from "./types";
+import { helpTooltipContent, type TextPromptNode } from "./types";
+import { HelpTooltip } from "@/components/HelpTooltip";
 
 function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
   const { updateNodeData } = useReactFlow();
@@ -63,8 +64,11 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
             }}
           />
         </div>
-        <div className="space-y-1">
-          <Label className="text-xs text-slate-300">Prompt</Label>
+        <div className="space-y-2">
+          <div className="flex gap-2">
+            <Label className="text-xs text-slate-300">Prompt</Label>
+            <HelpTooltip content={helpTooltipContent["prompt"]} />
+          </div>
           <AutoResizingTextarea
             onChange={(event) => {
               if (!editable) {

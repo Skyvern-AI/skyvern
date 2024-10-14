@@ -480,23 +480,18 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
             }}
           />
         </div>
-        <div className="flex items-center justify-between">
-          <TaskNodeDisplayModeSwitch
-            value={displayMode}
-            onChange={(mode) => {
-              setDisplayMode(mode);
-              if (workflowPermanentId) {
-                localStorage.setItem(
-                  getLocalStorageKey(workflowPermanentId, label),
-                  mode,
-                );
-              }
-            }}
-          />
-          {displayMode === "basic" && (
-            <HelpTooltip content={helpTooltipContent["base"]} />
-          )}
-        </div>
+        <TaskNodeDisplayModeSwitch
+          value={displayMode}
+          onChange={(mode) => {
+            setDisplayMode(mode);
+            if (workflowPermanentId) {
+              localStorage.setItem(
+                getLocalStorageKey(workflowPermanentId, label),
+                mode,
+              );
+            }
+          }}
+        />
         {displayMode === "basic" && basicContent}
         {displayMode === "advanced" && advancedContent}
       </div>
