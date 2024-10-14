@@ -68,8 +68,8 @@ services:
       - ./har:/data/har
       - ./.streamlit:/app/.streamlit
     environment:
-      - VITE_WSS_BASE_URL=ws://localhost:8001/api/v1
-    #   - VITE_API_BASE_URL=
+      - VITE_WSS_BASE_URL=${VITE_WSS_BASE_URL}
+      - VITE_API_BASE_URL=${VITE_API_BASE_URL}
     #   - VITE_SKYVERN_API_KEY=
     depends_on:
       skyvern:
