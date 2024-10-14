@@ -8,7 +8,8 @@ import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { useState } from "react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
-import type { SendEmailNode } from "./types";
+import { helpTooltipContent, type SendEmailNode } from "./types";
+import { HelpTooltip } from "@/components/HelpTooltip";
 
 function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
   const { updateNodeData } = useReactFlow();
@@ -69,7 +70,7 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
             }}
           />
         </div>
-        <div className="space-y-1">
+        <div className="space-y-2">
           <Label className="text-xs text-slate-300">Recipients</Label>
           <Input
             onChange={(event) => {
@@ -84,7 +85,7 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
           />
         </div>
         <Separator />
-        <div className="space-y-1">
+        <div className="space-y-2">
           <Label className="text-xs text-slate-300">Subject</Label>
           <Input
             onChange={(event) => {
@@ -98,7 +99,7 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
             className="nopan text-xs"
           />
         </div>
-        <div className="space-y-1">
+        <div className="space-y-2">
           <Label className="text-xs text-slate-300">Body</Label>
           <Input
             onChange={(event) => {
@@ -113,8 +114,11 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
           />
         </div>
         <Separator />
-        <div className="space-y-1">
-          <Label className="text-xs text-slate-300">File Attachments</Label>
+        <div className="space-y-2">
+          <div className="flex gap-2">
+            <Label className="text-xs text-slate-300">File Attachments</Label>
+            <HelpTooltip content={helpTooltipContent["fileAttachments"]} />
+          </div>
           <Input
             value={inputs.fileAttachments}
             onChange={(event) => {

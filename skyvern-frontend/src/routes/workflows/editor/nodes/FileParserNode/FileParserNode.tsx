@@ -6,7 +6,9 @@ import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { useState } from "react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
-import type { FileParserNode } from "./types";
+import { helpTooltipContent, type FileParserNode } from "./types";
+import { Label } from "@/components/ui/label";
+import { HelpTooltip } from "@/components/HelpTooltip";
 
 function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
   const { updateNodeData } = useReactFlow();
@@ -57,8 +59,11 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
           />
         </div>
         <div className="space-y-4">
-          <div className="space-y-1">
-            <span className="text-sm text-slate-400">File URL</span>
+          <div className="space-y-2">
+            <div className="flex gap-2">
+              <Label className="text-xs text-slate-300">File URL</Label>
+              <HelpTooltip content={helpTooltipContent["fileUrl"]} />
+            </div>
             <Input
               value={inputs.fileUrl}
               onChange={(event) => {
