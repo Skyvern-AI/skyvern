@@ -26,16 +26,20 @@ const templateSamples: {
     description: "Find a product and add it to cart",
   },
   california_edd: {
-    title: "California_EDD",
+    title: "California EDD",
     description: "Fill the employer services online enrollment form",
   },
   bci_seguros: {
-    title: "bci_seguros",
+    title: "BCI Seguros",
     description: "Generate an auto insurance quote",
   },
   job_application: {
     title: "Job Application",
     description: "Fill a job application form",
+  },
+  contact_us_forms: {
+    title: "Contact Us Forms",
+    description: "Fill a contact us form on a random website",
   },
 };
 
