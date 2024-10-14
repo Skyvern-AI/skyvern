@@ -1,16 +1,17 @@
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
-import { useParams } from "react-router-dom";
+import { useLocation, useParams } from "react-router-dom";
 import { getSampleForInitialFormValues } from "../data/sampleTaskData";
 import { SampleCase, sampleCases } from "../types";
 import { CreateNewTaskForm } from "./CreateNewTaskForm";
 import { SavedTaskForm } from "./SavedTaskForm";
-import { WorkflowParameter } from "@/api/types";
+import { TaskGenerationApiResponse, WorkflowParameter } from "@/api/types";
 
 function CreateNewTaskFormPage() {
   const { template } = useParams();
   const credentialGetter = useCredentialGetter();
+  const location = useLocation();
 
   const { data, isFetching } = useQuery({
     queryKey: ["savedTask", template],
@@ -27,6 +28,41 @@ function CreateNewTaskFormPage() {
 
   if (!template) {
     return <div>Invalid template</div>;
+  }
+
+  if (template === "from-prompt") {
+    const data = location.state?.data as TaskGenerationApiResponse;
+    if (!data.url) {
+      return <div>Something went wrong, please try again</div>; // this should never happen
+    }
+    return (
+      <div className="space-y-4">
+        <header>
+          <h1 className="text-3xl">Create New Task</h1>
+        </header>
+        <CreateNewTaskForm
+          key={template}
+          initialValues={{
+            url: data.url,
+            navigationGoal: data.navigation_goal,
+            dataExtractionGoal: data.data_extraction_goal,
+            navigationPayload:
+              typeof data.navigation_payload === "string"
+                ? data.navigation_payload
+                : JSON.stringify(data.navigation_payload, null, 2),
+            extractedInformationSchema: JSON.stringify(
+              data.extracted_information_schema,
+              null,
+              2,
+            ),
+            errorCodeMapping: null,
+            totpIdentifier: null,
+            totpVerificationUrl: null,
+            webhookCallbackUrl: null,
+          }}
+        />
+      </div>
+    );
   }
 
   if (sampleCases.includes(template as SampleCase)) {
