@@ -1,29 +1,31 @@
 import { Status } from "@/api/types";
 import { Badge } from "./ui/badge";
+import { cn } from "@/util/utils";
 
 type Props = {
   status: Status;
 };
 
 function StatusBadge({ status }: Props) {
-  let variant: "default" | "success" | "destructive" | "warning" = "default";
-  if (status === "completed") {
-    variant = "success";
-  } else if (
-    status === "failed" ||
-    status === "terminated" ||
-    status === "timed_out" ||
-    status === "canceled"
-  ) {
-    variant = "destructive";
-  } else if (status === "running") {
-    variant = "warning";
-  }
-
   const statusText = status === "timed_out" ? "timed out" : status;
 
   return (
-    <Badge className="flex h-7 w-24 justify-center" variant={variant}>
+    <Badge
+      className={cn("flex h-7 w-24 justify-center", {
+        "bg-green-900 text-green-50 hover:bg-green-900/80":
+          status === Status.Completed,
+        "bg-orange-900 text-orange-50 hover:bg-orange-900/80":
+          status === Status.Terminated,
+        "bg-gray-900 text-gray-50 hover:bg-gray-900/80":
+          status === Status.Created,
+        "bg-red-900 text-red-50 hover:bg-red-900/80":
+          status === Status.Failed ||
+          status === Status.Canceled ||
+          status === Status.TimedOut,
+        "bg-yellow-900 text-yellow-50 hover:bg-yellow-900/80":
+          status === Status.Running || status === Status.Queued,
+      })}
+    >
       {statusText}
     </Badge>
   );
