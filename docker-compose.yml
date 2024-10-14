@@ -25,7 +25,7 @@ services:
     restart: on-failure
     # comment out if you want to externally call skyvern API
     ports:
-      - 8001:8001
+      - 8001:8000
     volumes:
       - ./artifacts:/data/artifacts
       - ./videos:/data/videos
@@ -59,7 +59,7 @@ services:
     image: public.ecr.aws/skyvern/skyvern-ui:latest
     restart: on-failure
     ports:
-      - 8081:8081
+      - 8081:8080
       - 9090:9090
     volumes:
       - ./artifacts:/data/artifacts
