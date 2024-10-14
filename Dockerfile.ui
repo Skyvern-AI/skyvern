@@ -5,8 +5,8 @@ COPY ./skyvern-frontend /app
 COPY ./entrypoint-skyvernui.sh /app/entrypoint-skyvernui.sh
 RUN npm install
 
-ENV VITE_API_BASE_URL=http://localhost:8000/api/v1
-ENV VITE_WSS_BASE_URL=ws://localhost:8000/api/v1
+ENV VITE_API_BASE_URL=http://localhost:8001/api/v1
+ENV VITE_WSS_BASE_URL=ws://localhost:8001/api/v1
 ENV VITE_ARTIFACT_API_BASE_URL=http://localhost:9090
 
 CMD [ "/bin/bash", "/app/entrypoint-skyvernui.sh" ]
