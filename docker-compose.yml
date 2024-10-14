@@ -25,7 +25,7 @@ services:
     restart: on-failure
     # comment out if you want to externally call skyvern API
     ports:
-      - 8000:8000
+      - 8001:8001
     volumes:
       - ./artifacts:/data/artifacts
       - ./videos:/data/videos
@@ -67,7 +67,7 @@ services:
       - ./har:/data/har
       - ./.streamlit:/app/.streamlit
     environment:
-      - VITE_WSS_BASE_URL=ws://localhost:8000/api/v1
+      - VITE_WSS_BASE_URL=ws://localhost:8001/api/v1
     #   - VITE_API_BASE_URL=
     #   - VITE_SKYVERN_API_KEY=
     depends_on:
