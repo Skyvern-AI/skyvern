@@ -10,4 +10,12 @@ function basicTimeFormat(time: string): string {
   return `${dateString} at ${timeString}`;
 }
 
-export { basicTimeFormat };
+function timeFormatWithShortDate(time: string): string {
+  const date = new Date(time);
+  const dateString =
+    date.getMonth() + 1 + "/" + date.getDate() + "/" + date.getFullYear();
+  const timeString = date.toLocaleTimeString("en-US");
+  return `${dateString} at ${timeString}`;
+}
+
+export { basicTimeFormat, timeFormatWithShortDate };
