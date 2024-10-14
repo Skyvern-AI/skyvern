@@ -11,12 +11,11 @@ function StatusBadge({ status }: Props) {
     variant = "success";
   } else if (
     status === "failed" ||
-    status === "terminated" ||
     status === "timed_out" ||
     status === "canceled"
   ) {
     variant = "destructive";
-  } else if (status === "running") {
+  } else if (status === "running" || status === "terminated") {
     variant = "warning";
   }
 
