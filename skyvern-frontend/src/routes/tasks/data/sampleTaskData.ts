@@ -78,6 +78,24 @@ export const finditparts = {
   errorCodeMapping: null,
 };
 
+export const contact_us_forms = {
+  url: "https://canadahvac.com/contact-hvac-canada/",
+  navigationGoal:
+    "Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent.",
+  navigationPayload: {
+    name: "John Doe",
+    email: "john.doe@gmail.com",
+    phone: "123-456-7890",
+    message: "Hello, I have a question about your services.",
+  },
+  dataExtractionGoal: null,
+  extractedInformationSchema: null,
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
+};
+
 export const job_application = {
   url: "https://jobs.lever.co/leverdemo-8/45d39614-464a-4b62-a5cd-8683ce4fb80a/apply",
   navigationGoal:
@@ -297,6 +315,9 @@ export function getSample(sample: SampleCase) {
     }
     case "finditparts": {
       return finditparts;
+    }
+    case "contact_us_forms": {
+      return contact_us_forms;
     }
     case "california_edd": {
       return california_edd;
