@@ -17,6 +17,7 @@ import { stringify as convertToYAML } from "yaml";
 import { SavedTaskCard } from "./SavedTaskCard";
 import { useState } from "react";
 import { cn } from "@/util/utils";
+import { Skeleton } from "@/components/ui/skeleton";
 
 function createEmptyTaskTemplate() {
   return {
@@ -53,7 +54,9 @@ function SavedTasks() {
   const navigate = useNavigate();
   const [hovering, setHovering] = useState(false);
 
-  const { data } = useQuery<Array<WorkflowApiResponse>>({
+  const { data, isLoading: savedTasksIsLoading } = useQuery<
+    Array<WorkflowApiResponse>
+  >({
     queryKey: ["savedTasks"],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
@@ -113,10 +116,8 @@ function SavedTasks() {
             "bg-slate-900": hovering,
           })}
         >
-          <CardTitle className="font-normal">New Template</CardTitle>
-          <CardDescription className="overflow-hidden text-ellipsis whitespace-nowrap text-slate-400">
-            Create your own template
-          </CardDescription>
+          <CardTitle className="font-normal">New Task</CardTitle>
+          <CardDescription>{"https://.."}</CardDescription>
         </CardHeader>
         <CardContent
           className={cn(
@@ -138,6 +139,13 @@ function SavedTasks() {
           )}
         </CardContent>
       </Card>
+      {savedTasksIsLoading && (
+        <>
+          <Skeleton className="h-56" />
+          <Skeleton className="h-56" />
+          <Skeleton className="h-56" />
+        </>
+      )}
       {data?.map((workflow) => {
         return (
           <SavedTaskCard

@@ -8,6 +8,10 @@ export const sampleCases = [
   "bci_seguros",
   "job_application",
   "contact_us_forms",
+  "hackernews",
+  "AAPLStockPrice",
+  "NYTBestseller",
+  "topRankedFootballTeam",
 ] as const;
 
 export type SampleCase = (typeof sampleCases)[number];
