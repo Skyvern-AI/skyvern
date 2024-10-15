@@ -7,14 +7,14 @@ import {
   SMTP_PORT_PARAMETER_KEY,
   SMTP_USERNAME_PARAMETER_KEY,
 } from "../../constants";
+import { NodeBaseData } from "../types";
 
-export type SendEmailNodeData = {
+export type SendEmailNodeData = NodeBaseData & {
   recipients: string;
   subject: string;
   body: string;
   fileAttachments: string;
   editable: boolean;
-  label: string;
   sender: string;
   smtpHostSecretParameterKey?: string;
   smtpPortSecretParameterKey?: string;
@@ -36,6 +36,7 @@ export const sendEmailNodeDefaultData: SendEmailNodeData = {
   smtpPortSecretParameterKey: SMTP_PORT_PARAMETER_KEY,
   smtpUsernameSecretParameterKey: SMTP_USERNAME_PARAMETER_KEY,
   smtpPasswordSecretParameterKey: SMTP_PASSWORD_PARAMETER_KEY,
+  continueOnFailure: false,
 } as const;
 
 export const helpTooltipContent = {
