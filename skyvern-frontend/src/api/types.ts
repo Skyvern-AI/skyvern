@@ -78,6 +78,7 @@ export type TaskApiResponse = {
   failure_reason: string | null;
   errors: Array<Record<string, unknown>>;
   max_steps_per_run: number | null;
+  workflow_run_id: string | null;
 };
 
 export type CreateTaskRequest = {
