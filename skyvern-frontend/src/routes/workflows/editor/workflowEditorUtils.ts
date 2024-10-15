@@ -1,7 +1,11 @@
 import Dagre from "@dagrejs/dagre";
+import type { Node } from "@xyflow/react";
 import { Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
 import type {
+  AWSSecretParameter,
+  BitwardenSensitiveInformationParameter,
+  ContextParameter,
   OutputParameter,
   Parameter,
   WorkflowApiResponse,
@@ -33,6 +37,7 @@ import {
   SMTP_USERNAME_AWS_KEY,
   SMTP_USERNAME_PARAMETER_KEY,
 } from "./constants";
+import { ParametersState } from "./FlowRenderer";
 import { AppNode, nodeTypes } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
@@ -42,8 +47,8 @@ import { NodeAdderNode } from "./nodes/NodeAdderNode/types";
 import { sendEmailNodeDefaultData } from "./nodes/SendEmailNode/types";
 import { taskNodeDefaultData } from "./nodes/TaskNode/types";
 import { textPromptNodeDefaultData } from "./nodes/TextPromptNode/types";
+import { NodeBaseData } from "./nodes/types";
 import { uploadNodeDefaultData } from "./nodes/UploadNode/types";
-import type { Node } from "@xyflow/react";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -126,6 +131,10 @@ function convertToNode(
     position: { x: 0, y: 0 },
     connectable: false,
   };
+  const commonData: NodeBaseData = {
+    label: block.label,
+    continueOnFailure: block.continue_on_failure,
+  };
   switch (block.block_type) {
     case "task": {
       return {
@@ -133,7 +142,7 @@ function convertToNode(
         ...common,
         type: "task",
         data: {
-          label: block.label,
+          ...commonData,
           editable: true,
           url: block.url ?? "",
           navigationGoal: block.navigation_goal ?? "",
@@ -147,7 +156,7 @@ function convertToNode(
           parameterKeys: block.parameters.map((p) => p.key),
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
-          continueOnFailure: block.continue_on_failure,
+          cacheActions: block.cache_actions,
         },
       };
     }
@@ -157,7 +166,7 @@ function convertToNode(
         ...common,
         type: "codeBlock",
         data: {
-          label: block.label,
+          ...commonData,
           editable: true,
           code: block.code,
         },
@@ -169,7 +178,7 @@ function convertToNode(
         ...common,
         type: "sendEmail",
         data: {
-          label: block.label,
+          ...commonData,
           editable: true,
           body: block.body,
           fileAttachments: block.file_attachments.join(", "),
@@ -189,7 +198,7 @@ function convertToNode(
         ...common,
         type: "textPrompt",
         data: {
-          label: block.label,
+          ...commonData,
           editable: true,
           prompt: block.prompt,
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
@@ -202,7 +211,7 @@ function convertToNode(
         ...common,
         type: "loop",
         data: {
-          label: block.label,
+          ...commonData,
           editable: true,
           loopValue: block.loop_over.key,
         },
@@ -214,7 +223,7 @@ function convertToNode(
         ...common,
         type: "fileParser",
         data: {
-          label: block.label,
+          ...commonData,
           editable: true,
           fileUrl: block.file_url,
         },
@@ -227,7 +236,7 @@ function convertToNode(
         ...common,
         type: "download",
         data: {
-          label: block.label,
+          ...commonData,
           editable: true,
           url: block.url,
         },
@@ -240,7 +249,7 @@ function convertToNode(
         ...common,
         type: "upload",
         data: {
-          label: block.label,
+          ...commonData,
           editable: true,
           path: block.path,
         },
@@ -497,11 +506,15 @@ function JSONParseSafe(json: string): Record<string, unknown> | null {
 function getWorkflowBlock(
   node: Exclude<AppNode, LoopNode | NodeAdderNode>,
 ): BlockYAML {
+  const base = {
+    label: node.data.label,
+    continue_on_failure: node.data.continueOnFailure,
+  };
   switch (node.type) {
     case "task": {
       return {
+        ...base,
         block_type: "task",
-        label: node.data.label,
         url: node.data.url,
         navigation_goal: node.data.navigationGoal,
         data_extraction_goal: node.data.dataExtractionGoal,
@@ -519,13 +532,13 @@ function getWorkflowBlock(
         parameter_keys: node.data.parameterKeys,
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
-        continue_on_failure: node.data.continueOnFailure,
+        cache_actions: node.data.cacheActions,
       };
     }
     case "sendEmail": {
       return {
+        ...base,
         block_type: "send_email",
-        label: node.data.label,
         body: node.data.body,
         file_attachments: node.data.fileAttachments
           .split(",")
@@ -545,37 +558,37 @@ function getWorkflowBlock(
     }
     case "codeBlock": {
       return {
+        ...base,
         block_type: "code",
-        label: node.data.label,
         code: node.data.code,
       };
     }
     case "download": {
       return {
+        ...base,
         block_type: "download_to_s3",
-        label: node.data.label,
         url: node.data.url,
       };
     }
     case "upload": {
       return {
+        ...base,
         block_type: "upload_to_s3",
-        label: node.data.label,
         path: node.data.path,
       };
     }
     case "fileParser": {
       return {
+        ...base,
         block_type: "file_url_parser",
-        label: node.data.label,
         file_url: node.data.fileUrl,
         file_type: "csv",
       };
     }
     case "textPrompt": {
       return {
+        ...base,
         block_type: "text_prompt",
-        label: node.data.label,
         llm_key: "",
         prompt: node.data.prompt,
         json_schema: JSONParseSafe(node.data.jsonSchema),
@@ -629,13 +642,6 @@ function generateNodeLabel(existingLabels: Array<string>) {
   }
   throw new Error("Failed to generate a new node label");
 }
-
-import type {
-  AWSSecretParameter,
-  BitwardenSensitiveInformationParameter,
-  ContextParameter,
-} from "../types/workflowTypes";
-import { ParametersState } from "./FlowRenderer";
 
 /**
  * If a parameter is not displayed in the editor, we should echo its value back when saved.
@@ -980,6 +986,7 @@ function convertBlocks(blocks: Array<WorkflowBlock>): Array<BlockYAML> {
           parameter_keys: block.parameters.map((p) => p.key),
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
+          cache_actions: block.cache_actions,
         };
         return blockYaml;
       }
@@ -1076,22 +1083,22 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
 }
 
 export {
+  convert,
+  convertEchoParameters,
   createNode,
   generateNodeData,
-  getElements,
-  getWorkflowBlocks,
-  layout,
   generateNodeLabel,
-  convertEchoParameters,
-  getOutputParameterKey,
-  getUpdatedNodesAfterLabelUpdateForParameterKeys,
   getAdditionalParametersForEmailBlock,
-  getUniqueLabelForExistingNode,
-  isOutputParameterKey,
+  getAvailableOutputParameterKeys,
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,
-  getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
+  getElements,
+  getOutputParameterKey,
   getPreviousNodeIds,
-  getAvailableOutputParameterKeys,
-  convert,
+  getUniqueLabelForExistingNode,
+  getUpdatedNodesAfterLabelUpdateForParameterKeys,
+  getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
+  getWorkflowBlocks,
+  isOutputParameterKey,
+  layout,
 };

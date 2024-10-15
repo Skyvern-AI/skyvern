@@ -1,6 +1,7 @@
 import type { Node } from "@xyflow/react";
+import { NodeBaseData } from "../types";
 
-export type TaskNodeData = {
+export type TaskNodeData = NodeBaseData & {
   url: string;
   navigationGoal: string;
   dataExtractionGoal: string;
@@ -11,11 +12,10 @@ export type TaskNodeData = {
   allowDownloads: boolean;
   downloadSuffix: string | null;
   editable: boolean;
-  label: string;
   parameterKeys: Array<string>;
   totpVerificationUrl: string | null;
   totpIdentifier: string | null;
-  continueOnFailure: boolean;
+  cacheActions: boolean;
 };
 
 export type TaskNode = Node<TaskNodeData, "task">;
@@ -38,6 +38,7 @@ export const taskNodeDefaultData: TaskNodeData = {
   totpVerificationUrl: null,
   totpIdentifier: null,
   continueOnFailure: false,
+  cacheActions: false,
 } as const;
 
 export function isTaskNode(node: Node): node is TaskNode {

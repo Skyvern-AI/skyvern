@@ -137,6 +137,7 @@ export type TaskBlock = WorkflowBlockBase & {
   download_suffix?: string | null;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
+  cache_actions: boolean;
 };
 
 export type ForLoopBlock = WorkflowBlockBase & {

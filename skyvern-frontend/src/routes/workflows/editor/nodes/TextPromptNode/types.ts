@@ -1,6 +1,7 @@
 import type { Node } from "@xyflow/react";
+import { NodeBaseData } from "../types";
 
-export type TextPromptNodeData = {
+export type TextPromptNodeData = NodeBaseData & {
   prompt: string;
   jsonSchema: string;
   editable: boolean;
@@ -14,6 +15,7 @@ export const textPromptNodeDefaultData: TextPromptNodeData = {
   label: "",
   prompt: "",
   jsonSchema: "null",
+  continueOnFailure: false,
 } as const;
 
 export const helpTooltipContent = {
