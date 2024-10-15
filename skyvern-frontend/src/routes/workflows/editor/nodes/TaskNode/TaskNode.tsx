@@ -90,7 +90,10 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
   const basicContent = (
     <>
       <div className="space-y-2">
-        <Label className="text-xs text-slate-300">URL</Label>
+        <div className="flex gap-2">
+          <Label className="text-xs text-slate-300">URL</Label>
+          <HelpTooltip content={helpTooltipContent["url"]} />
+        </div>
         <AutoResizingTextarea
           value={inputs.url}
           className="nopan text-xs"
@@ -141,7 +144,10 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
           <AccordionContent className="pl-[1.5rem] pr-1">
             <div className="space-y-4">
               <div className="space-y-2">
-                <Label className="text-xs text-slate-300">URL</Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">URL</Label>
+                  <HelpTooltip content={helpTooltipContent["url"]} />
+                </div>
                 <AutoResizingTextarea
                   onChange={(event) => {
                     if (!editable) {

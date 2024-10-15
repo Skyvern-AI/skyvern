@@ -49,6 +49,7 @@ export const helpTooltipContent = {
   limits:
     "Give Skyvern limitations, such as number of retries on failure, the number of maximum steps, the option to download and append suffix identifiers, and return message for errors Skyvern encounters.",
   totp: "Link your internal TOTP storage system to relay 2FA codes we encounter straight to Skyvern. If you have multiple tasks running simultaneously, make sure to link an identifier so Skyvern knows which TOTP URL goes with which task.",
+  url: "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last task block left off.",
   navigationGoal:
     "Give Skyvern an objective. Make sure to include when the task is complete, when it should self-terminate, and any guardrails.",
   parameters:
