@@ -77,7 +77,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
         className="opacity-0"
       />
       <div
-        className="w-[60rem] rounded-md border-2 border-dashed border-slate-600 p-2"
+        className="w-[600px] rounded-xl border-2 border-dashed border-slate-600 p-2"
         style={{
           height: childrenHeightExtent,
         }}
