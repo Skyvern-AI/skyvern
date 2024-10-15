@@ -1,4 +1,4 @@
-Based on the content of the screenshot and the elements on the page, determine whether the user goal has been successfully completed or not.
+Based on the content of the elements on the page, determine whether the user goal has been successfully completed or not.
 
 The JSON object should be in this format:
 ```json
@@ -7,15 +7,15 @@ The JSON object should be in this format:
   "user_goal_achieved": bool // True if the user goal has been completed, False otherwise.
 }
 
-Make sure to ONLY return the JSON object, with no additional text before or after it. Do not make any assumptions based on the screenshot, return a response solely based on what you observe in the screenshot and nothing else.
+Make sure to ONLY return the JSON object, with no additional text before or after it. Do not make any assumptions, return a response solely based on the elements on the page.
 
 Examples:
 {
-  "reasoning": "The screenshot shows a success message for a file upload field. Since the user's goal is to upload a file, it has been successfully completed.",
+  "reasoning": "There is a success message for a file upload field. Since the user's goal is to upload a file, it has been successfully completed.",
   "user_goal_achieved": true
 }
 {
-  "reasoning": "The screenshot shows a job application form with fields. Since the user's goal is to submit a job application, it has not been successfully completed.",
+  "reasoning": "This is a job application form with fields. Since the user's goal is to submit a job application, it has not been successfully completed.",
   "user_goal_achieved": false
 }
 

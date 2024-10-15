@@ -23,6 +23,7 @@ from skyvern.exceptions import (
     FailToSelectByIndex,
     FailToSelectByLabel,
     FailToSelectByValue,
+    IllegitComplete,
     ImaginaryFileUrl,
     InvalidElementForTextInput,
     MissingElement,
@@ -54,6 +55,7 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.actions import actions
 from skyvern.webeye.actions.actions import (
     Action,
+    ActionStatus,
     ActionType,
     CheckboxAction,
     ClickAction,
@@ -64,7 +66,7 @@ from skyvern.webeye.actions.actions import (
     UploadFileAction,
     WebAction,
 )
-from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
+from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_factory import BrowserState, get_download_dir
 from skyvern.webeye.scraper.scraper import (
     CleanupElementTreeFunc,
@@ -227,12 +229,13 @@ class ActionHandler:
     ) -> list[ActionResult]:
         LOG.info("Handling action", action=action)
         page = await browser_state.get_or_create_page()
+        actions_result: list[ActionResult] = []
         try:
             if action.action_type in ActionHandler._handled_action_types:
-                actions_result: list[ActionResult] = []
-
-                if invalid_web_action_check := check_for_invalid_web_action(action, page, scraped_page, task, step):
-                    return invalid_web_action_check
+                invalid_web_action_check = check_for_invalid_web_action(action, page, scraped_page, task, step)
+                if invalid_web_action_check:
+                    actions_result.extend(invalid_web_action_check)
+                    return actions_result
 
                 # do setup before action handler
                 if setup := ActionHandler._setup_action_types.get(action.action_type):
@@ -250,11 +253,10 @@ class ActionHandler:
 
                 # do the teardown
                 teardown = ActionHandler._teardown_action_types.get(action.action_type)
-                if not teardown:
-                    return actions_result
+                if teardown:
+                    results = await teardown(action, page, scraped_page, task, step)
+                    actions_result.extend(results)
 
-                results = await teardown(action, page, scraped_page, task, step)
-                actions_result.extend(results)
                 return actions_result
 
             else:
@@ -263,7 +265,8 @@ class ActionHandler:
                     action=action,
                     type=type(action),
                 )
-                return [ActionFailure(Exception(f"Unsupported action type: {type(action)}"))]
+                actions_result.append(ActionFailure(Exception(f"Unsupported action type: {type(action)}")))
+                return actions_result
         except MissingElement as e:
             LOG.info(
                 "Known exceptions",
@@ -271,16 +274,29 @@ class ActionHandler:
                 exception_type=type(e),
                 exception_message=str(e),
             )
-            return [ActionFailure(e)]
+            actions_result.append(ActionFailure(e))
         except MultipleElementsFound as e:
             LOG.exception(
                 "Cannot handle multiple elements with the same selector in one action.",
                 action=action,
             )
-            return [ActionFailure(e)]
+            actions_result.append(ActionFailure(e))
         except Exception as e:
             LOG.exception("Unhandled exception in action handler", action=action)
-            return [ActionFailure(e)]
+            actions_result.append(ActionFailure(e))
+        finally:
+            if actions_result and isinstance(actions_result[-1], ActionSuccess):
+                action.status = ActionStatus.completed
+            elif actions_result and isinstance(actions_result[-1], ActionAbort):
+                action.status = ActionStatus.skipped
+            else:
+                # either actions_result is empty or the last action is a failure
+                if not actions_result:
+                    LOG.warning("Action failed to execute, setting status to failed", action=action)
+                action.status = ActionStatus.failed
+            await app.DATABASE.create_action(action=action)
+
+        return actions_result
 
 
 def check_for_invalid_web_action(
@@ -874,7 +890,7 @@ async def handle_wait_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await asyncio.sleep(10)
+    await asyncio.sleep(20)
     return [ActionFailure(exception=Exception("Wait action is treated as a failure"))]
 
 
@@ -895,6 +911,25 @@ async def handle_complete_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    # If this action has a source_action_id, then we need to make sure if the goal is actually completed.
+    if action.source_action_id:
+        LOG.info("CompleteAction has source_action_id, checking if goal is completed")
+        complete_action_and_results = await app.agent.check_user_goal_success(page, scraped_page, task, step)
+        if complete_action_and_results is None:
+            return [
+                ActionFailure(
+                    exception=IllegitComplete(
+                        data={
+                            "error": "Cached complete action wasn't verified by LLM, fallback to default execution mode"
+                        }
+                    )
+                )
+            ]
+
+        _, action_results = complete_action_and_results
+        return action_results
+
+    # If there's no source_action_id, then we just handle it as a normal complete action
     extracted_data = None
     if action.data_extraction_goal:
         scrape_action_result = await extract_information_for_navigation_goal(
@@ -951,6 +986,15 @@ async def chain_click(
     # File choosers are impossible to close if you don't expect one. Instead of dealing with it, close it!
 
     locator = skyvern_element.locator
+    try:
+        await locator.hover(timeout=timeout)
+    except Exception:
+        LOG.warning(
+            "Failed to hover over element in chain_click",
+            action=action,
+            locator=locator,
+            exc_info=True,
+        )
     # TODO (suchintan): This should likely result in an ActionFailure -- we can figure out how to do this later!
     LOG.info("Chain click starts", action=action, locator=locator)
     file: list[str] | str = []
@@ -1015,6 +1059,7 @@ async def chain_click(
             parent_javascript_triggered = await is_javascript_triggered(scraped_page, page, parent_locator)
             javascript_triggered = javascript_triggered or parent_javascript_triggered
 
+            await parent_locator.hover(timeout=timeout)
             await parent_locator.click(timeout=timeout)
 
             LOG.info(
@@ -2101,6 +2146,10 @@ async def click_sibling_of_input(
             input_id = await input_element.get_attribute("id")
             sibling_label_css = f'label[for="{input_id}"]'
             label_locator = parent_locator.locator(sibling_label_css)
+            try:
+                await locator.hover(timeout=timeout)
+            except Exception:
+                LOG.warning("Failed to hover over input element in click_sibling_of_input", exc_info=True)
             await label_locator.click(timeout=timeout)
             LOG.info(
                 "Successfully clicked sibling label of input element",

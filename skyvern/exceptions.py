@@ -490,3 +490,8 @@ class IllegitComplete(SkyvernException):
     def __init__(self, data: dict | None = None) -> None:
         data_str = f", data={data}" if data else ""
         super().__init__(f"Illegit complete{data_str}")
+
+
+class CachedActionPlanError(SkyvernException):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)

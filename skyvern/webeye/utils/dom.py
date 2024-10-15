@@ -120,10 +120,11 @@ class SkyvernElement:
 
         return cls(locator, frame, element_dict)
 
-    def __init__(self, locator: Locator, frame: Page | Frame, static_element: dict) -> None:
+    def __init__(self, locator: Locator, frame: Page | Frame, static_element: dict, hash_value: str = "") -> None:
         self.__static_element = static_element
         self.__frame = frame
         self.locator = locator
+        self.hash_value = hash_value
 
     def build_HTML(self, need_trim_element: bool = True, need_skyvern_attrs: bool = True) -> str:
         element_dict = self.get_element_dict()
@@ -486,4 +487,6 @@ class DomUtil:
             )
             raise MultipleElementsFound(num=num_elements, selector=css, element_id=element_id)
 
-        return SkyvernElement(locator, frame_content, element)
+        hash_value = self.scraped_page.id_to_element_hash.get(element_id, "")
+
+        return SkyvernElement(locator, frame_content, element, hash_value)
