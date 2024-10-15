@@ -612,6 +612,22 @@ class WorkflowService:
     async def get_tasks_by_workflow_run_id(self, workflow_run_id: str) -> list[Task]:
         return await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
 
+    async def build_workflow_run_status_response_by_workflow_id(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+    ) -> WorkflowRunStatusResponse:
+        workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id)
+        if workflow_run is None:
+            LOG.error(f"Workflow run {workflow_run_id} not found")
+            raise WorkflowRunNotFound(workflow_run_id=workflow_run_id)
+        workflow_permanent_id = workflow_run.workflow_permanent_id
+        return await self.build_workflow_run_status_response(
+            workflow_permanent_id=workflow_permanent_id,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+
     async def build_workflow_run_status_response(
         self,
         workflow_permanent_id: str,

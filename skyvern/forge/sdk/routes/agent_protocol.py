@@ -641,6 +641,26 @@ async def get_workflow_run(
     )
 
 
+@base_router.get(
+    "/workflows/runs/{workflow_run_id}",
+    response_model=WorkflowRunStatusResponse,
+)
+@base_router.get(
+    "/workflows/runs/{workflow_run_id}/",
+    response_model=WorkflowRunStatusResponse,
+    include_in_schema=False,
+)
+async def get_workflow_run_by_run_id(
+    workflow_run_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowRunStatusResponse:
+    analytics.capture("skyvern-oss-agent-workflow-run-get")
+    return await app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id(
+        workflow_run_id=workflow_run_id,
+        organization_id=current_org.organization_id,
+    )
+
+
 @base_router.post(
     "/workflows",
     openapi_extra={
