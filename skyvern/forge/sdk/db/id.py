@@ -130,6 +130,11 @@ def generate_totp_code_id() -> str:
     return f"totp_{int_id}"
 
 
+def generate_action_id() -> str:
+    int_id = generate_id()
+    return f"a_{int_id}"
+
+
 def generate_id() -> int:
     """
     generate a 64-bit int ID

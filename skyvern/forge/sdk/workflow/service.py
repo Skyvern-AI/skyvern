@@ -985,7 +985,8 @@ class WorkflowService:
                         bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
                         bitwarden_client_secret_aws_secret_key=parameter.bitwarden_client_secret_aws_secret_key,
                         bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
-                        bitwarden_collection_id=parameter.bitwarden_collection_id,
+                        # TODO: remove "# type: ignore" after ensuring bitwarden_collection_id is always set
+                        bitwarden_collection_id=parameter.bitwarden_collection_id,  # type: ignore
                         bitwarden_item_id=parameter.bitwarden_item_id,
                         key=parameter.key,
                         description=parameter.description,
@@ -1128,6 +1129,7 @@ class WorkflowService:
                 continue_on_failure=block_yaml.continue_on_failure,
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
+                cache_actions=block_yaml.cache_actions,
             )
         elif block_yaml.block_type == BlockType.FOR_LOOP:
             loop_blocks = [

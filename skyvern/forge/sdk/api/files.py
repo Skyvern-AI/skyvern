@@ -113,7 +113,7 @@ def rename_file(file_path: str, new_file_name: str) -> str:
         return file_path
 
 
-def calculate_sha256(file_path: str) -> str:
+def calculate_sha256_for_file(file_path: str) -> str:
     """Helper function to calculate SHA256 hash of a file."""
     sha256_hash = hashlib.sha256()
     with open(file_path, "rb") as f:

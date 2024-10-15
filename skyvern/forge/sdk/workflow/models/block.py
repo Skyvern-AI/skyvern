@@ -32,7 +32,7 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.files import (
-    calculate_sha256,
+    calculate_sha256_for_file,
     download_file,
     download_from_s3,
     get_path_for_workflow_download_directory,
@@ -181,6 +181,7 @@ class TaskBlock(Block):
     download_suffix: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
+    cache_actions: bool = False
 
     def get_all_parameters(
         self,
@@ -1057,7 +1058,7 @@ class SendEmailBlock(Block):
                         subtype=subtype,
                         filename=attachment_filename,
                     )
-                    file_hash = calculate_sha256(path)
+                    file_hash = calculate_sha256_for_file(path)
                     file_names_by_hash[file_hash].append(path)
             finally:
                 if path:
