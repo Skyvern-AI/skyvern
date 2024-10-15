@@ -610,6 +610,7 @@ function getWorkflowBlocksUtil(nodes: Array<AppNode>): Array<BlockYAML> {
         {
           block_type: "for_loop",
           label: node.data.label,
+          continue_on_failure: node.data.continueOnFailure,
           loop_over_parameter_key: node.data.loopValue,
           loop_blocks: nodes
             .filter((n) => n.parentId === node.id)
