@@ -7,6 +7,7 @@ import { SampleCase, sampleCases } from "../types";
 import { CreateNewTaskForm } from "./CreateNewTaskForm";
 import { SavedTaskForm } from "./SavedTaskForm";
 import { TaskGenerationApiResponse, WorkflowParameter } from "@/api/types";
+import { Skeleton } from "@/components/ui/skeleton";
 
 function CreateNewTaskFormPage() {
   const { template } = useParams();
@@ -80,7 +81,16 @@ function CreateNewTaskFormPage() {
   }
 
   if (isFetching) {
-    return <div>Loading...</div>;
+    return (
+      <div className="space-y-4">
+        <header>
+          <h1 className="text-3xl">Edit Task Template</h1>
+        </header>
+        <Skeleton className="h-96" />
+        <Skeleton className="h-20" />
+        <Skeleton className="h-20" />
+      </div>
+    );
   }
 
   const navigationPayload = data.workflow_definition.parameters.find(
