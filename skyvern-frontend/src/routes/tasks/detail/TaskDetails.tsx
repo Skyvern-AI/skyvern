@@ -1,5 +1,9 @@
 import { getClient } from "@/api/AxiosClient";
-import { Status, TaskApiResponse } from "@/api/types";
+import {
+  Status,
+  TaskApiResponse,
+  WorkflowRunStatusApiResponse,
+} from "@/api/types";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -18,7 +22,7 @@ import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { cn } from "@/util/utils";
 import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, NavLink, Outlet, useParams } from "react-router-dom";
 import { TaskInfo } from "./TaskInfo";
 import { useTaskQuery } from "./hooks/useTaskQuery";
@@ -27,6 +31,7 @@ import fetchToCurl from "fetch-to-curl";
 import { apiBaseUrl } from "@/util/env";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { copyText } from "@/util/copyText";
+import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
 function createTaskRequestObject(values: TaskApiResponse) {
   return {
@@ -53,6 +58,30 @@ function TaskDetails() {
     isError: taskIsError,
     error: taskError,
   } = useTaskQuery({ id: taskId });
+
+  const { data: workflowRun, isLoading: workflowRunIsLoading } =
+    useQuery<WorkflowRunStatusApiResponse>({
+      queryKey: ["workflowRun", task?.workflow_run_id],
+      queryFn: async () => {
+        const client = await getClient(credentialGetter);
+        return client
+          .get(`/workflows/runs/${task?.workflow_run_id}`)
+          .then((response) => response.data);
+      },
+      enabled: !!task?.workflow_run_id,
+    });
+
+  const { data: workflow, isLoading: workflowIsLoading } =
+    useQuery<WorkflowApiResponse>({
+      queryKey: ["workflow", workflowRun?.workflow_id],
+      queryFn: async () => {
+        const client = await getClient(credentialGetter);
+        return client
+          .get(`/workflows/${workflowRun?.workflow_id}`)
+          .then((response) => response.data);
+      },
+      enabled: !!workflowRun?.workflow_id,
+    });
 
   const cancelTaskMutation = useMutation({
     mutationFn: async () => {
@@ -122,82 +151,99 @@ function TaskDetails() {
 
   return (
     <div className="flex flex-col gap-8">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
-          <span className="text-lg">{taskId}</span>
-          {taskId && <TaskInfo id={taskId} />}
-        </div>
-        <div className="flex items-center gap-2">
-          <Button
-            variant="secondary"
-            onClick={() => {
-              if (!task) {
-                return;
-              }
-              const curl = fetchToCurl({
-                method: "POST",
-                url: `${apiBaseUrl}/tasks`,
-                body: createTaskRequestObject(task),
-                headers: {
-                  "Content-Type": "application/json",
-                  "x-api-key": apiCredential ?? "<your-api-key>",
-                },
-              });
-              copyText(curl).then(() => {
-                toast({
-                  variant: "success",
-                  title: "Copied to Clipboard",
-                  description:
-                    "The cURL command has been copied to your clipboard.",
+      <header className="space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <span className="text-3xl">{taskId}</span>
+            {taskId && <TaskInfo id={taskId} />}
+          </div>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="secondary"
+              onClick={() => {
+                if (!task) {
+                  return;
+                }
+                const curl = fetchToCurl({
+                  method: "POST",
+                  url: `${apiBaseUrl}/tasks`,
+                  body: createTaskRequestObject(task),
+                  headers: {
+                    "Content-Type": "application/json",
+                    "x-api-key": apiCredential ?? "<your-api-key>",
+                  },
                 });
-              });
-            }}
-          >
-            <CopyIcon className="mr-2 h-4 w-4" />
-            cURL
-          </Button>
-          {taskIsRunningOrQueued && (
-            <Dialog>
-              <DialogTrigger asChild>
-                <Button variant="destructive">Cancel</Button>
-              </DialogTrigger>
-              <DialogContent>
-                <DialogHeader>
-                  <DialogTitle>Are you sure?</DialogTitle>
-                  <DialogDescription>
-                    Are you sure you want to cancel this task?
-                  </DialogDescription>
-                </DialogHeader>
-                <DialogFooter>
-                  <DialogClose asChild>
-                    <Button variant="secondary">Back</Button>
-                  </DialogClose>
-                  <Button
-                    variant="destructive"
-                    onClick={() => {
-                      cancelTaskMutation.mutate();
-                    }}
-                    disabled={cancelTaskMutation.isPending}
-                  >
-                    {cancelTaskMutation.isPending && (
-                      <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-                    )}
-                    Cancel Task
-                  </Button>
-                </DialogFooter>
-              </DialogContent>
-            </Dialog>
-          )}
-          {taskHasTerminalState && (
-            <Button asChild>
-              <Link to={`/create/retry/${task.task_id}`}>
-                <PlayIcon className="mr-2 h-4 w-4" />
-                Rerun
-              </Link>
+                copyText(curl).then(() => {
+                  toast({
+                    variant: "success",
+                    title: "Copied to Clipboard",
+                    description:
+                      "The cURL command has been copied to your clipboard.",
+                  });
+                });
+              }}
+            >
+              <CopyIcon className="mr-2 h-4 w-4" />
+              cURL
             </Button>
+            {taskIsRunningOrQueued && (
+              <Dialog>
+                <DialogTrigger asChild>
+                  <Button variant="destructive">Cancel</Button>
+                </DialogTrigger>
+                <DialogContent>
+                  <DialogHeader>
+                    <DialogTitle>Are you sure?</DialogTitle>
+                    <DialogDescription>
+                      Are you sure you want to cancel this task?
+                    </DialogDescription>
+                  </DialogHeader>
+                  <DialogFooter>
+                    <DialogClose asChild>
+                      <Button variant="secondary">Back</Button>
+                    </DialogClose>
+                    <Button
+                      variant="destructive"
+                      onClick={() => {
+                        cancelTaskMutation.mutate();
+                      }}
+                      disabled={cancelTaskMutation.isPending}
+                    >
+                      {cancelTaskMutation.isPending && (
+                        <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+                      )}
+                      Cancel Task
+                    </Button>
+                  </DialogFooter>
+                </DialogContent>
+              </Dialog>
+            )}
+            {taskHasTerminalState && (
+              <Button asChild>
+                <Link to={`/create/retry/${task.task_id}`}>
+                  <PlayIcon className="mr-2 h-4 w-4" />
+                  Rerun
+                </Link>
+              </Button>
+            )}
+          </div>
+        </div>
+        <div className="text-2xl text-slate-400 underline underline-offset-4">
+          {workflowIsLoading || workflowRunIsLoading ? (
+            <Skeleton className="h-8 w-64" />
+          ) : (
+            workflow &&
+            workflowRun && (
+              <Link
+                to={`/workflows/${workflow.workflow_permanent_id}/${workflowRun.workflow_run_id}`}
+              >
+                {workflow.title}
+              </Link>
+            )
           )}
         </div>
-      </div>
+      </header>
+
       {taskIsLoading ? (
         <div className="flex items-center gap-2">
           <Skeleton className="h-32 w-32" />
