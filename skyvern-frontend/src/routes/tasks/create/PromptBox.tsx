@@ -58,7 +58,7 @@ const exampleCases = [
   },
   {
     key: "california_edd",
-    label: "California EDD",
+    label: "Fill an online enrollment form",
   },
   {
     key: "contact_us_forms",
