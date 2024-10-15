@@ -61,12 +61,12 @@ function StepArtifacts({ id, stepProps }: Props) {
     (artifact) => artifact.artifact_type === ArtifactType.LLMRequest,
   );
 
-  const visibleElementsTreeInPrompt = artifacts?.find(
+  const visibleElementsTreeInPrompt = artifacts?.filter(
     (artifact) =>
       artifact.artifact_type === ArtifactType.VisibleElementsTreeInPrompt,
   );
 
-  const llmPrompt = artifacts?.find(
+  const llmPrompt = artifacts?.filter(
     (artifact) => artifact.artifact_type === ArtifactType.LLMPrompt,
   );
 
@@ -74,7 +74,7 @@ function StepArtifacts({ id, stepProps }: Props) {
     (artifact) => artifact.artifact_type === ArtifactType.LLMResponseParsed,
   );
 
-  const htmlRaw = artifacts?.find(
+  const htmlRaw = artifacts?.filter(
     (artifact) => artifact.artifact_type === ArtifactType.HTMLScrape,
   );
 
@@ -84,8 +84,10 @@ function StepArtifacts({ id, stepProps }: Props) {
         <TabsTrigger value="info">Info</TabsTrigger>
         <TabsTrigger value="screenshot_llm">Annotated Screenshots</TabsTrigger>
         <TabsTrigger value="screenshot_action">Action Screenshots</TabsTrigger>
-        <TabsTrigger value="element_tree_trimmed">Element Tree</TabsTrigger>
-        <TabsTrigger value="html_element_tree">HTML Element Tree</TabsTrigger>
+        <TabsTrigger value="element_tree_trimmed">
+          HTML Element Tree
+        </TabsTrigger>
+        <TabsTrigger value="element_tree">Element Tree</TabsTrigger>
         <TabsTrigger value="llm_prompt">Prompt</TabsTrigger>
         <TabsTrigger value="llm_response_parsed">Action List</TabsTrigger>
         <TabsTrigger value="html_raw">HTML (Raw)</TabsTrigger>
@@ -165,16 +167,16 @@ function StepArtifacts({ id, stepProps }: Props) {
       </TabsContent>
       <TabsContent value="element_tree_trimmed">
         {visibleElementsTreeInPrompt ? (
-          <HTMLArtifact artifact={visibleElementsTreeInPrompt} />
+          <HTMLArtifact artifacts={visibleElementsTreeInPrompt} />
         ) : null}
       </TabsContent>
-      <TabsContent value="html_element_tree">
+      <TabsContent value="element_tree">
         {visibleElementsTree ? (
           <JSONArtifact artifacts={visibleElementsTree} />
         ) : null}
       </TabsContent>
       <TabsContent value="llm_prompt">
-        {llmPrompt ? <TextArtifact artifact={llmPrompt} /> : null}
+        {llmPrompt ? <TextArtifact artifacts={llmPrompt} /> : null}
       </TabsContent>
       <TabsContent value="llm_response_parsed">
         {llmResponseParsed ? (
@@ -182,7 +184,7 @@ function StepArtifacts({ id, stepProps }: Props) {
         ) : null}
       </TabsContent>
       <TabsContent value="html_raw">
-        {htmlRaw ? <TextArtifact artifact={htmlRaw} /> : null}
+        {htmlRaw ? <TextArtifact artifacts={htmlRaw} /> : null}
       </TabsContent>
       <TabsContent value="llm_request">
         {llmRequest ? <JSONArtifact artifacts={llmRequest} /> : null}
