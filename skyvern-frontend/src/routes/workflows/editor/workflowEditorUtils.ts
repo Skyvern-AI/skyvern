@@ -99,7 +99,7 @@ function layout(
     const maxChildWidth = Math.max(
       ...childNodes.map((node) => node.measured?.width ?? 0),
     );
-    const loopNodeWidth = 60 * 16; // 60 rem
+    const loopNodeWidth = 600; // 600 px
     const layouted = layoutUtil(childNodes, childEdges, {
       marginx: (loopNodeWidth - maxChildWidth) / 2,
       marginy: 200,
