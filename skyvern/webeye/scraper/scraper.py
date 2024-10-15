@@ -11,7 +11,6 @@ from pydantic import BaseModel
 
 from skyvern.constants import SKYVERN_DIR, SKYVERN_ID_ATTR
 from skyvern.exceptions import FailedToTakeScreenshot, UnknownElementTreeFormat
-from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -128,34 +127,10 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
         return f'<{tag}{attributes_html if not attributes_html else " "+attributes_html}>{text}{children_html+option_html}</{tag}>'
 
 
-def clean_element_before_hashing(element: dict) -> dict:
-    element_copy = copy.deepcopy(element)
-    element_copy.pop("id", None)
-    element_copy.pop("rect", None)
-    if "attributes" in element_copy:
-        element_copy["attributes"].pop(SKYVERN_ID_ATTR, None)
-    if "children" in element_copy:
-        for idx, child in enumerate(element_copy["children"]):
-            element_copy["children"][idx] = clean_element_before_hashing(child)
-    return element_copy
-
-
-def hash_element(element: dict) -> str:
-    hash_ready_element = clean_element_before_hashing(element)
-    # Sort the keys to ensure consistent ordering
-    element_string = json.dumps(hash_ready_element, sort_keys=True)
-
-    return calculate_sha256(element_string)
-
-
-def build_element_dict(
-    elements: list[dict],
-) -> tuple[dict[str, str], dict[str, dict], dict[str, str], dict[str, str], dict[str, list[str]]]:
+def build_element_dict(elements: list[dict]) -> tuple[dict[str, str], dict[str, dict], dict[str, str]]:
     id_to_css_dict: dict[str, str] = {}
     id_to_element_dict: dict[str, dict] = {}
     id_to_frame_dict: dict[str, str] = {}
-    id_to_element_hash: dict[str, str] = {}
-    hash_to_element_ids: dict[str, list[str]] = {}
 
     for element in elements:
         element_id: str = element.get("id", "")
@@ -163,11 +138,8 @@ def build_element_dict(
         id_to_css_dict[element_id] = f"[{SKYVERN_ID_ATTR}='{element_id}']"
         id_to_element_dict[element_id] = element
         id_to_frame_dict[element_id] = element["frame"]
-        element_hash = hash_element(element)
-        id_to_element_hash[element_id] = element_hash
-        hash_to_element_ids[element_hash] = hash_to_element_ids.get(element_hash, []) + [element_id]
 
-    return id_to_css_dict, id_to_element_dict, id_to_frame_dict, id_to_element_hash, hash_to_element_ids
+    return id_to_css_dict, id_to_element_dict, id_to_frame_dict
 
 
 class ElementTreeFormat(StrEnum):
@@ -191,8 +163,6 @@ class ScrapedPage(BaseModel):
     id_to_element_dict: dict[str, dict] = {}
     id_to_frame_dict: dict[str, str] = {}
     id_to_css_dict: dict[str, str]
-    id_to_element_hash: dict[str, str]
-    hash_to_element_ids: dict[str, list[str]]
     element_tree: list[dict]
     element_tree_trimmed: list[dict]
     screenshots: list[bytes]
@@ -339,13 +309,7 @@ async def scrape_web_unsafe(
     elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
     element_tree = await cleanup_element_tree(url, copy.deepcopy(element_tree))
 
-    id_to_css_dict, id_to_element_dict, id_to_frame_dict, id_to_element_hash, hash_to_element_ids = build_element_dict(
-        elements
-    )
-
-    # if there are no elements, fail the scraping
-    if not elements:
-        raise Exception("No elements found on the page")
+    id_to_css_dict, id_to_element_dict, id_to_frame_dict = build_element_dict(elements)
 
     text_content = await get_frame_text(page.main_frame)
 
@@ -365,8 +329,6 @@ async def scrape_web_unsafe(
         id_to_css_dict=id_to_css_dict,
         id_to_element_dict=id_to_element_dict,
         id_to_frame_dict=id_to_frame_dict,
-        id_to_element_hash=id_to_element_hash,
-        hash_to_element_ids=hash_to_element_ids,
         element_tree=element_tree,
         element_tree_trimmed=trim_element_tree(copy.deepcopy(element_tree)),
         screenshots=screenshots,
@@ -472,7 +434,7 @@ class IncrementalScrapePage:
         js_script = "() => getIncrementElements()"
         incremental_elements, incremental_tree = await frame.evaluate(js_script)
         # we listen the incremental elements seperated by frames, so all elements will be in the same SkyvernFrame
-        self.id_to_css_dict, self.id_to_element_dict, _, _, _ = build_element_dict(incremental_elements)
+        self.id_to_css_dict, self.id_to_element_dict, _ = build_element_dict(incremental_elements)
 
         self.elements = incremental_elements
 

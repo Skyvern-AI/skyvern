@@ -51,14 +51,9 @@ from skyvern.webeye.actions.actions import (
     WebAction,
     parse_actions,
 )
-from skyvern.webeye.actions.caching import retrieve_action_plan
-from skyvern.webeye.actions.handler import (
-    ActionHandler,
-    extract_information_for_navigation_goal,
-    poll_verification_code,
-)
+from skyvern.webeye.actions.handler import ActionHandler, handle_complete_action, poll_verification_code
 from skyvern.webeye.actions.models import AgentStepOutput, DetailedAgentStepOutput
-from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
+from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -558,22 +553,7 @@ class ForgeAgent:
             detailed_agent_step_output.extract_action_prompt = extract_action_prompt
             json_response = None
             actions: list[Action]
-
-            using_cached_action_plan = False
-            if not task.navigation_goal:
-                actions = [
-                    CompleteAction(
-                        reasoning="Task has no navigation goal.",
-                        data_extraction_goal=task.data_extraction_goal,
-                    )
-                ]
-            elif (
-                task_block
-                and task_block.cache_actions
-                and (actions := await retrieve_action_plan(task, step, scraped_page))
-            ):
-                using_cached_action_plan = True
-            else:
+            if task.navigation_goal:
                 self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)
                 json_response = await app.LLM_API_HANDLER(
                     prompt=extract_action_prompt,
@@ -589,8 +569,14 @@ class ForgeAgent:
                 )
                 detailed_agent_step_output.llm_response = json_response
 
-                actions = parse_actions(task, step.step_id, step.order, scraped_page, json_response["actions"])
-
+                actions = parse_actions(task, json_response["actions"])
+            else:
+                actions = [
+                    CompleteAction(
+                        reasoning="Task has no navigation goal.",
+                        data_extraction_goal=task.data_extraction_goal,
+                    )
+                ]
             detailed_agent_step_output.actions = actions
             if len(actions) == 0:
                 LOG.info(
@@ -635,8 +621,7 @@ class ForgeAgent:
                 wait_actions_to_skip = [action for action in actions if action.action_type == ActionType.WAIT]
                 wait_actions_len = len(wait_actions_to_skip)
                 # if there are wait actions and there are other actions in the list, skip wait actions
-                # if we are using cached action plan, we don't skip wait actions
-                if wait_actions_len > 0 and wait_actions_len < len(actions) and not using_cached_action_plan:
+                if wait_actions_len > 0 and wait_actions_len < len(actions):
                     actions = [action for action in actions if action.action_type != ActionType.WAIT]
                     LOG.info(
                         "Skipping wait actions",
@@ -886,10 +871,12 @@ class ForgeAgent:
                 navigation_payload=task.navigation_payload,
                 elements=scraped_page.build_element_tree(ElementTreeFormat.HTML),
             )
+            screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=page.url)
+
             verification_llm_api_handler = app.SECONDARY_LLM_API_HANDLER
 
             verification_response = await verification_llm_api_handler(
-                prompt=verification_prompt, step=step, screenshots=None
+                prompt=verification_prompt, step=step, screenshots=screenshots
             )
             if "user_goal_achieved" not in verification_response or "reasoning" not in verification_response:
                 LOG.error(
@@ -908,16 +895,9 @@ class ForgeAgent:
                 return None
 
             LOG.info("User goal achieved, executing complete action")
-            extracted_data = None
-            if complete_action.data_extraction_goal:
-                scrape_action_result = await extract_information_for_navigation_goal(
-                    scraped_page=scraped_page,
-                    task=task,
-                    step=step,
-                )
-                extracted_data = scrape_action_result.scraped_data
+            action_results = await handle_complete_action(complete_action, page, scraped_page, task, step)
 
-            return complete_action, [ActionSuccess(data=extracted_data)]
+            return complete_action, action_results
 
         except Exception:
             LOG.error("LLM verification failed for complete action, skipping LLM verification", exc_info=True)

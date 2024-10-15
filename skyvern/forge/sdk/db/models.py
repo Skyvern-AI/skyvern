@@ -19,7 +19,6 @@ from sqlalchemy.orm import DeclarativeBase
 
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.id import (
-    generate_action_id,
     generate_artifact_id,
     generate_aws_secret_parameter_id,
     generate_bitwarden_credit_card_data_parameter_id,
@@ -438,29 +437,3 @@ class TOTPCodeModel(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     expired_at = Column(DateTime, index=True)
-
-
-class ActionModel(Base):
-    __tablename__ = "actions"
-    __table_args__ = (Index("action_org_task_step_index", "organization_id", "task_id", "step_id"),)
-
-    action_id = Column(String, primary_key=True, index=True, default=generate_action_id)
-    action_type = Column(String, nullable=False)
-    source_action_id = Column(String, ForeignKey("actions.action_id"), nullable=True, index=True)
-    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
-    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
-    task_id = Column(String, ForeignKey("tasks.task_id"), nullable=False, index=True)
-    step_id = Column(String, ForeignKey("steps.step_id"), nullable=False)
-    step_order = Column(Integer, nullable=False)
-    action_order = Column(Integer, nullable=False)
-    status = Column(String, nullable=False)
-    reasoning = Column(String, nullable=True)
-    intention = Column(String, nullable=True)
-    response = Column(String, nullable=True)
-    element_id = Column(String, nullable=True)
-    skyvern_element_hash = Column(String, nullable=True)
-    skyvern_element_data = Column(JSON, nullable=True)
-    action_json = Column(JSON, nullable=True)
-
-    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
-    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
