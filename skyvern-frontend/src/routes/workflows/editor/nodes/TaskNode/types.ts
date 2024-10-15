@@ -15,6 +15,7 @@ export type TaskNodeData = {
   parameterKeys: Array<string>;
   totpVerificationUrl: string | null;
   totpIdentifier: string | null;
+  continueOnFailure: boolean;
 };
 
 export type TaskNode = Node<TaskNodeData, "task">;
@@ -36,6 +37,7 @@ export const taskNodeDefaultData: TaskNodeData = {
   parameterKeys: [],
   totpVerificationUrl: null,
   totpIdentifier: null,
+  continueOnFailure: false,
 } as const;
 
 export function isTaskNode(node: Node): node is TaskNode {

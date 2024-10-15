@@ -73,6 +73,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
     maxRetries: data.maxRetries,
     maxStepsOverride: data.maxStepsOverride,
     allowDownloads: data.allowDownloads,
+    continueOnFailure: data.continueOnFailure,
     downloadSuffix: data.downloadSuffix,
     errorCodeMapping: data.errorCodeMapping,
     totpVerificationUrl: data.totpVerificationUrl,
@@ -329,6 +330,24 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                         return;
                       }
                       handleChange("allowDownloads", checked);
+                    }}
+                  />
+                </div>
+              </div>
+              <div className="flex items-center justify-between">
+                <div className="flex gap-2">
+                  <Label className="text-xs font-normal text-slate-300">
+                    Continue on Failure
+                  </Label>
+                </div>
+                <div className="w-52">
+                  <Switch
+                    checked={inputs.continueOnFailure}
+                    onCheckedChange={(checked) => {
+                      if (!editable) {
+                        return;
+                      }
+                      handleChange("continueOnFailure", checked);
                     }}
                   />
                 </div>
