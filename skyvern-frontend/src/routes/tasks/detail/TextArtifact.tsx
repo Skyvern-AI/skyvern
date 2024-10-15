@@ -2,33 +2,40 @@ import { artifactApiClient } from "@/api/AxiosClient";
 import { ArtifactApiResponse } from "@/api/types";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
-import { useQuery } from "@tanstack/react-query";
+import { useQueries } from "@tanstack/react-query";
 import axios from "axios";
 
 type Props = {
-  artifact: ArtifactApiResponse;
+  artifacts: Array<ArtifactApiResponse>;
 };
 
-function TextArtifact({ artifact }: Props) {
-  const { data, isFetching, isError, error } = useQuery<string>({
-    queryKey: ["artifact", artifact.artifact_id],
-    queryFn: async () => {
-      if (artifact.uri.startsWith("file://")) {
-        return artifactApiClient
-          .get(`/artifact/text`, {
-            params: {
-              path: artifact.uri.slice(7),
-            },
-          })
-          .then((response) => response.data);
-      }
-      if (artifact.uri.startsWith("s3://") && artifact.signed_url) {
-        return axios.get(artifact.signed_url).then((response) => response.data);
-      }
-    },
+function TextArtifact({ artifacts }: Props) {
+  function fetchArtifact(artifact: ArtifactApiResponse) {
+    if (artifact.uri.startsWith("file://")) {
+      return artifactApiClient
+        .get(`/artifact/text`, {
+          params: {
+            path: artifact.uri.slice(7),
+          },
+        })
+        .then((response) => response.data);
+    }
+    if (artifact.uri.startsWith("s3://") && artifact.signed_url) {
+      return axios.get(artifact.signed_url).then((response) => response.data);
+    }
+  }
+
+  const results = useQueries({
+    queries:
+      artifacts?.map((artifact) => {
+        return {
+          queryKey: ["artifact", artifact.artifact_id],
+          queryFn: () => fetchArtifact(artifact),
+        };
+      }) ?? [],
   });
 
-  if (isFetching) {
+  if (results.some((result) => result.isLoading)) {
     return <Skeleton className="h-48 w-full" />;
   }
 
@@ -36,7 +43,11 @@ function TextArtifact({ artifact }: Props) {
     <Textarea
       className="w-full"
       rows={15}
-      value={isError ? JSON.stringify(error) : data}
+      value={
+        results.some((result) => result.isError)
+          ? JSON.stringify(results.find((result) => result.isError)?.error)
+          : results.map((result) => result.data).join(",\n")
+      }
       readOnly
     />
   );
