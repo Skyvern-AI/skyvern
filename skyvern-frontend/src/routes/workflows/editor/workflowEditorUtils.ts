@@ -147,6 +147,7 @@ function convertToNode(
           parameterKeys: block.parameters.map((p) => p.key),
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
+          continueOnFailure: block.continue_on_failure,
         },
       };
     }
@@ -518,6 +519,7 @@ function getWorkflowBlock(
         parameter_keys: node.data.parameterKeys,
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
+        continue_on_failure: node.data.continueOnFailure,
       };
     }
     case "sendEmail": {
