@@ -1065,12 +1065,11 @@ function convertBlocks(blocks: Array<WorkflowBlock>): Array<BlockYAML> {
 }
 
 function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
-  const title = `Copy of ${workflow.title}`;
   const userParameters = workflow.workflow_definition.parameters.filter(
     (parameter) => parameter.parameter_type !== "output",
   );
   return {
-    title: title,
+    title: workflow.title,
     description: workflow.description,
     proxy_location: workflow.proxy_location,
     webhook_callback_url: workflow.webhook_callback_url,
