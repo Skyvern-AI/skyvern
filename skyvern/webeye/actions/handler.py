@@ -451,7 +451,18 @@ async def handle_input_text_action(
 
         # press arrowdown to watch if there's any options popping up
         await incremental_scraped.start_listen_dom_increment()
-        await skyvern_element.press_key("ArrowDown")
+        try:
+            await skyvern_element.press_key("ArrowDown")
+        except TimeoutError:
+            # sometimes we notice `press_key()` raise a timeout but actually the dropdown is opened.
+            LOG.info(
+                "Timeout to press ArrowDown to open dropdown, ignore the timeout and continue to execute the action",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                element_id=skyvern_element.get_id(),
+                action=action,
+            )
+
         await asyncio.sleep(5)
 
         incremental_element = await incremental_scraped.get_incremental_element_tree(
@@ -676,6 +687,13 @@ async def handle_select_option_action(
         tag_name=tag_name,
         element_dict=element_dict,
     )
+
+    # Handle the edge case:
+    # Sometimes our custom select logic could fail, and leaving the dropdown being opened.
+    # Confirm if the select action is on the custom option element
+    if await skyvern_element.is_custom_option():
+        click_action = ClickAction(element_id=action.element_id)
+        return await chain_click(task, scraped_page, page, click_action, skyvern_element)
 
     if not await skyvern_element.is_selectable():
         # 1. find from children
