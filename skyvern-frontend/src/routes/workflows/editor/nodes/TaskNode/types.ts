@@ -74,6 +74,9 @@ export const helpTooltipContent = {
     "If you have an internal system for storing TOTP codes, link the endpoint here.",
   totpIdentifier:
     "If you are running multiple tasks or workflows at once, you will need to give the task an identifier to know that this TOTP goes with this task.",
+  continueOnFailure:
+    "Allow the workflow to continue if it encounters a failure.",
+  cacheActions: "Cache the actions of this task.",
 } as const;
 
 export const fieldPlaceholders = {
