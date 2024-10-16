@@ -148,6 +148,9 @@ class SkyvernElement:
 
         return False
 
+    async def is_custom_option(self) -> bool:
+        return self.get_tag_name() == "li" or await self.get_attr("role") == "option"
+
     async def is_checkbox(self) -> bool:
         tag_name = self.get_tag_name()
         if tag_name != "input":
