@@ -1,6 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
 import { WorkflowApiResponse, WorkflowRunApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
   Pagination,
@@ -37,10 +38,10 @@ import {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { stringify as convertToYAML } from "yaml";
+import { ImportWorkflowButton } from "./ImportWorkflowButton";
 import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
-import { WorkflowTitle } from "./WorkflowTitle";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { WorkflowActions } from "./WorkflowActions";
+import { WorkflowTitle } from "./WorkflowTitle";
 
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
@@ -178,19 +179,22 @@ function Workflows() {
 
       <header className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Workflows</h1>
-        <Button
-          disabled={createNewWorkflowMutation.isPending}
-          onClick={() => {
-            createNewWorkflowMutation.mutate();
-          }}
-        >
-          {createNewWorkflowMutation.isPending ? (
-            <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-          ) : (
-            <PlusIcon className="mr-2 h-4 w-4" />
-          )}
-          Create Workflow
-        </Button>
+        <div className="flex gap-2">
+          <ImportWorkflowButton />
+          <Button
+            disabled={createNewWorkflowMutation.isPending}
+            onClick={() => {
+              createNewWorkflowMutation.mutate();
+            }}
+          >
+            {createNewWorkflowMutation.isPending ? (
+              <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <PlusIcon className="mr-2 h-4 w-4" />
+            )}
+            Create Workflow
+          </Button>
+        </div>
       </header>
       <div className="rounded-md border">
         <Table>
