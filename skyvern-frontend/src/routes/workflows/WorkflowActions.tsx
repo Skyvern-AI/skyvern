@@ -1,4 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
+import { GarbageIcon } from "@/components/icons/GarbageIcon";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -14,6 +15,10 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuPortal,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { toast } from "@/components/ui/use-toast";
@@ -21,27 +26,55 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import {
   CopyIcon,
   DotsHorizontalIcon,
+  DownloadIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
-import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
-import { stringify as convertToYAML } from "yaml";
-import { WorkflowApiResponse } from "./types/workflowTypes";
 import { useNavigate } from "react-router-dom";
-import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
+import { stringify as convertToYAML } from "yaml";
 import { convert } from "./editor/workflowEditorUtils";
-import { GarbageIcon } from "@/components/icons/GarbageIcon";
+import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
+import { WorkflowApiResponse } from "./types/workflowTypes";
+import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 
 type Props = {
   id: string;
 };
+
+function downloadFile(fileName: string, contents: string) {
+  const element = document.createElement("a");
+  element.setAttribute(
+    "href",
+    "data:text/plain;charset=utf-8," + encodeURIComponent(contents),
+  );
+  element.setAttribute("download", fileName);
+
+  element.style.display = "none";
+  document.body.appendChild(element);
+
+  element.click();
+
+  document.body.removeChild(element);
+}
 
 function WorkflowActions({ id }: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId: id });
   const navigate = useNavigate();
+
+  function handleExport(type: "json" | "yaml") {
+    if (!workflow) {
+      return;
+    }
+    const fileName = `${workflow.title}.${type}`;
+    const contents =
+      type === "json"
+        ? JSON.stringify(convert(workflow), null, 2)
+        : convertToYAML(convert(workflow));
+    downloadFile(fileName, contents);
+  }
 
   const createWorkflowMutation = useMutation({
     mutationFn: async (workflow: WorkflowCreateYAMLRequest) => {
@@ -98,7 +131,10 @@ function WorkflowActions({ id }: Props) {
               if (!workflow) {
                 return;
               }
-              const clonedWorkflow = convert(workflow);
+              const clonedWorkflow = convert({
+                ...workflow,
+                title: `Copy of ${workflow.title}`,
+              });
               createWorkflowMutation.mutate(clonedWorkflow);
             }}
             className="p-2"
@@ -106,6 +142,31 @@ function WorkflowActions({ id }: Props) {
             <CopyIcon className="mr-2 h-4 w-4" />
             Clone Workflow
           </DropdownMenuItem>
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>
+              <DownloadIcon className="mr-2 h-4 w-4" />
+              Export as...
+            </DropdownMenuSubTrigger>
+            <DropdownMenuPortal>
+              <DropdownMenuSubContent>
+                <DropdownMenuItem
+                  onSelect={() => {
+                    handleExport("yaml");
+                  }}
+                >
+                  YAML
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={() => {
+                    handleExport("json");
+                  }}
+                >
+                  JSON
+                </DropdownMenuItem>
+              </DropdownMenuSubContent>
+            </DropdownMenuPortal>
+          </DropdownMenuSub>
+
           <DialogTrigger>
             <DropdownMenuItem className="p-2">
               <GarbageIcon className="mr-2 h-4 w-4 text-destructive" />
