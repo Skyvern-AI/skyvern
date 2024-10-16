@@ -107,7 +107,7 @@ function WorkflowParametersPanel() {
         </DropdownMenu>
 
         <ScrollArea>
-          <ScrollAreaViewport className="max-h-[600px]">
+          <ScrollAreaViewport className="max-h-96">
             <section className="space-y-2">
               {workflowParameters.map((parameter) => {
                 return (
