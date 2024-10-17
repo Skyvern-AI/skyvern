@@ -8,10 +8,21 @@ import {
 import { QueuedTasks } from "../running/QueuedTasks";
 import { RunningTasks } from "../running/RunningTasks";
 import { TaskHistory } from "./TaskHistory";
+import { Button } from "@/components/ui/button";
+import { Link } from "react-router-dom";
+import { PlusIcon } from "@radix-ui/react-icons";
 
 function TaskList() {
   return (
-    <div className="flex flex-col gap-8">
+    <div className="space-y-8">
+      <header className="flex justify-end">
+        <Button asChild>
+          <Link to="/create">
+            <PlusIcon className="mr-2 h-4 w-4" />
+            Create New Task
+          </Link>
+        </Button>
+      </header>
       <Card>
         <CardHeader className="border-b-2">
           <CardTitle className="text-xl">Running Tasks</CardTitle>
