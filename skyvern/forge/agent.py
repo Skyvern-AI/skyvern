@@ -891,7 +891,7 @@ class ForgeAgent:
             verification_response = await verification_llm_api_handler(
                 prompt=verification_prompt, step=step, screenshots=None
             )
-            if "user_goal_achieved" not in verification_response or "reasoning" not in verification_response:
+            if "user_goal_achieved" not in verification_response or "thoughts" not in verification_response:
                 LOG.error(
                     "Invalid LLM response for user goal success verification, skipping verification",
                     verification_response=verification_response,
@@ -900,7 +900,7 @@ class ForgeAgent:
 
             user_goal_achieved: bool = verification_response["user_goal_achieved"]
             complete_action = CompleteAction(
-                reasoning=verification_response["reasoning"],
+                reasoning=verification_response["thoughts"],
                 data_extraction_goal=task.data_extraction_goal,
             )
             # We don't want to return a complete action if the user goal is not achieved since we're checking at every step
