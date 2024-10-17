@@ -67,7 +67,7 @@ export const helpTooltipContent = {
   completeOnDownload:
     "Allow Skyvern to auto-complete the task when it downloads a file.",
   fileSuffix:
-    "If you allow complete on download, you can opt-in to add a suffix identifier.",
+    "A file suffix that's automatically added to all downloaded files.",
   errorCodeMapping:
     "Knowing about why a task terminated can be important, specify error messages here.",
   totpVerificationUrl:
