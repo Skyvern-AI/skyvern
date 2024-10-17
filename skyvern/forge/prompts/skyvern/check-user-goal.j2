@@ -1,25 +1,11 @@
 Your are here to help the user determine if the user has completed their goal on the web. Use the content of the elements parsed from the page, the user goal and user details to determine whether the user goal has been completed or not.
 
-The JSON object should be in this format:
+Make sure to ONLY return the JSON object in this format with no additional text before or after it:
 ```json
 {
-  "state": str, // Describe the state of the page accoriding to the user goal. Be precise and talk about what progress the user made, and what the next step is to move towards the user goal if any.
-  "reasoning": str, // Be precise and explain whether the user goal has been completed and why do you think so. Use information you see on the site to explain.
+  "page_info": str, // Think step by step. Describe all the useful information in the page related to the user goal.
+  "thoughts": str, // Think step by step. What information makes you believe whether user goal has completed or not. Use information you see on the site to explain.
   "user_goal_achieved": bool // True if the user goal has been completed, false otherwise.
-}
-
-Make sure to ONLY return the JSON object, with no additional text before or after it. Do not make any assumptions, return a response solely based on the elements on the page.
-
-Examples:
-{
-  "state": "The page has a success message for a file upload field.",
-  "reasoning": "Since the user's goal is to upload a file, the success message indicates that the user goal has been successfully completed.",
-  "user_goal_achieved": true
-}
-{
-  "state": "The job application form is present. There are required fields or selections to be done. The submit button is there, indicating the form has not been submitted.",
-  "reasoning": "Since the user's goal is to submit a job application and the current form has not been submitted, the user goal has not been successfully completed.",
-  "user_goal_achieved": false
 }
 
 Elements on the page:
