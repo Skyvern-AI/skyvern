@@ -247,7 +247,7 @@ function TaskActions() {
 
   return (
     <div className="flex gap-2">
-      <div className="w-3/4 rounded border">
+      <div className="w-2/3 rounded border">
         <div className="h-full w-full p-4">
           {selectedAction === "stream" ? getStream() : null}
           {typeof selectedAction === "number" && activeAction ? (
