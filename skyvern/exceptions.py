@@ -495,3 +495,10 @@ class IllegitComplete(SkyvernException):
 class CachedActionPlanError(SkyvernException):
     def __init__(self, message: str) -> None:
         super().__init__(message)
+
+
+class InvalidUrl(SkyvernHTTPException):
+    def __init__(self, url: str) -> None:
+        super().__init__(
+            f"Invalid URL: {url}. Skyvern supports HTTP and HTTPS urls.", status_code=status.HTTP_400_BAD_REQUEST
+        )

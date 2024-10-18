@@ -36,6 +36,7 @@ from skyvern.forge.sdk.api.files import get_path_for_workflow_download_directory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
+from skyvern.forge.sdk.core.validators import validate_url
 from skyvern.forge.sdk.models import Organization, Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskStatus
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -126,6 +127,7 @@ class ForgeAgent:
 
             task_url = working_page.url
 
+        task_url = validate_url(task_url)
         task = await app.DATABASE.create_task(
             url=task_url,
             title=task_block.title,
@@ -183,10 +185,10 @@ class ForgeAgent:
 
     async def create_task(self, task_request: TaskRequest, organization_id: str | None = None) -> Task:
         task = await app.DATABASE.create_task(
-            url=task_request.url,
+            url=str(task_request.url),
             title=task_request.title,
-            webhook_callback_url=task_request.webhook_callback_url,
-            totp_verification_url=task_request.totp_verification_url,
+            webhook_callback_url=str(task_request.webhook_callback_url),
+            totp_verification_url=str(task_request.totp_verification_url),
             totp_identifier=task_request.totp_identifier,
             navigation_goal=task_request.navigation_goal,
             data_extraction_goal=task_request.data_extraction_goal,
