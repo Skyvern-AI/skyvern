@@ -461,6 +461,7 @@ class ActionModel(Base):
     skyvern_element_hash = Column(String, nullable=True)
     skyvern_element_data = Column(JSON, nullable=True)
     action_json = Column(JSON, nullable=True)
+    confidence_float = Column(Numeric, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
