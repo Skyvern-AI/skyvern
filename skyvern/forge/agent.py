@@ -886,11 +886,9 @@ class ForgeAgent:
                 navigation_payload=task.navigation_payload,
                 elements=scraped_page.build_element_tree(ElementTreeFormat.HTML),
             )
-            verification_llm_api_handler = app.SECONDARY_LLM_API_HANDLER
 
-            verification_response = await verification_llm_api_handler(
-                prompt=verification_prompt, step=step, screenshots=None
-            )
+            # this prompt is critical to our agent so let's use the primary LLM API handler
+            verification_response = await app.LLM_API_HANDLER(prompt=verification_prompt, step=step, screenshots=None)
             if "user_goal_achieved" not in verification_response or "thoughts" not in verification_response:
                 LOG.error(
                     "Invalid LLM response for user goal success verification, skipping verification",
