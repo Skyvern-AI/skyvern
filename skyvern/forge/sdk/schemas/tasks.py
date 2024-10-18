@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, HttpUrl
 
 from skyvern.exceptions import InvalidTaskStatusTransition, TaskAlreadyCanceled
 
@@ -22,7 +22,7 @@ class ProxyLocation(StrEnum):
     NONE = "NONE"
 
 
-class TaskRequest(BaseModel):
+class TaskBase(BaseModel):
     title: str | None = Field(
         default=None,
         description="The title of the task.",
@@ -74,6 +74,20 @@ class TaskRequest(BaseModel):
         default=None,
         description="The requested schema of the extracted information.",
     )
+
+
+class TaskRequest(TaskBase):
+    url: HttpUrl = Field(
+        ...,
+        description="Starting URL for the task.",
+        examples=["https://www.geico.com"],
+    )
+    webhook_callback_url: HttpUrl | None = Field(
+        default=None,
+        description="The URL to call when the task is completed.",
+        examples=["https://my-webhook.com"],
+    )
+    totp_verification_url: HttpUrl | None = None
 
 
 class TaskStatus(StrEnum):
@@ -144,7 +158,7 @@ class TaskStatus(StrEnum):
         return self in status_requires_failure_reason
 
 
-class Task(TaskRequest):
+class Task(TaskBase):
     created_at: datetime = Field(
         ...,
         description="The creation datetime of the task.",
@@ -229,7 +243,7 @@ class Task(TaskRequest):
 
 
 class TaskResponse(BaseModel):
-    request: TaskRequest
+    request: TaskBase
     task_id: str
     status: TaskStatus
     created_at: datetime
