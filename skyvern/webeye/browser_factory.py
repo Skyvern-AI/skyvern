@@ -208,6 +208,7 @@ class BrowserState:
         proxy_location: ProxyLocation | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
+        organization_id: str | None = None,
     ) -> None:
         if self.pw is None:
             LOG.info("Starting playwright")
@@ -225,6 +226,7 @@ class BrowserState:
                 proxy_location=proxy_location,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
             )
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts
@@ -312,6 +314,7 @@ class BrowserState:
         proxy_location: ProxyLocation | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
+        organization_id: str | None = None,
     ) -> Page:
         page = await self.get_working_page()
         if page is not None:
@@ -319,7 +322,11 @@ class BrowserState:
 
         try:
             await self.check_and_fix_state(
-                url=url, proxy_location=proxy_location, task_id=task_id, workflow_run_id=workflow_run_id
+                url=url,
+                proxy_location=proxy_location,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
             )
         except Exception as e:
             error_message = str(e)
@@ -327,14 +334,22 @@ class BrowserState:
                 raise e
             await self.close_current_open_page()
             await self.check_and_fix_state(
-                url=url, proxy_location=proxy_location, task_id=task_id, workflow_run_id=workflow_run_id
+                url=url,
+                proxy_location=proxy_location,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
             )
         await self.__assert_page()
 
         if not await BrowserContextFactory.validate_browser_context(await self.get_working_page()):
             await self.close_current_open_page()
             await self.check_and_fix_state(
-                url=url, proxy_location=proxy_location, task_id=task_id, workflow_run_id=workflow_run_id
+                url=url,
+                proxy_location=proxy_location,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
             )
             await self.__assert_page()
 

@@ -30,6 +30,7 @@ class BrowserManager:
         url: str | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
+        organization_id: str | None = None,
     ) -> BrowserState:
         pw = await async_playwright().start()
         (
@@ -42,6 +43,7 @@ class BrowserManager:
             url=url,
             task_id=task_id,
             workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
         )
         return BrowserState(
             pw=pw,
@@ -64,11 +66,18 @@ class BrowserManager:
             return self.pages[task.task_id]
 
         LOG.info("Creating browser state for task", task_id=task.task_id)
-        browser_state = await self._create_browser_state(task.proxy_location, task.url, task.task_id)
+        browser_state = await self._create_browser_state(
+            proxy_location=task.proxy_location,
+            url=task.url,
+            task_id=task.task_id,
+            organization_id=task.organization_id,
+        )
 
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.
-        await browser_state.get_or_create_page(url=task.url, proxy_location=task.proxy_location, task_id=task.task_id)
+        await browser_state.get_or_create_page(
+            url=task.url, proxy_location=task.proxy_location, task_id=task.task_id, organization_id=task.organization_id
+        )
 
         self.pages[task.task_id] = browser_state
         if task.workflow_run_id:
@@ -83,13 +92,19 @@ class BrowserManager:
             workflow_run_id=workflow_run.workflow_run_id,
         )
         browser_state = await self._create_browser_state(
-            workflow_run.proxy_location, url=url, workflow_run_id=workflow_run.workflow_run_id
+            workflow_run.proxy_location,
+            url=url,
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=workflow_run.organization_id,
         )
 
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.
         await browser_state.get_or_create_page(
-            url=url, proxy_location=workflow_run.proxy_location, workflow_run_id=workflow_run.workflow_run_id
+            url=url,
+            proxy_location=workflow_run.proxy_location,
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=workflow_run.organization_id,
         )
 
         self.pages[workflow_run.workflow_run_id] = browser_state
