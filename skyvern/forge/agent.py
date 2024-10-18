@@ -184,11 +184,13 @@ class ForgeAgent:
         return task, step
 
     async def create_task(self, task_request: TaskRequest, organization_id: str | None = None) -> Task:
+        webhook_callback_url = str(task_request.webhook_callback_url) if task_request.webhook_callback_url else None
+        totp_verification_url = str(task_request.totp_verification_url) if task_request.totp_verification_url else None
         task = await app.DATABASE.create_task(
             url=str(task_request.url),
             title=task_request.title,
-            webhook_callback_url=str(task_request.webhook_callback_url) if task_request.webhook_callback_url else None,
-            totp_verification_url=str(task_request.totp_verification_url) if task_request.totp_verification_url else None,
+            webhook_callback_url=webhook_callback_url,
+            totp_verification_url=totp_verification_url,
             totp_identifier=task_request.totp_identifier,
             navigation_goal=task_request.navigation_goal,
             data_extraction_goal=task_request.data_extraction_goal,
