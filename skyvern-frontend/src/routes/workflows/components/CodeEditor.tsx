@@ -22,6 +22,7 @@ function CodeEditor({
   maxHeight,
   language,
   className,
+  disabled,
   fontSize = 8,
 }: Props) {
   const extensions =
@@ -36,6 +37,7 @@ function CodeEditor({
       theme={tokyoNightStorm}
       minHeight={minHeight}
       maxHeight={maxHeight}
+      readOnly={disabled}
       className={cn("cursor-auto", className)}
       style={{
         fontSize: fontSize,

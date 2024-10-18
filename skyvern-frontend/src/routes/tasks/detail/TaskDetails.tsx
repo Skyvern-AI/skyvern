@@ -17,14 +17,12 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Textarea } from "@/components/ui/textarea";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { cn } from "@/util/utils";
 import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, NavLink, Outlet, useParams } from "react-router-dom";
-import { TaskInfo } from "./TaskInfo";
 import { useTaskQuery } from "./hooks/useTaskQuery";
 import { taskIsFinalized } from "@/api/utils";
 import fetchToCurl from "fetch-to-curl";
@@ -32,6 +30,8 @@ import { apiBaseUrl } from "@/util/env";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { copyText } from "@/util/copyText";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+import { StatusBadge } from "@/components/StatusBadge";
+import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 
 function createTaskRequestObject(values: TaskApiResponse) {
   return {
@@ -119,12 +119,16 @@ function TaskDetails() {
   const showExtractedInformation =
     task?.status === Status.Completed && task.extracted_information !== null;
   const extractedInformation = showExtractedInformation ? (
-    <div className="flex items-center">
-      <Label className="w-32 shrink-0 text-lg">Extracted Information</Label>
-      <Textarea
-        rows={5}
+    <div className="space-y-1">
+      <Label className="text-lg">Extracted Information</Label>
+      <CodeEditor
+        language="json"
         value={JSON.stringify(task.extracted_information, null, 2)}
-        readOnly
+        disabled
+        fontSize={12}
+        minHeight={"96px"}
+        maxHeight={"500px"}
+        className="w-full"
       />
     </div>
   ) : null;
@@ -139,12 +143,16 @@ function TaskDetails() {
     task?.status === Status.Terminated ||
     task?.status === Status.TimedOut;
   const failureReason = showFailureReason ? (
-    <div className="flex items-center">
-      <Label className="w-32 shrink-0 text-lg">Failure Reason</Label>
-      <Textarea
-        rows={5}
+    <div className="space-y-1">
+      <Label className="text-lg">Failure Reason</Label>
+      <CodeEditor
+        language="json"
         value={JSON.stringify(task.failure_reason, null, 2)}
-        readOnly
+        disabled
+        fontSize={12}
+        minHeight={"96px"}
+        maxHeight={"500px"}
+        className="w-full"
       />
     </div>
   ) : null;
@@ -153,9 +161,13 @@ function TaskDetails() {
     <div className="flex flex-col gap-8">
       <header className="space-y-3">
         <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-5">
             <span className="text-3xl">{taskId}</span>
-            {taskId && <TaskInfo id={taskId} />}
+            {taskIsLoading ? (
+              <Skeleton className="h-8 w-32" />
+            ) : (
+              task && <StatusBadge status={task.status} />
+            )}
           </div>
           <div className="flex items-center gap-2">
             <Button
@@ -245,10 +257,7 @@ function TaskDetails() {
       </header>
 
       {taskIsLoading ? (
-        <div className="flex items-center gap-2">
-          <Skeleton className="h-32 w-32" />
-          <Skeleton className="h-32 w-full" />
-        </div>
+        <Skeleton className="h-32 w-full" />
       ) : (
         <>
           {extractedInformation}
