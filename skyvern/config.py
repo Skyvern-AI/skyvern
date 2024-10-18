@@ -36,12 +36,12 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: list[str] = ["*"]
 
     # Secret key for JWT. Please generate your own secret key in production
-    SECRET_KEY: str = "RX1NvhujcJqBPi8O78-7aSfJEWuT86-fll4CzKc_uek"
+    SECRET_KEY: str = "PLACEHOLDER"
     # Algorithm used to sign the JWT
     SIGNATURE_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # one week
 
-    SKYVERN_API_KEY: str = "SKYVERN_API_KEY"
+    SKYVERN_API_KEY: str = "PLACEHOLDER"
 
     # Artifact storage settings
     ARTIFACT_STORAGE_PATH: str = f"{SKYVERN_DIR}/artifacts"
