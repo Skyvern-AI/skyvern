@@ -1629,3 +1629,15 @@ class AgentDB:
             )
             actions = (await session.scalars(query)).all()
             return [Action.model_validate(action) for action in actions]
+
+    async def delete_task_actions(self, organization_id: str, task_id: str) -> None:
+        async with self.Session() as session:
+            # delete actions by filtering organization_id and task_id
+            stmt = delete(ActionModel).where(
+                and_(
+                    ActionModel.organization_id == organization_id,
+                    ActionModel.task_id == task_id,
+                )
+            )
+            await session.execute(stmt)
+            await session.commit()
