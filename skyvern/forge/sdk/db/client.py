@@ -274,6 +274,26 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_task_actions(self, task_id: str, organization_id: str | None = None) -> list[Action]:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(ActionModel)
+                    .filter(ActionModel.organization_id == organization_id)
+                    .filter(ActionModel.task_id == task_id)
+                    .order_by(ActionModel.step_order, ActionModel.action_order, ActionModel.created_at)
+                )
+
+                actions = (await session.scalars(query)).all()
+                return [Action.model_validate(action) for action in actions]
+
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def get_latest_step(self, task_id: str, organization_id: str | None = None) -> Step | None:
         try:
             async with self.Session() as session:
