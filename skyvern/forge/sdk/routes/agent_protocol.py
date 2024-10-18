@@ -52,6 +52,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatusResponse,
 )
 from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
+from skyvern.webeye.actions.actions import Action
 
 base_router = APIRouter()
 
@@ -508,25 +509,19 @@ class ActionResultTmp(BaseModel):
     success: bool = True
 
 
-@base_router.get("/tasks/{task_id}/actions", response_model=list[ActionResultTmp])
+@base_router.get("/tasks/{task_id}/actions", response_model=list[Action])
 @base_router.get(
     "/tasks/{task_id}/actions/",
-    response_model=list[ActionResultTmp],
+    response_model=list[Action],
     include_in_schema=False,
 )
 async def get_task_actions(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> list[ActionResultTmp]:
+) -> list[Action]:
     analytics.capture("skyvern-oss-agent-task-actions-get")
-    steps = await app.DATABASE.get_task_step_models(task_id, organization_id=current_org.organization_id)
-    results: list[ActionResultTmp] = []
-    for step_s in steps:
-        if not step_s.output or "action_results" not in step_s.output:
-            continue
-        for action_result in step_s.output["action_results"]:
-            results.append(ActionResultTmp.model_validate(action_result))
-    return results
+    actions = await app.DATABASE.get_task_actions(task_id, organization_id=current_org.organization_id)
+    return actions
 
 
 @base_router.post("/workflows/{workflow_id}/run", response_model=RunWorkflowResponse)
