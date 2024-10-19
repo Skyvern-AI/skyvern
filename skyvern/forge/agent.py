@@ -569,6 +569,13 @@ class ForgeAgent:
                     CompleteAction(
                         reasoning="Task has no navigation goal.",
                         data_extraction_goal=task.data_extraction_goal,
+                        organization_id=task.organization_id,
+                        task_id=task.task_id,
+                        workflow_run_id=task.workflow_run_id,
+                        step_id=step.step_id,
+                        step_order=step.order,
+                        action_order=0,
+                        confidence_float=1.0,
                     )
                 ]
             elif (
