@@ -48,7 +48,7 @@ Want to see examples of Skyvern in action? Jump to [#real-world-examples-of-skyv
 # How it works
 Skyvern was inspired by the Task-Driven autonomous agent design popularized by [BabyAGI](https://github.com/yoheinakajima/babyagi) and [AutoGPT](https://github.com/Significant-Gravitas/AutoGPT) -- with one major bonus: we give Skyvern the ability to interact with websites using browser automation libraries like [Playwright](https://playwright.dev/).
 
-Skyvern uses a swarm of agents to comprehend a website, and plan and executeits actions:
+Skyvern uses a swarm of agents to comprehend a website, and plan and execute its actions:
 1. **Interactable Element Agent**: This agent is responsible for parsing the HTML of a website and extracting the interactable elements. 
 2. **Navigation Agent**: This agent is responsible for planning the navigation to complete a task. Examples include clicking buttons, inserting text, selecting options, etc.
 3. **Data Extraction Agent**: This agent is responsible for extracting data from a website. It's capable of reading the tables and text on the page, and extract the output in a user-defined structured format
