@@ -1613,6 +1613,7 @@ class AgentDB:
                 skyvern_element_hash=action.skyvern_element_hash,
                 skyvern_element_data=action.skyvern_element_data,
                 action_json=action.model_dump(),
+                confidence_float=action.confidence_float,
             )
             session.add(new_action)
             await session.commit()
