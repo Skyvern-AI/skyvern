@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
+    BLOCKED_HOSTS: list[str] = ["localhost"]
 
     # Secret key for JWT. Please generate your own secret key in production
     SECRET_KEY: str = "PLACEHOLDER"

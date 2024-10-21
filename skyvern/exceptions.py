@@ -502,3 +502,11 @@ class InvalidUrl(SkyvernHTTPException):
         super().__init__(
             f"Invalid URL: {url}. Skyvern supports HTTP and HTTPS urls.", status_code=status.HTTP_400_BAD_REQUEST
         )
+
+
+class BlockedHost(SkyvernHTTPException):
+    def __init__(self, host: str) -> None:
+        super().__init__(
+            f"The host in your url is blocked: {host}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
