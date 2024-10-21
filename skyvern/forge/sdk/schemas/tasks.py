@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost, InvalidTaskStatusTransition, TaskAlreadyCanceled
+from skyvern.forge.sdk.core.validators import is_blocked_ip
 
 
 class ProxyLocation(StrEnum):
@@ -95,11 +96,10 @@ class TaskRequest(TaskBase):
     def validate_urls(cls, v: HttpUrl | None) -> HttpUrl | None:
         if not v or not v.host:
             return None
-        # Disallow internal IP ranges
         host = v.host
-        for block in settings.BLOCKED_HOSTS:
-            if host.startswith(block):
-                raise BlockedHost(host)
+        blocked = is_blocked_ip(host)
+        if blocked:
+            raise BlockedHost(host=host)
         return v
 
 
