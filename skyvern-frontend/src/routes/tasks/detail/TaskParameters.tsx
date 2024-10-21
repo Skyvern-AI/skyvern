@@ -76,6 +76,7 @@ function TaskParameters() {
           readOnly
           minHeight="96px"
           maxHeight="500px"
+          fontSize={12}
         />
       </div>
       <div className="flex gap-16">
@@ -112,6 +113,7 @@ function TaskParameters() {
           readOnly
           minHeight="96px"
           maxHeight="500px"
+          fontSize={12}
         />
       </div>
     </section>
