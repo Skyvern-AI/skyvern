@@ -1073,7 +1073,7 @@ async def chain_click(
                     dom=DomUtil(scraped_page=scraped_page, page=page)
                 ):
                     await bound_element.get_locator().click(timeout=timeout)
-                    action_results.extend(ActionSuccess())
+                    action_results.append(ActionSuccess())
                     return action_results
             except Exception:
                 action_results.append(
