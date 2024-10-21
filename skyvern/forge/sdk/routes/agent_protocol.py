@@ -867,10 +867,7 @@ async def update_organization(
 ) -> Organization:
     return await app.DATABASE.update_organization(
         current_org.organization_id,
-        organization_name=org_update.organization_name,
-        webhook_callback_url=org_update.webhook_callback_url,
         max_steps_per_run=org_update.max_steps_per_run,
-        max_retries_per_step=org_update.max_retries_per_step,
     )
 
 
