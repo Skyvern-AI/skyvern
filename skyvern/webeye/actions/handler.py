@@ -1060,9 +1060,33 @@ async def chain_click(
                 javascript_triggered=javascript_triggered,
             )
         ]
-        if await is_input_element(locator):
+
+        if skyvern_element.get_tag_name() == "label":
+            LOG.info(
+                "Chain click: it's a label element. going to try for-click",
+                task_id=task.task_id,
+                action=action,
+                locator=locator,
+            )
+            try:
+                if bound_element := await skyvern_element.find_label_for(
+                    dom=DomUtil(scraped_page=scraped_page, page=page)
+                ):
+                    await bound_element.get_locator().click(timeout=timeout)
+                    action_results.extend(ActionSuccess())
+                    return action_results
+            except Exception:
+                action_results.append(
+                    ActionFailure(
+                        FailToClick(action.element_id, anchor="for"),
+                        javascript_triggered=javascript_triggered,
+                    )
+                )
+
+        if skyvern_element.get_tag_name() == InteractiveElement.INPUT:
             LOG.info(
                 "Chain click: it's an input element. going to try sibling click",
+                task_id=task.task_id,
                 action=action,
                 locator=locator,
             )
@@ -1100,7 +1124,7 @@ async def chain_click(
             )
             action_results.append(
                 ActionFailure(
-                    FailToClick(action.element_id),
+                    FailToClick(action.element_id, anchor="parent"),
                     javascript_triggered=javascript_triggered,
                     interacted_with_parent=True,
                 )
