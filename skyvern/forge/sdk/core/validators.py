@@ -16,7 +16,7 @@ def validate_url(url: str) -> str:
         raise InvalidUrl(url=url)
 
 
-def is_blocked_ip(host: str) -> bool:
+def is_blocked_host(host: str) -> bool:
     try:
         ip = ipaddress.ip_address(host)
         # Check if the IP is private, link-local, loopback, or reserved

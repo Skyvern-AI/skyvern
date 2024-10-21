@@ -6,9 +6,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
-from skyvern.config import settings
 from skyvern.exceptions import BlockedHost, InvalidTaskStatusTransition, TaskAlreadyCanceled
-from skyvern.forge.sdk.core.validators import is_blocked_ip
+from skyvern.forge.sdk.core.validators import is_blocked_host
 
 
 class ProxyLocation(StrEnum):
@@ -97,7 +96,7 @@ class TaskRequest(TaskBase):
         if not v or not v.host:
             return None
         host = v.host
-        blocked = is_blocked_ip(host)
+        blocked = is_blocked_host(host)
         if blocked:
             raise BlockedHost(host=host)
         return v
