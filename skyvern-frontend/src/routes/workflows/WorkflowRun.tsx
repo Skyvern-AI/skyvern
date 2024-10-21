@@ -492,7 +492,7 @@ function WorkflowRun() {
                 ) : (
                   <CodeEditor
                     value={JSON.stringify(value, null, 2)}
-                    disabled
+                    readOnly
                     language="json"
                     fontSize={12}
                     minHeight="96px"

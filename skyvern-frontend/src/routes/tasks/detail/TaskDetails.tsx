@@ -124,7 +124,7 @@ function TaskDetails() {
       <CodeEditor
         language="json"
         value={JSON.stringify(task.extracted_information, null, 2)}
-        disabled
+        readOnly
         fontSize={12}
         minHeight={"96px"}
         maxHeight={"500px"}
@@ -148,7 +148,7 @@ function TaskDetails() {
       <CodeEditor
         language="json"
         value={JSON.stringify(task.failure_reason, null, 2)}
-        disabled
+        readOnly
         fontSize={12}
         minHeight={"96px"}
         maxHeight={"500px"}
