@@ -8,7 +8,7 @@ type Props = {
   value: string;
   onChange?: (value: string) => void;
   language: "python" | "json";
-  disabled?: boolean;
+  readOnly?: boolean;
   minHeight?: string;
   maxHeight?: string;
   className?: string;
@@ -22,7 +22,7 @@ function CodeEditor({
   maxHeight,
   language,
   className,
-  disabled,
+  readOnly = false,
   fontSize = 8,
 }: Props) {
   const extensions =
@@ -37,7 +37,7 @@ function CodeEditor({
       theme={tokyoNightStorm}
       minHeight={minHeight}
       maxHeight={maxHeight}
-      readOnly={disabled}
+      readOnly={readOnly}
       className={cn("cursor-auto", className)}
       style={{
         fontSize: fontSize,
