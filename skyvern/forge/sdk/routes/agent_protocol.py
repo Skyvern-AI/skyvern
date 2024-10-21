@@ -40,7 +40,15 @@ from skyvern.forge.sdk.schemas.organizations import (
     OrganizationUpdate,
 )
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration, TaskGenerationBase
-from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskRequest, TaskResponse, TaskStatus
+from skyvern.forge.sdk.schemas.tasks import (
+    CreateTaskResponse,
+    OrderBy,
+    SortDirection,
+    Task,
+    TaskRequest,
+    TaskResponse,
+    TaskStatus,
+)
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import FailedToCreateWorkflow, FailedToUpdateWorkflow
@@ -385,6 +393,8 @@ async def get_agent_tasks(
     workflow_run_id: Annotated[str | None, Query()] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     only_standalone_tasks: bool = Query(False),
+    sort: OrderBy = Query(OrderBy.created_at),
+    order: SortDirection = Query(SortDirection.desc),
 ) -> Response:
     """
     Get all tasks.
@@ -393,6 +403,8 @@ async def get_agent_tasks(
     :param task_status: Task status filter
     :param workflow_run_id: Workflow run id filter
     :param only_standalone_tasks: Only standalone tasks, tasks which are part of a workflow run will be filtered out
+    :param order: Direction to sort by, ascending or descending
+    :param sort: Column to sort by, created_at or modified_at
     :return: List of tasks with pagination without steps populated. Steps can be populated by calling the
         get_agent_task endpoint.
     """
@@ -409,6 +421,8 @@ async def get_agent_tasks(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
         only_standalone_tasks=only_standalone_tasks,
+        order=order,
+        order_by_column=sort,
     )
     return ORJSONResponse([task.to_task_response().model_dump() for task in tasks])
 

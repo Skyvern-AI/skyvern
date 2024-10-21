@@ -51,7 +51,7 @@ from skyvern.forge.sdk.db.utils import (
 )
 from skyvern.forge.sdk.models import Organization, OrganizationAuthToken, Step, StepStatus
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskStatus
+from skyvern.forge.sdk.schemas.tasks import OrderBy, ProxyLocation, SortDirection, Task, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -461,6 +461,8 @@ class AgentDB:
         workflow_run_id: str | None = None,
         organization_id: str | None = None,
         only_standalone_tasks: bool = False,
+        order_by_column: OrderBy = OrderBy.created_at,
+        order: SortDirection = SortDirection.desc,
     ) -> list[Task]:
         """
         Get all tasks.
@@ -469,6 +471,8 @@ class AgentDB:
         :param task_status:
         :param workflow_run_id:
         :param only_standalone_tasks:
+        :param order_by_column:
+        :param order:
         :return:
         """
         if page < 1:
@@ -484,7 +488,12 @@ class AgentDB:
                     query = query.filter(TaskModel.workflow_run_id == workflow_run_id)
                 if only_standalone_tasks:
                     query = query.filter(TaskModel.workflow_run_id.is_(None))
-                query = query.order_by(TaskModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
+                order_by_col = getattr(TaskModel, order_by_column)
+                query = (
+                    query.order_by(order_by_col.desc() if order == SortDirection.desc else order_by_col.asc())
+                    .limit(page_size)
+                    .offset(db_page * page_size)
+                )
                 tasks = (await session.scalars(query)).all()
                 return [convert_to_task(task, debug_enabled=self.debug_enabled) for task in tasks]
         except SQLAlchemyError:
