@@ -21,7 +21,6 @@ function WorkflowParameterInput({ type, value, onChange }: Props) {
         value={
           typeof value === "string" ? value : JSON.stringify(value, null, 2)
         }
-        fontSize={12}
       />
     );
   }

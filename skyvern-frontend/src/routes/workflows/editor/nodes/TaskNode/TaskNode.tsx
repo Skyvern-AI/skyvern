@@ -223,6 +223,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                           handleChange("dataSchema", value);
                         }}
                         className="nowheel nopan"
+                        fontSize={8}
                       />
                     </div>
                   )}
@@ -324,6 +325,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                           handleChange("errorCodeMapping", value);
                         }}
                         className="nowheel nopan"
+                        fontSize={8}
                       />
                     </div>
                   )}

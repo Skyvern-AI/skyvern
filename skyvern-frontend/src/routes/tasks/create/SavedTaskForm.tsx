@@ -462,7 +462,6 @@ function SavedTaskForm({ initialValues }: Props) {
                                 <CodeEditor
                                   {...field}
                                   language="json"
-                                  fontSize={12}
                                   minHeight="96px"
                                   maxHeight="500px"
                                   value={
@@ -557,7 +556,6 @@ function SavedTaskForm({ initialValues }: Props) {
                             <CodeEditor
                               {...field}
                               language="json"
-                              fontSize={14}
                               minHeight="96px"
                               maxHeight="500px"
                               value={
@@ -683,7 +681,6 @@ function SavedTaskForm({ initialValues }: Props) {
                             <CodeEditor
                               {...field}
                               language="json"
-                              fontSize={12}
                               minHeight="96px"
                               maxHeight="500px"
                               value={field.value === null ? "" : field.value}

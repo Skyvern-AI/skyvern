@@ -115,6 +115,7 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
                   updateNodeData(id, { jsonSchema: value });
                 }}
                 className="nowheel nopan"
+                fontSize={8}
               />
             </div>
           )}

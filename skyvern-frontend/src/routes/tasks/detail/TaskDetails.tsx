@@ -125,7 +125,6 @@ function TaskDetails() {
         language="json"
         value={JSON.stringify(task.extracted_information, null, 2)}
         readOnly
-        fontSize={12}
         minHeight={"96px"}
         maxHeight={"500px"}
         className="w-full"
@@ -149,7 +148,6 @@ function TaskDetails() {
         language="json"
         value={JSON.stringify(task.failure_reason, null, 2)}
         readOnly
-        fontSize={12}
         minHeight={"96px"}
         maxHeight={"500px"}
         className="w-full"

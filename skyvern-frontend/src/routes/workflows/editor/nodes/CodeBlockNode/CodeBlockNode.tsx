@@ -70,6 +70,7 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
               updateNodeData(id, { code: value });
             }}
             className="nopan"
+            fontSize={8}
           />
         </div>
       </div>

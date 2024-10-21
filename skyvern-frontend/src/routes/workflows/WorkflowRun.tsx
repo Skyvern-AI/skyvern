@@ -494,7 +494,6 @@ function WorkflowRun() {
                     value={JSON.stringify(value, null, 2)}
                     readOnly
                     language="json"
-                    fontSize={12}
                     minHeight="96px"
                     maxHeight="500px"
                   />
