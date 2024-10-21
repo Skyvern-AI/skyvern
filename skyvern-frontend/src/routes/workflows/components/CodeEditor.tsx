@@ -23,7 +23,7 @@ function CodeEditor({
   language,
   className,
   readOnly = false,
-  fontSize = 8,
+  fontSize = 12,
 }: Props) {
   const extensions =
     language === "json"
