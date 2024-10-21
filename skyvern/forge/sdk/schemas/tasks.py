@@ -290,3 +290,13 @@ class TaskOutput(BaseModel):
 
 class CreateTaskResponse(BaseModel):
     task_id: str
+
+
+class OrderBy(StrEnum):
+    created_at = "created_at"
+    modified_at = "modified_at"
+
+
+class SortDirection(StrEnum):
+    asc = "asc"
+    desc = "desc"
