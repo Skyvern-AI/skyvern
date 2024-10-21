@@ -2,12 +2,6 @@ import { getClient } from "@/api/AxiosClient";
 import { Action, ActionTypes } from "@/api/types";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { cn } from "@/util/utils";
 import {
@@ -117,24 +111,8 @@ function ScrollableActionList({
                     <span className="text-xs">Fail</span>
                   </div>
                 )}
-                {typeof action.confidence === "number" && (
-                  <TooltipProvider>
-                    <Tooltip>
-                      <TooltipTrigger>
-                        <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
-                          <span className="text-xs text-success">
-                            {action.confidence}
-                          </span>
-                          <span className="text-xs">CS</span>
-                        </div>
-                      </TooltipTrigger>
-                      <TooltipContent>Confidence Score</TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                )}
               </div>
             </div>
-
             <div className="text-xs text-slate-400">{action.reasoning}</div>
             {action.type === ActionTypes.InputText && (
               <>
