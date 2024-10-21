@@ -50,7 +50,7 @@ const exampleCases = [
   },
   {
     key: "geico",
-    label: "Geico - generate an insurance quote",
+    label: "Generate an insurance quote",
   },
   {
     key: "job_application",
@@ -66,7 +66,7 @@ const exampleCases = [
   },
   {
     key: "bci_seguros",
-    label: "Generate an auto insurance quote",
+    label: "Generate an auto insurance quote in spanish",
   },
   {
     key: "hackernews",
