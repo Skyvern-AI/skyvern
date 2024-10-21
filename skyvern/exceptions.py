@@ -355,8 +355,8 @@ class InputActionOnSelect2Dropdown(SkyvernException):
 
 
 class FailToClick(SkyvernException):
-    def __init__(self, element_id: str):
-        super().__init__(f"Failed to click. element_id={element_id}")
+    def __init__(self, element_id: str, anchor: str = "self"):
+        super().__init__(f"Failed to click({anchor}). element_id={element_id}")
 
 
 class FailToSelectByLabel(SkyvernException):
