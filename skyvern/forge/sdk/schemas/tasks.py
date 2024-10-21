@@ -4,9 +4,10 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 
-from skyvern.exceptions import InvalidTaskStatusTransition, TaskAlreadyCanceled
+from skyvern.config import settings
+from skyvern.exceptions import BlockedHost, InvalidTaskStatusTransition, TaskAlreadyCanceled
 
 
 class ProxyLocation(StrEnum):
@@ -88,6 +89,18 @@ class TaskRequest(TaskBase):
         examples=["https://my-webhook.com"],
     )
     totp_verification_url: HttpUrl | None = None
+
+    @field_validator("url", "webhook_callback_url", "totp_verification_url")
+    @classmethod
+    def validate_urls(cls, v: HttpUrl | None) -> HttpUrl | None:
+        if not v or not v.host:
+            return None
+        # Disallow internal IP ranges
+        host = v.host
+        for block in settings.BLOCKED_HOSTS:
+            if host.startswith(block):
+                raise BlockedHost(host)
+        return v
 
 
 class TaskStatus(StrEnum):
