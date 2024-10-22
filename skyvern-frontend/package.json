@@ -16,6 +16,7 @@
     "start": "npm run serve & npm run run-artifact-server"
   },
   "dependencies": {
+    "@codemirror/lang-html": "^6.4.9",
     "@codemirror/lang-json": "^6.0.1",
     "@codemirror/lang-python": "^6.1.6",
     "@dagrejs/dagre": "^1.1.4",
