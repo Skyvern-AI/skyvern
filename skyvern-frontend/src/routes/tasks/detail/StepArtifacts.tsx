@@ -11,13 +11,12 @@ import { useParams } from "react-router-dom";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { Skeleton } from "@/components/ui/skeleton";
-import { JSONArtifact } from "./JSONArtifact";
-import { TextArtifact } from "./TextArtifact";
 import { getImageURL } from "./artifactUtils";
 import { Input } from "@/components/ui/input";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { HTMLArtifact } from "./HTMLArtifact";
+import { Artifact } from "./Artifact";
+
 type Props = {
   id: string;
   stepProps: StepApiResponse;
@@ -167,27 +166,27 @@ function StepArtifacts({ id, stepProps }: Props) {
       </TabsContent>
       <TabsContent value="element_tree_trimmed">
         {visibleElementsTreeInPrompt ? (
-          <HTMLArtifact artifacts={visibleElementsTreeInPrompt} />
+          <Artifact type="html" artifacts={visibleElementsTreeInPrompt} />
         ) : null}
       </TabsContent>
       <TabsContent value="element_tree">
         {visibleElementsTree ? (
-          <JSONArtifact artifacts={visibleElementsTree} />
+          <Artifact type="json" artifacts={visibleElementsTree} />
         ) : null}
       </TabsContent>
       <TabsContent value="llm_prompt">
-        {llmPrompt ? <TextArtifact artifacts={llmPrompt} /> : null}
+        {llmPrompt ? <Artifact type="text" artifacts={llmPrompt} /> : null}
       </TabsContent>
       <TabsContent value="llm_response_parsed">
         {llmResponseParsed ? (
-          <JSONArtifact artifacts={llmResponseParsed} />
+          <Artifact type="json" artifacts={llmResponseParsed} />
         ) : null}
       </TabsContent>
       <TabsContent value="html_raw">
-        {htmlRaw ? <TextArtifact artifacts={htmlRaw} /> : null}
+        {htmlRaw ? <Artifact type="html" artifacts={htmlRaw} /> : null}
       </TabsContent>
       <TabsContent value="llm_request">
-        {llmRequest ? <JSONArtifact artifacts={llmRequest} /> : null}
+        {llmRequest ? <Artifact type="json" artifacts={llmRequest} /> : null}
       </TabsContent>
     </Tabs>
   );

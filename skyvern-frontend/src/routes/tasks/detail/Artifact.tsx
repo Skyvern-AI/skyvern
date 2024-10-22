@@ -1,7 +1,7 @@
 import { artifactApiClient } from "@/api/AxiosClient";
 import { ArtifactApiResponse } from "@/api/types";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Textarea } from "@/components/ui/textarea";
+import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useQueries } from "@tanstack/react-query";
 import axios from "axios";
 
@@ -26,15 +26,38 @@ function format(html: string) {
   return result.substring(1, result.length - 3);
 }
 
+function getFormattedResult(type: "json" | "html" | "text", result: unknown) {
+  switch (type) {
+    case "json":
+      return JSON.stringify(result, null, 2);
+    case "html":
+      return format(result as string);
+    case "text":
+      return result;
+  }
+}
+
+function getEndpoint(type: "json" | "html" | "text") {
+  switch (type) {
+    case "json":
+      return "/artifact/json";
+    case "html":
+    case "text":
+      return "/artifact/text";
+  }
+}
+
 type Props = {
+  type: "json" | "html" | "text";
   artifacts: Array<ArtifactApiResponse>;
 };
 
-function HTMLArtifact({ artifacts }: Props) {
+function Artifact({ type, artifacts }: Props) {
   function fetchArtifact(artifact: ArtifactApiResponse) {
     if (artifact.uri.startsWith("file://")) {
+      const endpoint = getEndpoint(type);
       return artifactApiClient
-        .get(`/artifact/text`, {
+        .get(endpoint, {
           params: {
             path: artifact.uri.slice(7),
           },
@@ -61,17 +84,21 @@ function HTMLArtifact({ artifacts }: Props) {
   }
 
   return (
-    <Textarea
+    <CodeEditor
+      language={type === "text" ? undefined : type}
       className="w-full"
-      rows={15}
       value={
         results.some((result) => result.isError)
           ? JSON.stringify(results.find((result) => result.isError)?.error)
-          : results.map((result) => format(result.data ?? "")).join(",\n")
+          : results
+              .map((result) => getFormattedResult(type, result.data))
+              .join(",\n")
       }
+      minHeight="96px"
+      maxHeight="500px"
       readOnly
     />
   );
 }
 
-export { HTMLArtifact };
+export { Artifact };
