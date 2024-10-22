@@ -17,8 +17,12 @@ import type { DownloadNode } from "./DownloadNode/types";
 import { DownloadNode as DownloadNodeComponent } from "./DownloadNode/DownloadNode";
 import type { NodeAdderNode } from "./NodeAdderNode/types";
 import { NodeAdderNode as NodeAdderNodeComponent } from "./NodeAdderNode/NodeAdderNode";
+import { StartNode as StartNodeComponent } from "./StartNode/StartNode";
+import type { StartNode } from "./StartNode/types";
 
-export type AppNode =
+export type UtilityNode = StartNode | NodeAdderNode;
+
+export type WorkflowBlockNode =
   | LoopNode
   | TaskNode
   | TextPromptNode
@@ -26,8 +30,17 @@ export type AppNode =
   | CodeBlockNode
   | FileParserNode
   | UploadNode
-  | DownloadNode
-  | NodeAdderNode;
+  | DownloadNode;
+
+export function isUtilityNode(node: AppNode): node is UtilityNode {
+  return node.type === "nodeAdder" || node.type === "start";
+}
+
+export function isWorkflowBlockNode(node: AppNode): node is WorkflowBlockNode {
+  return node.type !== "nodeAdder" && node.type !== "start";
+}
+
+export type AppNode = UtilityNode | WorkflowBlockNode;
 
 export const nodeTypes = {
   loop: memo(LoopNodeComponent),
@@ -39,4 +52,5 @@ export const nodeTypes = {
   upload: memo(UploadNodeComponent),
   download: memo(DownloadNodeComponent),
   nodeAdder: memo(NodeAdderNodeComponent),
+  start: memo(StartNodeComponent),
 };

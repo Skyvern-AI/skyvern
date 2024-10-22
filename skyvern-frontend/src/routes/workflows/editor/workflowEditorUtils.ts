@@ -38,7 +38,7 @@ import {
   SMTP_USERNAME_PARAMETER_KEY,
 } from "./constants";
 import { ParametersState } from "./FlowRenderer";
-import { AppNode, nodeTypes } from "./nodes";
+import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
 import { fileParserNodeDefaultData } from "./nodes/FileParserNode/types";
@@ -49,6 +49,7 @@ import { taskNodeDefaultData } from "./nodes/TaskNode/types";
 import { textPromptNodeDefaultData } from "./nodes/TextPromptNode/types";
 import { NodeBaseData } from "./nodes/types";
 import { uploadNodeDefaultData } from "./nodes/UploadNode/types";
+import { StartNode } from "./nodes/StartNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -313,6 +314,61 @@ function getNodeData(
   return data;
 }
 
+export function defaultEdge(source: string, target: string) {
+  return {
+    id: nanoid(),
+    type: "default",
+    source,
+    target,
+    style: {
+      strokeWidth: 2,
+    },
+  };
+}
+
+export function edgeWithAddButton(source: string, target: string) {
+  return {
+    id: nanoid(),
+    type: "edgeWithAddButton",
+    source,
+    target,
+    style: {
+      strokeWidth: 2,
+    },
+    zIndex: REACT_FLOW_EDGE_Z_INDEX,
+  };
+}
+
+export function startNode(id: string, parentId?: string): StartNode {
+  const node: StartNode = {
+    id,
+    type: "start",
+    position: { x: 0, y: 0 },
+    data: {},
+    draggable: false,
+    connectable: false,
+  };
+  if (parentId) {
+    node.parentId = parentId;
+  }
+  return node;
+}
+
+export function nodeAdderNode(id: string, parentId?: string): NodeAdderNode {
+  const node: NodeAdderNode = {
+    id,
+    type: "nodeAdder",
+    position: { x: 0, y: 0 },
+    data: {},
+    draggable: false,
+    connectable: false,
+  };
+  if (parentId) {
+    node.parentId = parentId;
+  }
+  return node;
+}
+
 function getElements(blocks: Array<WorkflowBlock>): {
   nodes: Array<AppNode>;
   edges: Array<Edge>;
@@ -331,64 +387,47 @@ function getElements(blocks: Array<WorkflowBlock>): {
     );
     nodes.push(node);
     if (d.previous) {
-      edges.push({
-        id: nanoid(),
-        type: "edgeWithAddButton",
-        source: d.previous,
-        target: d.id,
-        style: {
-          strokeWidth: 2,
-        },
-        zIndex: REACT_FLOW_EDGE_Z_INDEX,
-      });
+      edges.push(edgeWithAddButton(d.previous, d.id));
     }
   });
 
   const loopBlocks = data.filter((d) => d.block.block_type === "for_loop");
   loopBlocks.forEach((block) => {
+    const startNodeId = nanoid();
+    nodes.push(startNode(startNodeId, block.id));
     const children = data.filter((b) => b.parentId === block.id);
+    if (children.length === 0) {
+      const adderNodeId = nanoid();
+      nodes.push(nodeAdderNode(adderNodeId, block.id));
+      edges.push(defaultEdge(startNodeId, adderNodeId));
+    } else {
+      const firstChild = children.find((c) => c.previous === null)!;
+      edges.push(edgeWithAddButton(startNodeId, firstChild.id));
+    }
     const lastChild = children.find((c) => c.next === null);
-    nodes.push({
-      id: `${block.id}-nodeAdder`,
-      type: "nodeAdder",
-      position: { x: 0, y: 0 },
-      data: {},
-      draggable: false,
-      connectable: false,
-      parentId: block.id,
-    });
+    const adderNodeId = nanoid();
+    nodes.push(nodeAdderNode(adderNodeId, block.id));
     if (lastChild) {
-      edges.push({
-        id: `${block.id}-nodeAdder-edge`,
-        type: "default",
-        source: lastChild.id,
-        target: `${block.id}-nodeAdder`,
-        style: {
-          strokeWidth: 2,
-        },
-      });
+      edges.push(defaultEdge(lastChild.id, adderNodeId));
     }
   });
 
-  if (nodes.length > 0) {
-    const lastNode = data.find((d) => d.next === null && d.parentId === null);
-    edges.push({
-      id: "edge-nodeAdder",
-      type: "default",
-      source: lastNode!.id,
-      target: "nodeAdder",
-      style: {
-        strokeWidth: 2,
-      },
-    });
-    nodes.push({
-      id: "nodeAdder",
-      type: "nodeAdder",
-      position: { x: 0, y: 0 },
-      data: {},
-      draggable: false,
-      connectable: false,
-    });
+  const startNodeId = nanoid();
+  const adderNodeId = nanoid();
+
+  if (nodes.length === 0) {
+    nodes.push(startNode(startNodeId));
+    nodes.push(nodeAdderNode(adderNodeId));
+    edges.push(defaultEdge(startNodeId, adderNodeId));
+  } else {
+    const firstNode = data.find(
+      (d) => d.previous === null && d.parentId === null,
+    );
+    nodes.push(startNode(startNodeId));
+    edges.push(edgeWithAddButton(startNodeId, firstNode!.id));
+    const lastNode = data.find((d) => d.next === null && d.parentId === null)!;
+    edges.push(defaultEdge(lastNode.id, adderNodeId));
+    nodes.push(nodeAdderNode(adderNodeId));
   }
 
   return { nodes, edges };
@@ -396,7 +435,7 @@ function getElements(blocks: Array<WorkflowBlock>): {
 
 function createNode(
   identifiers: { id: string; parentId?: string },
-  nodeType: Exclude<keyof typeof nodeTypes, "nodeAdder">,
+  nodeType: NonNullable<WorkflowBlockNode["type"]>,
   label: string,
 ): AppNode {
   const common = {
@@ -503,9 +542,7 @@ function JSONParseSafe(json: string): Record<string, unknown> | null {
   }
 }
 
-function getWorkflowBlock(
-  node: Exclude<AppNode, LoopNode | NodeAdderNode>,
-): BlockYAML {
+function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
   const base = {
     label: node.data.label,
     continue_on_failure: node.data.continueOnFailure,
@@ -616,22 +653,22 @@ function getWorkflowBlocksUtil(nodes: Array<AppNode>): Array<BlockYAML> {
             .filter((n) => n.parentId === node.id)
             .map((n) => {
               return getWorkflowBlock(
-                n as Exclude<AppNode, LoopNode | NodeAdderNode>,
+                n as Exclude<AppNode, LoopNode | NodeAdderNode | StartNode>,
               );
             }),
         },
       ];
     }
     return [
-      getWorkflowBlock(node as Exclude<AppNode, LoopNode | NodeAdderNode>),
+      getWorkflowBlock(
+        node as Exclude<AppNode, LoopNode | NodeAdderNode | StartNode>,
+      ),
     ];
   });
 }
 
 function getWorkflowBlocks(nodes: Array<AppNode>): Array<BlockYAML> {
-  return getWorkflowBlocksUtil(
-    nodes.filter((node) => node.type !== "nodeAdder"),
-  );
+  return getWorkflowBlocksUtil(nodes.filter(isWorkflowBlockNode));
 }
 
 function generateNodeLabel(existingLabels: Array<string>) {
@@ -892,7 +929,7 @@ function getAvailableOutputParameterKeys(
     previousNodeIds.includes(node.id),
   );
   const labels = previousNodes
-    .filter((node) => node.type !== "nodeAdder")
+    .filter(isWorkflowBlockNode)
     .map((node) => node.data.label);
   const outputParameterKeys = labels.map((label) =>
     getOutputParameterKey(label),

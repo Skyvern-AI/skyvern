@@ -20,8 +20,6 @@ export type TaskNodeData = NodeBaseData & {
 
 export type TaskNode = Node<TaskNodeData, "task">;
 
-export type TaskNodeDisplayMode = "basic" | "advanced";
-
 export const taskNodeDefaultData: TaskNodeData = {
   url: "",
   navigationGoal: "",
