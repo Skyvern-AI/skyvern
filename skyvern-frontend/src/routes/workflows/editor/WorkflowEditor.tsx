@@ -6,6 +6,7 @@ import { useParams } from "react-router-dom";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { FlowRenderer } from "./FlowRenderer";
 import { getElements } from "./workflowEditorUtils";
+import { LogoMinimized } from "@/components/LogoMinimized";
 
 function WorkflowEditor() {
   const { workflowPermanentId } = useParams();
@@ -29,7 +30,7 @@ function WorkflowEditor() {
   if (isLoading) {
     return (
       <div className="flex h-screen w-full items-center justify-center">
-        Loading...
+        <LogoMinimized />
       </div>
     );
   }
