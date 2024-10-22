@@ -1,23 +1,18 @@
-import { useEffect, useState } from "react";
-import { useParams } from "react-router-dom";
-import { ActionScreenshot } from "./ActionScreenshot";
-import { ScrollableActionList } from "./ScrollableActionList";
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import {
-  ActionApiResponse,
-  ActionTypes,
-  Status,
-  StepApiResponse,
-  TaskApiResponse,
-} from "@/api/types";
 import { getClient } from "@/api/AxiosClient";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { Status, StepApiResponse, TaskApiResponse } from "@/api/types";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/use-toast";
-import { envCredential } from "@/util/env";
-import { statusIsNotFinalized, statusIsRunningOrQueued } from "../types";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { useCostCalculator } from "@/hooks/useCostCalculator";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { envCredential } from "@/util/env";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { statusIsNotFinalized, statusIsRunningOrQueued } from "../types";
+import { ActionScreenshot } from "./ActionScreenshot";
+import { useActions } from "./hooks/useActions";
+import { ScrollableActionList } from "./ScrollableActionList";
 
 const formatter = Intl.NumberFormat("en-US", {
   style: "currency",
@@ -33,18 +28,6 @@ type StreamMessage = {
 let socket: WebSocket | null = null;
 
 const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
-
-function getActionInput(action: ActionApiResponse) {
-  let input = "";
-  if (action.action_type === ActionTypes.InputText && action.text) {
-    input = action.text;
-  } else if (action.action_type === ActionTypes.Click) {
-    input = "Click";
-  } else if (action.action_type === ActionTypes.SelectOption && action.option) {
-    input = action.option.label;
-  }
-  return input;
-}
 
 function TaskActions() {
   const { taskId } = useParams();
@@ -165,31 +148,11 @@ function TaskActions() {
     placeholderData: keepPreviousData,
   });
 
-  const actions = steps
-    ?.map((step) => {
-      const actionsAndResults = step.output?.actions_and_results ?? [];
+  const { data: actions, isLoading: actionsIsLoading } = useActions({
+    id: taskId,
+  });
 
-      const actions = actionsAndResults.map((actionAndResult, index) => {
-        const action = actionAndResult[0];
-        const actionResult = actionAndResult[1];
-        if (actionResult.length === 0) {
-          return null;
-        }
-        return {
-          reasoning: action.reasoning,
-          confidence: action.confidence_float,
-          input: getActionInput(action),
-          type: action.action_type,
-          success: actionResult?.[0]?.success ?? false,
-          stepId: step.step_id,
-          index,
-        };
-      });
-      return actions;
-    })
-    .flat();
-
-  if (taskIsLoading || stepsIsLoading) {
+  if (taskIsLoading || actionsIsLoading || stepsIsLoading) {
     return (
       <div className="flex gap-2">
         <div className="h-[40rem] w-3/4">
