@@ -276,3 +276,17 @@ export type TaskGenerationApiResponse = {
   navigation_payload: Record<string, unknown> | null;
   extracted_information_schema: Record<string, unknown> | null;
 };
+
+export type ActionsApiResponse = {
+  action_type: ActionType;
+  status: Status;
+  task_id: string | null;
+  step_id: string | null;
+  step_order: number | null;
+  action_order: number | null;
+  confidence_float: number | null;
+  description: string | null;
+  reasoning: string | null;
+  intention: string | null;
+  response: string | null;
+};
