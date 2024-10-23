@@ -1,5 +1,6 @@
 import json
 from datetime import datetime
+from typing import Any
 
 import requests
 import structlog
@@ -125,13 +126,13 @@ class WorkflowService:
                 request_body_value = workflow_request.data[workflow_parameter.key]
                 workflow_run_parameter = await self.create_workflow_run_parameter(
                     workflow_run_id=workflow_run.workflow_run_id,
-                    workflow_parameter_id=workflow_parameter.workflow_parameter_id,
+                    workflow_parameter=workflow_parameter,
                     value=request_body_value,
                 )
             elif workflow_parameter.default_value is not None:
                 workflow_run_parameter = await self.create_workflow_run_parameter(
                     workflow_run_id=workflow_run.workflow_run_id,
-                    workflow_parameter_id=workflow_parameter.workflow_parameter_id,
+                    workflow_parameter=workflow_parameter,
                     value=workflow_parameter.default_value,
                 )
             else:
@@ -565,12 +566,15 @@ class WorkflowService:
     async def create_workflow_run_parameter(
         self,
         workflow_run_id: str,
-        workflow_parameter_id: str,
-        value: bool | int | float | str | dict | list,
+        workflow_parameter: WorkflowParameter,
+        value: Any,
     ) -> WorkflowRunParameter:
+        # InvalidWorkflowParameter will be raised if the validation fails
+        workflow_parameter.workflow_parameter_type.convert_value(value)
+
         return await app.DATABASE.create_workflow_run_parameter(
             workflow_run_id=workflow_run_id,
-            workflow_parameter_id=workflow_parameter_id,
+            workflow_parameter=workflow_parameter,
             value=json.dumps(value) if isinstance(value, (dict, list)) else value,
         )
 

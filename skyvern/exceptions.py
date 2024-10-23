@@ -510,3 +510,14 @@ class BlockedHost(SkyvernHTTPException):
             f"The host in your url is blocked: {host}",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
+
+
+class InvalidWorkflowParameter(SkyvernHTTPException):
+    def __init__(self, expected_parameter_type: str, value: str, workflow_permanent_id: str | None = None) -> None:
+        message = f"Invalid workflow parameter. Excpected parameter type: {expected_parameter_type}. Value: {value}."
+        if workflow_permanent_id:
+            message += f" Workflow permanent id: {workflow_permanent_id}"
+        super().__init__(
+            message,
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )

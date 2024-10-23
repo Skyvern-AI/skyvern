@@ -2,9 +2,11 @@ import abc
 import json
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Literal, Union
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from skyvern.exceptions import InvalidWorkflowParameter
 
 
 class ParameterType(StrEnum):
@@ -114,21 +116,29 @@ class WorkflowParameterType(StrEnum):
     JSON = "json"
     FILE_URL = "file_url"
 
-    def convert_value(self, value: str | None) -> str | int | float | bool | dict | list | None:
+    def convert_value(self, value: Any) -> str | int | float | bool | dict | list | None:
         if value is None:
             return None
-        if self == WorkflowParameterType.STRING:
-            return value
-        elif self == WorkflowParameterType.INTEGER:
-            return int(value)
-        elif self == WorkflowParameterType.FLOAT:
-            return float(value)
-        elif self == WorkflowParameterType.BOOLEAN:
-            return value.lower() in ["true", "1"]
-        elif self == WorkflowParameterType.JSON:
-            return json.loads(value)
-        elif self == WorkflowParameterType.FILE_URL:
-            return value
+        try:
+            if self == WorkflowParameterType.STRING:
+                return str(value)
+            elif self == WorkflowParameterType.INTEGER:
+                return int(value)
+            elif self == WorkflowParameterType.FLOAT:
+                return float(value)
+            elif self == WorkflowParameterType.BOOLEAN:
+                if isinstance(value, bool):
+                    return value
+                lower_case = str(value).lower()
+                if lower_case in ["true", "false", "1", "0"]:
+                    raise InvalidWorkflowParameter(expected_parameter_type=self, value=str(value))
+                return lower_case in ["true", "1"]
+            elif self == WorkflowParameterType.JSON:
+                return json.loads(value)
+            elif self == WorkflowParameterType.FILE_URL:
+                return value
+        except Exception:
+            raise InvalidWorkflowParameter(expected_parameter_type=self, value=str(value))
 
 
 class WorkflowParameter(Parameter):
