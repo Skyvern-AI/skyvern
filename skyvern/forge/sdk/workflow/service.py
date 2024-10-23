@@ -120,30 +120,34 @@ class WorkflowService:
 
         # Create all the workflow run parameters, AWSSecretParameter won't have workflow run parameters created.
         all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
-        workflow_run_parameters = []
-        for workflow_parameter in all_workflow_parameters:
-            if workflow_request.data and workflow_parameter.key in workflow_request.data:
-                request_body_value = workflow_request.data[workflow_parameter.key]
-                workflow_run_parameter = await self.create_workflow_run_parameter(
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    workflow_parameter=workflow_parameter,
-                    value=request_body_value,
-                )
-            elif workflow_parameter.default_value is not None:
-                workflow_run_parameter = await self.create_workflow_run_parameter(
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    workflow_parameter=workflow_parameter,
-                    value=workflow_parameter.default_value,
-                )
-            else:
-                await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
-                raise MissingValueForParameter(
-                    parameter_key=workflow_parameter.key,
-                    workflow_id=workflow.workflow_id,
-                    workflow_run_id=workflow_run.workflow_run_id,
-                )
-
-            workflow_run_parameters.append(workflow_run_parameter)
+        try:
+            for workflow_parameter in all_workflow_parameters:
+                if workflow_request.data and workflow_parameter.key in workflow_request.data:
+                    request_body_value = workflow_request.data[workflow_parameter.key]
+                    await self.create_workflow_run_parameter(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_parameter=workflow_parameter,
+                        value=request_body_value,
+                    )
+                elif workflow_parameter.default_value is not None:
+                    await self.create_workflow_run_parameter(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_parameter=workflow_parameter,
+                        value=workflow_parameter.default_value,
+                    )
+                else:
+                    raise MissingValueForParameter(
+                        parameter_key=workflow_parameter.key,
+                        workflow_id=workflow.workflow_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                    )
+        except Exception as e:
+            LOG.exception(
+                f"Error while setting up workflow run {workflow_run.workflow_run_id}",
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
+            await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
+            raise e
 
         return workflow_run
 
