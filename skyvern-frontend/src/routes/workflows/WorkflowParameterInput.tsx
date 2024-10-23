@@ -16,11 +16,14 @@ function WorkflowParameterInput({ type, value, onChange }: Props) {
   if (type === "json") {
     return (
       <CodeEditor
+        className="w-full"
         language="json"
         onChange={(value) => onChange(value)}
         value={
           typeof value === "string" ? value : JSON.stringify(value, null, 2)
         }
+        minHeight="96px"
+        maxHeight="500px"
       />
     );
   }
@@ -37,7 +40,7 @@ function WorkflowParameterInput({ type, value, onChange }: Props) {
   if (type === "integer") {
     return (
       <Input
-        value={value as number}
+        value={value === null ? "" : Number(value)}
         onChange={(e) => onChange(parseInt(e.target.value))}
         type="number"
       />
@@ -47,7 +50,7 @@ function WorkflowParameterInput({ type, value, onChange }: Props) {
   if (type === "float") {
     return (
       <Input
-        value={value as number}
+        value={value === null ? "" : Number(value)}
         onChange={(e) => onChange(parseFloat(e.target.value))}
         type="number"
         step="any"

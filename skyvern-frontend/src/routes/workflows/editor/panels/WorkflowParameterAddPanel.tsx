@@ -220,7 +220,9 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                 parameterType: "workflow",
                 dataType: parameterType,
                 description,
-                defaultValue: defaultValue,
+                defaultValue: defaultValueState.hasDefaultValue
+                  ? defaultValue
+                  : null,
               });
             }
             if (type === "credential") {
