@@ -1,11 +1,18 @@
 import json
 from datetime import datetime
+from typing import Any
 
 import requests
 import structlog
 
 from skyvern import analytics
-from skyvern.exceptions import FailedToSendWebhook, MissingValueForParameter, WorkflowNotFound, WorkflowRunNotFound
+from skyvern.exceptions import (
+    FailedToSendWebhook,
+    MissingValueForParameter,
+    WorkflowNotFound,
+    WorkflowParameterNotFound,
+    WorkflowRunNotFound,
+)
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
@@ -566,8 +573,15 @@ class WorkflowService:
         self,
         workflow_run_id: str,
         workflow_parameter_id: str,
-        value: bool | int | float | str | dict | list,
+        value: Any,
     ) -> WorkflowRunParameter:
+        # get workflow parameter id first and validate the value according to the workflow_parameter.workflow_parameter_type
+        workflow_parameter = await app.DATABASE.get_workflow_parameter(workflow_parameter_id)
+        if not workflow_parameter:
+            raise WorkflowParameterNotFound(workflow_parameter_id)
+        # InvalidWorkflowParameter will be raised if the validation fails
+        workflow_parameter.workflow_parameter_type.convert_value(value)
+
         return await app.DATABASE.create_workflow_run_parameter(
             workflow_run_id=workflow_run_id,
             workflow_parameter_id=workflow_parameter_id,
