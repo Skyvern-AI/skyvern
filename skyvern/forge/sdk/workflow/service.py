@@ -6,13 +6,7 @@ import requests
 import structlog
 
 from skyvern import analytics
-from skyvern.exceptions import (
-    FailedToSendWebhook,
-    MissingValueForParameter,
-    WorkflowNotFound,
-    WorkflowParameterNotFound,
-    WorkflowRunNotFound,
-)
+from skyvern.exceptions import FailedToSendWebhook, MissingValueForParameter, WorkflowNotFound, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
@@ -132,13 +126,13 @@ class WorkflowService:
                 request_body_value = workflow_request.data[workflow_parameter.key]
                 workflow_run_parameter = await self.create_workflow_run_parameter(
                     workflow_run_id=workflow_run.workflow_run_id,
-                    workflow_parameter_id=workflow_parameter.workflow_parameter_id,
+                    workflow_parameter=workflow_parameter,
                     value=request_body_value,
                 )
             elif workflow_parameter.default_value is not None:
                 workflow_run_parameter = await self.create_workflow_run_parameter(
                     workflow_run_id=workflow_run.workflow_run_id,
-                    workflow_parameter_id=workflow_parameter.workflow_parameter_id,
+                    workflow_parameter=workflow_parameter,
                     value=workflow_parameter.default_value,
                 )
             else:
@@ -572,19 +566,15 @@ class WorkflowService:
     async def create_workflow_run_parameter(
         self,
         workflow_run_id: str,
-        workflow_parameter_id: str,
+        workflow_parameter: WorkflowParameter,
         value: Any,
     ) -> WorkflowRunParameter:
-        # get workflow parameter id first and validate the value according to the workflow_parameter.workflow_parameter_type
-        workflow_parameter = await app.DATABASE.get_workflow_parameter(workflow_parameter_id)
-        if not workflow_parameter:
-            raise WorkflowParameterNotFound(workflow_parameter_id)
         # InvalidWorkflowParameter will be raised if the validation fails
         workflow_parameter.workflow_parameter_type.convert_value(value)
 
         return await app.DATABASE.create_workflow_run_parameter(
             workflow_run_id=workflow_run_id,
-            workflow_parameter_id=workflow_parameter_id,
+            workflow_parameter=workflow_parameter,
             value=json.dumps(value) if isinstance(value, (dict, list)) else value,
         )
 

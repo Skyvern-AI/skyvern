@@ -1421,8 +1421,9 @@ class AgentDB:
             raise
 
     async def create_workflow_run_parameter(
-        self, workflow_run_id: str, workflow_parameter_id: str, value: Any
+        self, workflow_run_id: str, workflow_parameter: WorkflowParameter, value: Any
     ) -> WorkflowRunParameter:
+        workflow_parameter_id = workflow_parameter.workflow_parameter_id
         try:
             async with self.Session() as session:
                 workflow_run_parameter = WorkflowRunParameterModel(
@@ -1433,9 +1434,6 @@ class AgentDB:
                 session.add(workflow_run_parameter)
                 await session.commit()
                 await session.refresh(workflow_run_parameter)
-                workflow_parameter = await self.get_workflow_parameter(workflow_parameter_id)
-                if not workflow_parameter:
-                    raise WorkflowParameterNotFound(workflow_parameter_id)
                 return convert_to_workflow_run_parameter(workflow_run_parameter, workflow_parameter, self.debug_enabled)
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
