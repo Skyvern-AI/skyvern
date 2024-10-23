@@ -118,22 +118,6 @@ class SkyvernFrame:
 
         return screenshots
 
-    @staticmethod
-    async def get_print_triggered(page: Page) -> bool:
-        """
-        Get print triggered on the page. Only Page instance could be printed as PDF.
-        """
-        # the flag was injected in the "window" object from the "add_init_script" when the BrowserContext initialized.
-        return await page.evaluate("window.__printTriggered")
-
-    @staticmethod
-    async def reset_print_triggered(page: Page) -> bool:
-        """
-        Get print triggered on the page. Only Page instance could be printed as PDF.
-        """
-        # the flag was injected in the "window" object from the "add_init_script" when the BrowserContext initialized.
-        return await page.evaluate("() => window.__printTriggered = false")
-
     @classmethod
     async def create_instance(cls, frame: Page | Frame) -> SkyvernFrame:
         instance = cls(frame=frame)

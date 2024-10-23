@@ -67,7 +67,7 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
-from skyvern.webeye.browser_factory import BrowserState, get_download_dir
+from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import (
     CleanupElementTreeFunc,
     ElementTreeFormat,
@@ -386,19 +386,7 @@ async def handle_click_to_download_file_action(
 
     try:
         await locator.click(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
-
         await page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
-        # TODO: shall we back to the previous page ?
-        if await SkyvernFrame.get_print_triggered(page):
-            path = f"{get_download_dir(task.workflow_run_id, task.task_id)}/{uuid.uuid4()}"
-            LOG.warning(
-                "Trying to download the printed PDF",
-                path=path,
-                action=action,
-            )
-            await page.pdf(format="A4", display_header_footer=True, path=path)
-            await SkyvernFrame.reset_print_triggered(page)
-
     except Exception as e:
         LOG.exception("ClickAction with download failed", action=action, exc_info=True)
         return [ActionFailure(e, download_triggered=False)]
