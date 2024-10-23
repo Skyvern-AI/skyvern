@@ -205,7 +205,7 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                 } catch (e) {
                   toast({
                     variant: "destructive",
-                    title: "Failed to save parameters",
+                    title: "Failed to add parameter",
                     description: "Invalid JSON for default value",
                   });
                   return;
@@ -227,6 +227,14 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
               });
             }
             if (type === "credential") {
+              if (!collectionId) {
+                toast({
+                  variant: "destructive",
+                  title: "Failed to add parameter",
+                  description: "Collection ID is required",
+                });
+                return;
+              }
               onSave({
                 key,
                 parameterType: "credential",
@@ -239,7 +247,7 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
               if (!sourceParameterKey) {
                 toast({
                   variant: "destructive",
-                  title: "Failed to save parameters",
+                  title: "Failed to add parameter",
                   description: "Source parameter key is required",
                 });
                 return;

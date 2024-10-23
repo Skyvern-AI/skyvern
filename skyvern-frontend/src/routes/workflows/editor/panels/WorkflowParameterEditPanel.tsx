@@ -238,7 +238,7 @@ function WorkflowParameterEditPanel({
                 } catch (e) {
                   toast({
                     variant: "destructive",
-                    title: "Failed to save parameters",
+                    title: "Failed to save parameter",
                     description: "Invalid JSON for default value",
                   });
                   return;
@@ -260,6 +260,14 @@ function WorkflowParameterEditPanel({
               });
             }
             if (type === "credential") {
+              if (!collectionId) {
+                toast({
+                  variant: "destructive",
+                  title: "Failed to save parameter",
+                  description: "Collection ID is required",
+                });
+                return;
+              }
               onSave({
                 key,
                 parameterType: "credential",
@@ -272,7 +280,7 @@ function WorkflowParameterEditPanel({
               if (!sourceParameterKey) {
                 toast({
                   variant: "destructive",
-                  title: "Failed to save parameters",
+                  title: "Failed to save parameter",
                   description: "Source parameter key is required",
                 });
                 return;
