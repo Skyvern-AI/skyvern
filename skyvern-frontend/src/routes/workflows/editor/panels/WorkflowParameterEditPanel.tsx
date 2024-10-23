@@ -28,7 +28,8 @@ type Props = {
 
 const workflowParameterTypeOptions = [
   { label: "string", value: WorkflowParameterValueType.String },
-  { label: "number", value: WorkflowParameterValueType.Float },
+  { label: "float", value: WorkflowParameterValueType.Float },
+  { label: "integer", value: WorkflowParameterValueType.Integer },
   { label: "boolean", value: WorkflowParameterValueType.Boolean },
   { label: "file", value: WorkflowParameterValueType.FileURL },
   { label: "JSON", value: WorkflowParameterValueType.JSON },
