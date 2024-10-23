@@ -2316,6 +2316,7 @@ async def poll_verification_code(
     while True:
         # check timeout
         if datetime.utcnow() > timeout_datetime:
+            LOG.warning("Polling verification code timed out", workflow_id=workflow_id)
             return None
         verification_code = None
         if totp_verification_url:

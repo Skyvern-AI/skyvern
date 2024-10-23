@@ -37,7 +37,8 @@ Reply in JSON format with the following keys:
         }]
 {% endif %}
     }],{% if verification_code_check %}
-    "need_verification_code": bool, // Whether a verification code is needed to proceed.{% endif %}
+    "verification_code_reasoning": str, // Let's think step by step. Describe what you see and think if a verification code is needed for login or any verification step. Explain why you believe a verification code is needed or not. Has the code been sent and is code available somewhere (email, phone or 2FA device)?
+    "need_verification_code": bool, // Whether a verification code is needed to proceed. True only if the code is available to user. If the code is not sent, return false {% endif %}
 }
 {% if action_history %}
 Consider the action history from the last step and the screenshot together, if actions from the last step don't yield positive impact, try other actions or other action combinations.
