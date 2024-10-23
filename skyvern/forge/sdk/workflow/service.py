@@ -569,13 +569,14 @@ class WorkflowService:
         workflow_parameter: WorkflowParameter,
         value: Any,
     ) -> WorkflowRunParameter:
+        value = json.dumps(value) if isinstance(value, (dict, list)) else value
         # InvalidWorkflowParameter will be raised if the validation fails
         workflow_parameter.workflow_parameter_type.convert_value(value)
 
         return await app.DATABASE.create_workflow_run_parameter(
             workflow_run_id=workflow_run_id,
             workflow_parameter=workflow_parameter,
-            value=json.dumps(value) if isinstance(value, (dict, list)) else value,
+            value=value,
         )
 
     async def get_workflow_run_parameter_tuples(
