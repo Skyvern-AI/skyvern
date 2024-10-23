@@ -28,16 +28,6 @@ def load_js_script() -> str:
         raise e
 
 
-DISABLE_PRINTER_WITH_FLAG = """
-(function() {
-    const originalPrint = window.print;
-    window.print = function() {
-        window.__printTriggered = true;
-    };
-    window.__printTriggered = false;
-})();
-"""
-
 JS_FUNCTION_DEFS = load_js_script()
 
 

@@ -72,6 +72,7 @@ class BrowserContextFactory:
                 "--disable-blink-features=AutomationControlled",
                 "--disk-cache-size=1",
                 "--start-maximized",
+                "--kiosk-printing",
             ],
             "ignore_default_args": [
                 "--enable-automation",
