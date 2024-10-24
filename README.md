@@ -242,7 +242,7 @@ You'll need to have Skyvern running locally if you want to try these examples ou
 <!-- Add example of delaware entity lookups x2 -->
 
 ## Filling out random contact us forms
-[💡 See it in action](https://app.skyvern.com/create/contact_us_form)
+[💡 See it in action](https://app.skyvern.com/create/contact_us_forms)
 <p align="center">
   <img src="docs/images/contact_forms.gif"/>
 </p>
