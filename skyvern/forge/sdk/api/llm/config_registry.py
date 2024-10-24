@@ -43,7 +43,7 @@ class LLMConfigRegistry:
         return cls._configs[llm_key]
 
 
-# if none of the LLM providers are enabled, raise an error
+# Update the check for enabled providers
 if not any(
     [
         SettingsManager.get_settings().ENABLE_OPENAI,
@@ -51,6 +51,7 @@ if not any(
         SettingsManager.get_settings().ENABLE_AZURE,
         SettingsManager.get_settings().ENABLE_AZURE_GPT4O_MINI,
         SettingsManager.get_settings().ENABLE_BEDROCK,
+        SettingsManager.get_settings().ENABLE_OLLAMA,
     ]
 ):
     raise NoProviderEnabledError()
@@ -214,5 +215,22 @@ if SettingsManager.get_settings().ENABLE_AZURE_GPT4O_MINI:
             ),
             supports_vision=True,
             add_assistant_prefix=False,
+        ),
+    )
+
+# Add Ollama configuration
+if SettingsManager.get_settings().ENABLE_OLLAMA:
+    LLMConfigRegistry.register_config(
+        "OLLAMA",
+        LLMConfig(
+            f"ollama/{SettingsManager.get_settings().OLLAMA_MODEL}",
+            [],  # No API key required
+            litellm_params=LiteLLMParams(
+                api_base=SettingsManager.get_settings().OLLAMA_API_BASE,
+                model_info={"model_name": f"ollama/{SettingsManager.get_settings().OLLAMA_MODEL}"},
+            ),
+            supports_vision=True,  # Set this to True since llava:34b supports vision
+            add_assistant_prefix=False,
+            skip_cost_calculation=True,  # Add this line to skip cost calculation for Ollama
         ),
     )

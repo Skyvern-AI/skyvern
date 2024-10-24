@@ -174,6 +174,10 @@ class LLMAPIHandlerFactory:
             if llm_config.litellm_params:  # type: ignore
                 active_parameters.update(llm_config.litellm_params)  # type: ignore
 
+            # Update this line to use the new 60-second timeout
+            timeout = active_parameters.pop('timeout', SettingsManager.get_settings().LLM_CONFIG_TIMEOUT)
+            max_retries = active_parameters.pop('max_retries', 3)
+
             if step:
                 await app.ARTIFACT_MANAGER.create_artifact(
                     step=step,
@@ -214,10 +218,48 @@ class LLMAPIHandlerFactory:
                 response = await litellm.acompletion(
                     model=llm_config.model_name,
                     messages=messages,
-                    timeout=SettingsManager.get_settings().LLM_CONFIG_TIMEOUT,
+                    timeout=timeout,
+                    max_retries=max_retries,
                     **active_parameters,
                 )
                 LOG.info("LLM API call successful", llm_key=llm_key, model=llm_config.model_name)
+
+                if step:
+                    await app.ARTIFACT_MANAGER.create_artifact(
+                        step=step,
+                        artifact_type=ArtifactType.LLM_RESPONSE,
+                        data=response.model_dump_json(indent=2).encode("utf-8"),
+                    )
+
+                    if not llm_config.skip_cost_calculation:
+                        try:
+                            llm_cost = litellm.completion_cost(completion_response=response)
+                        except litellm.exceptions.NotFoundError:
+                            LOG.warning(f"Cost calculation not available for model: {llm_config.model_name}. Setting cost to 0.")
+                            llm_cost = 0
+                    else:
+                        llm_cost = 0
+
+                    prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
+                    completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
+                    await app.DATABASE.update_step(
+                        task_id=step.task_id,
+                        step_id=step.step_id,
+                        organization_id=step.organization_id,
+                        incremental_cost=llm_cost,
+                        incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
+                        incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
+                    )
+
+                parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
+                if step:
+                    await app.ARTIFACT_MANAGER.create_artifact(
+                        step=step,
+                        artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
+                        data=json.dumps(parsed_response, indent=2).encode("utf-8"),
+                    )
+                return parsed_response
+
             except litellm.exceptions.APIError as e:
                 raise LLMProviderErrorRetryableTask(llm_key) from e
             except CancelledError:
@@ -230,33 +272,8 @@ class LLMAPIHandlerFactory:
                 )
                 raise LLMProviderError(llm_key)
             except Exception as e:
-                LOG.exception("LLM request failed unexpectedly", llm_key=llm_key)
+                LOG.exception("LLM request failed unexpectedly", llm_key=llm_key, error=str(e))
                 raise LLMProviderError(llm_key) from e
-            if step:
-                await app.ARTIFACT_MANAGER.create_artifact(
-                    step=step,
-                    artifact_type=ArtifactType.LLM_RESPONSE,
-                    data=response.model_dump_json(indent=2).encode("utf-8"),
-                )
-                llm_cost = litellm.completion_cost(completion_response=response)
-                prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
-                completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
-                await app.DATABASE.update_step(
-                    task_id=step.task_id,
-                    step_id=step.step_id,
-                    organization_id=step.organization_id,
-                    incremental_cost=llm_cost,
-                    incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
-                    incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
-                )
-            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
-            if step:
-                await app.ARTIFACT_MANAGER.create_artifact(
-                    step=step,
-                    artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-                    data=json.dumps(parsed_response, indent=2).encode("utf-8"),
-                )
-            return parsed_response
 
         return llm_api_handler
 

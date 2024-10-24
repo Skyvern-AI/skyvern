@@ -93,7 +93,7 @@ class Settings(BaseSettings):
     LLM_KEY: str = "OPENAI_GPT4O"
     SECONDARY_LLM_KEY: str | None = None
     # COMMON
-    LLM_CONFIG_TIMEOUT: int = 300
+    LLM_CONFIG_TIMEOUT: int = 60
     LLM_CONFIG_MAX_TOKENS: int = 4096
     LLM_CONFIG_TEMPERATURE: float = 0
     # LLM PROVIDER SPECIFIC
@@ -124,6 +124,11 @@ class Settings(BaseSettings):
     VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 5
 
     SVG_MAX_LENGTH: int = 100000
+
+    # Add these new settings for Ollama
+    ENABLE_OLLAMA: bool = False
+    OLLAMA_API_BASE: str = "http://192.168.1.3:11434"
+    OLLAMA_MODEL: str = "llama2"  # Default model, can be changed
 
     def is_cloud_environment(self) -> bool:
         """

@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:14-alpine
@@ -23,7 +21,6 @@ services:
   skyvern:
     image: public.ecr.aws/skyvern/skyvern:latest
     restart: on-failure
-    # comment out if you want to externally call skyvern API
     ports:
       - 8000:8000
     volumes:
@@ -31,21 +28,25 @@ services:
       - ./videos:/data/videos
       - ./har:/data/har
       - ./.streamlit:/app/.streamlit
+      - ./skyvern/config.py:/app/skyvern/config.py
+      - ./skyvern/forge/sdk/api/llm/models.py:/app/skyvern/forge/sdk/api/llm/models.py
+      - ./skyvern/forge/sdk/api/llm/config_registry.py:/app/skyvern/forge/sdk/api/llm/config_registry.py
+      - ./skyvern/forge/sdk/api/llm/api_handler_factory.py:/app/skyvern/forge/sdk/api/llm/api_handler_factory.py
     environment:
       - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
       - BROWSER_TYPE=chromium-headful
-      - ENABLE_OPENAI=true
-      - OPENAI_API_KEY=<your_openai_key>
-      # If you want to use other LLM provider, like azure and anthropic:
-      # - ENABLE_ANTHROPIC=true
-      # - LLM_KEY=ANTHROPIC_CLAUDE3_OPUS
-      # - ANTHROPIC_API_KEY=<your_anthropic_key>
-      # - ENABLE_AZURE=true
-      # - LLM_KEY=AZURE_OPENAI
-      # - AZURE_DEPLOYMENT=<your_azure_deployment>
-      # - AZURE_API_KEY=<your_azure_api_key>
-      # - AZURE_API_BASE=<your_azure_api_base>
-      # - AZURE_API_VERSION=<your_azure_api_version>
+      # Enable Ollama
+      - ENABLE_OLLAMA=true
+      - LLM_KEY=OLLAMA
+      - OLLAMA_API_BASE=http://192.168.1.3:11434
+      - OLLAMA_MODEL=minicpm-v:latest
+      # Disable other providers
+      - ENABLE_OPENAI=false
+      - ENABLE_ANTHROPIC=false
+      - ENABLE_AZURE=false
+      - ENABLE_AZURE_GPT4O_MINI=false
+      - ENABLE_BEDROCK=false
+      - LITELLM_VERBOSE=true
     depends_on:
       postgres:
         condition: service_healthy
