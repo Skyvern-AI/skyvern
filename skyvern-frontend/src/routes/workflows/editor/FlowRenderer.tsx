@@ -219,9 +219,10 @@ function FlowRenderer({
       setHasChanges(false);
     },
     onError: (error: AxiosError) => {
+      const detail = (error.response?.data as { detail?: string }).detail;
       toast({
         title: "Error",
-        description: error.message,
+        description: detail ? detail : error.message,
         variant: "destructive",
       });
     },
