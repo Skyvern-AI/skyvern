@@ -1217,7 +1217,18 @@ class ForgeAgent:
         return json.dumps(
             [
                 {
-                    "action": action.model_dump(exclude_none=True, exclude={"text", "confidence_float"}),
+                    "action": action.model_dump(
+                        exclude_none=True,
+                        exclude={
+                            "text",
+                            "confidence_float",
+                            "organization_id",
+                            "task_id",
+                            "step_id",
+                            "step_order",
+                            "action_order",
+                        },
+                    ),
                     "results": [
                         result.model_dump(
                             exclude_none=True,
