@@ -19,6 +19,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     InvalidWorkflowDefinition,
     WorkflowDefinitionHasDuplicateParameterKeys,
     WorkflowDefinitionHasReservedParameterKeys,
+    WorkflowParameterMissingRequiredValue,
 )
 from skyvern.forge.sdk.workflow.models.block import (
     BlockStatus,
@@ -957,6 +958,12 @@ class WorkflowService:
                         description=parameter.description,
                     )
                 elif parameter.parameter_type == ParameterType.BITWARDEN_LOGIN_CREDENTIAL:
+                    if not parameter.bitwarden_collection_id:
+                        raise WorkflowParameterMissingRequiredValue(
+                            workflow_parameter_type=ParameterType.BITWARDEN_LOGIN_CREDENTIAL,
+                            workflow_parameter_key=parameter.key,
+                            required_value="bitwarden_collection_id",
+                        )
                     parameters[parameter.key] = await self.create_bitwarden_login_credential_parameter(
                         workflow_id=workflow.workflow_id,
                         bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
