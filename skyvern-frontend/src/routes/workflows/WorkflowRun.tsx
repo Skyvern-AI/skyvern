@@ -97,6 +97,18 @@ function WorkflowRun() {
         return false;
       },
       placeholderData: keepPreviousData,
+      refetchOnMount: (query) => {
+        if (!query.state.data) {
+          return false;
+        }
+        return statusIsRunningOrQueued(query.state.data);
+      },
+      refetchOnWindowFocus: (query) => {
+        if (!query.state.data) {
+          return false;
+        }
+        return statusIsRunningOrQueued(query.state.data);
+      },
     });
 
   const { data: workflowTasks, isLoading: workflowTasksIsLoading } = useQuery<
