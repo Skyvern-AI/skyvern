@@ -448,6 +448,11 @@ function isInteractable(element) {
     if (hasAngularClickBinding(element)) {
       return true;
     }
+    // https://www.oxygenxml.com/dita/1.3/specs/langRef/technicalContent/svg-container.html
+    // svg-container is usually used for clickable elements that wrap SVGs
+    if (element.className.toString().includes("svg-container")) {
+      return true;
+    }
   }
 
   // support listbox and options underneath it
