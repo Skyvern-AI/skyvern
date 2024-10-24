@@ -1,14 +1,14 @@
-import { useState } from "react";
 import { StepNavigation } from "./StepNavigation";
 import { StepArtifacts } from "./StepArtifacts";
 import { useQuery } from "@tanstack/react-query";
 import { StepApiResponse } from "@/api/types";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 function StepArtifactsLayout() {
-  const [activeIndex, setActiveIndex] = useState(0);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const step = Number(searchParams.get("step")) || 0;
   const credentialGetter = useCredentialGetter();
   const { taskId } = useParams();
 
@@ -30,14 +30,25 @@ function StepArtifactsLayout() {
     return <div>Error: {error?.message}</div>;
   }
 
-  const activeStep = steps?.[activeIndex];
+  const activeStep = steps?.[step];
 
   return (
     <div className="flex">
       <aside className="w-64 shrink-0">
         <StepNavigation
-          activeIndex={activeIndex}
-          onActiveIndexChange={setActiveIndex}
+          activeIndex={step}
+          onActiveIndexChange={(index) => {
+            setSearchParams(
+              (params) => {
+                const newParams = new URLSearchParams(params);
+                newParams.set("step", String(index));
+                return newParams;
+              },
+              {
+                replace: true,
+              },
+            );
+          }}
         />
       </aside>
       <main className="w-full px-4">
