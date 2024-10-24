@@ -51,7 +51,11 @@ from skyvern.forge.sdk.schemas.tasks import (
 )
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.workflow.exceptions import FailedToCreateWorkflow, FailedToUpdateWorkflow
+from skyvern.forge.sdk.workflow.exceptions import (
+    FailedToCreateWorkflow,
+    FailedToUpdateWorkflow,
+    WorkflowParameterMissingRequiredValue,
+)
 from skyvern.forge.sdk.workflow.models.workflow import (
     RunWorkflowResponse,
     Workflow,
@@ -707,6 +711,8 @@ async def create_workflow(
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org, request=workflow_create_request
         )
+    except WorkflowParameterMissingRequiredValue as e:
+        raise e
     except Exception as e:
         LOG.error("Failed to create workflow", exc_info=True, organization_id=current_org.organization_id)
         raise FailedToCreateWorkflow(str(e))
