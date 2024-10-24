@@ -90,7 +90,7 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
 1. Make sure you have [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running on your machine
 1. Make sure you don't have postgres running locally (Run `docker ps` to check)
 1. Clone the repository and navigate to the root directory
-1. Fill in the LLM provider key on the [docker-compose.yml](./docker-compose.yml)
+1. Fill in the LLM provider key on the [docker-compose.yml](./docker-compose.yml). *If you want to run skyvern on a remote server, make sure you set the correct server ip for the UI container in [docker-compose.yml](./docker-compose.yml).*
 2. Run the following command via the commandline:
    ```bash
     docker compose up -d
@@ -101,6 +101,7 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
 ## Full Setup (Contributors) - Prerequisites 
 
 ### :warning: :warning: MAKE SURE YOU ARE USING PYTHON 3.11 :warning: :warning:
+:warning: :warning: only well-tested on MacOS :warning: :warning:
 Before you begin, make sure you have the following installed:
 
 - [Brew (if you're on a Mac)](https://brew.sh/)
