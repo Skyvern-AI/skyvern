@@ -97,6 +97,18 @@ function TaskDetails() {
       queryClient.invalidateQueries({
         queryKey: ["tasks"],
       });
+      if (task?.workflow_run_id) {
+        queryClient.invalidateQueries({
+          queryKey: ["workflowRun", task.workflow_run_id],
+        });
+        queryClient.invalidateQueries({
+          queryKey: [
+            "workflowRun",
+            workflow?.workflow_permanent_id,
+            task.workflow_run_id,
+          ],
+        });
+      }
       toast({
         variant: "success",
         title: "Task Canceled",
