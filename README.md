@@ -241,7 +241,12 @@ You'll need to have Skyvern running locally if you want to try these examples ou
 </p>
 <!-- Add example of delaware entity lookups x2 -->
 
-<!-- Add Example of contact us form submission -->
+## Filling out random contact us forms
+[💡 See it in action](https://app.skyvern.com/create/contact_us_form)
+<p align="center">
+  <img src="docs/images/contact_forms.gif"/>
+</p>
+
 
 ## Retrieving insurance quotes from insurance providers in any language
 [💡 See it in action](https://app.skyvern.com/create/bci_seguros)
