@@ -7,7 +7,7 @@ import {
 import { StatusBadge } from "@/components/StatusBadge";
 import { Label } from "@/components/ui/label";
 import { useQuery } from "@tanstack/react-query";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -23,6 +23,8 @@ type Props = {
 };
 
 function StepArtifacts({ id, stepProps }: Props) {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const artifact = searchParams.get("artifact") ?? "info";
   const { taskId } = useParams();
   const credentialGetter = useCredentialGetter();
   const {
@@ -78,7 +80,22 @@ function StepArtifacts({ id, stepProps }: Props) {
   );
 
   return (
-    <Tabs defaultValue="info" className="w-full">
+    <Tabs
+      value={artifact}
+      onValueChange={(value) => {
+        setSearchParams(
+          (params) => {
+            const newParams = new URLSearchParams(params);
+            newParams.set("artifact", value);
+            return newParams;
+          },
+          {
+            replace: true,
+          },
+        );
+      }}
+      className="w-full"
+    >
       <TabsList className="grid h-16 w-full grid-cols-5">
         <TabsTrigger value="info">Info</TabsTrigger>
         <TabsTrigger value="screenshot_llm">Annotated Screenshots</TabsTrigger>
