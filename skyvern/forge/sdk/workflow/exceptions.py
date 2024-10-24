@@ -99,3 +99,11 @@ class InvalidFileType(BaseWorkflowHTTPException):
             f"File URL {file_url} is not a valid {file_type} file. Error: {error}",
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
+
+
+class WorkflowParameterMissingRequiredValue(BaseWorkflowHTTPException):
+    def __init__(self, workflow_parameter_type: str, workflow_parameter_key: str, required_value: str) -> None:
+        super().__init__(
+            f"Missing required value for workflow parameter. Workflow parameter type: {workflow_parameter_type}. workflow_parameter_key: {workflow_parameter_key}. Required value: {required_value}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
