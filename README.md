@@ -63,7 +63,9 @@ Skyvern uses a swarm of agents to comprehend a website, and plan and execute its
 
 # Demo
 <!-- Redo demo -->
-https://github.com/Skyvern-AI/skyvern/assets/3853670/4fd87a66-39a1-4c3b-b9ac-64c165da6336
+https://github.com/user-attachments/assets/5cab4668-e8e2-4982-8551-aab05ff73a7f
+
+
 
 
 # Skyvern Cloud
