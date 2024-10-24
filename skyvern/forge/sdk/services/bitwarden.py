@@ -184,6 +184,9 @@ class BitwardenService:
             elif collection_id:
                 LOG.info("Collection ID is provided, filtering items by collection ID", collection_id=collection_id)
                 list_command.extend(["--collectionid", collection_id])
+            else:
+                LOG.error("No collection ID or organization ID provided -- this is required")
+                raise BitwardenListItemsError("No collection ID or organization ID provided -- this is required")
             items_result = BitwardenService.run_command(list_command)
 
             if items_result.stderr and "Event post failed" not in items_result.stderr:
