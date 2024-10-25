@@ -156,6 +156,7 @@ Tasks require you to specify a `url`, `navigation_goal`, and optionally `data_ex
 Workflows are a way to chain multiple tasks together to form a cohesive unit of work. 
 
 For example, if you wanted to download all invoices newer than January 1st, you could create a workflow that first navigated to the invoices page, then filtered down to only show invoices newer than January 1st, extracted a list of all eligible invoices, and iterated through each invoice to download it.
+
 Another example is if you wanted to automate purchasing products from an e-commerce store, you could create a workflow that first navigated to the desired product, then added it to a cart. Second, it would navigate to the cart and validate the cart state. Finally, it would go through the checkout process to purchase the items.
 
 Supported workflow features include:
