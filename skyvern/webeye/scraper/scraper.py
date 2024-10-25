@@ -32,6 +32,7 @@ RESERVED_ATTRIBUTES = {
     "data-original-title",  # for bootstrap tooltip
     "data-ui",
     "disabled",  # for button
+    "aria-disabled",
     "for",
     "href",  # For a tags
     "maxlength",
@@ -550,6 +551,22 @@ class IncrementalScrapePage:
         return "".join([json_to_html(element) for element in (element_tree or self.element_tree_trimmed)])
 
 
+def _should_keep_unique_id(element: dict) -> bool:
+    # case where we shouldn't keep unique_id
+    # 1. not disable attr and no interactable
+    # 2. disable=false and intrecatable=false
+
+    attributes = element.get("attributes", {})
+    if "disabled" not in attributes and "aria-disabled" not in attributes:
+        return element.get("interactable", False)
+
+    disabled = attributes.get("disabled")
+    aria_disabled = attributes.get("aria-disabled")
+    if disabled or aria_disabled:
+        return True
+    return element.get("interactable", False)
+
+
 def trim_element(element: dict) -> dict:
     queue = [element]
     while queue:
@@ -557,7 +574,7 @@ def trim_element(element: dict) -> dict:
         if "frame" in queue_ele:
             del queue_ele["frame"]
 
-        if "id" in queue_ele and not queue_ele.get("interactable"):
+        if "id" in queue_ele and not _should_keep_unique_id(queue_ele):
             del queue_ele["id"]
 
         if "attributes" in queue_ele:

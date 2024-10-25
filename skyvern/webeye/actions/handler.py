@@ -25,6 +25,7 @@ from skyvern.exceptions import (
     FailToSelectByValue,
     IllegitComplete,
     ImaginaryFileUrl,
+    InteractWithDisabledElement,
     InvalidElementForTextInput,
     MissingElement,
     MissingFileUrl,
@@ -347,6 +348,18 @@ async def handle_click_action(
     dom = DomUtil(scraped_page=scraped_page, page=page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     await asyncio.sleep(0.3)
+
+    # dynamically validate the attr, since it could change into enabled after the previous actions
+    if await skyvern_element.is_disabled(dynamic=True):
+        LOG.warning(
+            "Try to click on a disabled element",
+            action_type=action.action_type,
+            task_id=task.task_id,
+            step_id=step.step_id,
+            element_id=skyvern_element.get_id(),
+        )
+        return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
+
     if action.download:
         results = await handle_click_to_download_file_action(action, page, scraped_page, task)
     else:
@@ -416,6 +429,17 @@ async def handle_input_text_action(
     text = await get_actual_value_of_parameter_if_secret(task, action.text)
     if text is None:
         return [ActionFailure(FailedToFetchSecret())]
+
+    # dynamically validate the attr, since it could change into enabled after the previous actions
+    if await skyvern_element.is_disabled(dynamic=True):
+        LOG.warning(
+            "Try to input text on a disabled element",
+            action_type=action.action_type,
+            task_id=task.task_id,
+            step_id=step.step_id,
+            element_id=skyvern_element.get_id(),
+        )
+        return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
     incremental_element: list[dict] = []
     # check if it's selectable
@@ -572,6 +596,18 @@ async def handle_upload_file_action(
 
     dom = DomUtil(scraped_page=scraped_page, page=page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
+
+    # dynamically validate the attr, since it could change into enabled after the previous actions
+    if await skyvern_element.is_disabled(dynamic=True):
+        LOG.warning(
+            "Try to upload file on a disabled element",
+            action_type=action.action_type,
+            task_id=task.task_id,
+            step_id=step.step_id,
+            element_id=skyvern_element.get_id(),
+        )
+        return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
+
     locator = skyvern_element.locator
 
     file_path = await download_file(file_url)
@@ -716,6 +752,17 @@ async def handle_select_option_action(
                 option=action.option,
             )
             return await handle_select_option_action(select_action, page, scraped_page, task, step)
+
+    # dynamically validate the attr, since it could change into enabled after the previous actions
+    if await skyvern_element.is_disabled(dynamic=True):
+        LOG.warning(
+            "Try to select on a disabled element",
+            action_type=action.action_type,
+            task_id=task.task_id,
+            step_id=step.step_id,
+            element_id=skyvern_element.get_id(),
+        )
+        return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
     if tag_name == InteractiveElement.SELECT:
         LOG.info(

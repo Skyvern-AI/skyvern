@@ -207,6 +207,43 @@ class SkyvernElement:
     def is_interactable(self) -> bool:
         return self.__static_element.get("interactable", False)
 
+    async def is_disabled(self, dynamic: bool = False) -> bool:
+        # if attr not exist, return None
+        # if attr is like 'disabled', return empty string or True
+        # if attr is like `disabled=false`, return the value
+        disabled = False
+        aria_disabled = False
+
+        disabled_attr: bool | str | None = None
+        aria_disabled_attr: bool | str | None = None
+
+        try:
+            disabled_attr = await self.get_attr("disabled", dynamic=dynamic)
+            aria_disabled_attr = await self.get_attr("aria-disabled", dynamic=dynamic)
+        except Exception:
+            # FIXME: maybe it should be considered as "disabled" element if failed to get the attributes?
+            LOG.exception(
+                "Failed to get the disabled attribute",
+                element=self.__static_element,
+                element_id=self.get_id(),
+            )
+
+        if disabled_attr is not None:
+            # disabled_attr should be bool or str
+            if isinstance(disabled_attr, bool):
+                disabled = disabled_attr
+            if isinstance(disabled_attr, str):
+                disabled = disabled_attr.lower() != "false"
+
+        if aria_disabled_attr is not None:
+            # aria_disabled_attr should be bool or str
+            if isinstance(aria_disabled_attr, bool):
+                aria_disabled = aria_disabled_attr
+            if isinstance(aria_disabled_attr, str):
+                aria_disabled = aria_disabled_attr.lower() != "false"
+
+        return disabled or aria_disabled
+
     async def is_selectable(self) -> bool:
         return self.get_selectable() or self.get_tag_name() in SELECTABLE_ELEMENT
 
@@ -367,7 +404,8 @@ class SkyvernElement:
         timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
     ) -> typing.Any:
         if not dynamic:
-            if attr := self.get_attributes().get(attr_name):
+            attr = self.get_attributes().get(attr_name)
+            if attr is not None:
                 return attr
 
         return await self.locator.get_attribute(attr_name, timeout=timeout)
