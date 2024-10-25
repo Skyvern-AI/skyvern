@@ -836,7 +836,8 @@ function buildElementObject(frame, element, interactable, purgeable = false) {
       attr.name === "aria-selected" ||
       attr.name === "readonly" ||
       attr.name === "aria-readonly" ||
-      attr.name === "disabled"
+      attr.name === "disabled" ||
+      attr.name === "aria-disabled"
     ) {
       if (attrValue && attrValue.toLowerCase() === "false") {
         attrValue = false;
