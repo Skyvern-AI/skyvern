@@ -109,6 +109,7 @@ class WorkflowRunContext:
             master_password=self.secrets[BitwardenConstants.MASTER_PASSWORD],
             bw_organization_id=self.secrets[BitwardenConstants.BW_ORGANIZATION_ID],
             bw_collection_ids=self.secrets[BitwardenConstants.BW_COLLECTION_IDS],
+            collection_id=self.secrets[BitwardenConstants.BW_COLLECTION_ID],
         )
         return secret_credentials
 
