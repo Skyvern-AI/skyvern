@@ -1227,6 +1227,8 @@ class ForgeAgent:
                             "step_id",
                             "step_order",
                             "action_order",
+                            "skyvern_element_hash",
+                            "skyvern_element_data",
                         },
                     ),
                     "results": [
