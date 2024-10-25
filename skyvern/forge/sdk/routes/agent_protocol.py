@@ -762,7 +762,11 @@ async def update_workflow(
     except WorkflowParameterMissingRequiredValue as e:
         raise e
     except Exception as e:
-        LOG.exception("Failed to update workflow", workflow_permanent_id=workflow_permanent_id)
+        LOG.exception(
+            "Failed to update workflow",
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=current_org.organization_id,
+        )
         raise FailedToUpdateWorkflow(workflow_permanent_id, f"<{type(e).__name__}: {str(e)}>")
 
 
