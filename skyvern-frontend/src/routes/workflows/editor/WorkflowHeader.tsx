@@ -75,8 +75,8 @@ function WorkflowHeader({
             navigate(`/workflows/${workflowPermanentId}/run`);
           }}
         >
-          <span className="mr-2">Run</span>
-          <PlayIcon className="h-6 w-6" />
+          <PlayIcon className="mr-2 h-6 w-6" />
+          Run
         </Button>
       </div>
     </div>
