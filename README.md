@@ -31,7 +31,7 @@
 
 Traditional approaches to browser automations required writing custom scripts for websites, often relying on DOM parsing and XPath-based interactions which would break whenever the website layouts changed.
 
-Instead of only relying on code-defined XPath interactions, Skyvern relies on prompts in addition to computer vision and LLMs to the mix to parse items in the viewport in real-time, create a plan for interaction and interact with them.
+Instead of only relying on code-defined XPath interactions, Skyvern relies on prompts in addition to computer vision and LLMs to parse items in the viewport in real-time, create a plan for interaction and interact with them.
 
 This approach gives us a few advantages:
 
@@ -51,10 +51,10 @@ Skyvern was inspired by the Task-Driven autonomous agent design popularized by [
 Skyvern uses a swarm of agents to comprehend a website, and plan and execute its actions:
 1. **Interactable Element Agent**: This agent is responsible for parsing the HTML of a website and extracting the interactable elements. 
 2. **Navigation Agent**: This agent is responsible for planning the navigation to complete a task. Examples include clicking buttons, inserting text, selecting options, etc.
-3. **Data Extraction Agent**: This agent is responsible for extracting data from a website. It's capable of reading the tables and text on the page, and extract the output in a user-defined structured format
+3. **Data Extraction Agent**: This agent is responsible for extracting data from a website. It's capable of reading the tables and text on the page, and extracting the output in a user-defined structured format
 4. **Password Agent**: This agent is responsible for filling out password forms on a website. It's capable of reading the username and password from a password manager, and filling out the form while preserving the privacy of the user-defined secrets.
 5. **2FA Agent**: This agent is responsible for filling out 2FA forms on a website. It's capable of  intercepting website requests for 2FAs, and either requesting user-defined APIs for 2FA codes or waiting for users to feed 2FA codes into it, and then completing the login process.
-6. **Dynamic Auto-complete Agent**: This agent is responsible for filling out dynamic auto-complete forms on a website. It's capable of reading the options presented to it, and selecting the appropriate option based on the user's input, adjusting its inputs based on the feedback from inside the form. Popular examples include: Address forms, university dropdowns, and more.
+6. **Dynamic Auto-complete Agent**: This agent is responsible for filling out dynamic auto-complete forms on a website. It's capable of reading the options presented to it, selecting the appropriate option based on the user's input, and adjusting its inputs based on the feedback from inside the form. Popular examples include: Address forms, university dropdowns, and more.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/skyvern-system-diagram-dark.png" />
@@ -69,7 +69,7 @@ https://github.com/user-attachments/assets/5cab4668-e8e2-4982-8551-aab05ff73a7f
 
 
 # Skyvern Cloud
-We offer a managed cloud version of Skyvern that allows you to run Skyvern without having to manage the infrastructure. It allows to you run multiple Skyvern instances in parallel to automate your workflows at scale. In addition, Skyvern cloud comes bundled with anti-bot detection mechanisms, proxy network, and CAPTCHA solving to allow you to complete more complicated workflows.
+We offer a managed cloud version of Skyvern that allows you to run Skyvern without having to manage the infrastructure. It allows you to run multiple Skyvern instances in parallel to automate your workflows at scale. In addition, Skyvern cloud comes bundled with anti-bot detection mechanisms, proxy network, and CAPTCHA solving to allow you to complete more complicated workflows.
 
 If you'd like to try it out, 
 1. Navigate to [app.skyvern.com](https://app.skyvern.com)
@@ -78,7 +78,7 @@ If you'd like to try it out,
 
 Here are some tips that may help you on your adventure:
 1. Skyvern is really good at carrying out a single goal. If you give it too many instructions to do, it has a high likelihood of getting confused along the way. 
-2. Being really explicit about goals is very important. For example, if you're generating an insurance quote, let it know very clearly how it can identify it's accomplished its goals. Use words like "COMPLETE" or "TERMINATE" to indicate success and failure modes, respectively.
+2. Being really explicit about goals is very important. For example, if you're generating an insurance quote, let it know very clearly how it can identify it has accomplished its goals. Use words like "COMPLETE" or "TERMINATE" to indicate success and failure modes, respectively.
 3. Workflows can be used if you'd like to do more advanced things such as chaining multiple instructions together, or securely logging in. If you need any help with this, please feel free to book some time with us! We're always happy to help
 
 
@@ -90,7 +90,7 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
 1. Make sure you have [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running on your machine
 1. Make sure you don't have postgres running locally (Run `docker ps` to check)
 1. Clone the repository and navigate to the root directory
-1. Fill in the LLM provider key on the [docker-compose.yml](./docker-compose.yml). *If you want to run skyvern on a remote server, make sure you set the correct server ip for the UI container in [docker-compose.yml](./docker-compose.yml).*
+1. Fill in the LLM provider key on the [docker-compose.yml](./docker-compose.yml). *If you want to run Skyvern on a remote server, make sure you set the correct server ip for the UI container in [docker-compose.yml](./docker-compose.yml).*
 2. Run the following command via the commandline:
    ```bash
     docker compose up -d
@@ -155,9 +155,8 @@ Tasks require you to specify a `url`, `navigation_goal`, and optionally `data_ex
 ## Skyvern Workflows
 Workflows are a way to chain multiple tasks together to form a cohesive unit of work. 
 
-For example, if you wanted to download all invoics newer than January 1st, you could create a workflow that first navigated to the invoices page, then filtered down to only show invoices newer than January 1st, extracted a list of all eligilble invoices, and iterated through each invoice to download it.
-
-Another example is if you wanted to automate purchasing products from an e-commerce store, you could create a workflow that first navigated to the desired product, added it to cart. Second, it would navigate to the cart and validate the cart state. Finally, it would go through the checkout process to purchase the items.
+For example, if you wanted to download all invoices newer than January 1st, you could create a workflow that first navigated to the invoices page, then filtered down to only show invoices newer than January 1st, extracted a list of all eligible invoices, and iterated through each invoice to download it.
+Another example is if you wanted to automate purchasing products from an e-commerce store, you could create a workflow that first navigated to the desired product, then added it to a cart. Second, it would navigate to the cart and validate the cart state. Finally, it would go through the checkout process to purchase the items.
 
 Supported workflow features include:
 1. Tasks (+ chained tasks)
@@ -306,7 +305,7 @@ This is our planned roadmap for the next few months. If you have any suggestions
 - [x] **Chrome Viewport streaming** - Introduce a way to live-stream the Chrome viewport to the user's browser (as a part of the self-serve UI)
 - [x] **Past Runs UI** - Deprecate the Streamlit UI in favour of a React-based UI that allows you to visualize past runs and their results
 - [ ] **Prompt Caching** - Introduce a caching layer to the LLM calls to dramatically reduce the cost of running Skyvern (memorize past actions and repeat them!)
-- [ ] **Web Evaluation Dataset** - Integrate Skyvern with public benchmark tests to track the quality our models over time
+- [ ] **Web Evaluation Dataset** - Integrate Skyvern with public benchmark tests to track the quality of our models over time
 - [ ] **Improved Debug mode** - Allow Skyvern to plan its actions and get "approval" before running them, allowing you to debug what it's doing and more easily iterate on the prompt
 - [ ] **Auto workflow builder ("Observer") mode** - Allow Skyvern to auto-generate workflows as it's navigating the web to make it easier to build new workflows
 - [ ] **Chrome Extension** - Allow users to interact with Skyvern through a Chrome extension (incl voice mode, saving tasks, etc.)
