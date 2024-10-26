@@ -330,4 +330,4 @@ main
 #Test Model
 bash
 echo "Testing OpenRouter model connection..."
-python3 -c "from your_module import test_openrouter_model; test_openrouter_model()
+python3 -c "from your_module import test_openrouter_model; test_openrouter_model()"
