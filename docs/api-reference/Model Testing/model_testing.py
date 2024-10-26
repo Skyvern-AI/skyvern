@@ -6,7 +6,7 @@ import requests
 # model testing
 def test_openrouter_model():
     url = "https://openrouter.ai/api/v1/chat/completions"
-    api_key = os.getenv("OPENROUTER_API_KEY")
+    api_key = os.getenv("OPENROUTER_API_KEY") or ''
 
     # Set headers and payload for test
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
