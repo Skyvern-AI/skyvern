@@ -1084,7 +1084,7 @@ class ForgeAgent:
                 if idx < len(SCRAPE_TYPE_ORDER) - 1:
                     continue
                 LOG.error(
-                    "Failed to take screenshot after two normal attemps and reload-page retry",
+                    "Failed to take screenshot after two normal attempts and reload-page retry",
                     task_id=task.task_id,
                     step_id=step.step_id,
                 )
