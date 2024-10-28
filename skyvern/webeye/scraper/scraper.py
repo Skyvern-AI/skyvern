@@ -122,11 +122,20 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
     if element.get("purgeable", False):
         return children_html + option_html
 
+    before_pseudo_text = element.get("beforePseudoText", "")
+    after_pseudo_text = element.get("afterPseudoText", "")
+
     # Check if the element is self-closing
-    if tag in ["img", "input", "br", "hr", "meta", "link"] and not option_html and not children_html:
+    if (
+        tag in ["img", "input", "br", "hr", "meta", "link"]
+        and not option_html
+        and not children_html
+        and not before_pseudo_text
+        and not after_pseudo_text
+    ):
         return f'<{tag}{attributes_html if not attributes_html else " "+attributes_html}>'
     else:
-        return f'<{tag}{attributes_html if not attributes_html else " "+attributes_html}>{text}{children_html+option_html}</{tag}>'
+        return f'<{tag}{attributes_html if not attributes_html else " "+attributes_html}>{before_pseudo_text}{text}{children_html+option_html}{after_pseudo_text}</{tag}>'
 
 
 def clean_element_before_hashing(element: dict) -> dict:
@@ -602,6 +611,13 @@ def trim_element(element: dict) -> dict:
             element_text = str(queue_ele["text"]).strip()
             if not element_text:
                 del queue_ele["text"]
+
+        if "beforePseudoText" in queue_ele and not queue_ele.get("beforePseudoText"):
+            del queue_ele["beforePseudoText"]
+
+        if "afterPseudoText" in queue_ele and not queue_ele.get("afterPseudoText"):
+            del queue_ele["afterPseudoText"]
+
     return element
 
 
