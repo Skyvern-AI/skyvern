@@ -133,7 +133,7 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
       <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-8">
         <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
           <header>
-            <h1 className="text-lg">Workflow Parameters</h1>
+            <h1 className="text-lg">Input Parameters</h1>
           </header>
           {workflowParameters?.map((parameter) => {
             return (
@@ -198,7 +198,7 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
             );
           })}
           {workflowParameters.length === 0 && (
-            <div>No workflow parameters for this workflow.</div>
+            <div>This workflow doesn't have any input parameters</div>
           )}
         </div>
 

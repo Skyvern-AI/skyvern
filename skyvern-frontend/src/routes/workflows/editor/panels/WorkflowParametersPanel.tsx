@@ -54,7 +54,7 @@ function WorkflowParametersPanel() {
     <div className="relative w-[25rem] rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl">
       <div className="space-y-4">
         <header>
-          <h1 className="text-lg">Workflow Parameters</h1>
+          <h1 className="text-lg">Parameters</h1>
           <span className="text-sm text-slate-400">
             Create placeholder values that you can link in nodes. You will be
             prompted to fill them in before running your workflow.
@@ -79,7 +79,7 @@ function WorkflowParametersPanel() {
                 });
               }}
             >
-              Workflow Parameter
+              Input Parameter
             </DropdownMenuItem>
             <DropdownMenuItem
               onClick={() => {
