@@ -616,6 +616,26 @@ const isAngularDropdown = (element) => {
   return false;
 };
 
+function getPseudoContent(element, pseudo) {
+  const content = getElementComputedStyle(element, pseudo)
+    .getPropertyValue("content")
+    .replace(/"/g, "")
+    .trim();
+
+  if (content === "none" || !content) {
+    return null;
+  }
+
+  return content;
+}
+
+function hasBeforeOrAfterPseudoContent(element) {
+  return (
+    getPseudoContent(element, "::before") != null ||
+    getPseudoContent(element, "::after") != null
+  );
+}
+
 const checkParentClass = (className) => {
   const targetParentClasses = ["field", "entry"];
   for (let i = 0; i < targetParentClasses.length; i++) {
@@ -876,7 +896,9 @@ function buildElementObject(frame, element, interactable, purgeable = false) {
     interactable: interactable,
     tagName: elementTagNameLower,
     attributes: attrs,
+    beforePseudoText: getPseudoContent(element, "::before"),
     text: getElementContent(element),
+    afterPseudoText: getPseudoContent(element, "::after"),
     children: [],
     rect: DomUtils.getVisibleClientRect(element, true),
     // if purgeable is True, which means this element is only used for building the tree relationship
@@ -1019,6 +1041,8 @@ function buildElementTree(starter = document.body, frame, full_tree = false) {
         } else if (isTableRelatedElement(element)) {
           // build all table related elements into skyvern element
           // we need these elements to preserve the DOM structure
+          elementObj = buildElementObject(frame, element, false);
+        } else if (hasBeforeOrAfterPseudoContent(element)) {
           elementObj = buildElementObject(frame, element, false);
         } else if (full_tree) {
           // when building full tree, we only get text from element itself
