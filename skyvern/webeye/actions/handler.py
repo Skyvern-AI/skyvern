@@ -768,6 +768,8 @@ async def handle_select_option_action(
         LOG.info(
             "SelectOptionAction is on <select>",
             action=action,
+            task_id=task.task_id,
+            step_id=step.step_id,
         )
         return await normal_select(action=action, skyvern_element=skyvern_element)
 
@@ -775,6 +777,8 @@ async def handle_select_option_action(
         LOG.info(
             "SelectOptionAction is on <input> checkbox",
             action=action,
+            task_id=task.task_id,
+            step_id=step.step_id,
         )
         check_action = CheckboxAction(element_id=action.element_id, is_checked=True)
         return await handle_checkbox_action(check_action, page, scraped_page, task, step)
@@ -783,6 +787,19 @@ async def handle_select_option_action(
         LOG.info(
             "SelectOptionAction is on <input> radio",
             action=action,
+            task_id=task.task_id,
+            step_id=step.step_id,
+        )
+        click_action = ClickAction(element_id=action.element_id)
+        return await chain_click(task, scraped_page, page, click_action, skyvern_element)
+
+    # FIXME: maybe there's a case where <input type="button"> could trigger dropdown menu?
+    if await skyvern_element.is_btn_input():
+        LOG.info(
+            "SelectOptionAction is on <input> button",
+            action=action,
+            task_id=task.task_id,
+            step_id=step.step_id,
         )
         click_action = ClickAction(element_id=action.element_id)
         return await chain_click(task, scraped_page, page, click_action, skyvern_element)

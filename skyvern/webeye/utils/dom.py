@@ -167,6 +167,14 @@ class SkyvernElement:
         button_type = await self.get_attr("type")
         return button_type == "radio"
 
+    async def is_btn_input(self) -> bool:
+        tag_name = self.get_tag_name()
+        if tag_name != InteractiveElement.INPUT:
+            return False
+
+        input_type = await self.get_attr("type")
+        return input_type == "button"
+
     async def is_raw_input(self) -> bool:
         if self.get_tag_name() != InteractiveElement.INPUT:
             return False
