@@ -839,6 +839,22 @@ async def handle_select_option_action(
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(task=task, step=step, check_exist_funcs=[dom.check_id_in_dom]),
         )
+
+        if len(incremental_element) == 0 and skyvern_element.get_tag_name() == InteractiveElement.INPUT:
+            LOG.info(
+                "No incremental elements detected for the input element, trying to press Arrowdown to trigger the dropdown",
+                element_id=skyvern_element.get_id(),
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            await skyvern_element.scroll_into_view()
+            await skyvern_element.press_key("ArrowDown")
+            # wait 5s for options to load
+            await asyncio.sleep(5)
+            incremental_element = await incremental_scraped.get_incremental_element_tree(
+                clean_and_remove_element_tree_factory(task=task, step=step, check_exist_funcs=[dom.check_id_in_dom]),
+            )
+
         if len(incremental_element) == 0:
             raise NoIncrementalElementFoundForCustomSelection(element_id=action.element_id)
 
