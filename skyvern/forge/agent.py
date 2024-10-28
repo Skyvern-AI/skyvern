@@ -1219,7 +1219,7 @@ class ForgeAgent:
                 {
                     "action": action.model_dump(
                         exclude_none=True,
-                        include={"action_type", "element_id", "status", "reasoning", "option"},
+                        include={"action_type", "element_id", "status", "reasoning", "option", "download"},
                     ),
                     "results": [
                         result.model_dump(
