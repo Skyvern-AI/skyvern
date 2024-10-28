@@ -538,6 +538,7 @@ function FlowRenderer({
             fitViewOptions={{
               maxZoom: 1,
             }}
+            deleteKeyCode={null}
           >
             <Background variant={BackgroundVariant.Dots} bgColor="#020617" />
             <Controls position="bottom-left" />
