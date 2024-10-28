@@ -274,61 +274,59 @@ function TaskDetails() {
           {failureReason}
         </>
       )}
-      <div className="flex items-center justify-center">
-        <div className="inline-flex rounded border bg-muted p-1">
-          <NavLink
-            to="actions"
-            className={({ isActive }) => {
-              return cn(
-                "cursor-pointer rounded-md px-2 py-1 text-muted-foreground",
-                {
-                  "bg-primary-foreground text-foreground": isActive,
-                },
-              );
-            }}
-          >
-            Actions
-          </NavLink>
-          <NavLink
-            to="recording"
-            className={({ isActive }) => {
-              return cn(
-                "cursor-pointer rounded-md px-2 py-1 text-muted-foreground",
-                {
-                  "bg-primary-foreground text-foreground": isActive,
-                },
-              );
-            }}
-          >
-            Recording
-          </NavLink>
-          <NavLink
-            to="parameters"
-            className={({ isActive }) => {
-              return cn(
-                "cursor-pointer rounded-md px-2 py-1 text-muted-foreground",
-                {
-                  "bg-primary-foreground text-foreground": isActive,
-                },
-              );
-            }}
-          >
-            Parameters
-          </NavLink>
-          <NavLink
-            to="diagnostics"
-            className={({ isActive }) => {
-              return cn(
-                "cursor-pointer rounded-md px-2 py-1 text-muted-foreground",
-                {
-                  "bg-primary-foreground text-foreground": isActive,
-                },
-              );
-            }}
-          >
-            Diagnostics
-          </NavLink>
-        </div>
+      <div className="flex w-fit gap-2 rounded-sm border border-slate-700 p-2">
+        <NavLink
+          to="actions"
+          className={({ isActive }) => {
+            return cn(
+              "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
+              {
+                "bg-slate-700": isActive,
+              },
+            );
+          }}
+        >
+          Actions
+        </NavLink>
+        <NavLink
+          to="recording"
+          className={({ isActive }) => {
+            return cn(
+              "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
+              {
+                "bg-slate-700": isActive,
+              },
+            );
+          }}
+        >
+          Recording
+        </NavLink>
+        <NavLink
+          to="parameters"
+          className={({ isActive }) => {
+            return cn(
+              "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
+              {
+                "bg-slate-700": isActive,
+              },
+            );
+          }}
+        >
+          Parameters
+        </NavLink>
+        <NavLink
+          to="diagnostics"
+          className={({ isActive }) => {
+            return cn(
+              "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
+              {
+                "bg-slate-700": isActive,
+              },
+            );
+          }}
+        >
+          Diagnostics
+        </NavLink>
       </div>
       <Outlet />
     </div>
