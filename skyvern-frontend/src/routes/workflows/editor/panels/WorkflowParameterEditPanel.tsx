@@ -37,7 +37,7 @@ const workflowParameterTypeOptions = [
 
 function header(type: "workflow" | "credential" | "context") {
   if (type === "workflow") {
-    return "Edit Workflow Parameter";
+    return "Edit Input Parameter";
   }
   if (type === "credential") {
     return "Edit Credential Parameter";

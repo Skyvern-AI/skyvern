@@ -493,8 +493,11 @@ function WorkflowRun() {
       {Object.entries(parameters).length > 0 && (
         <div className="space-y-4">
           <header>
-            <h2 className="text-lg font-semibold">Parameters</h2>
+            <h2 className="text-lg font-semibold">Input Parameter Values</h2>
           </header>
+          {Object.entries(parameters).length === 0 && (
+            <div>This workflow doesn't have any input parameters.</div>
+          )}
           {Object.entries(parameters).map(([key, value]) => {
             return (
               <div key={key} className="flex flex-col gap-2">
