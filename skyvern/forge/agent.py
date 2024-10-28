@@ -1219,28 +1219,15 @@ class ForgeAgent:
                 {
                     "action": action.model_dump(
                         exclude_none=True,
-                        exclude={
-                            "text",
-                            "confidence_float",
-                            "organization_id",
-                            "task_id",
-                            "step_id",
-                            "step_order",
-                            "action_order",
-                            "skyvern_element_hash",
-                            "skyvern_element_data",
-                        },
+                        include={"action_type", "element_id", "status", "reasoning", "option"},
                     ),
                     "results": [
                         result.model_dump(
                             exclude_none=True,
-                            exclude={
-                                "javascript_triggered",
-                                "interacted_with_sibling",
-                                "interacted_with_parent",
-                                "step_retry_number",
-                                "step_order",
-                                "stop_execution_on_failure",
+                            include={
+                                "success",
+                                "exception_type",
+                                "exception_message",
                             },
                         )
                         for result in results
