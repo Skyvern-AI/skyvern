@@ -335,7 +335,7 @@ class ForgeAgent:
                     is_task_completed,
                     maybe_last_step,
                     maybe_next_step,
-                ) = await self.handle_completed_step(organization, task, step)
+                ) = await self.handle_completed_step(organization, task, step, await browser_state.get_working_page())
                 if is_task_completed is not None and maybe_last_step:
                     last_step = maybe_last_step
                     await self.send_task_response(
@@ -1649,8 +1649,65 @@ class ForgeAgent:
             )
             return next_step
 
+    async def summary_failure_reason_for_max_steps(
+        self,
+        organization: Organization,
+        task: Task,
+        step: Step,
+        page: Page | None,
+    ) -> str:
+        try:
+            steps = await app.DATABASE.get_task_steps(
+                task_id=task.task_id, organization_id=organization.organization_id
+            )
+            steps_results = []
+            for step_cnt, step in enumerate(steps):
+                if step.output is None:
+                    continue
+
+                if len(step.output.errors) > 0:
+                    return ";".join([repr(err) for err in step.output.errors])
+
+                if step.output.actions_and_results is None:
+                    continue
+
+                action_result_summary: list[str] = []
+                step_result: dict[str, Any] = {
+                    "order": step_cnt,
+                }
+                for action, action_results in step.output.actions_and_results:
+                    if len(action_results) == 0:
+                        continue
+                    action_result_summary.append(
+                        f"{action.reasoning}(action_type={action.action_type}, result={'success' if action_results[-1].success else 'failed'})"
+                    )
+                step_result["actions_result"] = action_result_summary
+                steps_results.append(step_result)
+
+            screenshots: list[bytes] = []
+            if page is not None:
+                screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=page.url)
+
+            prompt = prompt_engine.load_prompt(
+                "summarize-max-steps-reason",
+                step_count=len(steps),
+                navigation_goal=task.navigation_goal,
+                navigation_payload=task.navigation_payload,
+                steps=steps_results,
+            )
+            json_response = await app.LLM_API_HANDLER(prompt=prompt, screenshots=screenshots, step=step)
+            return json_response.get("reasoning", "")
+
+        except Exception:
+            LOG.exception("Failed to summary the failure reason", task=task.task_id)
+            return ""
+
     async def handle_completed_step(
-        self, organization: Organization, task: Task, step: Step
+        self,
+        organization: Organization,
+        task: Task,
+        step: Step,
+        page: Page | None,
     ) -> tuple[bool | None, Step | None, Step | None]:
         if step.is_goal_achieved():
             LOG.info(
@@ -1701,10 +1758,20 @@ class ForgeAgent:
                 max_steps=max_steps_per_run,
             )
             last_step = await self.update_step(step, is_last=True)
+
+            failure_reason = await self.summary_failure_reason_for_max_steps(
+                organization=organization,
+                task=task,
+                step=step,
+                page=page,
+            )
+            if not failure_reason:
+                failure_reason = f"Max steps per task ({max_steps_per_run}) exceeded"
+
             await self.update_task(
                 task,
                 status=TaskStatus.failed,
-                failure_reason=f"Max steps per task ({max_steps_per_run}) exceeded",
+                failure_reason=failure_reason,
             )
             return False, last_step, None
         else:
