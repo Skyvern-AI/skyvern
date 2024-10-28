@@ -264,7 +264,7 @@ You'll need to have Skyvern running locally if you want to try these examples ou
 
 # Documentation
 
-More extensive documentation can be found on our [documentation website](https://docs.skyvern.ai). Please let us know if something is unclear or missing by opening an issue or reaching out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
+More extensive documentation can be found on our [documentation website](https://docs.skyvern.com). Please let us know if something is unclear or missing by opening an issue or reaching out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
 
 # Supported LLMs
 | Provider | Supported Models |
