@@ -617,7 +617,11 @@ const isAngularDropdown = (element) => {
 };
 
 function getPseudoContent(element, pseudo) {
-  const content = getElementComputedStyle(element, pseudo)
+  const pseudoStyle = getElementComputedStyle(element, pseudo);
+  if (!pseudoStyle) {
+    return null;
+  }
+  const content = pseudoStyle
     .getPropertyValue("content")
     .replace(/"/g, "")
     .trim();
