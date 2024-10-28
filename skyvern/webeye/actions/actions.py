@@ -53,6 +53,9 @@ class UserDefinedError(BaseModel):
     reasoning: str
     confidence_float: float = Field(..., ge=0, le=1)
 
+    def __repr__(self) -> str:
+        return f"{self.reasoning}(error_code={self.error_code}, confidence_float={self.confidence_float})"
+
 
 class SelectOption(BaseModel):
     label: str | None = None

@@ -294,17 +294,22 @@ async def get_task(
             task_status=task_obj.status,
         )
 
-    failure_reason = None
+    failure_reason: str | None = None
     if task_obj.status == TaskStatus.failed and (latest_step.output or task_obj.failure_reason):
         failure_reason = ""
         if task_obj.failure_reason:
-            failure_reason += f"Reasoning: {task_obj.failure_reason or ''}"
-            failure_reason += "\n"
-        if latest_step.output and latest_step.output.action_results:
-            failure_reason += "Exceptions: "
-            failure_reason += str(
-                [f"[{ar.exception_type}]: {ar.exception_message}" for ar in latest_step.output.action_results]
-            )
+            failure_reason += task_obj.failure_reason or ""
+        if latest_step.output is not None and latest_step.output.actions_and_results is not None:
+            action_results_string: list[str] = []
+            for action, results in latest_step.output.actions_and_results:
+                if len(results) == 0:
+                    continue
+                if results[-1].success:
+                    continue
+                action_results_string.append(f"{action.action_type} action failed.")
+
+            if len(action_results_string) > 0:
+                failure_reason += "(Exceptions: " + str(action_results_string) + ")"
 
     return task_obj.to_task_response(
         action_screenshot_urls=latest_action_screenshot_urls,
