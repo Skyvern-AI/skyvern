@@ -37,9 +37,11 @@ services:
       - BROWSER_TYPE=chromium-headful
       # Enable Ollama
       - ENABLE_OLLAMA=true
-      - LLM_KEY=OLLAMA
+      - LLM_KEY=OLLAMA_TEXT
       - OLLAMA_API_BASE=http://192.168.1.3:11434
-      - OLLAMA_MODEL=minicpm-v:latest
+      - OLLAMA_TEXT_MODEL=llama3.1:70b
+      - OLLAMA_VISION_MODEL=moondream:latest
+      - OLLAMA_CONTEXT_WINDOW=8192
       # Disable other providers
       - ENABLE_OPENAI=false
       - ENABLE_ANTHROPIC=false
@@ -47,6 +49,7 @@ services:
       - ENABLE_AZURE_GPT4O_MINI=false
       - ENABLE_BEDROCK=false
       - LITELLM_VERBOSE=true
+      - LOG_LEVEL=DEBUG
     depends_on:
       postgres:
         condition: service_healthy

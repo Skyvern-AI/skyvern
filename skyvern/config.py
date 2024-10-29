@@ -65,8 +65,8 @@ class Settings(BaseSettings):
     # browser settings
     BROWSER_LOCALE: str = "en-US"
     BROWSER_TIMEZONE: str = "America/New_York"
-    BROWSER_WIDTH: int = 1920
-    BROWSER_HEIGHT: int = 1080
+    BROWSER_WIDTH: int = 1366
+    BROWSER_HEIGHT: int = 768
 
     # Workflow constant parameters
     WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY: str = "SKYVERN_DOWNLOAD_DIRECTORY"
@@ -129,6 +129,9 @@ class Settings(BaseSettings):
     ENABLE_OLLAMA: bool = False
     OLLAMA_API_BASE: str = "http://192.168.1.3:11434"
     OLLAMA_MODEL: str = "llama2"  # Default model, can be changed
+    OLLAMA_TEXT_MODEL: str = "command-r:latest"  # Model for text-only requests
+    OLLAMA_VISION_MODEL: str = "llava:34b"  # Model for vision requests
+    OLLAMA_CONTEXT_WINDOW: int = 8192
 
     def is_cloud_environment(self) -> bool:
         """

@@ -171,59 +171,123 @@ class LLMAPIHandlerFactory:
                 parameters = LLMAPIHandlerFactory.get_api_parameters()
 
             active_parameters.update(parameters)
-            if llm_config.litellm_params:  # type: ignore
-                active_parameters.update(llm_config.litellm_params)  # type: ignore
+            if llm_config.litellm_params:
+                active_parameters.update(llm_config.litellm_params)
 
-            # Update this line to use the new 60-second timeout
+            # Get timeout and max_retries from settings
             timeout = active_parameters.pop('timeout', SettingsManager.get_settings().LLM_CONFIG_TIMEOUT)
             max_retries = active_parameters.pop('max_retries', 3)
 
-            if step:
-                await app.ARTIFACT_MANAGER.create_artifact(
-                    step=step,
-                    artifact_type=ArtifactType.LLM_PROMPT,
-                    data=prompt.encode("utf-8"),
-                )
-                for screenshot in screenshots or []:
-                    await app.ARTIFACT_MANAGER.create_artifact(
-                        step=step,
-                        artifact_type=ArtifactType.SCREENSHOT_LLM,
-                        data=screenshot,
-                    )
+            # Handle Ollama-specific options
+            ollama_options = {
+                "num_ctx": SettingsManager.get_settings().OLLAMA_CONTEXT_WINDOW,
+                "temperature": SettingsManager.get_settings().LLM_CONFIG_TEMPERATURE,
+                "num_predict": SettingsManager.get_settings().LLM_CONFIG_MAX_TOKENS,
+            }
 
-            # TODO (kerem): instead of overriding the screenshots, should we just not take them in the first place?
-            if not llm_config.supports_vision:
-                screenshots = None
+            # Format messages for Ollama
+            async def format_ollama_messages(messages: list) -> str:
+                formatted_prompt = ""
+                for message in messages:
+                    if message["role"] == "user":
+                        content = message["content"]
+                        if isinstance(content, list):
+                            # Handle multi-modal content
+                            for item in content:
+                                if item["type"] == "text":
+                                    formatted_prompt += f"{item['text']}\n"
+                        else:
+                            formatted_prompt += f"{content}\n"
+                return formatted_prompt.strip()
 
-            messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
-            if step:
-                await app.ARTIFACT_MANAGER.create_artifact(
-                    step=step,
-                    artifact_type=ArtifactType.LLM_REQUEST,
-                    data=json.dumps(
-                        {
-                            "model": llm_config.model_name,
-                            "messages": messages,
-                            # we're not using active_parameters here because it may contain sensitive information
-                            **parameters,
-                        }
-                    ).encode("utf-8"),
-                )
-            t_llm_request = time.perf_counter()
             try:
-                # TODO (kerem): add a timeout to this call
-                # TODO (kerem): add a retry mechanism to this call (acompletion_with_retries)
-                # TODO (kerem): use litellm fallbacks? https://litellm.vercel.app/docs/tutorials/fallbacks#how-does-completion_with_fallbacks-work
-                LOG.info("Calling LLM API", llm_key=llm_key, model=llm_config.model_name)
-                response = await litellm.acompletion(
-                    model=llm_config.model_name,
-                    messages=messages,
-                    timeout=timeout,
-                    max_retries=max_retries,
-                    **active_parameters,
-                )
-                LOG.info("LLM API call successful", llm_key=llm_key, model=llm_config.model_name)
+                if llm_config.model_name.startswith("ollama/") and screenshots:
+                    # Use vision model for image-related prompts
+                    vision_config = LLMConfigRegistry.get_config("OLLAMA_VISION")
+                    text_config = LLMConfigRegistry.get_config("OLLAMA_TEXT")
+                    
+                    # First, process the image with vision model
+                    vision_messages = await llm_messages_builder(prompt, screenshots, vision_config.add_assistant_prefix)
+                    vision_prompt = await format_ollama_messages(vision_messages)
+                    
+                    LOG.info("Calling Vision LLM API", model=vision_config.model_name)
+                    vision_response = await litellm.acompletion(
+                        model=vision_config.model_name,
+                        messages=[{"role": "user", "content": vision_prompt}],
+                        timeout=timeout,
+                        max_retries=max_retries,
+                        options=ollama_options
+                    )
+                    
+                    # Log the raw vision response
+                    LOG.info("Raw Vision LLM Response", 
+                            model=vision_config.model_name,
+                            response=vision_response.choices[0].message.content if vision_response.choices else "No response")
+                    
+                    # Extract vision analysis from response
+                    vision_analysis = vision_response.choices[0].message.content
+                    
+                    # Then, process with text model
+                    text_prompt = f"Vision Analysis:\n{vision_analysis}\n\nOriginal Prompt:\n{prompt}"
+                    text_messages = await llm_messages_builder(text_prompt, None, text_config.add_assistant_prefix)
+                    formatted_text_prompt = await format_ollama_messages(text_messages)
+                    
+                    LOG.info("Calling Text LLM API", model=text_config.model_name)
+                    response = await litellm.acompletion(
+                        model=text_config.model_name,
+                        messages=[{"role": "user", "content": formatted_text_prompt}],
+                        timeout=timeout,
+                        max_retries=max_retries,
+                        options=ollama_options
+                    )
+                    
+                    # Log the raw text response
+                    LOG.info("Raw Text LLM Response", 
+                            model=text_config.model_name,
+                            response=response.choices[0].message.content if response.choices else "No response")
+                else:
+                    # Use regular handling for non-Ollama models or text-only requests
+                    messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
+                    
+                    if llm_config.model_name.startswith("ollama/"):
+                        # Format messages for Ollama
+                        formatted_prompt = await format_ollama_messages(messages)
+                        LOG.info("Full prompt being sent to LLM", 
+                                llm_key=llm_key, 
+                                model=llm_config.model_name, 
+                                messages=formatted_prompt)
+                        response = await litellm.acompletion(
+                            model=llm_config.model_name,
+                            messages=[{"role": "user", "content": formatted_prompt}],
+                            timeout=timeout,
+                            max_retries=max_retries,
+                            options=ollama_options
+                        )
+                        
+                        # Log the raw response
+                        LOG.info("Raw LLM Response", 
+                                model=llm_config.model_name,
+                                response=response.choices[0].message.content if response.choices else "No response")
+                    else:
+                        # Regular handling for other models
+                        LOG.info("Full prompt being sent to LLM", 
+                                llm_key=llm_key, 
+                                model=llm_config.model_name, 
+                                messages=json.dumps(messages, indent=2))
+                        response = await litellm.acompletion(
+                            model=llm_config.model_name,
+                            messages=messages,
+                            timeout=timeout,
+                            max_retries=max_retries,
+                            **active_parameters
+                        )
+                        
+                        # Log the raw response
+                        LOG.info("Raw LLM Response", 
+                                model=llm_config.model_name,
+                                response=response.choices[0].message.content if response.choices else "No response")
 
+                # Create artifact for raw LLM response
                 if step:
                     await app.ARTIFACT_MANAGER.create_artifact(
                         step=step,
@@ -231,46 +295,103 @@ class LLMAPIHandlerFactory:
                         data=response.model_dump_json(indent=2).encode("utf-8"),
                     )
 
+                    # Handle cost calculation if needed
                     if not llm_config.skip_cost_calculation:
-                        try:
-                            llm_cost = litellm.completion_cost(completion_response=response)
-                        except litellm.exceptions.NotFoundError:
-                            LOG.warning(f"Cost calculation not available for model: {llm_config.model_name}. Setting cost to 0.")
-                            llm_cost = 0
-                    else:
-                        llm_cost = 0
+                        llm_cost = litellm.completion_cost(completion_response=response)
+                        prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
+                        completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
+                        await app.DATABASE.update_step(
+                            task_id=step.task_id,
+                            step_id=step.step_id,
+                            organization_id=step.organization_id,
+                            incremental_cost=llm_cost,
+                            incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
+                            incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
+                        )
 
-                    prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
-                    completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
-                    await app.DATABASE.update_step(
-                        task_id=step.task_id,
-                        step_id=step.step_id,
-                        organization_id=step.organization_id,
-                        incremental_cost=llm_cost,
-                        incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
-                        incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
-                    )
+                # Process the response content
+                if response and response.choices:
+                    content = response.choices[0].message.content
+                    
+                    # Clean up the response content and extract JSON if present
+                    def extract_json_from_content(content: str) -> str:
+                        content = content.strip()
+                        # Look for JSON code block
+                        if "```json" in content:
+                            # Extract content between ```json and ```
+                            parts = content.split("```json")
+                            if len(parts) > 1:
+                                json_part = parts[1].split("```")[0]
+                                return json_part.strip()
+                        # Look for just ``` code block
+                        elif "```" in content:
+                            # Extract content between ``` and ```
+                            parts = content.split("```")
+                            if len(parts) > 1:
+                                return parts[1].strip()
+                        # If no code blocks found, return the original content
+                        return content
 
-                parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
-                if step:
-                    await app.ARTIFACT_MANAGER.create_artifact(
-                        step=step,
-                        artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-                        data=json.dumps(parsed_response, indent=2).encode("utf-8"),
-                    )
-                return parsed_response
+                    try:
+                        # Parse JSON if expected
+                        if "JSON" in prompt:
+                            # Extract and clean JSON content
+                            json_content = extract_json_from_content(content)
+                            LOG.debug("Attempting to parse JSON response", content=json_content)
+                            
+                            try:
+                                parsed_content = json.loads(json_content)
+                            except json.JSONDecodeError:
+                                # If JSON parsing fails, try to clean the content further
+                                cleaned_content = json_content.strip()
+                                if cleaned_content.startswith('json'):
+                                    cleaned_content = cleaned_content.split('\n', 1)[1]
+                                LOG.debug("Retrying JSON parse with cleaned content", content=cleaned_content)
+                                parsed_content = json.loads(cleaned_content)
+                            
+                            # Ensure response has required keys for action parsing
+                            if "actions" not in parsed_content and "action" in parsed_content:
+                                # Handle case where LLM returns single action
+                                parsed_content = {"actions": [parsed_content]}
+                            elif "actions" not in parsed_content and not any(key in parsed_content for key in ["action", "actions"]):
+                                # If no action-related keys found, wrap the entire response
+                                if "confidence_float" in parsed_content and "shape" in parsed_content:
+                                    # Special case for SVG shape analysis
+                                    return parsed_content
+                                else:
+                                    LOG.warning("Response missing actions key, wrapping content", content=parsed_content)
+                                    parsed_content = {"actions": [{"action": "UNKNOWN", "data": parsed_content}]}
+                            
+                            # Create artifact for parsed response
+                            if step:
+                                await app.ARTIFACT_MANAGER.create_artifact(
+                                    step=step,
+                                    artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
+                                    data=json.dumps(parsed_content, indent=2).encode("utf-8"),
+                                )
+                            
+                            return parsed_content
+                        
+                        # Handle non-JSON responses
+                        result = {"content": content}
+                        if step:
+                            await app.ARTIFACT_MANAGER.create_artifact(
+                                step=step,
+                                artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
+                                data=json.dumps(result, indent=2).encode("utf-8"),
+                            )
+                        return result
 
-            except litellm.exceptions.APIError as e:
-                raise LLMProviderErrorRetryableTask(llm_key) from e
-            except CancelledError:
-                t_llm_cancelled = time.perf_counter()
-                LOG.error(
-                    "LLM request got cancelled",
-                    llm_key=llm_key,
-                    model=llm_config.model_name,
-                    duration=t_llm_cancelled - t_llm_request,
-                )
-                raise LLMProviderError(llm_key)
+                    except json.JSONDecodeError as e:
+                        LOG.error("Failed to parse JSON response", 
+                                content=content,
+                                error=str(e),
+                                raw_content=content)
+                        return {"error": "Invalid JSON response", "raw_content": content}
+                
+                LOG.error("Empty response from LLM")
+                return {"error": "Empty response from LLM"}
+
             except Exception as e:
                 LOG.exception("LLM request failed unexpectedly", llm_key=llm_key, error=str(e))
                 raise LLMProviderError(llm_key) from e

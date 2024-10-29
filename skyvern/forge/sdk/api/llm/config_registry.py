@@ -218,19 +218,34 @@ if SettingsManager.get_settings().ENABLE_AZURE_GPT4O_MINI:
         ),
     )
 
-# Add Ollama configuration
+# Add Ollama configurations
 if SettingsManager.get_settings().ENABLE_OLLAMA:
+    # Register vision model
     LLMConfigRegistry.register_config(
-        "OLLAMA",
+        "OLLAMA_VISION",
         LLMConfig(
-            f"ollama/{SettingsManager.get_settings().OLLAMA_MODEL}",
+            f"ollama/{SettingsManager.get_settings().OLLAMA_VISION_MODEL}",
             [],  # No API key required
             litellm_params=LiteLLMParams(
                 api_base=SettingsManager.get_settings().OLLAMA_API_BASE,
-                model_info={"model_name": f"ollama/{SettingsManager.get_settings().OLLAMA_MODEL}"},
             ),
-            supports_vision=True,  # Set this to True since llava:34b supports vision
+            supports_vision=True,
             add_assistant_prefix=False,
-            skip_cost_calculation=True,  # Add this line to skip cost calculation for Ollama
+            skip_cost_calculation=True,
+        ),
+    )
+
+    # Register text model
+    LLMConfigRegistry.register_config(
+        "OLLAMA_TEXT",
+        LLMConfig(
+            f"ollama/{SettingsManager.get_settings().OLLAMA_TEXT_MODEL}",
+            [],  # No API key required
+            litellm_params=LiteLLMParams(
+                api_base=SettingsManager.get_settings().OLLAMA_API_BASE,
+            ),
+            supports_vision=False,
+            add_assistant_prefix=False,
+            skip_cost_calculation=True,
         ),
     )
