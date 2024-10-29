@@ -1718,8 +1718,10 @@ async def select_from_dropdown(
         task_id=task.task_id,
     )
 
+    action_type: str = json_response.get("action_type", "")
+    action_type = action_type.upper()
     element_id: str | None = json_response.get("id", None)
-    if not element_id:
+    if not element_id or action_type not in ["CLICK", "INPUT_TEXT"]:
         raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
 
     if not force_select and target_value:
@@ -1730,6 +1732,29 @@ async def select_from_dropdown(
                 task_id=task.task_id,
                 step_id=step.step_id,
             )
+            return single_select_result
+
+    if action_type == "INPUT_TEXT":
+        LOG.info(
+            "No clickable option found, but found input element to search",
+            element_id=element_id,
+            task_id=task.task_id,
+            step_id=step.step_id,
+        )
+        try:
+            input_element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
+            await input_element.scroll_into_view()
+            current_text = await get_input_value(input_element.get_tag_name(), input_element.get_locator())
+            if current_text == value:
+                single_select_result.action_result = ActionSuccess()
+                return single_select_result
+
+            await input_element.input_clear()
+            await input_element.input_sequentially(value)
+            single_select_result.action_result = ActionSuccess()
+            return single_select_result
+        except Exception as e:
+            single_select_result.action_result = ActionFailure(exception=e)
             return single_select_result
 
     try:
