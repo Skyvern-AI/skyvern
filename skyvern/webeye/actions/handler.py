@@ -1734,7 +1734,7 @@ async def select_from_dropdown(
             )
             return single_select_result
 
-    if action_type == "INPUT_TEXT":
+    if value is not None and action_type == "INPUT_TEXT":
         LOG.info(
             "No clickable option found, but found input element to search",
             element_id=element_id,
