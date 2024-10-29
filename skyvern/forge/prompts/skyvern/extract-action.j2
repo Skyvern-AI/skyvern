@@ -11,7 +11,7 @@ Reply in JSON format with the following keys:
 {
     "user_goal_stage": str, // A string to describe the reasoning whether user goal has been achieved or not.
     "user_goal_achieved": bool, // True if the user goal has been completed, otherwise False.
-    "action_plan": str, // A string that describes the plan of actions you're going to take. Be specific and to the point. Use this as a quick summary of the actions you're going to take, and what order you're going to take them in, and how that moves you towards your overall goal. Output "COMPLETE" action in the "actions" if user_goal_achieved is True.
+    "action_plan": str, // A string that describes the plan of actions you're going to take. Be specific and to the point. Use this as a quick summary of the actions you're going to take, and what order you're going to take them in, and how that moves you towards your overall goal. Output "COMPLETE" action in the "actions" if user_goal_achieved is True. Output "TERMINATE" action in the "actions" if your plan is to terminate the process.
     "actions": array // An array of actions. Here's the format of each action:
     [{
         "reasoning": str, // The reasoning behind the action. This reasoning must be user information agnostic. Mention why you chose the action type, and why you chose the element id. Keep the reasoning short and to the point.
