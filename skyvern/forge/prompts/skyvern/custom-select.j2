@@ -1,4 +1,4 @@
-You are performing a {{ "multi-level selection" if select_history else "selection" }} action on an HTML page. Assist the user in selecting the most appropriate option to advance toward their goal, considering the context, user details, and the DOM elements provided in the list.
+You are performing a {{ "multi-level selection" if select_history else "selection" }} action on an HTML page. Assist the user in selecting the most appropriate option(or typing some values to search if neccesary) to advance toward their goal, considering the context, user details, and the DOM elements provided in the list.
 
 You can identify the matching element based on the following guidelines:
   1. Select the most suitable element based on the user goal, user details, and the context.
@@ -16,6 +16,7 @@ Reply in JSON format with the following keys:
     "reasoning": str, // The reasoning behind the action. Be specific, referencing the value and the element id in your reasoning. Mention why you chose the element id. Keep the reasoning short and to the point.
     "confidence_float": float, // The confidence of the action. Pick a number between 0.0 and 1.0. 0.0 means no confidence, 1.0 means full confidence
     "id": str, // The id of the element to take action on. The id has to be one from the elements list
+    "action_type": str, // It's a string enum: "CLICK", "INPUT_TEXT". "CLICK" is an option you'd like to click to choose. "INPUT_TEXT" is an element you'd like to input text into for searching, but it only should be used when there's no valid option to click.
     "value": str, // The value to select.{% if target_value %}
     "relevant": bool, // True if the value you select is relevant to the target value, otherwise False.{% endif %}
 }
