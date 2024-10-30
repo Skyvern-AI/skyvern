@@ -63,7 +63,7 @@ title: 'Workato'
 1. Since this action is pulling a previously ran task or workflow, the run you want to use needs to have already run/finished running to be able to pull it into your Workato workflow
 2. Depending on whether you selected a “Get a Task” or “Get a Workflow” action, find the appropriate ID
     1. The Workflow Run ID starts with a WR and the Task ID starts with a TSK
-3. Once you’ve selected found the Workflow Run ID or Task ID for the run you would like to add to your action, paste it into the input field
+3. Once you’ve selected the Workflow Run ID or Task ID for the run you would like to add to your action, paste it into the input field
 
 ### Test
 
