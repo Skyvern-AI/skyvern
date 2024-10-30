@@ -281,7 +281,7 @@ class AgentDB:
                     select(ActionModel)
                     .filter(ActionModel.organization_id == organization_id)
                     .filter(ActionModel.task_id == task_id)
-                    .order_by(ActionModel.step_order, ActionModel.action_order, ActionModel.created_at)
+                    .order_by(ActionModel.created_at)
                 )
 
                 actions = (await session.scalars(query)).all()
