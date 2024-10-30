@@ -8,7 +8,7 @@ title: 'Workato'
 
 1. After setting the trigger, add an “action in app” and search for Skyvern
 2. Once you select the Skyvern integration, pick your action. This section will describe how to set up, configure, and test the “Create and Run Task” action
-3. You will then be brought to the “Connection” tab where you need to link your Skyvern account. You will need to have a Skyvern account to be able to run to this integration. So after creating your account and/or logging in, navigate to settings and copy your API Key
+3. You will then be brought to the “Connection” tab where you need to link your Skyvern account. You will need to have a Skyvern account to be able to run this integration. So after creating your account and/or logging in, navigate to settings and copy your API Key
 4. When you’re back to Workato, having copied your Skyvern API key, add a new connection and paste it under the API key input field
 5. Once you’ve connected your account, all of the setup requirements are done and you will move onto setting up your integration
 
