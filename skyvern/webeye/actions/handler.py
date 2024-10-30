@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable, List
 
 import structlog
 from deprecation import deprecated
-from playwright.async_api import FileChooser, Locator, Page, TimeoutError
+from playwright.async_api import FileChooser, Frame, Locator, Page, TimeoutError
 from pydantic import BaseModel
 
 from skyvern.constants import REPO_ROOT_DIR, SKYVERN_ID_ATTR
@@ -165,8 +165,10 @@ def remove_exist_elements(element_tree: list[dict], check_exist: CheckExistIDFun
 def clean_and_remove_element_tree_factory(
     task: Task, step: Step, check_exist_funcs: list[CheckExistIDFunc]
 ) -> CleanupElementTreeFunc:
-    async def helper_func(url: str, element_tree: list[dict]) -> list[dict]:
-        element_tree = await app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step)(url, element_tree)
+    async def helper_func(frame: Page | Frame, url: str, element_tree: list[dict]) -> list[dict]:
+        element_tree = await app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step)(
+            frame, url, element_tree
+        )
         for check_exist in check_exist_funcs:
             element_tree = remove_exist_elements(element_tree=element_tree, check_exist=check_exist)
         return element_tree
@@ -1270,7 +1272,7 @@ async def choose_auto_completion_dropdown(
 
         if len(confirmed_preserved_list) > 0:
             confirmed_preserved_list = await app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step)(
-                skyvern_frame.get_frame().url, copy.deepcopy(confirmed_preserved_list)
+                skyvern_frame.get_frame(), skyvern_frame.get_frame().url, copy.deepcopy(confirmed_preserved_list)
             )
             confirmed_preserved_list = trim_element_tree(copy.deepcopy(confirmed_preserved_list))
 

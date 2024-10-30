@@ -686,6 +686,14 @@ const checkRequiredFromStyle = (element) => {
   return element.className.toLowerCase().includes("require");
 };
 
+function checkDisabledFromStyle(element) {
+  const className = element.className.toString().toLowerCase();
+  if (className.includes("react-datepicker__day--disabled")) {
+    return true;
+  }
+  return false;
+}
+
 function getElementContext(element) {
   // dfs to collect the non unique_id context
   let fullContext = new Array();
@@ -870,6 +878,14 @@ function buildElementObject(frame, element, interactable, purgeable = false) {
       }
     }
     attrs[attr.name] = attrValue;
+  }
+
+  if (
+    checkDisabledFromStyle(element) &&
+    !attrs["disabled"] &&
+    !attrs["aria-disabled"]
+  ) {
+    attrs["disabled"] = true;
   }
 
   if (
