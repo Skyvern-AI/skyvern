@@ -23,6 +23,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, ScrapedPage, json_to_html, trim_element
+from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
@@ -224,10 +225,14 @@ class SkyvernElement:
 
         disabled_attr: bool | str | None = None
         aria_disabled_attr: bool | str | None = None
+        style_disabled: bool = False
 
         try:
             disabled_attr = await self.get_attr("disabled", dynamic=dynamic)
             aria_disabled_attr = await self.get_attr("aria-disabled", dynamic=dynamic)
+            skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
+            style_disabled = await skyvern_frame.get_disabled_from_style(await self.get_element_handler())
+
         except Exception:
             # FIXME: maybe it should be considered as "disabled" element if failed to get the attributes?
             LOG.exception(
@@ -250,7 +255,7 @@ class SkyvernElement:
             if isinstance(aria_disabled_attr, str):
                 aria_disabled = aria_disabled_attr.lower() != "false"
 
-        return disabled or aria_disabled
+        return disabled or aria_disabled or style_disabled
 
     async def is_selectable(self) -> bool:
         return self.get_selectable() or self.get_tag_name() in SELECTABLE_ELEMENT

@@ -17,11 +17,12 @@ from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
-CleanupElementTreeFunc = Callable[[str, list[dict]], Awaitable[list[dict]]]
+CleanupElementTreeFunc = Callable[[Page | Frame, str, list[dict]], Awaitable[list[dict]]]
 
 RESERVED_ATTRIBUTES = {
     "accept",  # for input file
     "alt",
+    "shape-description",  # for css shape
     "aria-checked",  # for option tag
     "aria-current",
     "aria-label",
@@ -122,8 +123,8 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
     if element.get("purgeable", False):
         return children_html + option_html
 
-    before_pseudo_text = element.get("beforePseudoText", "")
-    after_pseudo_text = element.get("afterPseudoText", "")
+    before_pseudo_text = element.get("beforePseudoText") or ""
+    after_pseudo_text = element.get("afterPseudoText") or ""
 
     # Check if the element is self-closing
     if (
@@ -347,7 +348,7 @@ async def scrape_web_unsafe(
     screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=url, draw_boxes=True)
 
     elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
-    element_tree = await cleanup_element_tree(url, copy.deepcopy(element_tree))
+    element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))
 
     id_to_css_dict, id_to_element_dict, id_to_frame_dict, id_to_element_hash, hash_to_element_ids = build_element_dict(
         elements
@@ -486,7 +487,7 @@ class IncrementalScrapePage:
 
         self.elements = incremental_elements
 
-        incremental_tree = await cleanup_element_tree(frame.url, copy.deepcopy(incremental_tree))
+        incremental_tree = await cleanup_element_tree(frame, frame.url, copy.deepcopy(incremental_tree))
         trimmed_element_tree = trim_element_tree(copy.deepcopy(incremental_tree))
 
         self.element_tree = incremental_tree
