@@ -37,7 +37,7 @@ title: 'Workato'
 ### Setup
 
 1. First, create your workflow in Skyvern. The purpose of this block is to run a pre-configured workflow inside of Workato. Every workflow tool has limitations, allowing you to run a Skyvern workflow in another workflow builder extends the possibilities of their tool
-2. Complete the same setup as detailed above in the the task block instructions, following steps 1-5. At the end of the setup you will have configured a trigger, selected the “Run a Workflow” action, and connected your Skyvern account
+2. Complete the same setup as detailed above in the task block instructions, following steps 1-5. At the end of the setup you will have configured a trigger, selected the “Run a Workflow” action, and connected your Skyvern account
 
 ### Configure
 
