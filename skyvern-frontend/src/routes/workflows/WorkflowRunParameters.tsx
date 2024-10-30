@@ -19,6 +19,7 @@ function WorkflowRunParameters() {
         .get(`/workflows/${workflowPermanentId}`)
         .then((response) => response.data);
     },
+    refetchOnWindowFocus: false,
   });
 
   const workflowParameters = workflow?.workflow_definition.parameters.filter(
