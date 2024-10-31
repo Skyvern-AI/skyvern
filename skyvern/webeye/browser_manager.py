@@ -169,6 +169,24 @@ class BrowserManager:
         )
         return b""
 
+    async def get_browser_console_log(
+        self,
+        browser_state: BrowserState,
+        task_id: str = "",
+        workflow_id: str = "",
+        workflow_run_id: str = "",
+    ) -> bytes:
+        if browser_state.browser_artifacts.browser_console_log_path is None:
+            LOG.warning(
+                "browser console log not found for task",
+                task_id=task_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+            )
+            return b""
+
+        return await browser_state.browser_artifacts.read_browser_console_log()
+
     @classmethod
     async def close(cls) -> None:
         LOG.info("Closing BrowserManager")

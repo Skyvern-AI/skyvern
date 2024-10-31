@@ -843,6 +843,25 @@ class WorkflowService:
                 data=har_data,
             )
 
+    async def persist_browser_console_log(
+        self,
+        browser_state: BrowserState,
+        last_step: Step,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+    ) -> None:
+        browser_log = await app.BROWSER_MANAGER.get_browser_console_log(
+            workflow_id=workflow.workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            browser_state=browser_state,
+        )
+        if browser_log:
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=last_step,
+                artifact_type=ArtifactType.BROWSER_CONSOLE_LOG,
+                data=browser_log,
+            )
+
     async def persist_tracing_data(
         self, browser_state: BrowserState, last_step: Step, workflow_run: WorkflowRun
     ) -> None:

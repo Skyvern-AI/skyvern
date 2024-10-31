@@ -6,6 +6,7 @@ from skyvern.forge.sdk.models import Step
 # TODO: This should be a part of the ArtifactType model
 FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
     ArtifactType.RECORDING: "webm",
+    ArtifactType.BROWSER_CONSOLE_LOG: "log",
     ArtifactType.SCREENSHOT_LLM: "png",
     ArtifactType.SCREENSHOT_ACTION: "png",
     ArtifactType.SCREENSHOT_FINAL: "png",

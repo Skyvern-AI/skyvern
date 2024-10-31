@@ -30,6 +30,7 @@ services:
       - ./artifacts:/data/artifacts
       - ./videos:/data/videos
       - ./har:/data/har
+      - ./log:/data/log
       - ./.streamlit:/app/.streamlit
     environment:
       - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern

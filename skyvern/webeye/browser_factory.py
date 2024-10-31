@@ -8,9 +8,10 @@ import uuid
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Protocol
 
+import aiofiles
 import structlog
-from playwright.async_api import BrowserContext, Error, Page, Playwright, async_playwright
-from pydantic import BaseModel
+from playwright.async_api import BrowserContext, ConsoleMessage, Error, Page, Playwright, async_playwright
+from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
 from skyvern.constants import REPO_ROOT_DIR
@@ -38,6 +39,23 @@ def get_download_dir(workflow_run_id: str | None, task_id: str | None) -> str:
     LOG.info("Initializing download directory", download_dir=download_dir)
     os.makedirs(download_dir, exist_ok=True)
     return download_dir
+
+
+def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> str:
+    if browser_artifacts.browser_console_log_path is None:
+        log_path = f"{settings.LOG_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{uuid.uuid4()}.log"
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        browser_artifacts.browser_console_log_path = log_path
+
+    async def browser_console_log(msg: ConsoleMessage) -> None:
+        current_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        key_values = " ".join([f"{key}={value}" for key, value in msg.location.items()])
+        format_log = f"{current_time}[{msg.type}]{msg.text} {key_values}\n"
+        await browser_artifacts.append_browser_console_log(format_log)
+
+    LOG.info("browser console log is saved", log_path=browser_artifacts.browser_console_log_path)
+    browser_context.on("console", browser_console_log)
+    return browser_artifacts.browser_console_log_path
 
 
 class BrowserContextCreator(Protocol):
@@ -91,12 +109,14 @@ class BrowserContextFactory:
         har_path: str | None = None,
         traces_dir: str | None = None,
         browser_session_dir: str | None = None,
+        browser_console_log_path: str | None = None,
     ) -> BrowserArtifacts:
         return BrowserArtifacts(
             video_artifacts=video_artifacts or [],
             har_path=har_path,
             traces_dir=traces_dir,
             browser_session_dir=browser_session_dir,
+            browser_console_log_path=browser_console_log_path,
         )
 
     @classmethod
@@ -113,6 +133,7 @@ class BrowserContextFactory:
             if not creator:
                 raise UnknownBrowserType(browser_type)
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
+            set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
             return browser_context, browser_artifacts, cleanup_func
         except UnknownBrowserType as e:
             raise e
@@ -141,6 +162,24 @@ class BrowserArtifacts(BaseModel):
     har_path: str | None = None
     traces_dir: str | None = None
     browser_session_dir: str | None = None
+    browser_console_log_path: str | None = None
+    _browser_console_log_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
+
+    async def append_browser_console_log(self, msg: str) -> int:
+        if self.browser_console_log_path is None:
+            return 0
+
+        async with self._browser_console_log_lock:
+            async with aiofiles.open(self.browser_console_log_path, "a") as f:
+                return await f.write(msg)
+
+    async def read_browser_console_log(self) -> bytes:
+        if self.browser_console_log_path is None:
+            return b""
+
+        async with self._browser_console_log_lock:
+            async with aiofiles.open(self.browser_console_log_path, "rb") as f:
+                return await f.read()
 
 
 async def _create_headless_chromium(
