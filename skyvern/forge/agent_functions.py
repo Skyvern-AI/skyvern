@@ -303,7 +303,7 @@ class AgentFunction:
         """
         return
 
-    def generate_async_operations(
+    async def generate_async_operations(
         self,
         organization: Organization,
         task: Task,

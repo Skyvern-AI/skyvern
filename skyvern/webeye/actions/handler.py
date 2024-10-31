@@ -1074,15 +1074,6 @@ async def chain_click(
     # File choosers are impossible to close if you don't expect one. Instead of dealing with it, close it!
 
     locator = skyvern_element.locator
-    try:
-        await locator.hover(timeout=timeout)
-    except Exception:
-        LOG.warning(
-            "Failed to hover over element in chain_click",
-            action=action,
-            locator=locator,
-            exc_info=True,
-        )
     # TODO (suchintan): This should likely result in an ActionFailure -- we can figure out how to do this later!
     LOG.info("Chain click starts", action=action, locator=locator)
     file: list[str] | str = []
@@ -1171,7 +1162,6 @@ async def chain_click(
             parent_javascript_triggered = await is_javascript_triggered(scraped_page, page, parent_locator)
             javascript_triggered = javascript_triggered or parent_javascript_triggered
 
-            await parent_locator.hover(timeout=timeout)
             await parent_locator.click(timeout=timeout)
 
             LOG.info(
@@ -2283,10 +2273,6 @@ async def click_sibling_of_input(
             input_id = await input_element.get_attribute("id")
             sibling_label_css = f'label[for="{input_id}"]'
             label_locator = parent_locator.locator(sibling_label_css)
-            try:
-                await locator.hover(timeout=timeout)
-            except Exception:
-                LOG.warning("Failed to hover over input element in click_sibling_of_input", exc_info=True)
             await label_locator.click(timeout=timeout)
             LOG.info(
                 "Successfully clicked sibling label of input element",

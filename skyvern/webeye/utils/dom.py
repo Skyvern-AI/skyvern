@@ -456,6 +456,34 @@ class SkyvernElement:
     async def input_clear(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().clear(timeout=timeout)
 
+    async def move_mouse_to_safe(
+        self,
+        page: Page,
+        task_id: str | None = None,
+        step_id: str | None = None,
+        timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+    ) -> tuple[float, float] | tuple[None, None]:
+        element_id = self.get_id()
+        try:
+            return await self.move_mouse_to(page, timeout=timeout)
+        except NoElementBoudingBox:
+            LOG.warning(
+                "Failed to move mouse to the element - NoElementBoudingBox",
+                task_id=task_id,
+                step_id=step_id,
+                element_id=element_id,
+                exc_info=True,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to move mouse to the element - unexpectd exception",
+                task_id=task_id,
+                step_id=step_id,
+                element_id=element_id,
+                exc_info=True,
+            )
+        return None, None
+
     async def move_mouse_to(
         self, page: Page, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
     ) -> tuple[float, float]:
