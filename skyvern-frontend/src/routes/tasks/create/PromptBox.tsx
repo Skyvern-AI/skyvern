@@ -149,7 +149,7 @@ function PromptBox() {
           <span className="text-2xl">
             What task would you like to accomplish?
           </span>
-          <div className="flex w-[35rem] max-w-xl items-center rounded-xl bg-slate-700 py-2 pr-4">
+          <div className="flex w-1/2 max-w-xl items-center rounded-xl bg-slate-700 py-2 pr-4">
             <Textarea
               className="min-h-0 resize-none rounded-xl border-transparent px-4 hover:border-transparent focus-visible:ring-0"
               value={prompt}
