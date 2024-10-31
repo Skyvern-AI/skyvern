@@ -1517,6 +1517,16 @@ class ForgeAgent:
                     data=har_data,
                 )
 
+            browser_log = await app.BROWSER_MANAGER.get_browser_console_log(
+                task_id=task.task_id, browser_state=browser_state
+            )
+            if browser_log:
+                await app.ARTIFACT_MANAGER.create_artifact(
+                    step=last_step,
+                    artifact_type=ArtifactType.BROWSER_CONSOLE_LOG,
+                    data=browser_log,
+                )
+
             if browser_state.browser_context and browser_state.browser_artifacts.traces_dir:
                 trace_path = f"{browser_state.browser_artifacts.traces_dir}/{task.task_id}.zip"
                 await app.ARTIFACT_MANAGER.create_artifact(

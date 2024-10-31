@@ -48,6 +48,7 @@ repos:
           - alembic
           - "sqlalchemy[mypy]"
           - types-PyYAML
+          - types-aiofiles
         exclude: |
           (?x)(
             ^tests.*|

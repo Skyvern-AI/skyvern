@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = None
     HAR_PATH: str | None = "./har"
+    LOG_PATH: str = "./log"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
     BROWSER_LOADING_TIMEOUT_MS: int = 120000
