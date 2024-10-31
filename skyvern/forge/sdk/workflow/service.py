@@ -884,6 +884,7 @@ class WorkflowService:
         if not last_step:
             return
 
+        await self.persist_browser_console_log(browser_state, last_step, workflow, workflow_run)
         await self.persist_har_data(browser_state, last_step, workflow, workflow_run)
         await self.persist_tracing_data(browser_state, last_step, workflow_run)
 
