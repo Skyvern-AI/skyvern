@@ -19,6 +19,7 @@ COPY . /app
 ENV PYTHONPATH="/app:$PYTHONPATH"
 ENV VIDEO_PATH=/data/videos
 ENV HAR_PATH=/data/har
+ENV LOG_PATH=/data/log
 ENV ARTIFACT_STORAGE_PATH=/data/artifacts
 
 COPY ./entrypoint-skyvern.sh /app/entrypoint-skyvern.sh
