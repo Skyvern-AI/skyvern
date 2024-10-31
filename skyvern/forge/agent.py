@@ -209,8 +209,8 @@ class ForgeAgent:
         )
         return task
 
-    def register_async_operations(self, organization: Organization, task: Task, page: Page) -> None:
-        operations = app.AGENT_FUNCTION.generate_async_operations(organization, task, page)
+    async def register_async_operations(self, organization: Organization, task: Task, page: Page) -> None:
+        operations = await app.AGENT_FUNCTION.generate_async_operations(organization, task, page)
         self.async_operation_pool.add_operations(task.task_id, operations)
 
     async def execute_step(
@@ -273,7 +273,7 @@ class ForgeAgent:
             ) = await self._initialize_execution_state(task, step, workflow_run)
 
             if page := await browser_state.get_working_page():
-                self.register_async_operations(organization, task, page)
+                await self.register_async_operations(organization, task, page)
 
             step, detailed_output = await self.agent_step(
                 task, step, browser_state, organization=organization, task_block=task_block
