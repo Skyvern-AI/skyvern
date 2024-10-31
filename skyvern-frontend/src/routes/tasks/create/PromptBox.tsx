@@ -145,11 +145,11 @@ function PromptBox() {
           background: `url(${img}) 50% / cover no-repeat`,
         }}
       >
-        <div className="flex flex-col items-center gap-7">
+        <div className="mx-auto flex min-w-44 flex-col items-center gap-7 px-8">
           <span className="text-2xl">
             What task would you like to accomplish?
           </span>
-          <div className="flex w-1/2 max-w-xl items-center rounded-xl bg-slate-700 py-2 pr-4">
+          <div className="flex w-full max-w-xl items-center rounded-xl bg-slate-700 py-2 pr-4 lg:w-3/4">
             <Textarea
               className="min-h-0 resize-none rounded-xl border-transparent px-4 hover:border-transparent focus-visible:ring-0"
               value={prompt}
@@ -185,7 +185,7 @@ function PromptBox() {
           return (
             <div
               key={example.key}
-              className="cursor-pointer whitespace-nowrap rounded-sm bg-slate-elevation3 px-4 py-3 hover:bg-slate-elevation5"
+              className="cursor-pointer whitespace-normal rounded-sm bg-slate-elevation3 px-4 py-3 hover:bg-slate-elevation5 lg:whitespace-nowrap"
               onClick={() => {
                 navigate(`/create/${example.key}`);
               }}
