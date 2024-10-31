@@ -105,3 +105,7 @@ body,
 .cm-gutters {
   @apply rounded-md;
 }
+
+.cm-search.cm-panel {
+  @apply text-sm;
+}
