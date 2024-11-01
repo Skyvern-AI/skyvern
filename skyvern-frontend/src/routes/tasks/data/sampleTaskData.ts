@@ -108,6 +108,8 @@ export const job_application = {
       "https://writing.colostate.edu/guides/documents/resume/functionalSample.pdf",
     cover_letter: "Generate a compelling cover letter for me",
   },
+  dataExtractionGoal: null,
+  extractedInformationSchema: null,
   webhookCallbackUrl: null,
   totpIdentifier: null,
   totpVerificationUrl: null,
