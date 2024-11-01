@@ -87,9 +87,10 @@
     {
       "group": "Integrations",
       "pages": [
+        "integrations/api",
         "integrations/zapier",
         "integrations/make.com",
-        "integrations/api"
+        "integrations/workato"
       ]
     }
   ],
