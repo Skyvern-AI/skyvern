@@ -122,6 +122,7 @@ function TaskActions({ task }: Props) {
     },
     onSuccess: () => {
       toast({
+        variant: "success",
         title: "Template saved",
         description: "Template saved successfully",
       });
