@@ -124,8 +124,15 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
   });
 
   function onSubmit(values: Record<string, unknown>) {
-    const parsedValues = parseValuesForWorkflowRun(values, workflowParameters);
-    runWorkflowMutation.mutate(parsedValues);
+    const { webhookCallbackUrl, ...parameters } = values;
+    const parsedParameters = parseValuesForWorkflowRun(
+      parameters,
+      workflowParameters,
+    );
+    runWorkflowMutation.mutate({
+      ...parsedParameters,
+      webhookCallbackUrl,
+    });
   }
 
   return (
@@ -264,17 +271,28 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
             type="button"
             variant="secondary"
             onClick={() => {
-              const parsedValues = parseValuesForWorkflowRun(
-                form.getValues(),
+              const values = form.getValues();
+              const { webhookCallbackUrl, ...parameters } = values;
+              const parsedParameters = parseValuesForWorkflowRun(
+                parameters,
                 workflowParameters,
               );
+              const body: {
+                data: Record<string, unknown>;
+                proxy_location: string;
+                webhook_callback_url?: string;
+              } = {
+                data: parsedParameters,
+                proxy_location: "RESIDENTIAL",
+              };
+              if (webhookCallbackUrl) {
+                body.webhook_callback_url = webhookCallbackUrl as string;
+              }
+
               const curl = fetchToCurl({
                 method: "POST",
                 url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
-                body: {
-                  data: parsedValues,
-                  proxy_location: "RESIDENTIAL",
-                },
+                body,
                 headers: {
                   "Content-Type": "application/json",
                   "x-api-key": apiCredential ?? "<your-api-key>",
