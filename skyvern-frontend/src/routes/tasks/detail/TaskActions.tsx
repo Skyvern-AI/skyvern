@@ -9,7 +9,11 @@ import { envCredential } from "@/util/env";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
-import { statusIsNotFinalized, statusIsRunningOrQueued } from "../types";
+import {
+  statusIsFinalized,
+  statusIsNotFinalized,
+  statusIsRunningOrQueued,
+} from "../types";
 import { ActionScreenshot } from "./ActionScreenshot";
 import { useActions } from "./hooks/useActions";
 import { ScrollableActionList } from "./ScrollableActionList";
@@ -33,7 +37,9 @@ function TaskActions() {
   const { taskId } = useParams();
   const credentialGetter = useCredentialGetter();
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
-  const [selectedAction, setSelectedAction] = useState<number | "stream">(0);
+  const [selectedAction, setSelectedAction] = useState<
+    number | "stream" | null
+  >(null);
   const costCalculator = useCostCalculator();
 
   const { data: task, isLoading: taskIsLoading } = useQuery<TaskApiResponse>({
@@ -89,7 +95,6 @@ function TaskActions() {
             message.status === "terminated"
           ) {
             socket?.close();
-            setSelectedAction(0);
             if (
               message.status === "failed" ||
               message.status === "terminated"
@@ -126,12 +131,6 @@ function TaskActions() {
     };
   }, [credentialGetter, taskId, taskIsRunningOrQueued]);
 
-  useEffect(() => {
-    if (!taskIsLoading && taskIsNotFinalized) {
-      setSelectedAction("stream");
-    }
-  }, [taskIsLoading, taskIsNotFinalized]);
-
   const { data: steps, isLoading: stepsIsLoading } = useQuery<
     Array<StepApiResponse>
   >({
@@ -165,9 +164,23 @@ function TaskActions() {
     );
   }
 
+  function getActiveSelection() {
+    if (selectedAction === null) {
+      if (taskIsNotFinalized) {
+        return "stream";
+      }
+      return actions.length - 1;
+    }
+    if (selectedAction === "stream" && task && statusIsFinalized(task)) {
+      return actions.length - 1;
+    }
+    return selectedAction;
+  }
+
+  const activeSelection = getActiveSelection();
+
   const activeAction =
-    typeof selectedAction === "number" &&
-    actions?.[actions.length - selectedAction - 1];
+    activeSelection !== "stream" ? actions[activeSelection] : null;
 
   function getStream() {
     if (task?.status === Status.Created) {
@@ -212,17 +225,18 @@ function TaskActions() {
     <div className="flex gap-2">
       <div className="w-2/3 rounded border">
         <div className="h-full w-full p-4">
-          {selectedAction === "stream" ? getStream() : null}
-          {typeof selectedAction === "number" && activeAction ? (
+          {activeSelection === "stream" ? getStream() : null}
+          {typeof activeSelection === "number" && activeAction ? (
             <ActionScreenshot
               stepId={activeAction.stepId}
               index={activeAction.index}
+              taskStatus={task?.status}
             />
           ) : null}
         </div>
       </div>
       <ScrollableActionList
-        activeIndex={selectedAction}
+        activeIndex={activeSelection}
         data={actions ?? []}
         onActiveIndexChange={setSelectedAction}
         showStreamOption={Boolean(taskIsNotFinalized)}
@@ -232,52 +246,6 @@ function TaskActions() {
           cost: showCost
             ? formatter.format(costCalculator(notRunningSteps ?? []))
             : undefined,
-        }}
-        onNext={() => {
-          if (!actions) {
-            return;
-          }
-          setSelectedAction((prev) => {
-            if (taskIsNotFinalized) {
-              if (actions.length === 0) {
-                return "stream";
-              }
-              if (prev === actions.length - 1) {
-                return actions.length - 1;
-              }
-              if (prev === "stream") {
-                return 0;
-              }
-              return prev + 1;
-            }
-            if (typeof prev === "number") {
-              return prev === actions.length - 1 ? prev : prev + 1;
-            }
-            return 0;
-          });
-        }}
-        onPrevious={() => {
-          if (!actions) {
-            return;
-          }
-          setSelectedAction((prev) => {
-            if (taskIsNotFinalized) {
-              if (actions.length === 0) {
-                return "stream";
-              }
-              if (prev === 0) {
-                return "stream";
-              }
-              if (prev === "stream") {
-                return "stream";
-              }
-              return prev - 1;
-            }
-            if (typeof prev === "number") {
-              return prev === 0 ? prev : prev - 1;
-            }
-            return 0;
-          });
         }}
       />
     </div>

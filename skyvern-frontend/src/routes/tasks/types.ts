@@ -24,6 +24,16 @@ export function statusIsNotFinalized({ status }: { status: Status }): boolean {
   );
 }
 
+export function statusIsFinalized({ status }: { status: Status }): boolean {
+  return (
+    status === Status.Completed ||
+    status === Status.Failed ||
+    status === Status.Terminated ||
+    status === Status.TimedOut ||
+    status === Status.Canceled
+  );
+}
+
 export function statusIsRunningOrQueued({
   status,
 }: {

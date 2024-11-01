@@ -10,14 +10,12 @@ import {
   DotFilledIcon,
 } from "@radix-ui/react-icons";
 import { useQueryClient } from "@tanstack/react-query";
-import { ReactNode, useEffect, useRef } from "react";
+import { ReactNode, useRef } from "react";
 import { useParams } from "react-router-dom";
 import { ActionTypePill } from "./ActionTypePill";
 
 type Props = {
   data: Array<Action | null>;
-  onNext: () => void;
-  onPrevious: () => void;
   onActiveIndexChange: (index: number | "stream") => void;
   activeIndex: number | "stream";
   showStreamOption: boolean;
@@ -42,35 +40,19 @@ function ScrollableActionList({
     Array.from({ length: data.length + 1 }),
   );
 
-  useEffect(() => {
-    if (typeof activeIndex === "number" && refs.current[activeIndex]) {
-      refs.current[activeIndex]?.scrollIntoView({
-        behavior: "smooth",
-        block: "nearest",
-      });
-    }
-    if (activeIndex === "stream") {
-      refs.current[data.length]?.scrollIntoView({
-        behavior: "smooth",
-        block: "nearest",
-      });
-    }
-  }, [activeIndex, data.length]);
-
   function getReverseActions() {
     const elements: ReactNode[] = [];
     for (let i = data.length - 1; i >= 0; i--) {
       const action = data[i];
-      const actionIndex = data.length - i - 1;
       if (!action) {
         continue;
       }
-      const selected = activeIndex === actionIndex;
+      const selected = activeIndex === i;
       elements.push(
         <div
           key={i}
           ref={(element) => {
-            refs.current[actionIndex] = element;
+            refs.current[i] = element;
           }}
           className={cn(
             "flex cursor-pointer rounded-lg border-2 bg-slate-elevation3 hover:border-slate-50",
@@ -80,7 +62,7 @@ function ScrollableActionList({
               "border-slate-50": selected,
             },
           )}
-          onClick={() => onActiveIndexChange(actionIndex)}
+          onClick={() => onActiveIndexChange(i)}
           onMouseEnter={() => {
             queryClient.prefetchQuery({
               queryKey: ["task", taskId, "steps", action.stepId, "artifacts"],
