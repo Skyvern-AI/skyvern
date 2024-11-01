@@ -90,7 +90,7 @@
         "integrations/api",
         "integrations/zapier",
         "integrations/make.com",
-        "integrations/Workato"
+        "integrations/workato"
       ]
     }
   ],
