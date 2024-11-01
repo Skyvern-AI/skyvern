@@ -178,6 +178,9 @@ class BrowserArtifacts(BaseModel):
             return b""
 
         async with self._browser_console_log_lock:
+            if not os.path.exists(self.browser_console_log_path):
+                return b""
+
             async with aiofiles.open(self.browser_console_log_path, "rb") as f:
                 return await f.read()
 
