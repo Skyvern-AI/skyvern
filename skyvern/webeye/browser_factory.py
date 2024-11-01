@@ -10,7 +10,7 @@ from typing import Any, Awaitable, Callable, Protocol
 
 import aiofiles
 import structlog
-from playwright.async_api import BrowserContext, ConsoleMessage, Error, Page, Playwright, async_playwright
+from playwright.async_api import BrowserContext, ConsoleMessage, Error, Page, Playwright
 from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
@@ -41,10 +41,21 @@ def get_download_dir(workflow_run_id: str | None, task_id: str | None) -> str:
     return download_dir
 
 
-def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> str:
+def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> None:
     if browser_artifacts.browser_console_log_path is None:
-        log_path = f"{settings.LOG_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{uuid.uuid4()}.log"
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        try:
+            log_path = f"{settings.LOG_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{uuid.uuid4()}.log"
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            # create the empty log file
+            with open(log_path, "w") as _:
+                pass
+        except Exception:
+            LOG.warning(
+                "Failed to create browser log file",
+                log_path=log_path,
+                exc_info=True,
+            )
+            return
         browser_artifacts.browser_console_log_path = log_path
 
     async def browser_console_log(msg: ConsoleMessage) -> None:
@@ -55,7 +66,6 @@ def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: 
 
     LOG.info("browser console log is saved", log_path=browser_artifacts.browser_console_log_path)
     browser_context.on("console", browser_console_log)
-    return browser_artifacts.browser_console_log_path
 
 
 class BrowserContextCreator(Protocol):
@@ -128,6 +138,7 @@ class BrowserContextFactory:
         cls, playwright: Playwright, **kwargs: Any
     ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
         browser_type = SettingsManager.get_settings().BROWSER_TYPE
+        browser_context: BrowserContext | None = None
         try:
             creator = cls._creators.get(browser_type)
             if not creator:
@@ -135,9 +146,15 @@ class BrowserContextFactory:
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
             set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
             return browser_context, browser_artifacts, cleanup_func
-        except UnknownBrowserType as e:
-            raise e
         except Exception as e:
+            if browser_context is not None:
+                # FIXME: sometimes it can't close the browser context?
+                LOG.error("unexpected error happens after created browser context, going to close the context")
+                await browser_context.close()
+
+            if isinstance(e, UnknownBrowserType):
+                raise e
+
             raise UnknownErrorWhileCreatingBrowserContext(browser_type, e) from e
 
     @classmethod
@@ -217,7 +234,7 @@ class BrowserState:
 
     def __init__(
         self,
-        pw: Playwright | None = None,
+        pw: Playwright,
         browser_context: BrowserContext | None = None,
         page: Page | None = None,
         browser_artifacts: BrowserArtifacts = BrowserArtifacts(),
@@ -253,10 +270,6 @@ class BrowserState:
         workflow_run_id: str | None = None,
         organization_id: str | None = None,
     ) -> None:
-        if self.pw is None:
-            LOG.info("Starting playwright")
-            self.pw = await async_playwright().start()
-            LOG.info("playwright is started")
         if self.browser_context is None:
             LOG.info("creating browser context")
             (
@@ -275,8 +288,6 @@ class BrowserState:
             self.browser_artifacts = browser_artifacts
             self.browser_cleanup = browser_cleanup
             LOG.info("browser context is created")
-
-        assert self.browser_context is not None
 
         if await self.get_working_page() is None:
             success = False
