@@ -39,6 +39,8 @@ class SkyvernFrame:
         file_path: str | None = None,
         timeout: float = SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS,
     ) -> bytes:
+        if page.is_closed():
+            raise FailedToTakeScreenshot(error_message="Page is closed")
         try:
             await page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
             LOG.debug("Page is fully loaded, agent is about to take screenshots")
