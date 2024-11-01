@@ -1,3 +1,23 @@
+<!-- START doctoc generated TOC please keep comment here to allow auto update -->
+<!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
+**Table of Contents**  *generated with [DocToc](https://github.com/thlorenz/doctoc)*
+
+- [title: 'Workato'](#title-workato)
+- [Running a Skyvern Task in Workato](#running-a-skyvern-task-in-workato)
+  - [Setup](#setup)
+  - [Configure](#configure)
+  - [Test](#test)
+- [Running a Skyvern Workflow in Workato](#running-a-skyvern-workflow-in-workato)
+  - [Setup](#setup-1)
+  - [Configure](#configure-1)
+  - [Test](#test-1)
+- [Adding a Previously Ran Task or Workflow in Workato](#adding-a-previously-ran-task-or-workflow-in-workato)
+  - [Setup](#setup-2)
+  - [Configure](#configure-2)
+  - [Test](#test-2)
+
+<!-- END doctoc generated TOC please keep comment here to allow auto update -->
+
 ---
 title: 'Workato'
 ---
