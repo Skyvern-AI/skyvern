@@ -92,6 +92,7 @@ function SavedTasks() {
     },
     onSuccess: (response) => {
       toast({
+        variant: "success",
         title: "New template created",
         description: "Your template was created successfully",
       });

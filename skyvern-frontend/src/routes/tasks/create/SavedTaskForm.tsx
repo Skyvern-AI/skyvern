@@ -221,6 +221,7 @@ function SavedTaskForm({ initialValues }: Props) {
     },
     onSuccess: (response) => {
       toast({
+        variant: "success",
         title: "Task Created",
         description: `${response.data.task_id} created successfully.`,
         action: (
@@ -262,6 +263,7 @@ function SavedTaskForm({ initialValues }: Props) {
     },
     onSuccess: () => {
       toast({
+        variant: "success",
         title: "Changes saved",
         description: "Changes saved successfully",
       });
@@ -766,7 +768,8 @@ function SavedTaskForm({ initialValues }: Props) {
               });
               copyText(curl).then(() => {
                 toast({
-                  title: "Copied cURL",
+                  variant: "success",
+                  title: "Copied successfully",
                   description: "cURL copied to clipboard",
                 });
               });
