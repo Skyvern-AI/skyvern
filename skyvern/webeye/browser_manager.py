@@ -53,17 +53,25 @@ class BrowserManager:
             browser_cleanup=browser_cleanup,
         )
 
-    async def get_or_create_for_task(self, task: Task) -> BrowserState:
-        if task.task_id in self.pages:
-            return self.pages[task.task_id]
-        elif task.workflow_run_id in self.pages:
+    def get_for_task(self, task_id: str, workflow_run_id: str | None = None) -> BrowserState | None:
+        if task_id in self.pages:
+            return self.pages[task_id]
+
+        if workflow_run_id and workflow_run_id in self.pages:
             LOG.info(
                 "Browser state for task not found. Using browser state for workflow run",
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
             )
-            self.pages[task.task_id] = self.pages[task.workflow_run_id]
-            return self.pages[task.task_id]
+            self.pages[task_id] = self.pages[workflow_run_id]
+            return self.pages[task_id]
+
+        return None
+
+    async def get_or_create_for_task(self, task: Task) -> BrowserState:
+        browser_state = self.get_for_task(task_id=task.task_id, workflow_run_id=task.workflow_run_id)
+        if browser_state is not None:
+            return browser_state
 
         LOG.info("Creating browser state for task", task_id=task.task_id)
         browser_state = await self._create_browser_state(
@@ -85,8 +93,10 @@ class BrowserManager:
         return browser_state
 
     async def get_or_create_for_workflow_run(self, workflow_run: WorkflowRun, url: str | None = None) -> BrowserState:
-        if workflow_run.workflow_run_id in self.pages:
-            return self.pages[workflow_run.workflow_run_id]
+        browser_state = self.get_for_workflow_run(workflow_run_id=workflow_run.workflow_run_id)
+        if browser_state is not None:
+            return browser_state
+
         LOG.info(
             "Creating browser state for workflow run",
             workflow_run_id=workflow_run.workflow_run_id,
@@ -110,7 +120,7 @@ class BrowserManager:
         self.pages[workflow_run.workflow_run_id] = browser_state
         return browser_state
 
-    async def get_for_workflow_run(self, workflow_run_id: str) -> BrowserState | None:
+    def get_for_workflow_run(self, workflow_run_id: str) -> BrowserState | None:
         if workflow_run_id in self.pages:
             return self.pages[workflow_run_id]
         return None
@@ -230,7 +240,18 @@ class BrowserManager:
 
             await browser_state_to_close.close(close_browser_on_completion=close_browser_on_completion)
         for task_id in task_ids:
-            self.pages.pop(task_id, None)
+            task_browser_state = self.pages.pop(task_id, None)
+            if task_browser_state is None:
+                continue
+            try:
+                await task_browser_state.close()
+            except Exception:
+                LOG.info(
+                    "Failed to close the browser state from the task block, might because it's already closed.",
+                    exc_info=True,
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                )
         LOG.info("Workflow run is cleaned up")
 
         return browser_state_to_close

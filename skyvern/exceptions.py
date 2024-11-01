@@ -77,8 +77,10 @@ class ImaginaryFileUrl(SkyvernException):
 
 
 class MissingBrowserState(SkyvernException):
-    def __init__(self, task_id: str) -> None:
-        super().__init__(f"Browser state for task {task_id} is missing.")
+    def __init__(self, task_id: str | None = None, workflow_run_id: str | None = None) -> None:
+        task_str = f"task_id={task_id}" if task_id else ""
+        workflow_run_str = f"workflow_run_id={workflow_run_id}" if workflow_run_id else ""
+        super().__init__(f"Browser state for {task_str} {workflow_run_str} is missing.")
 
 
 class MissingBrowserStatePage(SkyvernException):
