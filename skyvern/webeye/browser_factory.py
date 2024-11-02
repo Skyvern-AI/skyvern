@@ -43,8 +43,8 @@ def get_download_dir(workflow_run_id: str | None, task_id: str | None) -> str:
 
 def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> None:
     if browser_artifacts.browser_console_log_path is None:
+        log_path = f"{settings.LOG_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{uuid.uuid4()}.log"
         try:
-            log_path = f"{settings.LOG_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{uuid.uuid4()}.log"
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             # create the empty log file
             with open(log_path, "w") as _:
