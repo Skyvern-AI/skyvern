@@ -33,7 +33,8 @@ class LLMConfigBase:
 
 @dataclass(frozen=True)
 class LLMConfig(LLMConfigBase):
-    litellm_params: Optional[LiteLLMParams] = field(default=None)
+    litellm_params: Optional[LiteLLMParams] = None
+    skip_cost_calculation: bool = False
 
 
 @dataclass(frozen=True)
