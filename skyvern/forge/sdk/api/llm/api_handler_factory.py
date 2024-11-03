@@ -74,7 +74,7 @@ class LLMAPIHandlerFactory:
                 The response from the LLM router.
             """
             if parameters is None:
-                parameters = LLMAPIHandlerFactory.get_api_parameters()
+                parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
 
             if step:
                 await app.ARTIFACT_MANAGER.create_artifact(
@@ -168,7 +168,7 @@ class LLMAPIHandlerFactory:
         ) -> dict[str, Any]:
             active_parameters = base_parameters or {}
             if parameters is None:
-                parameters = LLMAPIHandlerFactory.get_api_parameters()
+                parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
 
             active_parameters.update(parameters)
             if llm_config.litellm_params:  # type: ignore
@@ -261,9 +261,9 @@ class LLMAPIHandlerFactory:
         return llm_api_handler
 
     @staticmethod
-    def get_api_parameters() -> dict[str, Any]:
+    def get_api_parameters(llm_config: LLMConfig | LLMRouterConfig) -> dict[str, Any]:
         return {
-            "max_tokens": SettingsManager.get_settings().LLM_CONFIG_MAX_TOKENS,
+            "max_tokens": llm_config.max_output_tokens,
             "temperature": SettingsManager.get_settings().LLM_CONFIG_TEMPERATURE,
         }
 

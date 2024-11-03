@@ -34,6 +34,7 @@ class LLMConfigBase:
 @dataclass(frozen=True)
 class LLMConfig(LLMConfigBase):
     litellm_params: Optional[LiteLLMParams] = field(default=None)
+    max_output_tokens: int = SettingsManager.get_settings().LLM_CONFIG_MAX_TOKENS
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,7 @@ class LLMRouterConfig(LLMConfigBase):
     allowed_fails: int | None = None
     allowed_fails_policy: AllowedFailsPolicy | None = None
     cooldown_time: float | None = None
+    max_output_tokens: int = SettingsManager.get_settings().LLM_CONFIG_MAX_TOKENS
 
 
 class LLMAPIHandler(Protocol):
