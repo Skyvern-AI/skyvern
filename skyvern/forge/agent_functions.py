@@ -36,19 +36,21 @@ def _should_css_shape_convert(element: Dict) -> bool:
     if tag_name not in ["a", "span", "i"]:
         return False
 
-    # if <span> and <i> without any text in the element, we try to convert the shape
-    if tag_name in ["span", "i"] and not element.get("text"):
+    # should be without children
+    if len(element.get("children", [])) > 0:
+        return False
+
+    # should be no text
+    if element.get("text"):
+        return False
+
+    # if <span> and <i>  we try to convert the shape
+    if tag_name in ["span", "i"]:
         return True
 
-    # if <a>, it should be no text, no children, no href/target attribute
+    # if <a>, it should be no text, no href/target attribute
     if tag_name == "a":
         attributes = element.get("attributes", {})
-        if element.get("text"):
-            return False
-
-        if len(element.get("children", [])) > 0:
-            return False
-
         if "href" in attributes:
             return False
 
