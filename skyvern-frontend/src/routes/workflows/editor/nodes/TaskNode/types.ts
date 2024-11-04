@@ -59,7 +59,7 @@ export const helpTooltipContent = {
     "Tell Skyvern what data you would like to scrape at the end of your run.",
   dataSchema: "Specify a format for extracted data in JSON.",
   maxRetries:
-    "Specify how many times you would like a task to retry upon failure.",
+    "Specify how many times you would like a step within a task to retry upon failure.",
   maxStepsOverride:
     "Specify the maximum number of steps a task can take in total.",
   completeOnDownload:
