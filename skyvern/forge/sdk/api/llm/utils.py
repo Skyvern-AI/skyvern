@@ -52,13 +52,16 @@ def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bo
         if add_assistant_prefix:
             content = "{" + content
         content = try_to_extract_json_from_markdown_format(content)
-        content = replace_useless_text_around_json(content)
         if not content:
             raise EmptyLLMResponseError(str(response))
         return commentjson.loads(content)
     except Exception as e:
         if content:
-            LOG.warning("Failed to parse LLM response. Will retry auto-fixing the response for unescaped quotes.")
+            LOG.warning(
+                "Failed to parse LLM response. Will retry auto-fixing the response for unescaped quotes.",
+                exc_info=True,
+                content=content,
+            )
             try:
                 return fix_and_parse_json_string(content)
             except Exception as e2:
@@ -178,12 +181,6 @@ def fix_and_parse_json_string(json_string: str) -> dict[str, Any]:
             error_position = e.pos
             # Try to fix the cutoff JSON string and see if it can be parsed
             return fix_cutoff_json(json_string, error_position)
-
-
-def replace_useless_text_around_json(input_string: str) -> str:
-    first_occurrence_of_brace = input_string.find("{")
-    last_occurrence_of_brace = input_string.rfind("}")
-    return input_string[first_occurrence_of_brace : last_occurrence_of_brace + 1]
 
 
 def try_to_extract_json_from_markdown_format(text: str) -> str:
