@@ -337,7 +337,6 @@ class ForgeAgent:
                         api_key=api_key,
                         close_browser_on_completion=close_browser_on_completion,
                     )
-                    await self.async_operation_pool.remove_task(task.task_id)
                     return step, detailed_output, None
             elif step.status == StepStatus.completed:
                 # TODO (kerem): keep the task object uptodate at all times so that clean_up_task can just use it
@@ -1402,6 +1401,7 @@ class ForgeAgent:
             )
             return
 
+        await self.async_operation_pool.remove_task(task.task_id)
         await self.cleanup_browser_and_create_artifacts(close_browser_on_completion, last_step, task)
 
         # Wait for all tasks to complete before generating the links for the artifacts
