@@ -103,9 +103,7 @@ class LLMAPIHandlerFactory:
                     ).encode("utf-8"),
                 )
             try:
-                LOG.info("Calling LLM API", llm_key=llm_key, model=llm_config.model_name)
                 response = await router.acompletion(model=main_model_group, messages=messages, **parameters)
-                LOG.info("LLM API call successful", llm_key=llm_key, model=llm_config.model_name)
             except litellm.exceptions.APIError as e:
                 raise LLMProviderErrorRetryableTask(llm_key) from e
             except ValueError as e:
