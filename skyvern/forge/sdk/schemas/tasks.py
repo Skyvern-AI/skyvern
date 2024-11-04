@@ -235,6 +235,7 @@ class Task(TaskBase):
         action_screenshot_urls: list[str] | None = None,
         screenshot_url: str | None = None,
         recording_url: str | None = None,
+        browser_console_log_url: str | None = None,
         failure_reason: str | None = None,
     ) -> TaskResponse:
         return TaskResponse(
@@ -248,6 +249,7 @@ class Task(TaskBase):
             action_screenshot_urls=action_screenshot_urls,
             screenshot_url=screenshot_url,
             recording_url=recording_url,
+            browser_console_log_url=browser_console_log_url,
             errors=self.errors,
             max_steps_per_run=self.max_steps_per_run,
             workflow_run_id=self.workflow_run_id,
@@ -264,6 +266,7 @@ class TaskResponse(BaseModel):
     action_screenshot_urls: list[str] | None = None
     screenshot_url: str | None = None
     recording_url: str | None = None
+    browser_console_log_url: str | None = None
     failure_reason: str | None = None
     errors: list[dict[str, Any]] = []
     max_steps_per_run: int | None = None

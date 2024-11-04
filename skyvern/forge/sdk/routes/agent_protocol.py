@@ -277,6 +277,15 @@ async def get_task(
     if recording_artifact:
         recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
+    browser_console_log = await app.DATABASE.get_latest_artifact(
+        task_id=task_obj.task_id,
+        artifact_types=[ArtifactType.BROWSER_CONSOLE_LOG],
+        organization_id=current_org.organization_id,
+    )
+    browser_console_log_url = None
+    if browser_console_log:
+        browser_console_log_url = await app.ARTIFACT_MANAGER.get_share_link(browser_console_log)
+
     # get the artifact of the last  screenshot and get the screenshot_url
     latest_action_screenshot_artifacts = await app.DATABASE.get_latest_n_artifacts(
         task_id=task_obj.task_id,
@@ -315,6 +324,7 @@ async def get_task(
         action_screenshot_urls=latest_action_screenshot_urls,
         screenshot_url=screenshot_url,
         recording_url=recording_url,
+        browser_console_log_url=browser_console_log_url,
         failure_reason=failure_reason,
     )
 
