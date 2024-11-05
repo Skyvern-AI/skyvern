@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import structlog
 from playwright._impl._errors import TimeoutError
@@ -32,6 +32,20 @@ JS_FUNCTION_DEFS = load_js_script()
 
 
 class SkyvernFrame:
+    @staticmethod
+    async def evaluate(
+        frame: Page | Frame,
+        expression: str,
+        arg: Any | None = None,
+        timeout_ms: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+    ) -> Any:
+        try:
+            async with asyncio.timeout(timeout_ms / 1000):
+                return await frame.evaluate(expression=expression, arg=arg)
+        except asyncio.TimeoutError:
+            LOG.exception("Timeout to evaluate expression", expression=expression)
+            raise TimeoutError("timeout to evaluate expression")
+
     @staticmethod
     async def take_screenshot(
         page: Page,
@@ -123,7 +137,7 @@ class SkyvernFrame:
     @classmethod
     async def create_instance(cls, frame: Page | Frame) -> SkyvernFrame:
         instance = cls(frame=frame)
-        await instance.frame.evaluate(JS_FUNCTION_DEFS)
+        await cls.evaluate(frame=instance.frame, expression=JS_FUNCTION_DEFS)
         return instance
 
     def __init__(self, frame: Page | Frame) -> None:
@@ -138,35 +152,35 @@ class SkyvernFrame:
 
     async def get_scroll_x_y(self) -> tuple[int, int]:
         js_script = "() => getScrollXY()"
-        return await self.frame.evaluate(js_script)
+        return await self.evaluate(frame=self.frame, expression=js_script)
 
     async def scroll_to_x_y(self, x: int, y: int) -> None:
         js_script = "([x, y]) => scrollToXY(x, y)"
-        return await self.frame.evaluate(js_script, [x, y])
+        return await self.evaluate(frame=self.frame, expression=js_script, arg=[x, y])
 
     async def scroll_to_element_bottom(self, element: ElementHandle, page_by_page: bool = False) -> None:
         js_script = "([element, page_by_page]) => scrollToElementBottom(element, page_by_page)"
-        return await self.frame.evaluate(js_script, [element, page_by_page])
+        return await self.evaluate(frame=self.frame, expression=js_script, arg=[element, page_by_page])
 
     async def scroll_to_element_top(self, element: ElementHandle) -> None:
         js_script = "(element) => scrollToElementTop(element)"
-        return await self.frame.evaluate(js_script, element)
+        return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
 
     async def parse_element_from_html(self, frame: str, element: ElementHandle, interactable: bool) -> Dict:
         js_script = "([frame, element, interactable]) => buildElementObject(frame, element, interactable)"
-        return await self.frame.evaluate(js_script, [frame, element, interactable])
+        return await self.evaluate(frame=self.frame, expression=js_script, arg=[frame, element, interactable])
 
     async def get_element_scrollable(self, element: ElementHandle) -> bool:
         js_script = "(element) => isScrollable(element)"
-        return await self.frame.evaluate(js_script, element)
+        return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
 
     async def get_element_visible(self, element: ElementHandle) -> bool:
         js_script = "(element) => isElementVisible(element) && !isHidden(element)"
-        return await self.frame.evaluate(js_script, element)
+        return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
 
     async def get_disabled_from_style(self, element: ElementHandle) -> bool:
         js_script = "(element) => checkDisabledFromStyle(element)"
-        return await self.frame.evaluate(js_script, element)
+        return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
 
     async def scroll_to_top(self, draw_boxes: bool) -> float:
         """
@@ -176,7 +190,7 @@ class SkyvernFrame:
         :return: Screenshot of the page.
         """
         js_script = f"() => scrollToTop({str(draw_boxes).lower()})"
-        scroll_y_px = await self.frame.evaluate(js_script)
+        scroll_y_px = await self.evaluate(frame=self.frame, expression=js_script)
         return scroll_y_px
 
     async def scroll_to_next_page(self, draw_boxes: bool) -> float:
@@ -187,7 +201,7 @@ class SkyvernFrame:
         :return: Screenshot of the page.
         """
         js_script = f"() => scrollToNextPage({str(draw_boxes).lower()})"
-        scroll_y_px = await self.frame.evaluate(js_script)
+        scroll_y_px = await self.evaluate(frame=self.frame, expression=js_script)
         return scroll_y_px
 
     async def remove_bounding_boxes(self) -> None:
@@ -196,12 +210,12 @@ class SkyvernFrame:
         :param page: Page instance to remove the bounding boxes from.
         """
         js_script = "() => removeBoundingBoxes()"
-        await self.frame.evaluate(js_script)
+        await self.evaluate(frame=self.frame, expression=js_script)
 
     async def build_elements_and_draw_bounding_boxes(self) -> None:
         js_script = "() => buildElementsAndDrawBoundingBoxes()"
-        await self.frame.evaluate(js_script)
+        await self.evaluate(frame=self.frame, expression=js_script)
 
     async def is_window_scrollable(self) -> bool:
         js_script = "() => isWindowScrollable()"
-        return await self.frame.evaluate(js_script)
+        return await self.evaluate(frame=self.frame, expression=js_script)

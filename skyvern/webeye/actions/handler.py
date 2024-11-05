@@ -613,7 +613,7 @@ async def handle_upload_file_action(
     locator = skyvern_element.locator
 
     file_path = await download_file(file_url)
-    is_file_input = await is_file_input_element(locator)
+    is_file_input = await skyvern_element.is_file_input()
 
     if is_file_input:
         LOG.info("Taking UploadFileAction. Found file input tag", action=action)
@@ -1103,24 +1103,14 @@ async def chain_click(
     Clicks on an element identified by the css and its parent if failed.
     :param css: css of the element to click
     """
-    javascript_triggered = await is_javascript_triggered(scraped_page, page, locator)
     try:
         await locator.click(timeout=timeout)
 
         LOG.info("Chain click: main element click succeeded", action=action, locator=locator)
-        return [
-            ActionSuccess(
-                javascript_triggered=javascript_triggered,
-            )
-        ]
+        return [ActionSuccess()]
 
     except Exception:
-        action_results: list[ActionResult] = [
-            ActionFailure(
-                FailToClick(action.element_id),
-                javascript_triggered=javascript_triggered,
-            )
-        ]
+        action_results: list[ActionResult] = [ActionFailure(FailToClick(action.element_id))]
 
         if skyvern_element.get_tag_name() == "label":
             LOG.info(
@@ -1137,12 +1127,7 @@ async def chain_click(
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception:
-                action_results.append(
-                    ActionFailure(
-                        FailToClick(action.element_id, anchor="for"),
-                        javascript_triggered=javascript_triggered,
-                    )
-                )
+                action_results.append(ActionFailure(FailToClick(action.element_id, anchor="for")))
 
         if skyvern_element.get_tag_name() == InteractiveElement.INPUT:
             LOG.info(
@@ -1158,10 +1143,6 @@ async def chain_click(
 
         try:
             parent_locator = locator.locator("..")
-
-            parent_javascript_triggered = await is_javascript_triggered(scraped_page, page, parent_locator)
-            javascript_triggered = javascript_triggered or parent_javascript_triggered
-
             await parent_locator.click(timeout=timeout)
 
             LOG.info(
@@ -1169,12 +1150,7 @@ async def chain_click(
                 action=action,
                 parent_locator=parent_locator,
             )
-            action_results.append(
-                ActionSuccess(
-                    javascript_triggered=javascript_triggered,
-                    interacted_with_parent=True,
-                )
-            )
+            action_results.append(ActionSuccess(interacted_with_parent=True))
         except Exception:
             LOG.warning(
                 "Failed to click parent element",
@@ -1185,7 +1161,6 @@ async def chain_click(
             action_results.append(
                 ActionFailure(
                     FailToClick(action.element_id, anchor="parent"),
-                    javascript_triggered=javascript_triggered,
                     interacted_with_parent=True,
                 )
             )
@@ -2223,48 +2198,9 @@ def get_checkbox_id_in_label_children(scraped_page: ScrapedPage, element_id: str
     return None
 
 
-@deprecated("This function is deprecated. It was used for select2 dropdown, but we don't use it anymore.")
-async def is_javascript_triggered(scraped_page: ScrapedPage, page: Page, locator: Locator) -> bool:
-    element = locator.first
-
-    tag_name = await element.evaluate("e => e.tagName")
-    if tag_name.lower() == "a":
-        href = await element.evaluate("e => e.href")
-        if href.lower().startswith("javascript:"):
-            LOG.info("Found javascript call in anchor tag, marking step as completed. Dropping remaining actions")
-            return True
-    return False
-
-
-async def get_tag_name_lowercase(locator: Locator) -> str | None:
-    element = locator.first
-    if element:
-        tag_name = await element.evaluate("e => e.tagName")
-        return tag_name.lower()
-    return None
-
-
-async def is_file_input_element(locator: Locator) -> bool:
-    element = locator.first
-    if element:
-        tag_name = await element.evaluate("el => el.tagName")
-        type_name = await element.evaluate("el => el.type")
-        return tag_name.lower() == "input" and type_name == "file"
-    return False
-
-
-async def is_input_element(locator: Locator) -> bool:
-    element = locator.first
-    if element:
-        tag_name = await element.evaluate("el => el.tagName")
-        return tag_name.lower() == "input"
-    return False
-
-
 async def click_sibling_of_input(
     locator: Locator,
     timeout: int,
-    javascript_triggered: bool = False,
 ) -> ActionResult:
     try:
         input_element = locator.first
@@ -2278,18 +2214,16 @@ async def click_sibling_of_input(
                 "Successfully clicked sibling label of input element",
                 sibling_label_css=sibling_label_css,
             )
-            return ActionSuccess(javascript_triggered=javascript_triggered, interacted_with_sibling=True)
+            return ActionSuccess(interacted_with_sibling=True)
         # Should never get here
         return ActionFailure(
             exception=Exception("Failed while trying to click sibling of input element"),
-            javascript_triggered=javascript_triggered,
             interacted_with_sibling=True,
         )
     except Exception:
         LOG.warning("Failed to click sibling label of input element", exc_info=True)
         return ActionFailure(
             exception=Exception("Failed while trying to click sibling of input element"),
-            javascript_triggered=javascript_triggered,
         )
 
 

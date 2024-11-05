@@ -777,17 +777,6 @@ class ForgeAgent:
                         action=action,
                         action_result=results,
                     )
-                    # if the action triggered javascript calls
-                    # this action should be the last action this round and do not take more actions.
-                    # for now, we're being optimistic and assuming that
-                    # js call doesn't have impact on the following actions
-                    if results[-1].javascript_triggered:
-                        LOG.info(
-                            "Action triggered javascript. Stop executing reamaining actions.",
-                            action=action,
-                        )
-                        # stop executing the rest actions
-                        break
                 elif results and not results[-1].success and not results[-1].stop_execution_on_failure:
                     LOG.warning(
                         "Action failed, but not stopping execution",
@@ -1198,7 +1187,9 @@ class ForgeAgent:
         navigation_goal = task.navigation_goal
         starting_url = task.url
         page = await browser_state.get_working_page()
-        current_url = await page.evaluate("() => document.location.href") if page else starting_url
+        current_url = (
+            await SkyvernFrame.evaluate(frame=page, expression="() => document.location.href") if page else starting_url
+        )
         final_navigation_payload = self._build_navigation_payload(
             task, expire_verification_code=expire_verification_code
         )

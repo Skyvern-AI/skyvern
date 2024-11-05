@@ -213,6 +213,9 @@ class SkyvernElement:
 
         return False
 
+    async def is_file_input(self) -> bool:
+        return self.get_tag_name() == InteractiveElement.INPUT and await self.get_attr("type") == "file"
+
     def is_interactable(self) -> bool:
         return self.__static_element.get("interactable", False)
 
@@ -507,7 +510,9 @@ class SkyvernElement:
         await page.mouse.click(click_x, click_y)
 
     async def blur(self) -> None:
-        await self.get_frame().evaluate("(element) => element.blur()", await self.get_element_handler())
+        await SkyvernFrame.evaluate(
+            frame=self.get_frame(), expression="(element) => element.blur()", arg=await self.get_element_handler()
+        )
 
     async def scroll_into_view(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
         element_handler = await self.get_element_handler(timeout=timeout)

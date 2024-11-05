@@ -13,7 +13,6 @@ class ActionResult(BaseModel):
     data: dict[str, Any] | list | str | None = None
     step_retry_number: int | None = None
     step_order: int | None = None
-    javascript_triggered: bool = False
     download_triggered: bool | None = None
     # None is used for old data so that we can differentiate between old and new data which only has boolean
     interacted_with_sibling: bool | None = None
@@ -30,8 +29,6 @@ class ActionResult(BaseModel):
             results.append(f"step_order={self.step_order}")
         if self.step_retry_number:
             results.append(f"step_retry_number={self.step_retry_number}")
-        if self.javascript_triggered:
-            results.append(f"javascript_triggered={self.javascript_triggered}")
         if self.download_triggered is not None:
             results.append(f"download_triggered={self.download_triggered}")
         if self.interacted_with_sibling is not None:
@@ -49,7 +46,6 @@ class ActionSuccess(ActionResult):
     def __init__(
         self,
         data: dict[str, Any] | list | str | None = None,
-        javascript_triggered: bool = False,
         download_triggered: bool | None = None,
         interacted_with_sibling: bool = False,
         interacted_with_parent: bool = False,
@@ -57,7 +53,6 @@ class ActionSuccess(ActionResult):
         super().__init__(
             success=True,
             data=data,
-            javascript_triggered=javascript_triggered,
             download_triggered=download_triggered,
             interacted_with_sibling=interacted_with_sibling,
             interacted_with_parent=interacted_with_parent,
@@ -69,7 +64,6 @@ class ActionFailure(ActionResult):
         self,
         exception: Exception,
         stop_execution_on_failure: bool = True,
-        javascript_triggered: bool = False,
         download_triggered: bool | None = None,
         interacted_with_sibling: bool = False,
         interacted_with_parent: bool = False,
@@ -79,7 +73,6 @@ class ActionFailure(ActionResult):
             exception_type=type(exception).__name__,
             stop_execution_on_failure=stop_execution_on_failure,
             exception_message=remove_whitespace(str(exception)),
-            javascript_triggered=javascript_triggered,
             download_triggered=download_triggered,
             interacted_with_sibling=interacted_with_sibling,
             interacted_with_parent=interacted_with_parent,
@@ -91,14 +84,12 @@ class ActionFailure(ActionResult):
 class ActionAbort(ActionResult):
     def __init__(
         self,
-        javascript_triggered: bool = False,
         download_triggered: bool | None = None,
         interacted_with_sibling: bool = False,
         interacted_with_parent: bool = False,
     ):
         super().__init__(
             success=True,
-            javascript_triggered=javascript_triggered,
             download_triggered=download_triggered,
             interacted_with_sibling=interacted_with_sibling,
             interacted_with_parent=interacted_with_parent,
