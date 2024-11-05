@@ -24,7 +24,6 @@ import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, NavLink, Outlet, useParams } from "react-router-dom";
 import { useTaskQuery } from "./hooks/useTaskQuery";
-import { taskIsFinalized } from "@/api/utils";
 import fetchToCurl from "fetch-to-curl";
 import { apiBaseUrl } from "@/util/env";
 import { useApiCredential } from "@/hooks/useApiCredential";
@@ -32,6 +31,7 @@ import { copyText } from "@/util/copyText";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { StatusBadge } from "@/components/StatusBadge";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import { statusIsFinalized } from "../types";
 
 function createTaskRequestObject(values: TaskApiResponse) {
   return {
@@ -147,7 +147,7 @@ function TaskDetails() {
   const taskIsRunningOrQueued =
     task?.status === Status.Running || task?.status === Status.Queued;
 
-  const taskHasTerminalState = task && taskIsFinalized(task);
+  const taskHasTerminalState = task && statusIsFinalized(task);
 
   const showFailureReason =
     task?.status === Status.Failed ||
