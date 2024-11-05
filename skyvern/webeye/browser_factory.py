@@ -419,7 +419,7 @@ class BrowserState:
     async def stop_page_loading(self) -> None:
         page = await self.__assert_page()
         try:
-            await page.evaluate("window.stop()")
+            await SkyvernFrame.evaluate(frame=page, expression="window.stop()")
         except Exception as e:
             LOG.exception(f"Error while stop loading the page: {repr(e)}")
             raise FailedToStopLoadingPage(url=page.url, error_message=repr(e))

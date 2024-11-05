@@ -284,7 +284,7 @@ async def get_frame_text(iframe: Frame) -> str:
     js_script = "() => document.body.innerText"
 
     try:
-        text = await iframe.evaluate(js_script)
+        text = await SkyvernFrame.evaluate(frame=iframe, expression=js_script)
     except Exception:
         LOG.warning(
             "failed to get text from iframe",
@@ -417,8 +417,10 @@ async def get_interactable_element_tree_in_frame(
 
         frame_js_script = f"() => buildTreeFromBody('{unique_id}')"
 
-        await frame.evaluate(JS_FUNCTION_DEFS)
-        frame_elements, frame_element_tree = await frame.evaluate(frame_js_script)
+        await SkyvernFrame.evaluate(frame=frame, expression=JS_FUNCTION_DEFS)
+        frame_elements, frame_element_tree = await SkyvernFrame.evaluate(
+            frame=frame, expression=frame_js_script, timeout_ms=60 * 1000
+        )
 
         if len(frame.child_frames) > 0:
             frame_elements, frame_element_tree = await get_interactable_element_tree_in_frame(
@@ -450,9 +452,11 @@ async def get_interactable_element_tree(
     :param page: Page instance to get the element tree from.
     :return: Tuple containing the element tree and a map of element IDs to elements.
     """
-    await page.evaluate(JS_FUNCTION_DEFS)
+    await SkyvernFrame.evaluate(frame=page, expression=JS_FUNCTION_DEFS)
     main_frame_js_script = "() => buildTreeFromBody()"
-    elements, element_tree = await page.evaluate(main_frame_js_script)
+    elements, element_tree = await SkyvernFrame.evaluate(
+        frame=page, expression=main_frame_js_script, timeout_ms=60 * 1000
+    )
 
     if len(page.main_frame.child_frames) > 0:
         elements, element_tree = await get_interactable_element_tree_in_frame(
@@ -481,7 +485,9 @@ class IncrementalScrapePage:
         frame = self.skyvern_frame.get_frame()
 
         js_script = "() => getIncrementElements()"
-        incremental_elements, incremental_tree = await frame.evaluate(js_script)
+        incremental_elements, incremental_tree = await SkyvernFrame.evaluate(
+            frame=frame, expression=js_script, timeout_ms=60 * 1000
+        )
         # we listen the incremental elements seperated by frames, so all elements will be in the same SkyvernFrame
         self.id_to_css_dict, self.id_to_element_dict, _, _, _ = build_element_dict(incremental_elements)
 
@@ -497,15 +503,15 @@ class IncrementalScrapePage:
 
     async def start_listen_dom_increment(self) -> None:
         js_script = "() => startGlobalIncrementalObserver()"
-        await self.skyvern_frame.get_frame().evaluate(js_script)
+        await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script)
 
     async def stop_listen_dom_increment(self) -> None:
         js_script = "() => stopGlobalIncrementalObserver()"
-        await self.skyvern_frame.get_frame().evaluate(js_script)
+        await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script)
 
     async def get_incremental_elements_num(self) -> int:
         js_script = "() => window.globalOneTimeIncrementElements.length"
-        return await self.skyvern_frame.get_frame().evaluate(js_script)
+        return await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script)
 
     async def __validate_element_by_value(self, value: str, element: dict) -> tuple[Locator | None, bool]:
         """
