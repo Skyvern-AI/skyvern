@@ -346,23 +346,23 @@ function WorkflowRun() {
               <div>Waiting for a task to start...</div>
             ) : (
               <div className="flex h-full flex-col gap-2">
-                <div className="flex gap-2 bg-slate-elevation2 p-2">
+                <div className="flex gap-2 rounded-sm bg-slate-elevation3 p-2">
                   <Label className="text-sm text-slate-400">ID</Label>
                   <span className="text-sm">{currentRunningTask.task_id}</span>
                 </div>
-                <div className="flex gap-2 bg-slate-elevation2 p-2">
+                <div className="flex gap-2 rounded-sm bg-slate-elevation3 p-2">
                   <Label className="text-sm text-slate-400">URL</Label>
                   <span className="text-sm">
                     {currentRunningTask.request.url}
                   </span>
                 </div>
-                <div className="flex items-center gap-2 bg-slate-elevation2 p-2">
+                <div className="flex items-center gap-2 rounded-sm bg-slate-elevation3 p-2">
                   <Label className="text-sm text-slate-400">Status</Label>
                   <span className="text-sm">
                     <StatusBadge status={currentRunningTask.status} />
                   </span>
                 </div>
-                <div className="flex gap-2 bg-slate-elevation2 p-2">
+                <div className="flex gap-2 rounded-sm bg-slate-elevation3 p-2">
                   <Label className="text-sm text-slate-400">Created</Label>
                   <span className="text-sm">
                     {currentRunningTask &&
