@@ -78,16 +78,15 @@ class BrowserManager:
             task_id=task.task_id,
             organization_id=task.organization_id,
         )
+        self.pages[task.task_id] = browser_state
+        if task.workflow_run_id:
+            self.pages[task.workflow_run_id] = browser_state
 
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.
         await browser_state.get_or_create_page(
             url=task.url, proxy_location=task.proxy_location, task_id=task.task_id, organization_id=task.organization_id
         )
-
-        self.pages[task.task_id] = browser_state
-        if task.workflow_run_id:
-            self.pages[task.workflow_run_id] = browser_state
         return browser_state
 
     async def get_or_create_for_workflow_run(self, workflow_run: WorkflowRun, url: str | None = None) -> BrowserState:
@@ -105,6 +104,7 @@ class BrowserManager:
             workflow_run_id=workflow_run.workflow_run_id,
             organization_id=workflow_run.organization_id,
         )
+        self.pages[workflow_run.workflow_run_id] = browser_state
 
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.
@@ -114,8 +114,6 @@ class BrowserManager:
             workflow_run_id=workflow_run.workflow_run_id,
             organization_id=workflow_run.organization_id,
         )
-
-        self.pages[workflow_run.workflow_run_id] = browser_state
         return browser_state
 
     def get_for_workflow_run(self, workflow_run_id: str) -> BrowserState | None:
