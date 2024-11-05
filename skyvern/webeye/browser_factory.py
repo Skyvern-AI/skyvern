@@ -14,7 +14,7 @@ from playwright.async_api import BrowserContext, ConsoleMessage, Error, Page, Pl
 from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
-from skyvern.constants import REPO_ROOT_DIR
+from skyvern.constants import BROWSER_CLOSE_TIMEOUT, REPO_ROOT_DIR
 from skyvern.exceptions import (
     FailedToNavigateToUrl,
     FailedToReloadPage,
@@ -443,17 +443,26 @@ class BrowserState:
 
     async def close(self, close_browser_on_completion: bool = True) -> None:
         LOG.info("Closing browser state")
-        if self.browser_context and close_browser_on_completion:
-            LOG.info("Closing browser context and its pages")
-            await self.browser_context.close()
-            LOG.info("Main browser context and all its pages are closed")
-            if self.browser_cleanup is not None:
-                self.browser_cleanup()
-                LOG.info("Main browser cleanup is excuted")
-        if self.pw and close_browser_on_completion:
-            LOG.info("Stopping playwright")
-            await self.pw.stop()
-            LOG.info("Playwright is stopped")
+        try:
+            async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+                if self.browser_context and close_browser_on_completion:
+                    LOG.info("Closing browser context and its pages")
+                    await self.browser_context.close()
+                    LOG.info("Main browser context and all its pages are closed")
+                    if self.browser_cleanup is not None:
+                        self.browser_cleanup()
+                        LOG.info("Main browser cleanup is excuted")
+        except asyncio.TimeoutError:
+            LOG.error("Timeout to close browser context, going to stop playwright directly")
+
+        try:
+            async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+                if self.pw and close_browser_on_completion:
+                    LOG.info("Stopping playwright")
+                    await self.pw.stop()
+                    LOG.info("Playwright is stopped")
+        except asyncio.TimeoutError:
+            LOG.error("Timeout to close playwright, might leave the broswer opening forever")
 
     async def take_screenshot(self, full_page: bool = False, file_path: str | None = None) -> bytes:
         page = await self.__assert_page()
