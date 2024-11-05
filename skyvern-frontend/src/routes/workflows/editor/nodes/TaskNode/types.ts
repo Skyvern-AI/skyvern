@@ -1,6 +1,7 @@
 import type { Node } from "@xyflow/react";
+import { NodeBaseData } from "../types";
 
-export type TaskNodeData = {
+export type TaskNodeData = NodeBaseData & {
   url: string;
   navigationGoal: string;
   dataExtractionGoal: string;
@@ -11,15 +12,13 @@ export type TaskNodeData = {
   allowDownloads: boolean;
   downloadSuffix: string | null;
   editable: boolean;
-  label: string;
   parameterKeys: Array<string>;
   totpVerificationUrl: string | null;
   totpIdentifier: string | null;
+  cacheActions: boolean;
 };
 
 export type TaskNode = Node<TaskNodeData, "task">;
-
-export type TaskNodeDisplayMode = "basic" | "advanced";
 
 export const taskNodeDefaultData: TaskNodeData = {
   url: "",
@@ -36,6 +35,8 @@ export const taskNodeDefaultData: TaskNodeData = {
   parameterKeys: [],
   totpVerificationUrl: null,
   totpIdentifier: null,
+  continueOnFailure: false,
+  cacheActions: false,
 } as const;
 
 export function isTaskNode(node: Node): node is TaskNode {
@@ -49,6 +50,7 @@ export const helpTooltipContent = {
   limits:
     "Give Skyvern limitations, such as number of retries on failure, the number of maximum steps, the option to download and append suffix identifiers, and return message for errors Skyvern encounters.",
   totp: "Link your internal TOTP storage system to relay 2FA codes we encounter straight to Skyvern. If you have multiple tasks running simultaneously, make sure to link an identifier so Skyvern knows which TOTP URL goes with which task.",
+  url: "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last task block left off.",
   navigationGoal:
     "Give Skyvern an objective. Make sure to include when the task is complete, when it should self-terminate, and any guardrails.",
   parameters:
@@ -57,19 +59,22 @@ export const helpTooltipContent = {
     "Tell Skyvern what data you would like to scrape at the end of your run.",
   dataSchema: "Specify a format for extracted data in JSON.",
   maxRetries:
-    "Specify how many times you would like a step within a task to retry upon failure.",
+    "Specify how many times you would like a task to retry upon failure.",
   maxStepsOverride:
     "Specify the maximum number of steps a task can take in total.",
   completeOnDownload:
     "Allow Skyvern to auto-complete the task when it downloads a file.",
   fileSuffix:
-    "If you allow complete on download, you can opt-in to add a suffix identifier.",
+    "A file suffix that's automatically added to all downloaded files.",
   errorCodeMapping:
     "Knowing about why a task terminated can be important, specify error messages here.",
   totpVerificationUrl:
     "If you have an internal system for storing TOTP codes, link the endpoint here.",
   totpIdentifier:
     "If you are running multiple tasks or workflows at once, you will need to give the task an identifier to know that this TOTP goes with this task.",
+  continueOnFailure:
+    "Allow the workflow to continue if it encounters a failure.",
+  cacheActions: "Cache the actions of this task.",
 } as const;
 
 export const fieldPlaceholders = {

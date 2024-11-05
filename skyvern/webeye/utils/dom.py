@@ -23,6 +23,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, ScrapedPage, json_to_html, trim_element
+from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
@@ -120,10 +121,11 @@ class SkyvernElement:
 
         return cls(locator, frame, element_dict)
 
-    def __init__(self, locator: Locator, frame: Page | Frame, static_element: dict) -> None:
+    def __init__(self, locator: Locator, frame: Page | Frame, static_element: dict, hash_value: str = "") -> None:
         self.__static_element = static_element
         self.__frame = frame
         self.locator = locator
+        self.hash_value = hash_value
 
     def build_HTML(self, need_trim_element: bool = True, need_skyvern_attrs: bool = True) -> str:
         element_dict = self.get_element_dict()
@@ -147,6 +149,9 @@ class SkyvernElement:
 
         return False
 
+    async def is_custom_option(self) -> bool:
+        return self.get_tag_name() == "li" or await self.get_attr("role") == "option"
+
     async def is_checkbox(self) -> bool:
         tag_name = self.get_tag_name()
         if tag_name != "input":
@@ -162,6 +167,14 @@ class SkyvernElement:
 
         button_type = await self.get_attr("type")
         return button_type == "radio"
+
+    async def is_btn_input(self) -> bool:
+        tag_name = self.get_tag_name()
+        if tag_name != InteractiveElement.INPUT:
+            return False
+
+        input_type = await self.get_attr("type")
+        return input_type == "button"
 
     async def is_raw_input(self) -> bool:
         if self.get_tag_name() != InteractiveElement.INPUT:
@@ -200,8 +213,52 @@ class SkyvernElement:
 
         return False
 
+    async def is_file_input(self) -> bool:
+        return self.get_tag_name() == InteractiveElement.INPUT and await self.get_attr("type") == "file"
+
     def is_interactable(self) -> bool:
         return self.__static_element.get("interactable", False)
+
+    async def is_disabled(self, dynamic: bool = False) -> bool:
+        # if attr not exist, return None
+        # if attr is like 'disabled', return empty string or True
+        # if attr is like `disabled=false`, return the value
+        disabled = False
+        aria_disabled = False
+
+        disabled_attr: bool | str | None = None
+        aria_disabled_attr: bool | str | None = None
+        style_disabled: bool = False
+
+        try:
+            disabled_attr = await self.get_attr("disabled", dynamic=dynamic)
+            aria_disabled_attr = await self.get_attr("aria-disabled", dynamic=dynamic)
+            skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
+            style_disabled = await skyvern_frame.get_disabled_from_style(await self.get_element_handler())
+
+        except Exception:
+            # FIXME: maybe it should be considered as "disabled" element if failed to get the attributes?
+            LOG.exception(
+                "Failed to get the disabled attribute",
+                element=self.__static_element,
+                element_id=self.get_id(),
+            )
+
+        if disabled_attr is not None:
+            # disabled_attr should be bool or str
+            if isinstance(disabled_attr, bool):
+                disabled = disabled_attr
+            if isinstance(disabled_attr, str):
+                disabled = disabled_attr.lower() != "false"
+
+        if aria_disabled_attr is not None:
+            # aria_disabled_attr should be bool or str
+            if isinstance(aria_disabled_attr, bool):
+                aria_disabled = aria_disabled_attr
+            if isinstance(aria_disabled_attr, str):
+                aria_disabled = aria_disabled_attr.lower() != "false"
+
+        return disabled or aria_disabled or style_disabled
 
     async def is_selectable(self) -> bool:
         return self.get_selectable() or self.get_tag_name() in SELECTABLE_ELEMENT
@@ -363,7 +420,8 @@ class SkyvernElement:
         timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
     ) -> typing.Any:
         if not dynamic:
-            if attr := self.get_attributes().get(attr_name):
+            attr = self.get_attributes().get(attr_name)
+            if attr is not None:
                 return attr
 
         return await self.locator.get_attribute(attr_name, timeout=timeout)
@@ -401,6 +459,34 @@ class SkyvernElement:
     async def input_clear(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().clear(timeout=timeout)
 
+    async def move_mouse_to_safe(
+        self,
+        page: Page,
+        task_id: str | None = None,
+        step_id: str | None = None,
+        timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+    ) -> tuple[float, float] | tuple[None, None]:
+        element_id = self.get_id()
+        try:
+            return await self.move_mouse_to(page, timeout=timeout)
+        except NoElementBoudingBox:
+            LOG.warning(
+                "Failed to move mouse to the element - NoElementBoudingBox",
+                task_id=task_id,
+                step_id=step_id,
+                element_id=element_id,
+                exc_info=True,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to move mouse to the element - unexpectd exception",
+                task_id=task_id,
+                step_id=step_id,
+                element_id=element_id,
+                exc_info=True,
+            )
+        return None, None
+
     async def move_mouse_to(
         self, page: Page, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
     ) -> tuple[float, float]:
@@ -424,7 +510,9 @@ class SkyvernElement:
         await page.mouse.click(click_x, click_y)
 
     async def blur(self) -> None:
-        await self.get_frame().evaluate("(element) => element.blur()", await self.get_element_handler())
+        await SkyvernFrame.evaluate(
+            frame=self.get_frame(), expression="(element) => element.blur()", arg=await self.get_element_handler()
+        )
 
     async def scroll_into_view(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
         element_handler = await self.get_element_handler(timeout=timeout)
@@ -486,4 +574,6 @@ class DomUtil:
             )
             raise MultipleElementsFound(num=num_elements, selector=css, element_id=element_id)
 
-        return SkyvernElement(locator, frame_content, element)
+        hash_value = self.scraped_page.id_to_element_hash.get(element_id, "")
+
+        return SkyvernElement(locator, frame_content, element, hash_value)

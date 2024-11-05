@@ -40,10 +40,22 @@ from skyvern.forge.sdk.schemas.organizations import (
     OrganizationUpdate,
 )
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration, TaskGenerationBase
-from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskRequest, TaskResponse, TaskStatus
+from skyvern.forge.sdk.schemas.tasks import (
+    CreateTaskResponse,
+    OrderBy,
+    SortDirection,
+    Task,
+    TaskRequest,
+    TaskResponse,
+    TaskStatus,
+)
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.workflow.exceptions import FailedToCreateWorkflow, FailedToUpdateWorkflow
+from skyvern.forge.sdk.workflow.exceptions import (
+    FailedToCreateWorkflow,
+    FailedToUpdateWorkflow,
+    WorkflowParameterMissingRequiredValue,
+)
 from skyvern.forge.sdk.workflow.models.workflow import (
     RunWorkflowResponse,
     Workflow,
@@ -52,6 +64,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatusResponse,
 )
 from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
+from skyvern.webeye.actions.actions import Action
 
 base_router = APIRouter()
 
@@ -264,6 +277,15 @@ async def get_task(
     if recording_artifact:
         recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
+    browser_console_log = await app.DATABASE.get_latest_artifact(
+        task_id=task_obj.task_id,
+        artifact_types=[ArtifactType.BROWSER_CONSOLE_LOG],
+        organization_id=current_org.organization_id,
+    )
+    browser_console_log_url = None
+    if browser_console_log:
+        browser_console_log_url = await app.ARTIFACT_MANAGER.get_share_link(browser_console_log)
+
     # get the artifact of the last  screenshot and get the screenshot_url
     latest_action_screenshot_artifacts = await app.DATABASE.get_latest_n_artifacts(
         task_id=task_obj.task_id,
@@ -281,22 +303,28 @@ async def get_task(
             task_status=task_obj.status,
         )
 
-    failure_reason = None
+    failure_reason: str | None = None
     if task_obj.status == TaskStatus.failed and (latest_step.output or task_obj.failure_reason):
         failure_reason = ""
         if task_obj.failure_reason:
-            failure_reason += f"Reasoning: {task_obj.failure_reason or ''}"
-            failure_reason += "\n"
-        if latest_step.output and latest_step.output.action_results:
-            failure_reason += "Exceptions: "
-            failure_reason += str(
-                [f"[{ar.exception_type}]: {ar.exception_message}" for ar in latest_step.output.action_results]
-            )
+            failure_reason += task_obj.failure_reason or ""
+        if latest_step.output is not None and latest_step.output.actions_and_results is not None:
+            action_results_string: list[str] = []
+            for action, results in latest_step.output.actions_and_results:
+                if len(results) == 0:
+                    continue
+                if results[-1].success:
+                    continue
+                action_results_string.append(f"{action.action_type} action failed.")
+
+            if len(action_results_string) > 0:
+                failure_reason += "(Exceptions: " + str(action_results_string) + ")"
 
     return task_obj.to_task_response(
         action_screenshot_urls=latest_action_screenshot_urls,
         screenshot_url=screenshot_url,
         recording_url=recording_url,
+        browser_console_log_url=browser_console_log_url,
         failure_reason=failure_reason,
     )
 
@@ -384,6 +412,8 @@ async def get_agent_tasks(
     workflow_run_id: Annotated[str | None, Query()] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     only_standalone_tasks: bool = Query(False),
+    sort: OrderBy = Query(OrderBy.created_at),
+    order: SortDirection = Query(SortDirection.desc),
 ) -> Response:
     """
     Get all tasks.
@@ -392,6 +422,8 @@ async def get_agent_tasks(
     :param task_status: Task status filter
     :param workflow_run_id: Workflow run id filter
     :param only_standalone_tasks: Only standalone tasks, tasks which are part of a workflow run will be filtered out
+    :param order: Direction to sort by, ascending or descending
+    :param sort: Column to sort by, created_at or modified_at
     :return: List of tasks with pagination without steps populated. Steps can be populated by calling the
         get_agent_task endpoint.
     """
@@ -408,6 +440,8 @@ async def get_agent_tasks(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
         only_standalone_tasks=only_standalone_tasks,
+        order=order,
+        order_by_column=sort,
     )
     return ORJSONResponse([task.to_task_response().model_dump() for task in tasks])
 
@@ -508,25 +542,19 @@ class ActionResultTmp(BaseModel):
     success: bool = True
 
 
-@base_router.get("/tasks/{task_id}/actions", response_model=list[ActionResultTmp])
+@base_router.get("/tasks/{task_id}/actions", response_model=list[Action])
 @base_router.get(
     "/tasks/{task_id}/actions/",
-    response_model=list[ActionResultTmp],
+    response_model=list[Action],
     include_in_schema=False,
 )
 async def get_task_actions(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> list[ActionResultTmp]:
+) -> list[Action]:
     analytics.capture("skyvern-oss-agent-task-actions-get")
-    steps = await app.DATABASE.get_task_step_models(task_id, organization_id=current_org.organization_id)
-    results: list[ActionResultTmp] = []
-    for step_s in steps:
-        if not step_s.output or "action_results" not in step_s.output:
-            continue
-        for action_result in step_s.output["action_results"]:
-            results.append(ActionResultTmp.model_validate(action_result))
-    return results
+    actions = await app.DATABASE.get_task_actions(task_id, organization_id=current_org.organization_id)
+    return actions
 
 
 @base_router.post("/workflows/{workflow_id}/run", response_model=RunWorkflowResponse)
@@ -641,6 +669,26 @@ async def get_workflow_run(
     )
 
 
+@base_router.get(
+    "/workflows/runs/{workflow_run_id}",
+    response_model=WorkflowRunStatusResponse,
+)
+@base_router.get(
+    "/workflows/runs/{workflow_run_id}/",
+    response_model=WorkflowRunStatusResponse,
+    include_in_schema=False,
+)
+async def get_workflow_run_by_run_id(
+    workflow_run_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowRunStatusResponse:
+    analytics.capture("skyvern-oss-agent-workflow-run-get")
+    return await app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id(
+        workflow_run_id=workflow_run_id,
+        organization_id=current_org.organization_id,
+    )
+
+
 @base_router.post(
     "/workflows",
     openapi_extra={
@@ -678,6 +726,8 @@ async def create_workflow(
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org, request=workflow_create_request
         )
+    except WorkflowParameterMissingRequiredValue as e:
+        raise e
     except Exception as e:
         LOG.error("Failed to create workflow", exc_info=True, organization_id=current_org.organization_id)
         raise FailedToCreateWorkflow(str(e))
@@ -724,8 +774,14 @@ async def update_workflow(
             request=workflow_create_request,
             workflow_permanent_id=workflow_permanent_id,
         )
+    except WorkflowParameterMissingRequiredValue as e:
+        raise e
     except Exception as e:
-        LOG.exception("Failed to update workflow", workflow_permanent_id=workflow_permanent_id)
+        LOG.exception(
+            "Failed to update workflow",
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=current_org.organization_id,
+        )
         raise FailedToUpdateWorkflow(workflow_permanent_id, f"<{type(e).__name__}: {str(e)}>")
 
 
@@ -852,10 +908,7 @@ async def update_organization(
 ) -> Organization:
     return await app.DATABASE.update_organization(
         current_org.organization_id,
-        organization_name=org_update.organization_name,
-        webhook_callback_url=org_update.webhook_callback_url,
         max_steps_per_run=org_update.max_steps_per_run,
-        max_retries_per_step=org_update.max_retries_per_step,
     )
 
 

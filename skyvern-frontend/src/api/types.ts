@@ -78,6 +78,7 @@ export type TaskApiResponse = {
   failure_reason: string | null;
   errors: Array<Record<string, unknown>>;
   max_steps_per_run: number | null;
+  workflow_run_id: string | null;
 };
 
 export type CreateTaskRequest = {
@@ -199,6 +200,7 @@ export const ActionTypes = {
   complete: "complete",
   wait: "wait",
   terminate: "terminate",
+  SolveCaptcha: "solve_captcha",
 } as const;
 
 export type ActionType = (typeof ActionTypes)[keyof typeof ActionTypes];
@@ -213,6 +215,7 @@ export const ReadableActionTypes: {
   complete: "Complete",
   wait: "Wait",
   terminate: "Terminate",
+  solve_captcha: "Solve Captcha",
 };
 
 export type Option = {
@@ -272,4 +275,18 @@ export type TaskGenerationApiResponse = {
   data_extraction_goal: string | null;
   navigation_payload: Record<string, unknown> | null;
   extracted_information_schema: Record<string, unknown> | null;
+};
+
+export type ActionsApiResponse = {
+  action_type: ActionType;
+  status: Status;
+  task_id: string | null;
+  step_id: string | null;
+  step_order: number | null;
+  action_order: number | null;
+  confidence_float: number | null;
+  description: string | null;
+  reasoning: string | null;
+  intention: string | null;
+  response: string | null;
 };

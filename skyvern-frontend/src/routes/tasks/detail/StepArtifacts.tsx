@@ -7,23 +7,24 @@ import {
 import { StatusBadge } from "@/components/StatusBadge";
 import { Label } from "@/components/ui/label";
 import { useQuery } from "@tanstack/react-query";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { Skeleton } from "@/components/ui/skeleton";
-import { JSONArtifact } from "./JSONArtifact";
-import { TextArtifact } from "./TextArtifact";
 import { getImageURL } from "./artifactUtils";
 import { Input } from "@/components/ui/input";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { HTMLArtifact } from "./HTMLArtifact";
+import { Artifact } from "./Artifact";
+
 type Props = {
   id: string;
   stepProps: StepApiResponse;
 };
 
 function StepArtifacts({ id, stepProps }: Props) {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const artifact = searchParams.get("artifact") ?? "info";
   const { taskId } = useParams();
   const credentialGetter = useCredentialGetter();
   const {
@@ -61,12 +62,12 @@ function StepArtifacts({ id, stepProps }: Props) {
     (artifact) => artifact.artifact_type === ArtifactType.LLMRequest,
   );
 
-  const visibleElementsTreeInPrompt = artifacts?.find(
+  const visibleElementsTreeInPrompt = artifacts?.filter(
     (artifact) =>
       artifact.artifact_type === ArtifactType.VisibleElementsTreeInPrompt,
   );
 
-  const llmPrompt = artifacts?.find(
+  const llmPrompt = artifacts?.filter(
     (artifact) => artifact.artifact_type === ArtifactType.LLMPrompt,
   );
 
@@ -74,18 +75,35 @@ function StepArtifacts({ id, stepProps }: Props) {
     (artifact) => artifact.artifact_type === ArtifactType.LLMResponseParsed,
   );
 
-  const htmlRaw = artifacts?.find(
+  const htmlRaw = artifacts?.filter(
     (artifact) => artifact.artifact_type === ArtifactType.HTMLScrape,
   );
 
   return (
-    <Tabs defaultValue="info" className="w-full">
+    <Tabs
+      value={artifact}
+      onValueChange={(value) => {
+        setSearchParams(
+          (params) => {
+            const newParams = new URLSearchParams(params);
+            newParams.set("artifact", value);
+            return newParams;
+          },
+          {
+            replace: true,
+          },
+        );
+      }}
+      className="w-full"
+    >
       <TabsList className="grid h-16 w-full grid-cols-5">
         <TabsTrigger value="info">Info</TabsTrigger>
         <TabsTrigger value="screenshot_llm">Annotated Screenshots</TabsTrigger>
         <TabsTrigger value="screenshot_action">Action Screenshots</TabsTrigger>
-        <TabsTrigger value="element_tree_trimmed">Element Tree</TabsTrigger>
-        <TabsTrigger value="html_element_tree">HTML Element Tree</TabsTrigger>
+        <TabsTrigger value="element_tree_trimmed">
+          HTML Element Tree
+        </TabsTrigger>
+        <TabsTrigger value="element_tree">Element Tree</TabsTrigger>
         <TabsTrigger value="llm_prompt">Prompt</TabsTrigger>
         <TabsTrigger value="llm_response_parsed">Action List</TabsTrigger>
         <TabsTrigger value="html_raw">HTML (Raw)</TabsTrigger>
@@ -165,27 +183,27 @@ function StepArtifacts({ id, stepProps }: Props) {
       </TabsContent>
       <TabsContent value="element_tree_trimmed">
         {visibleElementsTreeInPrompt ? (
-          <HTMLArtifact artifact={visibleElementsTreeInPrompt} />
+          <Artifact type="html" artifacts={visibleElementsTreeInPrompt} />
         ) : null}
       </TabsContent>
-      <TabsContent value="html_element_tree">
+      <TabsContent value="element_tree">
         {visibleElementsTree ? (
-          <JSONArtifact artifacts={visibleElementsTree} />
+          <Artifact type="json" artifacts={visibleElementsTree} />
         ) : null}
       </TabsContent>
       <TabsContent value="llm_prompt">
-        {llmPrompt ? <TextArtifact artifact={llmPrompt} /> : null}
+        {llmPrompt ? <Artifact type="text" artifacts={llmPrompt} /> : null}
       </TabsContent>
       <TabsContent value="llm_response_parsed">
         {llmResponseParsed ? (
-          <JSONArtifact artifacts={llmResponseParsed} />
+          <Artifact type="json" artifacts={llmResponseParsed} />
         ) : null}
       </TabsContent>
       <TabsContent value="html_raw">
-        {htmlRaw ? <TextArtifact artifact={htmlRaw} /> : null}
+        {htmlRaw ? <Artifact type="html" artifacts={htmlRaw} /> : null}
       </TabsContent>
       <TabsContent value="llm_request">
-        {llmRequest ? <JSONArtifact artifacts={llmRequest} /> : null}
+        {llmRequest ? <Artifact type="json" artifacts={llmRequest} /> : null}
       </TabsContent>
     </Tabs>
   );

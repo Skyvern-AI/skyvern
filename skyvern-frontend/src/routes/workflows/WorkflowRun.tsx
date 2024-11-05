@@ -5,6 +5,8 @@ import {
   WorkflowRunStatusApiResponse,
 } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
+import { ZoomableImage } from "@/components/ZoomableImage";
+import { AspectRatio } from "@/components/ui/aspect-ratio";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -25,10 +27,22 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { toast } from "@/components/ui/use-toast";
+import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { basicTimeFormat } from "@/util/timeFormat";
+import { copyText } from "@/util/copyText";
+import { apiBaseUrl, envCredential } from "@/util/env";
+import { basicTimeFormat, timeFormatWithShortDate } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
+import {
+  CopyIcon,
+  Pencil2Icon,
+  PlayIcon,
+  ReaderIcon,
+} from "@radix-ui/react-icons";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import fetchToCurl from "fetch-to-curl";
+import { useEffect, useState } from "react";
 import {
   Link,
   useNavigate,
@@ -37,16 +51,9 @@ import {
 } from "react-router-dom";
 import { TaskActions } from "../tasks/list/TaskActions";
 import { TaskListSkeletonRows } from "../tasks/list/TaskListSkeletonRows";
-import { useEffect, useState } from "react";
 import { statusIsNotFinalized, statusIsRunningOrQueued } from "../tasks/types";
-import { apiBaseUrl, envCredential } from "@/util/env";
-import { toast } from "@/components/ui/use-toast";
-import { CopyIcon, Pencil2Icon, PlayIcon } from "@radix-ui/react-icons";
+import { CodeEditor } from "./components/CodeEditor";
 import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
-import fetchToCurl from "fetch-to-curl";
-import { useApiCredential } from "@/hooks/useApiCredential";
-import { copyText } from "@/util/copyText";
-import { ZoomableImage } from "@/components/ZoomableImage";
 
 type StreamMessage = {
   task_id: string;
@@ -90,6 +97,18 @@ function WorkflowRun() {
         return false;
       },
       placeholderData: keepPreviousData,
+      refetchOnMount: (query) => {
+        if (!query.state.data) {
+          return false;
+        }
+        return statusIsRunningOrQueued(query.state.data);
+      },
+      refetchOnWindowFocus: (query) => {
+        if (!query.state.data) {
+          return false;
+        }
+        return statusIsRunningOrQueued(query.state.data);
+      },
     });
 
   const { data: workflowTasks, isLoading: workflowTasksIsLoading } = useQuery<
@@ -112,7 +131,12 @@ function WorkflowRun() {
     },
     placeholderData: keepPreviousData,
     refetchOnMount: workflowRun?.status === Status.Running,
+    refetchOnWindowFocus: workflowRun?.status === Status.Running,
   });
+
+  const currentRunningTask = workflowTasks?.find(
+    (task) => task.status === Status.Running,
+  );
 
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
@@ -189,7 +213,7 @@ function WorkflowRun() {
   function getStream() {
     if (workflowRun?.status === Status.Created) {
       return (
-        <div className="flex h-full w-full flex-col items-center justify-center gap-8 bg-slate-900 py-8 text-lg">
+        <div className="flex h-full w-full flex-col items-center justify-center gap-8 rounded-md bg-slate-900 py-8 text-lg">
           <span>Workflow has been created.</span>
           <span>Stream will start when the workflow is running.</span>
         </div>
@@ -197,7 +221,7 @@ function WorkflowRun() {
     }
     if (workflowRun?.status === Status.Queued) {
       return (
-        <div className="flex h-full w-full flex-col items-center justify-center gap-8 bg-slate-900 py-8 text-lg">
+        <div className="flex h-full w-full flex-col items-center justify-center gap-8 rounded-md bg-slate-900 py-8 text-lg">
           <span>Your workflow run is queued.</span>
           <span>Stream will start when the workflow is running.</span>
         </div>
@@ -206,7 +230,7 @@ function WorkflowRun() {
 
     if (workflowRun?.status === Status.Running && streamImgSrc.length === 0) {
       return (
-        <div className="flex h-full w-full items-center justify-center bg-slate-900 py-8 text-lg">
+        <div className="flex h-full w-full items-center justify-center rounded-md bg-slate-900 py-8 text-lg">
           Starting the stream...
         </div>
       );
@@ -215,7 +239,10 @@ function WorkflowRun() {
     if (workflowRun?.status === Status.Running && streamImgSrc.length > 0) {
       return (
         <div className="h-full w-full">
-          <ZoomableImage src={`data:image/png;base64,${streamImgSrc}`} />
+          <ZoomableImage
+            src={`data:image/png;base64,${streamImgSrc}`}
+            className="rounded-md"
+          />
         </div>
       );
     }
@@ -240,7 +267,7 @@ function WorkflowRun() {
     <div className="space-y-8">
       <header className="flex justify-between">
         <div className="space-y-3">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-5">
             <h1 className="text-3xl">{workflowRunId}</h1>
             {workflowRunIsLoading ? (
               <Skeleton className="h-8 w-28" />
@@ -308,20 +335,72 @@ function WorkflowRun() {
           </Button>
         </div>
       </header>
-      {getStream()}
-      <div className="space-y-4">
+      {workflowRun && statusIsNotFinalized(workflowRun) && (
+        <div className="flex gap-5">
+          <div className="w-3/4 shrink-0">
+            <AspectRatio ratio={16 / 9}>{getStream()}</AspectRatio>
+          </div>
+          <div className="flex w-full flex-col gap-4 rounded-md bg-slate-elevation1 p-4">
+            <header className="text-lg">Current Task</header>
+            {workflowRunIsLoading || !currentRunningTask ? (
+              <div>Waiting for a task to start...</div>
+            ) : (
+              <div className="flex h-full flex-col gap-2">
+                <div className="flex gap-2 rounded-sm bg-slate-elevation3 p-2">
+                  <Label className="text-sm text-slate-400">ID</Label>
+                  <span className="text-sm">{currentRunningTask.task_id}</span>
+                </div>
+                <div className="flex gap-2 rounded-sm bg-slate-elevation3 p-2">
+                  <Label className="text-sm text-slate-400">URL</Label>
+                  <span className="text-sm">
+                    {currentRunningTask.request.url}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 rounded-sm bg-slate-elevation3 p-2">
+                  <Label className="text-sm text-slate-400">Status</Label>
+                  <span className="text-sm">
+                    <StatusBadge status={currentRunningTask.status} />
+                  </span>
+                </div>
+                <div className="flex gap-2 rounded-sm bg-slate-elevation3 p-2">
+                  <Label className="text-sm text-slate-400">Created</Label>
+                  <span className="text-sm">
+                    {currentRunningTask &&
+                      timeFormatWithShortDate(currentRunningTask.created_at)}
+                  </span>
+                </div>
+                <div className="mt-auto flex justify-end">
+                  <Button asChild>
+                    <Link to={`/tasks/${currentRunningTask.task_id}/actions`}>
+                      <ReaderIcon className="mr-2 h-4 w-4" />
+                      View Actions
+                    </Link>
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+      <div className="space-y-5">
         <header>
-          <h2 className="text-lg font-semibold">Tasks</h2>
+          <h2 className="text-2xl">
+            {workflowRunIsRunningOrQueued ? "Previous Blocks" : "Blocks"}
+          </h2>
         </header>
         <div className="rounded-md border">
           <Table>
-            <TableHeader>
+            <TableHeader className="rounded-t-md bg-slate-elevation1">
               <TableRow>
-                <TableHead className="w-1/4">ID</TableHead>
-                <TableHead className="w-1/4">URL</TableHead>
-                <TableHead className="w-1/6">Status</TableHead>
-                <TableHead className="w-1/4">Created At</TableHead>
-                <TableHead className="w-1/12" />
+                <TableHead className="w-1/4 rounded-tl-md text-slate-400">
+                  ID
+                </TableHead>
+                <TableHead className="w-1/4 text-slate-400">URL</TableHead>
+                <TableHead className="w-1/6 text-slate-400">Status</TableHead>
+                <TableHead className="w-1/4 text-slate-400">
+                  Created At
+                </TableHead>
+                <TableHead className="w-1/12 rounded-tr-md" />
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -332,39 +411,51 @@ function WorkflowRun() {
                   <TableCell colSpan={5}>No tasks</TableCell>
                 </TableRow>
               ) : (
-                workflowTasks?.map((task) => {
-                  return (
-                    <TableRow key={task.task_id}>
-                      <TableCell
-                        className="w-1/4 cursor-pointer"
-                        onClick={(event) => handleNavigate(event, task.task_id)}
-                      >
-                        {task.task_id}
-                      </TableCell>
-                      <TableCell
-                        className="w-1/4 max-w-64 cursor-pointer overflow-hidden overflow-ellipsis whitespace-nowrap"
-                        onClick={(event) => handleNavigate(event, task.task_id)}
-                      >
-                        {task.request.url}
-                      </TableCell>
-                      <TableCell
-                        className="w-1/6 cursor-pointer"
-                        onClick={(event) => handleNavigate(event, task.task_id)}
-                      >
-                        <StatusBadge status={task.status} />
-                      </TableCell>
-                      <TableCell
-                        className="w-1/4 cursor-pointer"
-                        onClick={(event) => handleNavigate(event, task.task_id)}
-                      >
-                        {basicTimeFormat(task.created_at)}
-                      </TableCell>
-                      <TableCell className="w-1/12">
-                        <TaskActions task={task} />
-                      </TableCell>
-                    </TableRow>
-                  );
-                })
+                workflowTasks
+                  ?.filter(
+                    (task) => task.task_id !== currentRunningTask?.task_id,
+                  )
+                  .map((task) => {
+                    return (
+                      <TableRow key={task.task_id}>
+                        <TableCell
+                          className="w-1/4 cursor-pointer"
+                          onClick={(event) =>
+                            handleNavigate(event, task.task_id)
+                          }
+                        >
+                          {task.task_id}
+                        </TableCell>
+                        <TableCell
+                          className="w-1/4 max-w-64 cursor-pointer overflow-hidden overflow-ellipsis whitespace-nowrap"
+                          onClick={(event) =>
+                            handleNavigate(event, task.task_id)
+                          }
+                        >
+                          {task.request.url}
+                        </TableCell>
+                        <TableCell
+                          className="w-1/6 cursor-pointer"
+                          onClick={(event) =>
+                            handleNavigate(event, task.task_id)
+                          }
+                        >
+                          <StatusBadge status={task.status} />
+                        </TableCell>
+                        <TableCell
+                          className="w-1/4 cursor-pointer"
+                          onClick={(event) =>
+                            handleNavigate(event, task.task_id)
+                          }
+                        >
+                          {basicTimeFormat(task.created_at)}
+                        </TableCell>
+                        <TableCell className="w-1/12">
+                          <TaskActions task={task} />
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })
               )}
             </TableBody>
           </Table>
@@ -399,23 +490,34 @@ function WorkflowRun() {
           </Pagination>
         </div>
       </div>
-      <div className="space-y-4">
-        <header>
-          <h2 className="text-lg font-semibold">Parameters</h2>
-        </header>
-        {Object.entries(parameters).map(([key, value]) => {
-          return (
-            <div key={key} className="flex flex-col gap-2">
-              <Label>{key}</Label>
-              {typeof value === "string" ? (
-                <Input value={value} readOnly />
-              ) : (
-                <Input value={JSON.stringify(value)} readOnly />
-              )}
-            </div>
-          );
-        })}
-      </div>
+      {Object.entries(parameters).length > 0 && (
+        <div className="space-y-4">
+          <header>
+            <h2 className="text-lg font-semibold">Input Parameter Values</h2>
+          </header>
+          {Object.entries(parameters).length === 0 && (
+            <div>This workflow doesn't have any input parameters.</div>
+          )}
+          {Object.entries(parameters).map(([key, value]) => {
+            return (
+              <div key={key} className="flex flex-col gap-2">
+                <Label>{key}</Label>
+                {typeof value === "string" ? (
+                  <Input value={value} readOnly />
+                ) : (
+                  <CodeEditor
+                    value={JSON.stringify(value, null, 2)}
+                    readOnly
+                    language="json"
+                    minHeight="96px"
+                    maxHeight="500px"
+                  />
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

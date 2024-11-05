@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = None
     HAR_PATH: str | None = "./har"
+    LOG_PATH: str = "./log"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
     BROWSER_LOADING_TIMEOUT_MS: int = 120000
@@ -34,14 +35,15 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
+    BLOCKED_HOSTS: list[str] = ["localhost"]
 
     # Secret key for JWT. Please generate your own secret key in production
-    SECRET_KEY: str = "RX1NvhujcJqBPi8O78-7aSfJEWuT86-fll4CzKc_uek"
+    SECRET_KEY: str = "PLACEHOLDER"
     # Algorithm used to sign the JWT
     SIGNATURE_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # one week
 
-    SKYVERN_API_KEY: str = "SKYVERN_API_KEY"
+    SKYVERN_API_KEY: str = "PLACEHOLDER"
 
     # Artifact storage settings
     ARTIFACT_STORAGE_PATH: str = f"{SKYVERN_DIR}/artifacts"

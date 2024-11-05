@@ -175,5 +175,11 @@ node_modules
 .env.backup
 .env.old
 
+# ctags
+tags
+tags.lock
+tags.temp
+tags.temp.tmp
+
 ## Replit
 .replit

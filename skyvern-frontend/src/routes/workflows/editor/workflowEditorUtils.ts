@@ -1,7 +1,11 @@
 import Dagre from "@dagrejs/dagre";
+import type { Node } from "@xyflow/react";
 import { Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
 import type {
+  AWSSecretParameter,
+  BitwardenSensitiveInformationParameter,
+  ContextParameter,
   OutputParameter,
   Parameter,
   WorkflowApiResponse,
@@ -33,7 +37,8 @@ import {
   SMTP_USERNAME_AWS_KEY,
   SMTP_USERNAME_PARAMETER_KEY,
 } from "./constants";
-import { AppNode, nodeTypes } from "./nodes";
+import { ParametersState } from "./FlowRenderer";
+import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
 import { fileParserNodeDefaultData } from "./nodes/FileParserNode/types";
@@ -42,8 +47,9 @@ import { NodeAdderNode } from "./nodes/NodeAdderNode/types";
 import { sendEmailNodeDefaultData } from "./nodes/SendEmailNode/types";
 import { taskNodeDefaultData } from "./nodes/TaskNode/types";
 import { textPromptNodeDefaultData } from "./nodes/TextPromptNode/types";
+import { NodeBaseData } from "./nodes/types";
 import { uploadNodeDefaultData } from "./nodes/UploadNode/types";
-import type { Node } from "@xyflow/react";
+import { StartNode } from "./nodes/StartNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -99,7 +105,7 @@ function layout(
     const maxChildWidth = Math.max(
       ...childNodes.map((node) => node.measured?.width ?? 0),
     );
-    const loopNodeWidth = 60 * 16; // 60 rem
+    const loopNodeWidth = 600; // 600 px
     const layouted = layoutUtil(childNodes, childEdges, {
       marginx: (loopNodeWidth - maxChildWidth) / 2,
       marginy: 200,
@@ -126,6 +132,10 @@ function convertToNode(
     position: { x: 0, y: 0 },
     connectable: false,
   };
+  const commonData: NodeBaseData = {
+    label: block.label,
+    continueOnFailure: block.continue_on_failure,
+  };
   switch (block.block_type) {
     case "task": {
       return {
@@ -133,7 +143,7 @@ function convertToNode(
         ...common,
         type: "task",
         data: {
-          label: block.label,
+          ...commonData,
           editable: true,
           url: block.url ?? "",
           navigationGoal: block.navigation_goal ?? "",
@@ -147,6 +157,7 @@ function convertToNode(
           parameterKeys: block.parameters.map((p) => p.key),
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
+          cacheActions: block.cache_actions,
         },
       };
     }
@@ -156,7 +167,7 @@ function convertToNode(
         ...common,
         type: "codeBlock",
         data: {
-          label: block.label,
+          ...commonData,
           editable: true,
           code: block.code,
         },
@@ -168,7 +179,7 @@ function convertToNode(
         ...common,
         type: "sendEmail",
         data: {
-          label: block.label,
+          ...commonData,
           editable: true,
           body: block.body,
           fileAttachments: block.file_attachments.join(", "),
@@ -188,7 +199,7 @@ function convertToNode(
         ...common,
         type: "textPrompt",
         data: {
-          label: block.label,
+          ...commonData,
           editable: true,
           prompt: block.prompt,
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
@@ -201,7 +212,7 @@ function convertToNode(
         ...common,
         type: "loop",
         data: {
-          label: block.label,
+          ...commonData,
           editable: true,
           loopValue: block.loop_over.key,
         },
@@ -213,7 +224,7 @@ function convertToNode(
         ...common,
         type: "fileParser",
         data: {
-          label: block.label,
+          ...commonData,
           editable: true,
           fileUrl: block.file_url,
         },
@@ -226,7 +237,7 @@ function convertToNode(
         ...common,
         type: "download",
         data: {
-          label: block.label,
+          ...commonData,
           editable: true,
           url: block.url,
         },
@@ -239,7 +250,7 @@ function convertToNode(
         ...common,
         type: "upload",
         data: {
-          label: block.label,
+          ...commonData,
           editable: true,
           path: block.path,
         },
@@ -303,6 +314,61 @@ function getNodeData(
   return data;
 }
 
+export function defaultEdge(source: string, target: string) {
+  return {
+    id: nanoid(),
+    type: "default",
+    source,
+    target,
+    style: {
+      strokeWidth: 2,
+    },
+  };
+}
+
+export function edgeWithAddButton(source: string, target: string) {
+  return {
+    id: nanoid(),
+    type: "edgeWithAddButton",
+    source,
+    target,
+    style: {
+      strokeWidth: 2,
+    },
+    zIndex: REACT_FLOW_EDGE_Z_INDEX,
+  };
+}
+
+export function startNode(id: string, parentId?: string): StartNode {
+  const node: StartNode = {
+    id,
+    type: "start",
+    position: { x: 0, y: 0 },
+    data: {},
+    draggable: false,
+    connectable: false,
+  };
+  if (parentId) {
+    node.parentId = parentId;
+  }
+  return node;
+}
+
+export function nodeAdderNode(id: string, parentId?: string): NodeAdderNode {
+  const node: NodeAdderNode = {
+    id,
+    type: "nodeAdder",
+    position: { x: 0, y: 0 },
+    data: {},
+    draggable: false,
+    connectable: false,
+  };
+  if (parentId) {
+    node.parentId = parentId;
+  }
+  return node;
+}
+
 function getElements(blocks: Array<WorkflowBlock>): {
   nodes: Array<AppNode>;
   edges: Array<Edge>;
@@ -321,64 +387,47 @@ function getElements(blocks: Array<WorkflowBlock>): {
     );
     nodes.push(node);
     if (d.previous) {
-      edges.push({
-        id: nanoid(),
-        type: "edgeWithAddButton",
-        source: d.previous,
-        target: d.id,
-        style: {
-          strokeWidth: 2,
-        },
-        zIndex: REACT_FLOW_EDGE_Z_INDEX,
-      });
+      edges.push(edgeWithAddButton(d.previous, d.id));
     }
   });
 
   const loopBlocks = data.filter((d) => d.block.block_type === "for_loop");
   loopBlocks.forEach((block) => {
+    const startNodeId = nanoid();
+    nodes.push(startNode(startNodeId, block.id));
     const children = data.filter((b) => b.parentId === block.id);
+    if (children.length === 0) {
+      const adderNodeId = nanoid();
+      nodes.push(nodeAdderNode(adderNodeId, block.id));
+      edges.push(defaultEdge(startNodeId, adderNodeId));
+    } else {
+      const firstChild = children.find((c) => c.previous === null)!;
+      edges.push(edgeWithAddButton(startNodeId, firstChild.id));
+    }
     const lastChild = children.find((c) => c.next === null);
-    nodes.push({
-      id: `${block.id}-nodeAdder`,
-      type: "nodeAdder",
-      position: { x: 0, y: 0 },
-      data: {},
-      draggable: false,
-      connectable: false,
-      parentId: block.id,
-    });
+    const adderNodeId = nanoid();
+    nodes.push(nodeAdderNode(adderNodeId, block.id));
     if (lastChild) {
-      edges.push({
-        id: `${block.id}-nodeAdder-edge`,
-        type: "default",
-        source: lastChild.id,
-        target: `${block.id}-nodeAdder`,
-        style: {
-          strokeWidth: 2,
-        },
-      });
+      edges.push(defaultEdge(lastChild.id, adderNodeId));
     }
   });
 
-  if (nodes.length > 0) {
-    const lastNode = data.find((d) => d.next === null && d.parentId === null);
-    edges.push({
-      id: "edge-nodeAdder",
-      type: "default",
-      source: lastNode!.id,
-      target: "nodeAdder",
-      style: {
-        strokeWidth: 2,
-      },
-    });
-    nodes.push({
-      id: "nodeAdder",
-      type: "nodeAdder",
-      position: { x: 0, y: 0 },
-      data: {},
-      draggable: false,
-      connectable: false,
-    });
+  const startNodeId = nanoid();
+  const adderNodeId = nanoid();
+
+  if (nodes.length === 0) {
+    nodes.push(startNode(startNodeId));
+    nodes.push(nodeAdderNode(adderNodeId));
+    edges.push(defaultEdge(startNodeId, adderNodeId));
+  } else {
+    const firstNode = data.find(
+      (d) => d.previous === null && d.parentId === null,
+    );
+    nodes.push(startNode(startNodeId));
+    edges.push(edgeWithAddButton(startNodeId, firstNode!.id));
+    const lastNode = data.find((d) => d.next === null && d.parentId === null)!;
+    edges.push(defaultEdge(lastNode.id, adderNodeId));
+    nodes.push(nodeAdderNode(adderNodeId));
   }
 
   return { nodes, edges };
@@ -386,7 +435,7 @@ function getElements(blocks: Array<WorkflowBlock>): {
 
 function createNode(
   identifiers: { id: string; parentId?: string },
-  nodeType: Exclude<keyof typeof nodeTypes, "nodeAdder">,
+  nodeType: NonNullable<WorkflowBlockNode["type"]>,
   label: string,
 ): AppNode {
   const common = {
@@ -493,14 +542,16 @@ function JSONParseSafe(json: string): Record<string, unknown> | null {
   }
 }
 
-function getWorkflowBlock(
-  node: Exclude<AppNode, LoopNode | NodeAdderNode>,
-): BlockYAML {
+function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
+  const base = {
+    label: node.data.label,
+    continue_on_failure: node.data.continueOnFailure,
+  };
   switch (node.type) {
     case "task": {
       return {
+        ...base,
         block_type: "task",
-        label: node.data.label,
         url: node.data.url,
         navigation_goal: node.data.navigationGoal,
         data_extraction_goal: node.data.dataExtractionGoal,
@@ -518,12 +569,13 @@ function getWorkflowBlock(
         parameter_keys: node.data.parameterKeys,
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
+        cache_actions: node.data.cacheActions,
       };
     }
     case "sendEmail": {
       return {
+        ...base,
         block_type: "send_email",
-        label: node.data.label,
         body: node.data.body,
         file_attachments: node.data.fileAttachments
           .split(",")
@@ -543,37 +595,37 @@ function getWorkflowBlock(
     }
     case "codeBlock": {
       return {
+        ...base,
         block_type: "code",
-        label: node.data.label,
         code: node.data.code,
       };
     }
     case "download": {
       return {
+        ...base,
         block_type: "download_to_s3",
-        label: node.data.label,
         url: node.data.url,
       };
     }
     case "upload": {
       return {
+        ...base,
         block_type: "upload_to_s3",
-        label: node.data.label,
         path: node.data.path,
       };
     }
     case "fileParser": {
       return {
+        ...base,
         block_type: "file_url_parser",
-        label: node.data.label,
         file_url: node.data.fileUrl,
         file_type: "csv",
       };
     }
     case "textPrompt": {
       return {
+        ...base,
         block_type: "text_prompt",
-        label: node.data.label,
         llm_key: "",
         prompt: node.data.prompt,
         json_schema: JSONParseSafe(node.data.jsonSchema),
@@ -595,27 +647,28 @@ function getWorkflowBlocksUtil(nodes: Array<AppNode>): Array<BlockYAML> {
         {
           block_type: "for_loop",
           label: node.data.label,
+          continue_on_failure: node.data.continueOnFailure,
           loop_over_parameter_key: node.data.loopValue,
           loop_blocks: nodes
             .filter((n) => n.parentId === node.id)
             .map((n) => {
               return getWorkflowBlock(
-                n as Exclude<AppNode, LoopNode | NodeAdderNode>,
+                n as Exclude<AppNode, LoopNode | NodeAdderNode | StartNode>,
               );
             }),
         },
       ];
     }
     return [
-      getWorkflowBlock(node as Exclude<AppNode, LoopNode | NodeAdderNode>),
+      getWorkflowBlock(
+        node as Exclude<AppNode, LoopNode | NodeAdderNode | StartNode>,
+      ),
     ];
   });
 }
 
 function getWorkflowBlocks(nodes: Array<AppNode>): Array<BlockYAML> {
-  return getWorkflowBlocksUtil(
-    nodes.filter((node) => node.type !== "nodeAdder"),
-  );
+  return getWorkflowBlocksUtil(nodes.filter(isWorkflowBlockNode));
 }
 
 function generateNodeLabel(existingLabels: Array<string>) {
@@ -627,13 +680,6 @@ function generateNodeLabel(existingLabels: Array<string>) {
   }
   throw new Error("Failed to generate a new node label");
 }
-
-import type {
-  AWSSecretParameter,
-  BitwardenSensitiveInformationParameter,
-  ContextParameter,
-} from "../types/workflowTypes";
-import { ParametersState } from "./FlowRenderer";
 
 /**
  * If a parameter is not displayed in the editor, we should echo its value back when saved.
@@ -698,7 +744,7 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
   }
   const oldLabel = labelUpdatedNode.data.label as string;
   return nodes.map((node) => {
-    if (node.type === "nodeAdder") {
+    if (node.type === "nodeAdder" || node.type === "start") {
       return node;
     }
     if (node.type === "task") {
@@ -752,13 +798,13 @@ function getUpdatedParametersAfterLabelUpdateForSourceParameterKey(
   const oldOutputParameterKey = getOutputParameterKey(oldLabel);
   const newOutputParameterKey = getOutputParameterKey(newLabel);
   return parameters.map((parameter) => {
-    if (parameter.parameterType === "context") {
+    if (
+      parameter.parameterType === "context" &&
+      parameter.sourceParameterKey === oldOutputParameterKey
+    ) {
       return {
         ...parameter,
-        sourceParameterKey:
-          parameter.sourceParameterKey === oldOutputParameterKey
-            ? newOutputParameterKey
-            : oldOutputParameterKey,
+        sourceParameterKey: newOutputParameterKey,
       };
     }
     return parameter;
@@ -883,7 +929,7 @@ function getAvailableOutputParameterKeys(
     previousNodeIds.includes(node.id),
   );
   const labels = previousNodes
-    .filter((node) => node.type !== "nodeAdder")
+    .filter(isWorkflowBlockNode)
     .map((node) => node.data.label);
   const outputParameterKeys = labels.map((label) =>
     getOutputParameterKey(label),
@@ -978,6 +1024,7 @@ function convertBlocks(blocks: Array<WorkflowBlock>): Array<BlockYAML> {
           parameter_keys: block.parameters.map((p) => p.key),
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
+          cache_actions: block.cache_actions,
         };
         return blockYaml;
       }
@@ -1055,12 +1102,11 @@ function convertBlocks(blocks: Array<WorkflowBlock>): Array<BlockYAML> {
 }
 
 function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
-  const title = `Copy of ${workflow.title}`;
   const userParameters = workflow.workflow_definition.parameters.filter(
     (parameter) => parameter.parameter_type !== "output",
   );
   return {
-    title: title,
+    title: workflow.title,
     description: workflow.description,
     proxy_location: workflow.proxy_location,
     webhook_callback_url: workflow.webhook_callback_url,
@@ -1074,22 +1120,22 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
 }
 
 export {
+  convert,
+  convertEchoParameters,
   createNode,
   generateNodeData,
-  getElements,
-  getWorkflowBlocks,
-  layout,
   generateNodeLabel,
-  convertEchoParameters,
-  getOutputParameterKey,
-  getUpdatedNodesAfterLabelUpdateForParameterKeys,
   getAdditionalParametersForEmailBlock,
-  getUniqueLabelForExistingNode,
-  isOutputParameterKey,
+  getAvailableOutputParameterKeys,
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,
-  getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
+  getElements,
+  getOutputParameterKey,
   getPreviousNodeIds,
-  getAvailableOutputParameterKeys,
-  convert,
+  getUniqueLabelForExistingNode,
+  getUpdatedNodesAfterLabelUpdateForParameterKeys,
+  getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
+  getWorkflowBlocks,
+  isOutputParameterKey,
+  layout,
 };

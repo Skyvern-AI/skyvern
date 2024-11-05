@@ -21,13 +21,14 @@ Production:`https://api.skyvern.com/api/v1/tasks/`
 
 | Parameter | Type | Required? | Sample Value | Description |
 | --- | --- | --- | --- | --- |
-| webhook_callback_url | String | no | …  | The callback URL once our system is finished processing this async task |
+| url | HttpUrl | yes | https://www.example.com | It must be a http or https URL |
 | navigation_goal | String | no | Apply for a job | The prompt that tells the agent what the user-facing goal is. This is the guiding light for the LLM as it navigates a particular website / sitemap to achieve this specified goal |
 | data_extraction_goal | String | no | Was the job application successful? | The prompt that instructs the agent to extract information once the agent has achieved its user_goal |
 | navigation_payload | Object | no |         "name": "Chris P. Bacon",<br/>"email": "mailto:chris@pbacon.com" | JSON-formatted payload with any “facts” or information that would help the agent perform its job. In the case of navigating an insurance quote, this payload would include any user information to help fill out the insurance flow such as date of birth, or age they got their license, and so on<br/><br/>This can include nested information, and the formatting isn’t validated |
+| webhook_callback_url | HttpUrl | no | …  | The callback URL once our system is finished processing this async task |
 | proxy_location | String | yes | RESIDENTIAL | Proxy location for the web-browsing request. Please pass RESIDENTIAL as a value |
 | extracted_information_schema | JSON | no |  | Used to enforce a JSON schema spec to be enforced in the data_extraction_goal. Similar to https://json-schema.org/ definition. |
-| totp_verification_url | String | no | https://mywebsite.com/two_factor_code | The url of your TOTP endpoint. If this field is provided, Skyvern will call the url to fetch the TOTP/2FA/MFA code when needed |
+| totp_verification_url | HttpUrl | no | https://mywebsite.com/two_factor_code | The url of your TOTP endpoint. If this field is provided, Skyvern will call the url to fetch the TOTP/2FA/MFA code when needed |
 | totp_identifier | String | no | myemail@example.com / 4155558888 | The email address or the phone number which receives the TOTP/2FA/MFA code. If this field is provided, Skyvern will fetch the code that is pushed to [Skyvern's TOTP API](https://docs.skyvern.com/running-tasks/advanced-features#push-code-to-skyvern) |
 
 ## Example Request (Apply for a job)

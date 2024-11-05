@@ -8,12 +8,13 @@ import uuid
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Protocol
 
+import aiofiles
 import structlog
-from playwright.async_api import BrowserContext, Error, Page, Playwright, async_playwright
-from pydantic import BaseModel
+from playwright.async_api import BrowserContext, ConsoleMessage, Error, Page, Playwright
+from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
-from skyvern.constants import REPO_ROOT_DIR
+from skyvern.constants import BROWSER_CLOSE_TIMEOUT, REPO_ROOT_DIR
 from skyvern.exceptions import (
     FailedToNavigateToUrl,
     FailedToReloadPage,
@@ -38,6 +39,33 @@ def get_download_dir(workflow_run_id: str | None, task_id: str | None) -> str:
     LOG.info("Initializing download directory", download_dir=download_dir)
     os.makedirs(download_dir, exist_ok=True)
     return download_dir
+
+
+def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> None:
+    if browser_artifacts.browser_console_log_path is None:
+        log_path = f"{settings.LOG_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{uuid.uuid4()}.log"
+        try:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            # create the empty log file
+            with open(log_path, "w") as _:
+                pass
+        except Exception:
+            LOG.warning(
+                "Failed to create browser log file",
+                log_path=log_path,
+                exc_info=True,
+            )
+            return
+        browser_artifacts.browser_console_log_path = log_path
+
+    async def browser_console_log(msg: ConsoleMessage) -> None:
+        current_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        key_values = " ".join([f"{key}={value}" for key, value in msg.location.items()])
+        format_log = f"{current_time}[{msg.type}]{msg.text} {key_values}\n"
+        await browser_artifacts.append_browser_console_log(format_log)
+
+    LOG.info("browser console log is saved", log_path=browser_artifacts.browser_console_log_path)
+    browser_context.on("console", browser_console_log)
 
 
 class BrowserContextCreator(Protocol):
@@ -72,6 +100,7 @@ class BrowserContextFactory:
                 "--disable-blink-features=AutomationControlled",
                 "--disk-cache-size=1",
                 "--start-maximized",
+                "--kiosk-printing",
             ],
             "ignore_default_args": [
                 "--enable-automation",
@@ -90,12 +119,14 @@ class BrowserContextFactory:
         har_path: str | None = None,
         traces_dir: str | None = None,
         browser_session_dir: str | None = None,
+        browser_console_log_path: str | None = None,
     ) -> BrowserArtifacts:
         return BrowserArtifacts(
             video_artifacts=video_artifacts or [],
             har_path=har_path,
             traces_dir=traces_dir,
             browser_session_dir=browser_session_dir,
+            browser_console_log_path=browser_console_log_path,
         )
 
     @classmethod
@@ -107,15 +138,23 @@ class BrowserContextFactory:
         cls, playwright: Playwright, **kwargs: Any
     ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
         browser_type = SettingsManager.get_settings().BROWSER_TYPE
+        browser_context: BrowserContext | None = None
         try:
             creator = cls._creators.get(browser_type)
             if not creator:
                 raise UnknownBrowserType(browser_type)
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
+            set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
             return browser_context, browser_artifacts, cleanup_func
-        except UnknownBrowserType as e:
-            raise e
         except Exception as e:
+            if browser_context is not None:
+                # FIXME: sometimes it can't close the browser context?
+                LOG.error("unexpected error happens after created browser context, going to close the context")
+                await browser_context.close()
+
+            if isinstance(e, UnknownBrowserType):
+                raise e
+
             raise UnknownErrorWhileCreatingBrowserContext(browser_type, e) from e
 
     @classmethod
@@ -140,6 +179,27 @@ class BrowserArtifacts(BaseModel):
     har_path: str | None = None
     traces_dir: str | None = None
     browser_session_dir: str | None = None
+    browser_console_log_path: str | None = None
+    _browser_console_log_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
+
+    async def append_browser_console_log(self, msg: str) -> int:
+        if self.browser_console_log_path is None:
+            return 0
+
+        async with self._browser_console_log_lock:
+            async with aiofiles.open(self.browser_console_log_path, "a") as f:
+                return await f.write(msg)
+
+    async def read_browser_console_log(self) -> bytes:
+        if self.browser_console_log_path is None:
+            return b""
+
+        async with self._browser_console_log_lock:
+            if not os.path.exists(self.browser_console_log_path):
+                return b""
+
+            async with aiofiles.open(self.browser_console_log_path, "rb") as f:
+                return await f.read()
 
 
 async def _create_headless_chromium(
@@ -174,7 +234,7 @@ class BrowserState:
 
     def __init__(
         self,
-        pw: Playwright | None = None,
+        pw: Playwright,
         browser_context: BrowserContext | None = None,
         page: Page | None = None,
         browser_artifacts: BrowserArtifacts = BrowserArtifacts(),
@@ -208,11 +268,8 @@ class BrowserState:
         proxy_location: ProxyLocation | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
+        organization_id: str | None = None,
     ) -> None:
-        if self.pw is None:
-            LOG.info("Starting playwright")
-            self.pw = await async_playwright().start()
-            LOG.info("playwright is started")
         if self.browser_context is None:
             LOG.info("creating browser context")
             (
@@ -225,13 +282,12 @@ class BrowserState:
                 proxy_location=proxy_location,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
             )
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts
             self.browser_cleanup = browser_cleanup
             LOG.info("browser context is created")
-
-        assert self.browser_context is not None
 
         if await self.get_working_page() is None:
             success = False
@@ -312,6 +368,7 @@ class BrowserState:
         proxy_location: ProxyLocation | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
+        organization_id: str | None = None,
     ) -> Page:
         page = await self.get_working_page()
         if page is not None:
@@ -319,7 +376,11 @@ class BrowserState:
 
         try:
             await self.check_and_fix_state(
-                url=url, proxy_location=proxy_location, task_id=task_id, workflow_run_id=workflow_run_id
+                url=url,
+                proxy_location=proxy_location,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
             )
         except Exception as e:
             error_message = str(e)
@@ -327,14 +388,22 @@ class BrowserState:
                 raise e
             await self.close_current_open_page()
             await self.check_and_fix_state(
-                url=url, proxy_location=proxy_location, task_id=task_id, workflow_run_id=workflow_run_id
+                url=url,
+                proxy_location=proxy_location,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
             )
         await self.__assert_page()
 
         if not await BrowserContextFactory.validate_browser_context(await self.get_working_page()):
             await self.close_current_open_page()
             await self.check_and_fix_state(
-                url=url, proxy_location=proxy_location, task_id=task_id, workflow_run_id=workflow_run_id
+                url=url,
+                proxy_location=proxy_location,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
             )
             await self.__assert_page()
 
@@ -350,7 +419,7 @@ class BrowserState:
     async def stop_page_loading(self) -> None:
         page = await self.__assert_page()
         try:
-            await page.evaluate("window.stop()")
+            await SkyvernFrame.evaluate(frame=page, expression="window.stop()")
         except Exception as e:
             LOG.exception(f"Error while stop loading the page: {repr(e)}")
             raise FailedToStopLoadingPage(url=page.url, error_message=repr(e))
@@ -374,17 +443,26 @@ class BrowserState:
 
     async def close(self, close_browser_on_completion: bool = True) -> None:
         LOG.info("Closing browser state")
-        if self.browser_context and close_browser_on_completion:
-            LOG.info("Closing browser context and its pages")
-            await self.browser_context.close()
-            LOG.info("Main browser context and all its pages are closed")
-            if self.browser_cleanup is not None:
-                self.browser_cleanup()
-                LOG.info("Main browser cleanup is excuted")
-        if self.pw and close_browser_on_completion:
-            LOG.info("Stopping playwright")
-            await self.pw.stop()
-            LOG.info("Playwright is stopped")
+        try:
+            async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+                if self.browser_context and close_browser_on_completion:
+                    LOG.info("Closing browser context and its pages")
+                    await self.browser_context.close()
+                    LOG.info("Main browser context and all its pages are closed")
+                    if self.browser_cleanup is not None:
+                        self.browser_cleanup()
+                        LOG.info("Main browser cleanup is excuted")
+        except asyncio.TimeoutError:
+            LOG.error("Timeout to close browser context, going to stop playwright directly")
+
+        try:
+            async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+                if self.pw and close_browser_on_completion:
+                    LOG.info("Stopping playwright")
+                    await self.pw.stop()
+                    LOG.info("Playwright is stopped")
+        except asyncio.TimeoutError:
+            LOG.error("Timeout to close playwright, might leave the broswer opening forever")
 
     async def take_screenshot(self, full_page: bool = False, file_path: str | None = None) -> bytes:
         page = await self.__assert_page()

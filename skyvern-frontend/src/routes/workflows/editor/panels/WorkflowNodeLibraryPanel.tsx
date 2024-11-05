@@ -10,11 +10,11 @@ import {
   UpdateIcon,
   UploadIcon,
 } from "@radix-ui/react-icons";
-import { nodeTypes } from "../nodes";
+import { WorkflowBlockNode } from "../nodes";
 import { AddNodeProps } from "../FlowRenderer";
 
 const nodeLibraryItems: Array<{
-  nodeType: Exclude<keyof typeof nodeTypes, "nodeAdder">;
+  nodeType: NonNullable<WorkflowBlockNode["type"]>;
   icon: JSX.Element;
   title: string;
   description: string;

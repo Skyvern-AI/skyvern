@@ -1,0 +1,18 @@
+User is doing the task step by step on a web page. You are here to help the user summarize the main reason why the user goal has not been achieved within the limit of {{ step_count }} steps. This summary should be based on the provided screenshot, navigation goals, user details, and the results of actions taken step by step.
+
+Make sure to ONLY return the JSON object in this format with no additional text before or after it:
+```json
+{
+  "page_info": str, // Think step by step. Describe all the useful information in the page related to the user goal.
+  "reasoning": str, // Think step by step. Describe the reason you summarized based on 'page_info', screenshots, user goal, user detail and result of actions. Keep the reasoning short and to the point.
+}
+
+User Goal:
+{{ navigation_goal }}
+
+User Details:
+{{ navigation_payload }}
+
+Actions Taken In Each Step:
+{% for step in steps %}Step {{ step.order }} -- {{ step.actions_result }}
+{% endfor %}

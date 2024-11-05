@@ -11,16 +11,18 @@ from pydantic import BaseModel
 
 from skyvern.constants import SKYVERN_DIR, SKYVERN_ID_ATTR
 from skyvern.exceptions import FailedToTakeScreenshot, UnknownElementTreeFormat
+from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
-CleanupElementTreeFunc = Callable[[str, list[dict]], Awaitable[list[dict]]]
+CleanupElementTreeFunc = Callable[[Page | Frame, str, list[dict]], Awaitable[list[dict]]]
 
 RESERVED_ATTRIBUTES = {
     "accept",  # for input file
     "alt",
+    "shape-description",  # for css shape
     "aria-checked",  # for option tag
     "aria-current",
     "aria-label",
@@ -31,6 +33,7 @@ RESERVED_ATTRIBUTES = {
     "data-original-title",  # for bootstrap tooltip
     "data-ui",
     "disabled",  # for button
+    "aria-disabled",
     "for",
     "href",  # For a tags
     "maxlength",
@@ -120,17 +123,50 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
     if element.get("purgeable", False):
         return children_html + option_html
 
+    before_pseudo_text = element.get("beforePseudoText") or ""
+    after_pseudo_text = element.get("afterPseudoText") or ""
+
     # Check if the element is self-closing
-    if tag in ["img", "input", "br", "hr", "meta", "link"] and not option_html and not children_html:
+    if (
+        tag in ["img", "input", "br", "hr", "meta", "link"]
+        and not option_html
+        and not children_html
+        and not before_pseudo_text
+        and not after_pseudo_text
+    ):
         return f'<{tag}{attributes_html if not attributes_html else " "+attributes_html}>'
     else:
-        return f'<{tag}{attributes_html if not attributes_html else " "+attributes_html}>{text}{children_html+option_html}</{tag}>'
+        return f'<{tag}{attributes_html if not attributes_html else " "+attributes_html}>{before_pseudo_text}{text}{children_html+option_html}{after_pseudo_text}</{tag}>'
 
 
-def build_element_dict(elements: list[dict]) -> tuple[dict[str, str], dict[str, dict], dict[str, str]]:
+def clean_element_before_hashing(element: dict) -> dict:
+    element_copy = copy.deepcopy(element)
+    element_copy.pop("id", None)
+    element_copy.pop("rect", None)
+    if "attributes" in element_copy:
+        element_copy["attributes"].pop(SKYVERN_ID_ATTR, None)
+    if "children" in element_copy:
+        for idx, child in enumerate(element_copy["children"]):
+            element_copy["children"][idx] = clean_element_before_hashing(child)
+    return element_copy
+
+
+def hash_element(element: dict) -> str:
+    hash_ready_element = clean_element_before_hashing(element)
+    # Sort the keys to ensure consistent ordering
+    element_string = json.dumps(hash_ready_element, sort_keys=True)
+
+    return calculate_sha256(element_string)
+
+
+def build_element_dict(
+    elements: list[dict],
+) -> tuple[dict[str, str], dict[str, dict], dict[str, str], dict[str, str], dict[str, list[str]]]:
     id_to_css_dict: dict[str, str] = {}
     id_to_element_dict: dict[str, dict] = {}
     id_to_frame_dict: dict[str, str] = {}
+    id_to_element_hash: dict[str, str] = {}
+    hash_to_element_ids: dict[str, list[str]] = {}
 
     for element in elements:
         element_id: str = element.get("id", "")
@@ -138,8 +174,11 @@ def build_element_dict(elements: list[dict]) -> tuple[dict[str, str], dict[str, 
         id_to_css_dict[element_id] = f"[{SKYVERN_ID_ATTR}='{element_id}']"
         id_to_element_dict[element_id] = element
         id_to_frame_dict[element_id] = element["frame"]
+        element_hash = hash_element(element)
+        id_to_element_hash[element_id] = element_hash
+        hash_to_element_ids[element_hash] = hash_to_element_ids.get(element_hash, []) + [element_id]
 
-    return id_to_css_dict, id_to_element_dict, id_to_frame_dict
+    return id_to_css_dict, id_to_element_dict, id_to_frame_dict, id_to_element_hash, hash_to_element_ids
 
 
 class ElementTreeFormat(StrEnum):
@@ -163,6 +202,8 @@ class ScrapedPage(BaseModel):
     id_to_element_dict: dict[str, dict] = {}
     id_to_frame_dict: dict[str, str] = {}
     id_to_css_dict: dict[str, str]
+    id_to_element_hash: dict[str, str]
+    hash_to_element_ids: dict[str, list[str]]
     element_tree: list[dict]
     element_tree_trimmed: list[dict]
     screenshots: list[bytes]
@@ -243,7 +284,7 @@ async def get_frame_text(iframe: Frame) -> str:
     js_script = "() => document.body.innerText"
 
     try:
-        text = await iframe.evaluate(js_script)
+        text = await SkyvernFrame.evaluate(frame=iframe, expression=js_script)
     except Exception:
         LOG.warning(
             "failed to get text from iframe",
@@ -307,9 +348,15 @@ async def scrape_web_unsafe(
     screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=url, draw_boxes=True)
 
     elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
-    element_tree = await cleanup_element_tree(url, copy.deepcopy(element_tree))
+    element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))
 
-    id_to_css_dict, id_to_element_dict, id_to_frame_dict = build_element_dict(elements)
+    id_to_css_dict, id_to_element_dict, id_to_frame_dict, id_to_element_hash, hash_to_element_ids = build_element_dict(
+        elements
+    )
+
+    # if there are no elements, fail the scraping
+    if not elements:
+        raise Exception("No elements found on the page")
 
     text_content = await get_frame_text(page.main_frame)
 
@@ -329,6 +376,8 @@ async def scrape_web_unsafe(
         id_to_css_dict=id_to_css_dict,
         id_to_element_dict=id_to_element_dict,
         id_to_frame_dict=id_to_frame_dict,
+        id_to_element_hash=id_to_element_hash,
+        hash_to_element_ids=hash_to_element_ids,
         element_tree=element_tree,
         element_tree_trimmed=trim_element_tree(copy.deepcopy(element_tree)),
         screenshots=screenshots,
@@ -368,8 +417,10 @@ async def get_interactable_element_tree_in_frame(
 
         frame_js_script = f"() => buildTreeFromBody('{unique_id}')"
 
-        await frame.evaluate(JS_FUNCTION_DEFS)
-        frame_elements, frame_element_tree = await frame.evaluate(frame_js_script)
+        await SkyvernFrame.evaluate(frame=frame, expression=JS_FUNCTION_DEFS)
+        frame_elements, frame_element_tree = await SkyvernFrame.evaluate(
+            frame=frame, expression=frame_js_script, timeout_ms=60 * 1000
+        )
 
         if len(frame.child_frames) > 0:
             frame_elements, frame_element_tree = await get_interactable_element_tree_in_frame(
@@ -401,9 +452,11 @@ async def get_interactable_element_tree(
     :param page: Page instance to get the element tree from.
     :return: Tuple containing the element tree and a map of element IDs to elements.
     """
-    await page.evaluate(JS_FUNCTION_DEFS)
+    await SkyvernFrame.evaluate(frame=page, expression=JS_FUNCTION_DEFS)
     main_frame_js_script = "() => buildTreeFromBody()"
-    elements, element_tree = await page.evaluate(main_frame_js_script)
+    elements, element_tree = await SkyvernFrame.evaluate(
+        frame=page, expression=main_frame_js_script, timeout_ms=60 * 1000
+    )
 
     if len(page.main_frame.child_frames) > 0:
         elements, element_tree = await get_interactable_element_tree_in_frame(
@@ -432,13 +485,15 @@ class IncrementalScrapePage:
         frame = self.skyvern_frame.get_frame()
 
         js_script = "() => getIncrementElements()"
-        incremental_elements, incremental_tree = await frame.evaluate(js_script)
+        incremental_elements, incremental_tree = await SkyvernFrame.evaluate(
+            frame=frame, expression=js_script, timeout_ms=60 * 1000
+        )
         # we listen the incremental elements seperated by frames, so all elements will be in the same SkyvernFrame
-        self.id_to_css_dict, self.id_to_element_dict, _ = build_element_dict(incremental_elements)
+        self.id_to_css_dict, self.id_to_element_dict, _, _, _ = build_element_dict(incremental_elements)
 
         self.elements = incremental_elements
 
-        incremental_tree = await cleanup_element_tree(frame.url, copy.deepcopy(incremental_tree))
+        incremental_tree = await cleanup_element_tree(frame, frame.url, copy.deepcopy(incremental_tree))
         trimmed_element_tree = trim_element_tree(copy.deepcopy(incremental_tree))
 
         self.element_tree = incremental_tree
@@ -448,15 +503,15 @@ class IncrementalScrapePage:
 
     async def start_listen_dom_increment(self) -> None:
         js_script = "() => startGlobalIncrementalObserver()"
-        await self.skyvern_frame.get_frame().evaluate(js_script)
+        await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script)
 
     async def stop_listen_dom_increment(self) -> None:
         js_script = "() => stopGlobalIncrementalObserver()"
-        await self.skyvern_frame.get_frame().evaluate(js_script)
+        await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script)
 
     async def get_incremental_elements_num(self) -> int:
         js_script = "() => window.globalOneTimeIncrementElements.length"
-        return await self.skyvern_frame.get_frame().evaluate(js_script)
+        return await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script)
 
     async def __validate_element_by_value(self, value: str, element: dict) -> tuple[Locator | None, bool]:
         """
@@ -512,6 +567,22 @@ class IncrementalScrapePage:
         return "".join([json_to_html(element) for element in (element_tree or self.element_tree_trimmed)])
 
 
+def _should_keep_unique_id(element: dict) -> bool:
+    # case where we shouldn't keep unique_id
+    # 1. not disable attr and no interactable
+    # 2. disable=false and intrecatable=false
+
+    attributes = element.get("attributes", {})
+    if "disabled" not in attributes and "aria-disabled" not in attributes:
+        return element.get("interactable", False)
+
+    disabled = attributes.get("disabled")
+    aria_disabled = attributes.get("aria-disabled")
+    if disabled or aria_disabled:
+        return True
+    return element.get("interactable", False)
+
+
 def trim_element(element: dict) -> dict:
     queue = [element]
     while queue:
@@ -519,7 +590,7 @@ def trim_element(element: dict) -> dict:
         if "frame" in queue_ele:
             del queue_ele["frame"]
 
-        if "id" in queue_ele and not queue_ele.get("interactable"):
+        if "id" in queue_ele and not _should_keep_unique_id(queue_ele):
             del queue_ele["id"]
 
         if "attributes" in queue_ele:
@@ -547,6 +618,13 @@ def trim_element(element: dict) -> dict:
             element_text = str(queue_ele["text"]).strip()
             if not element_text:
                 del queue_ele["text"]
+
+        if "beforePseudoText" in queue_ele and not queue_ele.get("beforePseudoText"):
+            del queue_ele["beforePseudoText"]
+
+        if "afterPseudoText" in queue_ele and not queue_ele.get("afterPseudoText"):
+            del queue_ele["afterPseudoText"]
+
     return element
 
 

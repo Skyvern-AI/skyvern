@@ -14,9 +14,7 @@
 </p>
 <p align="center">
   <a href="https://www.skyvern.com/"><img src="https://img.shields.io/badge/Website-blue?logo=googlechrome&logoColor=black"/></a>
-  <!-- 
   <a href="https://docs.skyvern.com/"><img src="https://img.shields.io/badge/Docs-yellow?logo=gitbook&logoColor=black"/></a>
-  -->
   <a href="https://discord.gg/fG2XXEuQX3"><img src="https://img.shields.io/discord/1212486326352617534?logo=discord&label=discord"/></a>
   <!-- <a href="https://pepy.tech/project/skyvern" target="_blank"><img src="https://static.pepy.tech/badge/skyvern" alt="Total Downloads"/></a> -->
   <a href="https://github.com/skyvern-ai/skyvern"><img src="https://img.shields.io/github/stars/skyvern-ai/skyvern" /></a>
@@ -33,7 +31,7 @@
 
 Traditional approaches to browser automations required writing custom scripts for websites, often relying on DOM parsing and XPath-based interactions which would break whenever the website layouts changed.
 
-Instead of only relying on code-defined XPath interactions, Skyvern relies on prompts in addition to computer vision and LLMs to the mix to parse items in the viewport in real-time, create a plan for interaction and interact with them.
+Instead of only relying on code-defined XPath interactions, Skyvern relies on prompts in addition to computer vision and LLMs to parse items in the viewport in real-time, create a plan for interaction and interact with them.
 
 This approach gives us a few advantages:
 
@@ -50,34 +48,38 @@ Want to see examples of Skyvern in action? Jump to [#real-world-examples-of-skyv
 # How it works
 Skyvern was inspired by the Task-Driven autonomous agent design popularized by [BabyAGI](https://github.com/yoheinakajima/babyagi) and [AutoGPT](https://github.com/Significant-Gravitas/AutoGPT) -- with one major bonus: we give Skyvern the ability to interact with websites using browser automation libraries like [Playwright](https://playwright.dev/).
 
+Skyvern uses a swarm of agents to comprehend a website, and plan and execute its actions:
+1. **Interactable Element Agent**: This agent is responsible for parsing the HTML of a website and extracting the interactable elements. 
+2. **Navigation Agent**: This agent is responsible for planning the navigation to complete a task. Examples include clicking buttons, inserting text, selecting options, etc.
+3. **Data Extraction Agent**: This agent is responsible for extracting data from a website. It's capable of reading the tables and text on the page, and extracting the output in a user-defined structured format
+4. **Password Agent**: This agent is responsible for filling out password forms on a website. It's capable of reading the username and password from a password manager, and filling out the form while preserving the privacy of the user-defined secrets.
+5. **2FA Agent**: This agent is responsible for filling out 2FA forms on a website. It's capable of  intercepting website requests for 2FAs, and either requesting user-defined APIs for 2FA codes or waiting for users to feed 2FA codes into it, and then completing the login process.
+6. **Dynamic Auto-complete Agent**: This agent is responsible for filling out dynamic auto-complete forms on a website. It's capable of reading the options presented to it, selecting the appropriate option based on the user's input, and adjusting its inputs based on the feedback from inside the form. Popular examples include: Address forms, university dropdowns, and more.
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/skyvern-system-diagram-dark.png" />
   <img src="docs/images/skyvern-system-diagram-light.png" />
 </picture>
 
-<!-- TODO (suchintan): 
-Expand the diagram above to go deeper into how:
-1. We draw bounding boxes
-2. We parse the HTML + extract the image to generate an interactable element map
--->
-
 # Demo
-https://github.com/Skyvern-AI/skyvern/assets/3853670/4fd87a66-39a1-4c3b-b9ac-64c165da6336
+<!-- Redo demo -->
+https://github.com/user-attachments/assets/5cab4668-e8e2-4982-8551-aab05ff73a7f
+
+
 
 
 # Skyvern Cloud
-We offer a managed cloud version of Skyvern that allows you to run Skyvern without having to manage the infrastructure. It allows to you run multiple Skyvern instances in parallel to automate your workflows at scale. In addition, Skyvern cloud comes bundled with anti-bot detection mechanisms, proxy network, and CAPTCHA solving to allow you to complete more complicated workflows.
+We offer a managed cloud version of Skyvern that allows you to run Skyvern without having to manage the infrastructure. It allows you to run multiple Skyvern instances in parallel to automate your workflows at scale. In addition, Skyvern cloud comes bundled with anti-bot detection mechanisms, proxy network, and CAPTCHA solving to allow you to complete more complicated workflows.
 
 If you'd like to try it out, 
 1. Navigate to [app.skyvern.com](https://app.skyvern.com)
-2. Create an account
-3. Set up your credit card information to get $5 of credits on us
-4. Kick off your first task and see Skyvern in action!
+1. Create an account & Get $5 of credits on us
+1. Kick off your first task and see Skyvern in action!
 
 Here are some tips that may help you on your adventure:
-1. Skyvern is really good at carrying out one task. If you give it too many instructions to do, it has a high likelihood of getting confused along the way.
-2. Being really explicit about goals is very important. For example, if you're generating an insurance quote, let it know very clearly how it can identify it's accomplished its goals. Use words like "COMPLETE" or "TERMINATE" to indicate success and failure modes, respectively.
-3. If you'd like to do more advanced things such as chaining multiple instructions together, or securely logging in, please feel free to book some time with me! I'm always happy to help
+1. Skyvern is really good at carrying out a single goal. If you give it too many instructions to do, it has a high likelihood of getting confused along the way. 
+2. Being really explicit about goals is very important. For example, if you're generating an insurance quote, let it know very clearly how it can identify it has accomplished its goals. Use words like "COMPLETE" or "TERMINATE" to indicate success and failure modes, respectively.
+3. Workflows can be used if you'd like to do more advanced things such as chaining multiple instructions together, or securely logging in. If you need any help with this, please feel free to book some time with us! We're always happy to help
 
 
 # Quickstart
@@ -88,7 +90,7 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
 1. Make sure you have [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running on your machine
 1. Make sure you don't have postgres running locally (Run `docker ps` to check)
 1. Clone the repository and navigate to the root directory
-1. Fill in the LLM provider key on the [docker-compose.yml](./docker-compose.yml)
+1. Fill in the LLM provider key on the [docker-compose.yml](./docker-compose.yml). *If you want to run Skyvern on a remote server, make sure you set the correct server ip for the UI container in [docker-compose.yml](./docker-compose.yml).*
 2. Run the following command via the commandline:
    ```bash
     docker compose up -d
@@ -99,6 +101,8 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
 ## Full Setup (Contributors) - Prerequisites 
 
 ### :warning: :warning: MAKE SURE YOU ARE USING PYTHON 3.11 :warning: :warning:
+:warning: :warning: Only well-tested on MacOS :warning: :warning:
+
 Before you begin, make sure you have the following installed:
 
 - [Brew (if you're on a Mac)](https://brew.sh/)
@@ -137,57 +141,75 @@ If you're looking to contribute to Skyvern, you'll need to install the pre-commi
 pre-commit install
 ```
 
-## Running your first automation
+# Supported Functionality
+## Skyvern Tasks
+Tasks are the fundamental building block inside Skyvern. Each task is a single request to Skyvern, instructing it to navigate through a website and accomplish a specific goal. 
 
-### Executing tasks (UI)
-Once you have the UI running, you can start an automation by filling out the fields shown in the UI and clicking "Execute" 
-
-<p align="center" >
-  <img src="docs/images/skyvern_visualizer_run_task.png"/>
-</p>
-
-### Executing tasks (cURL)
-
-```
-curl -X POST -H 'Content-Type: application/json' -H 'x-api-key: {Your local API key}' -d '{
-    "url": "https://www.geico.com",
-    "webhook_callback_url": "",
-    "navigation_goal": "Navigate through the website until you generate an auto insurance quote. Do not generate a home insurance quote. If this page contains an auto insurance quote, consider the goal achieved",
-    "data_extraction_goal": "Extract all quote information in JSON format including the premium amount, the timeframe for the quote.",
-    "navigation_payload": "{Your data here}",
-    "proxy_location": "NONE"
-}' http://0.0.0.0:8000/api/v1/tasks
-```
-
-## Debugging Skyvern
-Skyvern's visualizer allows you to debug every interaction Skyvern takes on the web.
-
-https://github.com/Skyvern-AI/skyvern/assets/3853670/99827aaf-6818-420e-a90a-edc1593ff71e
-
-
-### Tasks, Steps, and Actions
-Each API request you sent to Skyvern is called a "task". Each task is made up of "steps" which are the individual actions Skyvern takes to complete the task. Each step is made up of "actions" which are the individual interactions Skyvern takes on a particular website.
-
-Every time you call the API, you will be given a task_id you can use to find a task within the visualizer. Within each task, you'll be able to interact with each step, and see the specific actions Skyvern took to complete the task.
-
-In the screenshot below, we're navigating to finditparts.com and searching for a truck part. You'll see each action it took listed there, alongside the reasoning behind each action.
-<p align="center">
-  <img src="docs/images/skyvern_visualizer_debug_llm_response.png"/>
-</p>
-
-
-In addition to the actions suggested by the LLM in text form, Skyvern's visualizer also shows the state of the screen at the time of the action, with a 1:1 action to screenshot mapping. This allows you to see exactly what Skyvern saw when it made a decision, and debug any issues that may have arisen. 
+Tasks require you to specify a `url`, `navigation_goal`, and optionally `data_extraction_goal` if you'd like to extract data from the website, and a `navigation_payload` if you'd like to provide additional context to help Skyvern fill information or answer questions presented by a website.
 
 <p align="center">
-  <img src="docs/images/skyvern_visualizer_debug_action_screenshot.png"/>
+  <img src="docs/images/task_creation_form_example.png"/>
 </p>
 
+
+## Skyvern Workflows
+Workflows are a way to chain multiple tasks together to form a cohesive unit of work. 
+
+For example, if you wanted to download all invoices newer than January 1st, you could create a workflow that first navigated to the invoices page, then filtered down to only show invoices newer than January 1st, extracted a list of all eligible invoices, and iterated through each invoice to download it.
+
+Another example is if you wanted to automate purchasing products from an e-commerce store, you could create a workflow that first navigated to the desired product, then added it to a cart. Second, it would navigate to the cart and validate the cart state. Finally, it would go through the checkout process to purchase the items.
+
+Supported workflow features include:
+1. Tasks (+ chained tasks)
+1. Loops
+1. File parsing
+1. Uploading files to block storage
+1. Sending emails
+1. Text Prompts
+1. (Coming soon) Conditionals
+1. (Coming soon) Custom Code Block
+
+<p align="center">
+  <img src="docs/images/invoice_downloading_workflow_example.png"/>
+</p>
+
+## Livestreaming
+Skyvern allows you to livestream the viewport of the browser to your local machine so that you can see exactly what Skyvern is doing on the web. This is useful for debugging and understanding how Skyvern is interacting with a website, and intervening when necessary
+
+## Form Filling
+Skyvern is natively capable of filling out form inputs on websites. Passing in information via the `navigation_goal` or `navigation_payload` will allow Skyvern to comprehend the information and fill out the form accordingly.
+
+## Data Extraction
+Skyvern is also capable of extracting data from a website. Specifying a `data_extraction_goal` will allow Skyvern to extract the data and return it to you in the response.
+
+You can also specify a `data_extraction_schema` to tell Skyvern exactly what data you'd like to extract from the website, in jsonc format. Skyvern's output will be structured in accordance to the supplied schema.
+
+## File Downloading
+Skyvern is also capable of downloading files from a website. Specifying a `file_download_goal` will allow Skyvern to download the file and return a link to the file in the response.
+
+## Authentication
+Skyvern supports a number of different authentication methods to make it easier to automate tasks behind a login. 
+
+### Password Manager Integrations
+Skyvern currently supports the following password manager integrations:
+- [x] Bitwarden 
+- [ ] 1Password
+- [ ] LastPass
+
+<p align="center">
+  <img src="docs/images/secure_password_task_example.png"/>
+</p>
+
+### 2FA
+Skyvern supports a number of different 2FA methods to allow you to automate workflows that require 2FA. 
+
+Examples include:
+1. QR-based 2FA (e.g. Google Authenticator, Authy) 
+1. Email based 2FA
+1. SMS based 2FA
 
 
 # Real-world examples of Skyvern
-<!-- > TODO (suchintan):
-Preload these examples inside of our UI so that users can see them in action
-Provide a way to run these examples in the UI (via the commandline?) -->
 We love to see how Skyvern is being used in the wild. Here are some examples of how Skyvern is being used to automate workflows in the real world. Please open PRs to add your own examples!
 
 You'll need to have Skyvern running locally if you want to try these examples out. Please run the following command after going through the quickstart guide:
@@ -196,72 +218,64 @@ You'll need to have Skyvern running locally if you want to try these examples ou
 ```
 
 ## Invoice Downloading on many different websites
-Reach out to us (founders@skyvern.com) to see this live
+[Book a demo to see it live](https://meetings.hubspot.com/skyvern/demo)
 
 <p align="center">
   <img src="docs/images/invoice_downloading.gif"/>
 </p>
 
 ## Automate the job application process
-💡 See it in action at [app.skyvern.com](https://app.skyvern.com)
+[💡 See it in action](https://app.skyvern.com/create/job_application)
 <p align="center">
   <img src="docs/images/job_application_demo.gif"/>
 </p>
 
 ## Automate materials procurement for a manufacturing company
-💡 See it in action
-```
-./run_ui.sh finditparts
-```
+[💡 See it in action](https://app.skyvern.com/create/finditparts)
 <p align="center">
   <img src="docs/images/finditparts_recording_crop.gif"/>
 </p>
 
 ## Navigating to government websites to register accounts or fill out forms 
-💡 See it in action
-```
-./run_ui.sh california_edd 
-```
+[💡 See it in action](https://app.skyvern.com/create/california_edd)
 <p align="center">
   <img src="docs/images/edd_services.gif"/>
 </p>
 <!-- Add example of delaware entity lookups x2 -->
 
+## Filling out random contact us forms
+[💡 See it in action](https://app.skyvern.com/create/contact_us_forms)
+<p align="center">
+  <img src="docs/images/contact_forms.gif"/>
+</p>
+
+
 ## Retrieving insurance quotes from insurance providers in any language
-💡 See it in action
-```
-./run_ui.sh bci_seguros
-```
+[💡 See it in action](https://app.skyvern.com/create/bci_seguros)
 <p align="center">
   <img src="docs/images/bci_seguros_recording.gif"/>
 </p>
 
-💡 See it in action
-```
-./run_ui.sh geico
-```
+[💡 See it in action](https://app.skyvern.com/create/geico)
+
 <p align="center">
   <img src="docs/images/geico_shu_recording_cropped.gif"/>
 </p>
 
-<!---
-[## Documentation]
+# Documentation
 
-More extensive documentation can be found on our [documentation website](https://docs.skyvern.ai). Please let us know if something is unclear or missing by opening an issue or reaching out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
---->
+More extensive documentation can be found on our [documentation website](https://docs.skyvern.com). Please let us know if something is unclear or missing by opening an issue or reaching out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
 
-# Frequently Asked Questions (FAQs)
-## What gets us excited about Skyvern?
-Our focus is bringing stability to browser-based workflows. We leverage LLMs to create an AI Agent capable of interacting with websites like you or I would — all via a simple API call.
-## Skyvern Configurations
-### Skyvern Agent
-#### Supported LLMs
+# Supported LLMs
 | Provider | Supported Models |
 | -------- | ------- |
 | OpenAI   | gpt4-turbo, gpt-4o, gpt-4o-mini |
 | Anthropic | Claude 3 (Haiku, Sonnet, Opus), Claude 3.5 (Sonnet) |
 | Azure OpenAI | Any GPT models. Better performance with a multimodal llm (azure/gpt4-o) |
 | AWS Bedrock | Anthropic Claude 3 (Haiku, Sonnet, Opus), Claude 3.5 (Sonnet) |
+| Ollama | Coming soon (contributions welcome) |
+| Gemini | Coming soon (contributions welcome) |
+| Llama 3.2 | Coming soon (contributions welcome) | 
 
 #### Environment Variables
 | Variable | Description| Type | Sample Value|
@@ -279,22 +293,26 @@ Our focus is bringing stability to browser-based workflows. We leverage LLMs to 
 | `AZURE_DEPLOYMENT` | Azure OpenAI Deployment Name | String | `skyvern-deployment`|
 | `AZURE_API_BASE` | Azure deployment api base url| String | `https://skyvern-deployment.openai.azure.com/`|
 | `AZURE_API_VERSION` | Azure API Version| String | `2024-02-01`|
-### Skyvern UI
 
 # Feature Roadmap
 This is our planned roadmap for the next few months. If you have any suggestions or would like to see a feature added, please don't hesitate to reach out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
 
 - [x] **Open Source** - Open Source Skyvern's core codebase
 - [x] **[BETA] Workflow support** - Allow support to chain multiple Skyvern calls together
-- [ ] **Improved context** - Improve Skyvern's ability to understand content around interactable elements by introducing feeding relevant label context through the text prompt
-- [ ] **Cost Savings** - Improve Skyvern's stability and reduce the cost of running Skyvern by optimizing the context tree passed into Skyvern
-- [ ] **Self-serve UI** - Deprecate the Streamlit UI in favour of a React-based UI component that allows users to kick off new jobs in Skyvern
+- [x] **Improved context** - Improve Skyvern's ability to understand content around interactable elements by introducing feeding relevant label context through the text prompt
+- [x] **Cost Savings** - Improve Skyvern's stability and reduce the cost of running Skyvern by optimizing the context tree passed into Skyvern
+- [x] **Self-serve UI** - Deprecate the Streamlit UI in favour of a React-based UI component that allows users to kick off new jobs in Skyvern
+- [x] **Workflow UI Builder** - Introduce a UI to allow users to build and analyze workflows visually
+- [x] **Chrome Viewport streaming** - Introduce a way to live-stream the Chrome viewport to the user's browser (as a part of the self-serve UI)
+- [x] **Past Runs UI** - Deprecate the Streamlit UI in favour of a React-based UI that allows you to visualize past runs and their results
 - [ ] **Prompt Caching** - Introduce a caching layer to the LLM calls to dramatically reduce the cost of running Skyvern (memorize past actions and repeat them!)
-- [ ] **Chrome Viewport streaming** - Introduce a way to live-stream the Chrome viewport to the user's browser (as a part of the self-serve UI)
-- [ ] **Past Runs UI** - Deprecate the Streamlit UI in favour of a React-based UI that allows you to visualize past runs and their results
+- [ ] **Web Evaluation Dataset** - Integrate Skyvern with public benchmark tests to track the quality of our models over time
+- [ ] **Improved Debug mode** - Allow Skyvern to plan its actions and get "approval" before running them, allowing you to debug what it's doing and more easily iterate on the prompt
+- [ ] **Auto workflow builder ("Observer") mode** - Allow Skyvern to auto-generate workflows as it's navigating the web to make it easier to build new workflows
+- [ ] **Chrome Extension** - Allow users to interact with Skyvern through a Chrome extension (incl voice mode, saving tasks, etc.)
+- [ ] **Skyvern Action Recorder** - Allow Skyvern to watch a user complete a task and then automatically generate a workflow for it
+- [ ] **Interactable Livestream** - Allow users to interact with the livestream in real-time to intervene when necessary (such as manually submitting sensitive forms)
 - [ ] **Integrate LLM Observability tools** - Integrate LLM Observability tools to allow back-testing prompt changes with specific data sets + visualize the performance of Skyvern over time
-- [ ] **Integrate public datasets** - Integrate Skyvern with public benchmark tests to track the quality our models over time
-- [ ] **Workflow UI Builder** - Introduce a UI to allow users to build and analyze workflows visually
 - [ ] **Langchain Integration** - Create langchain integration in langchain_community to use Skyvern as a "tool".
 
 # Contributing

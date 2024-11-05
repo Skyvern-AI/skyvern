@@ -31,18 +31,21 @@ import {
 import { WorkflowHeader } from "./WorkflowHeader";
 import { WorkflowParametersStateContext } from "./WorkflowParametersStateContext";
 import { edgeTypes } from "./edges";
-import { AppNode, nodeTypes } from "./nodes";
+import { AppNode, nodeTypes, WorkflowBlockNode } from "./nodes";
 import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
 import "./reactFlowOverrideStyles.css";
 import {
   convertEchoParameters,
   createNode,
+  defaultEdge,
   generateNodeLabel,
   getAdditionalParametersForEmailBlock,
   getOutputParameterKey,
   getWorkflowBlocks,
   layout,
+  nodeAdderNode,
+  startNode,
 } from "./workflowEditorUtils";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useBlocker, useParams } from "react-router-dom";
@@ -139,7 +142,7 @@ type Props = {
 };
 
 export type AddNodeProps = {
-  nodeType: Exclude<keyof typeof nodeTypes, "nodeAdder">;
+  nodeType: NonNullable<WorkflowBlockNode["type"]>;
   previous: string | null;
   next: string | null;
   parent?: string;
@@ -216,9 +219,10 @@ function FlowRenderer({
       setHasChanges(false);
     },
     onError: (error: AxiosError) => {
+      const detail = (error.response?.data as { detail?: string }).detail;
       toast({
         title: "Error",
-        description: error.message,
+        description: detail ? detail : error.message,
         variant: "destructive",
       });
     },
@@ -316,15 +320,11 @@ function FlowRenderer({
 
     if (nodeType === "loop") {
       // when loop node is first created it needs an adder node so nodes can be added inside the loop
-      newNodes.push({
-        id: nanoid(),
-        type: "nodeAdder",
-        parentId: id,
-        position: { x: 0, y: 0 },
-        data: {},
-        draggable: false,
-        connectable: false,
-      });
+      const startNodeId = nanoid();
+      const adderNodeId = nanoid();
+      newNodes.push(startNode(startNodeId, id));
+      newNodes.push(nodeAdderNode(adderNodeId, id));
+      newEdges.push(defaultEdge(startNodeId, adderNodeId));
     }
 
     const editedEdges = previous
@@ -343,26 +343,6 @@ function FlowRenderer({
       ...nodes.slice(previousNodeIndex + 1),
     ];
 
-    if (nodes.length === 0) {
-      // if there were no nodes before, add a nodeAdder node and connect it to the new node
-      newNodesAfter.push({
-        id: `${id}-nodeAdder`,
-        type: "nodeAdder",
-        position: { x: 0, y: 0 },
-        data: {},
-        draggable: false,
-        connectable: false,
-      });
-      newEdges.push({
-        id: `edge-0-${id}`,
-        type: "default",
-        source: id,
-        target: `${id}-nodeAdder`,
-        style: {
-          strokeWidth: 2,
-        },
-      });
-    }
     setHasChanges(true);
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
   }
@@ -558,6 +538,7 @@ function FlowRenderer({
             fitViewOptions={{
               maxZoom: 1,
             }}
+            deleteKeyCode={null}
           >
             <Background variant={BackgroundVariant.Dots} bgColor="#020617" />
             <Controls position="bottom-left" />
@@ -617,16 +598,6 @@ function FlowRenderer({
                     }}
                   />
                 )}
-              </Panel>
-            )}
-            {nodes.length === 0 && (
-              <Panel position="top-right">
-                <WorkflowNodeLibraryPanel
-                  onNodeClick={(props) => {
-                    addNode(props);
-                  }}
-                  first
-                />
               </Panel>
             )}
           </ReactFlow>

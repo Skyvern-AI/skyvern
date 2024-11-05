@@ -13,6 +13,7 @@ from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import (
+    ActionModel,
     ArtifactModel,
     AWSSecretParameterModel,
     BitwardenCreditCardDataParameterModel,
@@ -50,7 +51,7 @@ from skyvern.forge.sdk.db.utils import (
 )
 from skyvern.forge.sdk.models import Organization, OrganizationAuthToken, Step, StepStatus
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskStatus
+from skyvern.forge.sdk.schemas.tasks import OrderBy, ProxyLocation, SortDirection, Task, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -68,6 +69,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunParameter,
     WorkflowRunStatus,
 )
+from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.actions.models import AgentStepOutput
 
 LOG = structlog.get_logger()
@@ -272,6 +274,26 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_task_actions(self, task_id: str, organization_id: str | None = None) -> list[Action]:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(ActionModel)
+                    .filter(ActionModel.organization_id == organization_id)
+                    .filter(ActionModel.task_id == task_id)
+                    .order_by(ActionModel.created_at)
+                )
+
+                actions = (await session.scalars(query)).all()
+                return [Action.model_validate(action) for action in actions]
+
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def get_latest_step(self, task_id: str, organization_id: str | None = None) -> Step | None:
         try:
             async with self.Session() as session:
@@ -439,6 +461,8 @@ class AgentDB:
         workflow_run_id: str | None = None,
         organization_id: str | None = None,
         only_standalone_tasks: bool = False,
+        order_by_column: OrderBy = OrderBy.created_at,
+        order: SortDirection = SortDirection.desc,
     ) -> list[Task]:
         """
         Get all tasks.
@@ -447,6 +471,8 @@ class AgentDB:
         :param task_status:
         :param workflow_run_id:
         :param only_standalone_tasks:
+        :param order_by_column:
+        :param order:
         :return:
         """
         if page < 1:
@@ -462,7 +488,12 @@ class AgentDB:
                     query = query.filter(TaskModel.workflow_run_id == workflow_run_id)
                 if only_standalone_tasks:
                     query = query.filter(TaskModel.workflow_run_id.is_(None))
-                query = query.order_by(TaskModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
+                order_by_col = getattr(TaskModel, order_by_column)
+                query = (
+                    query.order_by(order_by_col.desc() if order == SortDirection.desc else order_by_col.asc())
+                    .limit(page_size)
+                    .offset(db_page * page_size)
+                )
                 tasks = (await session.scalars(query)).all()
                 return [convert_to_task(task, debug_enabled=self.debug_enabled) for task in tasks]
         except SQLAlchemyError:
@@ -1390,8 +1421,9 @@ class AgentDB:
             raise
 
     async def create_workflow_run_parameter(
-        self, workflow_run_id: str, workflow_parameter_id: str, value: Any
+        self, workflow_run_id: str, workflow_parameter: WorkflowParameter, value: Any
     ) -> WorkflowRunParameter:
+        workflow_parameter_id = workflow_parameter.workflow_parameter_id
         try:
             async with self.Session() as session:
                 workflow_run_parameter = WorkflowRunParameterModel(
@@ -1402,9 +1434,6 @@ class AgentDB:
                 session.add(workflow_run_parameter)
                 await session.commit()
                 await session.refresh(workflow_run_parameter)
-                workflow_parameter = await self.get_workflow_parameter(workflow_parameter_id)
-                if not workflow_parameter:
-                    raise WorkflowParameterNotFound(workflow_parameter_id)
                 return convert_to_workflow_run_parameter(workflow_run_parameter, workflow_parameter, self.debug_enabled)
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
@@ -1571,3 +1600,72 @@ class AgentDB:
             )
             totp_code = (await session.scalars(query)).all()
             return [TOTPCode.model_validate(totp_code) for totp_code in totp_code]
+
+    async def create_action(self, action: Action) -> Action:
+        async with self.Session() as session:
+            new_action = ActionModel(
+                action_type=action.action_type,
+                source_action_id=action.source_action_id,
+                organization_id=action.organization_id,
+                workflow_run_id=action.workflow_run_id,
+                task_id=action.task_id,
+                step_id=action.step_id,
+                step_order=action.step_order,
+                action_order=action.action_order,
+                status=action.status,
+                reasoning=action.reasoning,
+                intention=action.intention,
+                response=action.response,
+                element_id=action.element_id,
+                skyvern_element_hash=action.skyvern_element_hash,
+                skyvern_element_data=action.skyvern_element_data,
+                action_json=action.model_dump(),
+                confidence_float=action.confidence_float,
+            )
+            session.add(new_action)
+            await session.commit()
+            await session.refresh(new_action)
+            return Action.model_validate(new_action)
+
+    async def retrieve_action_plan(self, task: Task) -> list[Action]:
+        async with self.Session() as session:
+            subquery = (
+                select(TaskModel.task_id)
+                .filter(TaskModel.url == task.url)
+                .filter(TaskModel.navigation_goal == task.navigation_goal)
+                .filter(TaskModel.status == TaskStatus.completed)
+                .order_by(TaskModel.created_at.desc())
+                .limit(1)
+                .subquery()
+            )
+
+            query = (
+                select(ActionModel)
+                .filter(ActionModel.task_id == subquery.c.task_id)
+                .order_by(ActionModel.step_order, ActionModel.action_order, ActionModel.created_at)
+            )
+
+            actions = (await session.scalars(query)).all()
+            return [Action.model_validate(action) for action in actions]
+
+    async def get_previous_actions_for_task(self, task_id: str) -> list[Action]:
+        async with self.Session() as session:
+            query = (
+                select(ActionModel)
+                .filter_by(task_id=task_id)
+                .order_by(ActionModel.step_order, ActionModel.action_order, ActionModel.created_at)
+            )
+            actions = (await session.scalars(query)).all()
+            return [Action.model_validate(action) for action in actions]
+
+    async def delete_task_actions(self, organization_id: str, task_id: str) -> None:
+        async with self.Session() as session:
+            # delete actions by filtering organization_id and task_id
+            stmt = delete(ActionModel).where(
+                and_(
+                    ActionModel.organization_id == organization_id,
+                    ActionModel.task_id == task_id,
+                )
+            )
+            await session.execute(stmt)
+            await session.commit()

@@ -57,7 +57,7 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
             }}
           />
         </div>
-        <div className="space-y-1">
+        <div className="space-y-2">
           <Label className="text-xs text-slate-300">Code Input</Label>
           <CodeEditor
             language="python"
@@ -70,6 +70,7 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
               updateNodeData(id, { code: value });
             }}
             className="nopan"
+            fontSize={8}
           />
         </div>
       </div>

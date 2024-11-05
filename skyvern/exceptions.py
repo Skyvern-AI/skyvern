@@ -77,8 +77,10 @@ class ImaginaryFileUrl(SkyvernException):
 
 
 class MissingBrowserState(SkyvernException):
-    def __init__(self, task_id: str) -> None:
-        super().__init__(f"Browser state for task {task_id} is missing.")
+    def __init__(self, task_id: str | None = None, workflow_run_id: str | None = None) -> None:
+        task_str = f"task_id={task_id}" if task_id else ""
+        workflow_run_str = f"workflow_run_id={workflow_run_id}" if workflow_run_id else ""
+        super().__init__(f"Browser state for {task_str} {workflow_run_str} is missing.")
 
 
 class MissingBrowserStatePage(SkyvernException):
@@ -355,8 +357,8 @@ class InputActionOnSelect2Dropdown(SkyvernException):
 
 
 class FailToClick(SkyvernException):
-    def __init__(self, element_id: str):
-        super().__init__(f"Failed to click. element_id={element_id}")
+    def __init__(self, element_id: str, anchor: str = "self"):
+        super().__init__(f"Failed to click({anchor}). element_id={element_id}")
 
 
 class FailToSelectByLabel(SkyvernException):
@@ -490,3 +492,41 @@ class IllegitComplete(SkyvernException):
     def __init__(self, data: dict | None = None) -> None:
         data_str = f", data={data}" if data else ""
         super().__init__(f"Illegit complete{data_str}")
+
+
+class CachedActionPlanError(SkyvernException):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class InvalidUrl(SkyvernHTTPException):
+    def __init__(self, url: str) -> None:
+        super().__init__(
+            f"Invalid URL: {url}. Skyvern supports HTTP and HTTPS urls.", status_code=status.HTTP_400_BAD_REQUEST
+        )
+
+
+class BlockedHost(SkyvernHTTPException):
+    def __init__(self, host: str) -> None:
+        super().__init__(
+            f"The host in your url is blocked: {host}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidWorkflowParameter(SkyvernHTTPException):
+    def __init__(self, expected_parameter_type: str, value: str, workflow_permanent_id: str | None = None) -> None:
+        message = f"Invalid workflow parameter. Expected parameter type: {expected_parameter_type}. Value: {value}."
+        if workflow_permanent_id:
+            message += f" Workflow permanent id: {workflow_permanent_id}"
+        super().__init__(
+            message,
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InteractWithDisabledElement(SkyvernException):
+    def __init__(self, element_id: str):
+        super().__init__(
+            f"The element(id={element_id}) now is disabled, try to interact with it later when it's enabled."
+        )

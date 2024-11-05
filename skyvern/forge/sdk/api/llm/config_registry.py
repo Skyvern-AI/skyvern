@@ -76,7 +76,10 @@ if SettingsManager.get_settings().ENABLE_OPENAI:
         ),
     )
     LLMConfigRegistry.register_config(
-        "OPENAI_GPT4O", LLMConfig("gpt-4o", ["OPENAI_API_KEY"], supports_vision=True, add_assistant_prefix=False)
+        "OPENAI_GPT4O",
+        LLMConfig(
+            "gpt-4o", ["OPENAI_API_KEY"], supports_vision=True, add_assistant_prefix=False, max_output_tokens=16384
+        ),
     )
     LLMConfigRegistry.register_config(
         "OPENAI_GPT4O_MINI",
@@ -85,11 +88,18 @@ if SettingsManager.get_settings().ENABLE_OPENAI:
             ["OPENAI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
+            max_output_tokens=16384,
         ),
     )
     LLMConfigRegistry.register_config(
         "OPENAI_GPT-4O-2024-08-06",
-        LLMConfig("gpt-4o-2024-08-06", ["OPENAI_API_KEY"], supports_vision=True, add_assistant_prefix=False),
+        LLMConfig(
+            "gpt-4o-2024-08-06",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_output_tokens=16384,
+        ),
     )
 
 
@@ -133,10 +143,11 @@ if SettingsManager.get_settings().ENABLE_ANTHROPIC:
     LLMConfigRegistry.register_config(
         "ANTHROPIC_CLAUDE3.5_SONNET",
         LLMConfig(
-            "anthropic/claude-3-5-sonnet-20240620",
+            "anthropic/claude-3-5-sonnet-latest",
             ["ANTHROPIC_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=True,
+            max_output_tokens=8192,
         ),
     )
 
@@ -172,7 +183,7 @@ if SettingsManager.get_settings().ENABLE_BEDROCK:
     LLMConfigRegistry.register_config(
         "BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET",
         LLMConfig(
-            "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0",
             ["AWS_REGION"],
             supports_vision=True,
             add_assistant_prefix=True,

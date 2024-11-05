@@ -1,6 +1,6 @@
 import { useNodes } from "@xyflow/react";
 import { useWorkflowParametersState } from "../editor/useWorkflowParametersState";
-import { AppNode } from "../editor/nodes";
+import { AppNode, isWorkflowBlockNode } from "../editor/nodes";
 import { getOutputParameterKey } from "../editor/workflowEditorUtils";
 import {
   Select,
@@ -22,7 +22,7 @@ function SourceParameterKeySelector({ value, onChange }: Props) {
     .filter((parameter) => parameter.parameterType !== "credential")
     .map((parameter) => parameter.key);
   const outputParameterKeys = nodes
-    .filter((node) => node.type !== "nodeAdder")
+    .filter(isWorkflowBlockNode)
     .map((node) => getOutputParameterKey(node.data.label));
 
   return (

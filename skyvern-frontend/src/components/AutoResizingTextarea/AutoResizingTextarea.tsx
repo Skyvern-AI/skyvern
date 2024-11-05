@@ -1,10 +1,22 @@
-import { useLayoutEffect, useRef } from "react";
+import { ChangeEventHandler, useLayoutEffect, useRef } from "react";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/util/utils";
 
-type Props = React.ComponentPropsWithoutRef<typeof Textarea>;
+type Props = {
+  value: string;
+  onChange?: ChangeEventHandler<HTMLTextAreaElement>;
+  className?: string;
+  readOnly?: boolean;
+  placeholder?: string;
+};
 
-function AutoResizingTextarea(props: Props) {
+function AutoResizingTextarea({
+  value,
+  onChange,
+  className,
+  readOnly,
+  placeholder,
+}: Props) {
   const ref = useRef<HTMLTextAreaElement>(null);
 
   useLayoutEffect(() => {
@@ -25,12 +37,15 @@ function AutoResizingTextarea(props: Props) {
 
   return (
     <Textarea
-      {...props}
+      value={value}
+      onChange={onChange}
+      readOnly={readOnly}
+      placeholder={placeholder}
       ref={ref}
       onKeyDown={setSize}
       onInput={setSize}
       rows={1}
-      className={cn("min-h-0 resize-none overflow-y-hidden", props.className)}
+      className={cn("min-h-0 resize-none overflow-y-hidden", className)}
     />
   );
 }

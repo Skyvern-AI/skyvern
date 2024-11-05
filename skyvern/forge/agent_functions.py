@@ -4,7 +4,7 @@ import hashlib
 from typing import Dict, List
 
 import structlog
-from playwright.async_api import Page
+from playwright.async_api import Frame, Page
 
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR
@@ -19,8 +19,8 @@ from skyvern.webeye.scraper.scraper import ELEMENT_NODE_ATTRIBUTES, CleanupEleme
 
 LOG = structlog.get_logger()
 
-USELESS_SVG_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
-SVG_RETRY_ATTEMPT = 3
+USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
+SHAPE_CONVERTION_RETRY_ATTEMPT = 3
 
 
 def _remove_rect(element: dict) -> None:
@@ -28,8 +28,45 @@ def _remove_rect(element: dict) -> None:
         del element["rect"]
 
 
+def _should_css_shape_convert(element: Dict) -> bool:
+    if "id" not in element:
+        return False
+
+    tag_name = element.get("tagName")
+    if tag_name not in ["a", "span", "i"]:
+        return False
+
+    # should be without children
+    if len(element.get("children", [])) > 0:
+        return False
+
+    # should be no text
+    if element.get("text"):
+        return False
+
+    # if <span> and <i>  we try to convert the shape
+    if tag_name in ["span", "i"]:
+        return True
+
+    # if <a>, it should be no text, no href/target attribute
+    if tag_name == "a":
+        attributes = element.get("attributes", {})
+        if "href" in attributes:
+            return False
+
+        if "target" in attributes:
+            return False
+        return True
+
+    return False
+
+
 def _get_svg_cache_key(hash: str) -> str:
     return f"skyvern:svg:{hash}"
+
+
+def _get_shape_cache_key(hash: str) -> str:
+    return f"skyvern:shape:{hash}"
 
 
 def _remove_skyvern_attributes(element: Dict) -> Dict:
@@ -44,7 +81,7 @@ def _remove_skyvern_attributes(element: Dict) -> Dict:
     if "attributes" in element_copied:
         attributes: dict = copy.deepcopy(element_copied.get("attributes", {}))
         for key in attributes.keys():
-            if key in USELESS_SVG_ATTRIBUTE:
+            if key in USELESS_SHAPE_ATTRIBUTE:
                 del element_copied["attributes"][key]
 
     children: List[Dict] | None = element_copied.get("children", None)
@@ -80,6 +117,8 @@ async def _convert_svg_to_string(task: Task, step: Step, organization: Organizat
     except Exception:
         LOG.warning(
             "Failed to loaded SVG cache",
+            task_id=task.task_id,
+            step_id=step.step_id,
             exc_info=True,
             key=svg_key,
         )
@@ -92,6 +131,8 @@ async def _convert_svg_to_string(task: Task, step: Step, organization: Organizat
             LOG.warning(
                 "SVG element is too large to convert, going to drop the svg element.",
                 element_id=element_id,
+                task_id=task.task_id,
+                step_id=step.step_id,
                 length=len(svg_html),
             )
             del element["children"]
@@ -101,7 +142,7 @@ async def _convert_svg_to_string(task: Task, step: Step, organization: Organizat
         LOG.debug("call LLM to convert SVG to string shape", element_id=element_id)
         svg_convert_prompt = prompt_engine.load_prompt("svg-convert", svg_element=svg_html)
 
-        for retry in range(SVG_RETRY_ATTEMPT):
+        for retry in range(SHAPE_CONVERTION_RETRY_ATTEMPT):
             try:
                 json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=svg_convert_prompt, step=step)
                 svg_shape = json_response.get("shape", "")
@@ -113,6 +154,8 @@ async def _convert_svg_to_string(task: Task, step: Step, organization: Organizat
             except Exception:
                 LOG.exception(
                     "Failed to convert SVG to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
+                    task_id=task.task_id,
+                    step_id=step.step_id,
                     element_id=element_id,
                     retry=retry,
                 )
@@ -124,6 +167,101 @@ async def _convert_svg_to_string(task: Task, step: Step, organization: Organizat
     element["attributes"]["alt"] = svg_shape
     del element["children"]
     return
+
+
+async def _convert_css_shape_to_string(
+    task: Task, step: Step, organization: Organization | None, frame: Page | Frame, element: Dict
+) -> None:
+    element_id: str = element.get("id", "")
+
+    shape_element = _remove_skyvern_attributes(element)
+    svg_html = json_to_html(shape_element)
+    hash_object = hashlib.sha256()
+    hash_object.update(svg_html.encode("utf-8"))
+    shape_hash = hash_object.hexdigest()
+    shape_key = _get_shape_cache_key(shape_hash)
+
+    css_shape: str | None = None
+    try:
+        css_shape = await app.CACHE.get(shape_key)
+    except Exception:
+        LOG.warning(
+            "Failed to loaded CSS shape cache",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            exc_info=True,
+            key=shape_key,
+        )
+
+    if css_shape:
+        LOG.debug("CSS shape loaded from cache", element_id=element_id, shape=css_shape)
+    else:
+        # FIXME: support element in iframe
+        locater = frame.locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
+        if await locater.count() == 0:
+            LOG.info(
+                "No locater found to convert css shape",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                element_id=element_id,
+            )
+            return None
+
+        if await locater.count() > 1:
+            LOG.info(
+                "multiple locaters found to convert css shape",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                element_id=element_id,
+            )
+            return None
+
+        try:
+            LOG.debug("call LLM to convert css shape to string shape", element_id=element_id)
+            screenshot = await locater.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
+            prompt = prompt_engine.load_prompt("css-shape-convert")
+
+            for retry in range(SHAPE_CONVERTION_RETRY_ATTEMPT):
+                try:
+                    json_response = await app.SECONDARY_LLM_API_HANDLER(
+                        prompt=prompt, screenshots=[screenshot], step=step
+                    )
+                    css_shape = json_response.get("shape", "")
+                    if not css_shape:
+                        raise Exception("Empty css shape replied by secondary llm")
+                    LOG.info("CSS Shape converted by LLM", element_id=element_id, shape=css_shape)
+                    await app.CACHE.set(shape_key, css_shape)
+                    break
+                except Exception:
+                    LOG.exception(
+                        "Failed to convert css shape to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        element_id=element_id,
+                        retry=retry,
+                    )
+                    await asyncio.sleep(3)
+            else:
+                LOG.info(
+                    "Max css shape convertion retry, going to abort the convertion.",
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    element_id=element_id,
+                )
+                return None
+        except Exception:
+            LOG.exception(
+                "Failed to convert css shape to string shape by LLM",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                element_id=element_id,
+            )
+            return None
+
+    if "attributes" not in element:
+        element["attributes"] = dict()
+    element["attributes"]["shape-description"] = css_shape
+    return None
 
 
 class AgentFunction:
@@ -167,7 +305,7 @@ class AgentFunction:
         """
         return
 
-    def generate_async_operations(
+    async def generate_async_operations(
         self,
         organization: Organization,
         task: Task,
@@ -181,7 +319,7 @@ class AgentFunction:
         step: Step,
         organization: Organization | None = None,
     ) -> CleanupElementTreeFunc:
-        async def cleanup_element_tree_func(url: str, element_tree: list[dict]) -> list[dict]:
+        async def cleanup_element_tree_func(frame: Page | Frame, url: str, element_tree: list[dict]) -> list[dict]:
             """
             Remove rect and attribute.unique_id from the elements.
             The reason we're doing it is to
@@ -197,6 +335,16 @@ class AgentFunction:
                 queue_ele = queue.pop(0)
                 _remove_rect(queue_ele)
                 await _convert_svg_to_string(task, step, organization, queue_ele)
+
+                if _should_css_shape_convert(element=queue_ele):
+                    await _convert_css_shape_to_string(
+                        task=task,
+                        step=step,
+                        organization=organization,
+                        frame=frame,
+                        element=queue_ele,
+                    )
+
                 # TODO: we can come back to test removing the unique_id
                 # from element attributes to make sure this won't increase hallucination
                 # _remove_unique_id(queue_ele)

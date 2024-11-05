@@ -78,6 +78,24 @@ export const finditparts = {
   errorCodeMapping: null,
 };
 
+export const contact_us_forms = {
+  url: "https://canadahvac.com/contact-hvac-canada/",
+  navigationGoal:
+    "Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent.",
+  navigationPayload: {
+    name: "John Doe",
+    email: "john.doe@gmail.com",
+    phone: "123-456-7890",
+    message: "Hello, I have a question about your services.",
+  },
+  dataExtractionGoal: null,
+  extractedInformationSchema: null,
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
+};
+
 export const job_application = {
   url: "https://jobs.lever.co/leverdemo-8/45d39614-464a-4b62-a5cd-8683ce4fb80a/apply",
   navigationGoal:
@@ -90,6 +108,8 @@ export const job_application = {
       "https://writing.colostate.edu/guides/documents/resume/functionalSample.pdf",
     cover_letter: "Generate a compelling cover letter for me",
   },
+  dataExtractionGoal: null,
+  extractedInformationSchema: null,
   webhookCallbackUrl: null,
   totpIdentifier: null,
   totpVerificationUrl: null,
@@ -290,6 +310,61 @@ export const geico = {
   errorCodeMapping: null,
 };
 
+export const hackernews = {
+  url: "https://news.ycombinator.com",
+  navigationGoal:
+    "Navigate to the Hacker News homepage and identify the top post. COMPLETE when the title and URL of the top post are extracted. Ensure that the top post is the first post listed on the page.",
+  dataExtractionGoal:
+    "Extract the title and URL of the top post on the Hacker News homepage.",
+  navigationPayload: null,
+  extractedInformationSchema: null,
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
+};
+
+export const AAPLStockPrice = {
+  url: "https://www.google.com/finance",
+  navigationGoal:
+    "Navigate to the search bar on Google Finance, type 'AAPL', and press Enter. COMPLETE when the search results for AAPL are displayed and the stock price is extracted.",
+  dataExtractionGoal: "Extract the stock price for AAPL",
+  navigationPayload: null,
+  extractedInformationSchema: null,
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
+};
+
+export const NYTBestseller = {
+  url: "https://www.nytimes.com/books/best-sellers",
+  navigationGoal:
+    "Navigate to the NYT Bestsellers page and identify the top book listed. COMPLETE when the title and author of the top book are identified.",
+  dataExtractionGoal:
+    "Extract the title, author, and rating of the top NYT Bestseller from the page.",
+  navigationPayload: null,
+  extractedInformationSchema: null,
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
+};
+
+export const topRankedFootballTeam = {
+  url: "https://www.fifa.com/fifa-world-ranking/",
+  navigationGoal:
+    "Navigate to the FIFA World Ranking page and identify the top ranked football team. COMPLETE when the name of the top ranked football team is found and displayed.",
+  dataExtractionGoal:
+    "Extract the name of the top ranked football team from the FIFA World Ranking page.",
+  navigationPayload: null,
+  extractedInformationSchema: null,
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
+};
+
 export function getSample(sample: SampleCase) {
   switch (sample) {
     case "geico": {
@@ -297,6 +372,9 @@ export function getSample(sample: SampleCase) {
     }
     case "finditparts": {
       return finditparts;
+    }
+    case "contact_us_forms": {
+      return contact_us_forms;
     }
     case "california_edd": {
       return california_edd;
@@ -316,6 +394,18 @@ export function getSample(sample: SampleCase) {
           phone,
         },
       };
+    }
+    case "hackernews": {
+      return hackernews;
+    }
+    case "AAPLStockPrice": {
+      return AAPLStockPrice;
+    }
+    case "NYTBestseller": {
+      return NYTBestseller;
+    }
+    case "topRankedFootballTeam": {
+      return topRankedFootballTeam;
     }
     case "blank": {
       return blank;

@@ -10,24 +10,6 @@ import { AxiosError } from "axios";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { stringify as convertToYAML } from "yaml";
-import {
-  ScrollArea,
-  ScrollAreaViewport,
-  ScrollBar,
-} from "@/components/ui/scroll-area";
-
-function createTaskFromTaskGenerationParameters(
-  values: TaskGenerationApiResponse,
-) {
-  return {
-    url: values.url,
-    navigation_goal: values.navigation_goal,
-    data_extraction_goal: values.data_extraction_goal,
-    proxy_location: "RESIDENTIAL",
-    navigation_payload: values.navigation_payload,
-    extracted_information_schema: values.extracted_information_schema,
-  };
-}
 
 function createTemplateTaskFromTaskGenerationParameters(
   values: TaskGenerationApiResponse,
@@ -61,12 +43,47 @@ function createTemplateTaskFromTaskGenerationParameters(
   };
 }
 
-const examplePrompts = [
-  "What is the top post on hackernews?",
-  "Navigate to Google Finance and search for AAPL",
-  "What is the top NYT bestseller?",
-  "What is the top ranked football team?",
-  "Find the top selling electrical connector on finditparts",
+const exampleCases = [
+  {
+    key: "finditparts",
+    label: "Find a product and add it to cart",
+  },
+  {
+    key: "geico",
+    label: "Generate an insurance quote",
+  },
+  {
+    key: "job_application",
+    label: "Apply to a job",
+  },
+  {
+    key: "california_edd",
+    label: "Fill an online enrollment form",
+  },
+  {
+    key: "contact_us_forms",
+    label: "Fill a contact us form",
+  },
+  {
+    key: "bci_seguros",
+    label: "Generate an auto insurance quote in spanish",
+  },
+  {
+    key: "hackernews",
+    label: "Get the top post on Hackernews",
+  },
+  {
+    key: "AAPLStockPrice",
+    label: "Get the stock price of AAPL",
+  },
+  {
+    key: "NYTBestseller",
+    label: "Get the top NYT bestseller",
+  },
+  {
+    key: "topRankedFootballTeam",
+    label: "Get the top ranked football team",
+  },
 ];
 
 function PromptBox() {
@@ -120,27 +137,6 @@ function PromptBox() {
     },
   });
 
-  const runTaskMutation = useMutation({
-    mutationFn: async (params: TaskGenerationApiResponse) => {
-      const client = await getClient(credentialGetter);
-      const data = createTaskFromTaskGenerationParameters(params);
-      return client.post<
-        ReturnType<typeof createTaskFromTaskGenerationParameters>,
-        { data: { task_id: string } }
-      >("/tasks", data);
-    },
-    onSuccess: (response) => {
-      navigate(`/tasks/${response.data.task_id}/actions`);
-    },
-    onError: (error: AxiosError) => {
-      toast({
-        variant: "destructive",
-        title: "Error running task",
-        description: error.message,
-      });
-    },
-  });
-
   return (
     <div>
       <div
@@ -149,11 +145,11 @@ function PromptBox() {
           background: `url(${img}) 50% / cover no-repeat`,
         }}
       >
-        <div className="flex flex-col items-center gap-7">
+        <div className="mx-auto flex min-w-44 flex-col items-center gap-7 px-8">
           <span className="text-2xl">
             What task would you like to accomplish?
           </span>
-          <div className="flex w-[35rem] max-w-xl items-center rounded-xl bg-slate-700 py-2 pr-4">
+          <div className="flex w-full max-w-xl items-center rounded-xl bg-slate-700 py-2 pr-4 lg:w-3/4">
             <Textarea
               className="min-h-0 resize-none rounded-xl border-transparent px-4 hover:border-transparent focus-visible:ring-0"
               value={prompt}
@@ -163,8 +159,7 @@ function PromptBox() {
             />
             <div className="h-full">
               {getTaskFromPromptMutation.isPending ||
-              saveTaskMutation.isPending ||
-              runTaskMutation.isPending ? (
+              saveTaskMutation.isPending ? (
                 <ReloadIcon className="h-6 w-6 animate-spin" />
               ) : (
                 <PaperPlaneIcon
@@ -173,7 +168,11 @@ function PromptBox() {
                     const taskGenerationResponse =
                       await getTaskFromPromptMutation.mutateAsync(prompt);
                     await saveTaskMutation.mutateAsync(taskGenerationResponse);
-                    await runTaskMutation.mutateAsync(taskGenerationResponse);
+                    navigate("/create/from-prompt", {
+                      state: {
+                        data: taskGenerationResponse,
+                      },
+                    });
                   }}
                 />
               )}
@@ -181,26 +180,21 @@ function PromptBox() {
           </div>
         </div>
       </div>
-      <ScrollArea>
-        <ScrollAreaViewport className="h-full w-full rounded-[inherit]">
-          <div className="flex gap-4 rounded-sm bg-slate-elevation1 p-4">
-            {examplePrompts.map((examplePrompt) => {
-              return (
-                <div
-                  key={examplePrompt}
-                  className="cursor-pointer whitespace-nowrap rounded-sm bg-slate-elevation3 px-4 py-3 hover:bg-slate-elevation5"
-                  onClick={() => {
-                    setPrompt(examplePrompt);
-                  }}
-                >
-                  {examplePrompt}
-                </div>
-              );
-            })}
-          </div>
-        </ScrollAreaViewport>
-        <ScrollBar orientation="horizontal" />
-      </ScrollArea>
+      <div className="flex flex-wrap justify-center gap-4 rounded-sm bg-slate-elevation1 p-4">
+        {exampleCases.map((example) => {
+          return (
+            <div
+              key={example.key}
+              className="cursor-pointer whitespace-normal rounded-sm bg-slate-elevation3 px-4 py-3 hover:bg-slate-elevation5 lg:whitespace-nowrap"
+              onClick={() => {
+                navigate(`/create/${example.key}`);
+              }}
+            >
+              {example.label}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

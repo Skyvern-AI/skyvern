@@ -28,7 +28,8 @@ type Props = {
 
 const workflowParameterTypeOptions = [
   { label: "string", value: WorkflowParameterValueType.String },
-  { label: "number", value: WorkflowParameterValueType.Float },
+  { label: "float", value: WorkflowParameterValueType.Float },
+  { label: "integer", value: WorkflowParameterValueType.Integer },
   { label: "boolean", value: WorkflowParameterValueType.Boolean },
   { label: "file", value: WorkflowParameterValueType.FileURL },
   { label: "JSON", value: WorkflowParameterValueType.JSON },
@@ -36,7 +37,7 @@ const workflowParameterTypeOptions = [
 
 function header(type: "workflow" | "credential" | "context") {
   if (type === "workflow") {
-    return "Edit Workflow Parameter";
+    return "Edit Input Parameter";
   }
   if (type === "credential") {
     return "Edit Credential Parameter";
@@ -237,7 +238,7 @@ function WorkflowParameterEditPanel({
                 } catch (e) {
                   toast({
                     variant: "destructive",
-                    title: "Failed to save parameters",
+                    title: "Failed to save parameter",
                     description: "Invalid JSON for default value",
                   });
                   return;
@@ -253,10 +254,20 @@ function WorkflowParameterEditPanel({
                 parameterType: "workflow",
                 dataType: parameterType,
                 description,
-                defaultValue: defaultValue,
+                defaultValue: defaultValueState.hasDefaultValue
+                  ? defaultValue
+                  : null,
               });
             }
             if (type === "credential") {
+              if (!collectionId) {
+                toast({
+                  variant: "destructive",
+                  title: "Failed to save parameter",
+                  description: "Collection ID is required",
+                });
+                return;
+              }
               onSave({
                 key,
                 parameterType: "credential",
@@ -269,7 +280,7 @@ function WorkflowParameterEditPanel({
               if (!sourceParameterKey) {
                 toast({
                   variant: "destructive",
-                  title: "Failed to save parameters",
+                  title: "Failed to save parameter",
                   description: "Source parameter key is required",
                 });
                 return;

@@ -28,10 +28,8 @@ function TaskRecording() {
 
   if (taskIsLoading) {
     return (
-      <div className="mx-auto flex">
-        <div className="h-[450px] w-[800px]">
-          <Skeleton className="h-full" />
-        </div>
+      <div className="h-[450px] w-[800px]">
+        <Skeleton className="h-full" />
       </div>
     );
   }
@@ -41,9 +39,7 @@ function TaskRecording() {
   }
 
   return recordingURL ? (
-    <div className="mx-auto flex">
-      <video width={800} height={450} src={recordingURL} controls />
-    </div>
+    <video width={800} height={450} src={recordingURL} controls />
   ) : (
     <div>No recording available for this task</div>
   );

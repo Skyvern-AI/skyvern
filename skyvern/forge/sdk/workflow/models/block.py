@@ -24,6 +24,7 @@ from skyvern.exceptions import (
     ContextParameterValueNotFound,
     DisabledBlockExecutionError,
     FailedToNavigateToUrl,
+    MissingBrowserState,
     MissingBrowserStatePage,
     TaskNotFound,
     UnexpectedTaskStatus,
@@ -32,7 +33,7 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.files import (
-    calculate_sha256,
+    calculate_sha256_for_file,
     download_file,
     download_from_s3,
     get_path_for_workflow_download_directory,
@@ -53,6 +54,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
     WorkflowParameter,
 )
+from skyvern.webeye.browser_factory import BrowserState
 
 LOG = structlog.get_logger()
 
@@ -181,6 +183,7 @@ class TaskBlock(Block):
     download_suffix: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
+    cache_actions: bool = False
 
     def get_all_parameters(
         self,
@@ -271,6 +274,7 @@ class TaskBlock(Block):
         # non-retryable terminations
         while will_retry:
             task_order, task_retry = await self.get_task_order(workflow_run_id, current_retry)
+            is_first_task = task_order == 0
             task, step = await app.agent.create_task_and_step_from_block(
                 task_block=self,
                 workflow=workflow,
@@ -282,9 +286,17 @@ class TaskBlock(Block):
             organization = await app.DATABASE.get_organization(organization_id=workflow.organization_id)
             if not organization:
                 raise Exception(f"Organization is missing organization_id={workflow.organization_id}")
-            browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                workflow_run=workflow_run, url=self.url
-            )
+
+            browser_state: BrowserState | None = None
+            if is_first_task:
+                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                    workflow_run=workflow_run, url=self.url
+                )
+            else:
+                browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
+                if browser_state is None:
+                    raise MissingBrowserState(task_id=task.task_id, workflow_run_id=workflow_run_id)
+
             working_page = await browser_state.get_working_page()
             if not working_page:
                 LOG.error(
@@ -1057,7 +1069,7 @@ class SendEmailBlock(Block):
                         subtype=subtype,
                         filename=attachment_filename,
                     )
-                    file_hash = calculate_sha256(path)
+                    file_hash = calculate_sha256_for_file(path)
                     file_names_by_hash[file_hash].append(path)
             finally:
                 if path:

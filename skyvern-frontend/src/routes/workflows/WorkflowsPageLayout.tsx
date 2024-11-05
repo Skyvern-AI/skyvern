@@ -7,7 +7,7 @@ function WorkflowsPageLayout() {
   return (
     <main
       className={cn({
-        "container mx-auto px-8": !match,
+        "container mx-auto": !match,
       })}
     >
       <Outlet />

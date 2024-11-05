@@ -3,27 +3,8 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 import { useLocation, useParams } from "react-router-dom";
 import { RunWorkflowForm } from "./RunWorkflowForm";
-import {
-  WorkflowApiResponse,
-  WorkflowParameterValueType,
-} from "./types/workflowTypes";
-
-function defaultValue(type: WorkflowParameterValueType) {
-  switch (type) {
-    case "string":
-      return "";
-    case "integer":
-      return 0;
-    case "float":
-      return 0.0;
-    case "boolean":
-      return false;
-    case "json":
-      return null;
-    case "file_url":
-      return null;
-  }
-}
+import { WorkflowApiResponse } from "./types/workflowTypes";
+import { Skeleton } from "@/components/ui/skeleton";
 
 function WorkflowRunParameters() {
   const credentialGetter = useCredentialGetter();
@@ -38,6 +19,7 @@ function WorkflowRunParameters() {
         .get(`/workflows/${workflowPermanentId}`)
         .then((response) => response.data);
     },
+    refetchOnWindowFocus: false,
   });
 
   const workflowParameters = workflow?.workflow_definition.parameters.filter(
@@ -65,18 +47,40 @@ function WorkflowRunParameters() {
             acc[curr.key] = Boolean(curr.default_value);
             return acc;
           }
+          if (
+            curr.default_value === null &&
+            curr.workflow_parameter_type === "string"
+          ) {
+            acc[curr.key] = "";
+            return acc;
+          }
           if (curr.default_value) {
             acc[curr.key] = curr.default_value;
             return acc;
           }
-          acc[curr.key] = defaultValue(curr.workflow_parameter_type);
+          acc[curr.key] = null;
           return acc;
         },
         {} as Record<string, unknown>,
       );
 
+  const header = (
+    <header className="space-y-5">
+      <h1 className="text-3xl">Parameters</h1>
+      <h2 className="text-lg text-slate-400">
+        Fill the placeholder values that you have linked throughout your
+        workflow.
+      </h2>
+    </header>
+  );
+
   if (isFetching) {
-    return <div>Getting workflow parameters...</div>;
+    return (
+      <div className="space-y-8">
+        {header}
+        <Skeleton className="h-96 w-full" />
+      </div>
+    );
   }
 
   if (!workflow || !workflowParameters || !initialValues) {
@@ -85,13 +89,7 @@ function WorkflowRunParameters() {
 
   return (
     <div className="space-y-8">
-      <header className="space-y-5">
-        <h1 className="text-3xl">Run Parameters</h1>
-        <h2 className="text-lg text-slate-400">
-          Fill the placeholder values that you have linked throughout your
-          workflow.
-        </h2>
-      </header>
+      {header}
       <RunWorkflowForm
         initialValues={initialValues}
         workflowParameters={workflowParameters}

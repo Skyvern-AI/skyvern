@@ -13,7 +13,7 @@ type Props = {
 function HelpTooltip({ content }: Props) {
   return (
     <TooltipProvider>
-      <Tooltip>
+      <Tooltip delayDuration={300}>
         <TooltipTrigger asChild>
           <QuestionMarkCircledIcon className="h-4 w-4" />
         </TooltipTrigger>

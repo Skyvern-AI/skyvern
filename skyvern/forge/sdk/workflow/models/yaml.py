@@ -129,6 +129,7 @@ class TaskBlockYAML(BlockYAML):
     download_suffix: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
+    cache_actions: bool = False
 
 
 class ForLoopBlockYAML(BlockYAML):
