@@ -744,7 +744,7 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
   }
   const oldLabel = labelUpdatedNode.data.label as string;
   return nodes.map((node) => {
-    if (node.type === "nodeAdder") {
+    if (node.type === "nodeAdder" || node.type === "start") {
       return node;
     }
     if (node.type === "task") {
@@ -798,13 +798,13 @@ function getUpdatedParametersAfterLabelUpdateForSourceParameterKey(
   const oldOutputParameterKey = getOutputParameterKey(oldLabel);
   const newOutputParameterKey = getOutputParameterKey(newLabel);
   return parameters.map((parameter) => {
-    if (parameter.parameterType === "context") {
+    if (
+      parameter.parameterType === "context" &&
+      parameter.sourceParameterKey === oldOutputParameterKey
+    ) {
       return {
         ...parameter,
-        sourceParameterKey:
-          parameter.sourceParameterKey === oldOutputParameterKey
-            ? newOutputParameterKey
-            : oldOutputParameterKey,
+        sourceParameterKey: newOutputParameterKey,
       };
     }
     return parameter;
