@@ -277,6 +277,7 @@ function TaskDetails() {
       <div className="flex w-fit gap-2 rounded-sm border border-slate-700 p-2">
         <NavLink
           to="actions"
+          replace
           className={({ isActive }) => {
             return cn(
               "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
@@ -290,6 +291,7 @@ function TaskDetails() {
         </NavLink>
         <NavLink
           to="recording"
+          replace
           className={({ isActive }) => {
             return cn(
               "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
@@ -303,6 +305,7 @@ function TaskDetails() {
         </NavLink>
         <NavLink
           to="parameters"
+          replace
           className={({ isActive }) => {
             return cn(
               "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
@@ -316,6 +319,7 @@ function TaskDetails() {
         </NavLink>
         <NavLink
           to="diagnostics"
+          replace
           className={({ isActive }) => {
             return cn(
               "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
