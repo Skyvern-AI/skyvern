@@ -20,7 +20,7 @@ import { toast } from "@/components/ui/use-toast";
 import { SourceParameterKeySelector } from "../../components/SourceParameterKeySelector";
 
 type Props = {
-  type: "workflow" | "credential" | "context";
+  type: "workflow" | "credential" | "context" | "secret";
   onClose: () => void;
   onSave: (value: ParametersState[number]) => void;
 };
@@ -34,12 +34,15 @@ const workflowParameterTypeOptions = [
   { label: "JSON", value: WorkflowParameterValueType.JSON },
 ];
 
-function header(type: "workflow" | "credential" | "context") {
+function header(type: "workflow" | "credential" | "context" | "secret") {
   if (type === "workflow") {
     return "Add Input Parameter";
   }
   if (type === "credential") {
     return "Add Credential Parameter";
+  }
+  if (type === "secret") {
+    return "Add Secret Parameter";
   }
   return "Add Context Parameter";
 }
@@ -61,6 +64,9 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
   const [sourceParameterKey, setSourceParameterKey] = useState<
     string | undefined
   >(undefined);
+
+  const [identityKey, setIdentityKey] = useState("");
+  const [identityFields, setIdentityFields] = useState("");
 
   return (
     <div className="space-y-4">
@@ -192,6 +198,31 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
           />
         </div>
       )}
+      {type === "secret" && (
+        <>
+          <div className="space-y-1">
+            <Label className="text-xs text-slate-300">Identity Key</Label>
+            <Input
+              value={identityKey}
+              onChange={(e) => setIdentityKey(e.target.value)}
+            />
+          </div>
+          <div className="space-y-1">
+            <Label className="text-xs text-slate-300">Identity Fields</Label>
+            <Input
+              value={identityFields}
+              onChange={(e) => setIdentityFields(e.target.value)}
+            />
+          </div>
+          <div className="space-y-1">
+            <Label className="text-xs text-slate-300">Collection ID</Label>
+            <Input
+              value={collectionId}
+              onChange={(e) => setCollectionId(e.target.value)}
+            />
+          </div>
+        </>
+      )}
       <div className="flex justify-end">
         <Button
           onClick={() => {
@@ -240,6 +271,27 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                 parameterType: "credential",
                 collectionId,
                 urlParameterKey,
+                description,
+              });
+            }
+            if (type === "secret") {
+              if (!collectionId) {
+                toast({
+                  variant: "destructive",
+                  title: "Failed to add parameter",
+                  description: "Collection ID is required",
+                });
+                return;
+              }
+              onSave({
+                key,
+                parameterType: "secret",
+                collectionId,
+                identityFields: identityFields
+                  .split(",")
+                  .filter((s) => s.length > 0)
+                  .map((field) => field.trim()),
+                identityKey,
                 description,
               });
             }
