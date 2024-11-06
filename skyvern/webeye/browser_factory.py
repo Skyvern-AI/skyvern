@@ -408,6 +408,11 @@ class BrowserState:
         await self.set_working_page(last_page, len(self.browser_context.pages) - 1)
         return last_page
 
+    async def must_get_working_page(self) -> Page:
+        page = await self.get_working_page()
+        assert page is not None
+        return page
+
     async def set_working_page(self, page: Page | None, index: int = 0) -> None:
         self.__page = page
         if page is None:

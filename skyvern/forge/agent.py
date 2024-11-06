@@ -54,13 +54,9 @@ from skyvern.webeye.actions.actions import (
     parse_actions,
 )
 from skyvern.webeye.actions.caching import retrieve_action_plan
-from skyvern.webeye.actions.handler import (
-    ActionHandler,
-    extract_information_for_navigation_goal,
-    poll_verification_code,
-)
+from skyvern.webeye.actions.handler import ActionHandler, poll_verification_code
 from skyvern.webeye.actions.models import AgentStepOutput, DetailedAgentStepOutput
-from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
+from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -753,7 +749,8 @@ class ForgeAgent:
                     element_id_to_last_action[action.element_id] = action_idx
 
                 self.async_operation_pool.run_operation(task.task_id, AgentPhase.action)
-                results = await ActionHandler.handle_action(scraped_page, task, step, browser_state, action)
+                current_page = await browser_state.must_get_working_page()
+                results = await ActionHandler.handle_action(scraped_page, task, step, current_page, action)
                 detailed_agent_step_output.actions_and_results[action_idx] = (
                     action,
                     results,
@@ -840,18 +837,7 @@ class ForgeAgent:
                         break
 
             task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
-            if (
-                not has_decisive_action
-                and not task_completes_on_download
-                and app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                    "CHECK_USER_GOAL_SUCCESS_EVERY_STEP",
-                    task.workflow_run_id or task.task_id,
-                    properties={
-                        "organization_id": task.organization_id,
-                        "organization_created_at": str(organization.created_at) if organization else None,
-                    },
-                )
-            ):
+            if not has_decisive_action and not task_completes_on_download:
                 LOG.info("Checking if user goal is achieved after re-scraping the page")
                 # Check if navigation goal is achieved after re-scraping the page
                 new_scraped_page = await self._scrape_with_type(
@@ -864,16 +850,25 @@ class ForgeAgent:
                 if new_scraped_page is None:
                     LOG.warning("Failed to scrape the page before checking user goal success, skipping check...")
                 else:
-                    working_page = await browser_state.get_working_page()
-                    result_tuple = await self.check_user_goal_success(
+                    working_page = await browser_state.must_get_working_page()
+                    complete_action = await self.check_user_goal_complete(
                         page=working_page,
                         scraped_page=new_scraped_page,
                         task=task,
                         step=step,
                     )
-                    if result_tuple is not None:
-                        complete_action, action_results = result_tuple
-                        detailed_agent_step_output.actions_and_results.append((complete_action, action_results))
+                    if complete_action is not None:
+                        LOG.info("User goal achieved, executing complete action")
+                        complete_action.organization_id = task.organization_id
+                        complete_action.workflow_run_id = task.workflow_run_id
+                        complete_action.task_id = task.task_id
+                        complete_action.step_id = step.step_id
+                        complete_action.step_order = step.order
+                        complete_action.action_order = len(detailed_agent_step_output.actions_and_results)
+                        complete_results = await ActionHandler.handle_action(
+                            scraped_page, task, step, working_page, complete_action
+                        )
+                        detailed_agent_step_output.actions_and_results.append((complete_action, complete_results))
                         await self.record_artifacts_after_action(task, step, browser_state)
             # If no action errors return the agent state and output
             completed_step = await self.update_step(
@@ -914,9 +909,9 @@ class ForgeAgent:
             return failed_step, detailed_agent_step_output.get_clean_detailed_output()
 
     @staticmethod
-    async def check_user_goal_success(
+    async def check_user_goal_complete(
         page: Page, scraped_page: ScrapedPage, task: Task, step: Step
-    ) -> tuple[CompleteAction, list[ActionResult]] | None:
+    ) -> CompleteAction | None:
         try:
             verification_prompt = prompt_engine.load_prompt(
                 "check-user-goal",
@@ -935,25 +930,14 @@ class ForgeAgent:
                 return None
 
             user_goal_achieved: bool = verification_response["user_goal_achieved"]
-            complete_action = CompleteAction(
-                reasoning=verification_response["thoughts"],
-                data_extraction_goal=task.data_extraction_goal,
-            )
             # We don't want to return a complete action if the user goal is not achieved since we're checking at every step
             if not user_goal_achieved:
                 return None
 
-            LOG.info("User goal achieved, executing complete action")
-            extracted_data = None
-            if complete_action.data_extraction_goal:
-                scrape_action_result = await extract_information_for_navigation_goal(
-                    scraped_page=scraped_page,
-                    task=task,
-                    step=step,
-                )
-                extracted_data = scrape_action_result.scraped_data
-
-            return complete_action, [ActionSuccess(data=extracted_data)]
+            return CompleteAction(
+                reasoning=verification_response["thoughts"],
+                data_extraction_goal=task.data_extraction_goal,
+            )
 
         except Exception:
             LOG.error("LLM verification failed for complete action, skipping LLM verification", exc_info=True)

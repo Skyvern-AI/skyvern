@@ -68,7 +68,6 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
-from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import (
     CleanupElementTreeFunc,
     ElementTreeFormat,
@@ -227,11 +226,10 @@ class ActionHandler:
         scraped_page: ScrapedPage,
         task: Task,
         step: Step,
-        browser_state: BrowserState,
+        page: Page,
         action: Action,
     ) -> list[ActionResult]:
         LOG.info("Handling action", action=action)
-        page = await browser_state.get_or_create_page()
         actions_result: list[ActionResult] = []
         try:
             if action.action_type in ActionHandler._handled_action_types:
@@ -1002,8 +1000,8 @@ async def handle_complete_action(
     # If this action has a source_action_id, then we need to make sure if the goal is actually completed.
     if action.source_action_id:
         LOG.info("CompleteAction has source_action_id, checking if goal is completed")
-        complete_action_and_results = await app.agent.check_user_goal_success(page, scraped_page, task, step)
-        if complete_action_and_results is None:
+        complete_action = await app.agent.check_user_goal_complete(page, scraped_page, task, step)
+        if complete_action is None:
             return [
                 ActionFailure(
                     exception=IllegitComplete(
@@ -1014,10 +1012,6 @@ async def handle_complete_action(
                 )
             ]
 
-        _, action_results = complete_action_and_results
-        return action_results
-
-    # If there's no source_action_id, then we just handle it as a normal complete action
     extracted_data = None
     if action.data_extraction_goal:
         scrape_action_result = await extract_information_for_navigation_goal(
