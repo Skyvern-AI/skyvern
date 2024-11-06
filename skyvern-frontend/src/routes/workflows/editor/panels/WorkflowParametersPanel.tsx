@@ -41,7 +41,7 @@ function WorkflowParametersPanel() {
     active: boolean;
     operation: "add" | "edit";
     parameter?: ParametersState[number] | null;
-    type: "workflow" | "credential" | "context";
+    type: "workflow" | "credential" | "context" | "secret";
   }>({
     active: false,
     operation: "add",
@@ -102,6 +102,17 @@ function WorkflowParametersPanel() {
               }}
             >
               Context Parameter
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              onClick={() => {
+                setOperationPanelState({
+                  active: true,
+                  operation: "add",
+                  type: "secret",
+                });
+              }}
+            >
+              Secret Parameter
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>

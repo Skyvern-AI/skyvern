@@ -4,8 +4,6 @@ import { Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
 import type {
   AWSSecretParameter,
-  BitwardenSensitiveInformationParameter,
-  ContextParameter,
   OutputParameter,
   Parameter,
   WorkflowApiResponse,
@@ -45,11 +43,11 @@ import { fileParserNodeDefaultData } from "./nodes/FileParserNode/types";
 import { LoopNode, loopNodeDefaultData } from "./nodes/LoopNode/types";
 import { NodeAdderNode } from "./nodes/NodeAdderNode/types";
 import { sendEmailNodeDefaultData } from "./nodes/SendEmailNode/types";
+import { StartNode } from "./nodes/StartNode/types";
 import { taskNodeDefaultData } from "./nodes/TaskNode/types";
 import { textPromptNodeDefaultData } from "./nodes/TextPromptNode/types";
 import { NodeBaseData } from "./nodes/types";
 import { uploadNodeDefaultData } from "./nodes/UploadNode/types";
-import { StartNode } from "./nodes/StartNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -685,11 +683,7 @@ function generateNodeLabel(existingLabels: Array<string>) {
  * If a parameter is not displayed in the editor, we should echo its value back when saved.
  */
 function convertEchoParameters(
-  parameters: Array<
-    | ContextParameter
-    | BitwardenSensitiveInformationParameter
-    | AWSSecretParameter
-  >,
+  parameters: Array<AWSSecretParameter>,
 ): Array<ParameterYAML> {
   return parameters.map((parameter) => {
     if (parameter.parameter_type === "aws_secret") {
@@ -697,21 +691,6 @@ function convertEchoParameters(
         key: parameter.key,
         parameter_type: "aws_secret",
         aws_key: parameter.aws_key,
-      };
-    }
-    if (parameter.parameter_type === "bitwarden_sensitive_information") {
-      return {
-        key: parameter.key,
-        parameter_type: "bitwarden_sensitive_information",
-        bitwarden_collection_id: parameter.bitwarden_collection_id,
-        bitwarden_identity_key: parameter.bitwarden_identity_key,
-        bitwarden_identity_fields: parameter.bitwarden_identity_fields,
-        bitwarden_client_id_aws_secret_key:
-          parameter.bitwarden_client_id_aws_secret_key,
-        bitwarden_client_secret_aws_secret_key:
-          parameter.bitwarden_client_secret_aws_secret_key,
-        bitwarden_master_password_aws_secret_key:
-          parameter.bitwarden_master_password_aws_secret_key,
       };
     }
     throw new Error("Unknown parameter type");

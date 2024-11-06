@@ -16,12 +16,12 @@ import { nanoid } from "nanoid";
 import { useEffect, useState } from "react";
 import {
   AWSSecretParameter,
-  BitwardenSensitiveInformationParameter,
   WorkflowApiResponse,
   WorkflowParameterValueType,
 } from "../types/workflowTypes";
 import {
   BitwardenLoginCredentialParameterYAML,
+  BitwardenSensitiveInformationParameterYAML,
   BlockYAML,
   ContextParameterYAML,
   ParameterYAML,
@@ -74,6 +74,7 @@ function convertToParametersYAML(
   | WorkflowParameterYAML
   | BitwardenLoginCredentialParameterYAML
   | ContextParameterYAML
+  | BitwardenSensitiveInformationParameterYAML
 > {
   return parameters.map((parameter) => {
     if (parameter.parameterType === "workflow") {
@@ -92,6 +93,20 @@ function convertToParametersYAML(
         key: parameter.key,
         description: parameter.description || null,
         source_parameter_key: parameter.sourceParameterKey,
+      };
+    } else if (parameter.parameterType === "secret") {
+      return {
+        parameter_type: "bitwarden_sensitive_information",
+        key: parameter.key,
+        bitwarden_identity_key: parameter.identityKey,
+        bitwarden_identity_fields: parameter.identityFields,
+        description: parameter.description || null,
+        bitwarden_collection_id: parameter.collectionId,
+        bitwarden_client_id_aws_secret_key: "SKYVERN_BITWARDEN_CLIENT_ID",
+        bitwarden_client_secret_aws_secret_key:
+          "SKYVERN_BITWARDEN_CLIENT_SECRET",
+        bitwarden_master_password_aws_secret_key:
+          "SKYVERN_BITWARDEN_MASTER_PASSWORD",
       };
     } else {
       return {
@@ -129,6 +144,14 @@ export type ParametersState = Array<
       key: string;
       parameterType: "context";
       sourceParameterKey: string;
+      description?: string | null;
+    }
+  | {
+      key: string;
+      parameterType: "secret";
+      identityKey: string;
+      identityFields: Array<string>;
+      collectionId: string;
       description?: string | null;
     }
 >;
@@ -246,12 +269,9 @@ function FlowRenderer({
     const parametersInYAMLConvertibleJSON = convertToParametersYAML(parameters);
     const filteredParameters = workflow.workflow_definition.parameters.filter(
       (parameter) => {
-        return (
-          parameter.parameter_type === "aws_secret" ||
-          parameter.parameter_type === "bitwarden_sensitive_information"
-        );
+        return parameter.parameter_type === "aws_secret";
       },
-    ) as Array<AWSSecretParameter | BitwardenSensitiveInformationParameter>;
+    ) as Array<AWSSecretParameter>;
 
     const echoParameters = convertEchoParameters(filteredParameters);
 
