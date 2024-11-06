@@ -8,7 +8,7 @@ import structlog
 from playwright._impl._errors import TimeoutError
 from playwright.async_api import ElementHandle, Frame, Page
 
-from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
+from skyvern.constants import BUILDING_ELEMENT_TREE_TIMEOUT_MS, PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
 from skyvern.exceptions import FailedToTakeScreenshot
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
@@ -190,7 +190,9 @@ class SkyvernFrame:
         :return: Screenshot of the page.
         """
         js_script = f"() => scrollToTop({str(draw_boxes).lower()})"
-        scroll_y_px = await self.evaluate(frame=self.frame, expression=js_script)
+        scroll_y_px = await self.evaluate(
+            frame=self.frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+        )
         return scroll_y_px
 
     async def scroll_to_next_page(self, draw_boxes: bool) -> float:
@@ -201,7 +203,9 @@ class SkyvernFrame:
         :return: Screenshot of the page.
         """
         js_script = f"() => scrollToNextPage({str(draw_boxes).lower()})"
-        scroll_y_px = await self.evaluate(frame=self.frame, expression=js_script)
+        scroll_y_px = await self.evaluate(
+            frame=self.frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+        )
         return scroll_y_px
 
     async def remove_bounding_boxes(self) -> None:
