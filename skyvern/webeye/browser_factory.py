@@ -6,15 +6,16 @@ import tempfile
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
 import aiofiles
 import structlog
-from playwright.async_api import BrowserContext, ConsoleMessage, Error, Page, Playwright
+from playwright.async_api import BrowserContext, ConsoleMessage, Download, Error, Page, Playwright
 from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
-from skyvern.constants import BROWSER_CLOSE_TIMEOUT, REPO_ROOT_DIR
+from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_DOWNLOAD_TIMEOUT, REPO_ROOT_DIR
 from skyvern.exceptions import (
     FailedToNavigateToUrl,
     FailedToReloadPage,
@@ -66,6 +67,66 @@ def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: 
 
     LOG.info("browser console log is saved", log_path=browser_artifacts.browser_console_log_path)
     browser_context.on("console", browser_console_log)
+
+
+def set_download_file_listener(browser_context: BrowserContext, **kwargs: Any) -> None:
+    async def listen_to_download(download: Download) -> None:
+        try:
+            workflow_run_id = kwargs.get("workflow_run_id")
+            task_id = kwargs.get("task_id")
+
+            async with asyncio.timeout(BROWSER_DOWNLOAD_TIMEOUT):
+                file_path = await download.path()
+                if file_path.suffix:
+                    return
+
+                LOG.info(
+                    "No file extensions, going to add file extension automatically",
+                    workflow_run_id=workflow_run_id,
+                    task_id=task_id,
+                    suggested_filename=download.suggested_filename,
+                    url=download.url,
+                )
+                suffix = Path(download.suggested_filename).suffix
+                if suffix:
+                    LOG.info(
+                        "Add extension according to suggested filename",
+                        workflow_run_id=workflow_run_id,
+                        task_id=task_id,
+                        filepath=str(file_path) + suffix,
+                    )
+                    file_path.rename(str(file_path) + suffix)
+                    return
+                suffix = Path(download.url).suffix
+                if suffix:
+                    LOG.info(
+                        "Add extension according to download url",
+                        workflow_run_id=workflow_run_id,
+                        task_id=task_id,
+                        filepath=str(file_path) + suffix,
+                    )
+                    file_path.rename(str(file_path) + suffix)
+                    return
+                # TODO: maybe should try to parse it from URL response
+        except asyncio.TimeoutError:
+            LOG.error(
+                "timeout to download file, going to cancel the download",
+                workflow_run_id=workflow_run_id,
+                task_id=task_id,
+            )
+            await download.cancel()
+
+        except Exception:
+            LOG.exception(
+                "Failed to add file extension name to downloaded file",
+                workflow_run_id=workflow_run_id,
+                task_id=task_id,
+            )
+
+    def listen_to_new_page(page: Page) -> None:
+        page.on("download", listen_to_download)
+
+    browser_context.on("page", listen_to_new_page)
 
 
 class BrowserContextCreator(Protocol):
@@ -145,6 +206,7 @@ class BrowserContextFactory:
                 raise UnknownBrowserType(browser_type)
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
             set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
+            set_download_file_listener(browser_context=browser_context, **kwargs)
             return browser_context, browser_artifacts, cleanup_func
         except Exception as e:
             if browser_context is not None:
