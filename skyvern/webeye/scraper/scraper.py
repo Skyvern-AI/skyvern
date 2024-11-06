@@ -9,7 +9,7 @@ import structlog
 from playwright.async_api import Frame, Locator, Page
 from pydantic import BaseModel
 
-from skyvern.constants import SKYVERN_DIR, SKYVERN_ID_ATTR
+from skyvern.constants import BUILDING_ELEMENT_TREE_TIMEOUT_MS, SKYVERN_DIR, SKYVERN_ID_ATTR
 from skyvern.exceptions import FailedToTakeScreenshot, UnknownElementTreeFormat
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -419,7 +419,7 @@ async def get_interactable_element_tree_in_frame(
 
         await SkyvernFrame.evaluate(frame=frame, expression=JS_FUNCTION_DEFS)
         frame_elements, frame_element_tree = await SkyvernFrame.evaluate(
-            frame=frame, expression=frame_js_script, timeout_ms=60 * 1000
+            frame=frame, expression=frame_js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
         )
 
         if len(frame.child_frames) > 0:
@@ -455,7 +455,7 @@ async def get_interactable_element_tree(
     await SkyvernFrame.evaluate(frame=page, expression=JS_FUNCTION_DEFS)
     main_frame_js_script = "() => buildTreeFromBody()"
     elements, element_tree = await SkyvernFrame.evaluate(
-        frame=page, expression=main_frame_js_script, timeout_ms=60 * 1000
+        frame=page, expression=main_frame_js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
     )
 
     if len(page.main_frame.child_frames) > 0:
@@ -486,7 +486,7 @@ class IncrementalScrapePage:
 
         js_script = "() => getIncrementElements()"
         incremental_elements, incremental_tree = await SkyvernFrame.evaluate(
-            frame=frame, expression=js_script, timeout_ms=60 * 1000
+            frame=frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
         )
         # we listen the incremental elements seperated by frames, so all elements will be in the same SkyvernFrame
         self.id_to_css_dict, self.id_to_element_dict, _, _, _ = build_element_dict(incremental_elements)
