@@ -1,7 +1,6 @@
 from typing import Awaitable, Callable
 
 from fastapi import FastAPI
-from playwright.async_api import Frame, Page
 
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.agent_functions import AgentFunction
@@ -17,6 +16,7 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.webeye.browser_manager import BrowserManager
+from skyvern.webeye.scraper.scraper import ScrapeExcludeFunc
 
 SETTINGS_MANAGER = SettingsManager.get_settings()
 DATABASE = AgentDB(
@@ -37,7 +37,7 @@ SECONDARY_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
 WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
 WORKFLOW_SERVICE = WorkflowService()
 AGENT_FUNCTION = AgentFunction()
-scrape_exclude: Callable[[Page, Frame], Awaitable[bool]] | None = None
+scrape_exclude: ScrapeExcludeFunc | None = None
 authentication_function: Callable[[str], Awaitable[Organization]] | None = None
 setup_api_app: Callable[[FastAPI], None] | None = None
 
