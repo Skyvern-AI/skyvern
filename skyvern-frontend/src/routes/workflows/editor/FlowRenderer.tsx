@@ -265,7 +265,7 @@ function FlowRenderer({
   }, [nodesInitialized]);
 
   async function handleSave() {
-    const blocks = getWorkflowBlocks(nodes);
+    const blocks = getWorkflowBlocks(nodes, edges);
     const parametersInYAMLConvertibleJSON = convertToParametersYAML(parameters);
     const filteredParameters = workflow.workflow_definition.parameters.filter(
       (parameter) => {

@@ -635,9 +635,48 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
   }
 }
 
-function getWorkflowBlocksUtil(nodes: Array<AppNode>): Array<BlockYAML> {
+function getOrderedChildrenBlocks(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+  parentId: string,
+): Array<BlockYAML> {
+  const parentNode = nodes.find((node) => node.id === parentId);
+  if (!parentNode) {
+    return [];
+  }
+  const blockStartNode = nodes.find(
+    (node) => node.type === "start" && node.parentId === parentId,
+  );
+  if (!blockStartNode) {
+    return [];
+  }
+  const firstChildId = edges.find(
+    (edge) => edge.source === blockStartNode.id,
+  )?.target;
+  const firstChild = nodes.find((node) => node.id === firstChildId);
+  if (!firstChild || !isWorkflowBlockNode(firstChild)) {
+    return [];
+  }
+
+  const children: Array<BlockYAML> = [];
+  let currentNode: WorkflowBlockNode | undefined = firstChild;
+  while (currentNode) {
+    children.push(getWorkflowBlock(currentNode));
+    const nextId = edges.find(
+      (edge) => edge.source === currentNode?.id,
+    )?.target;
+    const next = nodes.find((node) => node.id === nextId);
+    currentNode = next && isWorkflowBlockNode(next) ? next : undefined;
+  }
+  return children;
+}
+
+function getWorkflowBlocksUtil(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+): Array<BlockYAML> {
   return nodes.flatMap((node) => {
-    if (node.parentId) {
+    if (node.parentId || node.type === "start" || node.type === "nodeAdder") {
       return [];
     }
     if (node.type === "loop") {
@@ -647,26 +686,19 @@ function getWorkflowBlocksUtil(nodes: Array<AppNode>): Array<BlockYAML> {
           label: node.data.label,
           continue_on_failure: node.data.continueOnFailure,
           loop_over_parameter_key: node.data.loopValue,
-          loop_blocks: nodes
-            .filter((n) => n.parentId === node.id)
-            .map((n) => {
-              return getWorkflowBlock(
-                n as Exclude<AppNode, LoopNode | NodeAdderNode | StartNode>,
-              );
-            }),
+          loop_blocks: getOrderedChildrenBlocks(nodes, edges, node.id),
         },
       ];
     }
-    return [
-      getWorkflowBlock(
-        node as Exclude<AppNode, LoopNode | NodeAdderNode | StartNode>,
-      ),
-    ];
+    return [getWorkflowBlock(node as Exclude<WorkflowBlockNode, LoopNode>)];
   });
 }
 
-function getWorkflowBlocks(nodes: Array<AppNode>): Array<BlockYAML> {
-  return getWorkflowBlocksUtil(nodes.filter(isWorkflowBlockNode));
+function getWorkflowBlocks(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+): Array<BlockYAML> {
+  return getWorkflowBlocksUtil(nodes, edges);
 }
 
 function generateNodeLabel(existingLabels: Array<string>) {
