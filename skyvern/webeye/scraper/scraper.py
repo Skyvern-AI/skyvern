@@ -242,13 +242,25 @@ class ScrapedPage(BaseModel):
         raise UnknownElementTreeFormat(fmt=fmt)
 
     async def refresh(self, with_screenshot: bool = True) -> Self:
-        return await scrape_website(
+        refreshed_page = await scrape_website(
             browser_state=self._browser_state,
             url=self.url,
             cleanup_element_tree=self._clean_up_func,
             scrape_exclude=self._scrape_exclude,
             with_screenshot=with_screenshot,
         )
+        self.elements = refreshed_page.elements
+        self.id_to_css_dict = refreshed_page.id_to_css_dict
+        self.id_to_element_dict = refreshed_page.id_to_element_dict
+        self.id_to_frame_dict = refreshed_page.id_to_frame_dict
+        self.id_to_element_hash = refreshed_page.id_to_element_hash
+        self.hash_to_element_ids = refreshed_page.hash_to_element_ids
+        self.element_tree = refreshed_page.element_tree
+        self.element_tree_trimmed = refreshed_page.element_tree_trimmed
+        self.screenshots = refreshed_page.screenshots or self.screenshots
+        self.html = refreshed_page.html
+        self.extracted_text = refreshed_page.extracted_text
+        return self
 
 
 async def scrape_website(
