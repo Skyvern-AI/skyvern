@@ -5,6 +5,7 @@ import random
 import string
 from asyncio.exceptions import CancelledError
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Tuple
 
 import httpx
@@ -293,11 +294,12 @@ class ForgeAgent:
                 if len(list_files_after) > len(list_files_before):
                     files_to_rename = list(set(list_files_after) - set(list_files_before))
                     for file in files_to_rename:
+                        file_extension = Path(file).suffix
                         random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
                         random_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
                         if task_block.download_suffix:
                             random_file_name = f"{random_file_name}-{task_block.download_suffix}"
-                        rename_file(os.path.join(workflow_download_directory, file), random_file_name)
+                        rename_file(os.path.join(workflow_download_directory, file), random_file_name + file_extension)
 
                     LOG.info(
                         "Task marked as completed due to download",
