@@ -23,6 +23,14 @@ import { copyText } from "@/util/copyText";
 import { WorkflowParameter } from "./types/workflowTypes";
 import { Input } from "@/components/ui/input";
 import { z } from "zod";
+import { ProxyLocation } from "@/api/types";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 
 type Props = {
   workflowParameters: Array<WorkflowParameter>;
@@ -60,38 +68,61 @@ function parseValuesForWorkflowRun(
   );
 }
 
+type RunWorkflowRequestBody = {
+  data: Record<string, unknown>; // workflow parameters and values
+  proxy_location: ProxyLocation | null;
+  webhook_callback_url?: string | null;
+};
+
+function getRunWorkflowRequestBody(
+  values: RunWorkflowFormType,
+  workflowParameters: Array<WorkflowParameter>,
+): RunWorkflowRequestBody {
+  const { webhookCallbackUrl, proxyLocation, ...parameters } = values;
+
+  const parsedParameters = parseValuesForWorkflowRun(
+    parameters,
+    workflowParameters,
+  );
+
+  const body: RunWorkflowRequestBody = {
+    data: parsedParameters,
+    proxy_location: proxyLocation,
+  };
+
+  if (webhookCallbackUrl) {
+    body.webhook_callback_url = webhookCallbackUrl;
+  }
+
+  return body;
+}
+
+type RunWorkflowFormType = Record<string, unknown> & {
+  webhookCallbackUrl: string | null;
+  proxyLocation: ProxyLocation | null;
+};
+
 function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
   const { workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
-  const form = useForm<Record<string, unknown>>({
-    defaultValues: { ...initialValues, webhookCallbackUrl: null },
+  const form = useForm<RunWorkflowFormType>({
+    defaultValues: {
+      ...initialValues,
+      webhookCallbackUrl: null,
+      proxyLocation: ProxyLocation.Residential,
+    },
   });
   const apiCredential = useApiCredential();
 
   const runWorkflowMutation = useMutation({
-    mutationFn: async (values: Record<string, unknown>) => {
+    mutationFn: async (values: RunWorkflowFormType) => {
       const client = await getClient(credentialGetter);
-
-      const { webhookCallbackUrl, ...parameters } = values;
-
-      const body: {
-        data: Record<string, unknown>;
-        proxy_location: string;
-        webhook_callback_url?: string;
-      } = {
-        data: parameters,
-        proxy_location: "RESIDENTIAL",
-      };
-
-      if (webhookCallbackUrl) {
-        body.webhook_callback_url = webhookCallbackUrl as string;
-      }
-
-      return client.post<unknown, { data: { workflow_run_id: string } }>(
-        `/workflows/${workflowPermanentId}/run`,
-        body,
-      );
+      const body = getRunWorkflowRequestBody(values, workflowParameters);
+      return client.post<
+        RunWorkflowRequestBody,
+        { data: { workflow_run_id: string } }
+      >(`/workflows/${workflowPermanentId}/run`, body);
     },
     onSuccess: (response) => {
       toast({
@@ -123,8 +154,8 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
     },
   });
 
-  function onSubmit(values: Record<string, unknown>) {
-    const { webhookCallbackUrl, ...parameters } = values;
+  function onSubmit(values: RunWorkflowFormType) {
+    const { webhookCallbackUrl, proxyLocation, ...parameters } = values;
     const parsedParameters = parseValuesForWorkflowRun(
       parameters,
       workflowParameters,
@@ -132,6 +163,7 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
     runWorkflowMutation.mutate({
       ...parsedParameters,
       webhookCallbackUrl,
+      proxyLocation,
     });
   }
 
@@ -216,7 +248,7 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
           <FormField
             key="webhookCallbackUrl"
             control={form.control}
-            name={"webhookCallbackUrl"}
+            name="webhookCallbackUrl"
             rules={{
               validate: (value) => {
                 if (value === null) {
@@ -264,6 +296,62 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
               );
             }}
           />
+          <FormField
+            key="proxyLocation"
+            control={form.control}
+            name="proxyLocation"
+            render={({ field }) => {
+              return (
+                <FormItem>
+                  <div className="flex gap-16">
+                    <FormLabel>
+                      <div className="w-72">
+                        <div className="flex items-center gap-2 text-lg">
+                          Proxy Location
+                        </div>
+                        <h2 className="text-sm text-slate-400">
+                          Route Skyvern through one of our available proxies.
+                        </h2>
+                      </div>
+                    </FormLabel>
+                    <div className="w-full space-y-2">
+                      <FormControl>
+                        <Select
+                          value={field.value ?? ""}
+                          onValueChange={field.onChange}
+                        >
+                          <SelectTrigger className="w-48">
+                            <SelectValue placeholder="Proxy Location" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value={ProxyLocation.Residential}>
+                              Residential
+                            </SelectItem>
+                            <SelectItem value={ProxyLocation.ResidentialES}>
+                              Residential (Spain)
+                            </SelectItem>
+                            <SelectItem value={ProxyLocation.ResidentialIE}>
+                              Residential (Ireland)
+                            </SelectItem>
+                            <SelectItem value={ProxyLocation.ResidentialIN}>
+                              Residential (India)
+                            </SelectItem>
+                            <SelectItem value={ProxyLocation.ResidentialJP}>
+                              Residential (Japan)
+                            </SelectItem>
+                            <SelectItem value={ProxyLocation.None}>
+                              None
+                            </SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </FormControl>
+                      <FormMessage />
+                    </div>
+                  </div>
+                </FormItem>
+              );
+            }}
+          />
         </div>
 
         <div className="flex justify-end gap-2">
@@ -272,22 +360,10 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
             variant="secondary"
             onClick={() => {
               const values = form.getValues();
-              const { webhookCallbackUrl, ...parameters } = values;
-              const parsedParameters = parseValuesForWorkflowRun(
-                parameters,
+              const body = getRunWorkflowRequestBody(
+                values,
                 workflowParameters,
               );
-              const body: {
-                data: Record<string, unknown>;
-                proxy_location: string;
-                webhook_callback_url?: string;
-              } = {
-                data: parsedParameters,
-                proxy_location: "RESIDENTIAL",
-              };
-              if (webhookCallbackUrl) {
-                body.webhook_callback_url = webhookCallbackUrl as string;
-              }
 
               const curl = fetchToCurl({
                 method: "POST",
@@ -298,6 +374,7 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
                   "x-api-key": apiCredential ?? "<your-api-key>",
                 },
               });
+
               copyText(curl).then(() => {
                 toast({
                   variant: "success",
