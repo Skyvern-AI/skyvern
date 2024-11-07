@@ -173,7 +173,7 @@ class TaskBlock(Block):
     title: str = "Untitled Task"
     navigation_goal: str | None = None
     data_extraction_goal: str | None = None
-    data_schema: dict[str, Any] | None = None
+    data_schema: dict[str, Any] | list | None = None
     # error code to error description for the LLM
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
