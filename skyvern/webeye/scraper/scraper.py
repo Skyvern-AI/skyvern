@@ -241,13 +241,12 @@ class ScrapedPage(BaseModel):
 
         raise UnknownElementTreeFormat(fmt=fmt)
 
-    async def refresh(self, with_screenshot: bool = True) -> Self:
+    async def refresh(self) -> Self:
         refreshed_page = await scrape_website(
             browser_state=self._browser_state,
             url=self.url,
             cleanup_element_tree=self._clean_up_func,
             scrape_exclude=self._scrape_exclude,
-            with_screenshot=with_screenshot,
         )
         self.elements = refreshed_page.elements
         self.id_to_css_dict = refreshed_page.id_to_css_dict
@@ -260,6 +259,7 @@ class ScrapedPage(BaseModel):
         self.screenshots = refreshed_page.screenshots or self.screenshots
         self.html = refreshed_page.html
         self.extracted_text = refreshed_page.extracted_text
+        self.url = refreshed_page.url
         return self
 
 
@@ -269,7 +269,6 @@ async def scrape_website(
     cleanup_element_tree: CleanupElementTreeFunc,
     num_retry: int = 0,
     scrape_exclude: ScrapeExcludeFunc | None = None,
-    with_screenshot: bool = True,
 ) -> ScrapedPage:
     """
     ************************************************************************************************
@@ -299,7 +298,6 @@ async def scrape_website(
             url=url,
             cleanup_element_tree=cleanup_element_tree,
             scrape_exclude=scrape_exclude,
-            with_screenshot=with_screenshot,
         )
     except Exception as e:
         # NOTE: MAX_SCRAPING_RETRIES is set to 0 in both staging and production
@@ -321,7 +319,6 @@ async def scrape_website(
             cleanup_element_tree,
             num_retry=num_retry,
             scrape_exclude=scrape_exclude,
-            with_screenshot=with_screenshot,
         )
 
 
@@ -369,7 +366,6 @@ async def scrape_web_unsafe(
     url: str,
     cleanup_element_tree: CleanupElementTreeFunc,
     scrape_exclude: ScrapeExcludeFunc | None = None,
-    with_screenshot: bool = True,
 ) -> ScrapedPage:
     """
     Asynchronous function that performs web scraping without any built-in error handling. This function is intended
@@ -394,11 +390,7 @@ async def scrape_web_unsafe(
     LOG.info("Waiting for 5 seconds before scraping the website.")
     await asyncio.sleep(5)
 
-    screenshots: list[bytes] = []
-
-    # TODO: do we need to scroll to the button when we scrape without screenshots?
-    if with_screenshot:
-        screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=url, draw_boxes=True)
+    screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=url, draw_boxes=True)
 
     elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
     element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))

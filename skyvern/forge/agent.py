@@ -907,17 +907,19 @@ class ForgeAgent:
                 step_id=step.step_id,
                 workflow_run_id=task.workflow_run_id,
             )
-            scraped_page_without_screenshots = await scraped_page.refresh(with_screenshot=False)
+            scraped_page_refreshed = await scraped_page.refresh()
 
             verification_prompt = prompt_engine.load_prompt(
                 "check-user-goal",
                 navigation_goal=task.navigation_goal,
                 navigation_payload=task.navigation_payload,
-                elements=scraped_page_without_screenshots.build_element_tree(ElementTreeFormat.HTML),
+                elements=scraped_page_refreshed.build_element_tree(ElementTreeFormat.HTML),
             )
 
             # this prompt is critical to our agent so let's use the primary LLM API handler
-            verification_response = await app.LLM_API_HANDLER(prompt=verification_prompt, step=step, screenshots=None)
+            verification_response = await app.LLM_API_HANDLER(
+                prompt=verification_prompt, step=step, screenshots=scraped_page_refreshed.screenshots
+            )
             if "user_goal_achieved" not in verification_response or "thoughts" not in verification_response:
                 LOG.error(
                     "Invalid LLM response for user goal success verification, skipping verification",
