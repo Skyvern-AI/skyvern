@@ -12,6 +12,8 @@ export const ArtifactType = {
   HTMLScrape: "html_scrape",
 } as const;
 
+export type ArtifactType = (typeof ArtifactType)[keyof typeof ArtifactType];
+
 export const Status = {
   Created: "created",
   Running: "running",
@@ -25,7 +27,16 @@ export const Status = {
 
 export type Status = (typeof Status)[keyof typeof Status];
 
-export type ArtifactType = (typeof ArtifactType)[keyof typeof ArtifactType];
+export const ProxyLocation = {
+  Residential: "RESIDENTIAL",
+  ResidentialIE: "RESIDENTIAL_IE",
+  ResidentialES: "RESIDENTIAL_ES",
+  ResidentialIN: "RESIDENTIAL_IN",
+  ResidentialJP: "RESIDENTIAL_JP",
+  None: "NONE",
+} as const;
+
+export type ProxyLocation = (typeof ProxyLocation)[keyof typeof ProxyLocation];
 
 export type ArtifactApiResponse = {
   created_at: string;
@@ -90,7 +101,7 @@ export type CreateTaskRequest = {
   navigation_payload: Record<string, unknown> | string | null;
   extracted_information_schema: Record<string, unknown> | string | null;
   error_code_mapping: Record<string, string> | null;
-  proxy_location: string | null;
+  proxy_location: ProxyLocation | null;
   totp_verification_url: string | null;
   totp_identifier: string | null;
 };
@@ -184,7 +195,7 @@ export type WorkflowApiResponse = {
     parameters: Array<WorkflowParameter>;
     blocks: Array<WorkflowBlock>;
   };
-  proxy_location: string;
+  proxy_location: ProxyLocation | null;
   webhook_callback_url: string;
   created_at: string;
   modified_at: string;
@@ -248,7 +259,7 @@ export type WorkflowRunApiResponse = {
   workflow_run_id: string;
   workflow_id: string;
   status: Status;
-  proxy_location: string;
+  proxy_location: ProxyLocation | null;
   webhook_callback_url: string;
   created_at: string;
   modified_at: string;
@@ -258,7 +269,7 @@ export type WorkflowRunStatusApiResponse = {
   workflow_id: string;
   workflow_run_id: string;
   status: Status;
-  proxy_location: string;
+  proxy_location: ProxyLocation | null;
   webhook_callback_url: string | null;
   created_at: string;
   modified_at: string;
