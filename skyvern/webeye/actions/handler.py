@@ -2237,6 +2237,7 @@ async def extract_information_for_navigation_goal(
     element_tree_format = ElementTreeFormat.HTML
     element_tree_in_prompt: str = scraped_page.build_element_tree(element_tree_format)
 
+    scraped_page_refreshed = await scraped_page.refresh()
     extract_information_prompt = prompt_engine.load_prompt(
         prompt_template,
         navigation_goal=task.navigation_goal,
@@ -2244,8 +2245,8 @@ async def extract_information_for_navigation_goal(
         elements=element_tree_in_prompt,
         data_extraction_goal=task.data_extraction_goal,
         extracted_information_schema=task.extracted_information_schema,
-        current_url=scraped_page.url,
-        extracted_text=scraped_page.extracted_text,
+        current_url=scraped_page_refreshed.url,
+        extracted_text=scraped_page_refreshed.extracted_text,
         error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
         utc_datetime=datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
     )
