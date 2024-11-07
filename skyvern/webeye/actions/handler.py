@@ -832,9 +832,9 @@ async def handle_select_option_action(
             await skyvern_element.scroll_into_view()
             await skyvern_element.press_key("ArrowDown")
 
-            # wait 5s for options to load
-            await asyncio.sleep(5)
-            is_open = True
+        # wait 5s for options to load
+        await asyncio.sleep(5)
+        is_open = True
 
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(task=task, step=step, check_exist_funcs=[dom.check_id_in_dom]),
