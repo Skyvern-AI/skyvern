@@ -16,32 +16,51 @@ async def llm_messages_builder(
     prompt: str,
     screenshots: list[bytes] | None = None,
     add_assistant_prefix: bool = False,
+    is_llama: bool = False,
 ) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = [
-        {
-            "type": "text",
-            "text": prompt,
-        }
-    ]
-
-    if screenshots:
-        for screenshot in screenshots:
-            encoded_image = base64.b64encode(screenshot).decode("utf-8")
-            messages.append(
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/png;base64,{encoded_image}",
-                    },
-                }
-            )
-    # Anthropic models seems to struggle to always output a valid json object so we need to prefill the response to force it:
-    if add_assistant_prefix:
-        return [
-            {"role": "user", "content": messages},
-            {"role": "assistant", "content": "{"},
+    if is_llama:
+        # Llama 3.2 vision format
+        content = [{"type": "text", "text": prompt}]
+        
+        if screenshots:
+            for screenshot in screenshots:
+                encoded_image = base64.b64encode(screenshot).decode("utf-8")
+                content.append({
+                    "type": "image",
+                    "image_url": f"data:image/png;base64,{encoded_image}"
+                })
+        
+        return [{
+            "role": "user",
+            "content": content
+        }]
+    else:
+        # Original format for other models
+        messages: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": prompt,
+            }
         ]
-    return [{"role": "user", "content": messages}]
+
+        if screenshots:
+            for screenshot in screenshots:
+                encoded_image = base64.b64encode(screenshot).decode("utf-8")
+                messages.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{encoded_image}",
+                        },
+                    }
+                )
+
+        if add_assistant_prefix:
+            return [
+                {"role": "user", "content": messages},
+                {"role": "assistant", "content": "{"},
+            ]
+        return [{"role": "user", "content": messages}]
 
 
 def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bool = False) -> dict[str, Any]:

@@ -14,15 +14,21 @@ RUN playwright install-deps
 RUN playwright install
 RUN apt-get install -y xauth x11-apps netpbm && apt-get clean
 
+# Add these lines to install dos2unix and convert entrypoint scripts
+RUN apt-get update && \
+    apt-get install -y dos2unix && \
+    apt-get clean
+
 COPY . /app
+
+# Convert line endings
+RUN dos2unix /app/entrypoint-skyvern.sh && \
+    chmod +x /app/entrypoint-skyvern.sh
 
 ENV PYTHONPATH="/app:$PYTHONPATH"
 ENV VIDEO_PATH=/data/videos
 ENV HAR_PATH=/data/har
 ENV LOG_PATH=/data/log
 ENV ARTIFACT_STORAGE_PATH=/data/artifacts
-
-COPY ./entrypoint-skyvern.sh /app/entrypoint-skyvern.sh
-RUN chmod +x /app/entrypoint-skyvern.sh
 
 CMD [ "/bin/bash", "/app/entrypoint-skyvern.sh" ]

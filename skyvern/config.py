@@ -5,11 +5,38 @@ from skyvern.constants import SKYVERN_DIR
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=(".env", ".env.staging", ".env.prod"), extra="ignore")
+    # Use only model_config, not Config class
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
+    
+    # Llama Configuration
+    ENABLE_LLAMA: bool = True
+    LLAMA_API_BASE: str = "http://host.docker.internal:11434"
+    LLAMA_MODEL_NAME: str = "llama3.2-vision"
+    LLAMA_API_ROUTE: str = "/api/chat"
+    LLM_KEY: str = "LLAMA3"
+    SECONDARY_LLM_KEY: str = "LLAMA3"
+
+    # Disable other providers
+    ENABLE_OPENAI: bool = False
+    ENABLE_ANTHROPIC: bool = False
+    ENABLE_AZURE: bool = False
+    ENABLE_BEDROCK: bool = False
 
     ADDITIONAL_MODULES: list[str] = []
 
     BROWSER_TYPE: str = "chromium-headful"
+    MAX_SCRAPING_RETRIES: int = 0
+    VIDEO_PATH: str | None = None
+    HAR_PATH: str | None = "./har"
+    LOG_PATH: str = "./log"
+    BROWSER_ACTION_TIMEOUT_MS: int = 5000
+    BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
+    BROWSER_LOADING_TIMEOUT_MS: int = 120000
+    OPTION_LOADING_TIMEOUT_MS: int = 600000
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = None
     HAR_PATH: str | None = "./har"
@@ -91,8 +118,8 @@ class Settings(BaseSettings):
     # LLM Configuration #
     #####################
     # ACTIVE LLM PROVIDER
-    LLM_KEY: str = "OPENAI_GPT4O"
-    SECONDARY_LLM_KEY: str | None = None
+    LLM_KEY: str = "LLAMA3"  # Change default from OPENAI_GPT4O
+    SECONDARY_LLM_KEY: str = "LLAMA3"  # Also set this to LLAMA3
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
@@ -125,6 +152,9 @@ class Settings(BaseSettings):
     VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 5
 
     SVG_MAX_LENGTH: int = 100000
+
+    # Add debug property
+    DEBUG: bool = True
 
     def is_cloud_environment(self) -> bool:
         """

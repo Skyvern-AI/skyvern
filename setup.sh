@@ -9,7 +9,7 @@ log_event() {
 
 # Function to check if a command exists
 command_exists() {
-    command -v "$1" &> /dev/null
+    command -v "$1" &>/dev/null
 }
 
 ensure_required_commands() {
@@ -31,7 +31,7 @@ update_or_add_env_var() {
         sed -i.bak "s/^$key=.*/$key=$value/" .env && rm -f .env.bak
     else
         # Add new variable
-        echo "$key=$value" >> .env
+        echo "$key=$value" >>.env
     fi
 }
 
@@ -98,23 +98,31 @@ setup_llm_providers() {
         update_or_add_env_var "ENABLE_AZURE" "false"
     fi
 
+    echo "Do you want to enable Llama (y/n)?"
+    read enable_llama
+    if [[ "$enable_llama" == "y" ]]; then
+        read -p "Enter path to Llama model: " llama_model_path
+        update_or_add_env_var "ENABLE_LLAMA" "true"
+        update_or_add_env_var "LLAMA_MODEL_PATH" "$llama_model_path"
+        model_options+=("LLAMA_3_2_VISION")
+    fi
+
     # Model Selection
     if [ ${#model_options[@]} -eq 0 ]; then
         echo "No LLM providers enabled. You won't be able to run Skyvern unless you enable at least one provider. You can re-run this script to enable providers or manually update the .env file."
     else
         echo "Available LLM models based on your selections:"
         for i in "${!model_options[@]}"; do
-            echo "$((i+1)). ${model_options[$i]}"
+            echo "$((i + 1)). ${model_options[$i]}"
         done
         read -p "Choose a model by number (e.g., 1 for ${model_options[0]}): " model_choice
-        chosen_model=${model_options[$((model_choice-1))]}
+        chosen_model=${model_options[$((model_choice - 1))]}
         echo "Chosen LLM Model: $chosen_model"
         update_or_add_env_var "LLM_KEY" "$chosen_model"
     fi
 
     echo "LLM provider configurations updated in .env."
 }
-
 
 # Function to initialize .env file
 initialize_env_file() {
@@ -165,13 +173,15 @@ remove_poetry_env() {
 
 # Choose python version
 choose_python_version_or_fail() {
-  # https://github.com/python-poetry/poetry/issues/2117
-  # Py --list-paths 
+    # https://github.com/python-poetry/poetry/issues/2117
+    # Py --list-paths
     # This will output which paths are being used for Python 3.11
-  # Windows users need to poetry env use {{ Py --list-paths with 3.11}}
-  poetry env use python3.11 || { echo "Error: Python 3.11 is not installed. If you're on Windows, check out https://github.com/python-poetry/poetry/issues/2117 to unblock yourself"; exit 1; }
+    # Windows users need to poetry env use {{ Py --list-paths with 3.11}}
+    poetry env use python3.11 || {
+        echo "Error: Python 3.11 is not installed. If you're on Windows, check out https://github.com/python-poetry/poetry/issues/2117 to unblock yourself"
+        exit 1
+    }
 }
-
 
 # Function to install dependencies
 install_dependencies() {
@@ -211,9 +221,9 @@ setup_postgresql() {
             return 0
         fi
     fi
-    
+
     # Check if Docker is installed and running
-    if ! command_exists docker || ! docker info > /dev/null 2>&1; then
+    if ! command_exists docker || ! docker info >/dev/null 2>&1; then
         echo "Docker is not running or not installed. Please install or start Docker and try again."
         exit 1
     fi
@@ -221,7 +231,7 @@ setup_postgresql() {
     # Check if PostgreSQL is already running in a Docker container
     if docker ps | grep -q postgresql-container; then
         echo "PostgreSQL is already running in a Docker container."
-    else 
+    else
         # Attempt to install and start PostgreSQL using Docker
         echo "Attempting to install PostgreSQL via Docker..."
         docker run --name postgresql-container -e POSTGRES_HOST_AUTH_METHOD=trust -d -p 5432:5432 postgres:14
@@ -229,7 +239,7 @@ setup_postgresql() {
 
         # Wait for PostgreSQL to start
         echo "Waiting for PostgreSQL to start..."
-        sleep 20  # Adjust sleep time as necessary
+        sleep 20 # Adjust sleep time as necessary
     fi
 
     # Assuming docker exec works directly since we've checked Docker's status before
@@ -272,7 +282,7 @@ create_organization() {
     fi
 
     # Update the secrets-open-source.toml file
-    echo -e "[skyvern]\nconfigs = [\n    {\"env\" = \"local\", \"host\" = \"http://127.0.0.1:8000/api/v1\", \"orgs\" = [{name=\"Skyvern\", cred=\"$api_token\"}]}\n]" > .streamlit/secrets.toml
+    echo -e "[skyvern]\nconfigs = [\n    {\"env\" = \"local\", \"host\" = \"http://127.0.0.1:8000/api/v1\", \"orgs\" = [{name=\"Skyvern\", cred=\"$api_token\"}]}\n]" >.streamlit/secrets.toml
     echo ".streamlit/secrets.toml file updated with organization details."
 
     # Check if skyvern-frontend/.env exists and back it up

@@ -21,9 +21,12 @@ services:
       retries: 5
 
   skyvern:
-    image: public.ecr.aws/skyvern/skyvern:latest
+    # Replace the public image with a local build
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    # Keep the rest of the configuration
     restart: on-failure
-    # comment out if you want to externally call skyvern API
     ports:
       - 8000:8000
     volumes:
@@ -35,18 +38,20 @@ services:
     environment:
       - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
       - BROWSER_TYPE=chromium-headful
-      - ENABLE_OPENAI=true
-      - OPENAI_API_KEY=<your_openai_key>
-      # If you want to use other LLM provider, like azure and anthropic:
-      # - ENABLE_ANTHROPIC=true
-      # - LLM_KEY=ANTHROPIC_CLAUDE3_OPUS
-      # - ANTHROPIC_API_KEY=<your_anthropic_key>
-      # - ENABLE_AZURE=true
-      # - LLM_KEY=AZURE_OPENAI
-      # - AZURE_DEPLOYMENT=<your_azure_deployment>
-      # - AZURE_API_KEY=<your_azure_api_key>
-      # - AZURE_API_BASE=<your_azure_api_base>
-      # - AZURE_API_VERSION=<your_azure_api_version>
+      - ENABLE_LLAMA=true
+      - LLM_KEY=LLAMA3
+      - LLAMA_API_BASE=http://host.docker.internal:11434
+      - LLAMA_MODEL_NAME=llama3.2-vision
+      - LLAMA_API_ROUTE=/api/chat
+      - ENABLE_OPENAI=false
+      - ENABLE_ANTHROPIC=false
+      - ENABLE_AZURE=false
+      - ENABLE_BEDROCK=false
+      - ENABLE_AZURE_GPT4O_MINI=false
+      - LLAMA_BASE_URL=http://host.docker.internal:11434
+      - LLAMA_MODEL=llama3.2-vision
+      - ENV=local
+      - SECONDARY_LLM_KEY=LLAMA3
     depends_on:
       postgres:
         condition: service_healthy
@@ -55,6 +60,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   skyvern-ui:
     image: public.ecr.aws/skyvern/skyvern-ui:latest

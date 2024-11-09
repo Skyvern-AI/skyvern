@@ -89,7 +89,12 @@ class LLMAPIHandlerFactory:
                         data=screenshot,
                     )
 
-            messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
+            messages = await llm_messages_builder(
+                prompt=prompt,
+                screenshots=screenshots,
+                add_assistant_prefix=llm_config.add_assistant_prefix,
+                is_llama="llama" in llm_config.model_name.lower()
+            )
             if step:
                 await app.ARTIFACT_MANAGER.create_artifact(
                     step=step,
@@ -190,7 +195,12 @@ class LLMAPIHandlerFactory:
             if not llm_config.supports_vision:
                 screenshots = None
 
-            messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
+            messages = await llm_messages_builder(
+                prompt=prompt,
+                screenshots=screenshots,
+                add_assistant_prefix=llm_config.add_assistant_prefix,
+                is_llama="llama" in llm_config.model_name.lower()
+            )
             if step:
                 await app.ARTIFACT_MANAGER.create_artifact(
                     step=step,
@@ -214,6 +224,7 @@ class LLMAPIHandlerFactory:
                     model=llm_config.model_name,
                     messages=messages,
                     timeout=SettingsManager.get_settings().LLM_CONFIG_TIMEOUT,
+                    response_format={"type": "json_object"},  # Add this to force JSON response
                     **active_parameters,
                 )
                 LOG.info("LLM API call successful", llm_key=llm_key, model=llm_config.model_name)
@@ -237,7 +248,11 @@ class LLMAPIHandlerFactory:
                     artifact_type=ArtifactType.LLM_RESPONSE,
                     data=response.model_dump_json(indent=2).encode("utf-8"),
                 )
-                llm_cost = litellm.completion_cost(completion_response=response)
+                # Skip cost calculation for local Ollama models
+                if not llm_config.model_name.startswith("ollama/"):
+                    llm_cost = litellm.completion_cost(completion_response=response)
+                else:
+                    llm_cost = 0.0  # Local models are free
                 prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
                 completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
                 await app.DATABASE.update_step(
@@ -271,3 +286,7 @@ class LLMAPIHandlerFactory:
         if llm_key in cls._custom_handlers:
             raise DuplicateCustomLLMProviderError(llm_key)
         cls._custom_handlers[llm_key] = handler
+
+if SettingsManager.get_settings().ENABLE_LLAMA:
+    from .llama_handler import llama_handler
+    LLMAPIHandlerFactory.register_custom_handler("LLAMA3", llama_handler)

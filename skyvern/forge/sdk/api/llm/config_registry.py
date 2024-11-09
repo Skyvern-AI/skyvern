@@ -1,4 +1,5 @@
 import structlog
+import logging
 
 from skyvern.forge.sdk.api.llm.exceptions import (
     DuplicateLLMConfigError,
@@ -10,7 +11,34 @@ from skyvern.forge.sdk.api.llm.models import LiteLLMParams, LLMConfig, LLMRouter
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.get_logger()
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
+# Add debug logging at the top of the file
+print("Initializing config registry...")
+
+settings = SettingsManager.get_settings()
+print("Config Registry Settings:", {
+    "ENABLE_LLAMA": settings.ENABLE_LLAMA,
+    "LLAMA_API_BASE": settings.LLAMA_API_BASE,
+    "LLAMA_MODEL_NAME": settings.LLAMA_MODEL_NAME,
+    "LLM_KEY": settings.LLM_KEY,
+    "ENV_FILE": settings.model_config.get('env_file', '.env')  # Use model_config instead of Config
+})
+
+# First check if any providers are enabled
+provider_check = any([
+    settings.ENABLE_OPENAI,
+    settings.ENABLE_ANTHROPIC,
+    settings.ENABLE_AZURE,
+    settings.ENABLE_BEDROCK,
+    settings.ENABLE_LLAMA,
+])
+print("Provider check result:", provider_check)
+
+if not provider_check:
+    print("No providers enabled, raising NoProviderEnabledError")
+    raise NoProviderEnabledError()
 
 class LLMConfigRegistry:
     _configs: dict[str, LLMRouterConfig | LLMConfig] = {}
@@ -43,19 +71,64 @@ class LLMConfigRegistry:
         return cls._configs[llm_key]
 
 
-# if none of the LLM providers are enabled, raise an error
-if not any(
-    [
-        SettingsManager.get_settings().ENABLE_OPENAI,
-        SettingsManager.get_settings().ENABLE_ANTHROPIC,
-        SettingsManager.get_settings().ENABLE_AZURE,
-        SettingsManager.get_settings().ENABLE_AZURE_GPT4O_MINI,
-        SettingsManager.get_settings().ENABLE_BEDROCK,
-    ]
-):
+# Before the provider check, add debug logging
+logger.debug("Current settings: %s", {
+    "ENABLE_LLAMA": SettingsManager.get_settings().ENABLE_LLAMA,
+    "LLAMA_API_BASE": SettingsManager.get_settings().LLAMA_API_BASE,
+    "LLAMA_MODEL_NAME": SettingsManager.get_settings().LLAMA_MODEL_NAME,
+    "LLM_KEY": SettingsManager.get_settings().LLM_KEY
+})
+
+# Add this before the provider check
+logger.debug("Checking environment settings:")
+settings = SettingsManager.get_settings()
+logger.debug("Environment variables: %s", {
+    "ENABLE_LLAMA": settings.ENABLE_LLAMA,
+    "LLAMA_API_BASE": settings.LLAMA_API_BASE,
+    "LLAMA_MODEL_NAME": settings.LLAMA_MODEL_NAME,
+    "LLAMA_API_ROUTE": settings.LLAMA_API_ROUTE,
+    "LLM_KEY": settings.LLM_KEY,
+    "ENV_FILE": settings.model_config.get('env_file', '.env')
+})
+
+# First check if any providers are enabled
+if not any([
+    SettingsManager.get_settings().ENABLE_OPENAI,
+    SettingsManager.get_settings().ENABLE_ANTHROPIC,
+    SettingsManager.get_settings().ENABLE_AZURE,
+    SettingsManager.get_settings().ENABLE_BEDROCK,
+    SettingsManager.get_settings().ENABLE_LLAMA,  # Make sure Llama is included
+]):
     raise NoProviderEnabledError()
 
+# First register Llama configuration
+if SettingsManager.get_settings().ENABLE_LLAMA:
+    print("Registering Llama configuration...")
+    LLMConfigRegistry.register_config(
+        "LLAMA3",
+        LLMConfig(
+            model_name="ollama/llama3.2-vision",  # Move model name here with ollama/ prefix
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_output_tokens=16384,
+            litellm_params=LiteLLMParams(
+                api_base=settings.LLAMA_API_BASE,
+                api_key="",
+                model_info={
+                    "completion_route": "/api/chat"
+                }
+            )
+        )
+    )
 
+# Add after LLMConfigRegistry.register_config
+logger.debug("Registered configs after Llama registration: %s", LLMConfigRegistry._configs)
+
+# After registration, check registered configs
+logger.debug("Registered configs: %s", LLMConfigRegistry._configs)
+
+# Then register other provider configurations
 if SettingsManager.get_settings().ENABLE_OPENAI:
     LLMConfigRegistry.register_config(
         "OPENAI_GPT4_TURBO",
