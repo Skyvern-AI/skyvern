@@ -20,6 +20,13 @@ async def llm_messages_builder(
 ) -> list[dict[str, Any]]:
     if is_llama:
         # Llama 3.2 vision format
+        system_message = {
+            "role": "system",
+            "content": "You are a helpful AI assistant. Respond with pure JSON only, without markdown formatting or explanations. "\
+                       "Your response should be a valid JSON object that can be parsed directly. "\
+                       "When analyzing images, provide structured responses in pure JSON format."
+        }
+        
         content = [{"type": "text", "text": prompt}]
         
         if screenshots:
@@ -30,65 +37,76 @@ async def llm_messages_builder(
                     "image_url": f"data:image/png;base64,{encoded_image}"
                 })
         
-        return [{
-            "role": "user",
-            "content": content
-        }]
+        return [
+            system_message,
+            {
+                "role": "user",
+                "content": content
+            }
+        ]
     else:
         # Original format for other models
         messages: list[dict[str, Any]] = [
             {
-                "type": "text",
-                "text": prompt,
+                "role": "system",
+                "content": "You are a helpful assistant."
+            },
+            {
+                "role": "user",
+                "content": prompt
             }
         ]
-
+        
         if screenshots:
             for screenshot in screenshots:
                 encoded_image = base64.b64encode(screenshot).decode("utf-8")
-                messages.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{encoded_image}",
-                        },
+                messages.append({
+                    "role": "user",
+                    "content": {
+                        "type": "image",
+                        "image_url": f"data:image/png;base64,{encoded_image}"
                     }
-                )
-
-        if add_assistant_prefix:
-            return [
-                {"role": "user", "content": messages},
-                {"role": "assistant", "content": "{"},
-            ]
-        return [{"role": "user", "content": messages}]
+                })
+        
+        return messages
 
 
-def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bool = False) -> dict[str, Any]:
+def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bool = False, is_llama: bool = False) -> dict[str, Any]:
     content = None
     try:
         content = response.choices[0].message.content
-        # Since we prefilled Anthropic response with "{" we need to add it back to the response to have a valid json object:
         if add_assistant_prefix:
             content = "{" + content
-        content = try_to_extract_json_from_markdown_format(content)
-        if not content:
-            raise EmptyLLMResponseError(str(response))
-        return commentjson.loads(content)
-    except Exception as e:
-        if content:
-            LOG.warning(
-                "Failed to parse LLM response. Will retry auto-fixing the response for unescaped quotes.",
-                exc_info=True,
-                content=content,
-            )
+
+        # First try to extract JSON from markdown code blocks if present
+        if content.strip().startswith("```"):
+            if is_llama:
+                content = try_to_extract_json_from_markdown_format_llama(content)
+            else:
+                content = try_to_extract_json_from_markdown_format(content)
+        
+        # Attempt to parse the content as JSON
+        try:
+            return commentjson.loads(content)
+        except ValueError as e:
+            LOG.warning("Failed to parse LLM response as JSON. Attempting to auto-fix.", content=content)
+            # Attempt to fix unescaped quotes in the JSON string
+            fixed_content = fix_unescaped_quotes_in_json(content)
             try:
-                return fix_and_parse_json_string(content)
+                return commentjson.loads(fixed_content)
             except Exception as e2:
-                LOG.exception("Failed to auto-fix LLM response.", error=str(e2))
-                raise InvalidLLMResponseFormat(str(response)) from e2
-
-        raise InvalidLLMResponseFormat(str(response)) from e
-
+                LOG.error("Failed to auto-fix JSON string.", content=fixed_content)
+                # Try one last time with the JSON extractor
+                clean_content = try_to_extract_json_from_markdown_format(content)
+                if clean_content != content:
+                    try:
+                        return commentjson.loads(clean_content)
+                    except:
+                        pass
+                raise InvalidLLMResponseFormat(content) from e2
+    except Exception as e:
+        LOG.error("Unexpected error while parsing LLM response.", content=content)
+        raise InvalidLLMResponseFormat(content) from e
 
 def fix_cutoff_json(json_string: str, error_position: int) -> dict[str, Any]:
     """
@@ -117,7 +135,6 @@ def fix_cutoff_json(json_string: str, error_position: int) -> dict[str, Any]:
             return {"actions": []}
     except Exception as e:
         raise InvalidLLMResponseFormat(json_string) from e
-
 
 def fix_unescaped_quotes_in_json(json_string: str) -> str:
     """
@@ -173,7 +190,6 @@ def fix_unescaped_quotes_in_json(json_string: str) -> str:
 
     return json_string
 
-
 def fix_and_parse_json_string(json_string: str) -> dict[str, Any]:
     """
     Auto-fixes a JSON string by escaping unescaped quotes and ignoring the last action if the JSON is cutoff.
@@ -201,7 +217,6 @@ def fix_and_parse_json_string(json_string: str) -> dict[str, Any]:
             # Try to fix the cutoff JSON string and see if it can be parsed
             return fix_cutoff_json(json_string, error_position)
 
-
 def try_to_extract_json_from_markdown_format(text: str) -> str:
     pattern = r"```json\s*(.*?)\s*```"
     match = re.search(pattern, text, re.DOTALL)
@@ -209,3 +224,28 @@ def try_to_extract_json_from_markdown_format(text: str) -> str:
         return match.group(1)
     else:
         return text
+       
+def try_to_extract_json_from_markdown_format_llama(text: str) -> str:
+    """Extract JSON content from markdown code blocks.
+    This is particularly useful for models like Llama that may wrap their JSON responses.
+    
+    Args:
+        text (str): The text to process, which may contain JSON in markdown blocks
+        
+    Returns:
+        str: The extracted JSON string, or the original text if no JSON found
+    """
+    # First try to extract from ```json blocks
+    json_pattern = r"```(?:json)?\s*([\s\S]*?)\s*```"
+    match = re.search(json_pattern, text, re.MULTILINE)
+    if match:
+        return match.group(1).strip()
+    
+    # If no code blocks found, try to extract anything that looks like a JSON object
+    json_object_pattern = r"\{[\s\S]*?\}"  # Non-greedy match for nested objects
+    match = re.search(json_object_pattern, text)
+    if match:
+        return match.group(0)
+    
+    # If no JSON-like content found, return original text
+    return text

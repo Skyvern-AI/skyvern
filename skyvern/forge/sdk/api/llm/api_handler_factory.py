@@ -55,24 +55,30 @@ class LLMAPIHandlerFactory:
         )
         main_model_group = llm_config.main_model_group
 
+        async def llm_api_handler(
+            prompt: str,
+            llm_key: str,
+            model: str,
+            messages: list[dict[str, Any]],
+            **parameters: dict[str, Any],
+        ) -> dict[str, Any]:
+            try:
+                response = await router.completion(
+                    model=model,
+                    messages=messages,
+                    **parameters,
+                )
+                return response
+            except Exception as e:
+                LOG.exception("LLM request failed unexpectedly", llm_key=llm_key)
+                raise LLMProviderError(llm_key) from e
+
         async def llm_api_handler_with_router_and_fallback(
             prompt: str,
             step: Step | None = None,
             screenshots: list[bytes] | None = None,
             parameters: dict[str, Any] | None = None,
         ) -> dict[str, Any]:
-            """
-            Custom LLM API handler that utilizes the LiteLLM router and fallbacks to OpenAI GPT-4 Vision.
-
-            Args:
-                prompt: The prompt to generate completions for.
-                step: The step object associated with the prompt.
-                screenshots: The screenshots associated with the prompt.
-                parameters: Additional parameters to be passed to the LLM router.
-
-            Returns:
-                The response from the LLM router.
-            """
             if parameters is None:
                 parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
 
@@ -85,7 +91,7 @@ class LLMAPIHandlerFactory:
                 for screenshot in screenshots or []:
                     await app.ARTIFACT_MANAGER.create_artifact(
                         step=step,
-                        artifact_type=ArtifactType.SCREENSHOT_LLM,
+                        artifact_type=ArtifactType.LLM_SCREENSHOT,
                         data=screenshot,
                     )
 
@@ -93,65 +99,18 @@ class LLMAPIHandlerFactory:
                 prompt=prompt,
                 screenshots=screenshots,
                 add_assistant_prefix=llm_config.add_assistant_prefix,
-                is_llama="llama" in llm_config.model_name.lower()
+                is_llama=llm_config.model_name.startswith("ollama/"),
             )
-            if step:
-                await app.ARTIFACT_MANAGER.create_artifact(
-                    step=step,
-                    artifact_type=ArtifactType.LLM_REQUEST,
-                    data=json.dumps(
-                        {
-                            "model": llm_key,
-                            "messages": messages,
-                            **parameters,
-                        }
-                    ).encode("utf-8"),
-                )
-            try:
-                response = await router.acompletion(model=main_model_group, messages=messages, **parameters)
-                LOG.info("LLM API call successful", llm_key=llm_key, model=llm_config.model_name)
-            except litellm.exceptions.APIError as e:
-                raise LLMProviderErrorRetryableTask(llm_key) from e
-            except ValueError as e:
-                LOG.exception(
-                    "LLM token limit exceeded",
-                    llm_key=llm_key,
-                    model=main_model_group,
-                )
-                raise LLMProviderErrorRetryableTask(llm_key) from e
-            except Exception as e:
-                LOG.exception(
-                    "LLM request failed unexpectedly",
-                    llm_key=llm_key,
-                    model=main_model_group,
-                )
-                raise LLMProviderError(llm_key) from e
 
-            if step:
-                await app.ARTIFACT_MANAGER.create_artifact(
-                    step=step,
-                    artifact_type=ArtifactType.LLM_RESPONSE,
-                    data=response.model_dump_json(indent=2).encode("utf-8"),
-                )
-                llm_cost = litellm.completion_cost(completion_response=response)
-                prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
-                completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
-                await app.DATABASE.update_step(
-                    task_id=step.task_id,
-                    step_id=step.step_id,
-                    organization_id=step.organization_id,
-                    incremental_cost=llm_cost,
-                    incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
-                    incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
-                )
-            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
-            if step:
-                await app.ARTIFACT_MANAGER.create_artifact(
-                    step=step,
-                    artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-                    data=json.dumps(parsed_response, indent=2).encode("utf-8"),
-                )
-            return parsed_response
+            response = await llm_api_handler(
+                prompt=prompt,
+                llm_key=llm_config.model_name,
+                model=llm_config.model_name,
+                messages=messages,
+                **parameters,
+            )
+
+            return response
 
         return llm_api_handler_with_router_and_fallback
 
@@ -195,12 +154,7 @@ class LLMAPIHandlerFactory:
             if not llm_config.supports_vision:
                 screenshots = None
 
-            messages = await llm_messages_builder(
-                prompt=prompt,
-                screenshots=screenshots,
-                add_assistant_prefix=llm_config.add_assistant_prefix,
-                is_llama="llama" in llm_config.model_name.lower()
-            )
+            messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
             if step:
                 await app.ARTIFACT_MANAGER.create_artifact(
                     step=step,
@@ -224,7 +178,6 @@ class LLMAPIHandlerFactory:
                     model=llm_config.model_name,
                     messages=messages,
                     timeout=SettingsManager.get_settings().LLM_CONFIG_TIMEOUT,
-                    response_format={"type": "json_object"},  # Add this to force JSON response
                     **active_parameters,
                 )
                 LOG.info("LLM API call successful", llm_key=llm_key, model=llm_config.model_name)
@@ -263,7 +216,7 @@ class LLMAPIHandlerFactory:
                     incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
                     incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
                 )
-            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
+            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, llm_config.model_name.startswith("ollama/"))
             if step:
                 await app.ARTIFACT_MANAGER.create_artifact(
                     step=step,
