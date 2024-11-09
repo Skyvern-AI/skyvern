@@ -150,11 +150,16 @@ class LLMAPIHandlerFactory:
                         data=screenshot,
                     )
 
-            # TODO (kerem): instead of overriding the screenshots, should we just not take them in the first place?
             if not llm_config.supports_vision:
                 screenshots = None
 
-            messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
+            messages = await llm_messages_builder(
+                prompt=prompt,
+                screenshots=screenshots,
+                add_assistant_prefix=llm_config.add_assistant_prefix,
+                is_llama=llm_config.model_name.startswith("ollama/"),
+            )
+
             if step:
                 await app.ARTIFACT_MANAGER.create_artifact(
                     step=step,
@@ -163,16 +168,12 @@ class LLMAPIHandlerFactory:
                         {
                             "model": llm_config.model_name,
                             "messages": messages,
-                            # we're not using active_parameters here because it may contain sensitive information
                             **parameters,
                         }
                     ).encode("utf-8"),
                 )
             t_llm_request = time.perf_counter()
             try:
-                # TODO (kerem): add a timeout to this call
-                # TODO (kerem): add a retry mechanism to this call (acompletion_with_retries)
-                # TODO (kerem): use litellm fallbacks? https://litellm.vercel.app/docs/tutorials/fallbacks#how-does-completion_with_fallbacks-work
                 LOG.info("Calling LLM API", llm_key=llm_key, model=llm_config.model_name)
                 response = await litellm.acompletion(
                     model=llm_config.model_name,
