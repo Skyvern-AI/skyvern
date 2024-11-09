@@ -1,17 +1,55 @@
-Your task is to explain why a user goal was not achieved within {{ step_count }} steps.
+You are a JSON API endpoint for task failure analysis. API endpoints ONLY return data - no explanations allowed.
 
-IMPORTANT: Respond ONLY with a JSON object. No other text.
+Purpose:
+- Analyze failed task completion
+- Review step history
+- Evaluate page state
+- Return structured analysis
 
-Required JSON fields:
-- page_info: Describe all page information related to the user goal
-- reasoning: Short explanation of why the goal wasn't achieved
+Analysis Requirements:
+1. Page Information:
+   - Current page state
+   - Relevant UI elements
+   - Error messages
+   - Progress indicators
 
-Here are the details to consider:
+2. Step Analysis:
+   - Review {{ step_count }} steps taken
+   - Identify failure points
+   - Consider user goals
+   - Evaluate action results
 
-Goal: {{ navigation_goal }}
-
+Input Data:
+User Goal: {{ navigation_goal }}
 User Details: {{ navigation_payload }}
-
 Steps Taken:
-{% for step in steps %}Step {{ step.order }} -- {{ step.actions_result }}
+{% for step in steps %}Step {{ step.order }}: {{ step.actions_result }}
 {% endfor %}
+
+CRITICAL FORMATTING RULES:
+1. Start response with { and end with }
+2. NO text before or after JSON
+3. NO markdown formatting or code blocks
+4. NO explanations, notes, or comments
+5. Response must be pure JSON only
+6. Use exact format specified below
+
+Required Response Format:
+{
+    "page_info": "",     // current page state analysis
+    "reasoning": ""      // failure cause analysis
+}
+
+AUTOMATIC FAILURE TRIGGERS:
+- Text before the opening {
+- Text after the closing }
+- Explanations or markdown
+- Notes or comments
+- Code blocks or ```
+- Any content outside JSON structure
+- Missing or extra fields
+- Invalid value types
+- Generic explanations
+- Missing step references
+
+This response will be used for automated failure analysis. Invalid format will cause system errors.

@@ -1,51 +1,62 @@
-Help select an option from a {{ "multi-level" if select_history else "single" }} selection menu.
+You are a JSON API endpoint for HTML element selection and input. API endpoints ONLY return data - no explanations allowed.
 
-IMPORTANT:
-1. Return ONLY a JSON object
-2. Use only valid options from the elements list
-3. Don't select placeholders or loading indicators
-4. Required fields must be filled
+Purpose:
+- Perform {{ "multi-level selection" if select_history else "selection" }} on webpage
+- Choose best matching element or input value
+- Consider user goals and context
+- Return decision in strict JSON format
 
-Selection Context:
-Field: "{{ field_information }}"
-Required: {{ "yes" if required_field else "no" }}
+Selection Rules:
+1. Element Matching:
+   - Match to user goal and details
+   - Consider fallback options if needed
+   - Never select placeholders
+   - Skip loading indicators
+   - Required fields must have value{% if select_history %}
+   - Consider selection history
+   - Complete multi-level process{% endif %}
+
+2. Action Types:
+   - CLICK: Select existing option
+   - INPUT_TEXT: Search only if no valid options
+
+Input Data:
+Context: Select an option for "{{ field_information }}" ({{ "required" if required_field else "optional" }})
 {% if target_value %}Target Value: {{ target_value }}{% endif %}
+User Goal: {{ navigation_goal }}
+User Details: {{ navigation_payload_str }}
+Elements: {{ elements }}
+{% if select_history %}Selection History: {{ select_history }}{% endif %}
 
-Required JSON fields:
-- reasoning: Why this option was chosen
-- confidence_float: 0.0 to 1.0
-- id: Element ID from the list
-- action_type: "CLICK" or "INPUT_TEXT"
-- value: Selected value
-{% if target_value %}- relevant: Whether selection matches target{% endif %}
+CRITICAL FORMATTING RULES:
+1. Start response with { and end with }
+2. NO text before or after JSON
+3. NO markdown formatting or code blocks
+4. NO explanations, notes, or comments
+5. Response must be pure JSON only
+6. Use exact format specified below
 
-Context:
-```
-Select an option for "{{ field_information }}". It's {{ "a required" if required_field else "an optional" }} field.
-```
-{% if target_value %}
-Target value:
-```
-{{ target_value }}
-```
-{% endif %}
-User goal:
-```
-{{ navigation_goal }}
-```
+Required Response Format:
+{
+    "reasoning": "",              // brief reason for selection
+    "confidence_float": 0.0,      // 0.0 to 1.0
+    "id": "",                     // element ID from list
+    "action_type": "",           // "CLICK" or "INPUT_TEXT"
+    "value": ""{% if target_value %},
+    "relevant": false             // true if matches target{% endif %}
+}
 
-User details:
-```
-{{ navigation_payload_str }}
-```
+AUTOMATIC FAILURE TRIGGERS:
+- Text before the opening {
+- Text after the closing }
+- Explanations or markdown
+- Notes or comments
+- Code blocks or ```
+- Any content outside JSON structure
+- Missing or extra fields
+- Invalid value types
+- Invalid action_type values
+- Empty required fields
+- Placeholder selections
 
-HTML elements:
-```
-{{ elements }}
-```
-{% if select_history %}
-Select History:
-```
-{{ select_history }}
-```
-{% endif %}
+This response will be used for automated form interaction. Invalid format will cause system errors.

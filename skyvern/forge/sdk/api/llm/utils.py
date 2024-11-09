@@ -22,7 +22,7 @@ async def llm_messages_builder(
         system_message = {
             "role": "system",
             "content": (
-                "CRITICAL INSTRUCTION: You are a JSON-only assistant. DO NOT provide explanations or help.\n"
+                "CRITICAL INSTRUCTION: You are a JSON-only assistant. Do not respond in anything other than valid JSON and always follow the script you are given preisely.\n"
             )
         }
         
