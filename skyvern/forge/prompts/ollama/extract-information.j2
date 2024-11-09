@@ -1,0 +1,26 @@
+Extract information from a webpage screenshot.
+
+IMPORTANT:
+1. Return ONLY a JSON object
+2. Follow the exact schema format
+3. Use null for missing information
+4. No additional text or explanations
+
+{% if extracted_information_schema %}
+Required Schema:
+{{ extracted_information_schema }}
+{% endif %}
+
+Data Extraction Goal: {{ data_extraction_goal }}
+
+Available Information:
+1. URL: {{ current_url }}
+2. DOM Elements: {{ elements }}
+3. Page Text: {{ extracted_text }}
+4. User Data: {{ navigation_payload }}
+5. Current UTC Time: {{ utc_datetime }}
+
+{% if error_code_mapping_str %}
+Error Codes:
+{{ error_code_mapping_str }}
+{% endif %}

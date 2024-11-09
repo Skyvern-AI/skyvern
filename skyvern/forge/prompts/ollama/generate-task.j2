@@ -1,0 +1,24 @@
+Your task is to create a browser automation task definition.
+
+IMPORTANT:
+1. Output ONLY a JSON object
+2. No explanations or additional text
+3. All URLs must use HTTPS
+4. At least one goal (navigation or data extraction) must be provided
+
+Required Fields:
+1. url (string): Starting webpage URL
+2. suggested_title (string): Brief task description
+3. navigation_goal_reasoning (string): Why navigation is needed
+4. is_navigation_goal_required (boolean): Whether navigation is needed
+5. data_extraction_goal_reasoning (string): Why data extraction is needed
+6. is_data_extraction_goal_required (boolean): Whether data extraction is needed
+
+Optional Fields (use null if not needed):
+1. navigation_goal (string): Include "COMPLETE when..." criteria
+2. data_extraction_goal (string): Data to extract
+3. navigation_payload (json): Form values or parameters
+
+Create a task for this prompt:
+```
+{{ user_prompt }}

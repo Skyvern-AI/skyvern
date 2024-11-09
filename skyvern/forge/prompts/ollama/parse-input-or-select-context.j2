@@ -1,0 +1,19 @@
+You are analyzing an INPUT or SELECT element with ID "{{ element_id }}".
+
+IMPORTANT:
+1. Respond ONLY with a JSON object
+2. No additional text or explanations
+3. No markdown formatting
+
+Required JSON fields:
+- thought: How you verified the information
+- field: Which field this action will fill
+- is_required: true/false for required field
+- is_search_bar: true/false for search functionality
+
+Context Information:
+{{ action_reasoning }}
+
+Available Elements:
+{{ elements }}
+

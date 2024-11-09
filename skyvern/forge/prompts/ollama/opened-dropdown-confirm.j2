@@ -1,0 +1,12 @@
+Check if a screenshot shows an open dropdown menu.
+
+IMPORTANT: Return ONLY a JSON object. No other text.
+
+A dropdown menu is considered open if:
+1. At least one valid option is visible
+2. "No results" or "No match" messages don't count
+3. Placeholders like "Please select" don't count
+
+Required JSON fields:
+- reasoning: Why you determined it is/isn't a dropdown
+- is_opened_dropdown_menu: true/false

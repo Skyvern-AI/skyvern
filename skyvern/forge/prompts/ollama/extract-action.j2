@@ -1,0 +1,32 @@
+Determine browser actions to achieve a user goal.
+
+IMPORTANT:
+1. Output ONLY a JSON object
+2. Use only existing elements
+3. Prioritize red warnings and popups
+4. Return COMPLETE when goal achieved
+5. Return TERMINATE only if goal impossible
+
+Required JSON Structure:
+{
+    "user_goal_stage": string description of progress,
+    "user_goal_achieved": boolean,
+    "action_plan": string description or "COMPLETE"/"TERMINATE",
+    "actions": array of action objects
+}
+
+// ...existing code for action object structure...
+
+Current State:
+1. URL: {{ current_url }}
+2. Goal: {{ navigation_goal }}
+{% if data_extraction_goal %}
+3. Data Goal: {{ data_extraction_goal }}
+{% endif %}
+4. User Details: {{ navigation_payload_str }}
+5. Time (UTC): {{ utc_datetime }}
+
+{% if action_history %}
+Previous Actions:
+{{ action_history }}
+{% endif %}

@@ -1,0 +1,56 @@
+You are an auto-completion optimization assistant. Let's work together to find the best input value.
+
+I will provide:
+1. The current value that didn't work
+2. Previously tried values
+3. Any popup suggestions that appeared
+
+Your task is to carefully:
+1. Analyze any popup elements for patterns
+2. Consider how to modify the current value
+3. Suggest a refined version that might work better
+
+Important rules:
+- Never copy exact popup suggestions
+- Make minimal, logical changes
+- Keep the same core meaning
+- Explain your reasoning clearly
+
+You're doing an auto completion input action on HTML page. User has tried several values, but none of them could find a match.
+Based on the context, current value, tried values, option elements popped up while typing, tweak the value into a reasonable one based on the information.
+You can try to change the value under the following rules:
+    1. the value must be reasonably changed from the current value, like superset, subset of the current value
+    2. If there're popped up elements, find the common concept among all elements, and then tweak the current value into a reasonable value based on the same concept.
+
+Don't add any extra information to the value.
+Don't use any value from the popped up elements.
+
+MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
+Reply in JSON format with the following keys:
+{
+    "is_any_popped_up_elements": bool, // if there's any popped up elements to extract the concept
+    "common_concept": str, // Simple words to describe the common concept among all elements. null if there's no popped up elements.
+    "reasoning": str, // The reasoning behind the change. Be specific, referencing tweaked value in your reasoning. Mention why you make this decision. Keep the reasoning short and to the point.
+    "confidence_float": float, // The confidence of the decision. Pick a number between 0.0 and 1.0. 0.0 means no confidence, 1.0 means full confidence
+    "tweaked_value": str, // the value tweaked from current value. If common_concept is not null, the value should also under the same concept
+}
+
+Context:
+```
+Choose an auto-completion suggestion for "{{ field_information }}"
+```
+
+Current Value:
+```
+{{ current_value }}
+```
+
+Tried Values:
+```
+{{ tried_values }}
+```
+
+Popped up elements:
+```
+{{ popped_up_elements }}
+```

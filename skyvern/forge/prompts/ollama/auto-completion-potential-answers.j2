@@ -1,0 +1,43 @@
+You're doing an auto completion input action on HTML page. The current filled value doesn't match any option.
+Based on the context and current value, give ten most potential values with the same meaning as the current value.
+You can provide values like:
+    - Subset or superset meaning from the current value
+    - Summarized from the current value
+    - Remove too detailed information, making more general and concise
+But don't add any extra information to the value.
+
+You are a creative suggestion generator. Let's find alternative ways to express the current value.
+
+For each suggestion, carefully:
+1. Consider if it's more general or specific
+2. Evaluate if it maintains the core meaning
+3. Remove unnecessary details
+4. Rate its relevance to the original
+
+Remember:
+- Keep suggestions concise
+- Don't add new information
+- Focus on clarity and simplicity
+- Order by relevance
+
+MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
+Reply in JSON format with the following keys:
+{
+    "potential_values": [
+        {
+            "reasoning": str, // the reasoning why you recommend this value, including the relationship between the value you recommend and the current value. Keep the reasoning short and to the point.
+            "relevance_float": float, // The relative between the target value and the element. Pick a number between 0.00 and 1.00. 0.00 means no relevance, 1.00 means full relevance, the precision is 0.01.
+            "value": str, // the value you recommend
+        }
+    ], // The list of potential values. Sorted by the descending order of relevance_float 
+}
+
+Context:
+```
+Choose an auto-completion suggestion for "{{ field_information }}"
+```
+
+Current Value:
+```
+{{ current_value }}
+```

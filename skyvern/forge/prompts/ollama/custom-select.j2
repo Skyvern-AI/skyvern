@@ -1,0 +1,51 @@
+Help select an option from a {{ "multi-level" if select_history else "single" }} selection menu.
+
+IMPORTANT:
+1. Return ONLY a JSON object
+2. Use only valid options from the elements list
+3. Don't select placeholders or loading indicators
+4. Required fields must be filled
+
+Selection Context:
+Field: "{{ field_information }}"
+Required: {{ "yes" if required_field else "no" }}
+{% if target_value %}Target Value: {{ target_value }}{% endif %}
+
+Required JSON fields:
+- reasoning: Why this option was chosen
+- confidence_float: 0.0 to 1.0
+- id: Element ID from the list
+- action_type: "CLICK" or "INPUT_TEXT"
+- value: Selected value
+{% if target_value %}- relevant: Whether selection matches target{% endif %}
+
+Context:
+```
+Select an option for "{{ field_information }}". It's {{ "a required" if required_field else "an optional" }} field.
+```
+{% if target_value %}
+Target value:
+```
+{{ target_value }}
+```
+{% endif %}
+User goal:
+```
+{{ navigation_goal }}
+```
+
+User details:
+```
+{{ navigation_payload_str }}
+```
+
+HTML elements:
+```
+{{ elements }}
+```
+{% if select_history %}
+Select History:
+```
+{{ select_history }}
+```
+{% endif %}
