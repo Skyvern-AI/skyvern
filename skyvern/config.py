@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     
     # Llama Configuration
     ENABLE_LLAMA: bool = True
-    LLAMA_API_BASE: str = "http://host.docker.internal:11434"
+    LLAMA_API_BASE: str = "http://192.168.1.65:11434"
     LLAMA_MODEL_NAME: str = "llama3.2-vision"
     LLAMA_API_ROUTE: str = "/api/chat"
     LLM_KEY: str = "LLAMA3"

@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     
     # Llama Configuration
     ENABLE_LLAMA: bool = Field(default=False, env="ENABLE_LLAMA")
-    LLAMA_API_BASE: str = Field(default="http://localhost:11434", env="LLAMA_API_BASE")
+    LLAMA_API_BASE: str = Field(default="http://192.168.1.65:11434", env="LLAMA_API_BASE")
     LLAMA_MODEL_NAME: str = Field(default="llama3.2-vision", env="LLAMA_MODEL_NAME")
     LLAMA_API_ROUTE: str = Field(default="/api/chat", env="LLAMA_API_ROUTE")
     

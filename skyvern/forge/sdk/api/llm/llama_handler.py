@@ -22,7 +22,7 @@ async def llama_handler(
             # Convert screenshots to base64 for vision tasks
             payload["images"] = [base64.b64encode(img).decode('utf-8') for img in screenshots]
             
-        async with session.post("http://localhost:11434/api/chat", json=payload) as response:
+        async with session.post("http://192.168.1.65:11434/api/chat", json=payload) as response:
             result = await response.json()
             return {
                 "choices": [{

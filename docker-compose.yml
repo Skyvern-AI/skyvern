@@ -40,7 +40,7 @@ services:
       - BROWSER_TYPE=chromium-headful
       - ENABLE_LLAMA=true
       - LLM_KEY=LLAMA3
-      - LLAMA_API_BASE=http://host.docker.internal:11434
+      - LLAMA_API_BASE=http://192.168.1.65:11434
       - LLAMA_MODEL_NAME=llama3.2-vision
       - LLAMA_API_ROUTE=/api/chat
       - ENABLE_OPENAI=false
@@ -48,7 +48,7 @@ services:
       - ENABLE_AZURE=false
       - ENABLE_BEDROCK=false
       - ENABLE_AZURE_GPT4O_MINI=false
-      - LLAMA_BASE_URL=http://host.docker.internal:11434
+      - LLAMA_BASE_URL=http://192.168.1.65:11434
       - LLAMA_MODEL=llama3.2-vision
       - ENV=local
       - SECONDARY_LLM_KEY=LLAMA3
