@@ -8,7 +8,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, List
 
 import structlog
-from deprecation import deprecated
 from playwright.async_api import FileChooser, Frame, Locator, Page, TimeoutError
 from pydantic import BaseModel
 
@@ -641,7 +640,7 @@ async def handle_upload_file_action(
         )
 
 
-@deprecated("This function is deprecated. Downloads are handled by the click action handler now.")
+# This function is deprecated. Downloads are handled by the click action handler now.
 async def handle_download_file_action(
     action: actions.DownloadFileAction,
     page: Page,

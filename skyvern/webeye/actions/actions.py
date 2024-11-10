@@ -2,7 +2,6 @@ from enum import StrEnum
 from typing import Annotated, Any, Dict, Type, TypeVar
 
 import structlog
-from deprecation import deprecated
 from litellm import ConfigDict
 from pydantic import BaseModel, Field, ValidationError
 
@@ -177,7 +176,7 @@ class UploadFileAction(WebAction):
         return f"UploadFileAction(element_id={self.element_id}, file={self.file_url}, is_upload_file_tag={self.is_upload_file_tag})"
 
 
-@deprecated("This action is not used in the current implementation. Click actions are used instead.")
+# this is a deprecated action type
 class DownloadFileAction(WebAction):
     action_type: ActionType = ActionType.DOWNLOAD_FILE
     file_name: str
