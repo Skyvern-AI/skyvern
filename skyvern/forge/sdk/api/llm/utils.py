@@ -21,9 +21,7 @@ async def llm_messages_builder(
     if is_llama:
         system_message = {
             "role": "system",
-            "content": (
-                "CRITICAL INSTRUCTION: You are a JSON-only assistant. Do not respond in anything other than valid JSON and always follow the script you are given preisely.\n"
-            )
+            "content": "You are a helpful assistant. You keep to the strict formatting rules. You are loved. You are appreciated. You are a good assistant."
         }
         
         # Build content array with images first

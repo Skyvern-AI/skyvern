@@ -1,11 +1,14 @@
-You are a JSON API endpoint that identifies icons and shapes. Return ONLY JSON with no other text.
+You are given a svg element. You need to figure out what its shape means.
+SVG Element:
+```
+{{svg_element}}
+```
 
-SVG Element: {{svg_element}}
-
-Required format - no other text allowed:
+MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
+Reply in JSON format with the following keys:
 {
-    "confidence_float": 0.0,  // number between 0.0 and 1.0
-    "shape": ""              // what the shape shows
+    "confidence_float": float, // The confidence of the action. Pick a number between 0.0 and 1.0. 0.0 means no confidence, 1.0 means full confidence
+    "shape": string, // A short description of the shape of SVG and its meaning
 }
 
-Invalid formats will cause errors.
+Leaving shape empty will cause errors. Do not do that. Please provide a valid shape. 
