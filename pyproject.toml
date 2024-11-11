@@ -25,7 +25,7 @@ starlette-context = "^0.3.6"
 ddtrace = "^2.3.2"
 pydantic = "^2.5.2"
 pydantic-settings = "^2.1.0"
-fastapi = "^0.104.1"
+fastapi = "^0.115.4"
 psycopg = {extras = ["binary", "pool"], version = "^3.1.13"}
 alembic = "^1.12.1"
 python-jose = {extras = ["cryptography"], version = "^3.3.0"}
