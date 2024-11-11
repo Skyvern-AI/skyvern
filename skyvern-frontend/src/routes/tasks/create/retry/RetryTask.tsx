@@ -42,6 +42,7 @@ function RetryTask() {
           errorCodeMapping: task.request.error_code_mapping
             ? JSON.stringify(task.request.error_code_mapping, null, 2)
             : "",
+          proxyLocation: task.request.proxy_location,
         }}
       />
     </div>

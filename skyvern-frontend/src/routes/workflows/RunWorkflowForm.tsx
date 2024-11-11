@@ -24,13 +24,7 @@ import { WorkflowParameter } from "./types/workflowTypes";
 import { Input } from "@/components/ui/input";
 import { z } from "zod";
 import { ProxyLocation } from "@/api/types";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { ProxySelector } from "@/components/ProxySelector";
 
 type Props = {
   workflowParameters: Array<WorkflowParameter>;
@@ -316,34 +310,10 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
                     </FormLabel>
                     <div className="w-full space-y-2">
                       <FormControl>
-                        <Select
-                          value={field.value ?? ""}
-                          onValueChange={field.onChange}
-                        >
-                          <SelectTrigger className="w-48">
-                            <SelectValue placeholder="Proxy Location" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value={ProxyLocation.Residential}>
-                              Residential
-                            </SelectItem>
-                            <SelectItem value={ProxyLocation.ResidentialES}>
-                              Residential (Spain)
-                            </SelectItem>
-                            <SelectItem value={ProxyLocation.ResidentialIE}>
-                              Residential (Ireland)
-                            </SelectItem>
-                            <SelectItem value={ProxyLocation.ResidentialIN}>
-                              Residential (India)
-                            </SelectItem>
-                            <SelectItem value={ProxyLocation.ResidentialJP}>
-                              Residential (Japan)
-                            </SelectItem>
-                            <SelectItem value={ProxyLocation.None}>
-                              None
-                            </SelectItem>
-                          </SelectContent>
-                        </Select>
+                        <ProxySelector
+                          value={field.value}
+                          onChange={field.onChange}
+                        />
                       </FormControl>
                       <FormMessage />
                     </div>

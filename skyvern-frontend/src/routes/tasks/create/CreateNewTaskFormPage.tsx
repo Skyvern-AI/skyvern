@@ -60,6 +60,7 @@ function CreateNewTaskFormPage() {
             totpIdentifier: null,
             totpVerificationUrl: null,
             webhookCallbackUrl: null,
+            proxyLocation: null,
           }}
         />
       </div>

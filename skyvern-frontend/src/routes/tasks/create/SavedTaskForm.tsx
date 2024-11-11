@@ -31,7 +31,8 @@ import { stringify as convertToYAML } from "yaml";
 import { MAX_STEPS_DEFAULT } from "../constants";
 import { TaskFormSection } from "./TaskFormSection";
 import { savedTaskFormSchema, SavedTaskFormValues } from "./taskFormTypes";
-import { OrganizationApiResponse } from "@/api/types";
+import { OrganizationApiResponse, ProxyLocation } from "@/api/types";
+import { ProxySelector } from "@/components/ProxySelector";
 
 type Props = {
   initialValues: SavedTaskFormValues;
@@ -157,10 +158,10 @@ function SavedTaskForm({ initialValues }: Props) {
 
   const form = useForm<SavedTaskFormValues>({
     resolver: zodResolver(savedTaskFormSchema),
-    defaultValues: initialValues,
-    values: {
+    defaultValues: {
       ...initialValues,
       maxStepsOverride: initialValues.maxStepsOverride ?? null,
+      proxyLocation: initialValues.proxyLocation ?? ProxyLocation.Residential,
     },
   });
 
@@ -661,6 +662,38 @@ function SavedTaskForm({ initialValues }: Props) {
                       </div>
                     </FormItem>
                   )}
+                />
+                <FormField
+                  control={form.control}
+                  name="proxyLocation"
+                  render={({ field }) => {
+                    return (
+                      <FormItem>
+                        <div className="flex gap-16">
+                          <FormLabel>
+                            <div className="w-72">
+                              <div className="flex items-center gap-2 text-lg">
+                                Proxy Location
+                              </div>
+                              <h2 className="text-sm text-slate-400">
+                                Route Skyvern through one of our available
+                                proxies.
+                              </h2>
+                            </div>
+                          </FormLabel>
+                          <div className="w-full space-y-2">
+                            <FormControl>
+                              <ProxySelector
+                                value={field.value}
+                                onChange={field.onChange}
+                              />
+                            </FormControl>
+                            <FormMessage />
+                          </div>
+                        </div>
+                      </FormItem>
+                    );
+                  }}
                 />
                 <Separator />
                 <FormField
