@@ -32,7 +32,11 @@ import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { copyText } from "@/util/copyText";
 import { apiBaseUrl, envCredential } from "@/util/env";
-import { basicTimeFormat, timeFormatWithShortDate } from "@/util/timeFormat";
+import {
+  basicLocalTimeFormat,
+  basicTimeFormat,
+  timeFormatWithShortDate,
+} from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import {
   CopyIcon,
@@ -447,8 +451,9 @@ function WorkflowRun() {
                           onClick={(event) =>
                             handleNavigate(event, task.task_id)
                           }
+                          title={basicTimeFormat(task.created_at)}
                         >
-                          {basicTimeFormat(task.created_at)}
+                          {basicLocalTimeFormat(task.created_at)}
                         </TableCell>
                         <TableCell className="w-1/12">
                           <TaskActions task={task} />

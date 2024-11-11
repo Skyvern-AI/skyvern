@@ -26,7 +26,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { basicTimeFormat } from "@/util/timeFormat";
+import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import {
   ExclamationTriangleIcon,
@@ -240,8 +240,9 @@ function Workflows() {
                       onClick={(event) => {
                         handleRowClick(event, workflow.workflow_permanent_id);
                       }}
+                      title={basicTimeFormat(workflow.created_at)}
                     >
-                      {basicTimeFormat(workflow.created_at)}
+                      {basicLocalTimeFormat(workflow.created_at)}
                     </TableCell>
                     <TableCell>
                       <div className="flex justify-end gap-2">
@@ -383,8 +384,11 @@ function Workflows() {
                     <TableCell className="w-1/5">
                       <StatusBadge status={workflowRun.status} />
                     </TableCell>
-                    <TableCell className="w-1/5">
-                      {basicTimeFormat(workflowRun.created_at)}
+                    <TableCell
+                      className="w-1/5"
+                      title={basicTimeFormat(workflowRun.created_at)}
+                    >
+                      {basicLocalTimeFormat(workflowRun.created_at)}
                     </TableCell>
                   </TableRow>
                 );

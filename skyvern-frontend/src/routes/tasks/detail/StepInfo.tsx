@@ -2,7 +2,7 @@ import { StepApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
-import { basicTimeFormat } from "@/util/timeFormat";
+import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 
 type Props = {
   isFetching: boolean;
@@ -33,7 +33,9 @@ function StepInfo({ isFetching, stepProps }: Props) {
         {isFetching ? (
           <Skeleton className="h-4 w-40" />
         ) : stepProps ? (
-          <span>{basicTimeFormat(stepProps.created_at)}</span>
+          <span title={basicTimeFormat(stepProps.created_at)}>
+            {basicLocalTimeFormat(stepProps.created_at)}
+          </span>
         ) : null}
       </div>
     </div>

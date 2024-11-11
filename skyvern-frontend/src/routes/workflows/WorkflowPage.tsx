@@ -20,7 +20,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { basicTimeFormat } from "@/util/timeFormat";
+import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { Pencil2Icon } from "@radix-ui/react-icons";
 import { useQuery } from "@tanstack/react-query";
@@ -145,8 +145,8 @@ function WorkflowPage() {
                     <TableCell>
                       <StatusBadge status={workflowRun.status} />
                     </TableCell>
-                    <TableCell>
-                      {basicTimeFormat(workflowRun.created_at)}
+                    <TableCell title={basicTimeFormat(workflowRun.created_at)}>
+                      {basicLocalTimeFormat(workflowRun.created_at)}
                     </TableCell>
                   </TableRow>
                 ))
