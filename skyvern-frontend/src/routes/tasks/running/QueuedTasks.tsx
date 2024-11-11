@@ -1,7 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
 import { TaskApiResponse } from "@/api/types";
 import { useQuery } from "@tanstack/react-query";
-import { basicTimeFormat } from "@/util/timeFormat";
+import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import {
   Table,
   TableBody,
@@ -77,8 +77,11 @@ function QueuedTasks() {
                   <TableCell className="w-1/4">
                     <StatusBadge status={task.status} />
                   </TableCell>
-                  <TableCell className="w-1/4">
-                    {basicTimeFormat(task.created_at)}
+                  <TableCell
+                    className="w-1/4"
+                    title={basicTimeFormat(task.created_at)}
+                  >
+                    {basicLocalTimeFormat(task.created_at)}
                   </TableCell>
                 </TableRow>
               );

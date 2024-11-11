@@ -22,7 +22,7 @@ import {
   PaginationPrevious,
 } from "@/components/ui/pagination";
 import { StatusBadge } from "@/components/StatusBadge";
-import { basicTimeFormat } from "@/util/timeFormat";
+import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { TaskActions } from "./TaskActions";
 
@@ -120,8 +120,9 @@ function TaskHistory() {
                     <TableCell
                       className="w-1/4 cursor-pointer"
                       onClick={(event) => handleNavigate(event, task.task_id)}
+                      title={basicTimeFormat(task.created_at)}
                     >
-                      {basicTimeFormat(task.created_at)}
+                      {basicLocalTimeFormat(task.created_at)}
                     </TableCell>
                     <TableCell className="w-1/12">
                       <TaskActions task={task} />

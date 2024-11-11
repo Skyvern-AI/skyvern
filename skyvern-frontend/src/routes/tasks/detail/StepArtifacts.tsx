@@ -13,7 +13,7 @@ import { ZoomableImage } from "@/components/ZoomableImage";
 import { Skeleton } from "@/components/ui/skeleton";
 import { getImageURL } from "./artifactUtils";
 import { Input } from "@/components/ui/input";
-import { basicTimeFormat } from "@/util/timeFormat";
+import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { Artifact } from "./Artifact";
 
@@ -132,7 +132,11 @@ function StepArtifacts({ id, stepProps }: Props) {
             {isFetching ? (
               <Skeleton className="h-4 w-40" />
             ) : stepProps ? (
-              <Input value={basicTimeFormat(stepProps.created_at)} readOnly />
+              <Input
+                value={basicLocalTimeFormat(stepProps.created_at)}
+                readOnly
+                title={basicTimeFormat(stepProps.created_at)}
+              />
             ) : null}
           </div>
         </div>
