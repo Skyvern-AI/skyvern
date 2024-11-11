@@ -1,5 +1,9 @@
 import { getClient } from "@/api/AxiosClient";
-import { CreateTaskRequest, OrganizationApiResponse } from "@/api/types";
+import {
+  CreateTaskRequest,
+  OrganizationApiResponse,
+  ProxyLocation,
+} from "@/api/types";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { Button } from "@/components/ui/button";
 import {
@@ -33,6 +37,7 @@ import {
   createNewTaskFormSchema,
   CreateNewTaskFormValues,
 } from "./taskFormTypes";
+import { ProxySelector } from "@/components/ProxySelector";
 
 type Props = {
   initialValues: CreateNewTaskFormValues;
@@ -70,7 +75,7 @@ function createTaskRequestObject(
     webhook_callback_url: transform(formValues.webhookCallbackUrl),
     navigation_goal: transform(formValues.navigationGoal),
     data_extraction_goal: transform(formValues.dataExtractionGoal),
-    proxy_location: "RESIDENTIAL",
+    proxy_location: formValues.proxyLocation ?? ProxyLocation.Residential,
     navigation_payload: transform(formValues.navigationPayload),
     extracted_information_schema: extractedInformationSchema,
     totp_verification_url: transform(formValues.totpVerificationUrl),
@@ -105,10 +110,10 @@ function CreateNewTaskForm({ initialValues }: Props) {
 
   const form = useForm<CreateNewTaskFormValues>({
     resolver: zodResolver(createNewTaskFormSchema),
-    defaultValues: initialValues,
-    values: {
+    defaultValues: {
       ...initialValues,
-      maxStepsOverride: null,
+      maxStepsOverride: initialValues.maxStepsOverride ?? null,
+      proxyLocation: initialValues.proxyLocation ?? ProxyLocation.Residential,
     },
   });
   const { errors } = useFormState({ control: form.control });
@@ -485,6 +490,38 @@ function CreateNewTaskForm({ initialValues }: Props) {
                       </div>
                     </FormItem>
                   )}
+                />
+                <FormField
+                  control={form.control}
+                  name="proxyLocation"
+                  render={({ field }) => {
+                    return (
+                      <FormItem>
+                        <div className="flex gap-16">
+                          <FormLabel>
+                            <div className="w-72">
+                              <div className="flex items-center gap-2 text-lg">
+                                Proxy Location
+                              </div>
+                              <h2 className="text-sm text-slate-400">
+                                Route Skyvern through one of our available
+                                proxies.
+                              </h2>
+                            </div>
+                          </FormLabel>
+                          <div className="w-full space-y-2">
+                            <FormControl>
+                              <ProxySelector
+                                value={field.value}
+                                onChange={field.onChange}
+                              />
+                            </FormControl>
+                            <FormMessage />
+                          </div>
+                        </div>
+                      </FormItem>
+                    );
+                  }}
                 />
                 <Separator />
                 <FormField
