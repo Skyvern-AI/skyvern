@@ -69,9 +69,10 @@ class InputOrSelectContext(BaseModel):
     field: str | None = None
     is_required: bool | None = None
     is_search_bar: bool | None = None  # don't trigger custom-selection logic when it's a search bar
+    is_location_input: bool | None = None  # address input usually requires auto completion
 
     def __repr__(self) -> str:
-        return f"InputOrSelectContext(field={self.field}, is_required={self.is_required}, is_search_bar={self.is_search_bar})"
+        return f"InputOrSelectContext(field={self.field}, is_required={self.is_required}, is_search_bar={self.is_search_bar}, is_location_input={self.is_location_input})"
 
 
 class Action(BaseModel):

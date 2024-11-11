@@ -223,3 +223,7 @@ class SkyvernFrame:
     async def is_window_scrollable(self) -> bool:
         js_script = "() => isWindowScrollable()"
         return await self.evaluate(frame=self.frame, expression=js_script)
+
+    async def has_ASP_client_control(self) -> bool:
+        js_script = "() => hasASPClientControl()"
+        return await self.evaluate(frame=self.frame, expression=js_script)

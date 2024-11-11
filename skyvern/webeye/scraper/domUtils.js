@@ -216,6 +216,10 @@ function isElementStyleVisibilityVisible(element, style) {
   return true;
 }
 
+function hasASPClientControl() {
+  return typeof ASPxClientControl !== "undefined";
+}
+
 // from playwright
 function isElementVisible(element) {
   // TODO: This is a hack to not check visibility for option elements
@@ -496,8 +500,16 @@ function isInteractable(element) {
     if (element.className.toString().includes("hover:cursor-pointer")) {
       return true;
     }
+
+    // auto for <a> is equal to pointer for <a>
+    if (tagName == "a" && computedStyle.cursor === "auto") {
+      return true;
+    }
   }
 
+  if (hasASPClientControl() && tagName === "tr") {
+    return true;
+  }
   return false;
 }
 

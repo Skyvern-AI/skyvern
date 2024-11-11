@@ -18,7 +18,6 @@ from skyvern.exceptions import (
     ErrFoundSelectableElement,
     FailedToFetchSecret,
     FailToClick,
-    FailToFindAutocompleteOption,
     FailToSelectByIndex,
     FailToSelectByLabel,
     FailToSelectByValue,
@@ -27,6 +26,8 @@ from skyvern.exceptions import (
     InteractWithDisabledElement,
     InvalidElementForTextInput,
     MissingElement,
+    MissingElementDict,
+    MissingElementInCSSMap,
     MissingFileUrl,
     MultipleElementsFound,
     NoAutoCompleteOptionMeetCondition,
@@ -72,6 +73,7 @@ from skyvern.webeye.scraper.scraper import (
     ElementTreeFormat,
     IncrementalScrapePage,
     ScrapedPage,
+    hash_element,
     json_to_html,
     trim_element_tree,
 )
@@ -169,6 +171,7 @@ def clean_and_remove_element_tree_factory(
         )
         for check_exist in check_exist_funcs:
             element_tree = remove_exist_elements(element_tree=element_tree, check_exist=check_exist)
+
         return element_tree
 
     return helper_func
@@ -441,6 +444,7 @@ async def handle_input_text_action(
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
     incremental_element: list[dict] = []
+    auto_complete_hacky_flag: bool = False
     # check if it's selectable
     if skyvern_element.get_tag_name() == InteractiveElement.INPUT and not await skyvern_element.is_raw_input():
         select_action = SelectOptionAction(
@@ -489,6 +493,7 @@ async def handle_input_text_action(
             )
             await incremental_scraped.stop_listen_dom_increment()
         else:
+            auto_complete_hacky_flag = True
             try:
                 # TODO: we don't select by value for the auto completion detect case
                 result, _ = await sequentially_select_from_dropdown(
@@ -545,9 +550,26 @@ async def handle_input_text_action(
         if len(text) == 0:
             return [ActionSuccess()]
 
-        if await skyvern_element.is_auto_completion_input():
+        # parse the input context to help executing input action
+        prompt = prompt_engine.load_prompt(
+            "parse-input-or-select-context",
+            element_id=action.element_id,
+            action_reasoning=action.reasoning,
+            elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
+        )
+
+        json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+        input_or_select_context = InputOrSelectContext.model_validate(json_response)
+        LOG.info(
+            "Parsed input/select context",
+            context=input_or_select_context,
+            task_id=task.task_id,
+            step_id=step.step_id,
+        )
+
+        if await skyvern_element.is_auto_completion_input() or input_or_select_context.is_location_input:
             if result := await input_or_auto_complete_input(
-                action=action,
+                input_or_select_context=input_or_select_context,
                 page=page,
                 dom=dom,
                 text=text,
@@ -557,11 +579,22 @@ async def handle_input_text_action(
             ):
                 return [result]
 
-        await skyvern_element.input_sequentially(text=text)
+        await incremental_scraped.start_listen_dom_increment()
+
+        try:
+            await skyvern_element.input_sequentially(text=text)
+        finally:
+            incremental_element = await incremental_scraped.get_incremental_element_tree(
+                clean_and_remove_element_tree_factory(task=task, step=step, check_exist_funcs=[dom.check_id_in_dom]),
+            )
+            if len(incremental_element) > 0:
+                auto_complete_hacky_flag = True
+            await incremental_scraped.stop_listen_dom_increment()
+
         return [ActionSuccess()]
     finally:
         # HACK: force to finish missing auto completion input
-        if len(incremental_element) > 0:
+        if auto_complete_hacky_flag:
             LOG.debug(
                 "Trigger input-selection hack, pressing Tab to choose one",
                 action=action,
@@ -1240,7 +1273,8 @@ async def choose_auto_completion_dropdown(
         if len(incremental_element) == 0:
             raise NoIncrementalElementFoundForAutoCompletion(element_id=skyvern_element.get_id(), text=text)
 
-        html = incremental_scraped.build_html_tree(incremental_element)
+        cleaned_incremental_element = remove_duplicated_HTML_element(incremental_element)
+        html = incremental_scraped.build_html_tree(cleaned_incremental_element)
         auto_completion_confirm_prompt = prompt_engine.load_prompt(
             "auto-completion-choose-option",
             field_information=context.field,
@@ -1305,8 +1339,20 @@ async def choose_auto_completion_dropdown(
             await skyvern_element.input_clear()
 
 
+def remove_duplicated_HTML_element(elements: list[dict]) -> list[dict]:
+    cache_map = set()
+    new_elements: list[dict] = []
+    for element in elements:
+        key = hash_element(element=element)
+        if key in cache_map:
+            continue
+        cache_map.add(key)
+        new_elements.append(element)
+    return new_elements
+
+
 async def input_or_auto_complete_input(
-    action: actions.InputTextAction,
+    input_or_select_context: InputOrSelectContext,
     page: Page,
     dom: DomUtil,
     text: str,
@@ -1319,22 +1365,6 @@ async def input_or_auto_complete_input(
         task_id=task.task_id,
         step_id=step.step_id,
         element_id=skyvern_element.get_id(),
-    )
-
-    prompt = prompt_engine.load_prompt(
-        "parse-input-or-select-context",
-        element_id=action.element_id,
-        action_reasoning=action.reasoning,
-        elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
-    )
-
-    json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
-    input_or_select_context = InputOrSelectContext.model_validate(json_response)
-    LOG.info(
-        "Parsed input/select context",
-        context=input_or_select_context,
-        task_id=task.task_id,
-        step_id=step.step_id,
     )
 
     # 1. press the orignal text to see if there's a match
@@ -1388,6 +1418,8 @@ async def input_or_auto_complete_input(
             "auto-completion-potential-answers",
             field_information=input_or_select_context.field,
             current_value=current_value,
+            navigation_goal=task.navigation_goal,
+            navigation_payload_str=json.dumps(task.navigation_payload),
         )
 
         LOG.info(
@@ -1439,12 +1471,15 @@ async def input_or_auto_complete_input(
                 current_value=current_value,
                 current_attemp=current_attemp,
             )
+            cleaned_new_elements = remove_duplicated_HTML_element(whole_new_elements)
             prompt = prompt_engine.load_prompt(
                 "auto-completion-tweak-value",
                 field_information=input_or_select_context.field,
                 current_value=current_value,
+                navigation_goal=task.navigation_goal,
+                navigation_payload_str=json.dumps(task.navigation_payload),
                 tried_values=json.dumps(tried_values),
-                popped_up_elements="".join([json_to_html(element) for element in whole_new_elements]),
+                popped_up_elements="".join([json_to_html(element) for element in cleaned_new_elements]),
             )
             json_respone = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
             context_reasoning = json_respone.get("reasoning")
@@ -1462,7 +1497,13 @@ async def input_or_auto_complete_input(
             current_value = new_current_value
 
     else:
-        return ActionFailure(FailToFindAutocompleteOption(current_value=text))
+        LOG.warning(
+            "Auto completion didn't finish, this might leave the input value to be empty.",
+            context=input_or_select_context,
+            step_id=step.step_id,
+            task_id=task.task_id,
+        )
+        return None
 
 
 async def sequentially_select_from_dropdown(
@@ -1723,7 +1764,7 @@ async def select_from_dropdown(
         await selected_element.get_locator().click(timeout=timeout)
         single_select_result.action_result = ActionSuccess()
         return single_select_result
-    except MissingElement:
+    except (MissingElement, MissingElementDict, MissingElementInCSSMap, MultipleElementsFound):
         if not value:
             raise
 

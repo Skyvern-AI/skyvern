@@ -600,6 +600,7 @@ class IncrementalScrapePage:
             return None, False
 
         if not interactable:
+            LOG.debug("Find the target element by text, but the element is not interactable", text=text)
             return None, True
 
         return parent_locator, True

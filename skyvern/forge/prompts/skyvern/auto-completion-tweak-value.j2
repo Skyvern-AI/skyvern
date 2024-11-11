@@ -1,5 +1,5 @@
 You're doing an auto completion input action on HTML page. User has tried several values, but none of them could find a match.
-Based on the context, current value, tried values, option elements popped up while typing, tweak the value into a reasonable one based on the information.
+Based on the context, current value, tried values, user goal, user details and option elements popped up while typing, tweak the value into a reasonable one based on the information.
 You can try to change the value under the following rules:
     1. the value must be reasonably changed from the current value, like superset, subset of the current value
     2. If there're popped up elements, find the common concept among all elements, and then tweak the current value into a reasonable value based on the same concept.
@@ -30,6 +30,16 @@ Current Value:
 Tried Values:
 ```
 {{ tried_values }}
+```
+
+User goal:
+```
+{{ navigation_goal }}
+```
+
+User details:
+```
+{{ navigation_payload_str }}
 ```
 
 Popped up elements:
