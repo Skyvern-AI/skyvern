@@ -484,6 +484,10 @@ function isInteractable(element) {
     return true;
   }
 
+  if (tagName === "span" && element.closest("div[id^='dropdown-container']")) {
+    return true;
+  }
+
   if (
     tagName === "div" ||
     tagName === "img" ||
