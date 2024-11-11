@@ -67,6 +67,7 @@ import { Button } from "@/components/ui/button";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { isLoopNode, LoopNode } from "./nodes/LoopNode/types";
 import { isTaskNode } from "./nodes/TaskNode/types";
+import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -190,6 +191,7 @@ function FlowRenderer({
   const [title, setTitle] = useState(initialTitle);
   const nodesInitialized = useNodesInitialized();
   const { hasChanges, setHasChanges } = useWorkflowHasChangesStore();
+  useShouldNotifyWhenClosingTab();
   const blocker = useBlocker(({ currentLocation, nextLocation }) => {
     return hasChanges && nextLocation.pathname !== currentLocation.pathname;
   });
