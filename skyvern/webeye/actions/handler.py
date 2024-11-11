@@ -248,7 +248,7 @@ class ActionHandler:
                 handler = ActionHandler._handled_action_types[action.action_type]
                 results = await handler(action, page, scraped_page, task, step)
                 actions_result.extend(results)
-                if not results or type(actions_result[-1]) != ActionSuccess:
+                if not results or not isinstance(actions_result[-1], ActionSuccess):
                     return actions_result
 
                 # do the teardown
@@ -1131,7 +1131,7 @@ async def chain_click(
             )
             sibling_action_result = await click_sibling_of_input(locator, timeout=timeout)
             action_results.append(sibling_action_result)
-            if type(sibling_action_result) == ActionSuccess:
+            if isinstance(sibling_action_result, ActionSuccess):
                 return action_results
 
         try:
