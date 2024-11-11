@@ -22,7 +22,7 @@ import {
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
-import { Pencil2Icon } from "@radix-ui/react-icons";
+import { Pencil2Icon, PlayIcon } from "@radix-ui/react-icons";
 import { useQuery } from "@tanstack/react-query";
 import {
   Link,
@@ -88,13 +88,14 @@ function WorkflowPage() {
         <div className="flex gap-2">
           <Button asChild variant="secondary">
             <Link to={`/workflows/${workflowPermanentId}/edit`}>
-              <Pencil2Icon className="mr-2 h-4 w-4" />
-              Edit Workflow
+              <Pencil2Icon className="mr-2 size-4" />
+              Edit
             </Link>
           </Button>
           <Button asChild>
             <Link to={`/workflows/${workflowPermanentId}/run`}>
-              Create New Run
+              <PlayIcon className="mr-2 size-4" />
+              Run
             </Link>
           </Button>
         </div>
