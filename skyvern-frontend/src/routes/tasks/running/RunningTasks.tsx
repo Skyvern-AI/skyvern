@@ -31,7 +31,7 @@ function RunningTasks() {
         })
         .then((response) => response.data);
     },
-    refetchOnMount: true,
+    refetchOnMount: "always",
   });
 
   if (runningTasks?.length === 0) {

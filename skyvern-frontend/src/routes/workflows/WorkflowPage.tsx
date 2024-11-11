@@ -52,6 +52,7 @@ function WorkflowPage() {
         })
         .then((response) => response.data);
     },
+    refetchOnMount: "always",
   });
 
   const { data: workflow, isLoading: workflowIsLoading } =
