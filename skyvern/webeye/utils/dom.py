@@ -143,10 +143,6 @@ class SkyvernElement:
         if autocomplete and autocomplete == "list":
             return True
 
-        element_id = await self.get_attr("id")
-        if element_id == "location-input":
-            return True
-
         return False
 
     async def is_custom_option(self) -> bool:
@@ -526,6 +522,25 @@ class SkyvernElement:
             await self.blur()
             await self.focus(timeout=timeout)
         await asyncio.sleep(2)  # wait for scrolling into the target
+
+    async def calculate_vertical_distance_to(
+        self,
+        target_locator: Locator,
+        mode: typing.Literal["inner", "outer"],
+        timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+    ) -> float:
+        self_rect = await self.get_locator().bounding_box(timeout=timeout)
+        if self_rect is None:
+            raise Exception("Can't Skyvern element rect")
+
+        target_rect = await target_locator.bounding_box(timeout=timeout)
+        if self_rect is None or target_rect is None:
+            raise Exception("Can't get the target element rect")
+
+        if mode == "inner":
+            return abs(self_rect["y"] + self_rect["height"] - target_rect["y"])
+        else:
+            return abs(self_rect["y"] - (target_rect["y"] + target_rect["height"]))
 
 
 class DomUtil:

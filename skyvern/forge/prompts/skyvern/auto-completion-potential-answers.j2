@@ -1,5 +1,5 @@
 You're doing an auto completion input action on HTML page. The current filled value doesn't match any option.
-Based on the context and current value, give ten most potential values with the same meaning as the current value.
+Based on the context, current value, user goal and user details, give ten most potential values with the same meaning as the current value.
 You can provide values like:
     - Subset or superset meaning from the current value
     - Summarized from the current value
@@ -26,4 +26,14 @@ Choose an auto-completion suggestion for "{{ field_information }}"
 Current Value:
 ```
 {{ current_value }}
+```
+
+User goal:
+```
+{{ navigation_goal }}
+```
+
+User details:
+```
+{{ navigation_payload_str }}
 ```
