@@ -31,7 +31,7 @@ function QueuedTasks() {
         })
         .then((response) => response.data);
     },
-    refetchOnMount: true,
+    refetchOnMount: "always",
   });
 
   function handleNavigate(event: React.MouseEvent, id: string) {

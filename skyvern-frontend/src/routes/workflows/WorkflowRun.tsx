@@ -40,7 +40,11 @@ import {
   PlayIcon,
   ReaderIcon,
 } from "@radix-ui/react-icons";
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import {
+  keepPreviousData,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import fetchToCurl from "fetch-to-curl";
 import { useEffect, useState } from "react";
 import {
@@ -73,6 +77,7 @@ function WorkflowRun() {
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const navigate = useNavigate();
   const apiCredential = useApiCredential();
+  const queryClient = useQueryClient();
 
   const { data: workflow, isLoading: workflowIsLoading } = useWorkflowQuery({
     workflowPermanentId,
@@ -101,7 +106,7 @@ function WorkflowRun() {
         if (!query.state.data) {
           return false;
         }
-        return statusIsRunningOrQueued(query.state.data);
+        return statusIsRunningOrQueued(query.state.data) ? "always" : false;
       },
       refetchOnWindowFocus: (query) => {
         if (!query.state.data) {
@@ -130,8 +135,9 @@ function WorkflowRun() {
       return false;
     },
     placeholderData: keepPreviousData,
-    refetchOnMount: workflowRun?.status === Status.Running,
-    refetchOnWindowFocus: workflowRun?.status === Status.Running,
+    refetchOnMount: workflowRun?.status === Status.Running ? "always" : false,
+    refetchOnWindowFocus:
+      workflowRun?.status === Status.Running ? "always" : false,
   });
 
   const currentRunningTask = workflowTasks?.find(
@@ -174,6 +180,15 @@ function WorkflowRun() {
             message.status === "terminated"
           ) {
             socket?.close();
+            queryClient.invalidateQueries({
+              queryKey: ["workflowRuns"],
+            });
+            queryClient.invalidateQueries({
+              queryKey: ["workflowRun", workflowPermanentId, workflowRunId],
+            });
+            queryClient.invalidateQueries({
+              queryKey: ["workflowTasks", workflowRunId],
+            });
             if (
               message.status === "failed" ||
               message.status === "terminated"
@@ -208,7 +223,13 @@ function WorkflowRun() {
         socket = null;
       }
     };
-  }, [credentialGetter, workflowRunId, workflowRunIsRunningOrQueued]);
+  }, [
+    credentialGetter,
+    workflowRunId,
+    workflowRunIsRunningOrQueued,
+    queryClient,
+    workflowPermanentId,
+  ]);
 
   function getStream() {
     if (workflowRun?.status === Status.Created) {

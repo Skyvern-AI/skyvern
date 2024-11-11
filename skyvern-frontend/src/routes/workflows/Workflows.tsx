@@ -93,6 +93,7 @@ function Workflows() {
         })
         .then((response) => response.data);
     },
+    refetchOnMount: "always",
   });
 
   const createNewWorkflowMutation = useMutation({

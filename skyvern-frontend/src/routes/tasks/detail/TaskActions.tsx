@@ -6,7 +6,11 @@ import { ZoomableImage } from "@/components/ZoomableImage";
 import { useCostCalculator } from "@/hooks/useCostCalculator";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { envCredential } from "@/util/env";
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import {
+  keepPreviousData,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import {
@@ -41,6 +45,7 @@ function TaskActions() {
     number | "stream" | null
   >(null);
   const costCalculator = useCostCalculator();
+  const queryClient = useQueryClient();
 
   const { data: task, isLoading: taskIsLoading } = useQuery<TaskApiResponse>({
     queryKey: ["task", taskId],
@@ -95,6 +100,9 @@ function TaskActions() {
             message.status === "terminated"
           ) {
             socket?.close();
+            queryClient.invalidateQueries({
+              queryKey: ["tasks"],
+            });
             if (
               message.status === "failed" ||
               message.status === "terminated"
@@ -129,7 +137,7 @@ function TaskActions() {
         socket = null;
       }
     };
-  }, [credentialGetter, taskId, taskIsRunningOrQueued]);
+  }, [credentialGetter, taskId, taskIsRunningOrQueued, queryClient]);
 
   const { data: steps, isLoading: stepsIsLoading } = useQuery<
     Array<StepApiResponse>
