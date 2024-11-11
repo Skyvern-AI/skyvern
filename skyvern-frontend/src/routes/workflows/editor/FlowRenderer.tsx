@@ -191,7 +191,7 @@ function FlowRenderer({
   const [title, setTitle] = useState(initialTitle);
   const nodesInitialized = useNodesInitialized();
   const { hasChanges, setHasChanges } = useWorkflowHasChangesStore();
-  useShouldNotifyWhenClosingTab();
+  useShouldNotifyWhenClosingTab(hasChanges);
   const blocker = useBlocker(({ currentLocation, nextLocation }) => {
     return hasChanges && nextLocation.pathname !== currentLocation.pathname;
   });
