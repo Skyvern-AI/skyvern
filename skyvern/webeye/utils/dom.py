@@ -143,6 +143,10 @@ class SkyvernElement:
         if autocomplete and autocomplete == "list":
             return True
 
+        class_name: str = await self.get_attr("class")
+        if "autocomplete-input" in class_name:
+            return True
+
         return False
 
     async def is_custom_option(self) -> bool:
