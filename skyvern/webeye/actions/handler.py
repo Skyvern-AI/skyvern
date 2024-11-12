@@ -1085,7 +1085,8 @@ async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) ->
     if secret_value == BitwardenConstants.TOTP:
         totp_secret_key = workflow_run_context.totp_secret_value_key(parameter)
         totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
-        secret_value = pyotp.TOTP(totp_secret).now()
+        totp_secret_no_whitespace = "".join(totp_secret.split())
+        secret_value = pyotp.TOTP(totp_secret_no_whitespace).now()
     return secret_value if secret_value is not None else parameter
 
 
