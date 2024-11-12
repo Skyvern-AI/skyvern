@@ -477,6 +477,24 @@ function isInteractable(element) {
   }
 
   if (
+    tagName === "li" &&
+    element.className.toString().includes("ui-menu-item")
+  ) {
+    return true;
+  }
+
+  // google map address auto complete
+  // https://developers.google.com/maps/documentation/javascript/place-autocomplete#style-autocomplete
+  // demo: https://developers.google.com/maps/documentation/javascript/examples/places-autocomplete-addressform
+  if (
+    tagName === "div" &&
+    element.className.toString().includes("pac-item") &&
+    element.closest('div[class*="pac-container"]')
+  ) {
+    return true;
+  }
+
+  if (
     tagName === "div" &&
     element.hasAttribute("aria-disabled") &&
     element.getAttribute("aria-disabled").toLowerCase() === "false"
@@ -484,7 +502,7 @@ function isInteractable(element) {
     return true;
   }
 
-  if (tagName === "span" && element.closest("div[id^='dropdown-container']")) {
+  if (tagName === "span" && element.closest('div[id*="dropdown-container"]')) {
     return true;
   }
 
