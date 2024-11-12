@@ -199,6 +199,8 @@ class WorkflowRunContext:
                     if BitwardenConstants.TOTP in secret_credentials and secret_credentials[BitwardenConstants.TOTP]:
                         totp_secret_id = f"{random_secret_id}_totp"
                         self.secrets[totp_secret_id] = BitwardenConstants.TOTP
+                        totp_secret_value = self.totp_secret_value_key(totp_secret_id)
+                        self.secrets[totp_secret_value] = secret_credentials[BitwardenConstants.TOTP]
                         self.values[parameter.key]["totp"] = totp_secret_id
 
             except BitwardenBaseError as e:
@@ -450,6 +452,9 @@ class WorkflowRunContext:
 
             self.parameters[parameter.key] = parameter
             await self.register_parameter_value(aws_client, parameter, organization)
+
+    def totp_secret_value_key(self, totp_secret_id: str) -> str:
+        return f"{totp_secret_id}_value"
 
 
 class WorkflowContextManager:

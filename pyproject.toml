@@ -50,6 +50,7 @@ temporalio = "^1.6.0"
 requests-toolbelt = "^1.0.0"
 posthog = "^3.7.0"
 aiofiles = "^24.1.0"
+pyotp = "^2.9.0"
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"
