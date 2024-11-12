@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, List
 
+import pyotp
 import structlog
 from playwright.async_api import FileChooser, Frame, Locator, Page, TimeoutError
 from pydantic import BaseModel
@@ -1082,8 +1083,9 @@ async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) ->
     secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
 
     if secret_value == BitwardenConstants.TOTP:
-        secrets = await workflow_run_context.get_secrets_from_password_manager()
-        secret_value = secrets[BitwardenConstants.TOTP]
+        totp_secret_key = workflow_run_context.totp_secret_value_key(parameter)
+        totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
+        secret_value = pyotp.TOTP(totp_secret).now()
     return secret_value if secret_value is not None else parameter
 
 
