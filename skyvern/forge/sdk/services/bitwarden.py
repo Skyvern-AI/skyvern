@@ -215,7 +215,7 @@ class BitwardenService:
                     credential={
                         BitwardenConstants.USERNAME: item.get("login", {}).get("username", ""),
                         BitwardenConstants.PASSWORD: item.get("login", {}).get("password", ""),
-                        BitwardenConstants.TOTP: item.get("login", {}).get("totp", ""),
+                        BitwardenConstants.TOTP: item.get("login", {}).get("totp", "") or "",
                     },
                     uris=[uri.get("uri") for uri in item.get("login", {}).get("uris", []) if "uri" in uri],
                 )
