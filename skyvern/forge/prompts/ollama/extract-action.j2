@@ -1,57 +1,55 @@
-EXECUTE IMMEDIATE TASK - DO NOT ANALYZE OR EXPLAIN
+EXECUTE THIS BROWSER TASK NOW:
 
-You are currently running as an automated browser task. You have been provided:
-1. A webpage to analyze (current URL: {{ current_url }})
-2. A specific goal to achieve: {{ navigation_goal }}
-3. Valid element IDs to use: {{ elements }}
-4. User details for forms: {{ navigation_payload_str }}
+URL: {{ current_url }}
+GOAL: {{ navigation_goal }}
+ELEMENTS: {{ elements }}
+USER_INPUT: {{ navigation_payload_str }}
 
-This is an active automation task, not a request for help or clarification. 
-Execute this task now by providing a JSON response.
-No questions or clarifications are needed - all required information is provided.
+RETURN JSON WITH THESE EXACT ACTIONS:
+1. INPUT_TEXT - For typing in search/text fields
+2. CLICK - For buttons and links
+3. SELECT_OPTION - For dropdowns
+4. CHECKBOX - For checkboxes
+5. WAIT - When waiting needed
+6. SOLVE_CAPTCHA - For captchas
+7. TERMINATE - If goal impossible
+8. COMPLETE - When goal achieved
+9. UPLOAD_FILE - For file uploads
+10. NULL_ACTION - When no action needed
 
-Your task: Generate actions to help user progress towards the goal using the DOM elements in the list and any popup overlays present.
-Include only the elements that exist in the provided list, without inventing new ones.
-Use the user details to fill in necessary values in any forms.
-
-MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
-
-Here's exactly what I need - this format, with these exact fields:
-
+EXAMPLE RESPONSE:
 {
-    "user_goal_stage": str, 
-    "user_goal_achieved": bool, 
-    "action_plan": str,
+    "user_goal_stage": "Starting search",
+    "user_goal_achieved": false,
+    "action_plan": "Search for product",
     "actions": [
         {
-            "reasoning": str,
-            "user_detail_query": str,
-            "user_detail_answer": str, 
-            "confidence_float": float,
-            "action_type": str,
-            "id": str,
-            "text": str,
-            "file_url": str,
-            "download": bool,
-            "option": {
-                "label": str,
-                "index": int,
-                "value": str
-            }
+            "reasoning": "Enter search term",
+            "user_detail_query": "What to search?", 
+            "user_detail_answer": "search term",
+            "confidence_float": 1.0,
+            "action_type": "INPUT_TEXT",
+            "id": "an html element id from 'ELEMENTS' provided above. Scan it and find the correct id for the action. An id in html looks like this "<div id='thisIsAnId"</div>"",
+            "text": "search term",
+            "file_url": null,
+            "download": false,
+            "option": null
         }
     ]
 }
 
-FINAL REMINDER: This is an active task requiring immediate execution. 
-DO NOT:
-- Ask questions
-- Request clarification
-- Offer alternatives 
-- Explain the format
-DO:
-- Return valid JSON now
-- Include actions array
-- Use provided element IDs
-- Follow format exactly
+STRICT RULES:
+1. Output JSON object only - nothing else
+2. No text before or after JSON
+3. No ```json or ``` markers
+4. No "Here is the response:"
+5. No explanations or notes
+6. No markdown formatting
+7. Just the raw JSON object
+8. ONLY use element_ids from the provided ELEMENTS list
+9. VERIFY element exists before including in action
+10. NO assumed/common element names like "search-field"
+11. Element IDs must match EXACTLY
+12. If no valid elements, return an empty actions list
 
-Now, give me your JSON response and remember, I do not want a question in return. Just the JSON response related to the forementioned requirements.
+RESPOND NOW WITH JSON ONLY.

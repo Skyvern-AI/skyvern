@@ -74,6 +74,7 @@ async def llm_messages_builder(
                 })
         
         return messages
+    
 def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bool = False, is_llama: bool = False) -> dict[str, Any]:
     """Parse the response from the LLM API into a dictionary.
     
@@ -91,14 +92,11 @@ def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bo
         if add_assistant_prefix:
             content = "{" + content
 
-        # Extract JSON if wrapped in markdown (for Llama)
-        if is_llama and content.strip().startswith("```"):
-            json_pattern = r"```(?:json)?\s*([\s\S]*?)\s*```"
-            match = re.search(json_pattern, content, re.MULTILINE)
-            if match:
-                content = match.group(1).strip()
+        if is_llama:
+            content = try_to_extract_json_from_markdown_format_llama(content)
 
         return commentjson.loads(content)
+          
                 
     except Exception as e:
         LOG.error("Failed to parse LLM response.", content=content)
@@ -222,26 +220,55 @@ def try_to_extract_json_from_markdown_format(text: str) -> str:
         return text
        
 def try_to_extract_json_from_markdown_format_llama(text: str) -> str:
-    """Extract JSON content from markdown code blocks.
-    This is particularly useful for models like Llama that may wrap their JSON responses.
+    try:
+        json.loads(text)
+        return text  # Return original if valid JSON
+    except json.JSONDecodeError:
+        pass  # Continue with fixes if invalid
     
-    Args:
-        text (str): The text to process, which may contain JSON in markdown blocks
-        
-    Returns:
-        str: The extracted JSON string, or the original text if no JSON found
-    """
+    """Extract and fix JSON content from markdown code blocks."""
     # First try to extract from ```json blocks
     json_pattern = r"```(?:json)?\s*([\s\S]*?)\s*```"
     match = re.search(json_pattern, text, re.MULTILINE)
     if match:
-        return match.group(1).strip()
+        json_str = match.group(1).strip()
+    else:
+        # If no code blocks found, use the text as-is
+        json_str = text.strip()
     
-    # If no code blocks found, try to extract anything that looks like a JSON object
-    json_object_pattern = r"\{[\s\S]*?\}"  # Non-greedy match for nested objects
-    match = re.search(json_object_pattern, text)
-    if match:
-        return match.group(0)
+    # Fix specific JSON formatting issues
+    json_str = re.sub(r'\}\}(\s*\])', '}]}', json_str)  # Fix double closing brace before array end
+    json_str = re.sub(r'\}\}\s*$', '}]}', json_str)     # Fix double closing brace at end
     
-    # If no JSON-like content found, return original text
-    return text
+    # Balance brackets if still needed
+    open_curly = json_str.count('{')
+    close_curly = json_str.count('}')
+    open_square = json_str.count('[')
+    close_square = json_str.count(']')
+    
+    if open_curly > close_curly:
+        json_str += '}' * (open_curly - close_curly)
+    if open_square > close_square:
+        json_str += ']' * (open_square - close_square)
+    
+    # Validate JSON structure
+    try:
+        json.loads(json_str)
+        return json_str
+    except json.JSONDecodeError:
+        # If still invalid, try more aggressive fixes
+        json_str = re.sub(r'\}\s*\}\s*\]', '}]}', json_str)
+        return json_str
+
+def extract_json_from_response(response: str) -> dict:
+    """Extract JSON object from response text that may contain comments/explanations."""
+    # Find content between first { and last }
+    json_match = re.search(r'(\{.*\})', response, re.DOTALL)
+    if not json_match:
+        raise ValueError("No JSON object found in response")
+    
+    json_str = json_match.group(1)
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON structure: {e}")
