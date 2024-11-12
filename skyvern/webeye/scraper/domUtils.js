@@ -396,7 +396,7 @@ function isInteractable(element) {
     return false;
   }
 
-  if (isHiddenOrDisabled(element)) {
+  if (isHidden(element)) {
     return false;
   }
 
