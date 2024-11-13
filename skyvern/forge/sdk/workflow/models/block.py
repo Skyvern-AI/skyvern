@@ -170,7 +170,7 @@ class TaskBlock(Block):
     block_type: Literal[BlockType.TASK] = BlockType.TASK
 
     url: str | None = None
-    title: str = "Untitled Task"
+    title: str = ""
     navigation_goal: str | None = None
     data_extraction_goal: str | None = None
     data_schema: dict[str, Any] | list | None = None
