@@ -182,6 +182,10 @@ class SkyvernFrame:
         js_script = "(element) => checkDisabledFromStyle(element)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
 
+    async def get_blocking_element_id(self, element: ElementHandle) -> str:
+        js_script = "(element) => getBlockElementUniqueID(element)"
+        return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
+
     async def scroll_to_top(self, draw_boxes: bool) -> float:
         """
         Scroll to the top of the page and take a screenshot.
@@ -223,6 +227,14 @@ class SkyvernFrame:
     async def is_window_scrollable(self) -> bool:
         js_script = "() => isWindowScrollable()"
         return await self.evaluate(frame=self.frame, expression=js_script)
+
+    async def is_parent(self, parent: ElementHandle, child: ElementHandle) -> bool:
+        js_script = "([parent, child]) => isParent(parent, child)"
+        return await self.evaluate(frame=self.frame, expression=js_script, arg=[parent, child])
+
+    async def is_sibling(self, el1: ElementHandle, el2: ElementHandle) -> bool:
+        js_script = "([el1, el2]) => isSibling(el1, el2)"
+        return await self.evaluate(frame=self.frame, expression=js_script, arg=[el1, el2])
 
     async def has_ASP_client_control(self) -> bool:
         js_script = "() => hasASPClientControl()"
