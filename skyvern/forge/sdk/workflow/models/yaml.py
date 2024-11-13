@@ -117,7 +117,7 @@ class TaskBlockYAML(BlockYAML):
     block_type: Literal[BlockType.TASK] = BlockType.TASK  # type: ignore
 
     url: str | None = None
-    title: str = "Untitled Task"
+    title: str = ""
     navigation_goal: str | None = None
     data_extraction_goal: str | None = None
     data_schema: dict[str, Any] | list | None = None

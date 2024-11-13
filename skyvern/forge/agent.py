@@ -131,7 +131,7 @@ class ForgeAgent:
         task_url = validate_url(task_url)
         task = await app.DATABASE.create_task(
             url=task_url,
-            title=task_block.title,
+            title=task_block.title or task_block.label,
             webhook_callback_url=None,
             totp_verification_url=task_block.totp_verification_url,
             totp_identifier=task_block.totp_identifier,
