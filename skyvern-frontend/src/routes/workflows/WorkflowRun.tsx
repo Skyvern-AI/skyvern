@@ -365,7 +365,7 @@ function WorkflowRun() {
           <div className="w-3/4 shrink-0">
             <AspectRatio ratio={16 / 9}>{getStream()}</AspectRatio>
           </div>
-          <div className="flex w-full flex-col gap-4 rounded-md bg-slate-elevation1 p-4">
+          <div className="flex w-full min-w-0 flex-col gap-4 rounded-md bg-slate-elevation1 p-4">
             <header className="text-lg">Current Task</header>
             {workflowRunIsLoading || !currentRunningTask ? (
               <div>Waiting for a task to start...</div>
@@ -377,7 +377,10 @@ function WorkflowRun() {
                 </div>
                 <div className="flex gap-2 rounded-sm bg-slate-elevation3 p-2">
                   <Label className="text-sm text-slate-400">URL</Label>
-                  <span className="text-sm">
+                  <span
+                    className="truncate text-sm"
+                    title={currentRunningTask.request.url}
+                  >
                     {currentRunningTask.request.url}
                   </span>
                 </div>
@@ -389,7 +392,10 @@ function WorkflowRun() {
                 </div>
                 <div className="flex gap-2 rounded-sm bg-slate-elevation3 p-2">
                   <Label className="text-sm text-slate-400">Created</Label>
-                  <span className="text-sm">
+                  <span
+                    className="truncate text-sm"
+                    title={basicLocalTimeFormat(currentRunningTask.created_at)}
+                  >
                     {currentRunningTask &&
                       timeFormatWithShortDate(currentRunningTask.created_at)}
                   </span>
