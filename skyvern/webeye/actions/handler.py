@@ -1174,7 +1174,7 @@ async def chain_click(
             except Exception as e:
                 action_results.append(ActionFailure(FailToClick(action.element_id, anchor="attr_id", msg=str(e))))
 
-        if not await skyvern_element.is_visibile():
+        if not await skyvern_element.is_visible():
             LOG.info(
                 "Chain click: exit since the element is not visible on the page anymore",
                 taks_id=task.task_id,
