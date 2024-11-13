@@ -1138,14 +1138,15 @@ async def chain_click(
         LOG.info("Chain click: main element click succeeded", action=action, locator=locator)
         return [ActionSuccess()]
 
-    except Exception:
-        action_results: list[ActionResult] = [ActionFailure(FailToClick(action.element_id))]
+    except Exception as e:
+        action_results: list[ActionResult] = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
 
         if skyvern_element.get_tag_name() == "label":
             LOG.info(
                 "Chain click: it's a label element. going to try for-click",
                 task_id=task.task_id,
                 action=action,
+                element=str(skyvern_element),
                 locator=locator,
             )
             try:
@@ -1155,45 +1156,71 @@ async def chain_click(
                     await bound_element.get_locator().click(timeout=timeout)
                     action_results.append(ActionSuccess())
                     return action_results
-            except Exception:
-                action_results.append(ActionFailure(FailToClick(action.element_id, anchor="for")))
-
-        if skyvern_element.get_tag_name() == InteractiveElement.INPUT:
+            except Exception as e:
+                action_results.append(ActionFailure(FailToClick(action.element_id, anchor="for", msg=str(e))))
+        else:
             LOG.info(
-                "Chain click: it's an input element. going to try sibling click",
+                "Chain click: it's a non-label element. going to find the bound label element by attribute id and click",
                 task_id=task.task_id,
                 action=action,
+                element=str(skyvern_element),
                 locator=locator,
             )
-            sibling_action_result = await click_sibling_of_input(locator, timeout=timeout)
-            action_results.append(sibling_action_result)
-            if isinstance(sibling_action_result, ActionSuccess):
-                return action_results
+            try:
+                if bound_locator := await skyvern_element.find_bound_label_by_attr_id():
+                    await bound_locator.click(timeout=timeout)
+                    action_results.append(ActionSuccess())
+                    return action_results
+            except Exception as e:
+                action_results.append(ActionFailure(FailToClick(action.element_id, anchor="attr_id", msg=str(e))))
+
+        if not await skyvern_element.is_visibile():
+            LOG.info(
+                "Chain click: exit since the element is not visible on the page anymore",
+                taks_id=task.task_id,
+                action=action,
+                element=str(skyvern_element),
+                locator=locator,
+            )
+            return action_results
+
+        blocking_element = await skyvern_element.find_blocking_element(
+            dom=DomUtil(scraped_page=scraped_page, page=page)
+        )
+        if blocking_element is None:
+            LOG.info(
+                "Chain click: exit since the element is not blocking by any skyvern element",
+                taks_id=task.task_id,
+                action=action,
+                element=str(skyvern_element),
+                locator=locator,
+            )
+            return action_results
 
         try:
-            parent_locator = locator.locator("..")
-            await parent_locator.click(timeout=timeout)
-
-            LOG.info(
-                "Chain click: successfully clicked parent element",
+            LOG.debug(
+                "Chain click: verifying the blocking element is parent or sibling of the target element",
+                taks_id=task.task_id,
                 action=action,
-                parent_locator=parent_locator,
+                element=str(blocking_element),
+                locator=locator,
             )
-            action_results.append(ActionSuccess(interacted_with_parent=True))
-        except Exception:
-            LOG.warning(
-                "Failed to click parent element",
-                action=action,
-                parent_locator=parent_locator,
-                exc_info=True,
-            )
-            action_results.append(
-                ActionFailure(
-                    FailToClick(action.element_id, anchor="parent"),
-                    interacted_with_parent=True,
+            if await blocking_element.is_parent_of(
+                await skyvern_element.get_element_handler()
+            ) or await blocking_element.is_sibling_of(await skyvern_element.get_element_handler()):
+                LOG.info(
+                    "Chain click: element is blocked by other elements, going to click on the blocking element",
+                    taks_id=task.task_id,
+                    action=action,
+                    element=str(blocking_element),
+                    locator=locator,
                 )
-            )
-            # We don't raise exception here because we do log the exception, and return ActionFailure as the last action
+
+                await blocking_element.get_locator().click(timeout=timeout)
+                action_results.append(ActionSuccess())
+                return action_results
+        except Exception as e:
+            action_results.append(ActionFailure(FailToClick(action.element_id, anchor="blocking_element", msg=str(e))))
 
         return action_results
     finally:
@@ -2233,35 +2260,6 @@ def get_checkbox_id_in_label_children(scraped_page: ScrapedPage, element_id: str
             return child.get("id", None)
 
     return None
-
-
-async def click_sibling_of_input(
-    locator: Locator,
-    timeout: int,
-) -> ActionResult:
-    try:
-        input_element = locator.first
-        parent_locator = locator.locator("..")
-        if input_element:
-            input_id = await input_element.get_attribute("id")
-            sibling_label_css = f'label[for="{input_id}"]'
-            label_locator = parent_locator.locator(sibling_label_css)
-            await label_locator.click(timeout=timeout)
-            LOG.info(
-                "Successfully clicked sibling label of input element",
-                sibling_label_css=sibling_label_css,
-            )
-            return ActionSuccess(interacted_with_sibling=True)
-        # Should never get here
-        return ActionFailure(
-            exception=Exception("Failed while trying to click sibling of input element"),
-            interacted_with_sibling=True,
-        )
-    except Exception:
-        LOG.warning("Failed to click sibling label of input element", exc_info=True)
-        return ActionFailure(
-            exception=Exception("Failed while trying to click sibling of input element"),
-        )
 
 
 async def extract_information_for_navigation_goal(
