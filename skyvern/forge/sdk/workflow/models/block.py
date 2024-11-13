@@ -704,8 +704,8 @@ class TextPromptBlock(Block):
         for parameter in self.parameters:
             value = workflow_run_context.get_value(parameter.key)
             secret_value = workflow_run_context.get_original_secret_value_or_none(value)
-            if secret_value is not None:
-                parameter_values[parameter.key] = secret_value
+            if secret_value:
+                continue
             else:
                 parameter_values[parameter.key] = value
 
