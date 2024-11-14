@@ -335,7 +335,6 @@ class TaskBlock(Block):
                     organization=organization,
                     task=task,
                     step=step,
-                    workflow_run=workflow_run,
                     task_block=self,
                 )
             except Exception as e:

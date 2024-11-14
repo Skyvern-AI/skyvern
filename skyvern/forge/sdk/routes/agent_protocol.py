@@ -345,6 +345,15 @@ async def cancel_task(
     await app.agent.update_task(task_obj, status=TaskStatus.canceled)
 
 
+@base_router.post("/workflows/runs/{workflow_run_id}/cancel")
+@base_router.post("/workflows/runs/{workflow_run_id}/cancel/", include_in_schema=False)
+async def cancel_workflow_run(
+    workflow_run_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> None:
+    await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
+
+
 @base_router.post(
     "/tasks/{task_id}/retry_webhook",
     tags=["agent"],
