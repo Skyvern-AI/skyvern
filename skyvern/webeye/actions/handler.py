@@ -1102,6 +1102,7 @@ async def chain_click(
     # This automatically dismisses the dialog
     # File choosers are impossible to close if you don't expect one. Instead of dealing with it, close it!
 
+    dom = DomUtil(scraped_page=scraped_page, page=page)
     locator = skyvern_element.locator
     # TODO (suchintan): This should likely result in an ActionFailure -- we can figure out how to do this later!
     LOG.info("Chain click starts", action=action, locator=locator)
@@ -1142,31 +1143,51 @@ async def chain_click(
         action_results: list[ActionResult] = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
 
         if skyvern_element.get_tag_name() == "label":
-            LOG.info(
-                "Chain click: it's a label element. going to try for-click",
-                task_id=task.task_id,
-                action=action,
-                element=str(skyvern_element),
-                locator=locator,
-            )
             try:
-                if bound_element := await skyvern_element.find_label_for(
-                    dom=DomUtil(scraped_page=scraped_page, page=page)
-                ):
+                LOG.info(
+                    "Chain click: it's a label element. going to try for-click",
+                    task_id=task.task_id,
+                    action=action,
+                    element=str(skyvern_element),
+                    locator=locator,
+                )
+                if bound_element := await skyvern_element.find_label_for(dom=dom):
                     await bound_element.get_locator().click(timeout=timeout)
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
                 action_results.append(ActionFailure(FailToClick(action.element_id, anchor="for", msg=str(e))))
-        else:
-            LOG.info(
-                "Chain click: it's a non-label element. going to find the bound label element by attribute id and click",
-                task_id=task.task_id,
-                action=action,
-                element=str(skyvern_element),
-                locator=locator,
-            )
+
             try:
+                # sometimes the element is the direct chidren of the label, instead of using for="xx" attribute
+                # since it's a click action, the target element we're searching should only be INPUT
+                LOG.info(
+                    "Chain click: it's a label element. going to check for input of the direct chidren",
+                    task_id=task.task_id,
+                    action=action,
+                    element=str(skyvern_element),
+                    locator=locator,
+                )
+                if bound_element := await skyvern_element.find_element_in_label_children(
+                    dom=dom, element_type=InteractiveElement.INPUT
+                ):
+                    await bound_element.get_locator().click(timeout=timeout)
+                    action_results.append(ActionSuccess())
+                    return action_results
+            except Exception as e:
+                action_results.append(
+                    ActionFailure(FailToClick(action.element_id, anchor="direct_children", msg=str(e)))
+                )
+
+        else:
+            try:
+                LOG.info(
+                    "Chain click: it's a non-label element. going to find the bound label element by attribute id and click",
+                    task_id=task.task_id,
+                    action=action,
+                    element=str(skyvern_element),
+                    locator=locator,
+                )
                 if bound_locator := await skyvern_element.find_bound_label_by_attr_id():
                     await bound_locator.click(timeout=timeout)
                     action_results.append(ActionSuccess())
@@ -1174,10 +1195,27 @@ async def chain_click(
             except Exception as e:
                 action_results.append(ActionFailure(FailToClick(action.element_id, anchor="attr_id", msg=str(e))))
 
+            try:
+                # sometimes the element is the direct chidren of the label, instead of using for="xx" attribute
+                # so we check the direct parent if it's a label element
+                LOG.info(
+                    "Chain click: it's a non-label element. going to find the bound label element by direct parent",
+                    task_id=task.task_id,
+                    action=action,
+                    element=str(skyvern_element),
+                    locator=locator,
+                )
+                if bound_locator := await skyvern_element.find_bound_label_by_direct_parent():
+                    await bound_locator.click(timeout=timeout)
+                    action_results.append(ActionSuccess())
+                    return action_results
+            except Exception as e:
+                action_results.append(ActionFailure(FailToClick(action.element_id, anchor="direct_parent", msg=str(e))))
+
         if not await skyvern_element.is_visible():
             LOG.info(
                 "Chain click: exit since the element is not visible on the page anymore",
-                taks_id=task.task_id,
+                task_id=task.task_id,
                 action=action,
                 element=str(skyvern_element),
                 locator=locator,
@@ -1190,7 +1228,7 @@ async def chain_click(
         if blocking_element is None:
             LOG.info(
                 "Chain click: exit since the element is not blocking by any skyvern element",
-                taks_id=task.task_id,
+                task_id=task.task_id,
                 action=action,
                 element=str(skyvern_element),
                 locator=locator,
@@ -1200,7 +1238,7 @@ async def chain_click(
         try:
             LOG.debug(
                 "Chain click: verifying the blocking element is parent or sibling of the target element",
-                taks_id=task.task_id,
+                task_id=task.task_id,
                 action=action,
                 element=str(blocking_element),
                 locator=locator,
@@ -1210,7 +1248,7 @@ async def chain_click(
             ) or await blocking_element.is_sibling_of(await skyvern_element.get_element_handler()):
                 LOG.info(
                     "Chain click: element is blocked by other elements, going to click on the blocking element",
-                    taks_id=task.task_id,
+                    task_id=task.task_id,
                     action=action,
                     element=str(blocking_element),
                     locator=locator,

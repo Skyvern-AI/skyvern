@@ -327,6 +327,14 @@ class SkyvernElement:
             return None
         return await dom.get_skyvern_element_by_id(blocking_element_id)
 
+    async def find_element_in_label_children(
+        self, dom: DomUtil, element_type: InteractiveElement
+    ) -> SkyvernElement | None:
+        element_id = self.find_element_id_in_label_children(element_type=element_type)
+        if not element_id:
+            return None
+        return await dom.get_skyvern_element_by_id(element_id=element_id)
+
     def find_element_id_in_label_children(self, element_type: InteractiveElement) -> str | None:
         tag_name = self.get_tag_name()
         if tag_name != "label":
@@ -396,6 +404,28 @@ class SkyvernElement:
             return locator
 
         return None
+
+    async def find_bound_label_by_direct_parent(
+        self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    ) -> Locator | None:
+        if self.get_tag_name() == "label":
+            return None
+
+        parent_locator = self.get_locator().locator("..")
+        cnt = await parent_locator.count()
+        if cnt != 1:
+            return None
+
+        timeout_sec = timeout / 1000
+        async with asyncio.timeout(timeout_sec):
+            tag_name: str | None = await parent_locator.evaluate("el => el.tagName")
+            if not tag_name:
+                return None
+
+            if tag_name.lower() != "label":
+                return None
+
+            return parent_locator
 
     async def find_selectable_child(self, dom: DomUtil) -> SkyvernElement | None:
         # BFS to find the first selectable child
