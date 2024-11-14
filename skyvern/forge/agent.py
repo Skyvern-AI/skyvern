@@ -859,26 +859,32 @@ class ForgeAgent:
 
             task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
             if not has_decisive_action and not task_completes_on_download:
-                working_page = await browser_state.must_get_working_page()
-                complete_action = await self.check_user_goal_complete(
-                    page=working_page,
-                    scraped_page=scraped_page,
-                    task=task,
-                    step=step,
+                disable_user_goal_check = app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                    "DISABLE_USER_GOAL_CHECK",
+                    task.task_id,
+                    properties={"task_url": task.url, "organization_id": task.organization_id},
                 )
-                if complete_action is not None:
-                    LOG.info("User goal achieved, executing complete action")
-                    complete_action.organization_id = task.organization_id
-                    complete_action.workflow_run_id = task.workflow_run_id
-                    complete_action.task_id = task.task_id
-                    complete_action.step_id = step.step_id
-                    complete_action.step_order = step.order
-                    complete_action.action_order = len(detailed_agent_step_output.actions_and_results)
-                    complete_results = await ActionHandler.handle_action(
-                        scraped_page, task, step, working_page, complete_action
+                if not disable_user_goal_check:
+                    working_page = await browser_state.must_get_working_page()
+                    complete_action = await self.check_user_goal_complete(
+                        page=working_page,
+                        scraped_page=scraped_page,
+                        task=task,
+                        step=step,
                     )
-                    detailed_agent_step_output.actions_and_results.append((complete_action, complete_results))
-                    await self.record_artifacts_after_action(task, step, browser_state)
+                    if complete_action is not None:
+                        LOG.info("User goal achieved, executing complete action")
+                        complete_action.organization_id = task.organization_id
+                        complete_action.workflow_run_id = task.workflow_run_id
+                        complete_action.task_id = task.task_id
+                        complete_action.step_id = step.step_id
+                        complete_action.step_order = step.order
+                        complete_action.action_order = len(detailed_agent_step_output.actions_and_results)
+                        complete_results = await ActionHandler.handle_action(
+                            scraped_page, task, step, working_page, complete_action
+                        )
+                        detailed_agent_step_output.actions_and_results.append((complete_action, complete_results))
+                        await self.record_artifacts_after_action(task, step, browser_state)
             # If no action errors return the agent state and output
             completed_step = await self.update_step(
                 step=step,
