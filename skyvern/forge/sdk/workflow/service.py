@@ -308,7 +308,19 @@ class WorkflowService:
                 await self.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, api_key=api_key)
                 return workflow_run
 
-        await self.mark_workflow_run_as_completed(workflow_run_id=workflow_run.workflow_run_id)
+        refreshed_workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=workflow_run.workflow_run_id)
+        if refreshed_workflow_run and refreshed_workflow_run.status not in (
+            WorkflowRunStatus.canceled,
+            WorkflowRunStatus.failed,
+            WorkflowRunStatus.terminated,
+        ):
+            await self.mark_workflow_run_as_completed(workflow_run_id=workflow_run.workflow_run_id)
+        else:
+            LOG.info(
+                "Workflow run is already canceled, failed, or terminated, not marking as completed",
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_run_status=refreshed_workflow_run.status if refreshed_workflow_run else None,
+            )
         await self.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, api_key=api_key)
         return workflow_run
 
