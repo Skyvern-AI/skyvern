@@ -44,7 +44,7 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskStatus
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import TaskBlock
-from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.webeye.actions.actions import (
     Action,
     ActionType,
@@ -220,10 +220,29 @@ class ForgeAgent:
         task: Task,
         step: Step,
         api_key: str | None = None,
-        workflow_run: WorkflowRun | None = None,
         close_browser_on_completion: bool = True,
         task_block: TaskBlock | None = None,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
+        workflow_run: WorkflowRun | None = None
+        if task.workflow_run_id:
+            workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=task.workflow_run_id)
+            if workflow_run and workflow_run.status == WorkflowRunStatus.canceled:
+                LOG.info(
+                    "Workflow run is canceled, stopping execution inside task",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    step_id=step.step_id,
+                )
+                step = await self.update_step(
+                    step,
+                    status=StepStatus.canceled,
+                    is_last=True,
+                )
+                task = await self.update_task(
+                    task,
+                    status=TaskStatus.canceled,
+                )
+                return step, None, None
+
         refreshed_task = await app.DATABASE.get_task(task_id=task.task_id, organization_id=organization.organization_id)
         if refreshed_task:
             task = refreshed_task
