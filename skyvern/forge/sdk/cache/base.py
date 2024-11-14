@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from datetime import timedelta
 from typing import Any
 
-CACHE_EXPIRE_TIME = timedelta(weeks=1)
+CACHE_EXPIRE_TIME = timedelta(weeks=4)
 MAX_CACHE_ITEM = 1000
 
 
