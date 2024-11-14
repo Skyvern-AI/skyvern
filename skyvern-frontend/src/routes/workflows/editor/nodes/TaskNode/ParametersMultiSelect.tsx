@@ -9,7 +9,7 @@ type Props = {
   onParametersChange: (parameters: Array<string>) => void;
 };
 
-function TaskNodeParametersPanel({
+function ParametersMultiSelect({
   availableOutputParameters,
   parameters,
   onParametersChange,
@@ -42,4 +42,4 @@ function TaskNodeParametersPanel({
   );
 }
 
-export { TaskNodeParametersPanel };
+export { ParametersMultiSelect };

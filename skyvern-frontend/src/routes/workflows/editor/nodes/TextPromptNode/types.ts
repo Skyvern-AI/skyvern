@@ -6,6 +6,7 @@ export type TextPromptNodeData = NodeBaseData & {
   jsonSchema: string;
   editable: boolean;
   label: string;
+  parameterKeys: Array<string>;
 };
 
 export type TextPromptNode = Node<TextPromptNodeData, "textPrompt">;
@@ -16,6 +17,7 @@ export const textPromptNodeDefaultData: TextPromptNodeData = {
   prompt: "",
   jsonSchema: "null",
   continueOnFailure: false,
+  parameterKeys: [],
 } as const;
 
 export const helpTooltipContent = {
