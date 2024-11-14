@@ -201,6 +201,7 @@ function convertToNode(
           editable: true,
           prompt: block.prompt,
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
+          parameterKeys: block.parameters.map((p) => p.key),
         },
       };
     }
@@ -627,6 +628,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         llm_key: "",
         prompt: node.data.prompt,
         json_schema: JSONParseSafe(node.data.jsonSchema),
+        parameter_keys: node.data.parameterKeys,
       };
     }
     default: {
@@ -758,7 +760,7 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
     if (node.type === "nodeAdder" || node.type === "start") {
       return node;
     }
-    if (node.type === "task") {
+    if (node.type === "task" || node.type === "textPrompt") {
       return {
         ...node,
         data: {

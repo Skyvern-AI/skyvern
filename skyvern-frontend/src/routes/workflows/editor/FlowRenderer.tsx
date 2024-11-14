@@ -418,6 +418,19 @@ function FlowRenderer({
           },
         };
       }
+      // TODO: Fix this. When we put these into the same if statement TS fails to recognize that the returned value fits both the task and text prompt node types
+      if (node.type === "textPrompt") {
+        return {
+          ...node,
+          data: {
+            ...node.data,
+            parameterKeys: node.data.parameterKeys.filter(
+              (parameter) =>
+                parameter !== getOutputParameterKey(deletedNodeLabel),
+            ),
+          },
+        };
+      }
       if (node.type === "loop") {
         return {
           ...node,
