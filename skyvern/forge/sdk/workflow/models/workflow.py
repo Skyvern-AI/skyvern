@@ -114,6 +114,7 @@ class WorkflowRunStatusResponse(BaseModel):
     workflow_id: str
     workflow_run_id: str
     status: WorkflowRunStatus
+    failure_reason: str | None = None
     proxy_location: ProxyLocation | None = None
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None

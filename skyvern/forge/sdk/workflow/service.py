@@ -779,6 +779,7 @@ class WorkflowService:
             workflow_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run_id,
             status=workflow_run.status,
+            failure_reason=workflow_run.failure_reason,
             proxy_location=workflow_run.proxy_location,
             webhook_callback_url=workflow_run.webhook_callback_url,
             totp_verification_url=workflow_run.totp_verification_url,
