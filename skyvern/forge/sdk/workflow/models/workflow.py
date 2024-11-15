@@ -90,6 +90,7 @@ class WorkflowRun(BaseModel):
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
+    failure_reason: str | None = None
 
     created_at: datetime
     modified_at: datetime

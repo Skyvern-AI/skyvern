@@ -211,6 +211,7 @@ class WorkflowRunModel(Base):
     workflow_permanent_id = Column(String, nullable=False, index=True)
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False, index=True)
     status = Column(String, nullable=False)
+    failure_reason = Column(String)
     proxy_location = Column(Enum(ProxyLocation))
     webhook_callback_url = Column(String)
     totp_verification_url = Column(String)

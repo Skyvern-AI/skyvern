@@ -1083,13 +1083,16 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
-    async def update_workflow_run(self, workflow_run_id: str, status: WorkflowRunStatus) -> WorkflowRun | None:
+    async def update_workflow_run(
+        self, workflow_run_id: str, status: WorkflowRunStatus, failure_reason: str | None = None
+    ) -> WorkflowRun | None:
         async with self.Session() as session:
             workflow_run = (
                 await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
             ).first()
             if workflow_run:
                 workflow_run.status = status
+                workflow_run.failure_reason = failure_reason
                 await session.commit()
                 await session.refresh(workflow_run)
                 return convert_to_workflow_run(workflow_run)
