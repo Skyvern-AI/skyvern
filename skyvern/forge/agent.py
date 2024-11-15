@@ -49,6 +49,7 @@ from skyvern.webeye.actions.actions import (
     Action,
     ActionType,
     CompleteAction,
+    CompleteVerifyResult,
     DecisiveAction,
     UserDefinedError,
     WebAction,
@@ -924,56 +925,58 @@ class ForgeAgent:
             return failed_step, detailed_agent_step_output.get_clean_detailed_output()
 
     @staticmethod
+    async def complete_verify(page: Page, scraped_page: ScrapedPage, task: Task, step: Step) -> CompleteVerifyResult:
+        LOG.info(
+            "Checking if user goal is achieved after re-scraping the page",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            workflow_run_id=task.workflow_run_id,
+        )
+        scraped_page_refreshed = await scraped_page.refresh()
+
+        # TODO: currently, just using the check user goal for complete verification
+        # maybe need a desinged complete criterion in the future
+        verification_prompt = prompt_engine.load_prompt(
+            "check-user-goal",
+            navigation_goal=task.navigation_goal,
+            navigation_payload=task.navigation_payload,
+            elements=scraped_page_refreshed.build_element_tree(ElementTreeFormat.HTML),
+        )
+
+        # this prompt is critical to our agent so let's use the primary LLM API handler
+        verification_result = await app.LLM_API_HANDLER(
+            prompt=verification_prompt, step=step, screenshots=scraped_page_refreshed.screenshots
+        )
+        return CompleteVerifyResult.model_validate(verification_result)
+
+    @staticmethod
     async def check_user_goal_complete(
         page: Page, scraped_page: ScrapedPage, task: Task, step: Step
     ) -> CompleteAction | None:
         try:
-            LOG.info(
-                "Checking if user goal is achieved after re-scraping the page without screenshots",
-                task_id=task.task_id,
-                step_id=step.step_id,
-                workflow_run_id=task.workflow_run_id,
-            )
-            scraped_page_refreshed = await scraped_page.refresh()
-
-            verification_prompt = prompt_engine.load_prompt(
-                "check-user-goal",
-                navigation_goal=task.navigation_goal,
-                navigation_payload=task.navigation_payload,
-                elements=scraped_page_refreshed.build_element_tree(ElementTreeFormat.HTML),
+            verification_result = await app.agent.complete_verify(
+                page=page,
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
             )
 
-            # this prompt is critical to our agent so let's use the primary LLM API handler
-            verification_response = await app.LLM_API_HANDLER(
-                prompt=verification_prompt, step=step, screenshots=scraped_page_refreshed.screenshots
-            )
-            if "user_goal_achieved" not in verification_response or "thoughts" not in verification_response:
-                LOG.error(
-                    "Invalid LLM response for user goal success verification, skipping verification",
-                    verification_response=verification_response,
-                    task_id=task.task_id,
-                    step_id=step.step_id,
-                    workflow_run_id=task.workflow_run_id,
-                )
-                return None
-
-            user_goal_achieved: bool = verification_response["user_goal_achieved"]
             # We don't want to return a complete action if the user goal is not achieved since we're checking at every step
-            if not user_goal_achieved:
+            if not verification_result.user_goal_achieved:
                 return None
 
             return CompleteAction(
-                reasoning=verification_response["thoughts"],
+                reasoning=verification_result.thoughts,
                 data_extraction_goal=task.data_extraction_goal,
+                verified=True,
             )
 
         except Exception:
-            LOG.error(
-                "LLM verification failed for complete action, skipping LLM verification",
+            LOG.exception(
+                "Failed to check user goal complete, skipping",
                 task_id=task.task_id,
                 step_id=step.step_id,
                 workflow_run_id=task.workflow_run_id,
-                exc_info=True,
             )
             return None
 
