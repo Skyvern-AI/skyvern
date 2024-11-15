@@ -250,11 +250,12 @@ async def _convert_css_shape_to_string(
                 )
                 return None
         except Exception:
-            LOG.exception(
+            LOG.warning(
                 "Failed to convert css shape to string shape by LLM",
                 task_id=task.task_id,
                 step_id=step.step_id,
                 element_id=element_id,
+                exc_info=True,
             )
             return None
 
