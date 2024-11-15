@@ -1031,7 +1031,7 @@ async def handle_complete_action(
     step: Step,
 ) -> list[ActionResult]:
     # If this action has a source_action_id, then we need to make sure if the goal is actually completed.
-    if action.source_action_id:
+    if action.source_action_id and task.navigation_goal:
         LOG.info(
             "CompleteAction has source_action_id, checking if goal is completed",
             task_id=task.task_id,
@@ -1051,7 +1051,7 @@ async def handle_complete_action(
             ]
         action.verified = True
 
-    if not action.verified:
+    if not action.verified and task.navigation_goal:
         LOG.info(
             "CompleteAction hasn't been verified, going to verify the user goal",
             task_id=task.task_id,
