@@ -6,7 +6,13 @@ import httpx
 import structlog
 
 from skyvern import analytics
-from skyvern.exceptions import FailedToSendWebhook, MissingValueForParameter, WorkflowNotFound, WorkflowRunNotFound
+from skyvern.exceptions import (
+    FailedToSendWebhook,
+    MissingValueForParameter,
+    SkyvernException,
+    WorkflowNotFound,
+    WorkflowRunNotFound,
+)
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
@@ -147,7 +153,14 @@ class WorkflowService:
                 f"Error while setting up workflow run {workflow_run.workflow_run_id}",
                 workflow_run_id=workflow_run.workflow_run_id,
             )
-            await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
+
+            failure_reason = "Setup up workflow failed due to an unexpected exception"
+            if isinstance(e, SkyvernException):
+                failure_reason = f"Setup workflow failed due to an SkyvernException({e.__class__.__name__})"
+
+            await self.mark_workflow_run_as_failed(
+                workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
+            )
             raise e
 
         return workflow_run
@@ -260,7 +273,10 @@ class WorkflowService:
                             block_label=block.label,
                         )
                     else:
-                        await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
+                        failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} failed. failure reason: {block_result.failure_reason}"
+                        await self.mark_workflow_run_as_failed(
+                            workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
+                        )
                         await self.clean_up_workflow(
                             workflow=workflow,
                             workflow_run=workflow_run,
@@ -289,14 +305,17 @@ class WorkflowService:
                             block_label=block.label,
                         )
                     else:
-                        await self.mark_workflow_run_as_terminated(workflow_run_id=workflow_run.workflow_run_id)
+                        failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} terminated. Reason: {block_result.failure_reason}"
+                        await self.mark_workflow_run_as_terminated(
+                            workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
+                        )
                         await self.clean_up_workflow(
                             workflow=workflow,
                             workflow_run=workflow_run,
                             api_key=api_key,
                         )
                         return workflow_run
-            except Exception:
+            except Exception as e:
                 LOG.exception(
                     f"Error while executing workflow run {workflow_run.workflow_run_id}",
                     workflow_run_id=workflow_run.workflow_run_id,
@@ -304,7 +323,15 @@ class WorkflowService:
                     block_type=block.block_type,
                     block_label=block.label,
                 )
-                await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
+
+                exception_message = "unexpected exception"
+                if isinstance(e, SkyvernException):
+                    exception_message = f"unexpected SkyvernException({e.__class__.__name__})"
+
+                failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} failed. failure reason: {exception_message}"
+                await self.mark_workflow_run_as_failed(
+                    workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
+                )
                 await self.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, api_key=api_key)
                 return workflow_run
 
@@ -472,15 +499,17 @@ class WorkflowService:
             status=WorkflowRunStatus.completed,
         )
 
-    async def mark_workflow_run_as_failed(self, workflow_run_id: str) -> None:
+    async def mark_workflow_run_as_failed(self, workflow_run_id: str, failure_reason: str | None) -> None:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as failed",
             workflow_run_id=workflow_run_id,
             workflow_status="failed",
+            failure_reason=failure_reason,
         )
         await app.DATABASE.update_workflow_run(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.failed,
+            failure_reason=failure_reason,
         )
 
     async def mark_workflow_run_as_running(self, workflow_run_id: str) -> None:
@@ -494,15 +523,17 @@ class WorkflowService:
             status=WorkflowRunStatus.running,
         )
 
-    async def mark_workflow_run_as_terminated(self, workflow_run_id: str) -> None:
+    async def mark_workflow_run_as_terminated(self, workflow_run_id: str, failure_reason: str | None) -> None:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as terminated",
             workflow_run_id=workflow_run_id,
             workflow_status="terminated",
+            failure_reason=failure_reason,
         )
         await app.DATABASE.update_workflow_run(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.terminated,
+            failure_reason=failure_reason,
         )
 
     async def mark_workflow_run_as_canceled(self, workflow_run_id: str) -> None:
