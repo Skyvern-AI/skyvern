@@ -246,7 +246,8 @@ function isElementVisible(element) {
   // because they are not visible by default. We check their parent instead for visibility.
   if (
     element.tagName.toLowerCase() === "option" ||
-    (element.tagName.toLowerCase() === "input" && element.type === "radio")
+    (element.tagName.toLowerCase() === "input" &&
+      (element.type === "radio" || element.type === "checkbox"))
   )
     return element.parentElement && isElementVisible(element.parentElement);
 
