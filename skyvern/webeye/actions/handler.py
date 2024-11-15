@@ -1032,9 +1032,14 @@ async def handle_complete_action(
 ) -> list[ActionResult]:
     # If this action has a source_action_id, then we need to make sure if the goal is actually completed.
     if action.source_action_id:
-        LOG.info("CompleteAction has source_action_id, checking if goal is completed")
-        complete_action = await app.agent.check_user_goal_complete(page, scraped_page, task, step)
-        if complete_action is None:
+        LOG.info(
+            "CompleteAction has source_action_id, checking if goal is completed",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            workflow_run_id=task.workflow_run_id,
+        )
+        verified_complete_action = await app.agent.check_user_goal_complete(page, scraped_page, task, step)
+        if verified_complete_action is None:
             return [
                 ActionFailure(
                     exception=IllegitComplete(
@@ -1044,6 +1049,36 @@ async def handle_complete_action(
                     )
                 )
             ]
+        action.verified = True
+
+    if not action.verified:
+        LOG.info(
+            "CompleteAction hasn't been verified, going to verify the user goal",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            workflow_run_id=task.workflow_run_id,
+        )
+        try:
+            verification_result = await app.agent.complete_verify(page, scraped_page, task, step)
+        except Exception as e:
+            LOG.exception(
+                "Failed to verify the complete action",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                workflow_run_id=task.workflow_run_id,
+            )
+            return [ActionFailure(exception=e)]
+
+        if not verification_result.user_goal_achieved:
+            return [ActionFailure(exception=IllegitComplete(data={"error": verification_result.thoughts}))]
+
+        LOG.info(
+            "CompleteAction has been verified successfully",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            workflow_run_id=task.workflow_run_id,
+        )
+        action.verified = True
 
     extracted_data = None
     if action.data_extraction_goal:

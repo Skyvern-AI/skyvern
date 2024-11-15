@@ -65,6 +65,15 @@ class SelectOption(BaseModel):
         return f"SelectOption(label={self.label}, value={self.value}, index={self.index})"
 
 
+class CompleteVerifyResult(BaseModel):
+    user_goal_achieved: bool
+    thoughts: str
+    page_info: str | None = None
+
+    def __repr__(self) -> str:
+        return f"CompleteVerifyResponse(thoughts={self.thoughts}, user_goal_achieved={self.user_goal_achieved}, page_info={self.page_info})"
+
+
 class InputOrSelectContext(BaseModel):
     field: str | None = None
     is_required: bool | None = None
@@ -226,6 +235,7 @@ class TerminateAction(DecisiveAction):
 
 class CompleteAction(DecisiveAction):
     action_type: ActionType = ActionType.COMPLETE
+    verified: bool = False
     data_extraction_goal: str | None = None
 
 
