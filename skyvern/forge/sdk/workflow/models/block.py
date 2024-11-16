@@ -298,14 +298,37 @@ class TaskBlock(Block):
                 raise Exception(f"Organization is missing organization_id={workflow.organization_id}")
 
             browser_state: BrowserState | None = None
-            if is_first_task:
-                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                    workflow_run=workflow_run, url=self.url
+            try:
+                if is_first_task:
+                    browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                        workflow_run=workflow_run, url=self.url
+                    )
+                else:
+                    browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
+                    if browser_state is None:
+                        raise MissingBrowserState(task_id=task.task_id, workflow_run_id=workflow_run_id)
+            except FailedToNavigateToUrl as e:
+                # Make sure the task is marked as failed in the database before raising the exception
+                await app.DATABASE.update_task(
+                    task.task_id,
+                    status=TaskStatus.failed,
+                    organization_id=workflow.organization_id,
+                    failure_reason=str(e),
                 )
-            else:
-                browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
-                if browser_state is None:
-                    raise MissingBrowserState(task_id=task.task_id, workflow_run_id=workflow_run_id)
+                raise e
+            except Exception as e:
+                await app.DATABASE.update_task(
+                    task.task_id,
+                    status=TaskStatus.failed,
+                    organization_id=workflow.organization_id,
+                    failure_reason=str(e),
+                )
+                LOG.exception(
+                    "Failed to get browser state for task",
+                    task_id=task.task_id,
+                    workflow_run_id=workflow_run_id,
+                )
+                raise e
 
             working_page = await browser_state.get_working_page()
             if not working_page:
