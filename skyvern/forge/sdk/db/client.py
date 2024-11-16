@@ -79,7 +79,7 @@ class AgentDB:
     def __init__(self, database_string: str, debug_enabled: bool = False) -> None:
         super().__init__()
         self.debug_enabled = debug_enabled
-        self.engine = create_async_engine(database_string, json_serializer=_custom_json_serializer)
+        self.engine = create_async_engine(database_string, json_serializer=_custom_json_serializer, pool_pre_ping=True)
         self.Session = async_sessionmaker(bind=self.engine)
 
     async def create_task(
