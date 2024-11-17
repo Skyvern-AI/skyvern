@@ -26,7 +26,7 @@ ddtrace = "^2.3.2"
 pydantic = "^2.5.2"
 pydantic-settings = "^2.1.0"
 fastapi = "^0.115.4"
-psycopg = "3.1.18"
+psycopg = {version = "3.1.18", extras = ["binary", "pool"]}
 alembic = "^1.12.1"
 python-jose = {extras = ["cryptography"], version = "^3.3.0"}
 cachetools = "^5.3.2"
