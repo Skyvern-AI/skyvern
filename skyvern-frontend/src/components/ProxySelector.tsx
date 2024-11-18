@@ -32,7 +32,6 @@ function ProxySelector({ value, onChange }: Props) {
         <SelectItem value={ProxyLocation.ResidentialJP}>
           Residential (Japan)
         </SelectItem>
-        <SelectItem value={ProxyLocation.None}>None</SelectItem>
       </SelectContent>
     </Select>
   );
