@@ -365,6 +365,20 @@ export const topRankedFootballTeam = {
   errorCodeMapping: null,
 };
 
+export const extractIntegrationsFromGong = {
+  url: "https://www.gong.io",
+  navigationGoal:
+    "Navigate to the 'Integrations' page on the Gong website. COMPLETE when the page displaying a list of integrations is fully loaded. Ensure not to click on any external links or advertisements.",
+  dataExtractionGoal:
+    "Extract the names and descriptions of all integrations listed on the Gong integrations page.",
+  navigationPayload: null,
+  extractedInformationSchema: null,
+  webhookCallbackUrl: null,
+  totpIdentifier: null,
+  totpVerificationUrl: null,
+  errorCodeMapping: null,
+};
+
 export function getSample(sample: SampleCase) {
   switch (sample) {
     case "geico": {
@@ -406,6 +420,9 @@ export function getSample(sample: SampleCase) {
     }
     case "topRankedFootballTeam": {
       return topRankedFootballTeam;
+    }
+    case "extractIntegrationsFromGong": {
+      return extractIntegrationsFromGong;
     }
     case "blank": {
       return blank;

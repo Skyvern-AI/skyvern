@@ -84,6 +84,10 @@ const exampleCases = [
     key: "topRankedFootballTeam",
     label: "Get the top ranked football team",
   },
+  {
+    key: "extractIntegrationsFromGong",
+    label: "Extract Integrations from Gong",
+  },
 ];
 
 function PromptBox() {
