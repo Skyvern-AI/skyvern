@@ -35,6 +35,7 @@ import { apiBaseUrl, envCredential } from "@/util/env";
 import {
   basicLocalTimeFormat,
   basicTimeFormat,
+  localTimeFormatWithShortDate,
   timeFormatWithShortDate,
 } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
@@ -475,10 +476,14 @@ function WorkflowRun() {
                   <Label className="text-sm text-slate-400">Created</Label>
                   <span
                     className="truncate text-sm"
-                    title={basicLocalTimeFormat(currentRunningTask.created_at)}
+                    title={timeFormatWithShortDate(
+                      currentRunningTask.created_at,
+                    )}
                   >
                     {currentRunningTask &&
-                      timeFormatWithShortDate(currentRunningTask.created_at)}
+                      localTimeFormatWithShortDate(
+                        currentRunningTask.created_at,
+                      )}
                   </span>
                 </div>
                 <div className="mt-auto flex justify-end">
