@@ -42,7 +42,34 @@ function timeFormatWithShortDate(time: string): string {
   const dateString =
     date.getMonth() + 1 + "/" + date.getDate() + "/" + date.getFullYear();
   const timeString = date.toLocaleTimeString("en-US");
+  return `${dateString} at ${timeString} UTC`;
+}
+
+function localTimeFormatWithShortDate(time: string): string {
+  // Adjust the fractional seconds to milliseconds (3 digits)
+  time = time.replace(/\.(\d{3})\d*/, ".$1");
+
+  // Append 'Z' to indicate UTC time if not already present
+  if (!time.endsWith("Z")) {
+    time += "Z";
+  }
+
+  const date = new Date(time);
+  const localTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+  const dateString =
+    date.getMonth() + 1 + "/" + date.getDate() + "/" + date.getFullYear();
+
+  const timeString = date.toLocaleTimeString("en-US", {
+    timeZone: localTimezone,
+  });
+
   return `${dateString} at ${timeString}`;
 }
 
-export { basicLocalTimeFormat, basicTimeFormat, timeFormatWithShortDate };
+export {
+  basicLocalTimeFormat,
+  basicTimeFormat,
+  timeFormatWithShortDate,
+  localTimeFormatWithShortDate,
+};
