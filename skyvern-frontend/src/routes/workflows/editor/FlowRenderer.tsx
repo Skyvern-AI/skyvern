@@ -317,7 +317,7 @@ function FlowRenderer({
     newNodes.push(node);
     if (previous) {
       const newEdge = {
-        id: `edge-${previous}-${id}`,
+        id: nanoid(),
         type: "edgeWithAddButton",
         source: previous,
         target: id,
@@ -329,7 +329,7 @@ function FlowRenderer({
     }
     if (next) {
       const newEdge = {
-        id: `edge-${id}-${next}`,
+        id: nanoid(),
         type: connectingEdgeType,
         source: id,
         target: next,

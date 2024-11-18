@@ -376,7 +376,10 @@ function getElements(blocks: Array<WorkflowBlock>): {
   const nodes: Array<AppNode> = [];
   const edges: Array<Edge> = [];
 
-  data.forEach((d) => {
+  const startNodeId = nanoid();
+  nodes.push(startNode(startNodeId));
+
+  data.forEach((d, index) => {
     const node = convertToNode(
       {
         id: d.id,
@@ -387,6 +390,9 @@ function getElements(blocks: Array<WorkflowBlock>): {
     nodes.push(node);
     if (d.previous) {
       edges.push(edgeWithAddButton(d.previous, d.id));
+    }
+    if (index === 0) {
+      edges.push(edgeWithAddButton(startNodeId, d.id));
     }
   });
 
@@ -411,18 +417,15 @@ function getElements(blocks: Array<WorkflowBlock>): {
     }
   });
 
-  const startNodeId = nanoid();
   const adderNodeId = nanoid();
 
-  if (nodes.length === 0) {
-    nodes.push(startNode(startNodeId));
+  if (data.length === 0) {
     nodes.push(nodeAdderNode(adderNodeId));
     edges.push(defaultEdge(startNodeId, adderNodeId));
   } else {
     const firstNode = data.find(
       (d) => d.previous === null && d.parentId === null,
     );
-    nodes.push(startNode(startNodeId));
     edges.push(edgeWithAddButton(startNodeId, firstNode!.id));
     const lastNode = data.find((d) => d.next === null && d.parentId === null)!;
     edges.push(defaultEdge(lastNode.id, adderNodeId));
