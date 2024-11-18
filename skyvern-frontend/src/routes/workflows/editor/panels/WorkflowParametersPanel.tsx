@@ -176,7 +176,10 @@ function WorkflowParametersPanel() {
                                 setHasChanges(true);
                                 setNodes((nodes) => {
                                   return nodes.map((node) => {
-                                    if (node.type === "task") {
+                                    if (
+                                      node.type === "task" ||
+                                      node.type === "textPrompt"
+                                    ) {
                                       return {
                                         ...node,
                                         data: {
@@ -270,7 +273,10 @@ function WorkflowParametersPanel() {
                     );
                     setNodes((nodes) => {
                       return nodes.map((node) => {
-                        if (node.type === "task") {
+                        if (
+                          node.type === "task" ||
+                          node.type === "textPrompt"
+                        ) {
                           return {
                             ...node,
                             data: {

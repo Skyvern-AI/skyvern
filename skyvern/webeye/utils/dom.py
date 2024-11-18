@@ -127,6 +127,9 @@ class SkyvernElement:
         self.locator = locator
         self.hash_value = hash_value
 
+    def __repr__(self) -> str:
+        return f"SkyvernElement({str(self.__static_element)})"
+
     def build_HTML(self, need_trim_element: bool = True, need_skyvern_attrs: bool = True) -> str:
         element_dict = self.get_element_dict()
         if need_trim_element:
@@ -263,6 +266,22 @@ class SkyvernElement:
     async def is_selectable(self) -> bool:
         return self.get_selectable() or self.get_tag_name() in SELECTABLE_ELEMENT
 
+    async def is_visible(self) -> bool:
+        skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
+        return await skyvern_frame.get_element_visible(await self.get_element_handler())
+
+    async def is_parent_of(self, target: ElementHandle) -> bool:
+        skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
+        return await skyvern_frame.is_parent(await self.get_element_handler(), target)
+
+    async def is_child_of(self, target: ElementHandle) -> bool:
+        skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
+        return await skyvern_frame.is_parent(target, await self.get_element_handler())
+
+    async def is_sibling_of(self, target: ElementHandle) -> bool:
+        skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
+        return await skyvern_frame.is_sibling(await self.get_element_handler(), target)
+
     def get_element_dict(self) -> dict:
         return self.__static_element
 
@@ -300,6 +319,21 @@ class SkyvernElement:
         handler = await self.locator.element_handle(timeout=timeout)
         assert handler is not None
         return handler
+
+    async def find_blocking_element(self, dom: DomUtil) -> SkyvernElement | None:
+        skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
+        blocking_element_id = await skyvern_frame.get_blocking_element_id(await self.get_element_handler())
+        if not blocking_element_id:
+            return None
+        return await dom.get_skyvern_element_by_id(blocking_element_id)
+
+    async def find_element_in_label_children(
+        self, dom: DomUtil, element_type: InteractiveElement
+    ) -> SkyvernElement | None:
+        element_id = self.find_element_id_in_label_children(element_type=element_type)
+        if not element_id:
+            return None
+        return await dom.get_skyvern_element_by_id(element_id=element_id)
 
     def find_element_id_in_label_children(self, element_type: InteractiveElement) -> str | None:
         tag_name = self.get_tag_name()
@@ -353,6 +387,45 @@ class SkyvernElement:
             return None
 
         return await dom.get_skyvern_element_by_id(unique_id)
+
+    async def find_bound_label_by_attr_id(
+        self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    ) -> Locator | None:
+        if self.get_tag_name() == "label":
+            return None
+
+        element_id: str = await self.get_attr("id", timeout=timeout)
+        if not element_id:
+            return None
+
+        locator = self.get_frame().locator(f"label[for='{element_id}']")
+        cnt = await locator.count()
+        if cnt == 1:
+            return locator
+
+        return None
+
+    async def find_bound_label_by_direct_parent(
+        self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    ) -> Locator | None:
+        if self.get_tag_name() == "label":
+            return None
+
+        parent_locator = self.get_locator().locator("..")
+        cnt = await parent_locator.count()
+        if cnt != 1:
+            return None
+
+        timeout_sec = timeout / 1000
+        async with asyncio.timeout(timeout_sec):
+            tag_name: str | None = await parent_locator.evaluate("el => el.tagName")
+            if not tag_name:
+                return None
+
+            if tag_name.lower() != "label":
+                return None
+
+            return parent_locator
 
     async def find_selectable_child(self, dom: DomUtil) -> SkyvernElement | None:
         # BFS to find the first selectable child

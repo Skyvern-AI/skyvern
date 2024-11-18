@@ -317,7 +317,7 @@ function FlowRenderer({
     newNodes.push(node);
     if (previous) {
       const newEdge = {
-        id: `edge-${previous}-${id}`,
+        id: nanoid(),
         type: "edgeWithAddButton",
         source: previous,
         target: id,
@@ -329,7 +329,7 @@ function FlowRenderer({
     }
     if (next) {
       const newEdge = {
-        id: `edge-${id}-${next}`,
+        id: nanoid(),
         type: connectingEdgeType,
         source: id,
         target: next,
@@ -407,6 +407,19 @@ function FlowRenderer({
     // if any node was using the output parameter of the deleted node, remove it from their parameter keys
     const newNodesWithUpdatedParameters = newNodes.map((node) => {
       if (node.type === "task") {
+        return {
+          ...node,
+          data: {
+            ...node.data,
+            parameterKeys: node.data.parameterKeys.filter(
+              (parameter) =>
+                parameter !== getOutputParameterKey(deletedNodeLabel),
+            ),
+          },
+        };
+      }
+      // TODO: Fix this. When we put these into the same if statement TS fails to recognize that the returned value fits both the task and text prompt node types
+      if (node.type === "textPrompt") {
         return {
           ...node,
           data: {

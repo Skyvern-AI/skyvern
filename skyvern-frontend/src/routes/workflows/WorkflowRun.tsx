@@ -35,6 +35,7 @@ import { apiBaseUrl, envCredential } from "@/util/env";
 import {
   basicLocalTimeFormat,
   basicTimeFormat,
+  localTimeFormatWithShortDate,
   timeFormatWithShortDate,
 } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
@@ -43,9 +44,11 @@ import {
   Pencil2Icon,
   PlayIcon,
   ReaderIcon,
+  ReloadIcon,
 } from "@radix-ui/react-icons";
 import {
   keepPreviousData,
+  useMutation,
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
@@ -59,9 +62,23 @@ import {
 } from "react-router-dom";
 import { TaskActions } from "../tasks/list/TaskActions";
 import { TaskListSkeletonRows } from "../tasks/list/TaskListSkeletonRows";
-import { statusIsNotFinalized, statusIsRunningOrQueued } from "../tasks/types";
+import {
+  statusIsFinalized,
+  statusIsNotFinalized,
+  statusIsRunningOrQueued,
+} from "../tasks/types";
 import { CodeEditor } from "./components/CodeEditor";
 import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 
 type StreamMessage = {
   task_id: string;
@@ -144,12 +161,43 @@ function WorkflowRun() {
       workflowRun?.status === Status.Running ? "always" : false,
   });
 
+  const cancelWorkflowMutation = useMutation({
+    mutationFn: async () => {
+      const client = await getClient(credentialGetter);
+      return client
+        .post(`/workflows/runs/${workflowRunId}/cancel`)
+        .then((response) => response.data);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: ["workflowRun", workflowRunId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["workflowRun", workflowPermanentId, workflowRunId],
+      });
+      toast({
+        variant: "success",
+        title: "Workflow Canceled",
+        description: "The workflow has been successfully canceled.",
+      });
+    },
+    onError: (error) => {
+      toast({
+        variant: "destructive",
+        title: "Error",
+        description: error.message,
+      });
+    },
+  });
+
   const currentRunningTask = workflowTasks?.find(
     (task) => task.status === Status.Running,
   );
 
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
+
+  const workflowRunIsFinalized = workflowRun && statusIsFinalized(workflowRun);
 
   useEffect(() => {
     if (!workflowRunIsRunningOrQueued) {
@@ -347,17 +395,51 @@ function WorkflowRun() {
               Edit
             </Link>
           </Button>
-          <Button asChild>
-            <Link
-              to={`/workflows/${workflowPermanentId}/run`}
-              state={{
-                data: parameters,
-              }}
-            >
-              <PlayIcon className="mr-2 h-4 w-4" />
-              Rerun
-            </Link>
-          </Button>
+          {workflowRunIsRunningOrQueued && (
+            <Dialog>
+              <DialogTrigger asChild>
+                <Button variant="destructive">Cancel</Button>
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Are you sure?</DialogTitle>
+                  <DialogDescription>
+                    Are you sure you want to cancel this workflow run?
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogFooter>
+                  <DialogClose asChild>
+                    <Button variant="secondary">Back</Button>
+                  </DialogClose>
+                  <Button
+                    variant="destructive"
+                    onClick={() => {
+                      cancelWorkflowMutation.mutate();
+                    }}
+                    disabled={cancelWorkflowMutation.isPending}
+                  >
+                    {cancelWorkflowMutation.isPending && (
+                      <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+                    )}
+                    Cancel Workflow Run
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+          )}
+          {workflowRunIsFinalized && (
+            <Button asChild>
+              <Link
+                to={`/workflows/${workflowPermanentId}/run`}
+                state={{
+                  data: parameters,
+                }}
+              >
+                <PlayIcon className="mr-2 h-4 w-4" />
+                Rerun
+              </Link>
+            </Button>
+          )}
         </div>
       </header>
       {workflowRun && statusIsNotFinalized(workflowRun) && (
@@ -365,7 +447,7 @@ function WorkflowRun() {
           <div className="w-3/4 shrink-0">
             <AspectRatio ratio={16 / 9}>{getStream()}</AspectRatio>
           </div>
-          <div className="flex w-full flex-col gap-4 rounded-md bg-slate-elevation1 p-4">
+          <div className="flex w-full min-w-0 flex-col gap-4 rounded-md bg-slate-elevation1 p-4">
             <header className="text-lg">Current Task</header>
             {workflowRunIsLoading || !currentRunningTask ? (
               <div>Waiting for a task to start...</div>
@@ -377,7 +459,10 @@ function WorkflowRun() {
                 </div>
                 <div className="flex gap-2 rounded-sm bg-slate-elevation3 p-2">
                   <Label className="text-sm text-slate-400">URL</Label>
-                  <span className="text-sm">
+                  <span
+                    className="truncate text-sm"
+                    title={currentRunningTask.request.url}
+                  >
                     {currentRunningTask.request.url}
                   </span>
                 </div>
@@ -389,9 +474,16 @@ function WorkflowRun() {
                 </div>
                 <div className="flex gap-2 rounded-sm bg-slate-elevation3 p-2">
                   <Label className="text-sm text-slate-400">Created</Label>
-                  <span className="text-sm">
+                  <span
+                    className="truncate text-sm"
+                    title={timeFormatWithShortDate(
+                      currentRunningTask.created_at,
+                    )}
+                  >
                     {currentRunningTask &&
-                      timeFormatWithShortDate(currentRunningTask.created_at)}
+                      localTimeFormatWithShortDate(
+                        currentRunningTask.created_at,
+                      )}
                   </span>
                 </div>
                 <div className="mt-auto flex justify-end">

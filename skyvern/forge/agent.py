@@ -44,11 +44,12 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskStatus
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import TaskBlock
-from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.webeye.actions.actions import (
     Action,
     ActionType,
     CompleteAction,
+    CompleteVerifyResult,
     DecisiveAction,
     UserDefinedError,
     WebAction,
@@ -220,10 +221,29 @@ class ForgeAgent:
         task: Task,
         step: Step,
         api_key: str | None = None,
-        workflow_run: WorkflowRun | None = None,
         close_browser_on_completion: bool = True,
         task_block: TaskBlock | None = None,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
+        workflow_run: WorkflowRun | None = None
+        if task.workflow_run_id:
+            workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=task.workflow_run_id)
+            if workflow_run and workflow_run.status == WorkflowRunStatus.canceled:
+                LOG.info(
+                    "Workflow run is canceled, stopping execution inside task",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    step_id=step.step_id,
+                )
+                step = await self.update_step(
+                    step,
+                    status=StepStatus.canceled,
+                    is_last=True,
+                )
+                task = await self.update_task(
+                    task,
+                    status=TaskStatus.canceled,
+                )
+                return step, None, None
+
         refreshed_task = await app.DATABASE.get_task(task_id=task.task_id, organization_id=organization.organization_id)
         if refreshed_task:
             task = refreshed_task
@@ -840,26 +860,32 @@ class ForgeAgent:
 
             task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
             if not has_decisive_action and not task_completes_on_download:
-                working_page = await browser_state.must_get_working_page()
-                complete_action = await self.check_user_goal_complete(
-                    page=working_page,
-                    scraped_page=scraped_page,
-                    task=task,
-                    step=step,
+                disable_user_goal_check = app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                    "DISABLE_USER_GOAL_CHECK",
+                    task.task_id,
+                    properties={"task_url": task.url, "organization_id": task.organization_id},
                 )
-                if complete_action is not None:
-                    LOG.info("User goal achieved, executing complete action")
-                    complete_action.organization_id = task.organization_id
-                    complete_action.workflow_run_id = task.workflow_run_id
-                    complete_action.task_id = task.task_id
-                    complete_action.step_id = step.step_id
-                    complete_action.step_order = step.order
-                    complete_action.action_order = len(detailed_agent_step_output.actions_and_results)
-                    complete_results = await ActionHandler.handle_action(
-                        scraped_page, task, step, working_page, complete_action
+                if not disable_user_goal_check:
+                    working_page = await browser_state.must_get_working_page()
+                    complete_action = await self.check_user_goal_complete(
+                        page=working_page,
+                        scraped_page=scraped_page,
+                        task=task,
+                        step=step,
                     )
-                    detailed_agent_step_output.actions_and_results.append((complete_action, complete_results))
-                    await self.record_artifacts_after_action(task, step, browser_state)
+                    if complete_action is not None:
+                        LOG.info("User goal achieved, executing complete action")
+                        complete_action.organization_id = task.organization_id
+                        complete_action.workflow_run_id = task.workflow_run_id
+                        complete_action.task_id = task.task_id
+                        complete_action.step_id = step.step_id
+                        complete_action.step_order = step.order
+                        complete_action.action_order = len(detailed_agent_step_output.actions_and_results)
+                        complete_results = await ActionHandler.handle_action(
+                            scraped_page, task, step, working_page, complete_action
+                        )
+                        detailed_agent_step_output.actions_and_results.append((complete_action, complete_results))
+                        await self.record_artifacts_after_action(task, step, browser_state)
             # If no action errors return the agent state and output
             completed_step = await self.update_step(
                 step=step,
@@ -899,56 +925,58 @@ class ForgeAgent:
             return failed_step, detailed_agent_step_output.get_clean_detailed_output()
 
     @staticmethod
+    async def complete_verify(page: Page, scraped_page: ScrapedPage, task: Task, step: Step) -> CompleteVerifyResult:
+        LOG.info(
+            "Checking if user goal is achieved after re-scraping the page",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            workflow_run_id=task.workflow_run_id,
+        )
+        scraped_page_refreshed = await scraped_page.refresh()
+
+        # TODO: currently, just using the check user goal for complete verification
+        # maybe need a desinged complete criterion in the future
+        verification_prompt = prompt_engine.load_prompt(
+            "check-user-goal",
+            navigation_goal=task.navigation_goal,
+            navigation_payload=task.navigation_payload,
+            elements=scraped_page_refreshed.build_element_tree(ElementTreeFormat.HTML),
+        )
+
+        # this prompt is critical to our agent so let's use the primary LLM API handler
+        verification_result = await app.LLM_API_HANDLER(
+            prompt=verification_prompt, step=step, screenshots=scraped_page_refreshed.screenshots
+        )
+        return CompleteVerifyResult.model_validate(verification_result)
+
+    @staticmethod
     async def check_user_goal_complete(
         page: Page, scraped_page: ScrapedPage, task: Task, step: Step
     ) -> CompleteAction | None:
         try:
-            LOG.info(
-                "Checking if user goal is achieved after re-scraping the page without screenshots",
-                task_id=task.task_id,
-                step_id=step.step_id,
-                workflow_run_id=task.workflow_run_id,
-            )
-            scraped_page_refreshed = await scraped_page.refresh()
-
-            verification_prompt = prompt_engine.load_prompt(
-                "check-user-goal",
-                navigation_goal=task.navigation_goal,
-                navigation_payload=task.navigation_payload,
-                elements=scraped_page_refreshed.build_element_tree(ElementTreeFormat.HTML),
+            verification_result = await app.agent.complete_verify(
+                page=page,
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
             )
 
-            # this prompt is critical to our agent so let's use the primary LLM API handler
-            verification_response = await app.LLM_API_HANDLER(
-                prompt=verification_prompt, step=step, screenshots=scraped_page_refreshed.screenshots
-            )
-            if "user_goal_achieved" not in verification_response or "thoughts" not in verification_response:
-                LOG.error(
-                    "Invalid LLM response for user goal success verification, skipping verification",
-                    verification_response=verification_response,
-                    task_id=task.task_id,
-                    step_id=step.step_id,
-                    workflow_run_id=task.workflow_run_id,
-                )
-                return None
-
-            user_goal_achieved: bool = verification_response["user_goal_achieved"]
             # We don't want to return a complete action if the user goal is not achieved since we're checking at every step
-            if not user_goal_achieved:
+            if not verification_result.user_goal_achieved:
                 return None
 
             return CompleteAction(
-                reasoning=verification_response["thoughts"],
+                reasoning=verification_result.thoughts,
                 data_extraction_goal=task.data_extraction_goal,
+                verified=True,
             )
 
         except Exception:
-            LOG.error(
-                "LLM verification failed for complete action, skipping LLM verification",
+            LOG.exception(
+                "Failed to check user goal complete, skipping",
                 task_id=task.task_id,
                 step_id=step.step_id,
                 workflow_run_id=task.workflow_run_id,
-                exc_info=True,
             )
             return None
 

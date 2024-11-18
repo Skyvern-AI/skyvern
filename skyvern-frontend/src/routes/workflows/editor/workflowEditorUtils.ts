@@ -201,6 +201,7 @@ function convertToNode(
           editable: true,
           prompt: block.prompt,
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
+          parameterKeys: block.parameters.map((p) => p.key),
         },
       };
     }
@@ -375,7 +376,10 @@ function getElements(blocks: Array<WorkflowBlock>): {
   const nodes: Array<AppNode> = [];
   const edges: Array<Edge> = [];
 
-  data.forEach((d) => {
+  const startNodeId = nanoid();
+  nodes.push(startNode(startNodeId));
+
+  data.forEach((d, index) => {
     const node = convertToNode(
       {
         id: d.id,
@@ -386,6 +390,9 @@ function getElements(blocks: Array<WorkflowBlock>): {
     nodes.push(node);
     if (d.previous) {
       edges.push(edgeWithAddButton(d.previous, d.id));
+    }
+    if (index === 0) {
+      edges.push(edgeWithAddButton(startNodeId, d.id));
     }
   });
 
@@ -410,18 +417,15 @@ function getElements(blocks: Array<WorkflowBlock>): {
     }
   });
 
-  const startNodeId = nanoid();
   const adderNodeId = nanoid();
 
-  if (nodes.length === 0) {
-    nodes.push(startNode(startNodeId));
+  if (data.length === 0) {
     nodes.push(nodeAdderNode(adderNodeId));
     edges.push(defaultEdge(startNodeId, adderNodeId));
   } else {
     const firstNode = data.find(
       (d) => d.previous === null && d.parentId === null,
     );
-    nodes.push(startNode(startNodeId));
     edges.push(edgeWithAddButton(startNodeId, firstNode!.id));
     const lastNode = data.find((d) => d.next === null && d.parentId === null)!;
     edges.push(defaultEdge(lastNode.id, adderNodeId));
@@ -627,6 +631,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         llm_key: "",
         prompt: node.data.prompt,
         json_schema: JSONParseSafe(node.data.jsonSchema),
+        parameter_keys: node.data.parameterKeys,
       };
     }
     default: {
@@ -758,7 +763,7 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
     if (node.type === "nodeAdder" || node.type === "start") {
       return node;
     }
-    if (node.type === "task") {
+    if (node.type === "task" || node.type === "textPrompt") {
       return {
         ...node,
         data: {

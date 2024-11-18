@@ -1,3 +1,6 @@
+// we only use chromium browser for now
+let browserNameForWorkarounds = "chromium";
+
 // Commands for manipulating rects.
 // Want to debug this? Run chromium, go to sources, and create a new snippet with the code in domUtils.js
 class Rect {
@@ -197,14 +200,31 @@ function getElementComputedStyle(element, pseudo) {
     : undefined;
 }
 
-// from playwright
+// from playwright: https://github.com/microsoft/playwright/blob/1b65f26f0287c0352e76673bc5f85bc36c934b55/packages/playwright-core/src/server/injected/domUtils.ts#L76-L98
 function isElementStyleVisibilityVisible(element, style) {
   style = style ?? getElementComputedStyle(element);
   if (!style) return true;
+  // Element.checkVisibility checks for content-visibility and also looks at
+  // styles up the flat tree including user-agent ShadowRoots, such as the
+  // details element for example.
+  // All the browser implement it, but WebKit has a bug which prevents us from using it:
+  // https://bugs.webkit.org/show_bug.cgi?id=264733
+  // @ts-ignore
   if (
-    !element.checkVisibility({ checkOpacity: false, checkVisibilityCSS: false })
-  )
-    return false;
+    Element.prototype.checkVisibility &&
+    browserNameForWorkarounds !== "webkit"
+  ) {
+    if (!element.checkVisibility()) return false;
+  } else {
+    // Manual workaround for WebKit that does not have checkVisibility.
+    const detailsOrSummary = element.closest("details,summary");
+    if (
+      detailsOrSummary !== element &&
+      detailsOrSummary?.nodeName === "DETAILS" &&
+      !detailsOrSummary.open
+    )
+      return false;
+  }
   if (style.visibility !== "visible") return false;
 
   // TODO: support style.clipPath and style.clipRule?
@@ -220,13 +240,14 @@ function hasASPClientControl() {
   return typeof ASPxClientControl !== "undefined";
 }
 
-// from playwright
+// from playwright: https://github.com/microsoft/playwright/blob/1b65f26f0287c0352e76673bc5f85bc36c934b55/packages/playwright-core/src/server/injected/domUtils.ts#L100-L119
 function isElementVisible(element) {
   // TODO: This is a hack to not check visibility for option elements
   // because they are not visible by default. We check their parent instead for visibility.
   if (
     element.tagName.toLowerCase() === "option" ||
-    (element.tagName.toLowerCase() === "input" && element.type === "radio")
+    (element.tagName.toLowerCase() === "input" &&
+      (element.type === "radio" || element.type === "checkbox"))
   )
     return element.parentElement && isElementVisible(element.parentElement);
 
@@ -249,7 +270,8 @@ function isElementVisible(element) {
         isElementVisible(child)
       )
         return true;
-      // skipping other nodes including text
+      if (child.nodeType === 3 /* Node.TEXT_NODE */ && isVisibleTextNode(child))
+        return true;
     }
     return false;
   }
@@ -271,6 +293,144 @@ function isElementVisible(element) {
   // }
 
   return true;
+}
+
+// from playwright: https://github.com/microsoft/playwright/blob/1b65f26f0287c0352e76673bc5f85bc36c934b55/packages/playwright-core/src/server/injected/domUtils.ts#L121-L127
+function isVisibleTextNode(node) {
+  // https://stackoverflow.com/questions/1461059/is-there-an-equivalent-to-getboundingclientrect-for-text-nodes
+  const range = node.ownerDocument.createRange();
+  range.selectNode(node);
+  const rect = range.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) {
+    return false;
+  }
+
+  // if the center point of the element is not in the page, we tag it as an non-interactable element
+  // FIXME: sometimes there could be an overflow element blocking the default scrolling, making Y coordinate be wrong. So we currently only check for X
+  const center_x = (rect.left + rect.width) / 2 + window.scrollX;
+  if (center_x < 0) {
+    return false;
+  }
+  // const center_y = (rect.top + rect.height) / 2 + window.scrollY;
+  // if (center_x < 0 || center_y < 0) {
+  //   return false;
+  // }
+  return true;
+}
+
+// from playwright: https://github.com/microsoft/playwright/blob/d685763c491e06be38d05675ef529f5c230388bb/packages/playwright-core/src/server/injected/domUtils.ts#L37-L44
+function parentElementOrShadowHost(element) {
+  if (element.parentElement) return element.parentElement;
+  if (!element.parentNode) return;
+  if (
+    element.parentNode.nodeType === 11 /* Node.DOCUMENT_FRAGMENT_NODE */ &&
+    element.parentNode.host
+  )
+    return element.parentNode.host;
+}
+
+// from playwright: https://github.com/microsoft/playwright/blob/d685763c491e06be38d05675ef529f5c230388bb/packages/playwright-core/src/server/injected/domUtils.ts#L46-L52
+function enclosingShadowRootOrDocument(element) {
+  let node = element;
+  while (node.parentNode) node = node.parentNode;
+  if (
+    node.nodeType === 11 /* Node.DOCUMENT_FRAGMENT_NODE */ ||
+    node.nodeType === 9 /* Node.DOCUMENT_NODE */
+  )
+    return node;
+}
+
+// from playwright: https://github.com/microsoft/playwright/blob/d685763c491e06be38d05675ef529f5c230388bb/packages/playwright-core/src/server/injected/injectedScript.ts#L799-L859
+function expectHitTarget(hitPoint, targetElement) {
+  const roots = [];
+
+  // Get all component roots leading to the target element.
+  // Go from the bottom to the top to make it work with closed shadow roots.
+  let parentElement = targetElement;
+  while (parentElement) {
+    const root = enclosingShadowRootOrDocument(parentElement);
+    if (!root) break;
+    roots.push(root);
+    if (root.nodeType === 9 /* Node.DOCUMENT_NODE */) break;
+    parentElement = root.host;
+  }
+
+  // Hit target in each component root should point to the next component root.
+  // Hit target in the last component root should point to the target or its descendant.
+  let hitElement;
+  for (let index = roots.length - 1; index >= 0; index--) {
+    const root = roots[index];
+    // All browsers have different behavior around elementFromPoint and elementsFromPoint.
+    // https://github.com/w3c/csswg-drafts/issues/556
+    // http://crbug.com/1188919
+    const elements = root.elementsFromPoint(hitPoint.x, hitPoint.y);
+    const singleElement = root.elementFromPoint(hitPoint.x, hitPoint.y);
+    if (
+      singleElement &&
+      elements[0] &&
+      parentElementOrShadowHost(singleElement) === elements[0]
+    ) {
+      const style = window.getComputedStyle(singleElement);
+      if (style?.display === "contents") {
+        // Workaround a case where elementsFromPoint misses the inner-most element with display:contents.
+        // https://bugs.chromium.org/p/chromium/issues/detail?id=1342092
+        elements.unshift(singleElement);
+      }
+    }
+    if (
+      elements[0] &&
+      elements[0].shadowRoot === root &&
+      elements[1] === singleElement
+    ) {
+      // Workaround webkit but where first two elements are swapped:
+      // <host>
+      //   #shadow root
+      //     <target>
+      // elementsFromPoint produces [<host>, <target>], while it should be [<target>, <host>]
+      // In this case, just ignore <host>.
+      elements.shift();
+    }
+    const innerElement = elements[0];
+    if (!innerElement) break;
+    hitElement = innerElement;
+    if (index && innerElement !== roots[index - 1].host) break;
+  }
+
+  // Check whether hit target is the target or its descendant.
+  const hitParents = [];
+  while (hitElement && hitElement !== targetElement) {
+    hitParents.push(hitElement);
+    hitElement = parentElementOrShadowHost(hitElement);
+  }
+  if (hitElement === targetElement) return null;
+
+  return hitParents[0] || document.documentElement;
+}
+
+function isParent(parent, child) {
+  return parent.contains(child);
+}
+
+function isSibling(el1, el2) {
+  return el1.parentElement === el2.parentElement;
+}
+
+function getBlockElementUniqueID(element) {
+  const rect = element.getBoundingClientRect();
+
+  const hitElement = expectHitTarget(
+    {
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+    },
+    element,
+  );
+
+  if (!hitElement) {
+    return "";
+  }
+
+  return hitElement.getAttribute("unique_id") ?? "";
 }
 
 function isHidden(element) {

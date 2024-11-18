@@ -27,7 +27,7 @@ import { AppNode } from "..";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
-import { TaskNodeParametersPanel } from "./TaskNodeParametersPanel";
+import { ParametersMultiSelect } from "./ParametersMultiSelect";
 import {
   dataSchemaExampleValue,
   errorMappingExampleValue,
@@ -152,7 +152,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                   />
                 </div>
                 <div className="space-y-2">
-                  <TaskNodeParametersPanel
+                  <ParametersMultiSelect
                     availableOutputParameters={outputParameterKeys}
                     parameters={data.parameterKeys}
                     onParametersChange={(parameterKeys) => {
