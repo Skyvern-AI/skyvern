@@ -2,7 +2,6 @@ import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import {
   Cross2Icon,
   CursorTextIcon,
-  DownloadIcon,
   EnvelopeClosedIcon,
   FileIcon,
   ListBulletIcon,
@@ -56,12 +55,13 @@ const nodeLibraryItems: Array<{
     title: "File Parser Block",
     description: "Downloads and parses a file",
   },
-  {
-    nodeType: "download",
-    icon: <DownloadIcon className="h-6 w-6" />,
-    title: "Download Block",
-    description: "Downloads a file from S3",
-  },
+  // disabled
+  // {
+  //   nodeType: "download",
+  //   icon: <DownloadIcon className="h-6 w-6" />,
+  //   title: "Download Block",
+  //   description: "Downloads a file from S3",
+  // },
   {
     nodeType: "upload",
     icon: <UploadIcon className="h-6 w-6" />,
