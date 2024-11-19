@@ -202,6 +202,10 @@ class BrowserManager:
         LOG.info("BrowserManger is closed")
 
     async def cleanup_for_task(self, task_id: str, close_browser_on_completion: bool = True) -> BrowserState | None:
+        """
+        Developer notes: handle errors here. Do not raise error from this function.
+        If error occurs, log it and address the cleanup error.
+        """
         LOG.info("Cleaning up for task")
         browser_state_to_close = self.pages.pop(task_id, None)
         if browser_state_to_close:

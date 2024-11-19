@@ -514,20 +514,29 @@ class BrowserState:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
                 if self.browser_context and close_browser_on_completion:
                     LOG.info("Closing browser context and its pages")
-                    await self.browser_context.close()
+                    try:
+                        await self.browser_context.close()
+                    except Exception:
+                        LOG.warning("Failed to close browser context", exc_info=True)
                     LOG.info("Main browser context and all its pages are closed")
                     if self.browser_cleanup is not None:
-                        self.browser_cleanup()
-                        LOG.info("Main browser cleanup is excuted")
+                        try:
+                            self.browser_cleanup()
+                            LOG.info("Main browser cleanup is excuted")
+                        except Exception:
+                            LOG.warning("Failed to execute browser cleanup", exc_info=True)
         except asyncio.TimeoutError:
             LOG.error("Timeout to close browser context, going to stop playwright directly")
 
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
                 if self.pw and close_browser_on_completion:
-                    LOG.info("Stopping playwright")
-                    await self.pw.stop()
-                    LOG.info("Playwright is stopped")
+                    try:
+                        LOG.info("Stopping playwright")
+                        await self.pw.stop()
+                        LOG.info("Playwright is stopped")
+                    except Exception:
+                        LOG.warning("Failed to stop playwright", exc_info=True)
         except asyncio.TimeoutError:
             LOG.error("Timeout to close playwright, might leave the broswer opening forever")
 

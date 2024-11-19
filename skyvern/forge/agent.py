@@ -1542,6 +1542,11 @@ class ForgeAgent:
     async def cleanup_browser_and_create_artifacts(
         self, close_browser_on_completion: bool, last_step: Step, task: Task
     ) -> None:
+        """
+        Developer notes: we should not expect any exception to be raised here.
+        This function should handle exceptions gracefully.
+        If errors are raised and not caught inside this function, please catch and handle them.
+        """
         # We need to close the browser even if there is no webhook callback url or api key
         browser_state = await app.BROWSER_MANAGER.cleanup_for_task(task.task_id, close_browser_on_completion)
         if browser_state:
