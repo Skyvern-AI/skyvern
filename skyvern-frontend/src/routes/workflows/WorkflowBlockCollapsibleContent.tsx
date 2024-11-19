@@ -34,14 +34,22 @@ function WorkflowBlockCollapsibleContent({ task, onNavigate }: Props) {
     />
   ) : null;
 
+  const isCanceled = task?.status === Status.Canceled;
+
   const showFailureReason =
     task?.status === Status.Failed ||
     task?.status === Status.Terminated ||
-    task?.status === Status.TimedOut;
+    task?.status === Status.TimedOut ||
+    task?.status === Status.Canceled;
+
   const failureReason = showFailureReason ? (
     <CodeEditor
       language="json"
-      value={JSON.stringify(task.failure_reason, null, 2)}
+      value={JSON.stringify(
+        task.failure_reason ?? (isCanceled && "This task was canceled."),
+        null,
+        2,
+      )}
       readOnly
       minHeight={"96px"}
       maxHeight={"500px"}
@@ -59,7 +67,7 @@ function WorkflowBlockCollapsibleContent({ task, onNavigate }: Props) {
         >
           <TableCell>
             <CollapsibleTrigger asChild>
-              <div className="w-fit cursor-pointer rounded-full p-2 hover:bg-muted">
+              <div className="w-10 cursor-pointer rounded-full p-2 hover:bg-muted">
                 {open ? (
                   <ChevronDownIcon className="size-6" />
                 ) : (
@@ -68,11 +76,15 @@ function WorkflowBlockCollapsibleContent({ task, onNavigate }: Props) {
               </div>
             </CollapsibleTrigger>
           </TableCell>
-          <TableCell className="w-1/4 cursor-pointer">
+          <TableCell
+            className="w-1/5 max-w-0 cursor-pointer truncate"
+            title={task.request.title ?? undefined}
+          >
             {task.request.title}
           </TableCell>
           <TableCell
-            className="w-1/4 cursor-pointer"
+            className="w-1/6 max-w-0 cursor-pointer truncate"
+            title={task.task_id}
             onClick={(event) => {
               onNavigate(event, task.task_id);
             }}
@@ -80,19 +92,20 @@ function WorkflowBlockCollapsibleContent({ task, onNavigate }: Props) {
             {task.task_id}
           </TableCell>
           <TableCell
-            className="w-1/4 max-w-64 cursor-pointer overflow-hidden overflow-ellipsis whitespace-nowrap"
+            className="w-1/4 max-w-0 cursor-pointer truncate"
+            title={task.request.url}
             onClick={(event) => onNavigate(event, task.task_id)}
           >
             {task.request.url}
           </TableCell>
           <TableCell
-            className="w-1/6 cursor-pointer"
+            className="w-1/8 cursor-pointer"
             onClick={(event) => onNavigate(event, task.task_id)}
           >
             <StatusBadge status={task.status} />
           </TableCell>
           <TableCell
-            className="w-1/4 cursor-pointer whitespace-nowrap"
+            className="w-1/5 max-w-0 cursor-pointer truncate"
             onClick={(event) => onNavigate(event, task.task_id)}
             title={basicTimeFormat(task.created_at)}
           >
