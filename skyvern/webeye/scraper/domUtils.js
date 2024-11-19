@@ -672,7 +672,8 @@ function isInteractable(element) {
     tagName === "span" ||
     tagName === "a" ||
     tagName === "i" ||
-    tagName === "li"
+    tagName === "li" ||
+    tagName === "p"
   ) {
     const computedStyle = window.getComputedStyle(element);
     if (computedStyle.cursor === "pointer") {
