@@ -68,7 +68,6 @@ import {
   useParams,
   useSearchParams,
 } from "react-router-dom";
-import { TaskListSkeletonRows } from "../tasks/list/TaskListSkeletonRows";
 import {
   statusIsFinalized,
   statusIsNotFinalized,
@@ -354,6 +353,29 @@ function WorkflowRun() {
     </div>
   ) : null;
 
+  const skeleton = (
+    <TableRow>
+      <TableCell className="w-10">
+        <Skeleton className="h-6 w-full" />
+      </TableCell>
+      <TableCell className="w-1/5">
+        <Skeleton className="h-6 w-full" />
+      </TableCell>
+      <TableCell className="w-1/6">
+        <Skeleton className="h-6 w-full" />
+      </TableCell>
+      <TableCell className="w-1/4">
+        <Skeleton className="h-6 w-full" />
+      </TableCell>
+      <TableCell className="w-1/8">
+        <Skeleton className="h-6 w-full" />
+      </TableCell>
+      <TableCell className="w-1/5">
+        <Skeleton className="h-6 w-full" />
+      </TableCell>
+    </TableRow>
+  );
+
   return (
     <div className="space-y-8">
       <header className="flex justify-between">
@@ -522,21 +544,21 @@ function WorkflowRun() {
           <Table>
             <TableHeader className="rounded-t-md bg-slate-elevation2">
               <TableRow>
-                <TableHead className="rounded-tl-md"></TableHead>
-                <TableHead className="w-1/4 text-slate-400">
+                <TableHead className="w-10 rounded-tl-md"></TableHead>
+                <TableHead className="w-1/5 text-slate-400">
                   Task Title
                 </TableHead>
-                <TableHead className="w-1/4 text-slate-400">ID</TableHead>
+                <TableHead className="w-1/6 text-slate-400">ID</TableHead>
                 <TableHead className="w-1/4 text-slate-400">URL</TableHead>
-                <TableHead className="w-1/6 text-slate-400">Status</TableHead>
-                <TableHead className="w-1/4 rounded-tr-md text-slate-400">
+                <TableHead className="w-1/8 text-slate-400">Status</TableHead>
+                <TableHead className="w-1/5 rounded-tr-md text-slate-400">
                   Created At
                 </TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {workflowTasksIsLoading ? (
-                <TaskListSkeletonRows />
+                skeleton
               ) : workflowTasks?.length === 0 ? (
                 <TableRow>
                   <TableCell colSpan={6}>Could not find any tasks</TableCell>
