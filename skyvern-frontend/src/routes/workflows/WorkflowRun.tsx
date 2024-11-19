@@ -8,6 +8,16 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -33,8 +43,6 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { copyText } from "@/util/copyText";
 import { apiBaseUrl, envCredential } from "@/util/env";
 import {
-  basicLocalTimeFormat,
-  basicTimeFormat,
   localTimeFormatWithShortDate,
   timeFormatWithShortDate,
 } from "@/util/timeFormat";
@@ -60,25 +68,15 @@ import {
   useParams,
   useSearchParams,
 } from "react-router-dom";
-import { TaskActions } from "../tasks/list/TaskActions";
 import { TaskListSkeletonRows } from "../tasks/list/TaskListSkeletonRows";
 import {
   statusIsFinalized,
   statusIsNotFinalized,
   statusIsRunningOrQueued,
 } from "../tasks/types";
+import { WorkflowBlockCollapsibleContent } from "./WorkflowBlockCollapsibleContent";
 import { CodeEditor } from "./components/CodeEditor";
 import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
-import {
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
 
 type StreamMessage = {
   task_id: string;
@@ -198,6 +196,8 @@ function WorkflowRun() {
     workflowRun && statusIsRunningOrQueued(workflowRun);
 
   const workflowRunIsFinalized = workflowRun && statusIsFinalized(workflowRun);
+
+  const showStream = workflowRun && statusIsNotFinalized(workflowRun);
 
   useEffect(() => {
     if (!workflowRunIsRunningOrQueued) {
@@ -336,25 +336,37 @@ function WorkflowRun() {
 
   const parameters = workflowRun?.parameters ?? {};
 
+  const title = workflowIsLoading ? (
+    <Skeleton className="h-9 w-48" />
+  ) : (
+    <h1 className="text-3xl">{workflow?.title}</h1>
+  );
+
+  const workflowFailureReason = workflowRun?.failure_reason ? (
+    <div
+      className="space-y-2 rounded-md border border-red-600 p-4"
+      style={{
+        backgroundColor: "rgba(220, 38, 38, 0.10)",
+      }}
+    >
+      <div className="font-bold">Workflow Failure Reason</div>
+      <div className="text-sm">{workflowRun.failure_reason}</div>
+    </div>
+  ) : null;
+
   return (
     <div className="space-y-8">
       <header className="flex justify-between">
         <div className="space-y-3">
           <div className="flex items-center gap-5">
-            <h1 className="text-3xl">{workflowRunId}</h1>
+            {title}
             {workflowRunIsLoading ? (
               <Skeleton className="h-8 w-28" />
             ) : workflowRun ? (
               <StatusBadge status={workflowRun?.status} />
             ) : null}
           </div>
-          <h2 className="text-2xl text-slate-400">
-            {workflowIsLoading ? (
-              <Skeleton className="h-8 w-48" />
-            ) : (
-              workflow?.title
-            )}
-          </h2>
+          <h2 className="text-2xl text-slate-400">{workflowRunId}</h2>
         </div>
 
         <div className="flex gap-2">
@@ -442,7 +454,8 @@ function WorkflowRun() {
           )}
         </div>
       </header>
-      {workflowRun && statusIsNotFinalized(workflowRun) && (
+      {workflowFailureReason}
+      {showStream && (
         <div className="flex gap-5">
           <div className="w-3/4 shrink-0">
             <AspectRatio ratio={16 / 9}>{getStream()}</AspectRatio>
@@ -507,17 +520,18 @@ function WorkflowRun() {
         </header>
         <div className="rounded-md border">
           <Table>
-            <TableHeader className="rounded-t-md bg-slate-elevation1">
+            <TableHeader className="rounded-t-md bg-slate-elevation2">
               <TableRow>
-                <TableHead className="w-1/4 rounded-tl-md text-slate-400">
-                  ID
+                <TableHead className="rounded-tl-md"></TableHead>
+                <TableHead className="w-1/4 text-slate-400">
+                  Task Title
                 </TableHead>
+                <TableHead className="w-1/4 text-slate-400">ID</TableHead>
                 <TableHead className="w-1/4 text-slate-400">URL</TableHead>
                 <TableHead className="w-1/6 text-slate-400">Status</TableHead>
-                <TableHead className="w-1/4 text-slate-400">
+                <TableHead className="w-1/4 rounded-tr-md text-slate-400">
                   Created At
                 </TableHead>
-                <TableHead className="w-1/12 rounded-tr-md" />
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -525,7 +539,7 @@ function WorkflowRun() {
                 <TaskListSkeletonRows />
               ) : workflowTasks?.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={5}>No tasks</TableCell>
+                  <TableCell colSpan={6}>Could not find any tasks</TableCell>
                 </TableRow>
               ) : (
                 workflowTasks
@@ -534,44 +548,11 @@ function WorkflowRun() {
                   )
                   .map((task) => {
                     return (
-                      <TableRow key={task.task_id}>
-                        <TableCell
-                          className="w-1/4 cursor-pointer"
-                          onClick={(event) =>
-                            handleNavigate(event, task.task_id)
-                          }
-                        >
-                          {task.task_id}
-                        </TableCell>
-                        <TableCell
-                          className="w-1/4 max-w-64 cursor-pointer overflow-hidden overflow-ellipsis whitespace-nowrap"
-                          onClick={(event) =>
-                            handleNavigate(event, task.task_id)
-                          }
-                        >
-                          {task.request.url}
-                        </TableCell>
-                        <TableCell
-                          className="w-1/6 cursor-pointer"
-                          onClick={(event) =>
-                            handleNavigate(event, task.task_id)
-                          }
-                        >
-                          <StatusBadge status={task.status} />
-                        </TableCell>
-                        <TableCell
-                          className="w-1/4 cursor-pointer"
-                          onClick={(event) =>
-                            handleNavigate(event, task.task_id)
-                          }
-                          title={basicTimeFormat(task.created_at)}
-                        >
-                          {basicLocalTimeFormat(task.created_at)}
-                        </TableCell>
-                        <TableCell className="w-1/12">
-                          <TaskActions task={task} />
-                        </TableCell>
-                      </TableRow>
+                      <WorkflowBlockCollapsibleContent
+                        key={task.task_id}
+                        task={task}
+                        onNavigate={handleNavigate}
+                      />
                     );
                   })
               )}
@@ -620,8 +601,10 @@ function WorkflowRun() {
             return (
               <div key={key} className="flex flex-col gap-2">
                 <Label>{key}</Label>
-                {typeof value === "string" ? (
-                  <Input value={value} readOnly />
+                {typeof value === "string" ||
+                typeof value === "number" ||
+                typeof value === "boolean" ? (
+                  <Input value={String(value)} readOnly />
                 ) : (
                   <CodeEditor
                     value={JSON.stringify(value, null, 2)}

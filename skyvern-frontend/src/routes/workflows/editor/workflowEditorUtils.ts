@@ -555,6 +555,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         ...base,
         block_type: "task",
         url: node.data.url,
+        title: node.data.label,
         navigation_goal: node.data.navigationGoal,
         data_extraction_goal: node.data.dataExtractionGoal,
         data_schema: JSONParseSafe(node.data.dataSchema),
