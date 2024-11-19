@@ -1414,7 +1414,13 @@ class ForgeAgent:
             return
 
         await self.async_operation_pool.remove_task(task.task_id)
-        await self.cleanup_browser_and_create_artifacts(close_browser_on_completion, last_step, task)
+        try:
+            await self.cleanup_browser_and_create_artifacts(close_browser_on_completion, last_step, task)
+        except TargetClosedError:
+            LOG.warning(
+                "Failed to close the browser. Browser might have been closed",
+                task_id=task.task_id,
+            )
 
         # Wait for all tasks to complete before generating the links for the artifacts
         await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks_for_task(task.task_id)
