@@ -277,6 +277,7 @@ export type WorkflowRunStatusApiResponse = {
   screenshot_urls: Array<string> | null;
   recording_url: string | null;
   outputs: Record<string, unknown> | null;
+  failure_reason: string | null;
 };
 
 export type TaskGenerationApiResponse = {
