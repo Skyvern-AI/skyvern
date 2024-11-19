@@ -1700,11 +1700,11 @@ class ForgeAgent:
         step: Step,
         page: Page | None,
     ) -> str:
+        steps_results = []
         try:
             steps = await app.DATABASE.get_task_steps(
                 task_id=task.task_id, organization_id=organization.organization_id
             )
-            steps_results = []
             for step_cnt, step in enumerate(steps):
                 if step.output is None:
                     continue
@@ -1741,9 +1741,11 @@ class ForgeAgent:
             )
             json_response = await app.LLM_API_HANDLER(prompt=prompt, screenshots=screenshots, step=step)
             return json_response.get("reasoning", "")
-
         except Exception:
-            LOG.exception("Failed to summary the failure reason", task=task.task_id)
+            LOG.warning("Failed to summary the failure reason", task_id=task.task_id, step_id=step.step_id)
+            if steps_results:
+                last_step_result = steps_results[-1]
+                return f"Step {last_step_result['order']}: {last_step_result['actions_result']}"
             return ""
 
     async def handle_completed_step(
