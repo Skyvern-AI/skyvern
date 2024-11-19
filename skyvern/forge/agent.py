@@ -1414,13 +1414,7 @@ class ForgeAgent:
             return
 
         await self.async_operation_pool.remove_task(task.task_id)
-        try:
-            await self.cleanup_browser_and_create_artifacts(close_browser_on_completion, last_step, task)
-        except TargetClosedError:
-            LOG.warning(
-                "Failed to close the browser. Browser might have been closed",
-                task_id=task.task_id,
-            )
+        await self.cleanup_browser_and_create_artifacts(close_browser_on_completion, last_step, task)
 
         # Wait for all tasks to complete before generating the links for the artifacts
         await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks_for_task(task.task_id)
@@ -1548,6 +1542,11 @@ class ForgeAgent:
     async def cleanup_browser_and_create_artifacts(
         self, close_browser_on_completion: bool, last_step: Step, task: Task
     ) -> None:
+        """
+        Developer notes: we should not expect any exception to be raised here.
+        This function should handle exceptions gracefully.
+        If errors are raised and not caught inside this function, please catch and handle them.
+        """
         # We need to close the browser even if there is no webhook callback url or api key
         browser_state = await app.BROWSER_MANAGER.cleanup_for_task(task.task_id, close_browser_on_completion)
         if browser_state:
