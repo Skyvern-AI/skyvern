@@ -796,6 +796,17 @@ class ForgeAgent:
                         action=action,
                         action_result=results,
                     )
+                elif results and isinstance(action, DecisiveAction):
+                    LOG.warning(
+                        "DecisiveAction failed, but not stopping execution",
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        step_order=step.order,
+                        step_retry=step.retry_index,
+                        action_idx=action_idx,
+                        action=action,
+                        action_result=results,
+                    )
                 elif results and not results[-1].success and not results[-1].stop_execution_on_failure:
                     LOG.warning(
                         "Action failed, but not stopping execution",
