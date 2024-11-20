@@ -551,34 +551,35 @@ async def handle_input_text_action(
         if len(text) == 0:
             return [ActionSuccess()]
 
-        # parse the input context to help executing input action
-        prompt = prompt_engine.load_prompt(
-            "parse-input-or-select-context",
-            element_id=action.element_id,
-            action_reasoning=action.reasoning,
-            elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
-        )
+        if not await skyvern_element.is_raw_input():
+            # parse the input context to help executing input action
+            prompt = prompt_engine.load_prompt(
+                "parse-input-or-select-context",
+                element_id=action.element_id,
+                action_reasoning=action.reasoning,
+                elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
+            )
 
-        json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
-        input_or_select_context = InputOrSelectContext.model_validate(json_response)
-        LOG.info(
-            "Parsed input/select context",
-            context=input_or_select_context,
-            task_id=task.task_id,
-            step_id=step.step_id,
-        )
+            json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+            input_or_select_context = InputOrSelectContext.model_validate(json_response)
+            LOG.info(
+                "Parsed input/select context",
+                context=input_or_select_context,
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
 
-        if await skyvern_element.is_auto_completion_input() or input_or_select_context.is_location_input:
-            if result := await input_or_auto_complete_input(
-                input_or_select_context=input_or_select_context,
-                page=page,
-                dom=dom,
-                text=text,
-                skyvern_element=skyvern_element,
-                step=step,
-                task=task,
-            ):
-                return [result]
+            if await skyvern_element.is_auto_completion_input() or input_or_select_context.is_location_input:
+                if result := await input_or_auto_complete_input(
+                    input_or_select_context=input_or_select_context,
+                    page=page,
+                    dom=dom,
+                    text=text,
+                    skyvern_element=skyvern_element,
+                    step=step,
+                    task=task,
+                ):
+                    return [result]
 
         await incremental_scraped.start_listen_dom_increment()
 
