@@ -74,12 +74,22 @@ from skyvern.webeye.actions.models import AgentStepOutput
 
 LOG = structlog.get_logger()
 
+DB_CONNECT_ARGS: dict[str, Any] = {
+    "options": f"-c statement_timeout={settings.DATABASE_STATEMENT_TIMEOUT_MS}",
+}
+if "postgresql+asyncpg" in settings.DATABASE_STRING:
+    DB_CONNECT_ARGS = {"server_settings": {"statement_timeout": str(settings.DATABASE_STATEMENT_TIMEOUT_MS)}}
+
 
 class AgentDB:
     def __init__(self, database_string: str, debug_enabled: bool = False) -> None:
         super().__init__()
         self.debug_enabled = debug_enabled
-        self.engine = create_async_engine(database_string, json_serializer=_custom_json_serializer, pool_pre_ping=True)
+        self.engine = create_async_engine(
+            database_string,
+            json_serializer=_custom_json_serializer,
+            connect_args=DB_CONNECT_ARGS,
+        )
         self.Session = async_sessionmaker(bind=self.engine)
 
     async def create_task(
