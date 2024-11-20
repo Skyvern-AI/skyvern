@@ -1,5 +1,4 @@
 import { getClient } from "@/api/AxiosClient";
-import { WorkflowApiResponse, WorkflowRunApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -42,6 +41,8 @@ import { ImportWorkflowButton } from "./ImportWorkflowButton";
 import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 import { WorkflowActions } from "./WorkflowActions";
 import { WorkflowTitle } from "./WorkflowTitle";
+import { WorkflowApiResponse } from "./types/workflowTypes";
+import { WorkflowRunApiResponse } from "@/api/types";
 
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
@@ -285,7 +286,7 @@ function Workflows() {
                             <TooltipContent>Create New Run</TooltipContent>
                           </Tooltip>
                         </TooltipProvider>
-                        <WorkflowActions id={workflow.workflow_permanent_id} />
+                        <WorkflowActions workflow={workflow} />
                       </div>
                     </TableCell>
                   </TableRow>
