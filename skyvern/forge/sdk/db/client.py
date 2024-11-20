@@ -74,10 +74,11 @@ from skyvern.webeye.actions.models import AgentStepOutput
 
 LOG = structlog.get_logger()
 
-DB_CONNECT_ARGS: dict[str, Any] = {
-    "options": f"-c statement_timeout={settings.DATABASE_STATEMENT_TIMEOUT_MS}",
-}
-if "postgresql+asyncpg" in settings.DATABASE_STRING:
+DB_CONNECT_ARGS: dict[str, Any] = {}
+
+if "postgresql+psycopg" in settings.DATABASE_STRING:
+    DB_CONNECT_ARGS = {"options": f"-c statement_timeout={settings.DATABASE_STATEMENT_TIMEOUT_MS}"}
+elif "postgresql+asyncpg" in settings.DATABASE_STRING:
     DB_CONNECT_ARGS = {"server_settings": {"statement_timeout": str(settings.DATABASE_STATEMENT_TIMEOUT_MS)}}
 
 
