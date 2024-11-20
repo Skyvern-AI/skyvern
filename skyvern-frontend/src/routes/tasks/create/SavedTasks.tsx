@@ -1,6 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
 import { queryClient } from "@/api/QueryClient";
-import { WorkflowApiResponse } from "@/api/types";
 import {
   Card,
   CardContent,
@@ -18,6 +17,10 @@ import { SavedTaskCard } from "./SavedTaskCard";
 import { useState } from "react";
 import { cn } from "@/util/utils";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  TaskBlock,
+  WorkflowApiResponse,
+} from "@/routes/workflows/types/workflowTypes";
 
 function createEmptyTaskTemplate() {
   return {
@@ -148,13 +151,18 @@ function SavedTasks() {
         </>
       )}
       {data?.map((workflow) => {
+        const firstBlock = workflow.workflow_definition.blocks[0];
+        if (!firstBlock || firstBlock.block_type !== "task") {
+          return null; // saved tasks have only one block and it's a task
+        }
+        const task = firstBlock as TaskBlock;
         return (
           <SavedTaskCard
             key={workflow.workflow_permanent_id}
             workflowId={workflow.workflow_permanent_id}
             title={workflow.title}
             description={workflow.description}
-            url={workflow.workflow_definition.blocks[0]?.url ?? ""}
+            url={task.url ?? ""}
           />
         );
       })}

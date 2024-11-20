@@ -6,8 +6,9 @@ import { getSampleForInitialFormValues } from "../data/sampleTaskData";
 import { SampleCase, sampleCases } from "../types";
 import { CreateNewTaskForm } from "./CreateNewTaskForm";
 import { SavedTaskForm } from "./SavedTaskForm";
-import { TaskGenerationApiResponse, WorkflowParameter } from "@/api/types";
+import { TaskGenerationApiResponse } from "@/api/types";
 import { Skeleton } from "@/components/ui/skeleton";
+import { WorkflowParameter } from "@/routes/workflows/types/workflowTypes";
 
 function CreateNewTaskFormPage() {
   const { template } = useParams();

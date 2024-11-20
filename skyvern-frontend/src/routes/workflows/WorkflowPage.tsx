@@ -1,5 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import { WorkflowApiResponse, WorkflowRunApiResponse } from "@/api/types";
+import { WorkflowRunApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Button } from "@/components/ui/button";
 import {
@@ -30,6 +30,7 @@ import {
   useParams,
   useSearchParams,
 } from "react-router-dom";
+import { WorkflowApiResponse } from "./types/workflowTypes";
 
 function WorkflowPage() {
   const credentialGetter = useCredentialGetter();

@@ -1,5 +1,4 @@
 import { getClient } from "@/api/AxiosClient";
-import { WorkflowApiResponse } from "@/api/types";
 import {
   Table,
   TableBody,
@@ -24,6 +23,7 @@ import {
 import { cn } from "@/util/utils";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { WorkflowApiResponse } from "../types/workflowTypes";
 
 function WorkflowsTable() {
   const [page, setPage] = useState(1);
