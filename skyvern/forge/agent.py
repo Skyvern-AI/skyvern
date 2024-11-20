@@ -798,7 +798,7 @@ class ForgeAgent:
                     )
                 elif results and isinstance(action, DecisiveAction):
                     LOG.warning(
-                        "DecisiveAction failed, but not stopping execution",
+                        "DecisiveAction failed, but not stopping execution and not retrying the step",
                         task_id=task.task_id,
                         step_id=step.step_id,
                         step_order=step.order,
