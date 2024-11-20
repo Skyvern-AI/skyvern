@@ -1,10 +1,10 @@
-import { WorkflowParameterValueType } from "@/api/types";
 import { FileInputValue, FileUpload } from "@/components/FileUpload";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { CodeEditor } from "./components/CodeEditor";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { Label } from "@/components/ui/label";
+import { WorkflowParameterValueType } from "./types/workflowTypes";
 
 type Props = {
   type: WorkflowParameterValueType;
