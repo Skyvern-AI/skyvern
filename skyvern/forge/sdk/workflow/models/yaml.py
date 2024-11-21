@@ -3,6 +3,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
 
+from skyvern.forge.sdk.db.enums import ActionType
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileType
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
@@ -208,6 +209,32 @@ class FileParserBlockYAML(BlockYAML):
     file_type: FileType
 
 
+class ValidationBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION  # type: ignore
+
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
+    error_code_mapping: dict[str, str] | None = None
+    parameter_keys: list[str] | None = None
+
+
+class ActionBlockYAML(BlockYAML):
+    action_type: ActionType
+    block_type: Literal[BlockType.ACTION] = BlockType.ACTION  # type: ignore
+
+    url: str | None = None
+    title: str = ""
+    navigation_goal: str | None = None
+    error_code_mapping: dict[str, str] | None = None
+    max_retries: int = 0
+    parameter_keys: list[str] | None = None
+    complete_on_download: bool = False
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool = False
+
+
 PARAMETER_YAML_SUBCLASSES = (
     AWSSecretParameterYAML
     | BitwardenLoginCredentialParameterYAML
@@ -228,6 +255,8 @@ BLOCK_YAML_SUBCLASSES = (
     | UploadToS3BlockYAML
     | SendEmailBlockYAML
     | FileParserBlockYAML
+    | ValidationBlockYAML
+    | ActionBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 

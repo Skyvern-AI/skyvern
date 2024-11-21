@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from skyvern.config import settings
 from skyvern.exceptions import WorkflowParameterNotFound
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskPromptTemplate
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import (
     ActionModel,
@@ -97,6 +97,8 @@ class AgentDB:
         self,
         url: str,
         title: str | None,
+        complete_criterion: str | None,
+        terminate_criterion: str | None,
         navigation_goal: str | None,
         data_extraction_goal: str | None,
         navigation_payload: dict[str, Any] | list | str | None,
@@ -111,17 +113,21 @@ class AgentDB:
         retry: int | None = None,
         max_steps_per_run: int | None = None,
         error_code_mapping: dict[str, str] | None = None,
+        prompt_template: str = TaskPromptTemplate.ExtractAction,
     ) -> Task:
         try:
             async with self.Session() as session:
                 new_task = TaskModel(
                     status="created",
+                    prompt_template=prompt_template,
                     url=url,
                     title=title,
                     webhook_callback_url=webhook_callback_url,
                     totp_verification_url=totp_verification_url,
                     totp_identifier=totp_identifier,
                     navigation_goal=navigation_goal,
+                    complete_criterion=complete_criterion,
+                    terminate_criterion=terminate_criterion,
                     data_extraction_goal=data_extraction_goal,
                     navigation_payload=navigation_payload,
                     organization_id=organization_id,

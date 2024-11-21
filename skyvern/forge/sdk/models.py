@@ -104,6 +104,14 @@ class Step(BaseModel):
 
         return False
 
+    def is_success(self) -> bool:
+        if self.status != StepStatus.completed:
+            return False
+        # TODO (kerem): Remove this check once we have backfilled all the steps
+        if self.output is None or self.output.actions_and_results is None:
+            return False
+        return True
+
     def is_terminated(self) -> bool:
         if self.status != StepStatus.completed:
             return False

@@ -40,6 +40,7 @@ from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.db.enums import TaskPromptTemplate
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
@@ -69,6 +70,8 @@ class BlockType(StrEnum):
     UPLOAD_TO_S3 = "upload_to_s3"
     SEND_EMAIL = "send_email"
     FILE_URL_PARSER = "file_url_parser"
+    VALIDATION = "validation"
+    ACTION = "action"
 
 
 class BlockStatus(StrEnum):
@@ -174,11 +177,12 @@ class Block(BaseModel, abc.ABC):
         pass
 
 
-class TaskBlock(Block):
-    block_type: Literal[BlockType.TASK] = BlockType.TASK
-
+class BaseTaskBlock(Block):
+    prompt_template: str = TaskPromptTemplate.ExtractAction
     url: str | None = None
     title: str = ""
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
     navigation_goal: str | None = None
     data_extraction_goal: str | None = None
     data_schema: dict[str, Any] | list | None = None
@@ -462,6 +466,10 @@ class TaskBlock(Block):
             status=BlockStatus.failed,
             failure_reason=current_running_task.failure_reason if current_running_task else None,
         )
+
+
+class TaskBlock(BaseTaskBlock):
+    block_type: Literal[BlockType.TASK] = BlockType.TASK
 
 
 class ForLoopBlock(Block):
@@ -1264,6 +1272,36 @@ class FileParserBlock(Block):
         )
 
 
+class ValidationBlock(BaseTaskBlock):
+    block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION
+
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,
+    ) -> list[PARAMETER_TYPE]:
+        return self.parameters
+
+    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+        task_order, _ = await self.get_task_order(workflow_run_id, 0)
+        is_first_task = task_order == 0
+        if is_first_task:
+            return self.build_block_result(
+                success=False,
+                failure_reason="Validation block should not be the first block",
+                output_parameter_value=None,
+                status=BlockStatus.terminated,
+            )
+
+        return await super().execute(workflow_run_id=workflow_run_id, kwargs=kwargs)
+
+
+class ActionBlock(BaseTaskBlock):
+    block_type: Literal[BlockType.ACTION] = BlockType.ACTION
+
+    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+        return await super().execute(workflow_run_id=workflow_run_id, kwargs=kwargs)
+
+
 BlockSubclasses = Union[
     ForLoopBlock,
     TaskBlock,
@@ -1273,5 +1311,7 @@ BlockSubclasses = Union[
     UploadToS3Block,
     SendEmailBlock,
     FileParserBlock,
+    ValidationBlock,
+    ActionBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
