@@ -1381,7 +1381,7 @@ class WorkflowService:
                 )
 
             action_type: str = json_response.get("action_type") or ""
-            action_type = action_type.lower()
+            action_type = ActionType[action_type.upper()]
 
             prompt_template = ""
             if action_type == ActionType.CLICK:
