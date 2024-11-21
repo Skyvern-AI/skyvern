@@ -1,23 +1,3 @@
-<!-- START doctoc generated TOC please keep comment here to allow auto update -->
-<!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
-**Table of Contents**  *generated with [DocToc](https://github.com/thlorenz/doctoc)*
-
-- [title: 'Workato'](#title-workato)
-- [Running a Skyvern Task in Workato](#running-a-skyvern-task-in-workato)
-  - [Setup](#setup)
-  - [Configure](#configure)
-  - [Test](#test)
-- [Running a Skyvern Workflow in Workato](#running-a-skyvern-workflow-in-workato)
-  - [Setup](#setup-1)
-  - [Configure](#configure-1)
-  - [Test](#test-1)
-- [Adding a Previously Ran Task or Workflow in Workato](#adding-a-previously-ran-task-or-workflow-in-workato)
-  - [Setup](#setup-2)
-  - [Configure](#configure-2)
-  - [Test](#test-2)
-
-<!-- END doctoc generated TOC please keep comment here to allow auto update -->
-
 ---
 title: 'Workato'
 ---
@@ -26,11 +6,32 @@ title: 'Workato'
 
 ### Setup
 
-1. After setting the trigger, add an “action in app” and search for Skyvern
-2. Once you select the Skyvern integration, pick your action. This section will describe how to set up, configure, and test the “Create and Run Task” action
-3. You will then be brought to the “Connection” tab where you need to link your Skyvern account. You will need to have a Skyvern account to be able to run this integration. So after creating your account and/or logging in, navigate to settings and copy your API Key
-4. When you’re back to Workato, having copied your Skyvern API key, add a new connection and paste it under the API key input field
-5. Once you’ve connected your account, all of the setup requirements are done and you will move onto setting up your integration
+1. Navigate to the community library tab, and search for Skyvern under “custom connectors”
+2. Once you find Skyvern and click into the app, you will be able to press “install” in the upper right hand corner
+3. Make sure to select “release latest version” to be able to add your Skyvern integrator into your workflows
+4. You will then need to create a new workflow or “recipe” 
+    1. If you are a returning user, you will configure setup, location, and starting point
+    2. If you are a new user, you will configure recipe and project name, location, project description, and starting point
+5. Once you’ve created your new workflow, set the trigger, add an “action in app” and search for Skyvern
+    1. If Skyvern is not showing up in this search, it is likely that there was a misstep in tasks 1-3
+6. Once you select the Skyvern integration, pick your action. This section will describe how to set up, configure, and test the “Create and Run Task” action
+7. You will then be brought to the “Connection” tab where you need to link your Skyvern account. You will need to have a Skyvern account to be able to run to this integration. So after creating your account and/or logging in, navigate to settings and copy your API Key
+8. When you’re back to Workato, having copied your Skyvern API key, add a new connection and paste it under the API key input field
+9. Once you’ve connected your account, all of the setup requirements are done and you will move onto setting up your integration
+
+<img src="/images/workato/s1img1.png"/>
+
+<img src="/images/workato/s1img2.png"/>
+
+<img src="/images/workato/s1img3.png"/>
+
+<img src="/images/workato/s1img4.png"/>
+
+<img src="/images/workato/s1img5.png"/>
+
+<img src="/images/workato/s1img6.png"/>
+
+<img src="/images/workato/s1img7.png"/>
 
 ### Configure
 
@@ -47,17 +48,29 @@ title: 'Workato'
 6. *(optional) Webhook Callback URL:* This URL can be specified if you would like Skyvern to notify you when it’s finished executing
 7. *(optional) Max Steps:* some users want to cap cost through the number of steps the task can take
 
+<img src="/images/workato/s2img1.png"/>
+
+<img src="/images/workato/s2img2.png"/>
+
+<img src="/images/workato/s2img3.png"/>
+
+<img src="/images/workato/s2img4.png"/>
+
 ### Test
 
 1. Testing in Workato is done by testing the entire “recipe,” or workflow. Make sure to hit the “save” button in the upper right hand corner and then “test recipe”
 2. Once the flow is triggered, Workato will tell you what nodes in the sequence ran successfully, failed, and why. Make sure to click through each node to see what the inputs were and their corresponding outputs. Note that you should also check your Skyvern account to see if the task was correctly triggered and the contents are correct under “parameters”
+
+<img src="/images/workato/s3img1.png"/>
+
+<img src="/images/workato/s3img2.png"/>
 
 ## Running a Skyvern Workflow in Workato
 
 ### Setup
 
 1. First, create your workflow in Skyvern. The purpose of this block is to run a pre-configured workflow inside of Workato. Every workflow tool has limitations, allowing you to run a Skyvern workflow in another workflow builder extends the possibilities of their tool
-2. Complete the same setup as detailed above in the task block instructions, following steps 1-5. At the end of the setup you will have configured a trigger, selected the “Run a Workflow” action, and connected your Skyvern account
+2. Complete the same setup as detailed above in the task block instructions, following steps 1-9. At the end of the setup you will have configured a trigger, selected the “Run a Workflow” action, and connected your Skyvern account
 
 ### Configure
 
@@ -66,6 +79,12 @@ title: 'Workato'
 2. Once you’ve selected the workflow you’d like to run, the only thing you need to configure are whatever parameters you have linked in your workflow. 
     1. If you don’t have parameters, and instead have fixed values, don’t worry about this step!
 3. If your workflow has parameters, they should populate. Add or amend the values to customize the workflow run
+
+<img src="/images/workato/s5img1.png"/>
+
+<img src="/images/workato/s5img2.png"/>
+
+<img src="/images/workato/s5img3.png"/>
 
 ### Test
 
@@ -76,7 +95,7 @@ title: 'Workato'
 ### Setup
 
 1. This block “gets,” or pulls the output of a previous run into your Workato workflow. The Get a Workflow does so for a workflow run, the Get a Task does so for a task run. 
-2. Complete the same setup as detailed above in the the task block instructions, following steps 1-5. At the end of the setup you will have configured a trigger, selected the “Get a Task” or “Get a Workflow” action, and connected your Skyvern account
+2. Complete the same setup as detailed above in the the task block instructions, following steps 1-9. At the end of the setup you will have configured a trigger, selected the “Get a Task” or “Get a Workflow” action, and connected your Skyvern account
 
 ### Configure
 
@@ -84,6 +103,10 @@ title: 'Workato'
 2. Depending on whether you selected a “Get a Task” or “Get a Workflow” action, find the appropriate ID
     1. The Workflow Run ID starts with a WR and the Task ID starts with a TSK
 3. Once you’ve selected the Workflow Run ID or Task ID for the run you would like to add to your action, paste it into the input field
+
+<img src="/images/workato/s8img1.png"/>
+
+<img src="/images/workato/s8img2.png"/>
 
 ### Test
 
