@@ -14,7 +14,6 @@ from skyvern.exceptions import (
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
-from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
@@ -24,7 +23,6 @@ from skyvern.forge.sdk.models import Organization, Step
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
-    FailedToParseActionInstruction,
     InvalidWorkflowDefinition,
     WorkflowDefinitionHasDuplicateParameterKeys,
     WorkflowDefinitionHasReservedParameterKeys,
@@ -66,7 +64,6 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatusResponse,
 )
 from skyvern.forge.sdk.workflow.models.yaml import BLOCK_YAML_TYPES, ForLoopBlockYAML, WorkflowCreateYAMLRequest
-from skyvern.webeye.actions.actions import ActionType
 from skyvern.webeye.browser_factory import BrowserState
 
 LOG = structlog.get_logger()
@@ -1372,34 +1369,7 @@ class WorkflowService:
             if not block_yaml.navigation_goal:
                 raise Exception("empty action instruction")
 
-            prompt = prompt_engine.load_prompt("infer-action-type", navigation_goal=block_yaml.navigation_goal)
-            # TODO: no step here, so LLM call won't be saved as an artifact
-            json_response = await app.LLM_API_HANDLER(prompt=prompt)
-            if json_response.get("error"):
-                raise FailedToParseActionInstruction(
-                    reason=json_response.get("thought"), error_type=json_response.get("error")
-                )
-
-            action_type: str = json_response.get("action_type") or ""
-            action_type = ActionType[action_type.upper()]
-
-            prompt_template = ""
-            if action_type == ActionType.CLICK:
-                prompt_template = TaskPromptTemplate.SingleClickAction
-            elif action_type == ActionType.INPUT_TEXT:
-                prompt_template = TaskPromptTemplate.SingleInputAction
-            elif action_type == ActionType.UPLOAD_FILE:
-                prompt_template = TaskPromptTemplate.SingleUploadAction
-            elif action_type == ActionType.SELECT_OPTION:
-                prompt_template = TaskPromptTemplate.SingleSelectAction
-
-            if not prompt_template:
-                raise Exception(
-                    f"Not supported action for action block. Currently we only support [click, input_text, upload_file, select_option], but got [{action_type}]"
-                )
-
             return ActionBlock(
-                prompt_template=prompt_template,
                 label=block_yaml.label,
                 url=block_yaml.url,
                 title=block_yaml.title,
