@@ -44,7 +44,7 @@ from skyvern.forge.sdk.models import Organization, Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskStatus
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock
+from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, ValidationBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.webeye.actions.actions import (
     Action,
@@ -632,7 +632,7 @@ class ForgeAgent:
             actions: list[Action]
 
             using_cached_action_plan = False
-            if not task.workflow_run_id and not task.navigation_goal:
+            if not task.navigation_goal and not isinstance(task_block, ValidationBlock):
                 actions = [
                     CompleteAction(
                         reasoning="Task has no navigation goal.",
