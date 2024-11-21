@@ -18,7 +18,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.db.enums import ActionType, TaskPromptTemplate
+from skyvern.forge.sdk.db.enums import TaskPromptTemplate
 from skyvern.forge.sdk.models import Organization, Step
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -64,6 +64,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatusResponse,
 )
 from skyvern.forge.sdk.workflow.models.yaml import BLOCK_YAML_TYPES, ForLoopBlockYAML, WorkflowCreateYAMLRequest
+from skyvern.webeye.actions.actions import ActionType
 from skyvern.webeye.browser_factory import BrowserState
 
 LOG = structlog.get_logger()
@@ -1366,13 +1367,13 @@ class WorkflowService:
                 else []
             )
             prompt_template = ""
-            if block_yaml.action_type == ActionType.Click:
+            if block_yaml.action_type == ActionType.CLICK:
                 prompt_template = TaskPromptTemplate.SingleClickAction
-            elif block_yaml.action_type == ActionType.InputText:
+            elif block_yaml.action_type == ActionType.INPUT_TEXT:
                 prompt_template = TaskPromptTemplate.SingleInputAction
-            elif block_yaml.action_type == ActionType.UploadFile:
+            elif block_yaml.action_type == ActionType.UPLOAD_FILE:
                 prompt_template = TaskPromptTemplate.SingleUploadAction
-            elif block_yaml.action_type == ActionType.SelectOption:
+            elif block_yaml.action_type == ActionType.SELECT_OPTION:
                 prompt_template = TaskPromptTemplate.SingleSelectAction
 
             if not prompt_template:
