@@ -18,6 +18,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.enums import ActionType, TaskPromptTemplate
 from skyvern.forge.sdk.models import Organization, Step
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -28,6 +29,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     WorkflowParameterMissingRequiredValue,
 )
 from skyvern.forge.sdk.workflow.models.block import (
+    ActionBlock,
     BlockStatus,
     BlockType,
     BlockTypeVar,
@@ -39,6 +41,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     TaskBlock,
     TextPromptBlock,
     UploadToS3Block,
+    ValidationBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -1333,4 +1336,65 @@ class WorkflowService:
                 file_type=block_yaml.file_type,
                 continue_on_failure=block_yaml.continue_on_failure,
             )
+        elif block_yaml.block_type == BlockType.VALIDATION:
+            validation_block_parameters = (
+                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                if block_yaml.parameter_keys
+                else []
+            )
+
+            if not block_yaml.complete_criterion and not block_yaml.terminate_criterion:
+                raise Exception("Both complete criterion and terminate criterion are empty")
+
+            return ValidationBlock(
+                label=block_yaml.label,
+                prompt_template=TaskPromptTemplate.DecisiveCriterionValidate,
+                parameters=validation_block_parameters,
+                output_parameter=output_parameter,
+                complete_criterion=block_yaml.complete_criterion,
+                terminate_criterion=block_yaml.terminate_criterion,
+                error_code_mapping=block_yaml.error_code_mapping,
+                continue_on_failure=block_yaml.continue_on_failure,
+                # only need one step for validation block
+                max_steps_per_run=1,
+            )
+
+        elif block_yaml.block_type == BlockType.ACTION:
+            action_block_parameters = (
+                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                if block_yaml.parameter_keys
+                else []
+            )
+            prompt_template = ""
+            if block_yaml.action_type == ActionType.Click:
+                prompt_template = TaskPromptTemplate.SingleClickAction
+            elif block_yaml.action_type == ActionType.InputText:
+                prompt_template = TaskPromptTemplate.SingleInputAction
+            elif block_yaml.action_type == ActionType.UploadFile:
+                prompt_template = TaskPromptTemplate.SingleUploadAction
+            elif block_yaml.action_type == ActionType.SelectOption:
+                prompt_template = TaskPromptTemplate.SingleSelectAction
+
+            if not prompt_template:
+                raise Exception("not supported action type for action block")
+
+            return ActionBlock(
+                prompt_template=prompt_template,
+                label=block_yaml.label,
+                url=block_yaml.url,
+                title=block_yaml.title,
+                parameters=action_block_parameters,
+                output_parameter=output_parameter,
+                navigation_goal=block_yaml.navigation_goal,
+                error_code_mapping=block_yaml.error_code_mapping,
+                max_retries=block_yaml.max_retries,
+                complete_on_download=block_yaml.complete_on_download,
+                download_suffix=block_yaml.download_suffix,
+                continue_on_failure=block_yaml.continue_on_failure,
+                totp_verification_url=block_yaml.totp_verification_url,
+                totp_identifier=block_yaml.totp_identifier,
+                cache_actions=block_yaml.cache_actions,
+                max_steps_per_run=1,
+            )
+
         raise ValueError(f"Invalid block type {block_yaml.block_type}")

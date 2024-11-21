@@ -39,11 +39,12 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.validators import validate_url
+from skyvern.forge.sdk.db.enums import TaskPromptTemplate
 from skyvern.forge.sdk.models import Organization, Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskStatus
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.models.block import TaskBlock
+from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.webeye.actions.actions import (
     Action,
@@ -98,7 +99,7 @@ class ForgeAgent:
 
     async def create_task_and_step_from_block(
         self,
-        task_block: TaskBlock,
+        task_block: BaseTaskBlock,
         workflow: Workflow,
         workflow_run: WorkflowRun,
         workflow_run_context: WorkflowRunContext,
@@ -132,6 +133,9 @@ class ForgeAgent:
         task_url = validate_url(task_url)
         task = await app.DATABASE.create_task(
             url=task_url,
+            prompt_template=task_block.prompt_template,
+            complete_criterion=task_block.complete_criterion,
+            terminate_criterion=task_block.terminate_criterion,
             title=task_block.title or task_block.label,
             webhook_callback_url=None,
             totp_verification_url=task_block.totp_verification_url,
@@ -195,6 +199,8 @@ class ForgeAgent:
             totp_verification_url=totp_verification_url,
             totp_identifier=task_request.totp_identifier,
             navigation_goal=task_request.navigation_goal,
+            complete_criterion=task_request.complete_criterion,
+            terminate_criterion=task_request.terminate_criterion,
             data_extraction_goal=task_request.data_extraction_goal,
             navigation_payload=task_request.navigation_payload,
             organization_id=organization_id,
@@ -222,7 +228,7 @@ class ForgeAgent:
         step: Step,
         api_key: str | None = None,
         close_browser_on_completion: bool = True,
-        task_block: TaskBlock | None = None,
+        task_block: BaseTaskBlock | None = None,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
         workflow_run: WorkflowRun | None = None
         if task.workflow_run_id:
@@ -362,7 +368,13 @@ class ForgeAgent:
                     is_task_completed,
                     maybe_last_step,
                     maybe_next_step,
-                ) = await self.handle_completed_step(organization, task, step, await browser_state.get_working_page())
+                ) = await self.handle_completed_step(
+                    organization=organization,
+                    task=task,
+                    step=step,
+                    page=await browser_state.get_working_page(),
+                    task_block=task_block,
+                )
                 if is_task_completed is not None and maybe_last_step:
                     last_step = maybe_last_step
                     await self.clean_up_task(
@@ -582,7 +594,7 @@ class ForgeAgent:
         step: Step,
         browser_state: BrowserState,
         organization: Organization | None = None,
-        task_block: TaskBlock | None = None,
+        task_block: BaseTaskBlock | None = None,
     ) -> tuple[Step, DetailedAgentStepOutput]:
         detailed_agent_step_output = DetailedAgentStepOutput(
             scraped_page=None,
@@ -620,7 +632,7 @@ class ForgeAgent:
             actions: list[Action]
 
             using_cached_action_plan = False
-            if not task.navigation_goal:
+            if not task.workflow_run_id and not task.navigation_goal:
                 actions = [
                     CompleteAction(
                         reasoning="Task has no navigation goal.",
@@ -870,7 +882,7 @@ class ForgeAgent:
                         break
 
             task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
-            if not has_decisive_action and not task_completes_on_download:
+            if not has_decisive_action and not task_completes_on_download and not isinstance(task_block, ActionBlock):
                 disable_user_goal_check = app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                     "DISABLE_USER_GOAL_CHECK",
                     task.task_id,
@@ -1225,8 +1237,10 @@ class ForgeAgent:
         final_navigation_payload = self._build_navigation_payload(
             task, expire_verification_code=expire_verification_code
         )
+
+        template = task.prompt_template if task.prompt_template else TaskPromptTemplate.ExtractAction
         return prompt_engine.load_prompt(
-            "extract-action",
+            template=template,
             navigation_goal=navigation_goal,
             navigation_payload_str=json.dumps(final_navigation_payload),
             starting_url=starting_url,
@@ -1237,6 +1251,8 @@ class ForgeAgent:
             error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
             utc_datetime=datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
             verification_code_check=verification_code_check,
+            complete_criterion=task.complete_criterion,
+            terminate_criterion=task.terminate_criterion,
         )
 
     def _build_navigation_payload(
@@ -1770,6 +1786,7 @@ class ForgeAgent:
         task: Task,
         step: Step,
         page: Page | None,
+        task_block: BaseTaskBlock | None = None,
     ) -> tuple[bool | None, Step | None, Step | None]:
         if step.is_goal_achieved():
             LOG.info(
@@ -1810,6 +1827,24 @@ class ForgeAgent:
             or organization.max_steps_per_run
             or SettingsManager.get_settings().MAX_STEPS_PER_RUN
         )
+
+        # HACK: action block only have one step to execute without complete action, so we consider the task is completed as long as the step is completed
+        if isinstance(task_block, ActionBlock) and step.is_success():
+            LOG.info(
+                "Step completed for the action block, marking task as completed",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                step_order=step.order,
+                step_retry=step.retry_index,
+                output=step.output,
+            )
+            last_step = await self.update_step(step, is_last=True)
+            await self.update_task(
+                task,
+                status=TaskStatus.completed,
+            )
+            return True, last_step, None
+
         if step.order + 1 >= max_steps_per_run:
             LOG.info(
                 "Step completed but max steps reached, marking task as failed",

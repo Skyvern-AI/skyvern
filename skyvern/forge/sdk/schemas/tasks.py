@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 from skyvern.exceptions import BlockedHost, InvalidTaskStatusTransition, TaskAlreadyCanceled
 from skyvern.forge.sdk.core.validators import is_blocked_host
+from skyvern.forge.sdk.db.enums import TaskPromptTemplate
 
 
 class ProxyLocation(StrEnum):
@@ -76,6 +77,19 @@ class TaskBase(BaseModel):
     extracted_information_schema: dict[str, Any] | list | str | None = Field(
         default=None,
         description="The requested schema of the extracted information.",
+    )
+    complete_criterion: str | None = Field(
+        default=None, description="Criterion to complete", examples=["Complete if 'hello world' shows up on the page"]
+    )
+    terminate_criterion: str | None = Field(
+        default=None,
+        description="Criterion to terminate",
+        examples=["Terminate if 'existing account' shows up on the page"],
+    )
+    prompt_template: str | None = Field(
+        default=TaskPromptTemplate.ExtractAction,
+        description="The prompt template used for task",
+        examples=[TaskPromptTemplate.ExtractAction, TaskPromptTemplate.DecisiveCriterionValidate],
     )
 
 
