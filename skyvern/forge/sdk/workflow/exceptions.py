@@ -107,3 +107,10 @@ class WorkflowParameterMissingRequiredValue(BaseWorkflowHTTPException):
             f"Missing required value for workflow parameter. Workflow parameter type: {workflow_parameter_type}. workflow_parameter_key: {workflow_parameter_key}. Required value: {required_value}",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
+
+
+class FailedToParseActionInstruction(SkyvernException):
+    def __init__(self, reason: str | None, error_type: str | None):
+        super().__init__(
+            f"Failed to parse the action instruction as '{reason}({error_type})'",
+        )
