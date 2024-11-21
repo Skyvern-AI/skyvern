@@ -3,10 +3,10 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
 
-from skyvern.forge.sdk.db.enums import ActionType
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileType
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
+from skyvern.webeye.actions.actions import ActionType
 
 
 class ParameterYAML(BaseModel, abc.ABC):

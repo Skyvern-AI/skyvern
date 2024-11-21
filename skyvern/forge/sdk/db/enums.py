@@ -12,10 +12,3 @@ class TaskPromptTemplate(StrEnum):
     SingleInputAction = "single-input-action"
     SingleUploadAction = "single-upload-action"
     SingleSelectAction = "single-select-action"
-
-
-class ActionType(StrEnum):
-    Click = "CLICK"
-    InputText = "INPUT_TEXT"
-    UploadFile = "UPLOAD_FILE"
-    SelectOption = "SELECT_OPTION"
