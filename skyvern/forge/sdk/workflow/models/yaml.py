@@ -6,7 +6,6 @@ from pydantic import BaseModel, Field
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileType
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
-from skyvern.webeye.actions.actions import ActionType
 
 
 class ParameterYAML(BaseModel, abc.ABC):
@@ -219,7 +218,6 @@ class ValidationBlockYAML(BlockYAML):
 
 
 class ActionBlockYAML(BlockYAML):
-    action_type: ActionType
     block_type: Literal[BlockType.ACTION] = BlockType.ACTION  # type: ignore
 
     url: str | None = None
