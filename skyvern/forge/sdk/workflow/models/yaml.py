@@ -233,6 +233,51 @@ class ActionBlockYAML(BlockYAML):
     cache_actions: bool = False
 
 
+class NavigationBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.NAVIGATION] = BlockType.NAVIGATION  # type: ignore
+
+    url: str | None = None
+    title: str = ""
+    navigation_goal: str | None = None
+    error_code_mapping: dict[str, str] | None = None
+    max_retries: int = 0
+    max_steps_per_run: int | None = None
+    parameter_keys: list[str] | None = None
+    complete_on_download: bool = False
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool = False
+
+
+class ExtractionBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.EXTRACTION] = BlockType.EXTRACTION  # type: ignore
+
+    url: str | None = None
+    title: str = ""
+    data_extraction_goal: str | None = None
+    data_schema: dict[str, Any] | list | None = None
+    max_retries: int = 0
+    max_steps_per_run: int | None = None
+    parameter_keys: list[str] | None = None
+    cache_actions: bool = False
+
+
+class LoginBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.LOGIN] = BlockType.LOGIN  # type: ignore
+
+    url: str | None = None
+    title: str = ""
+    navigation_goal: str | None = None
+    error_code_mapping: dict[str, str] | None = None
+    max_retries: int = 0
+    max_steps_per_run: int | None = None
+    parameter_keys: list[str] | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool = False
+
+
 PARAMETER_YAML_SUBCLASSES = (
     AWSSecretParameterYAML
     | BitwardenLoginCredentialParameterYAML
@@ -255,6 +300,9 @@ BLOCK_YAML_SUBCLASSES = (
     | FileParserBlockYAML
     | ValidationBlockYAML
     | ActionBlockYAML
+    | NavigationBlockYAML
+    | ExtractionBlockYAML
+    | LoginBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 
