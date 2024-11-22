@@ -13,6 +13,7 @@ import {
 import { WorkflowBlockNode } from "../nodes";
 import { AddNodeProps } from "../FlowRenderer";
 import { ClickIcon } from "@/components/icons/ClickIcon";
+import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 
 const nodeLibraryItems: Array<{
   nodeType: NonNullable<WorkflowBlockNode["type"]>;
@@ -118,46 +119,53 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
               : "Click on the node type you want to add"}
           </span>
         </header>
-        <div className="space-y-2">
-          {nodeLibraryItems.map((item) => {
-            if (workflowPanelData?.disableLoop && item.nodeType === "loop") {
-              return null;
-            }
-            return (
-              <div
-                key={item.nodeType}
-                className="flex cursor-pointer items-center justify-between rounded-sm bg-slate-elevation4 p-4 hover:bg-slate-elevation5"
-                onClick={() => {
-                  onNodeClick({
-                    nodeType: item.nodeType,
-                    next: workflowPanelData?.next ?? null,
-                    parent: workflowPanelData?.parent,
-                    previous: workflowPanelData?.previous ?? null,
-                    connectingEdgeType:
-                      workflowPanelData?.connectingEdgeType ??
-                      "edgeWithAddButton",
-                  });
-                  closeWorkflowPanel();
-                }}
-              >
-                <div className="flex gap-2">
-                  <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-                    {item.icon}
+        <ScrollArea>
+          <ScrollAreaViewport className="max-h-[28rem]">
+            <div className="space-y-2">
+              {nodeLibraryItems.map((item) => {
+                if (
+                  workflowPanelData?.disableLoop &&
+                  item.nodeType === "loop"
+                ) {
+                  return null;
+                }
+                return (
+                  <div
+                    key={item.nodeType}
+                    className="flex cursor-pointer items-center justify-between rounded-sm bg-slate-elevation4 p-4 hover:bg-slate-elevation5"
+                    onClick={() => {
+                      onNodeClick({
+                        nodeType: item.nodeType,
+                        next: workflowPanelData?.next ?? null,
+                        parent: workflowPanelData?.parent,
+                        previous: workflowPanelData?.previous ?? null,
+                        connectingEdgeType:
+                          workflowPanelData?.connectingEdgeType ??
+                          "edgeWithAddButton",
+                      });
+                      closeWorkflowPanel();
+                    }}
+                  >
+                    <div className="flex gap-2">
+                      <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
+                        {item.icon}
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="max-w-64 truncate text-base">
+                          {item.title}
+                        </span>
+                        <span className="text-xs text-slate-400">
+                          {item.description}
+                        </span>
+                      </div>
+                    </div>
+                    <PlusIcon className="size-6" />
                   </div>
-                  <div className="flex flex-col gap-1">
-                    <span className="max-w-64 truncate text-base">
-                      {item.title}
-                    </span>
-                    <span className="text-xs text-slate-400">
-                      {item.description}
-                    </span>
-                  </div>
-                </div>
-                <PlusIcon className="size-6" />
-              </div>
-            );
-          })}
-        </div>
+                );
+              })}
+            </div>
+          </ScrollAreaViewport>
+        </ScrollArea>
       </div>
     </div>
   );
