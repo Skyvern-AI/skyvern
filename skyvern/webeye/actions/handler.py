@@ -20,7 +20,6 @@ from skyvern.exceptions import (
     FailedToFetchSecret,
     FailToClick,
     FailToSelectByIndex,
-    FailToSelectByLabel,
     FailToSelectByValue,
     IllegitComplete,
     ImaginaryFileUrl,
@@ -810,7 +809,7 @@ async def handle_select_option_action(
             task_id=task.task_id,
             step_id=step.step_id,
         )
-        return await normal_select(action=action, skyvern_element=skyvern_element)
+        return await normal_select(action=action, skyvern_element=skyvern_element, dom=dom, task=task, step=step)
 
     if await skyvern_element.is_checkbox():
         LOG.info(
@@ -2188,6 +2187,9 @@ async def scroll_down_to_load_all_options(
 async def normal_select(
     action: actions.SelectOptionAction,
     skyvern_element: SkyvernElement,
+    dom: DomUtil,
+    task: Task,
+    step: Step,
 ) -> List[ActionResult]:
     try:
         current_text = await skyvern_element.get_attr("selected")
@@ -2200,12 +2202,45 @@ async def normal_select(
     is_success = False
     locator = skyvern_element.get_locator()
 
+    prompt = prompt_engine.load_prompt(
+        "parse-input-or-select-context",
+        action_reasoning=action.reasoning,
+        element_id=action.element_id,
+        elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
+    )
+    json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+    input_or_select_context = InputOrSelectContext.model_validate(json_response)
+    LOG.info(
+        "Parsed input/select context",
+        context=input_or_select_context,
+        task_id=task.task_id,
+        step_id=step.step_id,
+    )
+
+    options_html = "".join(
+        f'<option index="{option.get("optionIndex")}">{option.get("text")}</option>'
+        for option in skyvern_element.get_options()
+    )
+
+    prompt = prompt_engine.load_prompt(
+        "normal-select",
+        field_information=input_or_select_context.field,
+        required_field=input_or_select_context.is_required,
+        navigation_goal=task.navigation_goal,
+        navigation_payload_str=json.dumps(task.navigation_payload),
+        options=options_html,
+    )
+
+    json_response = await app.LLM_API_HANDLER(prompt=prompt, step=step)
+    index: int | None = json_response.get("index")
+    value: str | None = json_response.get("value")
+
     try:
         await locator.click(
             timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
         )
     except Exception as e:
-        LOG.error(
+        LOG.info(
             "Failed to click before select action",
             exc_info=True,
             action=action,
@@ -2214,46 +2249,28 @@ async def normal_select(
         action_result.append(ActionFailure(e))
         return action_result
 
-    if not is_success and action.option.label is not None:
-        try:
-            # First click by label (if it matches)
-            await locator.select_option(
-                label=action.option.label,
-                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
-            )
-            is_success = True
-            action_result.append(ActionSuccess())
-        except Exception:
-            action_result.append(ActionFailure(FailToSelectByLabel(action.element_id)))
-            LOG.error(
-                "Failed to take select action by label",
-                exc_info=True,
-                action=action,
-                locator=locator,
-            )
-
-    if not is_success and action.option.value is not None:
+    if not is_success and value is not None:
         try:
             # click by value (if it matches)
             await locator.select_option(
-                value=action.option.value,
+                value=value,
                 timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
             )
             is_success = True
             action_result.append(ActionSuccess())
         except Exception:
             action_result.append(ActionFailure(FailToSelectByValue(action.element_id)))
-            LOG.error(
+            LOG.info(
                 "Failed to take select action by value",
                 exc_info=True,
                 action=action,
                 locator=locator,
             )
 
-    if not is_success and action.option.index is not None:
-        if action.option.index >= len(skyvern_element.get_options()):
+    if not is_success and index is not None:
+        if index >= len(skyvern_element.get_options()):
             action_result.append(ActionFailure(OptionIndexOutOfBound(action.element_id)))
-            LOG.error(
+            LOG.info(
                 "option index is out of bound",
                 action=action,
                 locator=locator,
@@ -2262,14 +2279,14 @@ async def normal_select(
             try:
                 # This means the supplied index was for the select element, not a reference to the css dict
                 await locator.select_option(
-                    index=action.option.index,
+                    index=index,
                     timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
                 )
                 is_success = True
                 action_result.append(ActionSuccess())
             except Exception:
                 action_result.append(ActionFailure(FailToSelectByIndex(action.element_id)))
-                LOG.error(
+                LOG.info(
                     "Failed to click on the option by index",
                     exc_info=True,
                     action=action,
@@ -2281,7 +2298,7 @@ async def normal_select(
             timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
         )
     except Exception as e:
-        LOG.error(
+        LOG.info(
             "Failed to click after select action",
             exc_info=True,
             action=action,
