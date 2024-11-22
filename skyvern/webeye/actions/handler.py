@@ -2217,10 +2217,7 @@ async def normal_select(
         step_id=step.step_id,
     )
 
-    options_html = "".join(
-        f'<option index="{option.get("optionIndex")}">{option.get("text")}</option>'
-        for option in skyvern_element.get_options()
-    )
+    options_html = skyvern_element.build_HTML()
 
     prompt = prompt_engine.load_prompt(
         "normal-select",
