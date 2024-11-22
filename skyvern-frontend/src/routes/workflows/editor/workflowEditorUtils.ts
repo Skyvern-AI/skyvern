@@ -11,6 +11,7 @@ import type {
   WorkflowParameterValueType,
 } from "../types/workflowTypes";
 import {
+  ActionBlockYAML,
   BlockYAML,
   CodeBlockYAML,
   DownloadToS3BlockYAML,
@@ -50,6 +51,7 @@ import { textPromptNodeDefaultData } from "./nodes/TextPromptNode/types";
 import { NodeBaseData } from "./nodes/types";
 import { uploadNodeDefaultData } from "./nodes/UploadNode/types";
 import { validationNodeDefaultData } from "./nodes/ValidationNode/types";
+import { actionNodeDefaultData } from "./nodes/ActionNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -172,6 +174,26 @@ function convertToNode(
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
           parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
+    case "action": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "action",
+        data: {
+          ...commonData,
+          url: block.url ?? "",
+          navigationGoal: block.navigation_goal ?? "",
+          errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
+          allowDownloads: block.complete_on_download ?? false,
+          downloadSuffix: block.download_suffix ?? null,
+          maxRetries: block.max_retries ?? null,
+          parameterKeys: block.parameters.map((p) => p.key),
+          totpIdentifier: block.totp_identifier ?? null,
+          totpVerificationUrl: block.totp_verification_url ?? null,
+          cacheActions: block.cache_actions,
         },
       };
     }
@@ -476,6 +498,17 @@ function createNode(
         },
       };
     }
+    case "action": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "action",
+        data: {
+          ...actionNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "loop": {
       return {
         ...identifiers,
@@ -601,11 +634,32 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         block_type: "validation",
         complete_criterion: node.data.completeCriterion,
         terminate_criterion: node.data.terminateCriterion,
-        parameter_keys: node.data.parameterKeys,
         error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
           string,
           string
         > | null,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "action": {
+      return {
+        ...base,
+        block_type: "action",
+        navigation_goal: node.data.navigationGoal,
+        error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
+          string,
+          string
+        > | null,
+        url: node.data.url,
+        ...(node.data.maxRetries !== null && {
+          max_retries: node.data.maxRetries,
+        }),
+        complete_on_download: node.data.allowDownloads,
+        download_suffix: node.data.downloadSuffix,
+        parameter_keys: node.data.parameterKeys,
+        totp_identifier: node.data.totpIdentifier,
+        totp_verification_url: node.data.totpVerificationUrl,
+        cache_actions: node.data.cacheActions,
       };
     }
     case "sendEmail": {
@@ -1086,6 +1140,23 @@ function convertBlocks(blocks: Array<WorkflowBlock>): Array<BlockYAML> {
           terminate_criterion: block.terminate_criterion,
           error_code_mapping: block.error_code_mapping,
           parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
+      case "action": {
+        const blockYaml: ActionBlockYAML = {
+          ...base,
+          block_type: "action",
+          url: block.url,
+          navigation_goal: block.navigation_goal,
+          error_code_mapping: block.error_code_mapping,
+          max_retries: block.max_retries,
+          complete_on_download: block.complete_on_download,
+          download_suffix: block.download_suffix,
+          parameter_keys: block.parameters.map((p) => p.key),
+          totp_identifier: block.totp_identifier,
+          totp_verification_url: block.totp_verification_url,
+          cache_actions: block.cache_actions,
         };
         return blockYaml;
       }

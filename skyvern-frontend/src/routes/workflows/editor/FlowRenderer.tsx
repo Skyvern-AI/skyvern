@@ -74,6 +74,7 @@ import { isLoopNode, LoopNode } from "./nodes/LoopNode/types";
 import { isTaskNode } from "./nodes/TaskNode/types";
 import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
 import { isValidationNode } from "./nodes/ValidationNode/types";
+import { isActionNode } from "./nodes/ActionNode/types";
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -459,12 +460,27 @@ function FlowRenderer({
     const errors: Array<string> = [];
 
     const workflowBlockNodes = nodes.filter(isWorkflowBlockNode);
-    if (workflowBlockNodes[0]!.type === "validation") {
+    if (
+      workflowBlockNodes.length > 0 &&
+      workflowBlockNodes[0]!.type === "validation"
+    ) {
       const label = workflowBlockNodes[0]!.data.label;
       errors.push(
-        `${label}: Validation block can't be the first block in a workflow`,
+        `${label}: Validation block can't be the first block in a workflow.`,
       );
     }
+
+    const actionNodes = nodes.filter(isActionNode);
+    actionNodes.forEach((node) => {
+      if (node.data.navigationGoal.length === 0) {
+        errors.push(`${node.data.label}: Action Instruction is required.`);
+      }
+      try {
+        JSON.parse(node.data.errorCodeMapping);
+      } catch {
+        errors.push(`${node.data.label}: Error messages is not valid JSON.`);
+      }
+    });
 
     // check loop node parameters
     const loopNodes: Array<LoopNode> = nodes.filter(isLoopNode);
@@ -474,7 +490,7 @@ function FlowRenderer({
     if (emptyLoopNodes.length > 0) {
       emptyLoopNodes.forEach((node) => {
         errors.push(
-          `${node.data.label}: Loop value parameter must be selected`,
+          `${node.data.label}: Loop value parameter must be selected.`,
         );
       });
     }
@@ -485,12 +501,12 @@ function FlowRenderer({
       try {
         JSON.parse(node.data.dataSchema);
       } catch {
-        errors.push(`${node.data.label}: Data schema is not valid JSON`);
+        errors.push(`${node.data.label}: Data schema is not valid JSON.`);
       }
       try {
         JSON.parse(node.data.errorCodeMapping);
       } catch {
-        errors.push(`${node.data.label}: Error messages is not valid JSON`);
+        errors.push(`${node.data.label}: Error messages is not valid JSON.`);
       }
     });
 

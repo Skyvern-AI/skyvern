@@ -12,6 +12,7 @@ import {
 } from "@radix-ui/react-icons";
 import { WorkflowBlockNode } from "../nodes";
 import { AddNodeProps } from "../FlowRenderer";
+import { ClickIcon } from "@/components/icons/ClickIcon";
 
 const nodeLibraryItems: Array<{
   nodeType: NonNullable<WorkflowBlockNode["type"]>;
@@ -74,6 +75,12 @@ const nodeLibraryItems: Array<{
     icon: <CheckCircledIcon className="size-6" />,
     title: "Validation Block",
     description: "Validate the state of the workflow or terminate",
+  },
+  {
+    nodeType: "action",
+    icon: <ClickIcon className="size-6" />,
+    title: "Action Block",
+    description: "Take a single action",
   },
 ];
 

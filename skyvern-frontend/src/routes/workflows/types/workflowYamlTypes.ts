@@ -76,6 +76,7 @@ const BlockTypes = {
   SEND_EMAIL: "send_email",
   FILE_URL_PARSER: "file_url_parser",
   VALIDATION: "validation",
+  ACTION: "action",
 } as const;
 
 export type BlockType = (typeof BlockTypes)[keyof typeof BlockTypes];
@@ -89,7 +90,8 @@ export type BlockYAML =
   | SendEmailBlockYAML
   | FileUrlParserBlockYAML
   | ForLoopBlockYAML
-  | ValidationBlockYAML;
+  | ValidationBlockYAML
+  | ActionBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: BlockType;
@@ -121,6 +123,20 @@ export type ValidationBlockYAML = BlockYAMLBase & {
   terminate_criterion: string | null;
   error_code_mapping: Record<string, string> | null;
   parameter_keys?: Array<string> | null;
+};
+
+export type ActionBlockYAML = BlockYAMLBase & {
+  block_type: "action";
+  url: string | null;
+  navigation_goal: string | null;
+  error_code_mapping: Record<string, string> | null;
+  max_retries?: number;
+  parameter_keys?: Array<string> | null;
+  complete_on_download?: boolean;
+  download_suffix?: string | null;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
+  cache_actions: boolean;
 };
 
 export type CodeBlockYAML = BlockYAMLBase & {
