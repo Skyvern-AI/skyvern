@@ -74,6 +74,9 @@ class BlockType(StrEnum):
     FILE_URL_PARSER = "file_url_parser"
     VALIDATION = "validation"
     ACTION = "action"
+    NAVIGATION = "navigation"
+    EXTRACTION = "extraction"
+    LOGIN = "login"
 
 
 class BlockStatus(StrEnum):
@@ -1336,6 +1339,18 @@ class ActionBlock(BaseTaskBlock):
         return await super().execute(workflow_run_id=workflow_run_id, kwargs=kwargs)
 
 
+class NavigationBlock(BaseTaskBlock):
+    block_type: Literal[BlockType.NAVIGATION] = BlockType.NAVIGATION
+
+
+class ExtractionBlock(BaseTaskBlock):
+    block_type: Literal[BlockType.EXTRACTION] = BlockType.EXTRACTION
+
+
+class LoginBlock(BaseTaskBlock):
+    block_type: Literal[BlockType.LOGIN] = BlockType.LOGIN
+
+
 BlockSubclasses = Union[
     ForLoopBlock,
     TaskBlock,
@@ -1347,5 +1362,8 @@ BlockSubclasses = Union[
     FileParserBlock,
     ValidationBlock,
     ActionBlock,
+    NavigationBlock,
+    ExtractionBlock,
+    LoginBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]

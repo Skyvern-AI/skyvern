@@ -35,8 +35,11 @@ from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
     CodeBlock,
     DownloadToS3Block,
+    ExtractionBlock,
     FileParserBlock,
     ForLoopBlock,
+    LoginBlock,
+    NavigationBlock,
     SendEmailBlock,
     TaskBlock,
     TextPromptBlock,
@@ -1385,6 +1388,72 @@ class WorkflowService:
                 totp_identifier=block_yaml.totp_identifier,
                 cache_actions=block_yaml.cache_actions,
                 max_steps_per_run=1,
+            )
+
+        elif block_yaml.block_type == BlockType.NAVIGATION:
+            navigation_block_parameters = (
+                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                if block_yaml.parameter_keys
+                else []
+            )
+            return NavigationBlock(
+                label=block_yaml.label,
+                url=block_yaml.url,
+                title=block_yaml.title,
+                parameters=navigation_block_parameters,
+                output_parameter=output_parameter,
+                navigation_goal=block_yaml.navigation_goal,
+                error_code_mapping=block_yaml.error_code_mapping,
+                max_steps_per_run=block_yaml.max_steps_per_run,
+                max_retries=block_yaml.max_retries,
+                complete_on_download=block_yaml.complete_on_download,
+                download_suffix=block_yaml.download_suffix,
+                continue_on_failure=block_yaml.continue_on_failure,
+                totp_verification_url=block_yaml.totp_verification_url,
+                totp_identifier=block_yaml.totp_identifier,
+                cache_actions=block_yaml.cache_actions,
+            )
+
+        elif block_yaml.block_type == BlockType.EXTRACTION:
+            extraction_block_parameters = (
+                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                if block_yaml.parameter_keys
+                else []
+            )
+            return ExtractionBlock(
+                label=block_yaml.label,
+                url=block_yaml.url,
+                title=block_yaml.title,
+                parameters=extraction_block_parameters,
+                output_parameter=output_parameter,
+                data_extraction_goal=block_yaml.data_extraction_goal,
+                data_schema=block_yaml.data_schema,
+                max_steps_per_run=block_yaml.max_steps_per_run,
+                max_retries=block_yaml.max_retries,
+                continue_on_failure=block_yaml.continue_on_failure,
+                cache_actions=block_yaml.cache_actions,
+            )
+
+        elif block_yaml.block_type == BlockType.LOGIN:
+            login_block_parameters = (
+                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                if block_yaml.parameter_keys
+                else []
+            )
+            return LoginBlock(
+                label=block_yaml.label,
+                url=block_yaml.url,
+                title=block_yaml.title,
+                parameters=login_block_parameters,
+                output_parameter=output_parameter,
+                navigation_goal=block_yaml.navigation_goal,
+                error_code_mapping=block_yaml.error_code_mapping,
+                max_steps_per_run=block_yaml.max_steps_per_run,
+                max_retries=block_yaml.max_retries,
+                continue_on_failure=block_yaml.continue_on_failure,
+                totp_verification_url=block_yaml.totp_verification_url,
+                totp_identifier=block_yaml.totp_identifier,
+                cache_actions=block_yaml.cache_actions,
             )
 
         raise ValueError(f"Invalid block type {block_yaml.block_type}")
