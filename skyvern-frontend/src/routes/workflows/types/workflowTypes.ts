@@ -110,6 +110,7 @@ export const WorkflowBlockType = {
   UploadToS3: "upload_to_s3",
   SendEmail: "send_email",
   FileURLParser: "file_url_parser",
+  Validation: "validation",
 };
 
 export type WorkflowBlockType =
@@ -197,6 +198,11 @@ export type ValidationBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
 };
 
+export type ActionBlock = Omit<TaskBlock, "block_type"> & {
+  block_type: "action";
+  parameters: Array<WorkflowParameter>;
+};
+
 export type WorkflowBlock =
   | TaskBlock
   | ForLoopBlock
@@ -206,7 +212,8 @@ export type WorkflowBlock =
   | DownloadToS3Block
   | SendEmailBlock
   | FileURLParserBlock
-  | ValidationBlock;
+  | ValidationBlock
+  | ActionBlock;
 
 export type WorkflowDefinition = {
   parameters: Array<Parameter>;
