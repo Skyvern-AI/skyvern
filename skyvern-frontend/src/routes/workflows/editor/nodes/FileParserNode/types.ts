@@ -3,7 +3,6 @@ import { NodeBaseData } from "../types";
 
 export type FileParserNodeData = NodeBaseData & {
   fileUrl: string;
-  editable: boolean;
 };
 
 export type FileParserNode = Node<FileParserNodeData, "fileParser">;

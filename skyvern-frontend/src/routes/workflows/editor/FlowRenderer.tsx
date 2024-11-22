@@ -31,7 +31,12 @@ import {
 import { WorkflowHeader } from "./WorkflowHeader";
 import { WorkflowParametersStateContext } from "./WorkflowParametersStateContext";
 import { edgeTypes } from "./edges";
-import { AppNode, nodeTypes, WorkflowBlockNode } from "./nodes";
+import {
+  AppNode,
+  isWorkflowBlockNode,
+  nodeTypes,
+  WorkflowBlockNode,
+} from "./nodes";
 import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
 import "./reactFlowOverrideStyles.css";
@@ -68,6 +73,7 @@ import { ReloadIcon } from "@radix-ui/react-icons";
 import { isLoopNode, LoopNode } from "./nodes/LoopNode/types";
 import { isTaskNode } from "./nodes/TaskNode/types";
 import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
+import { isValidationNode } from "./nodes/ValidationNode/types";
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -452,6 +458,14 @@ function FlowRenderer({
   function getWorkflowErrors(): Array<string> {
     const errors: Array<string> = [];
 
+    const workflowBlockNodes = nodes.filter(isWorkflowBlockNode);
+    if (workflowBlockNodes[0]!.type === "validation") {
+      const label = workflowBlockNodes[0]!.data.label;
+      errors.push(
+        `${label}: Validation block can't be the first block in a workflow`,
+      );
+    }
+
     // check loop node parameters
     const loopNodes: Array<LoopNode> = nodes.filter(isLoopNode);
     const emptyLoopNodes = loopNodes.filter(
@@ -477,6 +491,23 @@ function FlowRenderer({
         JSON.parse(node.data.errorCodeMapping);
       } catch {
         errors.push(`${node.data.label}: Error messages is not valid JSON`);
+      }
+    });
+
+    const validationNodes = nodes.filter(isValidationNode);
+    validationNodes.forEach((node) => {
+      try {
+        JSON.parse(node.data.errorCodeMapping);
+      } catch {
+        errors.push(`${node.data.label}: Error messages is not valid JSON`);
+      }
+      if (
+        node.data.completeCriterion.length === 0 &&
+        node.data.terminateCriterion.length === 0
+      ) {
+        errors.push(
+          `${node.data.label}: At least one of completion or termination criteria must be provided`,
+        );
       }
     });
 

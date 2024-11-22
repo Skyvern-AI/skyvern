@@ -75,6 +75,7 @@ const BlockTypes = {
   UPLOAD_TO_S3: "upload_to_s3",
   SEND_EMAIL: "send_email",
   FILE_URL_PARSER: "file_url_parser",
+  VALIDATION: "validation",
 } as const;
 
 export type BlockType = (typeof BlockTypes)[keyof typeof BlockTypes];
@@ -87,7 +88,8 @@ export type BlockYAML =
   | UploadToS3BlockYAML
   | SendEmailBlockYAML
   | FileUrlParserBlockYAML
-  | ForLoopBlockYAML;
+  | ForLoopBlockYAML
+  | ValidationBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: BlockType;
@@ -111,6 +113,14 @@ export type TaskBlockYAML = BlockYAMLBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+};
+
+export type ValidationBlockYAML = BlockYAMLBase & {
+  block_type: "validation";
+  complete_criterion: string | null;
+  terminate_criterion: string | null;
+  error_code_mapping: Record<string, string> | null;
+  parameter_keys?: Array<string> | null;
 };
 
 export type CodeBlockYAML = BlockYAMLBase & {

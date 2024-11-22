@@ -21,6 +21,7 @@ import {
   TaskBlockYAML,
   TextPromptBlockYAML,
   UploadToS3BlockYAML,
+  ValidationBlockYAML,
   WorkflowCreateYAMLRequest,
 } from "../types/workflowYamlTypes";
 import {
@@ -48,6 +49,7 @@ import { taskNodeDefaultData } from "./nodes/TaskNode/types";
 import { textPromptNodeDefaultData } from "./nodes/TextPromptNode/types";
 import { NodeBaseData } from "./nodes/types";
 import { uploadNodeDefaultData } from "./nodes/UploadNode/types";
+import { validationNodeDefaultData } from "./nodes/ValidationNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -133,6 +135,7 @@ function convertToNode(
   const commonData: NodeBaseData = {
     label: block.label,
     continueOnFailure: block.continue_on_failure,
+    editable: true,
   };
   switch (block.block_type) {
     case "task": {
@@ -142,7 +145,6 @@ function convertToNode(
         type: "task",
         data: {
           ...commonData,
-          editable: true,
           url: block.url ?? "",
           navigationGoal: block.navigation_goal ?? "",
           dataExtractionGoal: block.data_extraction_goal ?? "",
@@ -159,6 +161,20 @@ function convertToNode(
         },
       };
     }
+    case "validation": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "validation",
+        data: {
+          ...commonData,
+          errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
+          completeCriterion: block.complete_criterion ?? "",
+          terminateCriterion: block.terminate_criterion ?? "",
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
     case "code": {
       return {
         ...identifiers,
@@ -166,7 +182,6 @@ function convertToNode(
         type: "codeBlock",
         data: {
           ...commonData,
-          editable: true,
           code: block.code,
         },
       };
@@ -178,7 +193,6 @@ function convertToNode(
         type: "sendEmail",
         data: {
           ...commonData,
-          editable: true,
           body: block.body,
           fileAttachments: block.file_attachments.join(", "),
           recipients: block.recipients.join(", "),
@@ -198,7 +212,6 @@ function convertToNode(
         type: "textPrompt",
         data: {
           ...commonData,
-          editable: true,
           prompt: block.prompt,
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
           parameterKeys: block.parameters.map((p) => p.key),
@@ -212,7 +225,6 @@ function convertToNode(
         type: "loop",
         data: {
           ...commonData,
-          editable: true,
           loopValue: block.loop_over.key,
         },
       };
@@ -224,7 +236,6 @@ function convertToNode(
         type: "fileParser",
         data: {
           ...commonData,
-          editable: true,
           fileUrl: block.file_url,
         },
       };
@@ -237,7 +248,6 @@ function convertToNode(
         type: "download",
         data: {
           ...commonData,
-          editable: true,
           url: block.url,
         },
       };
@@ -250,7 +260,6 @@ function convertToNode(
         type: "upload",
         data: {
           ...commonData,
-          editable: true,
           path: block.path,
         },
       };
@@ -456,6 +465,17 @@ function createNode(
         },
       };
     }
+    case "validation": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "validation",
+        data: {
+          ...validationNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "loop": {
       return {
         ...identifiers,
@@ -573,6 +593,19 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         cache_actions: node.data.cacheActions,
+      };
+    }
+    case "validation": {
+      return {
+        ...base,
+        block_type: "validation",
+        complete_criterion: node.data.completeCriterion,
+        terminate_criterion: node.data.terminateCriterion,
+        parameter_keys: node.data.parameterKeys,
+        error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
+          string,
+          string
+        > | null,
       };
     }
     case "sendEmail": {
@@ -1042,6 +1075,17 @@ function convertBlocks(blocks: Array<WorkflowBlock>): Array<BlockYAML> {
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           cache_actions: block.cache_actions,
+        };
+        return blockYaml;
+      }
+      case "validation": {
+        const blockYaml: ValidationBlockYAML = {
+          ...base,
+          block_type: "validation",
+          complete_criterion: block.complete_criterion,
+          terminate_criterion: block.terminate_criterion,
+          error_code_mapping: block.error_code_mapping,
+          parameter_keys: block.parameters.map((p) => p.key),
         };
         return blockYaml;
       }

@@ -4,7 +4,6 @@ import { NodeBaseData } from "../types";
 
 export type DownloadNodeData = NodeBaseData & {
   url: string;
-  editable: boolean;
 };
 
 export type DownloadNode = Node<DownloadNodeData, "download">;
