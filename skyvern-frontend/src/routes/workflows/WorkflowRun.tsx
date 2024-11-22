@@ -611,6 +611,20 @@ function WorkflowRun() {
           </Pagination>
         </div>
       </div>
+      {workflowRunIsFinalized && (
+        <div className="space-y-4">
+          <header>
+            <h2 className="text-lg font-semibold">Block Outputs</h2>
+          </header>
+          <CodeEditor
+            language="json"
+            value={JSON.stringify(workflowRun.outputs, null, 2)}
+            readOnly
+            minHeight="96px"
+            maxHeight="500px"
+          />
+        </div>
+      )}
       {Object.entries(parameters).length > 0 && (
         <div className="space-y-4">
           <header>
