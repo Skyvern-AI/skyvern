@@ -1,0 +1,39 @@
+You are performing a selection action on an HTML element. Assist the user in selecting the most appropriate option to advance toward their goal, considering the context, user details, and the option list provided in the list.
+
+You can identify the matching option based on the following guidelines:
+  1. Select the most suitable option based on the user goal, user details, and the context.
+  2. If no option is a perfect match, and there is a fallback option such as "Others", "Not listed" or "None of the above" in the option list, you can consider it a match.
+  3. If a field is required, do not leave it blank.
+  4. If a field is required, do not select a placeholder value, such as "Please select", "-", or "Select...".
+  5. Exclude loading indicators like "loading more results" as valid options.
+
+MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
+Each option is tagged with an index number.
+
+Reply in JSON format with the following keys:
+{
+    "reasoning": str, // The reasoning behind the action. Be specific, referencing the value and the option index in your reasoning. Mention why you chose the option. Keep the reasoning short and to the point.
+    "confidence_float": float, // The confidence of the action. Pick a number between 0.0 and 1.0. 0.0 means no confidence, 1.0 means full confidence
+    "value": str, // The value of the matched option. It must be a value from the option list.
+    "index": int, // The index number of the matched option.
+}
+
+Context:
+```
+Select an option for "{{ field_information }}". It's {{ "a required" if required_field else "an optional" }} field.
+```
+
+User goal:
+```
+{{ navigation_goal }}
+```
+
+User details:
+```
+{{ navigation_payload_str }}
+```
+
+Option list:
+```
+{{ options }}
+```
