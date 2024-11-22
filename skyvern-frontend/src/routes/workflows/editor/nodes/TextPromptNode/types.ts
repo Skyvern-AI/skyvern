@@ -4,8 +4,6 @@ import { NodeBaseData } from "../types";
 export type TextPromptNodeData = NodeBaseData & {
   prompt: string;
   jsonSchema: string;
-  editable: boolean;
-  label: string;
   parameterKeys: Array<string>;
 };
 

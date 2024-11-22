@@ -14,7 +14,6 @@ export type SendEmailNodeData = NodeBaseData & {
   subject: string;
   body: string;
   fileAttachments: string;
-  editable: boolean;
   sender: string;
   smtpHostSecretParameterKey?: string;
   smtpPortSecretParameterKey?: string;

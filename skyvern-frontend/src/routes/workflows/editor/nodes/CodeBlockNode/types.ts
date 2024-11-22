@@ -3,7 +3,6 @@ import { NodeBaseData } from "../types";
 
 export type CodeBlockNodeData = NodeBaseData & {
   code: string;
-  editable: boolean;
 };
 
 export type CodeBlockNode = Node<CodeBlockNodeData, "codeBlock">;

@@ -189,6 +189,14 @@ export type FileURLParserBlock = WorkflowBlockBase & {
   file_type: "csv";
 };
 
+export type ValidationBlock = WorkflowBlockBase & {
+  block_type: "validation";
+  complete_criterion: string | null;
+  terminate_criterion: string | null;
+  error_code_mapping: Record<string, string> | null;
+  parameters: Array<WorkflowParameter>;
+};
+
 export type WorkflowBlock =
   | TaskBlock
   | ForLoopBlock
@@ -197,7 +205,8 @@ export type WorkflowBlock =
   | UploadToS3Block
   | DownloadToS3Block
   | SendEmailBlock
-  | FileURLParserBlock;
+  | FileURLParserBlock
+  | ValidationBlock;
 
 export type WorkflowDefinition = {
   parameters: Array<Parameter>;

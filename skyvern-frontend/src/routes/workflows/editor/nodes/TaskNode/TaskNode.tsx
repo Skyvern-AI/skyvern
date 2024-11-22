@@ -28,14 +28,9 @@ import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { ParametersMultiSelect } from "./ParametersMultiSelect";
-import {
-  dataSchemaExampleValue,
-  errorMappingExampleValue,
-  fieldPlaceholders,
-  helpTooltipContent,
-  type TaskNode,
-} from "./types";
+import { fieldPlaceholders, helpTooltipContent, type TaskNode } from "./types";
 import { Separator } from "@/components/ui/separator";
+import { dataSchemaExampleValue, errorMappingExampleValue } from "../types";
 
 function TaskNode({ id, data }: NodeProps<TaskNode>) {
   const { updateNodeData } = useReactFlow();

@@ -11,7 +11,6 @@ export type TaskNodeData = NodeBaseData & {
   maxStepsOverride: number | null;
   allowDownloads: boolean;
   downloadSuffix: string | null;
-  editable: boolean;
   parameterKeys: Array<string>;
   totpVerificationUrl: string | null;
   totpIdentifier: string | null;
@@ -87,15 +86,4 @@ export const fieldPlaceholders = {
   label: "Task",
   totpVerificationUrl: "Provide your 2FA endpoint",
   totpIdentifier: "Add an ID that links your TOTP to the task",
-};
-
-export const errorMappingExampleValue = {
-  sample_invalid_credentials: "if the credentials are incorrect, terminate",
-};
-
-export const dataSchemaExampleValue = {
-  type: "object",
-  properties: {
-    sample: { type: "string" },
-  },
 };

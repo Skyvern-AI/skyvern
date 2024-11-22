@@ -3,7 +3,6 @@ import { NodeBaseData } from "../types";
 
 export type LoopNodeData = NodeBaseData & {
   loopValue: string;
-  editable: boolean;
 };
 
 export type LoopNode = Node<LoopNodeData, "loop">;

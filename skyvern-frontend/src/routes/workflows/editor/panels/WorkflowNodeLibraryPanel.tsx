@@ -1,5 +1,6 @@
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import {
+  CheckCircledIcon,
   Cross2Icon,
   CursorTextIcon,
   EnvelopeClosedIcon,
@@ -20,53 +21,59 @@ const nodeLibraryItems: Array<{
 }> = [
   {
     nodeType: "task",
-    icon: <ListBulletIcon className="h-6 w-6" />,
+    icon: <ListBulletIcon className="size-6" />,
     title: "Task Block",
     description: "Takes actions or extracts information",
   },
   {
     nodeType: "loop",
-    icon: <UpdateIcon className="h-6 w-6" />,
+    icon: <UpdateIcon className="size-6" />,
     title: "For Loop Block",
     description: "Repeats nested elements",
   },
   {
     nodeType: "textPrompt",
-    icon: <CursorTextIcon className="h-6 w-6" />,
+    icon: <CursorTextIcon className="size-6" />,
     title: "Text Prompt Block",
     description: "Generates AI response",
   },
   {
     nodeType: "sendEmail",
-    icon: <EnvelopeClosedIcon className="h-6 w-6" />,
+    icon: <EnvelopeClosedIcon className="size-6" />,
     title: "Send Email Block",
     description: "Sends an email",
   },
   // temporarily removed
   // {
   //   nodeType: "codeBlock",
-  //   icon: <CodeIcon className="h-6 w-6" />,
+  //   icon: <CodeIcon className="size-6" />,
   //   title: "Code Block",
   //   description: "Executes Python code",
   // },
   {
     nodeType: "fileParser",
-    icon: <FileIcon className="h-6 w-6" />,
+    icon: <FileIcon className="size-6" />,
     title: "File Parser Block",
     description: "Downloads and parses a file",
   },
   // disabled
   // {
   //   nodeType: "download",
-  //   icon: <DownloadIcon className="h-6 w-6" />,
+  //   icon: <DownloadIcon className="size-6" />,
   //   title: "Download Block",
   //   description: "Downloads a file from S3",
   // },
   {
     nodeType: "upload",
-    icon: <UploadIcon className="h-6 w-6" />,
+    icon: <UploadIcon className="size-6" />,
     title: "Upload Block",
     description: "Uploads a file to S3",
+  },
+  {
+    nodeType: "validation",
+    icon: <CheckCircledIcon className="size-6" />,
+    title: "Validation Block",
+    description: "Validate the state of the workflow or terminate",
   },
 ];
 
@@ -91,7 +98,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
             <h1 className="text-lg">Node Library</h1>
             {!first && (
               <Cross2Icon
-                className="h-6 w-6 cursor-pointer"
+                className="size-6 cursor-pointer"
                 onClick={() => {
                   closeWorkflowPanel();
                 }}
@@ -139,7 +146,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
                     </span>
                   </div>
                 </div>
-                <PlusIcon className="h-6 w-6" />
+                <PlusIcon className="size-6" />
               </div>
             );
           })}
