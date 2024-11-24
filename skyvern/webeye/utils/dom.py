@@ -147,7 +147,7 @@ class SkyvernElement:
             return True
 
         class_name: str | None = await self.get_attr("class")
-        if class_name and "autocomplete-input" in class_name:
+        if class_name is not None and "autocomplete-input" in class_name:
             return True
 
         return False
