@@ -251,7 +251,7 @@ function isElementVisible(element) {
   )
     return element.parentElement && isElementVisible(element.parentElement);
 
-  const className = element.className.toString();
+  const className = element.className ? element.className.toString() : "";
   if (
     className.includes("select2-offscreen") ||
     className.includes("select2-hidden") ||
