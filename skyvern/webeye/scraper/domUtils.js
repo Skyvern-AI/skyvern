@@ -1234,6 +1234,11 @@ function buildElementTree(starter = document.body, frame, full_tree = false) {
         const childElement = children[i];
         processElement(childElement, shadowHostElement.id);
       }
+      const selfChildren = getChildElements(element);
+      for (let i = 0; i < selfChildren.length; i++) {
+        const childElement = selfChildren[i];
+        processElement(childElement, shadowHostElement.id);
+      }
     } else {
       // For a non-interactable element, if it has direct text, we also tagged
       // it with unique_id, but with interatable=false in the element.
