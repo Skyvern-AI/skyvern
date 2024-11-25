@@ -25,6 +25,7 @@ import {
   ValidationBlockYAML,
   NavigationBlockYAML,
   WorkflowCreateYAMLRequest,
+  ExtractionBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -43,17 +44,31 @@ import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
 import { fileParserNodeDefaultData } from "./nodes/FileParserNode/types";
-import { LoopNode, loopNodeDefaultData } from "./nodes/LoopNode/types";
+import {
+  isLoopNode,
+  LoopNode,
+  loopNodeDefaultData,
+} from "./nodes/LoopNode/types";
 import { NodeAdderNode } from "./nodes/NodeAdderNode/types";
 import { sendEmailNodeDefaultData } from "./nodes/SendEmailNode/types";
 import { StartNode } from "./nodes/StartNode/types";
-import { taskNodeDefaultData } from "./nodes/TaskNode/types";
+import { isTaskNode, taskNodeDefaultData } from "./nodes/TaskNode/types";
 import { textPromptNodeDefaultData } from "./nodes/TextPromptNode/types";
 import { NodeBaseData } from "./nodes/types";
 import { uploadNodeDefaultData } from "./nodes/UploadNode/types";
-import { validationNodeDefaultData } from "./nodes/ValidationNode/types";
-import { actionNodeDefaultData } from "./nodes/ActionNode/types";
-import { navigationNodeDefaultData } from "./nodes/NavigationNode/types";
+import {
+  isValidationNode,
+  validationNodeDefaultData,
+} from "./nodes/ValidationNode/types";
+import { actionNodeDefaultData, isActionNode } from "./nodes/ActionNode/types";
+import {
+  isNavigationNode,
+  navigationNodeDefaultData,
+} from "./nodes/NavigationNode/types";
+import {
+  extractionNodeDefaultData,
+  isExtractionNode,
+} from "./nodes/ExtractionNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -217,6 +232,23 @@ function convertToNode(
           totpVerificationUrl: block.totp_verification_url ?? null,
           cacheActions: block.cache_actions,
           maxStepsOverride: block.max_steps_per_run ?? null,
+        },
+      };
+    }
+    case "extraction": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "extraction",
+        data: {
+          ...commonData,
+          url: block.url ?? "",
+          dataExtractionGoal: block.data_extraction_goal ?? "",
+          dataSchema: JSON.stringify(block.data_schema, null, 2),
+          parameterKeys: block.parameters.map((p) => p.key),
+          maxRetries: block.max_retries ?? null,
+          maxStepsOverride: block.max_steps_per_run ?? null,
+          cacheActions: block.cache_actions,
         },
       };
     }
@@ -543,6 +575,17 @@ function createNode(
         },
       };
     }
+    case "extraction": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "extraction",
+        data: {
+          ...extractionNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "loop": {
       return {
         ...identifiers,
@@ -679,6 +722,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
       return {
         ...base,
         block_type: "action",
+        title: node.data.label,
         navigation_goal: node.data.navigationGoal,
         error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
           string,
@@ -700,6 +744,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
       return {
         ...base,
         block_type: "navigation",
+        title: node.data.label,
         navigation_goal: node.data.navigationGoal,
         error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
           string,
@@ -715,6 +760,22 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         parameter_keys: node.data.parameterKeys,
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
+        cache_actions: node.data.cacheActions,
+      };
+    }
+    case "extraction": {
+      return {
+        ...base,
+        block_type: "extraction",
+        url: node.data.url,
+        title: node.data.label,
+        data_extraction_goal: node.data.dataExtractionGoal,
+        data_schema: JSONParseSafe(node.data.dataSchema),
+        ...(node.data.maxRetries !== null && {
+          max_retries: node.data.maxRetries,
+        }),
+        max_steps_per_run: node.data.maxStepsOverride,
+        parameter_keys: node.data.parameterKeys,
         cache_actions: node.data.cacheActions,
       };
     }
@@ -1174,6 +1235,7 @@ function convertBlocksToBlockYAML(
         const blockYaml: TaskBlockYAML = {
           ...base,
           block_type: "task",
+          title: block.title,
           url: block.url,
           navigation_goal: block.navigation_goal,
           data_extraction_goal: block.data_extraction_goal,
@@ -1206,6 +1268,7 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "action",
           url: block.url,
+          title: block.title,
           navigation_goal: block.navigation_goal,
           error_code_mapping: block.error_code_mapping,
           max_retries: block.max_retries,
@@ -1223,6 +1286,7 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "navigation",
           url: block.url,
+          title: block.title,
           navigation_goal: block.navigation_goal,
           error_code_mapping: block.error_code_mapping,
           max_retries: block.max_retries,
@@ -1232,6 +1296,21 @@ function convertBlocksToBlockYAML(
           parameter_keys: block.parameters.map((p) => p.key),
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
+          cache_actions: block.cache_actions,
+        };
+        return blockYaml;
+      }
+      case "extraction": {
+        const blockYaml: ExtractionBlockYAML = {
+          ...base,
+          block_type: "extraction",
+          url: block.url,
+          title: block.title,
+          data_extraction_goal: block.data_extraction_goal,
+          data_schema: block.data_schema,
+          max_retries: block.max_retries,
+          max_steps_per_run: block.max_steps_per_run,
+          parameter_keys: block.parameters.map((p) => p.key),
           cache_actions: block.cache_actions,
         };
         return blockYaml;
@@ -1327,6 +1406,92 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
   };
 }
 
+function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
+  const errors: Array<string> = [];
+
+  const workflowBlockNodes = nodes.filter(isWorkflowBlockNode);
+  if (
+    workflowBlockNodes.length > 0 &&
+    workflowBlockNodes[0]!.type === "validation"
+  ) {
+    const label = workflowBlockNodes[0]!.data.label;
+    errors.push(
+      `${label}: Validation block can't be the first block in a workflow.`,
+    );
+  }
+
+  const actionNodes = nodes.filter(isActionNode);
+  actionNodes.forEach((node) => {
+    if (node.data.navigationGoal.length === 0) {
+      errors.push(`${node.data.label}: Action Instruction is required.`);
+    }
+    try {
+      JSON.parse(node.data.errorCodeMapping);
+    } catch {
+      errors.push(`${node.data.label}: Error messages is not valid JSON.`);
+    }
+  });
+
+  // check loop node parameters
+  const loopNodes: Array<LoopNode> = nodes.filter(isLoopNode);
+  const emptyLoopNodes = loopNodes.filter(
+    (node: LoopNode) => node.data.loopValue === "",
+  );
+  if (emptyLoopNodes.length > 0) {
+    emptyLoopNodes.forEach((node) => {
+      errors.push(`${node.data.label}: Loop value parameter must be selected.`);
+    });
+  }
+
+  // check task node json fields
+  const taskNodes = nodes.filter(isTaskNode);
+  taskNodes.forEach((node) => {
+    try {
+      JSON.parse(node.data.dataSchema);
+    } catch {
+      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+    }
+    try {
+      JSON.parse(node.data.errorCodeMapping);
+    } catch {
+      errors.push(`${node.data.label}: Error messages is not valid JSON.`);
+    }
+  });
+
+  const validationNodes = nodes.filter(isValidationNode);
+  validationNodes.forEach((node) => {
+    try {
+      JSON.parse(node.data.errorCodeMapping);
+    } catch {
+      errors.push(`${node.data.label}: Error messages is not valid JSON`);
+    }
+    if (
+      node.data.completeCriterion.length === 0 &&
+      node.data.terminateCriterion.length === 0
+    ) {
+      errors.push(
+        `${node.data.label}: At least one of completion or termination criteria must be provided`,
+      );
+    }
+  });
+
+  const navigationNodes = nodes.filter(isNavigationNode);
+  navigationNodes.forEach((node) => {
+    if (node.data.navigationGoal.length === 0) {
+      errors.push(`${node.data.label}: Navigation goal is required.`);
+    }
+  });
+
+  const extractionNodes = nodes.filter(isExtractionNode);
+  extractionNodes.forEach((node) => {
+    if (node.data.dataExtractionGoal.length === 0) {
+      errors.push(`${node.data.label}: Data extraction goal is required.`);
+    }
+  });
+
+  return errors;
+}
+
 export {
   convert,
   convertEchoParameters,
@@ -1344,6 +1509,7 @@ export {
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
   getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
   getWorkflowBlocks,
+  getWorkflowErrors,
   isOutputParameterKey,
   layout,
 };

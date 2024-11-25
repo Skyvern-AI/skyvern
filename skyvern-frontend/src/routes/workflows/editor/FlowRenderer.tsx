@@ -1,5 +1,21 @@
+import { getClient } from "@/api/AxiosClient";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { toast } from "@/components/ui/use-toast";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
 import { DeleteNodeCallbackContext } from "@/store/DeleteNodeCallbackContext";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { ReloadIcon } from "@radix-ui/react-icons";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Background,
   BackgroundVariant,
@@ -12,8 +28,11 @@ import {
   useNodesState,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import { AxiosError } from "axios";
 import { nanoid } from "nanoid";
 import { useEffect, useState } from "react";
+import { useBlocker, useParams } from "react-router-dom";
+import { stringify as convertToYAML } from "yaml";
 import {
   AWSSecretParameter,
   WorkflowApiResponse,
@@ -31,12 +50,7 @@ import {
 import { WorkflowHeader } from "./WorkflowHeader";
 import { WorkflowParametersStateContext } from "./WorkflowParametersStateContext";
 import { edgeTypes } from "./edges";
-import {
-  AppNode,
-  isWorkflowBlockNode,
-  nodeTypes,
-  WorkflowBlockNode,
-} from "./nodes";
+import { AppNode, nodeTypes, WorkflowBlockNode } from "./nodes";
 import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
 import "./reactFlowOverrideStyles.css";
@@ -48,33 +62,11 @@ import {
   getAdditionalParametersForEmailBlock,
   getOutputParameterKey,
   getWorkflowBlocks,
+  getWorkflowErrors,
   layout,
   nodeAdderNode,
   startNode,
 } from "./workflowEditorUtils";
-import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
-import { useBlocker, useParams } from "react-router-dom";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { getClient } from "@/api/AxiosClient";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { stringify as convertToYAML } from "yaml";
-import { toast } from "@/components/ui/use-toast";
-import { AxiosError } from "axios";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { Button } from "@/components/ui/button";
-import { ReloadIcon } from "@radix-ui/react-icons";
-import { isLoopNode, LoopNode } from "./nodes/LoopNode/types";
-import { isTaskNode } from "./nodes/TaskNode/types";
-import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
-import { isValidationNode } from "./nodes/ValidationNode/types";
-import { isActionNode } from "./nodes/ActionNode/types";
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -456,80 +448,6 @@ function FlowRenderer({
     doLayout(newNodesWithUpdatedParameters, newEdges);
   }
 
-  function getWorkflowErrors(): Array<string> {
-    const errors: Array<string> = [];
-
-    const workflowBlockNodes = nodes.filter(isWorkflowBlockNode);
-    if (
-      workflowBlockNodes.length > 0 &&
-      workflowBlockNodes[0]!.type === "validation"
-    ) {
-      const label = workflowBlockNodes[0]!.data.label;
-      errors.push(
-        `${label}: Validation block can't be the first block in a workflow.`,
-      );
-    }
-
-    const actionNodes = nodes.filter(isActionNode);
-    actionNodes.forEach((node) => {
-      if (node.data.navigationGoal.length === 0) {
-        errors.push(`${node.data.label}: Action Instruction is required.`);
-      }
-      try {
-        JSON.parse(node.data.errorCodeMapping);
-      } catch {
-        errors.push(`${node.data.label}: Error messages is not valid JSON.`);
-      }
-    });
-
-    // check loop node parameters
-    const loopNodes: Array<LoopNode> = nodes.filter(isLoopNode);
-    const emptyLoopNodes = loopNodes.filter(
-      (node: LoopNode) => node.data.loopValue === "",
-    );
-    if (emptyLoopNodes.length > 0) {
-      emptyLoopNodes.forEach((node) => {
-        errors.push(
-          `${node.data.label}: Loop value parameter must be selected.`,
-        );
-      });
-    }
-
-    // check task node json fields
-    const taskNodes = nodes.filter(isTaskNode);
-    taskNodes.forEach((node) => {
-      try {
-        JSON.parse(node.data.dataSchema);
-      } catch {
-        errors.push(`${node.data.label}: Data schema is not valid JSON.`);
-      }
-      try {
-        JSON.parse(node.data.errorCodeMapping);
-      } catch {
-        errors.push(`${node.data.label}: Error messages is not valid JSON.`);
-      }
-    });
-
-    const validationNodes = nodes.filter(isValidationNode);
-    validationNodes.forEach((node) => {
-      try {
-        JSON.parse(node.data.errorCodeMapping);
-      } catch {
-        errors.push(`${node.data.label}: Error messages is not valid JSON`);
-      }
-      if (
-        node.data.completeCriterion.length === 0 &&
-        node.data.terminateCriterion.length === 0
-      ) {
-        errors.push(
-          `${node.data.label}: At least one of completion or termination criteria must be provided`,
-        );
-      }
-    });
-
-    return errors;
-  }
-
   return (
     <>
       <Dialog
@@ -649,7 +567,7 @@ function FlowRenderer({
                   }
                 }}
                 onSave={async () => {
-                  const errors = getWorkflowErrors();
+                  const errors = getWorkflowErrors(nodes);
                   if (errors.length > 0) {
                     toast({
                       title: "Can not save workflow because of errors:",
