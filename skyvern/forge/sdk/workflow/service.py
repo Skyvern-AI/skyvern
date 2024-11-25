@@ -1207,7 +1207,7 @@ class WorkflowService:
             raise e
 
     @staticmethod
-    async def _create_output_parameter_for_block(workflow_id: str, block_yaml: BLOCK_YAML_TYPES) -> OutputParameter:
+    async def create_output_parameter_for_block(workflow_id: str, block_yaml: BLOCK_YAML_TYPES) -> OutputParameter:
         output_parameter_key = f"{block_yaml.label}_output"
         return await app.DATABASE.create_output_parameter(
             workflow_id=workflow_id,
@@ -1221,7 +1221,7 @@ class WorkflowService:
     ) -> dict[str, OutputParameter]:
         output_parameters = {}
         for block_yaml in block_yamls:
-            output_parameter = await WorkflowService._create_output_parameter_for_block(
+            output_parameter = await WorkflowService.create_output_parameter_for_block(
                 workflow_id=workflow_id, block_yaml=block_yaml
             )
             output_parameters[block_yaml.label] = output_parameter

@@ -253,9 +253,9 @@ class NavigationBlockYAML(BlockYAML):
 class ExtractionBlockYAML(BlockYAML):
     block_type: Literal[BlockType.EXTRACTION] = BlockType.EXTRACTION  # type: ignore
 
+    data_extraction_goal: str
     url: str | None = None
     title: str = ""
-    data_extraction_goal: str | None = None
     data_schema: dict[str, Any] | list | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None

@@ -1372,9 +1372,13 @@ class ActionBlock(BaseTaskBlock):
 class NavigationBlock(BaseTaskBlock):
     block_type: Literal[BlockType.NAVIGATION] = BlockType.NAVIGATION
 
+    navigation_goal: str
+
 
 class ExtractionBlock(BaseTaskBlock):
     block_type: Literal[BlockType.EXTRACTION] = BlockType.EXTRACTION
+
+    data_extraction_goal: str
 
 
 class LoginBlock(BaseTaskBlock):
