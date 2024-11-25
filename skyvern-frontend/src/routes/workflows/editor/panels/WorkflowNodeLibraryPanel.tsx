@@ -14,6 +14,7 @@ import { WorkflowBlockNode } from "../nodes";
 import { AddNodeProps } from "../FlowRenderer";
 import { ClickIcon } from "@/components/icons/ClickIcon";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
+import { RobotIcon } from "@/components/icons/RobotIcon";
 
 const nodeLibraryItems: Array<{
   nodeType: NonNullable<WorkflowBlockNode["type"]>;
@@ -82,6 +83,12 @@ const nodeLibraryItems: Array<{
     icon: <ClickIcon className="size-6" />,
     title: "Action Block",
     description: "Take a single action",
+  },
+  {
+    nodeType: "navigation",
+    icon: <RobotIcon className="size-6" />,
+    title: "Navigation Block",
+    description: "Navigate on the page",
   },
 ];
 

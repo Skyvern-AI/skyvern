@@ -23,6 +23,7 @@ import {
   TextPromptBlockYAML,
   UploadToS3BlockYAML,
   ValidationBlockYAML,
+  NavigationBlockYAML,
   WorkflowCreateYAMLRequest,
 } from "../types/workflowYamlTypes";
 import {
@@ -52,6 +53,7 @@ import { NodeBaseData } from "./nodes/types";
 import { uploadNodeDefaultData } from "./nodes/UploadNode/types";
 import { validationNodeDefaultData } from "./nodes/ValidationNode/types";
 import { actionNodeDefaultData } from "./nodes/ActionNode/types";
+import { navigationNodeDefaultData } from "./nodes/NavigationNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -194,6 +196,27 @@ function convertToNode(
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           cacheActions: block.cache_actions,
+        },
+      };
+    }
+    case "navigation": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "navigation",
+        data: {
+          ...commonData,
+          url: block.url ?? "",
+          navigationGoal: block.navigation_goal ?? "",
+          errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
+          allowDownloads: block.complete_on_download ?? false,
+          downloadSuffix: block.download_suffix ?? null,
+          maxRetries: block.max_retries ?? null,
+          parameterKeys: block.parameters.map((p) => p.key),
+          totpIdentifier: block.totp_identifier ?? null,
+          totpVerificationUrl: block.totp_verification_url ?? null,
+          cacheActions: block.cache_actions,
+          maxStepsOverride: block.max_steps_per_run ?? null,
         },
       };
     }
@@ -509,6 +532,17 @@ function createNode(
         },
       };
     }
+    case "navigation": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "navigation",
+        data: {
+          ...navigationNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "loop": {
       return {
         ...identifiers,
@@ -654,6 +688,28 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         ...(node.data.maxRetries !== null && {
           max_retries: node.data.maxRetries,
         }),
+        complete_on_download: node.data.allowDownloads,
+        download_suffix: node.data.downloadSuffix,
+        parameter_keys: node.data.parameterKeys,
+        totp_identifier: node.data.totpIdentifier,
+        totp_verification_url: node.data.totpVerificationUrl,
+        cache_actions: node.data.cacheActions,
+      };
+    }
+    case "navigation": {
+      return {
+        ...base,
+        block_type: "navigation",
+        navigation_goal: node.data.navigationGoal,
+        error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
+          string,
+          string
+        > | null,
+        url: node.data.url,
+        ...(node.data.maxRetries !== null && {
+          max_retries: node.data.maxRetries,
+        }),
+        max_steps_per_run: node.data.maxStepsOverride,
         complete_on_download: node.data.allowDownloads,
         download_suffix: node.data.downloadSuffix,
         parameter_keys: node.data.parameterKeys,
@@ -1042,7 +1098,7 @@ function getAvailableOutputParameterKeys(
   return outputParameterKeys;
 }
 
-function convertParameters(
+function convertParametersToParameterYAML(
   parameters: Array<Exclude<Parameter, OutputParameter>>,
 ): Array<ParameterYAML> {
   return parameters.map((parameter) => {
@@ -1105,7 +1161,9 @@ function convertParameters(
   });
 }
 
-function convertBlocks(blocks: Array<WorkflowBlock>): Array<BlockYAML> {
+function convertBlocksToBlockYAML(
+  blocks: Array<WorkflowBlock>,
+): Array<BlockYAML> {
   return blocks.map((block) => {
     const base = {
       label: block.label,
@@ -1160,12 +1218,30 @@ function convertBlocks(blocks: Array<WorkflowBlock>): Array<BlockYAML> {
         };
         return blockYaml;
       }
+      case "navigation": {
+        const blockYaml: NavigationBlockYAML = {
+          ...base,
+          block_type: "navigation",
+          url: block.url,
+          navigation_goal: block.navigation_goal,
+          error_code_mapping: block.error_code_mapping,
+          max_retries: block.max_retries,
+          max_steps_per_run: block.max_steps_per_run,
+          complete_on_download: block.complete_on_download,
+          download_suffix: block.download_suffix,
+          parameter_keys: block.parameters.map((p) => p.key),
+          totp_identifier: block.totp_identifier,
+          totp_verification_url: block.totp_verification_url,
+          cache_actions: block.cache_actions,
+        };
+        return blockYaml;
+      }
       case "for_loop": {
         const blockYaml: ForLoopBlockYAML = {
           ...base,
           block_type: "for_loop",
           loop_over_parameter_key: block.loop_over.key,
-          loop_blocks: convertBlocks(block.loop_blocks),
+          loop_blocks: convertBlocksToBlockYAML(block.loop_blocks),
         };
         return blockYaml;
       }
@@ -1244,8 +1320,8 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     webhook_callback_url: workflow.webhook_callback_url,
     totp_verification_url: workflow.totp_verification_url,
     workflow_definition: {
-      parameters: convertParameters(userParameters),
-      blocks: convertBlocks(workflow.workflow_definition.blocks),
+      parameters: convertParametersToParameterYAML(userParameters),
+      blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
     },
     is_saved_task: workflow.is_saved_task,
   };

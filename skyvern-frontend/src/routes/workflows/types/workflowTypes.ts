@@ -111,7 +111,9 @@ export const WorkflowBlockType = {
   SendEmail: "send_email",
   FileURLParser: "file_url_parser",
   Validation: "validation",
-};
+  Action: "action",
+  Navigation: "navigation",
+} as const;
 
 export type WorkflowBlockType =
   (typeof WorkflowBlockType)[keyof typeof WorkflowBlockType];
@@ -198,9 +200,36 @@ export type ValidationBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
 };
 
-export type ActionBlock = Omit<TaskBlock, "block_type"> & {
+export type ActionBlock = WorkflowBlockBase & {
   block_type: "action";
+  url: string | null;
+  title: string;
+  navigation_goal: string | null;
+  error_code_mapping: Record<string, string> | null;
+  max_retries?: number;
+  max_steps_per_run?: number | null;
   parameters: Array<WorkflowParameter>;
+  complete_on_download?: boolean;
+  download_suffix?: string | null;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
+  cache_actions: boolean;
+};
+
+export type NavigationBlock = WorkflowBlockBase & {
+  block_type: "navigation";
+  url: string | null;
+  title: string;
+  navigation_goal: string | null;
+  error_code_mapping: Record<string, string> | null;
+  max_retries?: number;
+  max_steps_per_run?: number | null;
+  parameters: Array<WorkflowParameter>;
+  complete_on_download?: boolean;
+  download_suffix?: string | null;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
+  cache_actions: boolean;
 };
 
 export type WorkflowBlock =
@@ -213,7 +242,8 @@ export type WorkflowBlock =
   | SendEmailBlock
   | FileURLParserBlock
   | ValidationBlock
-  | ActionBlock;
+  | ActionBlock
+  | NavigationBlock;
 
 export type WorkflowDefinition = {
   parameters: Array<Parameter>;

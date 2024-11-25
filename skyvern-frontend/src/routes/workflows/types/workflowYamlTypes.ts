@@ -77,6 +77,7 @@ const BlockTypes = {
   FILE_URL_PARSER: "file_url_parser",
   VALIDATION: "validation",
   ACTION: "action",
+  NAVIGATION: "navigation",
 } as const;
 
 export type BlockType = (typeof BlockTypes)[keyof typeof BlockTypes];
@@ -91,7 +92,8 @@ export type BlockYAML =
   | FileUrlParserBlockYAML
   | ForLoopBlockYAML
   | ValidationBlockYAML
-  | ActionBlockYAML;
+  | ActionBlockYAML
+  | NavigationBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: BlockType;
@@ -131,6 +133,21 @@ export type ActionBlockYAML = BlockYAMLBase & {
   navigation_goal: string | null;
   error_code_mapping: Record<string, string> | null;
   max_retries?: number;
+  parameter_keys?: Array<string> | null;
+  complete_on_download?: boolean;
+  download_suffix?: string | null;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
+  cache_actions: boolean;
+};
+
+export type NavigationBlockYAML = BlockYAMLBase & {
+  block_type: "navigation";
+  url: string | null;
+  navigation_goal: string | null;
+  error_code_mapping: Record<string, string> | null;
+  max_retries?: number;
+  max_steps_per_run?: number | null;
   parameter_keys?: Array<string> | null;
   complete_on_download?: boolean;
   download_suffix?: string | null;
