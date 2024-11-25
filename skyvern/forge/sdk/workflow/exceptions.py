@@ -114,3 +114,8 @@ class FailedToParseActionInstruction(SkyvernException):
         super().__init__(
             f"Failed to parse the action instruction as '{reason}({error_type})'",
         )
+
+
+class InvalidWaitBlockTime(SkyvernException):
+    def __init__(self, max_sec: int):
+        super().__init__(f"Invalid wait time for wait block, it should be a number between 0 and {max_sec}.")

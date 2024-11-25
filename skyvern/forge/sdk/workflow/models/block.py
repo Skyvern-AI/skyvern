@@ -1,4 +1,5 @@
 import abc
+import asyncio
 import csv
 import json
 import os
@@ -77,6 +78,7 @@ class BlockType(StrEnum):
     NAVIGATION = "navigation"
     EXTRACTION = "extraction"
     LOGIN = "login"
+    WAIT = "wait"
 
 
 class BlockStatus(StrEnum):
@@ -1277,6 +1279,34 @@ class FileParserBlock(Block):
         )
 
 
+class WaitBlock(Block):
+    block_type: Literal[BlockType.WAIT] = BlockType.WAIT
+
+    wait_sec: int
+    parameters: list[PARAMETER_TYPE] = []
+
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,
+    ) -> list[PARAMETER_TYPE]:
+        return self.parameters
+
+    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+        # TODO: we need to support to interrupt the sleep when the workflow run failed/cancelled/terminated
+        LOG.info(
+            "Going to pause the workflow for a while",
+            second=self.wait_sec,
+            workflow_run_id=workflow_run_id,
+        )
+        await asyncio.sleep(self.wait_sec)
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        result_dict = {"success": True}
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
+        return self.build_block_result(
+            success=True, failure_reason=None, output_parameter_value=result_dict, status=BlockStatus.completed
+        )
+
+
 class ValidationBlock(BaseTaskBlock):
     block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION
 
@@ -1365,5 +1395,6 @@ BlockSubclasses = Union[
     NavigationBlock,
     ExtractionBlock,
     LoginBlock,
+    WaitBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]

@@ -21,8 +21,10 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskPromptTemplate
 from skyvern.forge.sdk.models import Organization, Step
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
+    InvalidWaitBlockTime,
     InvalidWorkflowDefinition,
     WorkflowDefinitionHasDuplicateParameterKeys,
     WorkflowDefinitionHasReservedParameterKeys,
@@ -45,6 +47,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     TextPromptBlock,
     UploadToS3Block,
     ValidationBlock,
+    WaitBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -1454,6 +1457,20 @@ class WorkflowService:
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 cache_actions=block_yaml.cache_actions,
+            )
+
+        elif block_yaml.block_type == BlockType.WAIT:
+            if (
+                block_yaml.wait_sec <= 0
+                or block_yaml.wait_sec > SettingsManager.get_settings().WORKFLOW_WAIT_BLOCK_MAX_SEC
+            ):
+                raise InvalidWaitBlockTime(SettingsManager.get_settings().WORKFLOW_WAIT_BLOCK_MAX_SEC)
+
+            return WaitBlock(
+                label=block_yaml.label,
+                wait_sec=block_yaml.wait_sec,
+                continue_on_failure=block_yaml.continue_on_failure,
+                output_parameter=output_parameter,
             )
 
         raise ValueError(f"Invalid block type {block_yaml.block_type}")
