@@ -72,6 +72,7 @@ class Settings(BaseSettings):
 
     # Workflow constant parameters
     WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY: str = "SKYVERN_DOWNLOAD_DIRECTORY"
+    WORKFLOW_WAIT_BLOCK_MAX_SEC: int = 30 * 60
 
     # streaming settings
     STREAMING_FILE_BASE_PATH: str = "/tmp"

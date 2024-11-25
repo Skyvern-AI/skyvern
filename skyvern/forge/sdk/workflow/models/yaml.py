@@ -278,6 +278,11 @@ class LoginBlockYAML(BlockYAML):
     cache_actions: bool = False
 
 
+class WaitBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.WAIT] = BlockType.WAIT  # type: ignore
+    wait_sec: int = 0
+
+
 PARAMETER_YAML_SUBCLASSES = (
     AWSSecretParameterYAML
     | BitwardenLoginCredentialParameterYAML
@@ -303,6 +308,7 @@ BLOCK_YAML_SUBCLASSES = (
     | NavigationBlockYAML
     | ExtractionBlockYAML
     | LoginBlockYAML
+    | WaitBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 
