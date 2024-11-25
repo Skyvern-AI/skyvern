@@ -101,6 +101,20 @@ export type Parameter =
   | BitwardenSensitiveInformationParameter
   | AWSSecretParameter;
 
+export type WorkflowBlock =
+  | TaskBlock
+  | ForLoopBlock
+  | TextPromptBlock
+  | CodeBlock
+  | UploadToS3Block
+  | DownloadToS3Block
+  | SendEmailBlock
+  | FileURLParserBlock
+  | ValidationBlock
+  | ActionBlock
+  | NavigationBlock
+  | ExtractionBlock;
+
 export const WorkflowBlockType = {
   Task: "task",
   ForLoop: "for_loop",
@@ -113,6 +127,7 @@ export const WorkflowBlockType = {
   Validation: "validation",
   Action: "action",
   Navigation: "navigation",
+  Extraction: "extraction",
 } as const;
 
 export type WorkflowBlockType =
@@ -232,18 +247,17 @@ export type NavigationBlock = WorkflowBlockBase & {
   cache_actions: boolean;
 };
 
-export type WorkflowBlock =
-  | TaskBlock
-  | ForLoopBlock
-  | TextPromptBlock
-  | CodeBlock
-  | UploadToS3Block
-  | DownloadToS3Block
-  | SendEmailBlock
-  | FileURLParserBlock
-  | ValidationBlock
-  | ActionBlock
-  | NavigationBlock;
+export type ExtractionBlock = WorkflowBlockBase & {
+  block_type: "extraction";
+  data_extraction_goal: string | null;
+  url: string | null;
+  title: string;
+  data_schema: Record<string, unknown> | null;
+  max_retries?: number;
+  max_steps_per_run?: number | null;
+  parameters: Array<WorkflowParameter>;
+  cache_actions: boolean;
+};
 
 export type WorkflowDefinition = {
   parameters: Array<Parameter>;
