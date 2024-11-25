@@ -624,7 +624,6 @@ class ForgeAgent:
                 task,
                 step,
                 browser_state,
-                organization,
             )
             detailed_agent_step_output.scraped_page = scraped_page
             detailed_agent_step_output.extract_action_prompt = extract_action_prompt
@@ -1098,7 +1097,6 @@ class ForgeAgent:
         step: Step,
         browser_state: BrowserState,
         scrape_type: ScrapeType,
-        organization: Organization | None = None,
     ) -> ScrapedPage:
         if scrape_type == ScrapeType.NORMAL:
             pass
@@ -1121,7 +1119,7 @@ class ForgeAgent:
         return await scrape_website(
             browser_state,
             task.url,
-            app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step, organization=organization),
+            app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step),
             scrape_exclude=app.scrape_exclude,
         )
 
@@ -1130,7 +1128,6 @@ class ForgeAgent:
         task: Task,
         step: Step,
         browser_state: BrowserState,
-        organization: Organization | None = None,
     ) -> tuple[ScrapedPage, str]:
         # start the async tasks while running scrape_website
         self.async_operation_pool.run_operation(task.task_id, AgentPhase.scrape)
@@ -1148,7 +1145,6 @@ class ForgeAgent:
                     step=step,
                     browser_state=browser_state,
                     scrape_type=scrape_type,
-                    organization=organization,
                 )
                 break
             except FailedToTakeScreenshot as e:
