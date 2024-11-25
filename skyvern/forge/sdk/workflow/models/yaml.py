@@ -236,9 +236,9 @@ class ActionBlockYAML(BlockYAML):
 class NavigationBlockYAML(BlockYAML):
     block_type: Literal[BlockType.NAVIGATION] = BlockType.NAVIGATION  # type: ignore
 
+    navigation_goal: str
     url: str | None = None
     title: str = ""
-    navigation_goal: str | None = None
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
