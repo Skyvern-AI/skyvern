@@ -96,13 +96,19 @@ def _remove_skyvern_attributes(element: Dict) -> Dict:
     return element_copied
 
 
-async def _convert_svg_to_string(task: Task, step: Step, organization: Organization | None, element: Dict) -> None:
+async def _convert_svg_to_string(
+    element: Dict,
+    task: Task | None = None,
+    step: Step | None = None,
+) -> None:
     if element.get("tagName") != "svg":
         return
 
     if element.get("isDropped", False):
         return
 
+    task_id = task.task_id if task else None
+    step_id = step.step_id if step else None
     element_id = element.get("id", "")
     svg_element = _remove_skyvern_attributes(element)
     svg_html = json_to_html(svg_element)
@@ -117,8 +123,8 @@ async def _convert_svg_to_string(task: Task, step: Step, organization: Organizat
     except Exception:
         LOG.warning(
             "Failed to loaded SVG cache",
-            task_id=task.task_id,
-            step_id=step.step_id,
+            task_id=task_id,
+            step_id=step_id,
             exc_info=True,
             key=svg_key,
         )
@@ -131,8 +137,8 @@ async def _convert_svg_to_string(task: Task, step: Step, organization: Organizat
             LOG.warning(
                 "SVG element is too large to convert, going to drop the svg element.",
                 element_id=element_id,
-                task_id=task.task_id,
-                step_id=step.step_id,
+                task_id=task_id,
+                step_id=step_id,
                 length=len(svg_html),
             )
             del element["children"]
@@ -154,8 +160,8 @@ async def _convert_svg_to_string(task: Task, step: Step, organization: Organizat
             except Exception:
                 LOG.exception(
                     "Failed to convert SVG to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
-                    task_id=task.task_id,
-                    step_id=step.step_id,
+                    task_id=task_id,
+                    step_id=step_id,
                     element_id=element_id,
                     retry=retry,
                 )
@@ -170,10 +176,15 @@ async def _convert_svg_to_string(task: Task, step: Step, organization: Organizat
 
 
 async def _convert_css_shape_to_string(
-    task: Task, step: Step, organization: Organization | None, frame: Page | Frame, element: Dict
+    frame: Page | Frame,
+    element: Dict,
+    task: Task | None = None,
+    step: Step | None = None,
 ) -> None:
     element_id: str = element.get("id", "")
 
+    task_id = task.task_id if task else None
+    step_id = step.step_id if step else None
     shape_element = _remove_skyvern_attributes(element)
     svg_html = json_to_html(shape_element)
     hash_object = hashlib.sha256()
@@ -187,8 +198,8 @@ async def _convert_css_shape_to_string(
     except Exception:
         LOG.warning(
             "Failed to loaded CSS shape cache",
-            task_id=task.task_id,
-            step_id=step.step_id,
+            task_id=task_id,
+            step_id=step_id,
             exc_info=True,
             key=shape_key,
         )
@@ -201,8 +212,8 @@ async def _convert_css_shape_to_string(
         if await locater.count() == 0:
             LOG.info(
                 "No locater found to convert css shape",
-                task_id=task.task_id,
-                step_id=step.step_id,
+                task_id=task_id,
+                step_id=step_id,
                 element_id=element_id,
             )
             return None
@@ -210,8 +221,8 @@ async def _convert_css_shape_to_string(
         if await locater.count() > 1:
             LOG.info(
                 "multiple locaters found to convert css shape",
-                task_id=task.task_id,
-                step_id=step.step_id,
+                task_id=task_id,
+                step_id=step_id,
                 element_id=element_id,
             )
             return None
@@ -235,8 +246,8 @@ async def _convert_css_shape_to_string(
                 except Exception:
                     LOG.exception(
                         "Failed to convert css shape to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
-                        task_id=task.task_id,
-                        step_id=step.step_id,
+                        task_id=task_id,
+                        step_id=step_id,
                         element_id=element_id,
                         retry=retry,
                     )
@@ -244,16 +255,16 @@ async def _convert_css_shape_to_string(
             else:
                 LOG.info(
                     "Max css shape convertion retry, going to abort the convertion.",
-                    task_id=task.task_id,
-                    step_id=step.step_id,
+                    task_id=task_id,
+                    step_id=step_id,
                     element_id=element_id,
                 )
                 return None
         except Exception:
             LOG.warning(
                 "Failed to convert css shape to string shape by LLM",
-                task_id=task.task_id,
-                step_id=step.step_id,
+                task_id=task_id,
+                step_id=step_id,
                 element_id=element_id,
                 exc_info=True,
             )
@@ -316,9 +327,8 @@ class AgentFunction:
 
     def cleanup_element_tree_factory(
         self,
-        task: Task,
-        step: Step,
-        organization: Organization | None = None,
+        task: Task | None = None,
+        step: Step | None = None,
     ) -> CleanupElementTreeFunc:
         async def cleanup_element_tree_func(frame: Page | Frame, url: str, element_tree: list[dict]) -> list[dict]:
             """
@@ -335,15 +345,14 @@ class AgentFunction:
             while queue:
                 queue_ele = queue.pop(0)
                 _remove_rect(queue_ele)
-                await _convert_svg_to_string(task, step, organization, queue_ele)
+                await _convert_svg_to_string(queue_ele, task, step)
 
                 if _should_css_shape_convert(element=queue_ele):
                     await _convert_css_shape_to_string(
-                        task=task,
-                        step=step,
-                        organization=organization,
                         frame=frame,
                         element=queue_ele,
+                        task=task,
+                        step=step,
                     )
 
                 # TODO: we can come back to test removing the unique_id
