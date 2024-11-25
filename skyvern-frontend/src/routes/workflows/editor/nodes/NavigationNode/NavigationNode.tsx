@@ -13,25 +13,27 @@ import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { useState } from "react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
-import type { ActionNode } from "./types";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
 import { errorMappingExampleValue } from "../types";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { Switch } from "@/components/ui/switch";
-import { ClickIcon } from "@/components/icons/ClickIcon";
+import type { NavigationNode } from "./types";
 import {
   commonFieldPlaceholders,
   commonHelpTooltipContent,
 } from "../../constants";
+import { RobotIcon } from "@/components/icons/RobotIcon";
 
+const urlTooltip =
+  "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
+const urlPlaceholder = "https://";
 const navigationGoalTooltip =
-  "Specify a single step or action you'd like Skyvern to complete. Actions are one-off tasks like filling a field or interacting with a specific element on the page.\n\nCurrently supported actions are click, input text, upload file, and select.";
+  "Give Skyvern an objective. Make sure to include when the task is complete, when it should self-terminate, and any guardrails.";
+const navigationGoalPlaceholder = "Tell Skyvern what to do.";
 
-const navigationGoalPlaceholder = 'Input text into "Name" field.';
-
-function ActionNode({ id, data }: NodeProps<ActionNode>) {
+function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
   const { updateNodeData } = useReactFlow();
   const { editable } = data;
   const [label, setLabel] = useNodeLabelChangeHandler({
@@ -39,9 +41,11 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
     initialValue: data.label,
   });
   const [inputs, setInputs] = useState({
+    url: data.url,
     navigationGoal: data.navigationGoal,
     errorCodeMapping: data.errorCodeMapping,
     maxRetries: data.maxRetries,
+    maxStepsOverride: data.maxStepsOverride,
     allowDownloads: data.allowDownloads,
     continueOnFailure: data.continueOnFailure,
     cacheActions: data.cacheActions,
@@ -77,7 +81,7 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
         <header className="flex h-[2.75rem] justify-between">
           <div className="flex gap-2">
             <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <ClickIcon className="size-6" />
+              <RobotIcon className="size-6" />
             </div>
             <div className="flex flex-col gap-1">
               <EditableNodeTitle
@@ -87,7 +91,7 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                 titleClassName="text-base"
                 inputClassName="text-base"
               />
-              <span className="text-xs text-slate-400">Action Block</span>
+              <span className="text-xs text-slate-400">Navigation Block</span>
             </div>
           </div>
           <NodeActionMenu
@@ -97,21 +101,40 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
           />
         </header>
         <div className="space-y-2">
-          <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">Action Instruction</Label>
-            <HelpTooltip content={navigationGoalTooltip} />
+          <div className="space-y-2">
+            <div className="flex gap-2">
+              <Label className="text-xs text-slate-300">URL</Label>
+              <HelpTooltip content={urlTooltip} />
+            </div>
+            <AutoResizingTextarea
+              onChange={(event) => {
+                if (!editable) {
+                  return;
+                }
+                handleChange("url", event.target.value);
+              }}
+              value={inputs.url}
+              placeholder={urlPlaceholder}
+              className="nopan text-xs"
+            />
           </div>
-          <AutoResizingTextarea
-            onChange={(event) => {
-              if (!editable) {
-                return;
-              }
-              handleChange("navigationGoal", event.target.value);
-            }}
-            value={inputs.navigationGoal}
-            placeholder={navigationGoalPlaceholder}
-            className="nopan text-xs"
-          />
+          <div className="space-y-2">
+            <div className="flex gap-2">
+              <Label className="text-xs text-slate-300">Navigation Goal</Label>
+              <HelpTooltip content={navigationGoalTooltip} />
+            </div>
+            <AutoResizingTextarea
+              onChange={(event) => {
+                if (!editable) {
+                  return;
+                }
+                handleChange("navigationGoal", event.target.value);
+              }}
+              value={inputs.navigationGoal}
+              placeholder={navigationGoalPlaceholder}
+              className="nopan text-xs"
+            />
+          </div>
         </div>
         <Separator />
         <Accordion type="single" collapsible>
@@ -145,6 +168,33 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                           ? null
                           : Number(event.target.value);
                       handleChange("maxRetries", value);
+                    }}
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <div className="flex gap-2">
+                    <Label className="text-xs font-normal text-slate-300">
+                      Max Steps Override
+                    </Label>
+                    <HelpTooltip
+                      content={commonHelpTooltipContent["maxStepsOverride"]}
+                    />
+                  </div>
+                  <Input
+                    type="number"
+                    placeholder={commonFieldPlaceholders["maxStepsOverride"]}
+                    className="nopan w-52 text-xs"
+                    min="0"
+                    value={inputs.maxStepsOverride ?? ""}
+                    onChange={(event) => {
+                      if (!editable) {
+                        return;
+                      }
+                      const value =
+                        event.target.value === ""
+                          ? null
+                          : Number(event.target.value);
+                      handleChange("maxStepsOverride", value);
                     }}
                   />
                 </div>
@@ -330,4 +380,4 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
   );
 }
 
-export { ActionNode };
+export { NavigationNode };

@@ -1,11 +1,12 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
 
-export type ActionNodeData = NodeBaseData & {
+export type NavigationNodeData = NodeBaseData & {
   url: string;
   navigationGoal: string;
   errorCodeMapping: string;
   maxRetries: number | null;
+  maxStepsOverride: number | null;
   allowDownloads: boolean;
   downloadSuffix: string | null;
   parameterKeys: Array<string>;
@@ -14,14 +15,15 @@ export type ActionNodeData = NodeBaseData & {
   cacheActions: boolean;
 };
 
-export type ActionNode = Node<ActionNodeData, "action">;
+export type NavigationNode = Node<NavigationNodeData, "navigation">;
 
-export const actionNodeDefaultData: ActionNodeData = {
+export const navigationNodeDefaultData: NavigationNodeData = {
   label: "",
   url: "",
   navigationGoal: "",
   errorCodeMapping: "null",
   maxRetries: null,
+  maxStepsOverride: null,
   allowDownloads: false,
   downloadSuffix: null,
   editable: true,
@@ -32,6 +34,6 @@ export const actionNodeDefaultData: ActionNodeData = {
   cacheActions: false,
 } as const;
 
-export function isActionNode(node: Node): node is ActionNode {
-  return node.type === "action";
+export function isNavigationNode(node: Node): node is NavigationNode {
+  return node.type === "navigation";
 }

@@ -23,6 +23,8 @@ import type { ValidationNode } from "./ValidationNode/types";
 import { ValidationNode as ValidationNodeComponent } from "./ValidationNode/ValidationNode";
 import type { ActionNode } from "./ActionNode/types";
 import { ActionNode as ActionNodeComponent } from "./ActionNode/ActionNode";
+import { NavigationNode } from "./NavigationNode/types";
+import { NavigationNode as NavigationNodeComponent } from "./NavigationNode/NavigationNode";
 
 export type UtilityNode = StartNode | NodeAdderNode;
 
@@ -36,7 +38,8 @@ export type WorkflowBlockNode =
   | UploadNode
   | DownloadNode
   | ValidationNode
-  | ActionNode;
+  | ActionNode
+  | NavigationNode;
 
 export function isUtilityNode(node: AppNode): node is UtilityNode {
   return node.type === "nodeAdder" || node.type === "start";
@@ -61,4 +64,5 @@ export const nodeTypes = {
   start: memo(StartNodeComponent),
   validation: memo(ValidationNodeComponent),
   action: memo(ActionNodeComponent),
-};
+  navigation: memo(NavigationNodeComponent),
+} as const;
