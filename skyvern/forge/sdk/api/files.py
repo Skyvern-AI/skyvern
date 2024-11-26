@@ -2,6 +2,7 @@ import hashlib
 import mimetypes
 import os
 import re
+import shutil
 import tempfile
 import zipfile
 from pathlib import Path
@@ -180,3 +181,25 @@ def create_named_temporary_file(delete: bool = True) -> tempfile._TemporaryFileW
     temp_dir = SettingsManager.get_settings().TEMP_PATH
     create_folder_if_not_exist(temp_dir)
     return tempfile.NamedTemporaryFile(dir=temp_dir, delete=delete)
+
+
+def clean_up_dir(dir: str) -> None:
+    if not os.path.exists(dir):
+        return
+
+    if os.path.isfile(dir):
+        os.unlink(dir)
+        return
+
+    for item in os.listdir(dir):
+        item_path = os.path.join(dir, item)
+        if os.path.isfile(item_path) or os.path.islink(item_path):
+            os.unlink(item_path)
+        elif os.path.isdir(item_path):
+            shutil.rmtree(item_path)
+
+    return
+
+
+def clean_up_skyvern_temp_dir() -> None:
+    return clean_up_dir(get_skyvern_temp_dir())
