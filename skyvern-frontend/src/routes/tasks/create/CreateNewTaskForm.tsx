@@ -514,6 +514,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                               <ProxySelector
                                 value={field.value}
                                 onChange={field.onChange}
+                                className="w-48"
                               />
                             </FormControl>
                             <FormMessage />

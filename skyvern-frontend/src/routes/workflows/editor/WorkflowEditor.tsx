@@ -7,6 +7,7 @@ import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { FlowRenderer } from "./FlowRenderer";
 import { getElements } from "./workflowEditorUtils";
 import { LogoMinimized } from "@/components/LogoMinimized";
+import { WorkflowSettings } from "../types/workflowTypes";
 
 function WorkflowEditor() {
   const { workflowPermanentId } = useParams();
@@ -39,7 +40,13 @@ function WorkflowEditor() {
     return null;
   }
 
-  const elements = getElements(workflow.workflow_definition.blocks);
+  const settings: WorkflowSettings = {
+    persistBrowserSession: workflow.persist_browser_session,
+    proxyLocation: workflow.proxy_location,
+    webhookCallbackUrl: workflow.webhook_callback_url,
+  };
+
+  const elements = getElements(workflow.workflow_definition.blocks, settings);
 
   return (
     <div className="h-screen w-full">

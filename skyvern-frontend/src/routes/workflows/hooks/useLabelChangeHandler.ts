@@ -1,5 +1,5 @@
 import { useNodes, useReactFlow } from "@xyflow/react";
-import { AppNode } from "../editor/nodes";
+import { AppNode, isWorkflowBlockNode } from "../editor/nodes";
 import {
   getUniqueLabelForExistingNode,
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
@@ -21,7 +21,9 @@ function useNodeLabelChangeHandler({ id, initialValue }: Props) {
     useWorkflowParametersState();
 
   function handleLabelChange(value: string) {
-    const existingLabels = nodes.map((n) => n.data.label);
+    const existingLabels = nodes
+      .filter(isWorkflowBlockNode)
+      .map((n) => n.data.label);
     const labelWithoutWhitespace = value.replace(/\s+/g, "_");
     const newLabel = getUniqueLabelForExistingNode(
       labelWithoutWhitespace,

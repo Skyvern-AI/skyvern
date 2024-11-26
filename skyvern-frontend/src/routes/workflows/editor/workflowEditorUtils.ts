@@ -9,6 +9,7 @@ import type {
   WorkflowApiResponse,
   WorkflowBlock,
   WorkflowParameterValueType,
+  WorkflowSettings,
 } from "../types/workflowTypes";
 import {
   ActionBlockYAML,
@@ -53,7 +54,12 @@ import {
 } from "./nodes/LoopNode/types";
 import { NodeAdderNode } from "./nodes/NodeAdderNode/types";
 import { sendEmailNodeDefaultData } from "./nodes/SendEmailNode/types";
-import { StartNode } from "./nodes/StartNode/types";
+import {
+  isStartNode,
+  isWorkflowStartNodeData,
+  StartNode,
+  StartNodeData,
+} from "./nodes/StartNode/types";
 import { isTaskNode, taskNodeDefaultData } from "./nodes/TaskNode/types";
 import { textPromptNodeDefaultData } from "./nodes/TextPromptNode/types";
 import { NodeBaseData } from "./nodes/types";
@@ -73,6 +79,7 @@ import {
 } from "./nodes/ExtractionNode/types";
 import { loginNodeDefaultData } from "./nodes/LoginNode/types";
 import { waitNodeDefaultData } from "./nodes/WaitNode/types";
+import { ProxyLocation } from "@/api/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -458,12 +465,16 @@ export function edgeWithAddButton(source: string, target: string) {
   };
 }
 
-export function startNode(id: string, parentId?: string): StartNode {
+export function startNode(
+  id: string,
+  data: StartNodeData,
+  parentId?: string,
+): StartNode {
   const node: StartNode = {
     id,
     type: "start",
     position: { x: 0, y: 0 },
-    data: {},
+    data,
     draggable: false,
     connectable: false,
   };
@@ -488,7 +499,10 @@ export function nodeAdderNode(id: string, parentId?: string): NodeAdderNode {
   return node;
 }
 
-function getElements(blocks: Array<WorkflowBlock>): {
+function getElements(
+  blocks: Array<WorkflowBlock>,
+  settings: WorkflowSettings,
+): {
   nodes: Array<AppNode>;
   edges: Array<Edge>;
 } {
@@ -497,7 +511,14 @@ function getElements(blocks: Array<WorkflowBlock>): {
   const edges: Array<Edge> = [];
 
   const startNodeId = nanoid();
-  nodes.push(startNode(startNodeId));
+  nodes.push(
+    startNode(startNodeId, {
+      withWorkflowSettings: true,
+      persistBrowserSession: settings.persistBrowserSession,
+      proxyLocation: settings.proxyLocation ?? ProxyLocation.Residential,
+      webhookCallbackUrl: settings.webhookCallbackUrl ?? "",
+    }),
+  );
 
   data.forEach((d, index) => {
     const node = convertToNode(
@@ -519,7 +540,15 @@ function getElements(blocks: Array<WorkflowBlock>): {
   const loopBlocks = data.filter((d) => d.block.block_type === "for_loop");
   loopBlocks.forEach((block) => {
     const startNodeId = nanoid();
-    nodes.push(startNode(startNodeId, block.id));
+    nodes.push(
+      startNode(
+        startNodeId,
+        {
+          withWorkflowSettings: false,
+        },
+        block.id,
+      ),
+    );
     const children = data.filter((b) => b.parentId === block.id);
     if (children.length === 0) {
       const adderNodeId = nanoid();
@@ -555,7 +584,7 @@ function createNode(
   identifiers: { id: string; parentId?: string },
   nodeType: NonNullable<WorkflowBlockNode["type"]>,
   label: string,
-): AppNode {
+): WorkflowBlockNode {
   const common = {
     draggable: false,
     position: { x: 0, y: 0 },
@@ -989,6 +1018,30 @@ function getWorkflowBlocks(
   edges: Array<Edge>,
 ): Array<BlockYAML> {
   return getWorkflowBlocksUtil(nodes, edges);
+}
+
+function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
+  const defaultSettings = {
+    persistBrowserSession: false,
+    proxyLocation: ProxyLocation.Residential,
+    webhookCallbackUrl: null,
+  };
+  const startNodes = nodes.filter(isStartNode);
+  const startNodeWithWorkflowSettings = startNodes.find(
+    (node) => node.data.withWorkflowSettings,
+  );
+  if (!startNodeWithWorkflowSettings) {
+    return defaultSettings;
+  }
+  const data = startNodeWithWorkflowSettings.data;
+  if (isWorkflowStartNodeData(data)) {
+    return {
+      persistBrowserSession: data.persistBrowserSession,
+      proxyLocation: data.proxyLocation,
+      webhookCallbackUrl: data.webhookCallbackUrl,
+    };
+  }
+  return defaultSettings;
 }
 
 function generateNodeLabel(existingLabels: Array<string>) {
@@ -1608,6 +1661,7 @@ export {
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,
   getElements,
+  getWorkflowSettings,
   getOutputParameterKey,
   getPreviousNodeIds,
   getUniqueLabelForExistingNode,

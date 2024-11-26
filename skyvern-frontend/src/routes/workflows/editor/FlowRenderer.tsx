@@ -37,6 +37,7 @@ import {
   AWSSecretParameter,
   WorkflowApiResponse,
   WorkflowParameterValueType,
+  WorkflowSettings,
 } from "../types/workflowTypes";
 import {
   BitwardenLoginCredentialParameterYAML,
@@ -50,7 +51,12 @@ import {
 import { WorkflowHeader } from "./WorkflowHeader";
 import { WorkflowParametersStateContext } from "./WorkflowParametersStateContext";
 import { edgeTypes } from "./edges";
-import { AppNode, nodeTypes, WorkflowBlockNode } from "./nodes";
+import {
+  AppNode,
+  isWorkflowBlockNode,
+  nodeTypes,
+  WorkflowBlockNode,
+} from "./nodes";
 import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
 import "./reactFlowOverrideStyles.css";
@@ -63,6 +69,7 @@ import {
   getOutputParameterKey,
   getWorkflowBlocks,
   getWorkflowErrors,
+  getWorkflowSettings,
   layout,
   nodeAdderNode,
   startNode,
@@ -200,6 +207,7 @@ function FlowRenderer({
       parameters: Array<ParameterYAML>;
       blocks: Array<BlockYAML>;
       title: string;
+      settings: WorkflowSettings;
     }) => {
       if (!workflowPermanentId) {
         return;
@@ -208,8 +216,9 @@ function FlowRenderer({
       const requestBody: WorkflowCreateYAMLRequest = {
         title: data.title,
         description: workflow.description,
-        proxy_location: workflow.proxy_location,
-        webhook_callback_url: workflow.webhook_callback_url,
+        proxy_location: data.settings.proxyLocation,
+        webhook_callback_url: data.settings.webhookCallbackUrl,
+        persist_browser_session: data.settings.persistBrowserSession,
         totp_verification_url: workflow.totp_verification_url,
         workflow_definition: {
           parameters: data.parameters,
@@ -267,6 +276,7 @@ function FlowRenderer({
 
   async function handleSave() {
     const blocks = getWorkflowBlocks(nodes, edges);
+    const settings = getWorkflowSettings(nodes);
     const parametersInYAMLConvertibleJSON = convertToParametersYAML(parameters);
     const filteredParameters = workflow.workflow_definition.parameters.filter(
       (parameter) => {
@@ -295,6 +305,7 @@ function FlowRenderer({
       ],
       blocks,
       title,
+      settings,
     });
   }
 
@@ -308,10 +319,13 @@ function FlowRenderer({
     const newNodes: Array<AppNode> = [];
     const newEdges: Array<Edge> = [];
     const id = nanoid();
+    const existingLabels = nodes
+      .filter(isWorkflowBlockNode)
+      .map((node) => node.data.label);
     const node = createNode(
       { id, parentId: parent },
       nodeType,
-      generateNodeLabel(nodes.map((node) => node.data.label)),
+      generateNodeLabel(existingLabels),
     );
     newNodes.push(node);
     if (previous) {
@@ -343,7 +357,9 @@ function FlowRenderer({
       // when loop node is first created it needs an adder node so nodes can be added inside the loop
       const startNodeId = nanoid();
       const adderNodeId = nanoid();
-      newNodes.push(startNode(startNodeId, id));
+      newNodes.push(
+        startNode(startNodeId, { withWorkflowSettings: false }, id),
+      );
       newNodes.push(nodeAdderNode(adderNodeId, id));
       newEdges.push(defaultEdge(startNodeId, adderNodeId));
     }
@@ -370,7 +386,7 @@ function FlowRenderer({
 
   function deleteNode(id: string) {
     const node = nodes.find((node) => node.id === id);
-    if (!node) {
+    if (!node || !isWorkflowBlockNode(node)) {
       return;
     }
     const deletedNodeLabel = node.data.label;

@@ -3,6 +3,7 @@ export type WorkflowCreateYAMLRequest = {
   description?: string | null;
   proxy_location?: string | null;
   webhook_callback_url?: string | null;
+  persist_browser_session?: boolean;
   totp_verification_url?: string | null;
   workflow_definition: WorkflowDefinitionYAML;
   is_saved_task?: boolean;

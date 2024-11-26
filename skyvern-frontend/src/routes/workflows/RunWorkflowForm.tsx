@@ -1,4 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
+import { ProxyLocation } from "@/api/types";
+import { ProxySelector } from "@/components/ProxySelector";
+import { Button } from "@/components/ui/button";
 import {
   Form,
   FormControl,
@@ -7,28 +10,29 @@ import {
   FormLabel,
   FormMessage,
 } from "@/components/ui/form";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useForm } from "react-hook-form";
-import { Link, useParams } from "react-router-dom";
-import { WorkflowParameterInput } from "./WorkflowParameterInput";
-import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { toast } from "@/components/ui/use-toast";
+import { useApiCredential } from "@/hooks/useApiCredential";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { copyText } from "@/util/copyText";
+import { apiBaseUrl } from "@/util/env";
 import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { ToastAction } from "@radix-ui/react-toast";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import fetchToCurl from "fetch-to-curl";
-import { apiBaseUrl } from "@/util/env";
-import { useApiCredential } from "@/hooks/useApiCredential";
-import { copyText } from "@/util/copyText";
-import { WorkflowParameter } from "./types/workflowTypes";
-import { Input } from "@/components/ui/input";
+import { useForm } from "react-hook-form";
+import { Link, useParams } from "react-router-dom";
 import { z } from "zod";
-import { ProxyLocation } from "@/api/types";
-import { ProxySelector } from "@/components/ProxySelector";
+import { WorkflowParameter } from "./types/workflowTypes";
+import { WorkflowParameterInput } from "./WorkflowParameterInput";
 
 type Props = {
   workflowParameters: Array<WorkflowParameter>;
   initialValues: Record<string, unknown>;
+  initialSettings: {
+    proxyLocation: ProxyLocation;
+    webhookCallbackUrl: string;
+  };
 };
 
 function parseValuesForWorkflowRun(
@@ -92,19 +96,23 @@ function getRunWorkflowRequestBody(
 }
 
 type RunWorkflowFormType = Record<string, unknown> & {
-  webhookCallbackUrl: string | null;
-  proxyLocation: ProxyLocation | null;
+  webhookCallbackUrl: string;
+  proxyLocation: ProxyLocation;
 };
 
-function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
+function RunWorkflowForm({
+  workflowParameters,
+  initialValues,
+  initialSettings,
+}: Props) {
   const { workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const form = useForm<RunWorkflowFormType>({
     defaultValues: {
       ...initialValues,
-      webhookCallbackUrl: null,
-      proxyLocation: ProxyLocation.Residential,
+      webhookCallbackUrl: initialSettings.webhookCallbackUrl,
+      proxyLocation: initialSettings.proxyLocation,
     },
   });
   const apiCredential = useApiCredential();
@@ -313,6 +321,7 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
                         <ProxySelector
                           value={field.value}
                           onChange={field.onChange}
+                          className="w-48"
                         />
                       </FormControl>
                       <FormMessage />
