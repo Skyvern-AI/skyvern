@@ -283,6 +283,22 @@ class WaitBlockYAML(BlockYAML):
     wait_sec: int = 0
 
 
+class FileDownloadBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD  # type: ignore
+
+    navigation_goal: str
+    url: str | None = None
+    title: str = ""
+    error_code_mapping: dict[str, str] | None = None
+    max_retries: int = 0
+    max_steps_per_run: int | None = None
+    parameter_keys: list[str] | None = None
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool = False
+
+
 PARAMETER_YAML_SUBCLASSES = (
     AWSSecretParameterYAML
     | BitwardenLoginCredentialParameterYAML
@@ -309,6 +325,7 @@ BLOCK_YAML_SUBCLASSES = (
     | ExtractionBlockYAML
     | LoginBlockYAML
     | WaitBlockYAML
+    | FileDownloadBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 
