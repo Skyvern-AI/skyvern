@@ -38,7 +38,6 @@ from skyvern.forge.sdk.workflow.models.block import (
     CodeBlock,
     DownloadToS3Block,
     ExtractionBlock,
-    FileDownloadBlock,
     FileParserBlock,
     ForLoopBlock,
     LoginBlock,
@@ -1473,30 +1472,6 @@ class WorkflowService:
                 wait_sec=block_yaml.wait_sec,
                 continue_on_failure=block_yaml.continue_on_failure,
                 output_parameter=output_parameter,
-            )
-
-        elif block_yaml.block_type == BlockType.FILE_DOWNLOAD:
-            file_download_block_parameters = (
-                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
-                if block_yaml.parameter_keys
-                else []
-            )
-            return FileDownloadBlock(
-                label=block_yaml.label,
-                url=block_yaml.url,
-                title=block_yaml.title,
-                parameters=file_download_block_parameters,
-                output_parameter=output_parameter,
-                navigation_goal=block_yaml.navigation_goal,
-                error_code_mapping=block_yaml.error_code_mapping,
-                max_steps_per_run=block_yaml.max_steps_per_run,
-                max_retries=block_yaml.max_retries,
-                download_suffix=block_yaml.download_suffix,
-                continue_on_failure=block_yaml.continue_on_failure,
-                totp_verification_url=block_yaml.totp_verification_url,
-                totp_identifier=block_yaml.totp_identifier,
-                cache_actions=block_yaml.cache_actions,
-                complete_on_download=True,
             )
 
         raise ValueError(f"Invalid block type {block_yaml.block_type}")
