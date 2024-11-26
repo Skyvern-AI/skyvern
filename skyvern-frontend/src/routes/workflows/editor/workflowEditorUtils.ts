@@ -543,10 +543,6 @@ function getElements(blocks: Array<WorkflowBlock>): {
     nodes.push(nodeAdderNode(adderNodeId));
     edges.push(defaultEdge(startNodeId, adderNodeId));
   } else {
-    const firstNode = data.find(
-      (d) => d.previous === null && d.parentId === null,
-    );
-    edges.push(edgeWithAddButton(startNodeId, firstNode!.id));
     const lastNode = data.find((d) => d.next === null && d.parentId === null)!;
     edges.push(defaultEdge(lastNode.id, adderNodeId));
     nodes.push(nodeAdderNode(adderNodeId));
