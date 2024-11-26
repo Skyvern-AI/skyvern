@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     VIDEO_PATH: str | None = None
     HAR_PATH: str | None = "./har"
     LOG_PATH: str = "./log"
+    TEMP_PATH: str = "./temp"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
     BROWSER_LOADING_TIMEOUT_MS: int = 120000
@@ -73,9 +74,6 @@ class Settings(BaseSettings):
     # Workflow constant parameters
     WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY: str = "SKYVERN_DOWNLOAD_DIRECTORY"
     WORKFLOW_WAIT_BLOCK_MAX_SEC: int = 30 * 60
-
-    # streaming settings
-    STREAMING_FILE_BASE_PATH: str = "/tmp"
 
     # Saved browser session settings
     BROWSER_SESSION_BASE_PATH: str = f"{constants.REPO_ROOT_DIR}/browser_sessions"

@@ -6,6 +6,7 @@ from urllib.parse import unquote, urlparse
 
 import structlog
 
+from skyvern.forge.sdk.api.files import get_skyvern_temp_dir
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP, BaseStorage
 from skyvern.forge.sdk.models import Step
@@ -73,9 +74,9 @@ class LocalStorage(BaseStorage):
         return
 
     async def get_streaming_file(self, organization_id: str, file_name: str, use_default: bool = True) -> bytes | None:
-        file_path = Path(f"{SettingsManager.get_settings().STREAMING_FILE_BASE_PATH}/skyvern_screenshot.png")
+        file_path = Path(f"{get_skyvern_temp_dir()}/skyvern_screenshot.png")
         if not use_default:
-            file_path = Path(f"{SettingsManager.get_settings().STREAMING_FILE_BASE_PATH}/{organization_id}/{file_name}")
+            file_path = Path(f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}")
         try:
             with open(file_path, "rb") as f:
                 return f.read()

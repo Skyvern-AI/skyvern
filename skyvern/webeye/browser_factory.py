@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import tempfile
 import time
 import uuid
 from datetime import datetime
@@ -24,6 +23,7 @@ from skyvern.exceptions import (
     UnknownBrowserType,
     UnknownErrorWhileCreatingBrowserContext,
 )
+from skyvern.forge.sdk.api.files import make_temp_directory
 from skyvern.forge.sdk.core.skyvern_context import current
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -153,7 +153,7 @@ class BrowserContextFactory:
         video_dir = f"{SettingsManager.get_settings().VIDEO_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}"
         har_dir = f"{SettingsManager.get_settings().HAR_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{BrowserContextFactory.get_subdir()}.har"
         return {
-            "user_data_dir": tempfile.mkdtemp(prefix="skyvern_browser_"),
+            "user_data_dir": make_temp_directory(prefix="skyvern_browser_"),
             "locale": SettingsManager.get_settings().BROWSER_LOCALE,
             "timezone_id": SettingsManager.get_settings().BROWSER_TIMEZONE,
             "color_scheme": "no-preference",

@@ -1,10 +1,14 @@
 import shutil
-import tempfile
 from datetime import datetime
 
 from skyvern.config import settings
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
-from skyvern.forge.sdk.api.files import unzip_files
+from skyvern.forge.sdk.api.files import (
+    create_named_temporary_file,
+    get_skyvern_temp_dir,
+    make_temp_directory,
+    unzip_files,
+)
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP, BaseStorage
 from skyvern.forge.sdk.models import Step
@@ -36,7 +40,7 @@ class S3Storage(BaseStorage):
         await self.async_client.upload_file_from_path(artifact.uri, path)
 
     async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
-        from_path = f"{settings.STREAMING_FILE_BASE_PATH}/{organization_id}/{file_name}"
+        from_path = f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}"
         to_path = f"s3://{settings.AWS_S3_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
         await self.async_client.upload_file_from_path(to_path, from_path)
 
@@ -46,7 +50,7 @@ class S3Storage(BaseStorage):
 
     async def store_browser_session(self, organization_id: str, workflow_permanent_id: str, directory: str) -> None:
         # Zip the directory to a temp file
-        temp_zip_file = tempfile.NamedTemporaryFile()
+        temp_zip_file = create_named_temporary_file()
         zip_file_path = shutil.make_archive(temp_zip_file.name, "zip", directory)
         browser_session_uri = f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
         await self.async_client.upload_file_from_path(browser_session_uri, zip_file_path)
@@ -56,11 +60,11 @@ class S3Storage(BaseStorage):
         downloaded_zip_bytes = await self.async_client.download_file(browser_session_uri, log_exception=True)
         if not downloaded_zip_bytes:
             return None
-        temp_zip_file = tempfile.NamedTemporaryFile(delete=False)
+        temp_zip_file = create_named_temporary_file(delete=False)
         temp_zip_file.write(downloaded_zip_bytes)
         temp_zip_file_path = temp_zip_file.name
 
-        temp_dir = tempfile.mkdtemp(prefix="skyvern_browser_session_")
+        temp_dir = make_temp_directory(prefix="skyvern_browser_session_")
         unzip_files(temp_zip_file_path, temp_dir)
         temp_zip_file.close()
         return temp_dir
