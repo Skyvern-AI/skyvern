@@ -6,6 +6,7 @@ import {
   EnvelopeClosedIcon,
   FileIcon,
   ListBulletIcon,
+  LockOpen1Icon,
   PlusIcon,
   UpdateIcon,
   UploadIcon,
@@ -96,6 +97,12 @@ const nodeLibraryItems: Array<{
     icon: <ExtractIcon className="size-6" />,
     title: "Extraction Block",
     description: "Extract data from the page",
+  },
+  {
+    nodeType: "login",
+    icon: <LockOpen1Icon className="size-6" />,
+    title: "Login Block",
+    description: "Login to a website",
   },
 ];
 

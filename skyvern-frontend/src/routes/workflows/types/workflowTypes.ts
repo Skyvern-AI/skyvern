@@ -113,7 +113,8 @@ export type WorkflowBlock =
   | ValidationBlock
   | ActionBlock
   | NavigationBlock
-  | ExtractionBlock;
+  | ExtractionBlock
+  | LoginBlock;
 
 export const WorkflowBlockType = {
   Task: "task",
@@ -128,6 +129,7 @@ export const WorkflowBlockType = {
   Action: "action",
   Navigation: "navigation",
   Extraction: "extraction",
+  Login: "login",
 } as const;
 
 export type WorkflowBlockType =
@@ -256,6 +258,20 @@ export type ExtractionBlock = WorkflowBlockBase & {
   max_retries?: number;
   max_steps_per_run?: number | null;
   parameters: Array<WorkflowParameter>;
+  cache_actions: boolean;
+};
+
+export type LoginBlock = WorkflowBlockBase & {
+  block_type: "login";
+  url: string | null;
+  title: string;
+  navigation_goal: string | null;
+  error_code_mapping: Record<string, string> | null;
+  max_retries?: number;
+  max_steps_per_run?: number | null;
+  parameters: Array<WorkflowParameter>;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
   cache_actions: boolean;
 };
 

@@ -79,6 +79,7 @@ const BlockTypes = {
   ACTION: "action",
   NAVIGATION: "navigation",
   EXTRACTION: "extraction",
+  LOGIN: "login",
 } as const;
 
 export type BlockType = (typeof BlockTypes)[keyof typeof BlockTypes];
@@ -95,7 +96,8 @@ export type BlockYAML =
   | ValidationBlockYAML
   | ActionBlockYAML
   | NavigationBlockYAML
-  | ExtractionBlockYAML;
+  | ExtractionBlockYAML
+  | LoginBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: BlockType;
@@ -169,6 +171,20 @@ export type ExtractionBlockYAML = BlockYAMLBase & {
   max_retries?: number;
   max_steps_per_run?: number | null;
   parameter_keys?: Array<string> | null;
+  cache_actions: boolean;
+};
+
+export type LoginBlockYAML = BlockYAMLBase & {
+  block_type: "login";
+  url: string | null;
+  title?: string;
+  navigation_goal: string | null;
+  error_code_mapping: Record<string, string> | null;
+  max_retries?: number;
+  max_steps_per_run?: number | null;
+  parameter_keys?: Array<string> | null;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
   cache_actions: boolean;
 };
 

@@ -26,6 +26,7 @@ import {
   NavigationBlockYAML,
   WorkflowCreateYAMLRequest,
   ExtractionBlockYAML,
+  LoginBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -69,6 +70,7 @@ import {
   extractionNodeDefaultData,
   isExtractionNode,
 } from "./nodes/ExtractionNode/types";
+import { loginNodeDefaultData } from "./nodes/LoginNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -249,6 +251,25 @@ function convertToNode(
           maxRetries: block.max_retries ?? null,
           maxStepsOverride: block.max_steps_per_run ?? null,
           cacheActions: block.cache_actions,
+        },
+      };
+    }
+    case "login": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "login",
+        data: {
+          ...commonData,
+          url: block.url ?? "",
+          navigationGoal: block.navigation_goal ?? "",
+          errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
+          maxRetries: block.max_retries ?? null,
+          parameterKeys: block.parameters.map((p) => p.key),
+          totpIdentifier: block.totp_identifier ?? null,
+          totpVerificationUrl: block.totp_verification_url ?? null,
+          cacheActions: block.cache_actions,
+          maxStepsOverride: block.max_steps_per_run ?? null,
         },
       };
     }
@@ -586,6 +607,17 @@ function createNode(
         },
       };
     }
+    case "login": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "login",
+        data: {
+          ...loginNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "loop": {
       return {
         ...identifiers,
@@ -776,6 +808,27 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         }),
         max_steps_per_run: node.data.maxStepsOverride,
         parameter_keys: node.data.parameterKeys,
+        cache_actions: node.data.cacheActions,
+      };
+    }
+    case "login": {
+      return {
+        ...base,
+        block_type: "login",
+        title: node.data.label,
+        navigation_goal: node.data.navigationGoal,
+        error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
+          string,
+          string
+        > | null,
+        url: node.data.url,
+        ...(node.data.maxRetries !== null && {
+          max_retries: node.data.maxRetries,
+        }),
+        max_steps_per_run: node.data.maxStepsOverride,
+        parameter_keys: node.data.parameterKeys,
+        totp_identifier: node.data.totpIdentifier,
+        totp_verification_url: node.data.totpVerificationUrl,
         cache_actions: node.data.cacheActions,
       };
     }
@@ -1311,6 +1364,23 @@ function convertBlocksToBlockYAML(
           max_retries: block.max_retries,
           max_steps_per_run: block.max_steps_per_run,
           parameter_keys: block.parameters.map((p) => p.key),
+          cache_actions: block.cache_actions,
+        };
+        return blockYaml;
+      }
+      case "login": {
+        const blockYaml: LoginBlockYAML = {
+          ...base,
+          block_type: "login",
+          url: block.url,
+          title: block.title,
+          navigation_goal: block.navigation_goal,
+          error_code_mapping: block.error_code_mapping,
+          max_retries: block.max_retries,
+          max_steps_per_run: block.max_steps_per_run,
+          parameter_keys: block.parameters.map((p) => p.key),
+          totp_identifier: block.totp_identifier,
+          totp_verification_url: block.totp_verification_url,
           cache_actions: block.cache_actions,
         };
         return blockYaml;
