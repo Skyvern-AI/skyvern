@@ -11,7 +11,7 @@ export const waitNodeDefaultData: WaitNodeData = {
   label: "",
   continueOnFailure: false,
   editable: true,
-  waitInSeconds: 0,
+  waitInSeconds: 1,
 };
 
 export function isWaitNode(node: Node): node is WaitNode {

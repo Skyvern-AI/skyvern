@@ -76,7 +76,7 @@ function WaitNode({ id, data }: NodeProps<WaitNode>) {
           </div>
           <Input
             type="number"
-            min="0"
+            min="1"
             max="300"
             value={inputs.waitInSeconds}
             onChange={(event) => {

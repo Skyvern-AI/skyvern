@@ -282,7 +282,7 @@ function convertToNode(
         type: "wait",
         data: {
           ...commonData,
-          waitInSeconds: block.wait_sec ?? 0,
+          waitInSeconds: block.wait_sec ?? 1,
         },
       };
     }
