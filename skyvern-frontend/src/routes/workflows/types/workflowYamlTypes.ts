@@ -80,6 +80,7 @@ const BlockTypes = {
   NAVIGATION: "navigation",
   EXTRACTION: "extraction",
   LOGIN: "login",
+  WAIT: "wait",
 } as const;
 
 export type BlockType = (typeof BlockTypes)[keyof typeof BlockTypes];
@@ -97,7 +98,8 @@ export type BlockYAML =
   | ActionBlockYAML
   | NavigationBlockYAML
   | ExtractionBlockYAML
-  | LoginBlockYAML;
+  | LoginBlockYAML
+  | WaitBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: BlockType;
@@ -186,6 +188,11 @@ export type LoginBlockYAML = BlockYAMLBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+};
+
+export type WaitBlockYAML = BlockYAMLBase & {
+  block_type: "wait";
+  wait_sec?: number;
 };
 
 export type CodeBlockYAML = BlockYAMLBase & {

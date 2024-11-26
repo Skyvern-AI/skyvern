@@ -114,7 +114,8 @@ export type WorkflowBlock =
   | ActionBlock
   | NavigationBlock
   | ExtractionBlock
-  | LoginBlock;
+  | LoginBlock
+  | WaitBlock;
 
 export const WorkflowBlockType = {
   Task: "task",
@@ -130,6 +131,7 @@ export const WorkflowBlockType = {
   Navigation: "navigation",
   Extraction: "extraction",
   Login: "login",
+  Wait: "wait",
 } as const;
 
 export type WorkflowBlockType =
@@ -273,6 +275,11 @@ export type LoginBlock = WorkflowBlockBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+};
+
+export type WaitBlock = WorkflowBlockBase & {
+  block_type: "wait";
+  wait_sec?: number;
 };
 
 export type WorkflowDefinition = {

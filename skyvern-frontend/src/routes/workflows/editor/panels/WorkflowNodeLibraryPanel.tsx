@@ -8,6 +8,7 @@ import {
   ListBulletIcon,
   LockOpen1Icon,
   PlusIcon,
+  StopwatchIcon,
   UpdateIcon,
   UploadIcon,
 } from "@radix-ui/react-icons";
@@ -103,6 +104,12 @@ const nodeLibraryItems: Array<{
     icon: <LockOpen1Icon className="size-6" />,
     title: "Login Block",
     description: "Login to a website",
+  },
+  {
+    nodeType: "wait",
+    icon: <StopwatchIcon className="size-6" />,
+    title: "Wait Block",
+    description: "Wait for some time",
   },
 ];
 

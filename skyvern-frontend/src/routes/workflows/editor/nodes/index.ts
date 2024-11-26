@@ -29,6 +29,8 @@ import { ExtractionNode } from "./ExtractionNode/types";
 import { ExtractionNode as ExtractionNodeComponent } from "./ExtractionNode/ExtractionNode";
 import { LoginNode } from "./LoginNode/types";
 import { LoginNode as LoginNodeComponent } from "./LoginNode/LoginNode";
+import { WaitNode } from "./WaitNode/types";
+import { WaitNode as WaitNodeComponent } from "./WaitNode/WaitNode";
 
 export type UtilityNode = StartNode | NodeAdderNode;
 
@@ -45,7 +47,8 @@ export type WorkflowBlockNode =
   | ActionNode
   | NavigationNode
   | ExtractionNode
-  | LoginNode;
+  | LoginNode
+  | WaitNode;
 
 export function isUtilityNode(node: AppNode): node is UtilityNode {
   return node.type === "nodeAdder" || node.type === "start";
@@ -73,4 +76,5 @@ export const nodeTypes = {
   navigation: memo(NavigationNodeComponent),
   extraction: memo(ExtractionNodeComponent),
   login: memo(LoginNodeComponent),
+  wait: memo(WaitNodeComponent),
 } as const;
