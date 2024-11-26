@@ -14,13 +14,14 @@ from multidict import CIMultiDictProxy
 from skyvern.constants import REPO_ROOT_DIR
 from skyvern.exceptions import DownloadFileMaxSizeExceeded
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
+from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.get_logger()
 
 
 async def download_from_s3(client: AsyncAWSClient, s3_uri: str) -> str:
     downloaded_bytes = await client.download_file(uri=s3_uri)
-    file_path = tempfile.NamedTemporaryFile(delete=False)
+    file_path = create_named_temporary_file(delete=False)
     file_path.write(downloaded_bytes)
     return file_path.name
 
@@ -56,7 +57,7 @@ async def download_file(url: str, max_size_mb: int | None = None) -> str:
                 a = urlparse(url)
 
                 # Get the file name
-                temp_dir = tempfile.mkdtemp(prefix="skyvern_downloads_")
+                temp_dir = make_temp_directory(prefix="skyvern_downloads_")
 
                 file_name = os.path.basename(a.path)
                 # if no suffix in the URL, we need to parse it from HTTP headers
@@ -151,3 +152,31 @@ def calculate_sha256_for_file(file_path: str) -> str:
         for byte_block in iter(lambda: f.read(4096), b""):
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
+
+
+def create_folder_if_not_exist(dir: str) -> None:
+    path = Path(dir)
+    if path.exists():
+        return
+    path.mkdir(parents=True)
+
+
+def get_skyvern_temp_dir() -> str:
+    temp_dir = SettingsManager.get_settings().TEMP_PATH
+    create_folder_if_not_exist(temp_dir)
+    return temp_dir
+
+
+def make_temp_directory(
+    suffix: str | None = None,
+    prefix: str | None = None,
+) -> str:
+    temp_dir = SettingsManager.get_settings().TEMP_PATH
+    create_folder_if_not_exist(temp_dir)
+    return tempfile.mkdtemp(suffix=suffix, prefix=prefix, dir=temp_dir)
+
+
+def create_named_temporary_file(delete: bool = True) -> tempfile._TemporaryFileWrapper:
+    temp_dir = SettingsManager.get_settings().TEMP_PATH
+    create_folder_if_not_exist(temp_dir)
+    return tempfile.NamedTemporaryFile(dir=temp_dir, delete=delete)

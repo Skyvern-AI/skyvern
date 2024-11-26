@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from email.message import EmailMessage
 from enum import StrEnum
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from typing import Annotated, Any, Literal, Union
 
 import filetype
@@ -36,6 +35,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
+    create_named_temporary_file,
     download_file,
     download_from_s3,
     get_path_for_workflow_download_directory,
@@ -1056,7 +1056,7 @@ class SendEmailBlock(Block):
     async def _download_from_s3(self, s3_uri: str) -> str:
         client = self.get_async_aws_client()
         downloaded_bytes = await client.download_file(uri=s3_uri)
-        file_path = NamedTemporaryFile(delete=False)
+        file_path = create_named_temporary_file(delete=False)
         file_path.write(downloaded_bytes)
         return file_path.name
 
