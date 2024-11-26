@@ -41,12 +41,11 @@ from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
-from skyvern.forge.sdk.db.enums import TaskPromptTemplate
+from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
-    FailedToParseActionInstruction,
     InvalidEmailClientConfiguration,
     InvalidFileType,
     NoValidEmailRecipient,
@@ -58,7 +57,6 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
     WorkflowParameter,
 )
-from skyvern.webeye.actions.actions import ActionType
 from skyvern.webeye.browser_factory import BrowserState
 
 LOG = structlog.get_logger()
@@ -185,7 +183,7 @@ class Block(BaseModel, abc.ABC):
 
 
 class BaseTaskBlock(Block):
-    prompt_template: str = TaskPromptTemplate.ExtractAction
+    task_type: str = TaskType.general
     url: str | None = None
     title: str = ""
     complete_criterion: str | None = None
@@ -1332,41 +1330,6 @@ class ValidationBlock(BaseTaskBlock):
 
 class ActionBlock(BaseTaskBlock):
     block_type: Literal[BlockType.ACTION] = BlockType.ACTION
-
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
-        try:
-            prompt = prompt_engine.load_prompt("infer-action-type", navigation_goal=self.navigation_goal)
-            # TODO: no step here, so LLM call won't be saved as an artifact
-            json_response = await app.LLM_API_HANDLER(prompt=prompt)
-            if json_response.get("error"):
-                raise FailedToParseActionInstruction(
-                    reason=json_response.get("thought"), error_type=json_response.get("error")
-                )
-
-            action_type: str = json_response.get("action_type") or ""
-            action_type = ActionType[action_type.upper()]
-
-            prompt_template = ""
-            if action_type == ActionType.CLICK:
-                prompt_template = TaskPromptTemplate.SingleClickAction
-            elif action_type == ActionType.INPUT_TEXT:
-                prompt_template = TaskPromptTemplate.SingleInputAction
-            elif action_type == ActionType.UPLOAD_FILE:
-                prompt_template = TaskPromptTemplate.SingleUploadAction
-            elif action_type == ActionType.SELECT_OPTION:
-                prompt_template = TaskPromptTemplate.SingleSelectAction
-
-            if not prompt_template:
-                raise Exception(
-                    f"Not supported action for action block. Currently we only support [click, input_text, upload_file, select_option], but got [{action_type}]"
-                )
-        except Exception as e:
-            return self.build_block_result(
-                success=False, failure_reason=str(e), output_parameter_value=None, status=BlockStatus.failed
-            )
-
-        self.prompt_template = prompt_template
-        return await super().execute(workflow_run_id=workflow_run_id, kwargs=kwargs)
 
 
 class NavigationBlock(BaseTaskBlock):

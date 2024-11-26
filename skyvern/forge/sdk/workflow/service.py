@@ -18,7 +18,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.db.enums import TaskPromptTemplate
+from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Organization, Step
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -1354,7 +1354,7 @@ class WorkflowService:
 
             return ValidationBlock(
                 label=block_yaml.label,
-                prompt_template=TaskPromptTemplate.DecisiveCriterionValidate,
+                task_type=TaskType.validation,
                 parameters=validation_block_parameters,
                 output_parameter=output_parameter,
                 complete_criterion=block_yaml.complete_criterion,
@@ -1379,6 +1379,7 @@ class WorkflowService:
                 label=block_yaml.label,
                 url=block_yaml.url,
                 title=block_yaml.title,
+                task_type=TaskType.action,
                 parameters=action_block_parameters,
                 output_parameter=output_parameter,
                 navigation_goal=block_yaml.navigation_goal,

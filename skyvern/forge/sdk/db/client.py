@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from skyvern.config import settings
 from skyvern.exceptions import WorkflowParameterNotFound
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskPromptTemplate
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import (
     ActionModel,
@@ -113,13 +113,13 @@ class AgentDB:
         retry: int | None = None,
         max_steps_per_run: int | None = None,
         error_code_mapping: dict[str, str] | None = None,
-        prompt_template: str = TaskPromptTemplate.ExtractAction,
+        task_type: str = TaskType.general,
     ) -> Task:
         try:
             async with self.Session() as session:
                 new_task = TaskModel(
                     status="created",
-                    prompt_template=prompt_template,
+                    task_type=task_type,
                     url=url,
                     title=title,
                     webhook_callback_url=webhook_callback_url,

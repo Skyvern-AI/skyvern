@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 from skyvern.exceptions import BlockedHost, InvalidTaskStatusTransition, TaskAlreadyCanceled
 from skyvern.forge.sdk.core.validators import is_blocked_host
-from skyvern.forge.sdk.db.enums import TaskPromptTemplate
+from skyvern.forge.sdk.db.enums import TaskType
 
 
 class ProxyLocation(StrEnum):
@@ -86,10 +86,10 @@ class TaskBase(BaseModel):
         description="Criterion to terminate",
         examples=["Terminate if 'existing account' shows up on the page"],
     )
-    prompt_template: str | None = Field(
-        default=TaskPromptTemplate.ExtractAction,
-        description="The prompt template used for task",
-        examples=[TaskPromptTemplate.ExtractAction, TaskPromptTemplate.DecisiveCriterionValidate],
+    task_type: TaskType | None = Field(
+        default=TaskType.general,
+        description="The type of the task",
+        examples=[TaskType.general, TaskType.validation],
     )
 
 
