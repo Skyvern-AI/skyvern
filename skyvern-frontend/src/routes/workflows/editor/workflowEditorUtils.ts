@@ -27,6 +27,7 @@ import {
   WorkflowCreateYAMLRequest,
   ExtractionBlockYAML,
   LoginBlockYAML,
+  WaitBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -71,6 +72,7 @@ import {
   isExtractionNode,
 } from "./nodes/ExtractionNode/types";
 import { loginNodeDefaultData } from "./nodes/LoginNode/types";
+import { waitNodeDefaultData } from "./nodes/WaitNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -270,6 +272,17 @@ function convertToNode(
           totpVerificationUrl: block.totp_verification_url ?? null,
           cacheActions: block.cache_actions,
           maxStepsOverride: block.max_steps_per_run ?? null,
+        },
+      };
+    }
+    case "wait": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "wait",
+        data: {
+          ...commonData,
+          waitInSeconds: block.wait_sec ?? 0,
         },
       };
     }
@@ -618,6 +631,17 @@ function createNode(
         },
       };
     }
+    case "wait": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "wait",
+        data: {
+          ...waitNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "loop": {
       return {
         ...identifiers,
@@ -830,6 +854,13 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         cache_actions: node.data.cacheActions,
+      };
+    }
+    case "wait": {
+      return {
+        ...base,
+        block_type: "wait",
+        wait_sec: node.data.waitInSeconds,
       };
     }
     case "sendEmail": {
@@ -1382,6 +1413,14 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           cache_actions: block.cache_actions,
+        };
+        return blockYaml;
+      }
+      case "wait": {
+        const blockYaml: WaitBlockYAML = {
+          ...base,
+          block_type: "wait",
+          wait_sec: block.wait_sec,
         };
         return blockYaml;
       }
