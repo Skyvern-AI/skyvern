@@ -10,12 +10,13 @@ import {
 type Props = {
   value: ProxyLocation | null;
   onChange: (value: ProxyLocation) => void;
+  className?: string;
 };
 
-function ProxySelector({ value, onChange }: Props) {
+function ProxySelector({ value, onChange, className }: Props) {
   return (
     <Select value={value ?? ""} onValueChange={onChange}>
-      <SelectTrigger className="w-48">
+      <SelectTrigger className={className}>
         <SelectValue placeholder="Proxy Location" />
       </SelectTrigger>
       <SelectContent>

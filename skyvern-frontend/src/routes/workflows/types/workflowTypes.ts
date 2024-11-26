@@ -1,3 +1,5 @@
+import { ProxyLocation } from "@/api/types";
+
 export type WorkflowParameterBase = {
   parameter_type: WorkflowParameterType;
   key: string;
@@ -296,12 +298,20 @@ export type WorkflowApiResponse = {
   version: number;
   description: string;
   workflow_definition: WorkflowDefinition;
-  proxy_location: string;
-  webhook_callback_url: string;
-  totp_verification_url: string;
+  proxy_location: ProxyLocation | null;
+  webhook_callback_url: string | null;
+  persist_browser_session: boolean;
+  totp_verification_url: string | null;
+  totp_identifier: string | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
+};
+
+export type WorkflowSettings = {
+  proxyLocation: ProxyLocation | null;
+  webhookCallbackUrl: string | null;
+  persistBrowserSession: boolean;
 };
 
 export function isOutputParameter(
