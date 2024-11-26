@@ -19,6 +19,7 @@ from skyvern.exceptions import (
     BrowserStateMissingPage,
     EmptyScrapePage,
     FailedToNavigateToUrl,
+    FailedToParseActionInstruction,
     FailedToSendWebhook,
     FailedToTakeScreenshot,
     InvalidTaskStatusTransition,
@@ -30,6 +31,8 @@ from skyvern.exceptions import (
     StepUnableToExecuteError,
     TaskAlreadyCanceled,
     TaskNotFound,
+    UnsupportedActionType,
+    UnsupportedTaskType,
 )
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
@@ -39,7 +42,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.validators import validate_url
-from skyvern.forge.sdk.db.enums import TaskPromptTemplate
+from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Organization, Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskStatus
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -133,7 +136,7 @@ class ForgeAgent:
         task_url = validate_url(task_url)
         task = await app.DATABASE.create_task(
             url=task_url,
-            prompt_template=task_block.prompt_template,
+            task_type=task_block.task_type,
             complete_criterion=task_block.complete_criterion,
             terminate_criterion=task_block.terminate_criterion,
             title=task_block.title or task_block.label,
@@ -524,6 +527,23 @@ class ForgeAgent:
                 need_call_webhook=False,
             )
             return step, detailed_output, None
+        except (UnsupportedActionType, UnsupportedTaskType, FailedToParseActionInstruction) as e:
+            LOG.warning(
+                "unsupported task type or action type, marking the task as failed",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                step_order=step.order,
+                step_retry=step.retry_index,
+            )
+            await self.fail_task(task, step, e.message)
+            await self.clean_up_task(
+                task=task,
+                last_step=step,
+                api_key=api_key,
+                need_call_webhook=False,
+            )
+            return step, detailed_output, None
+
         except Exception as e:
             LOG.exception(
                 "Got an unexpected exception in step, marking task as failed",
@@ -930,6 +950,9 @@ class ForgeAgent:
                 output=detailed_agent_step_output.to_agent_step_output(),
             )
             return failed_step, detailed_agent_step_output.get_clean_detailed_output()
+        except (UnsupportedActionType, UnsupportedTaskType, FailedToParseActionInstruction):
+            raise
+
         except Exception as e:
             LOG.exception(
                 "Unexpected exception in agent_step, marking step as failed",
@@ -1179,6 +1202,7 @@ class ForgeAgent:
         element_tree_in_prompt: str = scraped_page.build_element_tree(element_tree_format)
         extract_action_prompt = await self._build_extract_action_prompt(
             task,
+            step,
             browser_state,
             element_tree_in_prompt,
             verification_code_check=bool(task.totp_verification_url or task.totp_identifier),
@@ -1216,6 +1240,7 @@ class ForgeAgent:
     async def _build_extract_action_prompt(
         self,
         task: Task,
+        step: Step,
         browser_state: BrowserState,
         element_tree_in_prompt: str,
         verification_code_check: bool = False,
@@ -1234,7 +1259,37 @@ class ForgeAgent:
             task, expire_verification_code=expire_verification_code
         )
 
-        template = task.prompt_template if task.prompt_template else TaskPromptTemplate.ExtractAction
+        task_type = task.task_type if task.task_type else TaskType.general
+        template = ""
+        if task_type == TaskType.general:
+            template = "extract-action"
+        elif task_type == TaskType.validation:
+            template = "decisive-criterion-validate"
+        elif task_type == TaskType.action:
+            prompt = prompt_engine.load_prompt("infer-action-type", navigation_goal=navigation_goal)
+            json_response = await app.LLM_API_HANDLER(prompt=prompt, step=step)
+            if json_response.get("error"):
+                raise FailedToParseActionInstruction(
+                    reason=json_response.get("thought"), error_type=json_response.get("error")
+                )
+
+            action_type: str = json_response.get("action_type") or ""
+            action_type = ActionType[action_type.upper()]
+
+            if action_type == ActionType.CLICK:
+                template = "single-click-action"
+            elif action_type == ActionType.INPUT_TEXT:
+                template = "single-input-action"
+            elif action_type == ActionType.UPLOAD_FILE:
+                template = "single-upload-action"
+            elif action_type == ActionType.SELECT_OPTION:
+                template = "single-select-action"
+            else:
+                raise UnsupportedActionType(action_type=action_type)
+
+        if not template:
+            raise UnsupportedTaskType(task_type=task_type)
+
         return prompt_engine.load_prompt(
             template=template,
             navigation_goal=navigation_goal,
@@ -1916,6 +1971,7 @@ class ForgeAgent:
             element_tree_in_prompt: str = scraped_page.build_element_tree(ElementTreeFormat.HTML)
             extract_action_prompt = await self._build_extract_action_prompt(
                 task,
+                step,
                 browser_state,
                 element_tree_in_prompt,
                 verification_code_check=False,

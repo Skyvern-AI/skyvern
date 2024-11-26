@@ -530,3 +530,15 @@ class InteractWithDisabledElement(SkyvernException):
         super().__init__(
             f"The element(id={element_id}) now is disabled, try to interact with it later when it's enabled."
         )
+
+
+class FailedToParseActionInstruction(SkyvernException):
+    def __init__(self, reason: str | None, error_type: str | None):
+        super().__init__(
+            f"Failed to parse the action instruction as '{reason}({error_type})'",
+        )
+
+
+class UnsupportedTaskType(SkyvernException):
+    def __init__(self, task_type: str):
+        super().__init__(f"Not supported task type [{task_type}]")

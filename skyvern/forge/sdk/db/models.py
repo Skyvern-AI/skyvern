@@ -17,7 +17,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase
 
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskPromptTemplate
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
 from skyvern.forge.sdk.db.id import (
     generate_action_id,
     generate_artifact_id,
@@ -54,7 +54,7 @@ class TaskModel(Base):
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
     title = Column(String)
-    prompt_template = Column(String, default=TaskPromptTemplate.ExtractAction)
+    task_type = Column(String, default=TaskType.general)
     url = Column(String)
     navigation_goal = Column(String)
     data_extraction_goal = Column(String)
