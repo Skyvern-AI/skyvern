@@ -16,6 +16,7 @@ from typing import Annotated, Any, Literal, Union
 import filetype
 import structlog
 from email_validator import EmailNotValidError, validate_email
+from jinja2 import Template
 from playwright.async_api import Error
 from pydantic import BaseModel, Field
 
@@ -217,6 +218,15 @@ class BaseTaskBlock(Block):
         return parameters
 
     @staticmethod
+    def format_task_block_parameter_template_from_workflow_run_context(
+        potential_template: str | None, workflow_run_context: WorkflowRunContext
+    ) -> str | None:
+        if not potential_template:
+            return potential_template
+        template = Template(potential_template)
+        return template.render(workflow_run_context.values)
+
+    @staticmethod
     async def get_task_order(workflow_run_id: str, current_retry: int) -> tuple[int, int]:
         """
         Returns the order and retry for the next task in the workflow run as a tuple.
@@ -288,6 +298,26 @@ class BaseTaskBlock(Block):
                     download_suffix_parameter_key=self.download_suffix,
                 )
                 self.download_suffix = download_suffix_parameter_value
+
+        self.url = self.format_task_block_parameter_template_from_workflow_run_context(self.url, workflow_run_context)
+        self.totp_identifier = self.format_task_block_parameter_template_from_workflow_run_context(
+            self.totp_identifier, workflow_run_context
+        )
+        self.download_suffix = self.format_task_block_parameter_template_from_workflow_run_context(
+            self.download_suffix, workflow_run_context
+        )
+        self.navigation_goal = self.format_task_block_parameter_template_from_workflow_run_context(
+            self.navigation_goal, workflow_run_context
+        )
+        self.data_extraction_goal = self.format_task_block_parameter_template_from_workflow_run_context(
+            self.data_extraction_goal, workflow_run_context
+        )
+        self.complete_criterion = self.format_task_block_parameter_template_from_workflow_run_context(
+            self.complete_criterion, workflow_run_context
+        )
+        self.terminate_criterion = self.format_task_block_parameter_template_from_workflow_run_context(
+            self.terminate_criterion, workflow_run_context
+        )
 
         # TODO (kerem) we should always retry on terminated. We should make a distinction between retriable and
         # non-retryable terminations
