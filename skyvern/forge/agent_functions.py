@@ -8,7 +8,7 @@ from playwright.async_api import Frame, Page
 
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR
-from skyvern.exceptions import StepUnableToExecuteError, SVGConversionFailed
+from skyvern.exceptions import StepUnableToExecuteError
 from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.prompts import prompt_engine
@@ -152,14 +152,16 @@ async def _convert_svg_to_string(
             try:
                 json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=svg_convert_prompt, step=step)
                 svg_shape = json_response.get("shape", "")
-                if not svg_shape:
-                    raise Exception("Empty SVG shape replied by secondary llm")
+                recognized = json_response.get("recognized", False)
+                if not svg_shape or not recognized:
+                    raise Exception("Empty or unrecognized SVG shape replied by secondary llm")
                 LOG.info("SVG converted by LLM", element_id=element_id, shape=svg_shape)
                 await app.CACHE.set(svg_key, svg_shape)
                 break
             except Exception:
-                LOG.exception(
+                LOG.info(
                     "Failed to convert SVG to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
+                    exc_info=True,
                     task_id=task_id,
                     step_id=step_id,
                     element_id=element_id,
@@ -167,7 +169,16 @@ async def _convert_svg_to_string(
                 )
                 await asyncio.sleep(3)
         else:
-            raise SVGConversionFailed(svg_html=svg_html)
+            LOG.warning(
+                "Reaching the max try to convert svg element, going to drop the svg element.",
+                element_id=element_id,
+                task_id=task_id,
+                step_id=step_id,
+                length=len(svg_html),
+            )
+            del element["children"]
+            element["isDropped"] = True
+            return
 
     element["attributes"] = dict()
     element["attributes"]["alt"] = svg_shape
@@ -232,20 +243,23 @@ async def _convert_css_shape_to_string(
             screenshot = await locater.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
             prompt = prompt_engine.load_prompt("css-shape-convert")
 
-            for retry in range(SHAPE_CONVERTION_RETRY_ATTEMPT):
+            # TODO: we don't retry the css shape conversion today
+            for retry in range(1):
                 try:
                     json_response = await app.SECONDARY_LLM_API_HANDLER(
                         prompt=prompt, screenshots=[screenshot], step=step
                     )
                     css_shape = json_response.get("shape", "")
-                    if not css_shape:
-                        raise Exception("Empty css shape replied by secondary llm")
+                    recognized = json_response.get("recognized", False)
+                    if not css_shape or not recognized:
+                        raise Exception("Empty or unrecognized css shape replied by secondary llm")
                     LOG.info("CSS Shape converted by LLM", element_id=element_id, shape=css_shape)
                     await app.CACHE.set(shape_key, css_shape)
                     break
                 except Exception:
-                    LOG.exception(
+                    LOG.info(
                         "Failed to convert css shape to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
+                        exc_info=True,
                         task_id=task_id,
                         step_id=step_id,
                         element_id=element_id,
