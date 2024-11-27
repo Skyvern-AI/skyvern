@@ -1262,18 +1262,34 @@ async def chain_click(
             )
             return action_results
 
-        blocking_element = await skyvern_element.find_blocking_element(
+        blocking_element, blocked = await skyvern_element.find_blocking_element(
             dom=DomUtil(scraped_page=scraped_page, page=page)
         )
         if blocking_element is None:
+            if not blocked:
+                LOG.info(
+                    "Chain click: exit since the element is not blocking by any element",
+                    task_id=task.task_id,
+                    action=action,
+                    element=str(skyvern_element),
+                    locator=locator,
+                )
+                return action_results
+
             LOG.info(
-                "Chain click: exit since the element is not blocking by any skyvern element",
+                "Chain click: element is blocked by an non-interactable element, going to use javascript click instead of playwright click",
                 task_id=task.task_id,
                 action=action,
                 element=str(skyvern_element),
                 locator=locator,
             )
-            return action_results
+            try:
+                await skyvern_element.click_in_javascript()
+                action_results.append(ActionSuccess())
+                return action_results
+            except Exception as e:
+                action_results.append(ActionFailure(FailToClick(action.element_id, anchor="self_js", msg=str(e))))
+                return action_results
 
         try:
             LOG.debug(

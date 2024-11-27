@@ -182,7 +182,7 @@ class SkyvernFrame:
         js_script = "(element) => checkDisabledFromStyle(element)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
 
-    async def get_blocking_element_id(self, element: ElementHandle) -> str:
+    async def get_blocking_element_id(self, element: ElementHandle) -> tuple[str, bool]:
         js_script = "(element) => getBlockElementUniqueID(element)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
 
@@ -239,3 +239,7 @@ class SkyvernFrame:
     async def has_ASP_client_control(self) -> bool:
         js_script = "() => hasASPClientControl()"
         return await self.evaluate(frame=self.frame, expression=js_script)
+
+    async def click_element_in_javascript(self, element: ElementHandle) -> None:
+        js_script = "(element) => element.click()"
+        return await self.evaluate(frame=self.frame, expression=js_script, arg=element)

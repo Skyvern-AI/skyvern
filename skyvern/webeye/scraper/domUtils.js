@@ -427,10 +427,10 @@ function getBlockElementUniqueID(element) {
   );
 
   if (!hitElement) {
-    return "";
+    return ["", false];
   }
 
-  return hitElement.getAttribute("unique_id") ?? "";
+  return [hitElement.getAttribute("unique_id") ?? "", true];
 }
 
 function isHidden(element) {
