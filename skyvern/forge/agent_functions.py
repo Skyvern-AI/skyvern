@@ -184,7 +184,7 @@ async def _convert_svg_to_string(
                     element_id=element_id,
                     retry=retry,
                 )
-                if retry == CSS_SHAPE_CONVERTION_ATTEMPTS - 1:
+                if retry == SVG_SHAPE_CONVERTION_ATTEMPTS - 1:
                     # set the invalid css shape to cache to avoid retry in the near future
                     await app.CACHE.set(svg_key, INVALID_SHAPE, ex=timedelta(weeks=1))
                 await asyncio.sleep(3)
