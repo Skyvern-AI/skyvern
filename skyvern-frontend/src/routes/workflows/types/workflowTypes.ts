@@ -117,7 +117,8 @@ export type WorkflowBlock =
   | NavigationBlock
   | ExtractionBlock
   | LoginBlock
-  | WaitBlock;
+  | WaitBlock
+  | FileDownloadBlock;
 
 export const WorkflowBlockType = {
   Task: "task",
@@ -134,6 +135,7 @@ export const WorkflowBlockType = {
   Extraction: "extraction",
   Login: "login",
   Wait: "wait",
+  FileDownload: "file_download",
 } as const;
 
 export type WorkflowBlockType =
@@ -282,6 +284,21 @@ export type LoginBlock = WorkflowBlockBase & {
 export type WaitBlock = WorkflowBlockBase & {
   block_type: "wait";
   wait_sec?: number;
+};
+
+export type FileDownloadBlock = WorkflowBlockBase & {
+  block_type: "file_download";
+  url: string | null;
+  title: string;
+  navigation_goal: string | null;
+  error_code_mapping: Record<string, string> | null;
+  max_retries?: number;
+  max_steps_per_run?: number | null;
+  download_suffix?: string | null;
+  parameters: Array<WorkflowParameter>;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
+  cache_actions: boolean;
 };
 
 export type WorkflowDefinition = {

@@ -82,6 +82,7 @@ const BlockTypes = {
   EXTRACTION: "extraction",
   LOGIN: "login",
   WAIT: "wait",
+  FILE_DOWNLOAD: "file_download",
 } as const;
 
 export type BlockType = (typeof BlockTypes)[keyof typeof BlockTypes];
@@ -100,7 +101,8 @@ export type BlockYAML =
   | NavigationBlockYAML
   | ExtractionBlockYAML
   | LoginBlockYAML
-  | WaitBlockYAML;
+  | WaitBlockYAML
+  | FileDownloadBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: BlockType;
@@ -194,6 +196,21 @@ export type LoginBlockYAML = BlockYAMLBase & {
 export type WaitBlockYAML = BlockYAMLBase & {
   block_type: "wait";
   wait_sec?: number;
+};
+
+export type FileDownloadBlockYAML = BlockYAMLBase & {
+  block_type: "file_download";
+  url: string | null;
+  title?: string;
+  navigation_goal: string | null;
+  error_code_mapping: Record<string, string> | null;
+  max_retries?: number;
+  max_steps_per_run?: number | null;
+  parameter_keys?: Array<string> | null;
+  download_suffix?: string | null;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
+  cache_actions: boolean;
 };
 
 export type CodeBlockYAML = BlockYAMLBase & {
