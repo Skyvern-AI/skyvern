@@ -320,12 +320,12 @@ class SkyvernElement:
         assert handler is not None
         return handler
 
-    async def find_blocking_element(self, dom: DomUtil) -> SkyvernElement | None:
+    async def find_blocking_element(self, dom: DomUtil) -> tuple[SkyvernElement | None, bool]:
         skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
-        blocking_element_id = await skyvern_frame.get_blocking_element_id(await self.get_element_handler())
+        blocking_element_id, blocked = await skyvern_frame.get_blocking_element_id(await self.get_element_handler())
         if not blocking_element_id:
-            return None
-        return await dom.get_skyvern_element_by_id(blocking_element_id)
+            return None, blocked
+        return await dom.get_skyvern_element_by_id(blocking_element_id), blocked
 
     async def find_element_in_label_children(
         self, dom: DomUtil, element_type: InteractiveElement
@@ -575,6 +575,10 @@ class SkyvernElement:
         await page.mouse.move(dest_x, dest_y)
 
         return dest_x, dest_y
+
+    async def click_in_javascript(self) -> None:
+        skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
+        await skyvern_frame.click_element_in_javascript(await self.get_element_handler())
 
     async def coordinate_click(
         self, page: Page, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
