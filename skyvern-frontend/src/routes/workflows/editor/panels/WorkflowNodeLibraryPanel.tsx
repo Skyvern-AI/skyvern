@@ -3,6 +3,7 @@ import {
   CheckCircledIcon,
   Cross2Icon,
   CursorTextIcon,
+  DownloadIcon,
   EnvelopeClosedIcon,
   FileIcon,
   ListBulletIcon,
@@ -110,6 +111,12 @@ const nodeLibraryItems: Array<{
     icon: <StopwatchIcon className="size-6" />,
     title: "Wait Block",
     description: "Wait for some time",
+  },
+  {
+    nodeType: "fileDownload",
+    icon: <DownloadIcon className="size-6" />,
+    title: "File Download Block",
+    description: "Download a file",
   },
 ];
 

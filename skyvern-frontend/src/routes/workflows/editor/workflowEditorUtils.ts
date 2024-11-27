@@ -29,6 +29,7 @@ import {
   ExtractionBlockYAML,
   LoginBlockYAML,
   WaitBlockYAML,
+  FileDownloadBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -79,6 +80,7 @@ import {
 } from "./nodes/ExtractionNode/types";
 import { loginNodeDefaultData } from "./nodes/LoginNode/types";
 import { waitNodeDefaultData } from "./nodes/WaitNode/types";
+import { fileDownloadNodeDefaultData } from "./nodes/FileDownloadNode/types";
 import { ProxyLocation } from "@/api/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
@@ -290,6 +292,26 @@ function convertToNode(
         data: {
           ...commonData,
           waitInSeconds: block.wait_sec ?? 1,
+        },
+      };
+    }
+    case "file_download": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "fileDownload",
+        data: {
+          ...commonData,
+          url: block.url ?? "",
+          navigationGoal: block.navigation_goal ?? "",
+          errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
+          downloadSuffix: block.download_suffix ?? null,
+          maxRetries: block.max_retries ?? null,
+          parameterKeys: block.parameters.map((p) => p.key),
+          totpIdentifier: block.totp_identifier ?? null,
+          totpVerificationUrl: block.totp_verification_url ?? null,
+          cacheActions: block.cache_actions,
+          maxStepsOverride: block.max_steps_per_run ?? null,
         },
       };
     }
@@ -667,6 +689,17 @@ function createNode(
         },
       };
     }
+    case "fileDownload": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "fileDownload",
+        data: {
+          ...fileDownloadNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "loop": {
       return {
         ...identifiers,
@@ -886,6 +919,28 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         ...base,
         block_type: "wait",
         wait_sec: node.data.waitInSeconds,
+      };
+    }
+    case "fileDownload": {
+      return {
+        ...base,
+        block_type: "file_download",
+        title: node.data.label,
+        navigation_goal: node.data.navigationGoal,
+        error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
+          string,
+          string
+        > | null,
+        url: node.data.url,
+        ...(node.data.maxRetries !== null && {
+          max_retries: node.data.maxRetries,
+        }),
+        max_steps_per_run: node.data.maxStepsOverride,
+        download_suffix: node.data.downloadSuffix,
+        parameter_keys: node.data.parameterKeys,
+        totp_identifier: node.data.totpIdentifier,
+        totp_verification_url: node.data.totpVerificationUrl,
+        cache_actions: node.data.cacheActions,
       };
     }
     case "sendEmail": {
@@ -1470,6 +1525,24 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "wait",
           wait_sec: block.wait_sec,
+        };
+        return blockYaml;
+      }
+      case "file_download": {
+        const blockYaml: FileDownloadBlockYAML = {
+          ...base,
+          block_type: "file_download",
+          url: block.url,
+          title: block.title,
+          navigation_goal: block.navigation_goal,
+          error_code_mapping: block.error_code_mapping,
+          max_retries: block.max_retries,
+          max_steps_per_run: block.max_steps_per_run,
+          download_suffix: block.download_suffix,
+          parameter_keys: block.parameters.map((p) => p.key),
+          totp_identifier: block.totp_identifier,
+          totp_verification_url: block.totp_verification_url,
+          cache_actions: block.cache_actions,
         };
         return blockYaml;
       }
