@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import hashlib
+from datetime import timedelta
 from typing import Dict, List
 
 import structlog
@@ -12,6 +13,7 @@ from skyvern.exceptions import StepUnableToExecuteError
 from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.models import Organization, Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.webeye.browser_factory import BrowserState
@@ -20,7 +22,9 @@ from skyvern.webeye.scraper.scraper import ELEMENT_NODE_ATTRIBUTES, CleanupEleme
 LOG = structlog.get_logger()
 
 USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
-SHAPE_CONVERTION_RETRY_ATTEMPT = 3
+SVG_SHAPE_CONVERTION_ATTEMPTS = 3
+CSS_SHAPE_CONVERTION_ATTEMPTS = 1
+INVALID_SHAPE = "N/A"
 
 
 def _remove_rect(element: dict) -> None:
@@ -148,7 +152,7 @@ async def _convert_svg_to_string(
         LOG.debug("call LLM to convert SVG to string shape", element_id=element_id)
         svg_convert_prompt = prompt_engine.load_prompt("svg-convert", svg_element=svg_html)
 
-        for retry in range(SHAPE_CONVERTION_RETRY_ATTEMPT):
+        for retry in range(SVG_SHAPE_CONVERTION_ATTEMPTS):
             try:
                 json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=svg_convert_prompt, step=step)
                 svg_shape = json_response.get("shape", "")
@@ -158,6 +162,19 @@ async def _convert_svg_to_string(
                 LOG.info("SVG converted by LLM", element_id=element_id, shape=svg_shape)
                 await app.CACHE.set(svg_key, svg_shape)
                 break
+            except LLMProviderError:
+                LOG.info(
+                    "Failed to convert SVG to string due to llm error. Will retry if haven't met the max try attempt after 3s.",
+                    exc_info=True,
+                    task_id=task_id,
+                    step_id=step_id,
+                    element_id=element_id,
+                    retry=retry,
+                )
+                if retry == SVG_SHAPE_CONVERTION_ATTEMPTS - 1:
+                    # set the invalid css shape to cache to avoid retry in the near future
+                    await app.CACHE.set(svg_key, INVALID_SHAPE, ex=timedelta(hours=1))
+                await asyncio.sleep(3)
             except Exception:
                 LOG.info(
                     "Failed to convert SVG to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
@@ -167,6 +184,9 @@ async def _convert_svg_to_string(
                     element_id=element_id,
                     retry=retry,
                 )
+                if retry == SVG_SHAPE_CONVERTION_ATTEMPTS - 1:
+                    # set the invalid css shape to cache to avoid retry in the near future
+                    await app.CACHE.set(svg_key, INVALID_SHAPE, ex=timedelta(weeks=1))
                 await asyncio.sleep(3)
         else:
             LOG.warning(
@@ -181,7 +201,8 @@ async def _convert_svg_to_string(
             return
 
     element["attributes"] = dict()
-    element["attributes"]["alt"] = svg_shape
+    if svg_shape != INVALID_SHAPE:
+        element["attributes"]["alt"] = svg_shape
     del element["children"]
     return
 
@@ -244,7 +265,7 @@ async def _convert_css_shape_to_string(
             prompt = prompt_engine.load_prompt("css-shape-convert")
 
             # TODO: we don't retry the css shape conversion today
-            for retry in range(1):
+            for retry in range(CSS_SHAPE_CONVERTION_ATTEMPTS):
                 try:
                     json_response = await app.SECONDARY_LLM_API_HANDLER(
                         prompt=prompt, screenshots=[screenshot], step=step
@@ -256,6 +277,19 @@ async def _convert_css_shape_to_string(
                     LOG.info("CSS Shape converted by LLM", element_id=element_id, shape=css_shape)
                     await app.CACHE.set(shape_key, css_shape)
                     break
+                except LLMProviderError:
+                    LOG.info(
+                        "Failed to convert css shape due to llm error. Will retry if haven't met the max try attempt after 3s.",
+                        exc_info=True,
+                        task_id=task_id,
+                        step_id=step_id,
+                        element_id=element_id,
+                        retry=retry,
+                    )
+                    if retry == CSS_SHAPE_CONVERTION_ATTEMPTS - 1:
+                        # set the invalid css shape to cache to avoid retry in the near future
+                        await app.CACHE.set(shape_key, INVALID_SHAPE, ex=timedelta(hours=1))
+                    await asyncio.sleep(3)
                 except Exception:
                     LOG.info(
                         "Failed to convert css shape to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
@@ -265,6 +299,9 @@ async def _convert_css_shape_to_string(
                         element_id=element_id,
                         retry=retry,
                     )
+                    if retry == CSS_SHAPE_CONVERTION_ATTEMPTS - 1:
+                        # set the invalid css shape to cache to avoid retry in the near future
+                        await app.CACHE.set(shape_key, INVALID_SHAPE, ex=timedelta(weeks=1))
                     await asyncio.sleep(3)
             else:
                 LOG.info(
@@ -286,7 +323,8 @@ async def _convert_css_shape_to_string(
 
     if "attributes" not in element:
         element["attributes"] = dict()
-    element["attributes"]["shape-description"] = css_shape
+    if css_shape != INVALID_SHAPE:
+        element["attributes"]["shape-description"] = css_shape
     return None
 
 
