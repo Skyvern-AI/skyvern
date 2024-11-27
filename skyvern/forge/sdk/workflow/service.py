@@ -820,7 +820,8 @@ class WorkflowService:
         )
         if browser_state:
             await self.persist_video_data(browser_state, workflow, workflow_run)
-            await self.persist_debug_artifacts(browser_state, tasks[-1], workflow, workflow_run)
+            if tasks:
+                await self.persist_debug_artifacts(browser_state, tasks[-1], workflow, workflow_run)
             if workflow.persist_browser_session and browser_state.browser_artifacts.browser_session_dir:
                 await app.STORAGE.store_browser_session(
                     workflow.organization_id,
