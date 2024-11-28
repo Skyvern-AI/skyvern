@@ -221,7 +221,6 @@ export type CodeBlockYAML = BlockYAMLBase & {
 
 export type TextPromptBlockYAML = BlockYAMLBase & {
   block_type: "text_prompt";
-  llm_key: string | null;
   prompt: string;
   json_schema?: Record<string, unknown> | null;
   parameter_keys?: Array<string> | null;
