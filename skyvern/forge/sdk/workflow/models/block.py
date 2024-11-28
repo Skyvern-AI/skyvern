@@ -783,7 +783,8 @@ class TextPromptBlock(Block):
         return self.parameters
 
     async def send_prompt(self, prompt: str, parameter_values: dict[str, Any]) -> dict[str, Any]:
-        llm_api_handler = LLMAPIHandlerFactory.get_llm_api_handler(self.llm_key)
+        llm_key = self.llm_key or DEFAULT_TEXT_PROMPT_LLM_KEY
+        llm_api_handler = LLMAPIHandlerFactory.get_llm_api_handler(llm_key)
         if not self.json_schema:
             self.json_schema = {
                 "type": "object",
