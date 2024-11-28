@@ -70,7 +70,12 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowRunStatusResponse,
 )
-from skyvern.forge.sdk.workflow.models.yaml import BLOCK_YAML_TYPES, ForLoopBlockYAML, WorkflowCreateYAMLRequest
+from skyvern.forge.sdk.workflow.models.yaml import (
+    BLOCK_YAML_TYPES,
+    ForLoopBlockYAML,
+    WorkflowCreateYAMLRequest,
+    WorkflowDefinitionYAML,
+)
 from skyvern.webeye.browser_factory import BrowserState
 
 LOG = structlog.get_logger()
@@ -1501,3 +1506,20 @@ class WorkflowService:
             )
 
         raise ValueError(f"Invalid block type {block_yaml.block_type}")
+
+    async def create_empty_workflow(self, organization: Organization, title: str) -> Workflow:
+        """
+        Create a blank workflow with no blocks
+        """
+        # create a new workflow
+        workflow_create_request = WorkflowCreateYAMLRequest(
+            title=title,
+            workflow_definition=WorkflowDefinitionYAML(
+                parameters=[],
+                blocks=[],
+            ),
+        )
+        return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+            organization=organization,
+            request=workflow_create_request,
+        )
