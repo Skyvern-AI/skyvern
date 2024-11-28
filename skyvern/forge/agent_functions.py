@@ -134,7 +134,7 @@ async def _convert_svg_to_string(
         )
 
     if svg_shape:
-        LOG.debug("SVG loaded from cache", element_id=element_id, shape=svg_shape)
+        LOG.debug("SVG loaded from cache", element_id=element_id, key=svg_key, shape=svg_shape)
     else:
         if len(svg_html) > settings.SVG_MAX_LENGTH:
             # TODO: implement a fallback solution for "too large" case, maybe convert by screenshot
@@ -144,6 +144,7 @@ async def _convert_svg_to_string(
                 task_id=task_id,
                 step_id=step_id,
                 length=len(svg_html),
+                key=svg_key,
             )
             del element["children"]
             element["isDropped"] = True
@@ -159,7 +160,7 @@ async def _convert_svg_to_string(
                 recognized = json_response.get("recognized", False)
                 if not svg_shape or not recognized:
                     raise Exception("Empty or unrecognized SVG shape replied by secondary llm")
-                LOG.info("SVG converted by LLM", element_id=element_id, shape=svg_shape)
+                LOG.info("SVG converted by LLM", element_id=element_id, key=svg_key, shape=svg_shape)
                 await app.CACHE.set(svg_key, svg_shape)
                 break
             except LLMProviderError:
@@ -169,6 +170,7 @@ async def _convert_svg_to_string(
                     task_id=task_id,
                     step_id=step_id,
                     element_id=element_id,
+                    key=svg_key,
                     retry=retry,
                 )
                 if retry == SVG_SHAPE_CONVERTION_ATTEMPTS - 1:
@@ -194,6 +196,7 @@ async def _convert_svg_to_string(
                 element_id=element_id,
                 task_id=task_id,
                 step_id=step_id,
+                key=svg_key,
                 length=len(svg_html),
             )
             del element["children"]
@@ -202,6 +205,8 @@ async def _convert_svg_to_string(
 
     element["attributes"] = dict()
     if svg_shape != INVALID_SHAPE:
+        # refresh the cache expiration
+        await app.CACHE.set(svg_key, svg_shape)
         element["attributes"]["alt"] = svg_shape
     del element["children"]
     return
@@ -237,7 +242,7 @@ async def _convert_css_shape_to_string(
         )
 
     if css_shape:
-        LOG.debug("CSS shape loaded from cache", element_id=element_id, shape=css_shape)
+        LOG.debug("CSS shape loaded from cache", element_id=element_id, key=shape_key, shape=css_shape)
     else:
         # FIXME: support element in iframe
         locater = frame.locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
@@ -274,7 +279,7 @@ async def _convert_css_shape_to_string(
                     recognized = json_response.get("recognized", False)
                     if not css_shape or not recognized:
                         raise Exception("Empty or unrecognized css shape replied by secondary llm")
-                    LOG.info("CSS Shape converted by LLM", element_id=element_id, shape=css_shape)
+                    LOG.info("CSS Shape converted by LLM", element_id=element_id, key=shape_key, shape=css_shape)
                     await app.CACHE.set(shape_key, css_shape)
                     break
                 except LLMProviderError:
@@ -285,6 +290,7 @@ async def _convert_css_shape_to_string(
                         step_id=step_id,
                         element_id=element_id,
                         retry=retry,
+                        key=shape_key,
                     )
                     if retry == CSS_SHAPE_CONVERTION_ATTEMPTS - 1:
                         # set the invalid css shape to cache to avoid retry in the near future
@@ -298,6 +304,7 @@ async def _convert_css_shape_to_string(
                         step_id=step_id,
                         element_id=element_id,
                         retry=retry,
+                        key=shape_key,
                     )
                     if retry == CSS_SHAPE_CONVERTION_ATTEMPTS - 1:
                         # set the invalid css shape to cache to avoid retry in the near future
@@ -309,11 +316,13 @@ async def _convert_css_shape_to_string(
                     task_id=task_id,
                     step_id=step_id,
                     element_id=element_id,
+                    key=shape_key,
                 )
                 return None
         except Exception:
             LOG.warning(
                 "Failed to convert css shape to string shape by LLM",
+                key=shape_key,
                 task_id=task_id,
                 step_id=step_id,
                 element_id=element_id,
@@ -324,6 +333,8 @@ async def _convert_css_shape_to_string(
     if "attributes" not in element:
         element["attributes"] = dict()
     if css_shape != INVALID_SHAPE:
+        # refresh the cache expiration
+        await app.CACHE.set(shape_key, css_shape)
         element["attributes"]["shape-description"] = css_shape
     return None
 
