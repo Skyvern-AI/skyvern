@@ -997,7 +997,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
       return {
         ...base,
         block_type: "text_prompt",
-        llm_key: "",
+        llm_key: null,
         prompt: node.data.prompt,
         json_schema: JSONParseSafe(node.data.jsonSchema),
         parameter_keys: node.data.parameterKeys,
