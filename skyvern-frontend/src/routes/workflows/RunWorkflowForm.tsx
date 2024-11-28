@@ -253,7 +253,7 @@ function RunWorkflowForm({
             name="webhookCallbackUrl"
             rules={{
               validate: (value) => {
-                if (value === null) {
+                if (value === null || value === "") {
                   return;
                 }
                 if (typeof value !== "string") {
