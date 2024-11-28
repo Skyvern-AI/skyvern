@@ -765,10 +765,13 @@ async def user_code():
         return self.build_block_result(success=True, output_parameter_value=result, status=BlockStatus.completed)
 
 
+DEFAULT_TEXT_PROMPT_LLM_KEY = settings.SECONDARY_LLM_KEY or settings.LLM_KEY
+
+
 class TextPromptBlock(Block):
     block_type: Literal[BlockType.TEXT_PROMPT] = BlockType.TEXT_PROMPT
 
-    llm_key: str
+    llm_key: str = DEFAULT_TEXT_PROMPT_LLM_KEY
     prompt: str
     parameters: list[PARAMETER_TYPE] = []
     json_schema: dict[str, Any] | None = None
