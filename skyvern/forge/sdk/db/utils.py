@@ -82,6 +82,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False) -> Task:
         max_steps_per_run=task_obj.max_steps_per_run,
         error_code_mapping=task_obj.error_code_mapping,
         errors=task_obj.errors,
+        application=task_obj.application,
     )
     return task
 

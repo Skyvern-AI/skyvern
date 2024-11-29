@@ -216,6 +216,7 @@ class ForgeAgent:
             proxy_location=task_request.proxy_location,
             extracted_information_schema=task_request.extracted_information_schema,
             error_code_mapping=task_request.error_code_mapping,
+            application=task_request.application,
         )
         LOG.info(
             "Created new task",

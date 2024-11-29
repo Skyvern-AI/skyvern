@@ -114,6 +114,7 @@ class AgentDB:
         max_steps_per_run: int | None = None,
         error_code_mapping: dict[str, str] | None = None,
         task_type: str = TaskType.general,
+        application: str | None = None,
     ) -> Task:
         try:
             async with self.Session() as session:
@@ -138,6 +139,7 @@ class AgentDB:
                     retry=retry,
                     max_steps_per_run=max_steps_per_run,
                     error_code_mapping=error_code_mapping,
+                    application=application,
                 )
                 session.add(new_task)
                 await session.commit()
@@ -478,6 +480,7 @@ class AgentDB:
         workflow_run_id: str | None = None,
         organization_id: str | None = None,
         only_standalone_tasks: bool = False,
+        application: str | None = None,
         order_by_column: OrderBy = OrderBy.created_at,
         order: SortDirection = SortDirection.desc,
     ) -> list[Task]:
@@ -505,6 +508,8 @@ class AgentDB:
                     query = query.filter(TaskModel.workflow_run_id == workflow_run_id)
                 if only_standalone_tasks:
                     query = query.filter(TaskModel.workflow_run_id.is_(None))
+                if application:
+                    query = query.filter(TaskModel.application == application)
                 order_by_col = getattr(TaskModel, order_by_column)
                 query = (
                     query.order_by(order_by_col.desc() if order == SortDirection.desc else order_by_col.asc())

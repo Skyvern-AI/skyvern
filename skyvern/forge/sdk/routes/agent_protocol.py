@@ -421,6 +421,7 @@ async def get_agent_tasks(
     workflow_run_id: Annotated[str | None, Query()] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     only_standalone_tasks: bool = Query(False),
+    application: Annotated[str | None, Query()] = None,
     sort: OrderBy = Query(OrderBy.created_at),
     order: SortDirection = Query(SortDirection.desc),
 ) -> Response:
@@ -451,6 +452,7 @@ async def get_agent_tasks(
         only_standalone_tasks=only_standalone_tasks,
         order=order,
         order_by_column=sort,
+        application=application,
     )
     return ORJSONResponse([task.to_task_response().model_dump() for task in tasks])
 
