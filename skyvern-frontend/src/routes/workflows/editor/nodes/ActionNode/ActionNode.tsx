@@ -26,6 +26,8 @@ import {
   commonHelpTooltipContent,
 } from "../../constants";
 
+const urlTooltip =
+  "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
 const navigationGoalTooltip =
   "Specify a single step or action you'd like Skyvern to complete. Actions are one-off tasks like filling a field or interacting with a specific element on the page.\n\nCurrently supported actions are click, input text, upload file, and select.";
 
@@ -39,6 +41,7 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
     initialValue: data.label,
   });
   const [inputs, setInputs] = useState({
+    url: data.url,
     navigationGoal: data.navigationGoal,
     errorCodeMapping: data.errorCodeMapping,
     maxRetries: data.maxRetries,
@@ -96,22 +99,43 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
             }}
           />
         </header>
-        <div className="space-y-2">
-          <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">Action Instruction</Label>
-            <HelpTooltip content={navigationGoalTooltip} />
+        <div className="space-y-4">
+          <div className="space-y-2">
+            <div className="flex gap-2">
+              <Label className="text-xs text-slate-300">URL</Label>
+              <HelpTooltip content={urlTooltip} />
+            </div>
+            <AutoResizingTextarea
+              onChange={(event) => {
+                if (!editable) {
+                  return;
+                }
+                handleChange("url", event.target.value);
+              }}
+              value={inputs.url}
+              placeholder={commonFieldPlaceholders["url"]}
+              className="nopan text-xs"
+            />
           </div>
-          <AutoResizingTextarea
-            onChange={(event) => {
-              if (!editable) {
-                return;
-              }
-              handleChange("navigationGoal", event.target.value);
-            }}
-            value={inputs.navigationGoal}
-            placeholder={navigationGoalPlaceholder}
-            className="nopan text-xs"
-          />
+          <div className="space-y-2">
+            <div className="flex gap-2">
+              <Label className="text-xs text-slate-300">
+                Action Instruction
+              </Label>
+              <HelpTooltip content={navigationGoalTooltip} />
+            </div>
+            <AutoResizingTextarea
+              onChange={(event) => {
+                if (!editable) {
+                  return;
+                }
+                handleChange("navigationGoal", event.target.value);
+              }}
+              value={inputs.navigationGoal}
+              placeholder={navigationGoalPlaceholder}
+              className="nopan text-xs"
+            />
+          </div>
         </div>
         <Separator />
         <Accordion type="single" collapsible>
