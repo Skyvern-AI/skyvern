@@ -52,7 +52,7 @@ setup_llm_providers() {
         else
             update_or_add_env_var "OPENAI_API_KEY" "$openai_api_key"
             update_or_add_env_var "ENABLE_OPENAI" "true"
-            model_options+=("OPENAI_GPT4_TURBO" "OPENAI_GPT4V" "OPENAI_GPT4O")
+            model_options+=("OPENAI_GPT4_TURBO" "OPENAI_GPT4V" "OPENAI_GPT4O" "ANTHROPIC/CLAUDE-3.5-SONNET" "meta-llama/llama-3.2-90b-vision-instruct")
         fi
     else
         update_or_add_env_var "ENABLE_OPENAI" "false"
@@ -97,6 +97,24 @@ setup_llm_providers() {
     else
         update_or_add_env_var "ENABLE_AZURE" "false"
     fi
+
+    # Openrouter Configuration
+    echo "To enable Openrouter, you must have an Openrouter API key."
+    read -p "Do you want to enable Openrouter (y/n)? " enable_openrouter
+    if [[ "$enable_openrouter" == "y" ]]; then
+        read -p "Enter your Openrouter API key: " openrouter_api_key
+        if [ -z "$openrouter_api_key" ]; then
+            echo "Error: Openrouter API key is required."
+            echo "Openrouter will not be enabled."
+        else
+            update_or_add_env_var "OPENROUTER_API_KEY" "$openrouter_api_key"
+            update_or_add_env_var "ENABLE_OPENROUTER" "true"
+            model_options+=("ANTHROPIC/CLAUDE-3.5-SONNET" "meta-llama/llama-3.2-90b-vision-instruct" "google/gemini-flash-1.5-8b")
+        fi
+    else
+        update_or_add_env_var "ENABLE_OPENROUTER" "false"
+    fi
+
 
     # Model Selection
     if [ ${#model_options[@]} -eq 0 ]; then
@@ -308,3 +326,8 @@ main() {
 
 # Execute main function
 main
+
+#Test Model
+bash
+echo "Testing OpenRouter model connection..."
+python3 -c "from your_module import test_openrouter_model; test_openrouter_model()"
