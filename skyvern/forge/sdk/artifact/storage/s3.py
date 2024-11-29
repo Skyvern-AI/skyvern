@@ -3,6 +3,7 @@ import shutil
 from datetime import datetime
 
 from skyvern.config import settings
+from skyvern.constants import DOWNLOAD_FILE_PREFIX
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.files import (
     create_named_temporary_file,
@@ -79,20 +80,20 @@ class S3Storage(BaseStorage):
         for file in files:
             fpath = os.path.join(download_dir, file)
             if os.path.isfile(fpath):
-                uri = f"s3://{settings.AWS_S3_BUCKET_DOWNLOADS}/{settings.ENV}/{organization_id}/{workflow_run_id or task_id}/{file}"
+                uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{workflow_run_id or task_id}/{file}"
                 # TODO: use coroutine to speed up uploading if too many files
                 await self.async_client.upload_file_from_path(uri, fpath)
 
     async def get_downloaded_files(
         self, organization_id: str, task_id: str | None, workflow_run_id: str | None
     ) -> list[str]:
-        uri = f"s3://{settings.AWS_S3_BUCKET_DOWNLOADS}/{settings.ENV}/{organization_id}/{workflow_run_id or task_id}"
+        uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{workflow_run_id or task_id}"
         object_keys = await self.async_client.list_files(uri=uri)
         if len(object_keys) == 0:
             return []
         object_uris: list[str] = []
         for key in object_keys:
-            object_uri = f"s3://{settings.AWS_S3_BUCKET_DOWNLOADS}/{key}"
+            object_uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{key}"
             object_uris.append(object_uri)
         presigned_urils = await self.async_client.create_presigned_urls(object_uris)
         if presigned_urils is None:
