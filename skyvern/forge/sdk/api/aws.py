@@ -104,6 +104,18 @@ class AsyncAWSClient:
             LOG.exception("Failed to create presigned url for S3 objects.", uris=uris)
             return None
 
+    @execute_with_async_client(client_type=AWSClientType.S3)
+    async def list_files(self, uri: str, client: AioBaseClient = None) -> list[str]:
+        object_keys: list[str] = []
+        parsed_uri = S3Uri(uri)
+        async for page in client.get_paginator("list_objects_v2").paginate(
+            Bucket=parsed_uri.bucket, Prefix=parsed_uri.key
+        ):
+            if "Contents" in page:
+                for obj in page["Contents"]:
+                    object_keys.append(obj["Key"])
+        return object_keys
+
 
 class S3Uri(object):
     # From: https://stackoverflow.com/questions/42641315/s3-urls-get-bucket-name-and-path

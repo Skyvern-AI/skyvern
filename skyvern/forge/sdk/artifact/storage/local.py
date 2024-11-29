@@ -6,7 +6,7 @@ from urllib.parse import unquote, urlparse
 
 import structlog
 
-from skyvern.forge.sdk.api.files import get_skyvern_temp_dir
+from skyvern.forge.sdk.api.files import get_download_dir, get_skyvern_temp_dir
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP, BaseStorage
 from skyvern.forge.sdk.models import Step
@@ -119,6 +119,23 @@ class LocalStorage(BaseStorage):
         if not stored_folder_path.exists():
             return None
         return str(stored_folder_path)
+
+    async def save_downloaded_files(
+        self, organization_id: str, task_id: str | None, workflow_run_id: str | None
+    ) -> None:
+        pass
+
+    async def get_downloaded_files(
+        self, organization_id: str, task_id: str | None, workflow_run_id: str | None
+    ) -> list[str]:
+        download_dir = get_download_dir(workflow_run_id=workflow_run_id, task_id=task_id)
+        files: list[str] = []
+        files_and_folders = os.listdir(download_dir)
+        for file_or_folder in files_and_folders:
+            path = os.path.join(download_dir, file_or_folder)
+            if os.path.isfile(path):
+                files.append(f"file://{path}")
+        return files
 
     @staticmethod
     def _parse_uri_to_path(uri: str) -> str:
