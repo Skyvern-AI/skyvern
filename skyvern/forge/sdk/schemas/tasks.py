@@ -91,6 +91,11 @@ class TaskBase(BaseModel):
         description="The type of the task",
         examples=[TaskType.general, TaskType.validation],
     )
+    application: str | None = Field(
+        default=None,
+        description="The application for which the task is running",
+        examples=["forms"],
+    )
 
 
 class TaskRequest(TaskBase):
