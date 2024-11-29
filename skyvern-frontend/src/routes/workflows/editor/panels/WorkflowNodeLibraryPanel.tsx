@@ -6,12 +6,10 @@ import {
   DownloadIcon,
   EnvelopeClosedIcon,
   FileIcon,
-  ListBulletIcon,
   LockOpen1Icon,
   PlusIcon,
   StopwatchIcon,
   UpdateIcon,
-  UploadIcon,
 } from "@radix-ui/react-icons";
 import { WorkflowBlockNode } from "../nodes";
 import { AddNodeProps } from "../FlowRenderer";
@@ -27,16 +25,28 @@ const nodeLibraryItems: Array<{
   description: string;
 }> = [
   {
-    nodeType: "task",
-    icon: <ListBulletIcon className="size-6" />,
-    title: "Task Block",
-    description: "Takes actions or extracts information",
+    nodeType: "navigation",
+    icon: <RobotIcon className="size-6" />,
+    title: "Navigation Block",
+    description: "Navigate on the page",
   },
   {
-    nodeType: "loop",
-    icon: <UpdateIcon className="size-6" />,
-    title: "For Loop Block",
-    description: "Repeats nested elements",
+    nodeType: "action",
+    icon: <ClickIcon className="size-6" />,
+    title: "Action Block",
+    description: "Take a single action",
+  },
+  {
+    nodeType: "extraction",
+    icon: <ExtractIcon className="size-6" />,
+    title: "Extraction Block",
+    description: "Extract data from the page",
+  },
+  {
+    nodeType: "validation",
+    icon: <CheckCircledIcon className="size-6" />,
+    title: "Validation Block",
+    description: "Validate the state of the workflow or terminate",
   },
   {
     nodeType: "textPrompt",
@@ -49,6 +59,19 @@ const nodeLibraryItems: Array<{
     icon: <EnvelopeClosedIcon className="size-6" />,
     title: "Send Email Block",
     description: "Sends an email",
+  },
+  // legacy
+  // {
+  //   nodeType: "task",
+  //   icon: <ListBulletIcon className="size-6" />,
+  //   title: "Task Block",
+  //   description: "Takes actions or extracts information",
+  // },
+  {
+    nodeType: "loop",
+    icon: <UpdateIcon className="size-6" />,
+    title: "For Loop Block",
+    description: "Repeats nested elements",
   },
   // temporarily removed
   // {
@@ -70,35 +93,17 @@ const nodeLibraryItems: Array<{
   //   title: "Download Block",
   //   description: "Downloads a file from S3",
   // },
+  // {
+  //   nodeType: "upload",
+  //   icon: <UploadIcon className="size-6" />,
+  //   title: "Upload Block",
+  //   description: "Uploads a file to S3",
+  // },
   {
-    nodeType: "upload",
-    icon: <UploadIcon className="size-6" />,
-    title: "Upload Block",
-    description: "Uploads a file to S3",
-  },
-  {
-    nodeType: "validation",
-    icon: <CheckCircledIcon className="size-6" />,
-    title: "Validation Block",
-    description: "Validate the state of the workflow or terminate",
-  },
-  {
-    nodeType: "action",
-    icon: <ClickIcon className="size-6" />,
-    title: "Action Block",
-    description: "Take a single action",
-  },
-  {
-    nodeType: "navigation",
-    icon: <RobotIcon className="size-6" />,
-    title: "Navigation Block",
-    description: "Navigate on the page",
-  },
-  {
-    nodeType: "extraction",
-    icon: <ExtractIcon className="size-6" />,
-    title: "Extraction Block",
-    description: "Extract data from the page",
+    nodeType: "fileDownload",
+    icon: <DownloadIcon className="size-6" />,
+    title: "File Download Block",
+    description: "Download a file",
   },
   {
     nodeType: "login",
@@ -111,12 +116,6 @@ const nodeLibraryItems: Array<{
     icon: <StopwatchIcon className="size-6" />,
     title: "Wait Block",
     description: "Wait for some time",
-  },
-  {
-    nodeType: "fileDownload",
-    icon: <DownloadIcon className="size-6" />,
-    title: "File Download Block",
-    description: "Download a file",
   },
 ];
 
