@@ -27,9 +27,10 @@ import {
 import { ExtractIcon } from "@/components/icons/ExtractIcon";
 
 const dataExtractionGoalTooltip =
-  "Tell Skyvern what data you would like to scrape.";
+  "Tell Skyvern what data you would like to scrape. Use {{ parameter_name }} to specify parameters to use.";
 const dataSchemaTooltip = "Specify a format for extracted data in JSON.";
-const dataExtractionGoalPlaceholder = "What data do you need to extract?";
+const dataExtractionGoalPlaceholder =
+  "Extract the price of the product with id {{ product_id }}";
 
 function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
   const { updateNodeData } = useReactFlow();
