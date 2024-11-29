@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     GENERATE_PRESIGNED_URLS: bool = False
     AWS_S3_BUCKET_ARTIFACTS: str = "skyvern-artifacts"
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
+    AWS_S3_BUCKET_DOWNLOADS: str = "skyvern-uploads"
     AWS_S3_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
 
     # Supported storage types: local, s3

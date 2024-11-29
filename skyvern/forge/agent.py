@@ -14,7 +14,13 @@ from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Page
 
 from skyvern import analytics
-from skyvern.constants import SCRAPE_TYPE_ORDER, SPECIAL_FIELD_VERIFICATION_CODE, ScrapeType
+from skyvern.constants import (
+    GET_DOWNLOADED_FILES_TIMEOUT,
+    SAVE_DOWNLOADED_FILES_TIMEOUT,
+    SCRAPE_TYPE_ORDER,
+    SPECIAL_FIELD_VERIFICATION_CODE,
+    ScrapeType,
+)
 from skyvern.exceptions import (
     BrowserStateMissingPage,
     EmptyScrapePage,
@@ -1491,6 +1497,26 @@ class ForgeAgent:
             )
             return
 
+        if task.organization_id:
+            try:
+                async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                    await app.STORAGE.save_downloaded_files(
+                        task.organization_id, task_id=task.task_id, workflow_run_id=None
+                    )
+            except asyncio.TimeoutError:
+                LOG.warning(
+                    "Timeout to save downloaded files",
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to save downloaded files",
+                    exc_info=True,
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                )
+
         await self.async_operation_pool.remove_task(task.task_id)
         await self.cleanup_browser_and_create_artifacts(close_browser_on_completion, last_step, task)
 
@@ -1520,6 +1546,11 @@ class ForgeAgent:
             )
             return
 
+        screenshot_url = None
+        recording_url = None
+        latest_action_screenshot_urls: list[str] | None = None
+        downloaded_file_urls: list[str] | None = None
+
         # get the artifact of the screenshot and get the screenshot_url
         screenshot_artifact = await app.DATABASE.get_artifact(
             task_id=task.task_id,
@@ -1527,50 +1558,65 @@ class ForgeAgent:
             artifact_type=ArtifactType.SCREENSHOT_FINAL,
             organization_id=task.organization_id,
         )
-        if screenshot_artifact is None:
-            screenshot_url = None
-            if screenshot_artifact:
-                screenshot_url = await app.ARTIFACT_MANAGER.get_share_link(screenshot_artifact)
+        if screenshot_artifact:
+            screenshot_url = await app.ARTIFACT_MANAGER.get_share_link(screenshot_artifact)
 
-            recording_artifact = await app.DATABASE.get_artifact(
-                task_id=task.task_id,
-                step_id=last_step.step_id,
-                artifact_type=ArtifactType.RECORDING,
-                organization_id=task.organization_id,
-            )
-            recording_url = None
-            if recording_artifact:
-                recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
+        recording_artifact = await app.DATABASE.get_artifact(
+            task_id=task.task_id,
+            step_id=last_step.step_id,
+            artifact_type=ArtifactType.RECORDING,
+            organization_id=task.organization_id,
+        )
+        if recording_artifact:
+            recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
             # get the artifact of the last TASK_RESPONSE_ACTION_SCREENSHOT_COUNT screenshots and get the screenshot_url
-            latest_action_screenshot_artifacts = await app.DATABASE.get_latest_n_artifacts(
-                task_id=task.task_id,
-                organization_id=task.organization_id,
-                artifact_types=[ArtifactType.SCREENSHOT_ACTION],
-                n=SettingsManager.get_settings().TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
-            )
-            latest_action_screenshot_urls: list[str] | None = []
-            if latest_action_screenshot_artifacts:
-                latest_action_screenshot_urls = await app.ARTIFACT_MANAGER.get_share_links(
-                    latest_action_screenshot_artifacts
-                )
-            else:
-                LOG.error("Failed to get latest action screenshots")
-
-            # get the latest task from the db to get the latest status, extracted_information, and failure_reason
-            task_from_db = await app.DATABASE.get_task(task_id=task.task_id, organization_id=task.organization_id)
-            if not task_from_db:
-                LOG.error("Failed to get task from db when sending task response")
-                raise TaskNotFound(task_id=task.task_id)
-
-            task = task_from_db
-            task_response = task.to_task_response(
-                action_screenshot_urls=latest_action_screenshot_urls,
-                screenshot_url=screenshot_url,
-                recording_url=recording_url,
+        latest_action_screenshot_artifacts = await app.DATABASE.get_latest_n_artifacts(
+            task_id=task.task_id,
+            organization_id=task.organization_id,
+            artifact_types=[ArtifactType.SCREENSHOT_ACTION],
+            n=SettingsManager.get_settings().TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
+        )
+        if latest_action_screenshot_artifacts:
+            latest_action_screenshot_urls = await app.ARTIFACT_MANAGER.get_share_links(
+                latest_action_screenshot_artifacts
             )
         else:
-            task_response = task.to_task_response()
+            LOG.error("Failed to get latest action screenshots")
+
+        if task.organization_id:
+            try:
+                async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                    downloaded_file_urls = await app.STORAGE.get_downloaded_files(
+                        organization_id=task.organization_id, task_id=task.task_id, workflow_run_id=task.workflow_run_id
+                    )
+            except asyncio.TimeoutError:
+                LOG.warning(
+                    "Timeout to get downloaded files",
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to get downloaded files",
+                    exc_info=True,
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                )
+
+            # get the latest task from the db to get the latest status, extracted_information, and failure_reason
+        task_from_db = await app.DATABASE.get_task(task_id=task.task_id, organization_id=task.organization_id)
+        if not task_from_db:
+            LOG.error("Failed to get task from db when sending task response")
+            raise TaskNotFound(task_id=task.task_id)
+
+        task = task_from_db
+        task_response = task.to_task_response(
+            action_screenshot_urls=latest_action_screenshot_urls,
+            screenshot_url=screenshot_url,
+            recording_url=recording_url,
+            downloaded_file_urls=downloaded_file_urls,
+        )
 
         if not task.webhook_callback_url:
             LOG.info("Task has no webhook callback url. Not sending task response")

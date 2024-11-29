@@ -114,7 +114,13 @@ def unzip_files(zip_file_path: str, output_dir: str) -> None:
 
 
 def get_path_for_workflow_download_directory(workflow_run_id: str) -> Path:
-    return Path(f"{REPO_ROOT_DIR}/downloads/{workflow_run_id}/")
+    return Path(get_download_dir(workflow_run_id=workflow_run_id, task_id=None))
+
+
+def get_download_dir(workflow_run_id: str | None, task_id: str | None) -> str:
+    download_dir = f"{REPO_ROOT_DIR}/downloads/{workflow_run_id or task_id}"
+    os.makedirs(download_dir, exist_ok=True)
+    return download_dir
 
 
 def list_files_in_directory(directory: Path, recursive: bool = False) -> list[str]:

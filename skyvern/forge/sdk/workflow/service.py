@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import datetime
 from typing import Any
@@ -6,6 +7,7 @@ import httpx
 import structlog
 
 from skyvern import analytics
+from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
 from skyvern.exceptions import (
     FailedToSendWebhook,
     MissingValueForParameter,
@@ -778,6 +780,24 @@ class WorkflowService:
         if recording_artifact:
             recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
+        downloaded_file_urls: list[str] | None = None
+        try:
+            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                downloaded_file_urls = await app.STORAGE.get_downloaded_files(
+                    organization_id=workflow.organization_id, task_id=None, workflow_run_id=workflow_run.workflow_run_id
+                )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout to get downloaded files",
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to get downloaded files",
+                exc_info=True,
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
+
         workflow_parameter_tuples = await app.DATABASE.get_workflow_run_parameters(workflow_run_id=workflow_run_id)
         parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
         output_parameter_tuples: list[
@@ -804,6 +824,7 @@ class WorkflowService:
             parameters=parameters_with_value,
             screenshot_urls=screenshot_urls,
             recording_url=recording_url,
+            downloaded_file_urls=downloaded_file_urls,
             outputs=outputs,
         )
 
@@ -836,6 +857,23 @@ class WorkflowService:
                 LOG.info("Persisted browser session for workflow run", workflow_run_id=workflow_run.workflow_run_id)
 
         await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks_for_tasks(all_workflow_task_ids)
+
+        try:
+            async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                await app.STORAGE.save_downloaded_files(
+                    workflow.organization_id, task_id=None, workflow_run_id=workflow_run.workflow_run_id
+                )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout to save downloaded files",
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to save downloaded files",
+                exc_info=True,
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
 
         if not need_call_webhook:
             return

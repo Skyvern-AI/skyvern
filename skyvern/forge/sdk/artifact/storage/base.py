@@ -68,3 +68,15 @@ class BaseStorage(ABC):
     @abstractmethod
     async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
         pass
+
+    @abstractmethod
+    async def save_downloaded_files(
+        self, organization_id: str, task_id: str | None, workflow_run_id: str | None
+    ) -> None:
+        pass
+
+    @abstractmethod
+    async def get_downloaded_files(
+        self, organization_id: str, task_id: str | None, workflow_run_id: str | None
+    ) -> list[str]:
+        pass

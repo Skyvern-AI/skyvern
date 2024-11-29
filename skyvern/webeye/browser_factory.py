@@ -14,7 +14,7 @@ from playwright.async_api import BrowserContext, ConsoleMessage, Download, Error
 from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
-from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_DOWNLOAD_TIMEOUT, REPO_ROOT_DIR
+from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_DOWNLOAD_TIMEOUT
 from skyvern.exceptions import (
     FailedToNavigateToUrl,
     FailedToReloadPage,
@@ -33,13 +33,6 @@ LOG = structlog.get_logger()
 
 
 BrowserCleanupFunc = Callable[[], None] | None
-
-
-def get_download_dir(workflow_run_id: str | None, task_id: str | None) -> str:
-    download_dir = f"{REPO_ROOT_DIR}/downloads/{workflow_run_id or task_id}"
-    LOG.info("Initializing download directory", download_dir=download_dir)
-    os.makedirs(download_dir, exist_ok=True)
-    return download_dir
 
 
 def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> None:
