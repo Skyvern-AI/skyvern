@@ -79,6 +79,9 @@ function WorkflowBlockCollapsibleContent({ task, onNavigate }: Props) {
           <TableCell
             className="w-1/5 max-w-0 cursor-pointer truncate"
             title={task.request.title ?? undefined}
+            onClick={(event) => {
+              onNavigate(event, task.task_id);
+            }}
           >
             {task.request.title}
           </TableCell>
