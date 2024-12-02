@@ -20,8 +20,18 @@ import { errorMappingExampleValue } from "../types";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { Switch } from "@/components/ui/switch";
 import type { NavigationNode } from "./types";
+import {
+  commonFieldPlaceholders,
+  commonHelpTooltipContent,
+} from "../../constants";
 import { RobotIcon } from "@/components/icons/RobotIcon";
-import { helpTooltips, placeholders } from "../../helpContent";
+
+const urlTooltip =
+  "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
+const urlPlaceholder = "https://";
+const navigationGoalTooltip =
+  "Give Skyvern an objective. Make sure to include when the task is complete, when it should self-terminate, and any guardrails.";
+const navigationGoalPlaceholder = "Tell Skyvern what to do.";
 
 function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
   const { updateNodeData } = useReactFlow();
@@ -94,7 +104,7 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
           <div className="space-y-2">
             <div className="flex gap-2">
               <Label className="text-xs text-slate-300">URL</Label>
-              <HelpTooltip content={helpTooltips["navigation"]["url"]} />
+              <HelpTooltip content={urlTooltip} />
             </div>
             <AutoResizingTextarea
               onChange={(event) => {
@@ -104,16 +114,14 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                 handleChange("url", event.target.value);
               }}
               value={inputs.url}
-              placeholder={placeholders["navigation"]["url"]}
+              placeholder={urlPlaceholder}
               className="nopan text-xs"
             />
           </div>
           <div className="space-y-2">
             <div className="flex gap-2">
               <Label className="text-xs text-slate-300">Navigation Goal</Label>
-              <HelpTooltip
-                content={helpTooltips["navigation"]["navigationGoal"]}
-              />
+              <HelpTooltip content={navigationGoalTooltip} />
             </div>
             <AutoResizingTextarea
               onChange={(event) => {
@@ -123,7 +131,7 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                 handleChange("navigationGoal", event.target.value);
               }}
               value={inputs.navigationGoal}
-              placeholder={placeholders["navigation"]["navigationGoal"]}
+              placeholder={navigationGoalPlaceholder}
               className="nopan text-xs"
             />
           </div>
@@ -142,12 +150,12 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                       Max Retries
                     </Label>
                     <HelpTooltip
-                      content={helpTooltips["navigation"]["maxRetries"]}
+                      content={commonHelpTooltipContent["maxRetries"]}
                     />
                   </div>
                   <Input
                     type="number"
-                    placeholder={placeholders["navigation"]["maxRetries"]}
+                    placeholder={commonFieldPlaceholders["maxRetries"]}
                     className="nopan w-52 text-xs"
                     min="0"
                     value={inputs.maxRetries ?? ""}
@@ -169,12 +177,12 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                       Max Steps Override
                     </Label>
                     <HelpTooltip
-                      content={helpTooltips["navigation"]["maxStepsOverride"]}
+                      content={commonHelpTooltipContent["maxStepsOverride"]}
                     />
                   </div>
                   <Input
                     type="number"
-                    placeholder={placeholders["navigation"]["maxStepsOverride"]}
+                    placeholder={commonFieldPlaceholders["maxStepsOverride"]}
                     className="nopan w-52 text-xs"
                     min="0"
                     value={inputs.maxStepsOverride ?? ""}
@@ -197,7 +205,7 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                         Error Messages
                       </Label>
                       <HelpTooltip
-                        content={helpTooltips["navigation"]["errorCodeMapping"]}
+                        content={commonHelpTooltipContent["errorCodeMapping"]}
                       />
                     </div>
                     <Checkbox
@@ -240,7 +248,7 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                       Continue on Failure
                     </Label>
                     <HelpTooltip
-                      content={helpTooltips["navigation"]["continueOnFailure"]}
+                      content={commonHelpTooltipContent["continueOnFailure"]}
                     />
                   </div>
                   <div className="w-52">
@@ -261,7 +269,7 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                       Cache Actions
                     </Label>
                     <HelpTooltip
-                      content={helpTooltips["navigation"]["cacheActions"]}
+                      content={commonHelpTooltipContent["cacheActions"]}
                     />
                   </div>
                   <div className="w-52">
@@ -283,7 +291,7 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                       Complete on Download
                     </Label>
                     <HelpTooltip
-                      content={helpTooltips["navigation"]["completeOnDownload"]}
+                      content={commonHelpTooltipContent["completeOnDownload"]}
                     />
                   </div>
                   <div className="w-52">
@@ -304,12 +312,12 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                       File Suffix
                     </Label>
                     <HelpTooltip
-                      content={helpTooltips["navigation"]["fileSuffix"]}
+                      content={commonHelpTooltipContent["fileSuffix"]}
                     />
                   </div>
                   <Input
                     type="text"
-                    placeholder={placeholders["navigation"]["downloadSuffix"]}
+                    placeholder={commonFieldPlaceholders["downloadSuffix"]}
                     className="nopan w-52 text-xs"
                     value={inputs.downloadSuffix ?? ""}
                     onChange={(event) => {
@@ -327,9 +335,7 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                       2FA Verification URL
                     </Label>
                     <HelpTooltip
-                      content={
-                        helpTooltips["navigation"]["totpVerificationUrl"]
-                      }
+                      content={commonHelpTooltipContent["totpVerificationUrl"]}
                     />
                   </div>
                   <AutoResizingTextarea
@@ -340,9 +346,7 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                       handleChange("totpVerificationUrl", event.target.value);
                     }}
                     value={inputs.totpVerificationUrl ?? ""}
-                    placeholder={
-                      placeholders["navigation"]["totpVerificationUrl"]
-                    }
+                    placeholder={commonFieldPlaceholders["totpVerificationUrl"]}
                     className="nopan text-xs"
                   />
                 </div>
@@ -352,7 +356,7 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                       2FA Identifier
                     </Label>
                     <HelpTooltip
-                      content={helpTooltips["navigation"]["totpIdentifier"]}
+                      content={commonHelpTooltipContent["totpIdentifier"]}
                     />
                   </div>
                   <AutoResizingTextarea
@@ -363,7 +367,7 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                       handleChange("totpIdentifier", event.target.value);
                     }}
                     value={inputs.totpIdentifier ?? ""}
-                    placeholder={placeholders["navigation"]["totpIdentifier"]}
+                    placeholder={commonFieldPlaceholders["totpIdentifier"]}
                     className="nopan text-xs"
                   />
                 </div>

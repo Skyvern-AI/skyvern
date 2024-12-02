@@ -17,11 +17,14 @@ import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChan
 import { DownloadIcon } from "@radix-ui/react-icons";
 import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { useState } from "react";
+import {
+  commonFieldPlaceholders,
+  commonHelpTooltipContent,
+} from "../../constants";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { errorMappingExampleValue } from "../types";
 import type { FileDownloadNode } from "./types";
-import { helpTooltips, placeholders } from "../../helpContent";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -151,12 +154,12 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                       Max Retries
                     </Label>
                     <HelpTooltip
-                      content={helpTooltips["download"]["maxRetries"]}
+                      content={commonHelpTooltipContent["maxRetries"]}
                     />
                   </div>
                   <Input
                     type="number"
-                    placeholder={placeholders["download"]["maxRetries"]}
+                    placeholder={commonFieldPlaceholders["maxRetries"]}
                     className="nopan w-52 text-xs"
                     min="0"
                     value={inputs.maxRetries ?? ""}
@@ -178,12 +181,12 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                       Max Steps Override
                     </Label>
                     <HelpTooltip
-                      content={helpTooltips["download"]["maxStepsOverride"]}
+                      content={commonHelpTooltipContent["maxStepsOverride"]}
                     />
                   </div>
                   <Input
                     type="number"
-                    placeholder={placeholders["download"]["maxStepsOverride"]}
+                    placeholder={commonFieldPlaceholders["maxStepsOverride"]}
                     className="nopan w-52 text-xs"
                     min="0"
                     value={inputs.maxStepsOverride ?? ""}
@@ -206,7 +209,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                         Error Messages
                       </Label>
                       <HelpTooltip
-                        content={helpTooltips["download"]["errorCodeMapping"]}
+                        content={commonHelpTooltipContent["errorCodeMapping"]}
                       />
                     </div>
                     <Checkbox
@@ -249,7 +252,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                       Continue on Failure
                     </Label>
                     <HelpTooltip
-                      content={helpTooltips["download"]["continueOnFailure"]}
+                      content={commonHelpTooltipContent["continueOnFailure"]}
                     />
                   </div>
                   <div className="w-52">
@@ -270,7 +273,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                       Cache Actions
                     </Label>
                     <HelpTooltip
-                      content={helpTooltips["download"]["cacheActions"]}
+                      content={commonHelpTooltipContent["cacheActions"]}
                     />
                   </div>
                   <div className="w-52">
@@ -292,12 +295,12 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                       File Suffix
                     </Label>
                     <HelpTooltip
-                      content={helpTooltips["download"]["fileSuffix"]}
+                      content={commonHelpTooltipContent["fileSuffix"]}
                     />
                   </div>
                   <Input
                     type="text"
-                    placeholder={placeholders["download"]["downloadSuffix"]}
+                    placeholder={commonFieldPlaceholders["downloadSuffix"]}
                     className="nopan w-52 text-xs"
                     value={inputs.downloadSuffix ?? ""}
                     onChange={(event) => {
@@ -315,7 +318,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                       2FA Verification URL
                     </Label>
                     <HelpTooltip
-                      content={helpTooltips["download"]["totpVerificationUrl"]}
+                      content={commonHelpTooltipContent["totpVerificationUrl"]}
                     />
                   </div>
                   <AutoResizingTextarea
@@ -326,9 +329,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                       handleChange("totpVerificationUrl", event.target.value);
                     }}
                     value={inputs.totpVerificationUrl ?? ""}
-                    placeholder={
-                      placeholders["download"]["totpVerificationUrl"]
-                    }
+                    placeholder={commonFieldPlaceholders["totpVerificationUrl"]}
                     className="nopan text-xs"
                   />
                 </div>
@@ -338,7 +339,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                       2FA Identifier
                     </Label>
                     <HelpTooltip
-                      content={helpTooltips["download"]["totpIdentifier"]}
+                      content={commonHelpTooltipContent["totpIdentifier"]}
                     />
                   </div>
                   <AutoResizingTextarea
@@ -349,7 +350,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                       handleChange("totpIdentifier", event.target.value);
                     }}
                     value={inputs.totpIdentifier ?? ""}
-                    placeholder={placeholders["download"]["totpIdentifier"]}
+                    placeholder={commonFieldPlaceholders["totpIdentifier"]}
                     className="nopan text-xs"
                   />
                 </div>

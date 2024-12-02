@@ -37,3 +37,8 @@ export const sendEmailNodeDefaultData: SendEmailNodeData = {
   smtpPasswordSecretParameterKey: SMTP_PASSWORD_PARAMETER_KEY,
   continueOnFailure: false,
 } as const;
+
+export const helpTooltipContent = {
+  fileAttachments:
+    "Since we're in beta this section isn't fully customizable yet, contact us if you'd like to integrate it into your workflow.",
+} as const;

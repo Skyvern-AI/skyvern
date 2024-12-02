@@ -1,5 +1,4 @@
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
-import { HelpTooltip } from "@/components/HelpTooltip";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
@@ -16,13 +15,13 @@ import {
   useReactFlow,
 } from "@xyflow/react";
 import { useState } from "react";
-import { AppNode } from "..";
-import { helpTooltips } from "../../helpContent";
-import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
+import { helpTooltipContent, type TextPromptNode } from "./types";
+import { HelpTooltip } from "@/components/HelpTooltip";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
-import { type TextPromptNode } from "./types";
+import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
+import { AppNode } from "..";
 
 function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
   const { updateNodeData } = useReactFlow();
@@ -82,7 +81,7 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
         <div className="space-y-2">
           <div className="flex gap-2">
             <Label className="text-xs text-slate-300">Prompt</Label>
-            <HelpTooltip content={helpTooltips["textPrompt"]["prompt"]} />
+            <HelpTooltip content={helpTooltipContent["prompt"]} />
           </div>
           <AutoResizingTextarea
             onChange={(event) => {

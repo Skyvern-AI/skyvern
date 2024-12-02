@@ -6,9 +6,8 @@ import { DownloadIcon } from "@radix-ui/react-icons";
 import { Handle, NodeProps, Position } from "@xyflow/react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
-import type { DownloadNode } from "./types";
+import { helpTooltipContent, type DownloadNode } from "./types";
 import { HelpTooltip } from "@/components/HelpTooltip";
-import { helpTooltips } from "../../helpContent";
 
 function DownloadNode({ id, data }: NodeProps<DownloadNode>) {
   const [label, setLabel] = useNodeLabelChangeHandler({
@@ -58,7 +57,7 @@ function DownloadNode({ id, data }: NodeProps<DownloadNode>) {
           <div className="space-y-2">
             <div className="flex items-center gap-2">
               <Label className="text-sm text-slate-400">File Path</Label>
-              <HelpTooltip content={helpTooltips["download"]["url"]} />
+              <HelpTooltip content={helpTooltipContent["url"]} />
             </div>
             <Input value={data.url} disabled className="nopan text-xs" />
           </div>

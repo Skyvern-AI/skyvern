@@ -23,9 +23,8 @@ import { useWorkflowParametersState } from "../../useWorkflowParametersState";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
-import type { LoopNode } from "./types";
+import { helpTooltipContent, type LoopNode } from "./types";
 import { HelpTooltip } from "@/components/HelpTooltip";
-import { helpTooltips } from "../../helpContent";
 
 function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const { updateNodeData } = useReactFlow();
@@ -112,7 +111,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                 <Label className="text-xs text-slate-300">
                   Loop Value Parameter
                 </Label>
-                <HelpTooltip content={helpTooltips["loop"]["loopValue"]} />
+                <HelpTooltip content={helpTooltipContent["loopValue"]} />
               </div>
               <Select
                 value={data.loopValue}

@@ -9,7 +9,6 @@ import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import type { WaitNode } from "./types";
 import { HelpTooltip } from "@/components/HelpTooltip";
-import { helpTooltips } from "../../helpContent";
 
 function WaitNode({ id, data }: NodeProps<WaitNode>) {
   const { updateNodeData } = useReactFlow();
@@ -73,7 +72,7 @@ function WaitNode({ id, data }: NodeProps<WaitNode>) {
             <Label className="text-xs text-slate-300">
               Wait Time (in seconds)
             </Label>
-            <HelpTooltip content={helpTooltips["wait"]["waitInSeconds"]} />
+            <HelpTooltip content="Specify a number for how many seconds to wait. Value must be between 0 and 300 seconds." />
           </div>
           <Input
             type="number"
