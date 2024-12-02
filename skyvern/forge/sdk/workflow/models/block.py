@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import copy
 import csv
 import json
 import os
@@ -154,27 +155,42 @@ class Block(BaseModel, abc.ABC):
     def get_async_aws_client() -> AsyncAWSClient:
         return app.WORKFLOW_CONTEXT_MANAGER.aws_client
 
-    @staticmethod
     def format_block_parameter_template_from_workflow_run_context(
-        potential_template: str, workflow_run_context: WorkflowRunContext
+        self,
+        potential_template: str,
+        workflow_run_context: WorkflowRunContext,
+        extra_context: dict[str, Any] | None = None,
     ) -> str:
         if not potential_template:
             return potential_template
         template = Template(potential_template)
-        return template.render(workflow_run_context.values)
+        final_context = copy.deepcopy(workflow_run_context.values)
+        if extra_context:
+            final_context.update(extra_context)
+        return template.render(final_context)
 
     @abc.abstractmethod
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, extra_context: dict[str, Any] | None = None, **kwargs: dict
+    ) -> BlockResult:
         pass
 
-    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+    def format_potential_template_parameters(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        extra_context: dict[str, Any] | None = None,
+    ) -> None:
         self.label = self.format_block_parameter_template_from_workflow_run_context(
-            potential_template=self.label, workflow_run_context=workflow_run_context
+            potential_template=self.label,
+            workflow_run_context=workflow_run_context,
+            extra_context=extra_context,
         )
 
-    async def execute_safe(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute_safe(
+        self, workflow_run_id: str, extra_context: dict[str, Any] | None = None, **kwargs: dict
+    ) -> BlockResult:
         try:
-            return await self.execute(workflow_run_id, **kwargs)
+            return await self.execute(workflow_run_id, extra_context=extra_context, **kwargs)
         except Exception as e:
             LOG.exception(
                 "Block execution failed",
@@ -233,47 +249,75 @@ class BaseTaskBlock(Block):
 
         return parameters
 
-    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        super().format_potential_template_parameters(workflow_run_context=workflow_run_context)
+    def format_potential_template_parameters(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        extra_context: dict[str, Any] | None = None,
+    ) -> None:
+        super().format_potential_template_parameters(
+            workflow_run_context=workflow_run_context, extra_context=extra_context
+        )
 
-        self.title = self.format_block_parameter_template_from_workflow_run_context(self.title, workflow_run_context)
+        self.title = self.format_block_parameter_template_from_workflow_run_context(
+            self.title,
+            workflow_run_context,
+            extra_context=extra_context,
+        )
 
         if self.url:
-            self.url = self.format_block_parameter_template_from_workflow_run_context(self.url, workflow_run_context)
+            self.url = self.format_block_parameter_template_from_workflow_run_context(
+                self.url,
+                workflow_run_context,
+                extra_context=extra_context,
+            )
 
         if self.totp_identifier:
             self.totp_identifier = self.format_block_parameter_template_from_workflow_run_context(
-                self.totp_identifier, workflow_run_context
+                self.totp_identifier,
+                workflow_run_context,
+                extra_context=extra_context,
             )
 
         if self.totp_verification_url:
             self.totp_verification_url = self.format_block_parameter_template_from_workflow_run_context(
-                self.totp_verification_url, workflow_run_context
+                self.totp_verification_url,
+                workflow_run_context,
+                extra_context=extra_context,
             )
 
         if self.download_suffix:
             self.download_suffix = self.format_block_parameter_template_from_workflow_run_context(
-                self.download_suffix, workflow_run_context
+                self.download_suffix,
+                workflow_run_context,
+                extra_context=extra_context,
             )
 
         if self.navigation_goal:
             self.navigation_goal = self.format_block_parameter_template_from_workflow_run_context(
-                self.navigation_goal, workflow_run_context
+                self.navigation_goal,
+                workflow_run_context,
+                extra_context=extra_context,
             )
 
         if self.data_extraction_goal:
             self.data_extraction_goal = self.format_block_parameter_template_from_workflow_run_context(
-                self.data_extraction_goal, workflow_run_context
+                self.data_extraction_goal,
+                workflow_run_context,
+                extra_context=extra_context,
             )
 
         if self.complete_criterion:
             self.complete_criterion = self.format_block_parameter_template_from_workflow_run_context(
-                self.complete_criterion, workflow_run_context
+                self.complete_criterion,
+                workflow_run_context,
+                extra_context=extra_context,
             )
 
         if self.terminate_criterion:
             self.terminate_criterion = self.format_block_parameter_template_from_workflow_run_context(
-                self.terminate_criterion, workflow_run_context
+                self.terminate_criterion,
+                workflow_run_context,
+                extra_context=extra_context,
             )
 
     @staticmethod
@@ -306,7 +350,9 @@ class BaseTaskBlock(Block):
 
         return order, retry + 1
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, extra_context: dict[str, Any] | None = None, **kwargs: dict
+    ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         current_retry = 0
         # initial value for will_retry is True, so that the loop runs at least once
@@ -349,7 +395,9 @@ class BaseTaskBlock(Block):
                 )
                 self.download_suffix = download_suffix_parameter_value
 
-        self.format_potential_template_parameters(workflow_run_context=workflow_run_context)
+        self.format_potential_template_parameters(
+            workflow_run_context=workflow_run_context, extra_context=extra_context
+        )
         # TODO (kerem) we should always retry on terminated. We should make a distinction between retriable and
         # non-retryable terminations
         while will_retry:
@@ -676,7 +724,9 @@ class ForLoopBlock(Block):
                 loop_block = loop_block.copy()
                 current_block = loop_block
 
-                block_output = await loop_block.execute_safe(workflow_run_id=workflow_run_id)
+                block_output = await loop_block.execute_safe(
+                    workflow_run_id=workflow_run_id, extra_context={"loop_block_index": loop_idx}
+                )
                 each_loop_output_values.append(
                     {
                         "loop_value": loop_over_value,
@@ -725,9 +775,11 @@ class ForLoopBlock(Block):
             last_block=current_block,
         )
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, extra_context: dict[str, Any] | None = None, **kwargs: dict
+    ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        self.format_potential_template_parameters(workflow_run_context)
+        self.format_potential_template_parameters(workflow_run_context, extra_context=extra_context)
         loop_over_values = self.get_loop_over_parameter_values(workflow_run_context)
         LOG.info(
             f"Number of loop_over values: {len(loop_over_values)}",
@@ -802,15 +854,23 @@ class CodeBlock(Block):
     ) -> list[PARAMETER_TYPE]:
         return self.parameters
 
-    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        super().format_potential_template_parameters(workflow_run_context)
-        self.code = self.format_block_parameter_template_from_workflow_run_context(self.code, workflow_run_context)
+    def format_potential_template_parameters(
+        self, workflow_run_context: WorkflowRunContext, extra_context: dict[str, Any] | None = None
+    ) -> None:
+        super().format_potential_template_parameters(workflow_run_context, extra_context=extra_context)
+        self.code = self.format_block_parameter_template_from_workflow_run_context(
+            self.code,
+            workflow_run_context,
+            extra_context=extra_context,
+        )
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, extra_context: dict[str, Any] | None = None, **kwargs: dict
+    ) -> BlockResult:
         raise DisabledBlockExecutionError("CodeBlock is disabled")
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        self.format_potential_template_parameters(workflow_run_context)
+        self.format_potential_template_parameters(workflow_run_context, extra_context=extra_context)
 
         # get all parameters into a dictionary
         parameter_values = {}
@@ -871,12 +931,22 @@ class TextPromptBlock(Block):
     ) -> list[PARAMETER_TYPE]:
         return self.parameters
 
-    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        super().format_potential_template_parameters(workflow_run_context)
+    def format_potential_template_parameters(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        extra_context: dict[str, Any] | None = None,
+    ) -> None:
+        super().format_potential_template_parameters(workflow_run_context, extra_context=extra_context)
         self.llm_key = self.format_block_parameter_template_from_workflow_run_context(
-            self.llm_key, workflow_run_context
+            self.llm_key,
+            workflow_run_context,
+            extra_context=extra_context,
         )
-        self.prompt = self.format_block_parameter_template_from_workflow_run_context(self.prompt, workflow_run_context)
+        self.prompt = self.format_block_parameter_template_from_workflow_run_context(
+            self.prompt,
+            workflow_run_context,
+            extra_context=extra_context,
+        )
 
     async def send_prompt(self, prompt: str, parameter_values: dict[str, Any]) -> dict[str, Any]:
         llm_key = self.llm_key or DEFAULT_TEXT_PROMPT_LLM_KEY
@@ -909,10 +979,12 @@ class TextPromptBlock(Block):
         LOG.info("TextPromptBlock: Received response from LLM", response=response)
         return response
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, extra_context: dict[str, Any] | None = None, **kwargs: dict
+    ) -> BlockResult:
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        self.format_potential_template_parameters(workflow_run_context)
+        self.format_potential_template_parameters(workflow_run_context, extra_context=extra_context)
         # get all parameters into a dictionary
         parameter_values = {}
         for parameter in self.parameters:
@@ -946,9 +1018,15 @@ class DownloadToS3Block(Block):
 
         return []
 
-    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        super().format_potential_template_parameters(workflow_run_context)
-        self.url = self.format_block_parameter_template_from_workflow_run_context(self.url, workflow_run_context)
+    def format_potential_template_parameters(
+        self, workflow_run_context: WorkflowRunContext, extra_context: dict[str, Any] | None = None
+    ) -> None:
+        super().format_potential_template_parameters(workflow_run_context, extra_context=extra_context)
+        self.url = self.format_block_parameter_template_from_workflow_run_context(
+            self.url,
+            workflow_run_context,
+            extra_context=extra_context,
+        )
 
     async def _upload_file_to_s3(self, uri: str, file_path: str) -> None:
         try:
@@ -958,7 +1036,9 @@ class DownloadToS3Block(Block):
             # Clean up the temporary file since it's created with delete=False
             os.unlink(file_path)
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, extra_context: dict[str, Any] | None = None, **kwargs: dict
+    ) -> BlockResult:
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         # get all parameters into a dictionary
@@ -972,7 +1052,7 @@ class DownloadToS3Block(Block):
                 )
                 self.url = task_url_parameter_value
 
-        self.format_potential_template_parameters(workflow_run_context)
+        self.format_potential_template_parameters(workflow_run_context, extra_context=extra_context)
 
         try:
             file_path = await download_file(self.url, max_size_mb=10)
@@ -1012,10 +1092,16 @@ class UploadToS3Block(Block):
 
         return []
 
-    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        super().format_potential_template_parameters(workflow_run_context)
+    def format_potential_template_parameters(
+        self, workflow_run_context: WorkflowRunContext, extra_context: dict[str, Any] | None = None
+    ) -> None:
+        super().format_potential_template_parameters(workflow_run_context, extra_context=extra_context)
         if self.path:
-            self.path = self.format_block_parameter_template_from_workflow_run_context(self.path, workflow_run_context)
+            self.path = self.format_block_parameter_template_from_workflow_run_context(
+                self.path,
+                workflow_run_context,
+                extra_context=extra_context,
+            )
 
     @staticmethod
     def _get_s3_uri(workflow_run_id: str, path: str) -> str:
@@ -1023,7 +1109,9 @@ class UploadToS3Block(Block):
         s3_key = f"{SettingsManager.get_settings().ENV}/{workflow_run_id}/{uuid.uuid4()}_{Path(path).name}"
         return f"s3://{s3_bucket}/{s3_key}"
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, extra_context: dict[str, Any] | None = None, **kwargs: dict
+    ) -> BlockResult:
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         # get all parameters into a dictionary
@@ -1040,7 +1128,7 @@ class UploadToS3Block(Block):
         elif self.path == SettingsManager.get_settings().WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY:
             self.path = str(get_path_for_workflow_download_directory(workflow_run_id).absolute())
 
-        self.format_potential_template_parameters(workflow_run_context)
+        self.format_potential_template_parameters(workflow_run_context, extra_context=extra_context)
         if not self.path or not os.path.exists(self.path):
             raise FileNotFoundError(f"UploadToS3Block: File not found at path: {self.path}")
 
@@ -1116,13 +1204,25 @@ class SendEmailBlock(Block):
 
         return parameters
 
-    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        super().format_potential_template_parameters(workflow_run_context)
-        self.sender = self.format_block_parameter_template_from_workflow_run_context(self.sender, workflow_run_context)
-        self.subject = self.format_block_parameter_template_from_workflow_run_context(
-            self.subject, workflow_run_context
+    def format_potential_template_parameters(
+        self, workflow_run_context: WorkflowRunContext, extra_context: dict[str, Any] | None = None
+    ) -> None:
+        super().format_potential_template_parameters(workflow_run_context, extra_context=extra_context)
+        self.sender = self.format_block_parameter_template_from_workflow_run_context(
+            self.sender,
+            workflow_run_context,
+            extra_context=extra_context,
         )
-        self.body = self.format_block_parameter_template_from_workflow_run_context(self.body, workflow_run_context)
+        self.subject = self.format_block_parameter_template_from_workflow_run_context(
+            self.subject,
+            workflow_run_context,
+            extra_context=extra_context,
+        )
+        self.body = self.format_block_parameter_template_from_workflow_run_context(
+            self.body,
+            workflow_run_context,
+            extra_context=extra_context,
+        )
         # file_attachments are formatted in _get_file_paths()
         # recipients are formatted in get_real_email_recipients()
 
@@ -1158,7 +1258,12 @@ class SendEmailBlock(Block):
             smtp_password_value,
         )
 
-    def _get_file_paths(self, workflow_run_context: WorkflowRunContext, workflow_run_id: str) -> list[str]:
+    def _get_file_paths(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        extra_context: dict[str, Any] | None = None,
+    ) -> list[str]:
         file_paths = []
         for path in self.file_attachments:
             # if the file path is a parameter, get the value from the workflow run context first
@@ -1182,7 +1287,9 @@ class SendEmailBlock(Block):
                     file_path=path,
                 )
 
-            path = self.format_block_parameter_template_from_workflow_run_context(path, workflow_run_context)
+            path = self.format_block_parameter_template_from_workflow_run_context(
+                path, workflow_run_context, extra_context=extra_context
+            )
             # if the file path is a directory, add all files in the directory, skip directories, limit to 10 files
             if os.path.exists(path):
                 if os.path.isdir(path):
@@ -1215,7 +1322,9 @@ class SendEmailBlock(Block):
         file_path.write(downloaded_bytes)
         return file_path.name
 
-    def get_real_email_recipients(self, workflow_run_context: WorkflowRunContext) -> list[str]:
+    def get_real_email_recipients(
+        self, workflow_run_context: WorkflowRunContext, extra_context: dict[str, Any] | None = None
+    ) -> list[str]:
         recipients = []
         for recipient in self.recipients:
             if workflow_run_context.has_parameter(recipient):
@@ -1223,7 +1332,9 @@ class SendEmailBlock(Block):
             else:
                 maybe_recipient = recipient
 
-            recipient = self.format_block_parameter_template_from_workflow_run_context(recipient, workflow_run_context)
+            recipient = self.format_block_parameter_template_from_workflow_run_context(
+                recipient, workflow_run_context, extra_context=extra_context
+            )
             # check if maybe_recipient is a valid email address
             try:
                 validate_email(maybe_recipient)
@@ -1241,11 +1352,14 @@ class SendEmailBlock(Block):
         return recipients
 
     async def _build_email_message(
-        self, workflow_run_context: WorkflowRunContext, workflow_run_id: str
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        extra_context: dict[str, Any] | None = None,
     ) -> EmailMessage:
         msg = EmailMessage()
         msg["Subject"] = self.subject + f" - Workflow Run ID: {workflow_run_id}"
-        msg["To"] = ", ".join(self.get_real_email_recipients(workflow_run_context))
+        msg["To"] = ", ".join(self.get_real_email_recipients(workflow_run_context, extra_context=extra_context))
         msg["BCC"] = self.sender  # BCC the sender so there is a record of the email being sent
         msg["From"] = self.sender
         if self.body and workflow_run_context.has_parameter(self.body) and workflow_run_context.has_value(self.body):
@@ -1334,9 +1448,11 @@ class SendEmailBlock(Block):
 
         return msg
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, extra_context: dict[str, Any] | None = None, **kwargs: dict
+    ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        self.format_potential_template_parameters(workflow_run_context)
+        self.format_potential_template_parameters(workflow_run_context, extra_context=extra_context)
         smtp_host_value, smtp_port_value, smtp_username_value, smtp_password_value = self._decrypt_smtp_parameters(
             workflow_run_context
         )
@@ -1388,10 +1504,14 @@ class FileParserBlock(Block):
             return [workflow_run_context.get_parameter(self.file_url)]
         return []
 
-    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        super().format_potential_template_parameters(workflow_run_context)
+    def format_potential_template_parameters(
+        self, workflow_run_context: WorkflowRunContext, extra_context: dict[str, Any] | None = None
+    ) -> None:
+        super().format_potential_template_parameters(workflow_run_context, extra_context=extra_context)
         self.file_url = self.format_block_parameter_template_from_workflow_run_context(
-            self.file_url, workflow_run_context
+            self.file_url,
+            workflow_run_context,
+            extra_context=extra_context,
         )
 
     def validate_file_type(self, file_url_used: str, file_path: str) -> None:
@@ -1402,7 +1522,9 @@ class FileParserBlock(Block):
             except csv.Error as e:
                 raise InvalidFileType(file_url=file_url_used, file_type=self.file_type, error=str(e))
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, extra_context: dict[str, Any] | None = None, **kwargs: dict
+    ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         if (
             self.file_url
@@ -1418,7 +1540,7 @@ class FileParserBlock(Block):
                 )
                 self.file_url = file_url_parameter_value
 
-        self.format_potential_template_parameters(workflow_run_context)
+        self.format_potential_template_parameters(workflow_run_context, extra_context=extra_context)
 
         # Download the file
         if self.file_url.startswith("s3://"):
@@ -1453,7 +1575,9 @@ class WaitBlock(Block):
     ) -> list[PARAMETER_TYPE]:
         return self.parameters
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, extra_context: dict[str, Any] | None = None, **kwargs: dict
+    ) -> BlockResult:
         # TODO: we need to support to interrupt the sleep when the workflow run failed/cancelled/terminated
         LOG.info(
             "Going to pause the workflow for a while",
@@ -1478,7 +1602,9 @@ class ValidationBlock(BaseTaskBlock):
     ) -> list[PARAMETER_TYPE]:
         return self.parameters
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, extra_context: dict[str, Any] | None = None, **kwargs: dict
+    ) -> BlockResult:
         task_order, _ = await self.get_task_order(workflow_run_id, 0)
         is_first_task = task_order == 0
         if is_first_task:
