@@ -81,6 +81,11 @@ class LocalStorage(BaseStorage):
             with open(file_path, "rb") as f:
                 return f.read()
         except Exception:
+            LOG.exception(
+                "Failed to retrieve streaming file.",
+                organization_id=organization_id,
+                file_name=file_name,
+            )
             return None
 
     async def store_browser_session(self, organization_id: str, workflow_permanent_id: str, directory: str) -> None:
