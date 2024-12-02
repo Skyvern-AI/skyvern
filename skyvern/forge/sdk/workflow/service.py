@@ -7,6 +7,7 @@ import httpx
 import structlog
 
 from skyvern import analytics
+from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
 from skyvern.exceptions import (
     FailedToSendWebhook,
@@ -23,7 +24,6 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Organization, Step
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
-from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
     InvalidWaitBlockTime,
@@ -1508,11 +1508,8 @@ class WorkflowService:
             )
 
         elif block_yaml.block_type == BlockType.WAIT:
-            if (
-                block_yaml.wait_sec <= 0
-                or block_yaml.wait_sec > SettingsManager.get_settings().WORKFLOW_WAIT_BLOCK_MAX_SEC
-            ):
-                raise InvalidWaitBlockTime(SettingsManager.get_settings().WORKFLOW_WAIT_BLOCK_MAX_SEC)
+            if block_yaml.wait_sec <= 0 or block_yaml.wait_sec > settings.WORKFLOW_WAIT_BLOCK_MAX_SEC:
+                raise InvalidWaitBlockTime(settings.WORKFLOW_WAIT_BLOCK_MAX_SEC)
 
             return WaitBlock(
                 label=block_yaml.label,

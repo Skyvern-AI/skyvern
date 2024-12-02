@@ -12,6 +12,7 @@ import structlog
 from playwright.async_api import FileChooser, Frame, Locator, Page, TimeoutError
 from pydantic import BaseModel
 
+from skyvern.config import settings
 from skyvern.constants import REPO_ROOT_DIR, SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     EmptySelect,
@@ -52,7 +53,6 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
-from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.actions import actions
 from skyvern.webeye.actions.actions import (
     Action,
@@ -371,7 +371,7 @@ async def handle_click_action(
             page,
             action,
             skyvern_element,
-            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
         )
 
     if results and task.workflow_run_id and download_dir:
@@ -400,8 +400,8 @@ async def handle_click_to_download_file_action(
     locator = skyvern_element.locator
 
     try:
-        await locator.click(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
-        await page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
+        await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        await page.wait_for_load_state(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
     except Exception as e:
         LOG.exception("ClickAction with download failed", action=action, exc_info=True)
         return [ActionFailure(e, download_triggered=False)]
@@ -420,7 +420,7 @@ async def handle_input_text_action(
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
     incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
-    timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    timeout = settings.BROWSER_ACTION_TIMEOUT_MS
 
     current_text = await get_input_value(skyvern_element.get_tag_name(), skyvern_element.get_locator())
     if current_text == action.text:
@@ -656,7 +656,7 @@ async def handle_upload_file_action(
         if file_path:
             await locator.set_input_files(
                 file_path,
-                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
             )
 
             # Sleep for 10 seconds after uploading a file to let the page process it
@@ -675,7 +675,7 @@ async def handle_upload_file_action(
             page,
             action,
             skyvern_element,
-            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
         )
 
 
@@ -699,7 +699,7 @@ async def handle_download_file_action(
 
             locator = skyvern_element.locator
             await locator.click(
-                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
                 modifiers=["Alt"],
             )
 
@@ -847,7 +847,7 @@ async def handle_select_option_action(
         action=action,
     )
 
-    timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    timeout = settings.BROWSER_ACTION_TIMEOUT_MS
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
     incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
     is_open = False
@@ -935,7 +935,7 @@ async def handle_select_option_action(
     )
     try:
         await incremental_scraped.start_listen_dom_increment()
-        timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+        timeout = settings.BROWSER_ACTION_TIMEOUT_MS
         await skyvern_element.scroll_into_view()
 
         try:
@@ -999,9 +999,9 @@ async def handle_checkbox_action(
     locator = skyvern_element.locator
 
     if action.is_checked:
-        await locator.check(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+        await locator.check(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
     else:
-        await locator.uncheck(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+        await locator.uncheck(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
 
     # TODO (suchintan): Why does checking the label work, but not the actual input element?
     return [ActionSuccess()]
@@ -1136,7 +1136,7 @@ async def chain_click(
     page: Page,
     action: ClickAction | UploadFileAction,
     skyvern_element: SkyvernElement,
-    timeout: int = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+    timeout: int = settings.BROWSER_ACTION_TIMEOUT_MS,
 ) -> List[ActionResult]:
     # Add a defensive page handler here in case a click action opens a file chooser.
     # This automatically dismisses the dialog
@@ -1374,9 +1374,7 @@ async def choose_auto_completion_dropdown(
             if cnt == 0:
                 continue
 
-            element_handler = await locator.element_handle(
-                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-            )
+            element_handler = await locator.element_handle(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
             if not element_handler:
                 continue
 
@@ -1444,7 +1442,7 @@ async def choose_auto_completion_dropdown(
         if await locator.count() == 0:
             raise MissingElement(element_id=element_id)
 
-        await locator.click(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+        await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
         clear_input = False
         return result
     except Exception as e:
@@ -1776,7 +1774,7 @@ async def select_from_dropdown(
     select_history = [] if select_history is None else select_history
     single_select_result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
 
-    timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    timeout = settings.BROWSER_ACTION_TIMEOUT_MS
 
     if dropdown_menu_element is None:
         dropdown_menu_element = await locate_dropdown_menu(
@@ -1927,7 +1925,7 @@ async def select_from_dropdown_by_value(
     step: Step,
     dropdown_menu_element: SkyvernElement | None = None,
 ) -> ActionResult:
-    timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    timeout = settings.BROWSER_ACTION_TIMEOUT_MS
     await incremental_scraped.get_incremental_element_tree(
         clean_and_remove_element_tree_factory(task=task, step=step, check_exist_funcs=[dom.check_id_in_dom]),
     )
@@ -2061,9 +2059,7 @@ async def locate_dropdown_menu(
 
         # sometimes taking screenshot might scroll away, need to scroll back after the screenshot
         x, y = await skyvern_frame.get_scroll_x_y()
-        screenshot = await head_element.get_locator().screenshot(
-            timeout=SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS
-        )
+        screenshot = await head_element.get_locator().screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
         await skyvern_frame.scroll_to_x_y(x, y)
 
         # TODO: better to send untrimmed HTML without skyvern attributes in the future
@@ -2139,7 +2135,7 @@ async def scroll_down_to_load_all_options(
         step_id=step.step_id if step else "none",
         task_id=task.task_id if task else "none",
     )
-    timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    timeout = settings.BROWSER_ACTION_TIMEOUT_MS
 
     dropdown_menu_element_handle = await scrollable_element.get_locator().element_handle(timeout=timeout)
     if dropdown_menu_element_handle is None:
@@ -2153,12 +2149,10 @@ async def scroll_down_to_load_all_options(
     scroll_pace = 0
     previous_num = await incremental_scraped.get_incremental_elements_num()
 
-    deadline = datetime.now(timezone.utc) + timedelta(
-        milliseconds=SettingsManager.get_settings().OPTION_LOADING_TIMEOUT_MS
-    )
+    deadline = datetime.now(timezone.utc) + timedelta(milliseconds=settings.OPTION_LOADING_TIMEOUT_MS)
     while datetime.now(timezone.utc) < deadline:
         # make sure we can scroll to the bottom
-        scroll_interval = SettingsManager.get_settings().BROWSER_HEIGHT * 5
+        scroll_interval = settings.BROWSER_HEIGHT * 5
         if dropdown_menu_element_handle is None:
             LOG.info("element handle is None, using mouse to scroll down", element_id=scrollable_element.get_id())
             await page.mouse.wheel(0, scroll_interval)
@@ -2250,7 +2244,7 @@ async def normal_select(
 
     try:
         await locator.click(
-            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
         )
     except Exception as e:
         LOG.info(
@@ -2267,7 +2261,7 @@ async def normal_select(
             # click by value (if it matches)
             await locator.select_option(
                 value=value,
-                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
             )
             is_success = True
             action_result.append(ActionSuccess())
@@ -2293,7 +2287,7 @@ async def normal_select(
                 # This means the supplied index was for the select element, not a reference to the css dict
                 await locator.select_option(
                     index=index,
-                    timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+                    timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
                 )
                 is_success = True
                 action_result.append(ActionSuccess())
@@ -2308,7 +2302,7 @@ async def normal_select(
 
     try:
         await locator.click(
-            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
         )
     except Exception as e:
         LOG.info(
@@ -2464,7 +2458,7 @@ async def poll_verification_code(
     totp_verification_url: str | None = None,
     totp_identifier: str | None = None,
 ) -> str | None:
-    timeout = timedelta(minutes=SettingsManager.get_settings().VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
+    timeout = timedelta(minutes=settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
     start_datetime = datetime.utcnow()
     timeout_datetime = start_datetime + timeout
     org_token = await app.DATABASE.get_valid_org_auth_token(organization_id, OrganizationAuthTokenType.api)
@@ -2472,7 +2466,7 @@ async def poll_verification_code(
         LOG.error("Failed to get organization token when trying to get verification code")
         return None
     # wait for 40 seconds to let the verification code comes in before polling
-    await asyncio.sleep(SettingsManager.get_settings().VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS)
+    await asyncio.sleep(settings.VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS)
     while True:
         # check timeout
         if datetime.utcnow() > timeout_datetime:

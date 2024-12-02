@@ -3,8 +3,8 @@ import logging
 import structlog
 from structlog.typing import EventDict
 
+from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOGGING_LEVEL_MAP: dict[str, int] = {
     "DEBUG": logging.DEBUG,
@@ -34,7 +34,7 @@ def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: Ev
             event_dict["workflow_run_id"] = context.workflow_run_id
 
     # Add env to the log
-    event_dict["env"] = SettingsManager.get_settings().ENV
+    event_dict["env"] = settings.ENV
 
     if method_name not in ["info", "warning", "error", "critical", "exception"]:
         # Only modify the log for these log levels
@@ -59,11 +59,7 @@ def setup_logger() -> None:
     Setup the logger with the specified format
     """
     # logging.config.dictConfig(logging_config)
-    renderer = (
-        structlog.processors.JSONRenderer()
-        if SettingsManager.get_settings().JSON_LOGGING
-        else structlog.dev.ConsoleRenderer()
-    )
+    renderer = structlog.processors.JSONRenderer() if settings.JSON_LOGGING else structlog.dev.ConsoleRenderer()
     additional_processors = (
         [
             structlog.processors.EventRenamer("msg"),
@@ -78,10 +74,10 @@ def setup_logger() -> None:
                 }
             ),
         ]
-        if SettingsManager.get_settings().JSON_LOGGING
+        if settings.JSON_LOGGING
         else []
     )
-    LOG_LEVEL_VAL = LOGGING_LEVEL_MAP.get(SettingsManager.get_settings().LOG_LEVEL, logging.INFO)
+    LOG_LEVEL_VAL = LOGGING_LEVEL_MAP.get(settings.LOG_LEVEL, logging.INFO)
 
     structlog.configure(
         wrapper_class=structlog.make_filtering_bound_logger(LOG_LEVEL_VAL),

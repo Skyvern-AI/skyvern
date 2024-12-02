@@ -8,9 +8,9 @@ import structlog
 from playwright._impl._errors import TimeoutError
 from playwright.async_api import ElementHandle, Frame, Page
 
+from skyvern.config import settings
 from skyvern.constants import BUILDING_ELEMENT_TREE_TIMEOUT_MS, PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
 from skyvern.exceptions import FailedToTakeScreenshot
-from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.get_logger()
 
@@ -37,7 +37,7 @@ class SkyvernFrame:
         frame: Page | Frame,
         expression: str,
         arg: Any | None = None,
-        timeout_ms: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        timeout_ms: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> Any:
         try:
             async with asyncio.timeout(timeout_ms / 1000):
@@ -51,12 +51,12 @@ class SkyvernFrame:
         page: Page,
         full_page: bool = False,
         file_path: str | None = None,
-        timeout: float = SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS,
+        timeout: float = settings.BROWSER_LOADING_TIMEOUT_MS,
     ) -> bytes:
         if page.is_closed():
             raise FailedToTakeScreenshot(error_message="Page is closed")
         try:
-            await page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
+            await page.wait_for_load_state(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
             LOG.debug("Page is fully loaded, agent is about to take screenshots")
             start_time = time.time()
             screenshot: bytes = bytes()
@@ -92,7 +92,7 @@ class SkyvernFrame:
         page: Page,
         url: str,
         draw_boxes: bool = False,
-        max_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
+        max_number: int = settings.MAX_NUM_SCREENSHOTS,
     ) -> List[bytes]:
         skyvern_page = await SkyvernFrame.create_instance(frame=page)
         assert isinstance(skyvern_page.frame, Page)

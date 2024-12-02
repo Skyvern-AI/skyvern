@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from sqlalchemy.exc import OperationalError
 
 from skyvern import analytics
+from skyvern.config import settings
 from skyvern.exceptions import StepNotFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -50,7 +51,6 @@ from skyvern.forge.sdk.schemas.tasks import (
     TaskStatus,
 )
 from skyvern.forge.sdk.services import org_auth_service
-from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
@@ -95,7 +95,7 @@ async def webhook(
 
     generated_signature = generate_skyvern_signature(
         payload.decode("utf-8"),
-        SettingsManager.get_settings().SKYVERN_API_KEY,
+        settings.SKYVERN_API_KEY,
     )
 
     LOG.info(
@@ -291,7 +291,7 @@ async def get_task(
         task_id=task_obj.task_id,
         organization_id=task_obj.organization_id,
         artifact_types=[ArtifactType.SCREENSHOT_ACTION],
-        n=SettingsManager.get_settings().TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
+        n=settings.TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
     )
     latest_action_screenshot_urls: list[str] | None = None
     if latest_action_screenshot_artifacts:
@@ -532,7 +532,7 @@ async def get_agent_task_step_artifacts(
         step_id,
         organization_id=current_org.organization_id,
     )
-    if SettingsManager.get_settings().ENV != "local" or SettingsManager.get_settings().GENERATE_PRESIGNED_URLS:
+    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
         signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
         if signed_urls:
             for i, artifact in enumerate(artifacts):
@@ -863,7 +863,7 @@ async def generate_task(
     # check if there's a same user_prompt within the past x Hours
     # in the future, we can use vector db to fetch similar prompts
     existing_task_generation = await app.DATABASE.get_task_generation_by_prompt_hash(
-        user_prompt_hash=user_prompt_hash, query_window_hours=SettingsManager.get_settings().PROMPT_CACHE_WINDOW_HOURS
+        user_prompt_hash=user_prompt_hash, query_window_hours=settings.PROMPT_CACHE_WINDOW_HOURS
     )
     if existing_task_generation:
         new_task_generation = await app.DATABASE.create_task_generation(
@@ -898,7 +898,7 @@ async def generate_task(
             data_extraction_goal=parsed_task_generation_obj.data_extraction_goal,
             extracted_information_schema=parsed_task_generation_obj.extracted_information_schema,
             suggested_title=parsed_task_generation_obj.suggested_title,
-            llm=SettingsManager.get_settings().LLM_KEY,
+            llm=settings.LLM_KEY,
             llm_prompt=llm_prompt,
             llm_response=str(llm_response),
         )

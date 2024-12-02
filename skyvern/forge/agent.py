@@ -14,6 +14,7 @@ from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Page
 
 from skyvern import analytics
+from skyvern.config import settings
 from skyvern.constants import (
     GET_DOWNLOADED_FILES_TIMEOUT,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
@@ -51,7 +52,6 @@ from skyvern.forge.sdk.core.validators import validate_url
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Organization, Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskStatus
-from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, ValidationBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
@@ -84,25 +84,25 @@ class ActionLinkedNode:
 
 class ForgeAgent:
     def __init__(self) -> None:
-        if SettingsManager.get_settings().ADDITIONAL_MODULES:
-            for module in SettingsManager.get_settings().ADDITIONAL_MODULES:
+        if settings.ADDITIONAL_MODULES:
+            for module in settings.ADDITIONAL_MODULES:
                 LOG.info("Loading additional module", module=module)
                 __import__(module)
             LOG.info(
                 "Additional modules loaded",
-                modules=SettingsManager.get_settings().ADDITIONAL_MODULES,
+                modules=settings.ADDITIONAL_MODULES,
             )
         LOG.info(
             "Initializing ForgeAgent",
-            env=SettingsManager.get_settings().ENV,
-            execute_all_steps=SettingsManager.get_settings().EXECUTE_ALL_STEPS,
-            browser_type=SettingsManager.get_settings().BROWSER_TYPE,
-            max_scraping_retries=SettingsManager.get_settings().MAX_SCRAPING_RETRIES,
-            video_path=SettingsManager.get_settings().VIDEO_PATH,
-            browser_action_timeout_ms=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
-            max_steps_per_run=SettingsManager.get_settings().MAX_STEPS_PER_RUN,
-            long_running_task_warning_ratio=SettingsManager.get_settings().LONG_RUNNING_TASK_WARNING_RATIO,
-            debug_mode=SettingsManager.get_settings().DEBUG_MODE,
+            env=settings.ENV,
+            execute_all_steps=settings.EXECUTE_ALL_STEPS,
+            browser_type=settings.BROWSER_TYPE,
+            max_scraping_retries=settings.MAX_SCRAPING_RETRIES,
+            video_path=settings.VIDEO_PATH,
+            browser_action_timeout_ms=settings.BROWSER_ACTION_TIMEOUT_MS,
+            max_steps_per_run=settings.MAX_STEPS_PER_RUN,
+            long_running_task_warning_ratio=settings.LONG_RUNNING_TASK_WARNING_RATIO,
+            debug_mode=settings.DEBUG_MODE,
         )
         self.async_operation_pool = AsyncOperationPool()
 
@@ -290,7 +290,7 @@ class ForgeAgent:
             override_max_steps_per_run
             or task.max_steps_per_run
             or organization.max_steps_per_run
-            or SettingsManager.get_settings().MAX_STEPS_PER_RUN
+            or settings.MAX_STEPS_PER_RUN
         )
         if max_steps_per_run and task.max_steps_per_run != max_steps_per_run:
             await app.DATABASE.update_task(
@@ -423,7 +423,7 @@ class ForgeAgent:
                     close_browser_on_completion=close_browser_on_completion,
                     task_block=task_block,
                 )
-            elif SettingsManager.get_settings().execute_all_steps() and next_step:
+            elif settings.execute_all_steps() and next_step:
                 return await self.execute_step(
                     organization,
                     task,
@@ -437,8 +437,8 @@ class ForgeAgent:
                     "Step executed but continuous execution is disabled.",
                     task_id=task.task_id,
                     step_id=step.step_id,
-                    is_cloud_env=SettingsManager.get_settings().is_cloud_environment(),
-                    execute_all_steps=SettingsManager.get_settings().execute_all_steps(),
+                    is_cloud_env=settings.is_cloud_environment(),
+                    execute_all_steps=settings.execute_all_steps(),
                     next_step_id=next_step.step_id if next_step else None,
                 )
 
@@ -1342,7 +1342,7 @@ class ForgeAgent:
         # Get action results from the last app.SETTINGS.PROMPT_ACTION_HISTORY_WINDOW steps
         steps = await app.DATABASE.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
         # the last step is always the newly created one and it should be excluded from the history window
-        window_steps = steps[-1 - SettingsManager.get_settings().PROMPT_ACTION_HISTORY_WINDOW : -1]
+        window_steps = steps[-1 - settings.PROMPT_ACTION_HISTORY_WINDOW : -1]
         actions_and_results: list[tuple[Action, list[ActionResult]]] = []
         for window_step in window_steps:
             if window_step.output and window_step.output.actions_and_results:
@@ -1576,7 +1576,7 @@ class ForgeAgent:
             task_id=task.task_id,
             organization_id=task.organization_id,
             artifact_types=[ArtifactType.SCREENSHOT_ACTION],
-            n=SettingsManager.get_settings().TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
+            n=settings.TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
         )
         if latest_action_screenshot_artifacts:
             latest_action_screenshot_urls = await app.ARTIFACT_MANAGER.get_share_links(
@@ -1790,7 +1790,7 @@ class ForgeAgent:
             organization.max_retries_per_step
             # we need to check by None because 0 is a valid value for max_retries_per_step
             if organization.max_retries_per_step is not None
-            else SettingsManager.get_settings().MAX_RETRIES_PER_STEP
+            else settings.MAX_RETRIES_PER_STEP
         )
         if step.retry_index >= max_retries_per_step:
             LOG.warning(
@@ -1799,7 +1799,7 @@ class ForgeAgent:
                 step_id=step.step_id,
                 step_order=step.order,
                 step_retry=step.retry_index,
-                max_retries=SettingsManager.get_settings().MAX_RETRIES_PER_STEP,
+                max_retries=settings.MAX_RETRIES_PER_STEP,
             )
             await self.update_task(
                 task,
@@ -1923,7 +1923,7 @@ class ForgeAgent:
             override_max_steps_per_run
             or task.max_steps_per_run
             or organization.max_steps_per_run
-            or SettingsManager.get_settings().MAX_STEPS_PER_RUN
+            or settings.MAX_STEPS_PER_RUN
         )
 
         # HACK: action block only have one step to execute without complete action, so we consider the task is completed as long as the step is completed
@@ -1985,14 +1985,12 @@ class ForgeAgent:
                 organization_id=task.organization_id,
             )
 
-            if step.order == int(
-                max_steps_per_run * SettingsManager.get_settings().LONG_RUNNING_TASK_WARNING_RATIO - 1
-            ):
+            if step.order == int(max_steps_per_run * settings.LONG_RUNNING_TASK_WARNING_RATIO - 1):
                 LOG.info(
                     "Long running task warning",
                     order=step.order,
                     max_steps=max_steps_per_run,
-                    warning_ratio=SettingsManager.get_settings().LONG_RUNNING_TASK_WARNING_RATIO,
+                    warning_ratio=settings.LONG_RUNNING_TASK_WARNING_RATIO,
                 )
             return None, None, next_step
 

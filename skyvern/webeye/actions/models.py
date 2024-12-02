@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.config import settings
 from skyvern.webeye.actions.actions import Action, DecisiveAction, UserDefinedError
 from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.scraper.scraper import ScrapedPage
@@ -45,7 +45,7 @@ class DetailedAgentStepOutput(BaseModel):
         exclude = ["scraped_page", "extract_action_prompt"]
 
     def __repr__(self) -> str:
-        if SettingsManager.get_settings().DEBUG_MODE:
+        if settings.DEBUG_MODE:
             return f"DetailedAgentStepOutput({self.model_dump()})"
         else:
             return f"AgentStepOutput({self.to_agent_step_output().model_dump()})"

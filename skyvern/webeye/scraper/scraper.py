@@ -9,10 +9,10 @@ import structlog
 from playwright.async_api import Frame, Locator, Page
 from pydantic import BaseModel, PrivateAttr
 
+from skyvern.config import settings
 from skyvern.constants import BUILDING_ELEMENT_TREE_TIMEOUT_MS, SKYVERN_DIR, SKYVERN_ID_ATTR
 from skyvern.exceptions import FailedToTakeScreenshot, UnknownElementTreeFormat
 from skyvern.forge.sdk.api.crypto import calculate_sha256
-from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -301,10 +301,10 @@ async def scrape_website(
         )
     except Exception as e:
         # NOTE: MAX_SCRAPING_RETRIES is set to 0 in both staging and production
-        if num_retry > SettingsManager.get_settings().MAX_SCRAPING_RETRIES:
+        if num_retry > settings.MAX_SCRAPING_RETRIES:
             LOG.error(
                 "Scraping failed after max retries, aborting.",
-                max_retries=SettingsManager.get_settings().MAX_SCRAPING_RETRIES,
+                max_retries=settings.MAX_SCRAPING_RETRIES,
                 url=url,
                 exc_info=True,
             )

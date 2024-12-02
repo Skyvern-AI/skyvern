@@ -6,17 +6,17 @@ from urllib.parse import unquote, urlparse
 
 import structlog
 
+from skyvern.config import settings
 from skyvern.forge.sdk.api.files import get_download_dir, get_skyvern_temp_dir
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP, BaseStorage
 from skyvern.forge.sdk.models import Step
-from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.get_logger()
 
 
 class LocalStorage(BaseStorage):
-    def __init__(self, artifact_path: str = SettingsManager.get_settings().ARTIFACT_STORAGE_PATH) -> None:
+    def __init__(self, artifact_path: str = settings.ARTIFACT_STORAGE_PATH) -> None:
         self.artifact_path = artifact_path
 
     def build_uri(self, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
@@ -84,9 +84,7 @@ class LocalStorage(BaseStorage):
             return None
 
     async def store_browser_session(self, organization_id: str, workflow_permanent_id: str, directory: str) -> None:
-        stored_folder_path = (
-            Path(SettingsManager.get_settings().BROWSER_SESSION_BASE_PATH) / organization_id / workflow_permanent_id
-        )
+        stored_folder_path = Path(settings.BROWSER_SESSION_BASE_PATH) / organization_id / workflow_permanent_id
         if directory == str(stored_folder_path):
             return
         self._create_directories_if_not_exists(stored_folder_path)
@@ -108,9 +106,7 @@ class LocalStorage(BaseStorage):
                 shutil.copy2(source_file_path, target_file_path)
 
     async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
-        stored_folder_path = (
-            Path(SettingsManager.get_settings().BROWSER_SESSION_BASE_PATH) / organization_id / workflow_permanent_id
-        )
+        stored_folder_path = Path(settings.BROWSER_SESSION_BASE_PATH) / organization_id / workflow_permanent_id
         if not stored_folder_path.exists():
             return None
         return str(stored_folder_path)

@@ -103,6 +103,7 @@ class Settings(BaseSettings):
     ENABLE_AZURE: bool = False
     ENABLE_AZURE_GPT4O_MINI: bool = False
     ENABLE_BEDROCK: bool = False
+    ENABLE_GEMINI: bool = False
     # OPENAI
     OPENAI_API_KEY: str | None = None
     # ANTHROPIC
@@ -118,6 +119,9 @@ class Settings(BaseSettings):
     AZURE_GPT4O_MINI_API_KEY: str | None = None
     AZURE_GPT4O_MINI_API_BASE: str | None = None
     AZURE_GPT4O_MINI_API_VERSION: str | None = None
+
+    # GEMINI
+    GEMINI_API_KEY: str | None = None
 
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10

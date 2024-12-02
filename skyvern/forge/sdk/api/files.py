@@ -12,10 +12,10 @@ import aiohttp
 import structlog
 from multidict import CIMultiDictProxy
 
+from skyvern.config import settings
 from skyvern.constants import REPO_ROOT_DIR
 from skyvern.exceptions import DownloadFileMaxSizeExceeded
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
-from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.get_logger()
 
@@ -169,7 +169,7 @@ def create_folder_if_not_exist(dir: str) -> None:
 
 
 def get_skyvern_temp_dir() -> str:
-    temp_dir = SettingsManager.get_settings().TEMP_PATH
+    temp_dir = settings.TEMP_PATH
     create_folder_if_not_exist(temp_dir)
     return temp_dir
 
@@ -178,13 +178,13 @@ def make_temp_directory(
     suffix: str | None = None,
     prefix: str | None = None,
 ) -> str:
-    temp_dir = SettingsManager.get_settings().TEMP_PATH
+    temp_dir = settings.TEMP_PATH
     create_folder_if_not_exist(temp_dir)
     return tempfile.mkdtemp(suffix=suffix, prefix=prefix, dir=temp_dir)
 
 
 def create_named_temporary_file(delete: bool = True) -> tempfile._TemporaryFileWrapper:
-    temp_dir = SettingsManager.get_settings().TEMP_PATH
+    temp_dir = settings.TEMP_PATH
     create_folder_if_not_exist(temp_dir)
     return tempfile.NamedTemporaryFile(dir=temp_dir, delete=delete)
 
