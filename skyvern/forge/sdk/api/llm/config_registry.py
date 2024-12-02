@@ -51,6 +51,7 @@ if not any(
         settings.ENABLE_AZURE,
         settings.ENABLE_AZURE_GPT4O_MINI,
         settings.ENABLE_BEDROCK,
+        settings.ENABLE_GEMINI,
     ]
 ):
     raise NoProviderEnabledError()
@@ -244,5 +245,17 @@ if settings.ENABLE_AZURE_GPT4O_MINI:
             ),
             supports_vision=True,
             add_assistant_prefix=False,
+        ),
+    )
+
+if settings.ENABLE_GEMINI:
+    LLMConfigRegistry.register_config(
+        "GEMINI_PRO",
+        LLMConfig(
+            "gemini/gemini-pro-vision",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_output_tokens=8192,
         ),
     )
