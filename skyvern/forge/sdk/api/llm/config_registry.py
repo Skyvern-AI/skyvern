@@ -252,7 +252,17 @@ if settings.ENABLE_GEMINI:
     LLMConfigRegistry.register_config(
         "GEMINI_PRO",
         LLMConfig(
-            "gemini/gemini-pro-vision",
+            "gemini/gemini-1.5-pro",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_output_tokens=8192,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "GEMINI_FLUSH",
+        LLMConfig(
+            "gemini/gemini-1.5-flash",
             ["GEMINI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
