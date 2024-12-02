@@ -1960,8 +1960,9 @@ class ForgeAgent:
                 step=step,
                 page=page,
             )
-            if not failure_reason:
-                failure_reason = f"Max steps per task ({max_steps_per_run}) exceeded"
+            failure_reason = (
+                f"Reach the ({max_steps_per_run}) max steps. This may have failed because: {failure_reason}"
+            )
 
             await self.update_task(
                 task,
