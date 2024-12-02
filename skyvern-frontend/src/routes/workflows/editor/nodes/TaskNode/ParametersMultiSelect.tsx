@@ -1,7 +1,7 @@
 import { MultiSelect } from "@/components/ui/multi-select";
 import { useWorkflowParametersState } from "../../useWorkflowParametersState";
 import { HelpTooltip } from "@/components/HelpTooltip";
-import { helpTooltipContent } from "./types";
+import { helpTooltips } from "../../helpContent";
 
 type Props = {
   availableOutputParameters: Array<string>;
@@ -30,7 +30,7 @@ function ParametersMultiSelect({
     <div className="space-y-2">
       <header className="flex gap-2">
         <h1 className="text-xs text-slate-300">Parameters</h1>
-        <HelpTooltip content={helpTooltipContent["parameters"]} />
+        <HelpTooltip content={helpTooltips["task"]["parameters"]} />
       </header>
       <MultiSelect
         value={parameters}

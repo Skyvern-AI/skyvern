@@ -1,13 +1,14 @@
+import { HelpTooltip } from "@/components/HelpTooltip";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { UploadIcon } from "@radix-ui/react-icons";
 import { Handle, NodeProps, Position } from "@xyflow/react";
+import { helpTooltips } from "../../helpContent";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
-import { helpTooltipContent, type UploadNode } from "./types";
-import { HelpTooltip } from "@/components/HelpTooltip";
+import { type UploadNode } from "./types";
 
 function UploadNode({ id, data }: NodeProps<UploadNode>) {
   const deleteNodeCallback = useDeleteNodeCallback();
@@ -57,7 +58,7 @@ function UploadNode({ id, data }: NodeProps<UploadNode>) {
           <div className="space-y-2">
             <div className="flex items-center gap-2">
               <Label className="text-sm text-slate-400">File Path</Label>
-              <HelpTooltip content={helpTooltipContent["path"]} />
+              <HelpTooltip content={helpTooltips["upload"]["path"]} />
             </div>
             <Input value={data.path} className="nopan text-xs" disabled />
           </div>

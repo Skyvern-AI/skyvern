@@ -1,3 +1,4 @@
+import { HelpTooltip } from "@/components/HelpTooltip";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
@@ -6,10 +7,10 @@ import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChan
 import { EnvelopeClosedIcon } from "@radix-ui/react-icons";
 import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { useState } from "react";
+import { helpTooltips } from "../../helpContent";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
-import { helpTooltipContent, type SendEmailNode } from "./types";
-import { HelpTooltip } from "@/components/HelpTooltip";
+import { type SendEmailNode } from "./types";
 
 function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
   const { updateNodeData } = useReactFlow();
@@ -117,7 +118,9 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
         <div className="space-y-2">
           <div className="flex gap-2">
             <Label className="text-xs text-slate-300">File Attachments</Label>
-            <HelpTooltip content={helpTooltipContent["fileAttachments"]} />
+            <HelpTooltip
+              content={helpTooltips["sendEmail"]["fileAttachments"]}
+            />
           </div>
           <Input
             value={inputs.fileAttachments}
