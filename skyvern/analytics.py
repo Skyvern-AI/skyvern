@@ -6,7 +6,7 @@ from typing import Any, Dict
 import typer
 from posthog import Posthog
 
-from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.config import settings
 
 posthog = Posthog(
     "phc_bVT2ugnZhMHRWqMvSRHPdeTjaPxQqT3QSsI3r5FlQR5",
@@ -31,7 +31,7 @@ def analytics_metadata() -> Dict[str, Any]:
         "machine": platform.machine(),
         "platform": platform.platform(),
         "python_version": platform.python_version(),
-        "environment": SettingsManager.get_settings().ENV,
+        "environment": settings.ENV,
     }
 
 
@@ -40,10 +40,10 @@ def capture(
     data: dict[str, Any] | None = None,
 ) -> None:
     # If telemetry is disabled, don't send any data
-    if not SettingsManager.get_settings().SKYVERN_TELEMETRY:
+    if not settings.SKYVERN_TELEMETRY:
         return
 
-    distinct_id = SettingsManager.get_settings().ANALYTICS_ID
+    distinct_id = settings.ANALYTICS_ID
 
     payload: dict[str, Any] = data or {}
     try:

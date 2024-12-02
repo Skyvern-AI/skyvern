@@ -9,6 +9,7 @@ from random import uniform
 import structlog
 from playwright.async_api import ElementHandle, Frame, FrameLocator, Locator, Page, TimeoutError
 
+from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     ElementIsNotLabel,
@@ -21,7 +22,6 @@ from skyvern.exceptions import (
     NoneFrameError,
     SkyvernException,
 )
-from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, ScrapedPage, json_to_html, trim_element
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -313,9 +313,7 @@ class SkyvernElement:
     def get_locator(self) -> Locator:
         return self.locator
 
-    async def get_element_handler(
-        self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> ElementHandle:
+    async def get_element_handler(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> ElementHandle:
         handler = await self.locator.element_handle(timeout=timeout)
         assert handler is not None
         return handler
@@ -368,7 +366,7 @@ class SkyvernElement:
         return None
 
     async def find_label_for(
-        self, dom: DomUtil, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+        self, dom: DomUtil, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS
     ) -> SkyvernElement | None:
         if self.get_tag_name() != "label":
             return None
@@ -388,9 +386,7 @@ class SkyvernElement:
 
         return await dom.get_skyvern_element_by_id(unique_id)
 
-    async def find_bound_label_by_attr_id(
-        self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> Locator | None:
+    async def find_bound_label_by_attr_id(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> Locator | None:
         if self.get_tag_name() == "label":
             return None
 
@@ -406,7 +402,7 @@ class SkyvernElement:
         return None
 
     async def find_bound_label_by_direct_parent(
-        self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+        self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS
     ) -> Locator | None:
         if self.get_tag_name() == "label":
             return None
@@ -490,7 +486,7 @@ class SkyvernElement:
         self,
         attr_name: str,
         dynamic: bool = False,
-        timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> typing.Any:
         if not dynamic:
             attr = self.get_attributes().get(attr_name)
@@ -499,12 +495,10 @@ class SkyvernElement:
 
         return await self.locator.get_attribute(attr_name, timeout=timeout)
 
-    async def focus(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
+    async def focus(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().focus(timeout=timeout)
 
-    async def input_sequentially(
-        self, text: str, default_timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> None:
+    async def input_sequentially(self, text: str, default_timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         length = len(text)
         if length > TEXT_PRESS_MAX_LENGTH:
             # if the text is longer than TEXT_PRESS_MAX_LENGTH characters, we will locator.fill in initial texts until the last TEXT_PRESS_MAX_LENGTH characters
@@ -514,22 +508,16 @@ class SkyvernElement:
 
         await self.press_fill(text, timeout=default_timeout)
 
-    async def press_key(
-        self, key: str, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> None:
+    async def press_key(self, key: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().press(key=key, timeout=timeout)
 
-    async def press_fill(
-        self, text: str, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> None:
+    async def press_fill(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().press_sequentially(text, delay=TEXT_INPUT_DELAY, timeout=timeout)
 
-    async def input_fill(
-        self, text: str, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> None:
+    async def input_fill(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().fill(text, timeout=timeout)
 
-    async def input_clear(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
+    async def input_clear(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().clear(timeout=timeout)
 
     async def move_mouse_to_safe(
@@ -537,7 +525,7 @@ class SkyvernElement:
         page: Page,
         task_id: str | None = None,
         step_id: str | None = None,
-        timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> tuple[float, float] | tuple[None, None]:
         element_id = self.get_id()
         try:
@@ -561,7 +549,7 @@ class SkyvernElement:
         return None, None
 
     async def move_mouse_to(
-        self, page: Page, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+        self, page: Page, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS
     ) -> tuple[float, float]:
         bounding_box = await self.get_locator().bounding_box(timeout=timeout)
         if not bounding_box:
@@ -580,9 +568,7 @@ class SkyvernElement:
         skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
         await skyvern_frame.click_element_in_javascript(await self.get_element_handler())
 
-    async def coordinate_click(
-        self, page: Page, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> None:
+    async def coordinate_click(self, page: Page, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         click_x, click_y = await self.move_mouse_to(page=page, timeout=timeout)
         await page.mouse.click(click_x, click_y)
 
@@ -591,7 +577,7 @@ class SkyvernElement:
             frame=self.get_frame(), expression="(element) => element.blur()", arg=await self.get_element_handler()
         )
 
-    async def scroll_into_view(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
+    async def scroll_into_view(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         element_handler = await self.get_element_handler(timeout=timeout)
         try:
             await element_handler.scroll_into_view_if_needed(timeout=timeout)
@@ -608,7 +594,7 @@ class SkyvernElement:
         self,
         target_locator: Locator,
         mode: typing.Literal["inner", "outer"],
-        timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> float:
         self_rect = await self.get_locator().bounding_box(timeout=timeout)
         if self_rect is None:

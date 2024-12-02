@@ -11,6 +11,7 @@ from starlette.requests import HTTPConnection, Request
 from starlette_context.middleware import RawContextMiddleware
 from starlette_context.plugins.base import Plugin
 
+from skyvern.config import settings
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.core import skyvern_context
@@ -18,7 +19,6 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.routes.agent_protocol import base_router
 from skyvern.forge.sdk.routes.streaming import websocket_router
-from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.get_logger()
 
@@ -40,7 +40,7 @@ def get_agent_app() -> FastAPI:
     # Add CORS middleware
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=SettingsManager.get_settings().ALLOWED_ORIGINS,
+        allow_origins=settings.ALLOWED_ORIGINS,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -90,13 +90,13 @@ def get_agent_app() -> FastAPI:
         finally:
             skyvern_context.reset()
 
-    if SettingsManager.get_settings().ADDITIONAL_MODULES:
-        for module in SettingsManager.get_settings().ADDITIONAL_MODULES:
+    if settings.ADDITIONAL_MODULES:
+        for module in settings.ADDITIONAL_MODULES:
             LOG.info("Loading additional module to set up api app", module=module)
             __import__(module)
         LOG.info(
             "Additional modules loaded to set up api app",
-            modules=SettingsManager.get_settings().ADDITIONAL_MODULES,
+            modules=settings.ADDITIONAL_MODULES,
         )
 
     if forge_app.setup_api_app:

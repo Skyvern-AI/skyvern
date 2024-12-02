@@ -8,11 +8,11 @@ from jose import jwt
 from jose.exceptions import JWTError
 from pydantic import ValidationError
 
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.models import Organization, OrganizationAuthTokenType, TokenPayload
-from skyvern.forge.sdk.settings_manager import SettingsManager
 
 AUTHENTICATION_TTL = 60 * 60  # one hour
 CACHE_SIZE = 128
@@ -85,7 +85,7 @@ async def _get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
     try:
         payload = jwt.decode(
             x_api_key,
-            SettingsManager.get_settings().SECRET_KEY,
+            settings.SECRET_KEY,
             algorithms=[ALGORITHM],
         )
         api_key_data = TokenPayload(**payload)

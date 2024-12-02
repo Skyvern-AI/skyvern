@@ -46,7 +46,6 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
-from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
     InvalidEmailClientConfiguration,
@@ -376,8 +375,8 @@ class BaseTaskBlock(Block):
                     )
                 else:
                     browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
-                    if browser_state is None:
-                        raise MissingBrowserState(task_id=task.task_id, workflow_run_id=workflow_run_id)
+                if browser_state is None:
+                    raise MissingBrowserState(task_id=task.task_id, workflow_run_id=workflow_run_id)
             except FailedToNavigateToUrl as e:
                 # Make sure the task is marked as failed in the database before raising the exception
                 await app.DATABASE.update_task(
@@ -982,7 +981,7 @@ class DownloadToS3Block(Block):
 
         uri = None
         try:
-            uri = f"s3://{SettingsManager.get_settings().AWS_S3_BUCKET_UPLOADS}/{SettingsManager.get_settings().ENV}/{workflow_run_id}/{uuid.uuid4()}"
+            uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/{workflow_run_id}/{uuid.uuid4()}"
             await self._upload_file_to_s3(uri, file_path)
         except Exception as e:
             LOG.error("DownloadToS3Block: Failed to upload file to S3", uri=uri, error=str(e))
@@ -1019,8 +1018,8 @@ class UploadToS3Block(Block):
 
     @staticmethod
     def _get_s3_uri(workflow_run_id: str, path: str) -> str:
-        s3_bucket = SettingsManager.get_settings().AWS_S3_BUCKET_UPLOADS
-        s3_key = f"{SettingsManager.get_settings().ENV}/{workflow_run_id}/{uuid.uuid4()}_{Path(path).name}"
+        s3_bucket = settings.AWS_S3_BUCKET_UPLOADS
+        s3_key = f"{settings.ENV}/{workflow_run_id}/{uuid.uuid4()}_{Path(path).name}"
         return f"s3://{s3_bucket}/{s3_key}"
 
     async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
@@ -1037,7 +1036,7 @@ class UploadToS3Block(Block):
                 )
                 self.path = file_path_parameter_value
         # if the path is WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY, use the download directory for the workflow run
-        elif self.path == SettingsManager.get_settings().WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY:
+        elif self.path == settings.WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY:
             self.path = str(get_path_for_workflow_download_directory(workflow_run_id).absolute())
 
         self.format_potential_template_parameters(workflow_run_context)
@@ -1173,7 +1172,7 @@ class SendEmailBlock(Block):
                 else:
                     path = file_path_parameter_value
 
-            if path == SettingsManager.get_settings().WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY:
+            if path == settings.WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY:
                 # if the path is WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY, use download directory for the workflow run
                 path = str(get_path_for_workflow_download_directory(workflow_run_id).absolute())
                 LOG.info(

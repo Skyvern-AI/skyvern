@@ -6,7 +6,7 @@ import aioboto3
 import structlog
 from aiobotocore.client import AioBaseClient
 
-from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.config import settings
 
 LOG = structlog.get_logger()
 
@@ -22,7 +22,7 @@ def execute_with_async_client(client_type: AWSClientType) -> Callable:
             self = args[0]
             assert isinstance(self, AsyncAWSClient)
             session = aioboto3.Session()
-            async with session.client(client_type, region_name=SettingsManager.get_settings().AWS_REGION) as client:
+            async with session.client(client_type, region_name=settings.AWS_REGION) as client:
                 return await f(*args, client=client, **kwargs)
 
         return wrapper
@@ -95,7 +95,7 @@ class AsyncAWSClient:
                 url = await client.generate_presigned_url(
                     "get_object",
                     Params={"Bucket": parsed_uri.bucket, "Key": parsed_uri.key},
-                    ExpiresIn=SettingsManager.get_settings().PRESIGNED_URL_EXPIRATION,
+                    ExpiresIn=settings.PRESIGNED_URL_EXPIRATION,
                 )
                 presigned_urls.append(url)
 
