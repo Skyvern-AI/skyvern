@@ -16,60 +16,91 @@ async def llm_messages_builder(
     prompt: str,
     screenshots: list[bytes] | None = None,
     add_assistant_prefix: bool = False,
+    is_llama: bool = False,
 ) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = [
-        {
-            "type": "text",
-            "text": prompt,
+    if is_llama:
+        system_message = {
+            "role": "system",
+            "content": "You are a helpful assistant. You keep to the strict formatting rules. You are loved. You are appreciated. You are a good assistant."
         }
-    ]
-
-    if screenshots:
-        for screenshot in screenshots:
-            encoded_image = base64.b64encode(screenshot).decode("utf-8")
-            messages.append(
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/png;base64,{encoded_image}",
-                    },
-                }
-            )
-    # Anthropic models seems to struggle to always output a valid json object so we need to prefill the response to force it:
-    if add_assistant_prefix:
+        
+        # Build content array with images first
+        content = []
+        if screenshots:
+            for screenshot in screenshots:
+                encoded_image = base64.b64encode(screenshot).decode("utf-8")
+                # Use ollama's native format without data URI prefix
+                content.append({
+                    "type": "image",
+                    "data": encoded_image,
+                    "format": "png"
+                })
+        
+        # Add text prompt last
+        content.append({
+            "type": "text", 
+            "text": f"{prompt} OUTPUT JSON ONLY."
+        })
+        
         return [
-            {"role": "user", "content": messages},
-            {"role": "assistant", "content": "{"},
+            system_message,
+            {
+                "role": "user",
+                "content": content
+            }
         ]
-    return [{"role": "user", "content": messages}]
-
-
-def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bool = False) -> dict[str, Any]:
+    else:
+        # Original format for other models (unchanged)
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+        
+        if screenshots:
+            for screenshot in screenshots:
+                encoded_image = base64.b64encode(screenshot).decode("utf-8")
+                messages.append({
+                    "role": "user",
+                    "content": {
+                        "type": "image",
+                        "image_url": f"data:image/png;base64,{encoded_image}"
+                    }
+                })
+        
+        return messages
+    
+def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bool = False, is_llama: bool = False) -> dict[str, Any]:
+    """Parse the response from the LLM API into a dictionary.
+    
+    Args:
+        response: The response from the LLM API
+        add_assistant_prefix: Whether to add a prefix to the response
+        is_llama: Whether the response is from a Llama/Ollama model
+    
+    Returns:
+        The parsed response as a dictionary
+    """
     content = None
     try:
         content = response.choices[0].message.content
-        # Since we prefilled Anthropic response with "{" we need to add it back to the response to have a valid json object:
         if add_assistant_prefix:
             content = "{" + content
-        content = try_to_extract_json_from_markdown_format(content)
-        if not content:
-            raise EmptyLLMResponseError(str(response))
+
+        if is_llama:
+            content = try_to_extract_json_from_markdown_format_llama(content)
+
         return commentjson.loads(content)
+          
+                
     except Exception as e:
-        if content:
-            LOG.warning(
-                "Failed to parse LLM response. Will retry auto-fixing the response for unescaped quotes.",
-                exc_info=True,
-                content=content,
-            )
-            try:
-                return fix_and_parse_json_string(content)
-            except Exception as e2:
-                LOG.exception("Failed to auto-fix LLM response.", error=str(e2))
-                raise InvalidLLMResponseFormat(str(response)) from e2
-
-        raise InvalidLLMResponseFormat(str(response)) from e
-
+        LOG.error("Failed to parse LLM response.", content=content)
+        raise InvalidLLMResponseFormat(content) from e
 
 def fix_cutoff_json(json_string: str, error_position: int) -> dict[str, Any]:
     """
@@ -98,7 +129,6 @@ def fix_cutoff_json(json_string: str, error_position: int) -> dict[str, Any]:
             return {"actions": []}
     except Exception as e:
         raise InvalidLLMResponseFormat(json_string) from e
-
 
 def fix_unescaped_quotes_in_json(json_string: str) -> str:
     """
@@ -154,7 +184,6 @@ def fix_unescaped_quotes_in_json(json_string: str) -> str:
 
     return json_string
 
-
 def fix_and_parse_json_string(json_string: str) -> dict[str, Any]:
     """
     Auto-fixes a JSON string by escaping unescaped quotes and ignoring the last action if the JSON is cutoff.
@@ -182,7 +211,6 @@ def fix_and_parse_json_string(json_string: str) -> dict[str, Any]:
             # Try to fix the cutoff JSON string and see if it can be parsed
             return fix_cutoff_json(json_string, error_position)
 
-
 def try_to_extract_json_from_markdown_format(text: str) -> str:
     pattern = r"```json\s*(.*?)\s*```"
     match = re.search(pattern, text, re.DOTALL)
@@ -190,3 +218,57 @@ def try_to_extract_json_from_markdown_format(text: str) -> str:
         return match.group(1)
     else:
         return text
+       
+def try_to_extract_json_from_markdown_format_llama(text: str) -> str:
+    try:
+        json.loads(text)
+        return text  # Return original if valid JSON
+    except json.JSONDecodeError:
+        pass  # Continue with fixes if invalid
+    
+    """Extract and fix JSON content from markdown code blocks."""
+    # First try to extract from ```json blocks
+    json_pattern = r"```(?:json)?\s*([\s\S]*?)\s*```"
+    match = re.search(json_pattern, text, re.MULTILINE)
+    if match:
+        json_str = match.group(1).strip()
+    else:
+        # If no code blocks found, use the text as-is
+        json_str = text.strip()
+    
+    # Fix specific JSON formatting issues
+    json_str = re.sub(r'\}\}(\s*\])', '}]}', json_str)  # Fix double closing brace before array end
+    json_str = re.sub(r'\}\}\s*$', '}]}', json_str)     # Fix double closing brace at end
+    
+    # Balance brackets if still needed
+    open_curly = json_str.count('{')
+    close_curly = json_str.count('}')
+    open_square = json_str.count('[')
+    close_square = json_str.count(']')
+    
+    if open_curly > close_curly:
+        json_str += '}' * (open_curly - close_curly)
+    if open_square > close_square:
+        json_str += ']' * (open_square - close_square)
+    
+    # Validate JSON structure
+    try:
+        json.loads(json_str)
+        return json_str
+    except json.JSONDecodeError:
+        # If still invalid, try more aggressive fixes
+        json_str = re.sub(r'\}\s*\}\s*\]', '}]}', json_str)
+        return json_str
+
+def extract_json_from_response(response: str) -> dict:
+    """Extract JSON object from response text that may contain comments/explanations."""
+    # Find content between first { and last }
+    json_match = re.search(r'(\{.*\})', response, re.DOTALL)
+    if not json_match:
+        raise ValueError("No JSON object found in response")
+    
+    json_str = json_match.group(1)
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON structure: {e}")

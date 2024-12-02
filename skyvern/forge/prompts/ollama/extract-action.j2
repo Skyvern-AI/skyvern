@@ -1,0 +1,55 @@
+EXECUTE THIS BROWSER TASK NOW:
+
+URL: {{ current_url }}
+GOAL: {{ navigation_goal }}
+ELEMENTS: {{ elements }}
+USER_INPUT: {{ navigation_payload_str }}
+
+RETURN JSON WITH THESE EXACT ACTIONS:
+1. INPUT_TEXT - For typing in search/text fields
+2. CLICK - For buttons and links
+3. SELECT_OPTION - For dropdowns
+4. CHECKBOX - For checkboxes
+5. WAIT - When waiting needed
+6. SOLVE_CAPTCHA - For captchas
+7. TERMINATE - If goal impossible
+8. COMPLETE - When goal achieved
+9. UPLOAD_FILE - For file uploads
+10. NULL_ACTION - When no action needed
+
+EXAMPLE RESPONSE:
+{
+    "user_goal_stage": "Starting search",
+    "user_goal_achieved": false,
+    "action_plan": "Search for product",
+    "actions": [
+        {
+            "reasoning": "Enter search term",
+            "user_detail_query": "What to search?", 
+            "user_detail_answer": "search term",
+            "confidence_float": 1.0,
+            "action_type": "INPUT_TEXT",
+            "id": "an html element id from 'ELEMENTS' provided above. Scan it and find the correct id for the action. An id in html looks like this "<div id='thisIsAnId"</div>"",
+            "text": "search term",
+            "file_url": null,
+            "download": false,
+            "option": null
+        }
+    ]
+}
+
+STRICT RULES:
+1. Output JSON object only - nothing else
+2. No text before or after JSON
+3. No ```json or ``` markers
+4. No "Here is the response:"
+5. No explanations or notes
+6. No markdown formatting
+7. Just the raw JSON object
+8. ONLY use element_ids from the provided ELEMENTS list
+9. VERIFY element exists before including in action
+10. NO assumed/common element names like "search-field"
+11. Element IDs must match EXACTLY
+12. If no valid elements, return an empty actions list
+
+RESPOND NOW WITH JSON ONLY.
