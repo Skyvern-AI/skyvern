@@ -1,5 +1,5 @@
 import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
-import { helpTooltipContent, type ValidationNode } from "./types";
+import type { ValidationNode } from "./types";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { useState } from "react";
 import { CheckCircledIcon } from "@radix-ui/react-icons";
@@ -20,6 +20,7 @@ import {
   AccordionTrigger,
 } from "@/components/ui/accordion";
 import { Separator } from "@/components/ui/separator";
+import { helpTooltips } from "../../helpContent";
 
 function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
   const { updateNodeData } = useReactFlow();
@@ -121,7 +122,7 @@ function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
                         Error Messages
                       </Label>
                       <HelpTooltip
-                        content={helpTooltipContent["errorCodeMapping"]}
+                        content={helpTooltips["validation"]["errorCodeMapping"]}
                       />
                     </div>
                     <Checkbox
@@ -164,7 +165,7 @@ function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
                       Continue on Failure
                     </Label>
                     <HelpTooltip
-                      content={helpTooltipContent["continueOnFailure"]}
+                      content={helpTooltips["validation"]["continueOnFailure"]}
                     />
                   </div>
                   <div className="w-52">

@@ -17,8 +17,3 @@ export const textPromptNodeDefaultData: TextPromptNodeData = {
   continueOnFailure: false,
   parameterKeys: [],
 } as const;
-
-export const helpTooltipContent = {
-  prompt:
-    "Write a prompt you would like passed into the LLM and specify the output format, if applicable.",
-};

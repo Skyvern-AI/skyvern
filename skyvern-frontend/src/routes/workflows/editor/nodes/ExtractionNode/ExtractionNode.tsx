@@ -20,17 +20,9 @@ import { dataSchemaExampleValue } from "../types";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { Switch } from "@/components/ui/switch";
 import type { ExtractionNode } from "./types";
-import {
-  commonFieldPlaceholders,
-  commonHelpTooltipContent,
-} from "../../constants";
 import { ExtractIcon } from "@/components/icons/ExtractIcon";
 
-const dataExtractionGoalTooltip =
-  "Tell Skyvern what data you would like to scrape. Use {{ parameter_name }} to specify parameters to use.";
-const dataSchemaTooltip = "Specify a format for extracted data in JSON.";
-const dataExtractionGoalPlaceholder =
-  "Extract the price of the product with id {{ product_id }}";
+import { helpTooltips, placeholders } from "../../helpContent";
 
 function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
   const { updateNodeData } = useReactFlow();
@@ -100,7 +92,9 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
             <Label className="text-xs text-slate-300">
               Data Extraction Goal
             </Label>
-            <HelpTooltip content={dataExtractionGoalTooltip} />
+            <HelpTooltip
+              content={helpTooltips["extraction"]["dataExtractionGoal"]}
+            />
           </div>
           <AutoResizingTextarea
             onChange={(event) => {
@@ -110,7 +104,7 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
               handleChange("dataExtractionGoal", event.target.value);
             }}
             value={inputs.dataExtractionGoal}
-            placeholder={dataExtractionGoalPlaceholder}
+            placeholder={placeholders["extraction"]["dataExtractionGoal"]}
             className="nopan text-xs"
           />
         </div>
@@ -118,7 +112,7 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
           <div className="flex gap-4">
             <div className="flex gap-2">
               <Label className="text-xs text-slate-300">Data Schema</Label>
-              <HelpTooltip content={dataSchemaTooltip} />
+              <HelpTooltip content={helpTooltips["extraction"]["dataSchema"]} />
             </div>
             <Checkbox
               checked={inputs.dataSchema !== "null"}
@@ -166,12 +160,12 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
                       Max Retries
                     </Label>
                     <HelpTooltip
-                      content={commonHelpTooltipContent["maxRetries"]}
+                      content={helpTooltips["extraction"]["maxRetries"]}
                     />
                   </div>
                   <Input
                     type="number"
-                    placeholder={commonFieldPlaceholders["maxRetries"]}
+                    placeholder={placeholders["extraction"]["maxRetries"]}
                     className="nopan w-52 text-xs"
                     min="0"
                     value={inputs.maxRetries ?? ""}
@@ -193,12 +187,12 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
                       Max Steps Override
                     </Label>
                     <HelpTooltip
-                      content={commonHelpTooltipContent["maxStepsOverride"]}
+                      content={helpTooltips["extraction"]["maxStepsOverride"]}
                     />
                   </div>
                   <Input
                     type="number"
-                    placeholder={commonFieldPlaceholders["maxStepsOverride"]}
+                    placeholder={placeholders["extraction"]["maxStepsOverride"]}
                     className="nopan w-52 text-xs"
                     min="0"
                     value={inputs.maxStepsOverride ?? ""}
@@ -221,7 +215,7 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
                       Continue on Failure
                     </Label>
                     <HelpTooltip
-                      content={commonHelpTooltipContent["continueOnFailure"]}
+                      content={helpTooltips["extraction"]["continueOnFailure"]}
                     />
                   </div>
                   <div className="w-52">
@@ -242,7 +236,7 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
                       Cache Actions
                     </Label>
                     <HelpTooltip
-                      content={commonHelpTooltipContent["cacheActions"]}
+                      content={helpTooltips["extraction"]["cacheActions"]}
                     />
                   </div>
                   <div className="w-52">

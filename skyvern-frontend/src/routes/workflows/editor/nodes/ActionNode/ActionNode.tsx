@@ -21,10 +21,7 @@ import { errorMappingExampleValue } from "../types";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { Switch } from "@/components/ui/switch";
 import { ClickIcon } from "@/components/icons/ClickIcon";
-import {
-  commonFieldPlaceholders,
-  commonHelpTooltipContent,
-} from "../../constants";
+import { placeholders, helpTooltips } from "../../helpContent";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -113,7 +110,7 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                 handleChange("url", event.target.value);
               }}
               value={inputs.url}
-              placeholder={commonFieldPlaceholders["url"]}
+              placeholder={placeholders["action"]["url"]}
               className="nopan text-xs"
             />
           </div>
@@ -151,12 +148,12 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                       Max Retries
                     </Label>
                     <HelpTooltip
-                      content={commonHelpTooltipContent["maxRetries"]}
+                      content={helpTooltips["action"]["maxRetries"]}
                     />
                   </div>
                   <Input
                     type="number"
-                    placeholder={commonFieldPlaceholders["maxRetries"]}
+                    placeholder={placeholders["action"]["maxRetries"]}
                     className="nopan w-52 text-xs"
                     min="0"
                     value={inputs.maxRetries ?? ""}
@@ -179,7 +176,7 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                         Error Messages
                       </Label>
                       <HelpTooltip
-                        content={commonHelpTooltipContent["errorCodeMapping"]}
+                        content={helpTooltips["action"]["errorCodeMapping"]}
                       />
                     </div>
                     <Checkbox
@@ -222,7 +219,7 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                       Continue on Failure
                     </Label>
                     <HelpTooltip
-                      content={commonHelpTooltipContent["continueOnFailure"]}
+                      content={helpTooltips["action"]["continueOnFailure"]}
                     />
                   </div>
                   <div className="w-52">
@@ -243,7 +240,7 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                       Cache Actions
                     </Label>
                     <HelpTooltip
-                      content={commonHelpTooltipContent["cacheActions"]}
+                      content={helpTooltips["action"]["cacheActions"]}
                     />
                   </div>
                   <div className="w-52">
@@ -265,7 +262,7 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                       Complete on Download
                     </Label>
                     <HelpTooltip
-                      content={commonHelpTooltipContent["completeOnDownload"]}
+                      content={helpTooltips["action"]["completeOnDownload"]}
                     />
                   </div>
                   <div className="w-52">
@@ -286,12 +283,12 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                       File Suffix
                     </Label>
                     <HelpTooltip
-                      content={commonHelpTooltipContent["fileSuffix"]}
+                      content={helpTooltips["action"]["fileSuffix"]}
                     />
                   </div>
                   <Input
                     type="text"
-                    placeholder={commonFieldPlaceholders["downloadSuffix"]}
+                    placeholder={placeholders["action"]["downloadSuffix"]}
                     className="nopan w-52 text-xs"
                     value={inputs.downloadSuffix ?? ""}
                     onChange={(event) => {
@@ -309,7 +306,7 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                       2FA Verification URL
                     </Label>
                     <HelpTooltip
-                      content={commonHelpTooltipContent["totpVerificationUrl"]}
+                      content={helpTooltips["action"]["totpVerificationUrl"]}
                     />
                   </div>
                   <AutoResizingTextarea
@@ -320,7 +317,7 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                       handleChange("totpVerificationUrl", event.target.value);
                     }}
                     value={inputs.totpVerificationUrl ?? ""}
-                    placeholder={commonFieldPlaceholders["totpVerificationUrl"]}
+                    placeholder={placeholders["action"]["totpVerificationUrl"]}
                     className="nopan text-xs"
                   />
                 </div>
@@ -330,7 +327,7 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                       2FA Identifier
                     </Label>
                     <HelpTooltip
-                      content={commonHelpTooltipContent["totpIdentifier"]}
+                      content={helpTooltips["action"]["totpIdentifier"]}
                     />
                   </div>
                   <AutoResizingTextarea
@@ -341,7 +338,7 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                       handleChange("totpIdentifier", event.target.value);
                     }}
                     value={inputs.totpIdentifier ?? ""}
-                    placeholder={commonFieldPlaceholders["totpIdentifier"]}
+                    placeholder={placeholders["action"]["totpIdentifier"]}
                     className="nopan text-xs"
                   />
                 </div>

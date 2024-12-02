@@ -20,19 +20,9 @@ import { errorMappingExampleValue } from "../types";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { Switch } from "@/components/ui/switch";
 import type { LoginNode } from "./types";
-import {
-  commonFieldPlaceholders,
-  commonHelpTooltipContent,
-} from "../../constants";
 import { LockOpen1Icon } from "@radix-ui/react-icons";
 import { CredentialParameterSelector } from "./CredentialParameterSelector";
-
-const urlTooltip =
-  "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
-const urlPlaceholder = "https://";
-const navigationGoalTooltip =
-  "Give Skyvern an objective. Make sure to include when the task is complete, when it should self-terminate, and any guardrails.";
-const navigationGoalPlaceholder = "Tell Skyvern what to do.";
+import { helpTooltips, placeholders } from "../../helpContent";
 
 function LoginNode({ id, data }: NodeProps<LoginNode>) {
   const { updateNodeData } = useReactFlow();
@@ -103,7 +93,7 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
           <div className="space-y-2">
             <div className="flex gap-2">
               <Label className="text-xs text-slate-300">URL</Label>
-              <HelpTooltip content={urlTooltip} />
+              <HelpTooltip content={helpTooltips["login"]["url"]} />
             </div>
             <AutoResizingTextarea
               onChange={(event) => {
@@ -113,14 +103,14 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                 handleChange("url", event.target.value);
               }}
               value={inputs.url}
-              placeholder={urlPlaceholder}
+              placeholder={placeholders["login"]["url"]}
               className="nopan text-xs"
             />
           </div>
           <div className="space-y-2">
             <div className="flex gap-2">
               <Label className="text-xs text-slate-300">Login Goal</Label>
-              <HelpTooltip content={navigationGoalTooltip} />
+              <HelpTooltip content={helpTooltips["login"]["navigationGoal"]} />
             </div>
             <AutoResizingTextarea
               onChange={(event) => {
@@ -130,7 +120,7 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                 handleChange("navigationGoal", event.target.value);
               }}
               value={inputs.navigationGoal}
-              placeholder={navigationGoalPlaceholder}
+              placeholder={placeholders["login"]["navigationGoal"]}
               className="nopan text-xs"
             />
           </div>
@@ -175,12 +165,12 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                       Max Retries
                     </Label>
                     <HelpTooltip
-                      content={commonHelpTooltipContent["maxRetries"]}
+                      content={helpTooltips["login"]["maxRetries"]}
                     />
                   </div>
                   <Input
                     type="number"
-                    placeholder={commonFieldPlaceholders["maxRetries"]}
+                    placeholder={placeholders["login"]["maxRetries"]}
                     className="nopan w-52 text-xs"
                     min="0"
                     value={inputs.maxRetries ?? ""}
@@ -202,12 +192,12 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                       Max Steps Override
                     </Label>
                     <HelpTooltip
-                      content={commonHelpTooltipContent["maxStepsOverride"]}
+                      content={helpTooltips["login"]["maxStepsOverride"]}
                     />
                   </div>
                   <Input
                     type="number"
-                    placeholder={commonFieldPlaceholders["maxStepsOverride"]}
+                    placeholder={placeholders["login"]["maxStepsOverride"]}
                     className="nopan w-52 text-xs"
                     min="0"
                     value={inputs.maxStepsOverride ?? ""}
@@ -230,7 +220,7 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                         Error Messages
                       </Label>
                       <HelpTooltip
-                        content={commonHelpTooltipContent["errorCodeMapping"]}
+                        content={helpTooltips["login"]["errorCodeMapping"]}
                       />
                     </div>
                     <Checkbox
@@ -273,7 +263,7 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                       Continue on Failure
                     </Label>
                     <HelpTooltip
-                      content={commonHelpTooltipContent["continueOnFailure"]}
+                      content={helpTooltips["login"]["continueOnFailure"]}
                     />
                   </div>
                   <div className="w-52">
@@ -294,7 +284,7 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                       Cache Actions
                     </Label>
                     <HelpTooltip
-                      content={commonHelpTooltipContent["cacheActions"]}
+                      content={helpTooltips["login"]["cacheActions"]}
                     />
                   </div>
                   <div className="w-52">
@@ -316,7 +306,7 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                       2FA Verification URL
                     </Label>
                     <HelpTooltip
-                      content={commonHelpTooltipContent["totpVerificationUrl"]}
+                      content={helpTooltips["login"]["totpVerificationUrl"]}
                     />
                   </div>
                   <AutoResizingTextarea
@@ -327,7 +317,7 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                       handleChange("totpVerificationUrl", event.target.value);
                     }}
                     value={inputs.totpVerificationUrl ?? ""}
-                    placeholder={commonFieldPlaceholders["totpVerificationUrl"]}
+                    placeholder={placeholders["login"]["totpVerificationUrl"]}
                     className="nopan text-xs"
                   />
                 </div>
@@ -337,7 +327,7 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                       2FA Identifier
                     </Label>
                     <HelpTooltip
-                      content={commonHelpTooltipContent["totpIdentifier"]}
+                      content={helpTooltips["login"]["totpIdentifier"]}
                     />
                   </div>
                   <AutoResizingTextarea
@@ -348,7 +338,7 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                       handleChange("totpIdentifier", event.target.value);
                     }}
                     value={inputs.totpIdentifier ?? ""}
-                    placeholder={commonFieldPlaceholders["totpIdentifier"]}
+                    placeholder={placeholders["login"]["totpIdentifier"]}
                     className="nopan text-xs"
                   />
                 </div>
