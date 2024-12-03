@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     AWS_REGION: str = "us-east-1"
     AWS_S3_BUCKET_UPLOADS: str = "skyvern-uploads"
     MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
+    PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
 
     SKYVERN_TELEMETRY: bool = True
     ANALYTICS_ID: str = "anonymous"
