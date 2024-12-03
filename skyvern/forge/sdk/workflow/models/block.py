@@ -166,11 +166,6 @@ class Block(BaseModel, abc.ABC):
     async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
         pass
 
-    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        self.label = self.format_block_parameter_template_from_workflow_run_context(
-            potential_template=self.label, workflow_run_context=workflow_run_context
-        )
-
     async def execute_safe(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
         try:
             return await self.execute(workflow_run_id, **kwargs)
@@ -233,8 +228,6 @@ class BaseTaskBlock(Block):
         return parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        super().format_potential_template_parameters(workflow_run_context=workflow_run_context)
-
         self.title = self.format_block_parameter_template_from_workflow_run_context(self.title, workflow_run_context)
 
         if self.url:
@@ -348,7 +341,16 @@ class BaseTaskBlock(Block):
                 )
                 self.download_suffix = download_suffix_parameter_value
 
-        self.format_potential_template_parameters(workflow_run_context=workflow_run_context)
+        try:
+            self.format_potential_template_parameters(workflow_run_context=workflow_run_context)
+        except Exception as e:
+            return self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to format jinja template: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+            )
+
         # TODO (kerem) we should always retry on terminated. We should make a distinction between retriable and
         # non-retryable terminations
         while will_retry:
@@ -726,7 +728,6 @@ class ForLoopBlock(Block):
 
     async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        self.format_potential_template_parameters(workflow_run_context)
         loop_over_values = self.get_loop_over_parameter_values(workflow_run_context)
         LOG.info(
             f"Number of loop_over values: {len(loop_over_values)}",
@@ -802,14 +803,21 @@ class CodeBlock(Block):
         return self.parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        super().format_potential_template_parameters(workflow_run_context)
         self.code = self.format_block_parameter_template_from_workflow_run_context(self.code, workflow_run_context)
 
     async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
         raise DisabledBlockExecutionError("CodeBlock is disabled")
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        self.format_potential_template_parameters(workflow_run_context)
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception as e:
+            return self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to format jinja template: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+            )
 
         # get all parameters into a dictionary
         parameter_values = {}
@@ -871,7 +879,6 @@ class TextPromptBlock(Block):
         return self.parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        super().format_potential_template_parameters(workflow_run_context)
         self.llm_key = self.format_block_parameter_template_from_workflow_run_context(
             self.llm_key, workflow_run_context
         )
@@ -911,7 +918,15 @@ class TextPromptBlock(Block):
     async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        self.format_potential_template_parameters(workflow_run_context)
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception as e:
+            return self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to format jinja template: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+            )
         # get all parameters into a dictionary
         parameter_values = {}
         for parameter in self.parameters:
@@ -946,7 +961,6 @@ class DownloadToS3Block(Block):
         return []
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        super().format_potential_template_parameters(workflow_run_context)
         self.url = self.format_block_parameter_template_from_workflow_run_context(self.url, workflow_run_context)
 
     async def _upload_file_to_s3(self, uri: str, file_path: str) -> None:
@@ -971,7 +985,15 @@ class DownloadToS3Block(Block):
                 )
                 self.url = task_url_parameter_value
 
-        self.format_potential_template_parameters(workflow_run_context)
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception as e:
+            return self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to format jinja template: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+            )
 
         try:
             file_path = await download_file(self.url, max_size_mb=10)
@@ -1012,7 +1034,6 @@ class UploadToS3Block(Block):
         return []
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        super().format_potential_template_parameters(workflow_run_context)
         if self.path:
             self.path = self.format_block_parameter_template_from_workflow_run_context(self.path, workflow_run_context)
 
@@ -1039,7 +1060,16 @@ class UploadToS3Block(Block):
         elif self.path == settings.WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY:
             self.path = str(get_path_for_workflow_download_directory(workflow_run_id).absolute())
 
-        self.format_potential_template_parameters(workflow_run_context)
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception as e:
+            return self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to format jinja template: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+            )
+
         if not self.path or not os.path.exists(self.path):
             raise FileNotFoundError(f"UploadToS3Block: File not found at path: {self.path}")
 
@@ -1116,7 +1146,6 @@ class SendEmailBlock(Block):
         return parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        super().format_potential_template_parameters(workflow_run_context)
         self.sender = self.format_block_parameter_template_from_workflow_run_context(self.sender, workflow_run_context)
         self.subject = self.format_block_parameter_template_from_workflow_run_context(
             self.subject, workflow_run_context
@@ -1335,7 +1364,15 @@ class SendEmailBlock(Block):
 
     async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        self.format_potential_template_parameters(workflow_run_context)
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception as e:
+            return self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to format jinja template: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+            )
         smtp_host_value, smtp_port_value, smtp_username_value, smtp_password_value = self._decrypt_smtp_parameters(
             workflow_run_context
         )
@@ -1388,7 +1425,6 @@ class FileParserBlock(Block):
         return []
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        super().format_potential_template_parameters(workflow_run_context)
         self.file_url = self.format_block_parameter_template_from_workflow_run_context(
             self.file_url, workflow_run_context
         )
@@ -1417,7 +1453,15 @@ class FileParserBlock(Block):
                 )
                 self.file_url = file_url_parameter_value
 
-        self.format_potential_template_parameters(workflow_run_context)
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception as e:
+            return self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to format jinja template: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+            )
 
         # Download the file
         if self.file_url.startswith("s3://"):
