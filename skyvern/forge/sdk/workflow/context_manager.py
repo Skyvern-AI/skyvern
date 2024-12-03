@@ -6,6 +6,7 @@ import structlog
 from skyvern.exceptions import BitwardenBaseError, WorkflowRunContextNotInitialized
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.models import Organization
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
 from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -374,6 +375,14 @@ class WorkflowRunContext:
                 and isinstance(parameter.source, OutputParameter)
                 and parameter.source.key == output_parameter.key
             ):
+                # If task isn't completed, we should skip setting the value
+                if (
+                    isinstance(value, dict)
+                    and "extracted_information" in value
+                    and "status" in value
+                    and value["status"] != TaskStatus.completed
+                ):
+                    continue
                 if isinstance(value, dict) and "errors" in value and value["errors"]:
                     # Is this the correct way to handle errors from task blocks?
                     LOG.error(
