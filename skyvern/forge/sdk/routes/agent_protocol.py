@@ -28,7 +28,7 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import aws_client
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
-from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.models import Artifact
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
@@ -255,53 +255,7 @@ async def get_task(
     # get latest step
     latest_step = await app.DATABASE.get_latest_step(task_id, organization_id=current_org.organization_id)
     if not latest_step:
-        return task_obj.to_task_response()
-
-    screenshot_url = None
-    # todo (kerem): only access artifacts through the artifact manager instead of db
-    screenshot_artifact = await app.DATABASE.get_latest_artifact(
-        task_id=task_obj.task_id,
-        step_id=latest_step.step_id,
-        artifact_types=[ArtifactType.SCREENSHOT_ACTION, ArtifactType.SCREENSHOT_FINAL],
-        organization_id=current_org.organization_id,
-    )
-    if screenshot_artifact:
-        screenshot_url = await app.ARTIFACT_MANAGER.get_share_link(screenshot_artifact)
-
-    recording_artifact = await app.DATABASE.get_latest_artifact(
-        task_id=task_obj.task_id,
-        artifact_types=[ArtifactType.RECORDING],
-        organization_id=current_org.organization_id,
-    )
-    recording_url = None
-    if recording_artifact:
-        recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
-
-    browser_console_log = await app.DATABASE.get_latest_artifact(
-        task_id=task_obj.task_id,
-        artifact_types=[ArtifactType.BROWSER_CONSOLE_LOG],
-        organization_id=current_org.organization_id,
-    )
-    browser_console_log_url = None
-    if browser_console_log:
-        browser_console_log_url = await app.ARTIFACT_MANAGER.get_share_link(browser_console_log)
-
-    # get the artifact of the last  screenshot and get the screenshot_url
-    latest_action_screenshot_artifacts = await app.DATABASE.get_latest_n_artifacts(
-        task_id=task_obj.task_id,
-        organization_id=task_obj.organization_id,
-        artifact_types=[ArtifactType.SCREENSHOT_ACTION],
-        n=settings.TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
-    )
-    latest_action_screenshot_urls: list[str] | None = None
-    if latest_action_screenshot_artifacts:
-        latest_action_screenshot_urls = await app.ARTIFACT_MANAGER.get_share_links(latest_action_screenshot_artifacts)
-    elif task_obj.status in [TaskStatus.terminated, TaskStatus.completed]:
-        LOG.error(
-            "Failed to get latest action screenshots in task response",
-            task_id=task_id,
-            task_status=task_obj.status,
-        )
+        return await app.agent.build_task_response(task=task_obj)
 
     failure_reason: str | None = None
     if task_obj.status == TaskStatus.failed and (latest_step.output or task_obj.failure_reason):
@@ -319,13 +273,8 @@ async def get_task(
 
             if len(action_results_string) > 0:
                 failure_reason += "(Exceptions: " + str(action_results_string) + ")"
-
-    return task_obj.to_task_response(
-        action_screenshot_urls=latest_action_screenshot_urls,
-        screenshot_url=screenshot_url,
-        recording_url=recording_url,
-        browser_console_log_url=browser_console_log_url,
-        failure_reason=failure_reason,
+    return await app.agent.build_task_response(
+        task=task_obj, last_step=latest_step, failure_reason=failure_reason, need_browser_log=True
     )
 
 
@@ -381,12 +330,12 @@ async def retry_webhook(
     # get latest step
     latest_step = await app.DATABASE.get_latest_step(task_id, organization_id=current_org.organization_id)
     if not latest_step:
-        return task_obj.to_task_response()
+        return await app.agent.build_task_response(task=task_obj)
 
     # retry the webhook
     await app.agent.execute_task_webhook(task=task_obj, last_step=latest_step, api_key=x_api_key)
 
-    return task_obj.to_task_response()
+    return await app.agent.build_task_response(task=task_obj, last_step=latest_step)
 
 
 @base_router.get("/internal/tasks/{task_id}", response_model=list[Task])
@@ -454,7 +403,7 @@ async def get_agent_tasks(
         order_by_column=sort,
         application=application,
     )
-    return ORJSONResponse([task.to_task_response().model_dump() for task in tasks])
+    return ORJSONResponse([(await app.agent.build_task_response(task=task)).model_dump() for task in tasks])
 
 
 @base_router.get("/internal/tasks", tags=["agent"], response_model=list[Task])
