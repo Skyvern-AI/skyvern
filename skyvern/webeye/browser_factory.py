@@ -14,7 +14,7 @@ from playwright.async_api import BrowserContext, ConsoleMessage, Download, Error
 from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
-from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_DOWNLOAD_TIMEOUT
+from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_DOWNLOAD_TIMEOUT, NAVIGATION_MAX_RETRY_TIME
 from skyvern.exceptions import (
     FailedToNavigateToUrl,
     FailedToReloadPage,
@@ -346,49 +346,48 @@ class BrowserState:
             LOG.info("browser context is created")
 
         if await self.get_working_page() is None:
-            success = False
-            retries = 0
+            page = await self.browser_context.new_page()
+            await self.set_working_page(page, 0)
+            await self._close_all_other_pages()
 
-            while not success and retries < 3:
-                try:
-                    LOG.info("Creating a new page")
-                    page = await self.browser_context.new_page()
-                    await self.set_working_page(page, 0)
-                    await self._close_all_other_pages()
-                    LOG.info("A new page is created")
-                    if url:
-                        LOG.info(f"Navigating page to {url} and waiting for 5 seconds")
-                        try:
-                            start_time = time.time()
-                            await page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-                            end_time = time.time()
-                            LOG.info(
-                                "Page loading time",
-                                loading_time=end_time - start_time,
-                                url=url,
-                            )
-                            await asyncio.sleep(5)
-                        except Error as playright_error:
-                            LOG.warning(
-                                f"Error while navigating to url: {str(playright_error)}",
-                                exc_info=True,
-                            )
-                            raise FailedToNavigateToUrl(url=url, error_message=str(playright_error))
-                        success = True
-                        LOG.info(f"Successfully went to {url}")
-                    else:
-                        success = True
-                except Exception as e:
-                    LOG.exception(
-                        f"Error while creating or navigating to a new page. Waiting for 5 seconds. Error: {str(e)}",
-                    )
-                    retries += 1
-                    # Wait for 5 seconds before retrying
-                    await asyncio.sleep(5)
-                    if retries >= 3:
-                        LOG.exception(f"Failed to create a new page after 3 retries: {str(e)}")
-                        raise e
-                    LOG.info(f"Retrying to create a new page. Retry count: {retries}")
+            if url:
+                await self.navigate_to_url(page=page, url=url)
+
+    async def navigate_to_url(self, page: Page, url: str, retry_times: int = NAVIGATION_MAX_RETRY_TIME) -> None:
+        navigation_error: Exception = FailedToNavigateToUrl(url=url, error_message="")
+        for retry_time in range(retry_times):
+            LOG.info(f"Trying to navigate to {url} and waiting for 5 seconds.", url=url, retry_time=retry_time)
+            try:
+                start_time = time.time()
+                await page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+                end_time = time.time()
+                LOG.info(
+                    "Page loading time",
+                    loading_time=end_time - start_time,
+                    url=url,
+                )
+                await asyncio.sleep(5)
+                LOG.info(f"Successfully went to {url}", url=url, retry_time=retry_time)
+                return
+
+            except Exception as e:
+                navigation_error = e
+                LOG.warning(
+                    f"Error while navigating to url: {str(navigation_error)}",
+                    exc_info=True,
+                    url=url,
+                    retry_time=retry_time,
+                )
+                # Wait for 5 seconds before retrying
+                await asyncio.sleep(5)
+        else:
+            LOG.exception(
+                f"Failed to navigate to {url} after {retry_times} retries: {str(navigation_error)}",
+                url=url,
+            )
+            if isinstance(navigation_error, Error):
+                raise FailedToNavigateToUrl(url=url, error_message=str(navigation_error))
+            raise navigation_error
 
     async def get_working_page(self) -> Page | None:
         # HACK: currently, assuming the last page is always the working page.

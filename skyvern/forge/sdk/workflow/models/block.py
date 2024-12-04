@@ -19,14 +19,12 @@ import filetype
 import structlog
 from email_validator import EmailNotValidError, validate_email
 from jinja2 import Template
-from playwright.async_api import Error
 from pydantic import BaseModel, Field
 
 from skyvern.config import settings
 from skyvern.exceptions import (
     ContextParameterValueNotFound,
     DisabledBlockExecutionError,
-    FailedToNavigateToUrl,
     MissingBrowserState,
     MissingBrowserStatePage,
     SkyvernException,
@@ -370,70 +368,60 @@ class BaseTaskBlock(Block):
                 raise Exception(f"Organization is missing organization_id={workflow.organization_id}")
 
             browser_state: BrowserState | None = None
-            try:
-                if is_first_task:
+            if is_first_task:
+                # the first task block will create the browser state and do the navigation
+                try:
                     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                         workflow_run=workflow_run, url=self.url
                     )
-                else:
-                    browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
-                if browser_state is None:
-                    raise MissingBrowserState(task_id=task.task_id, workflow_run_id=workflow_run_id)
-            except FailedToNavigateToUrl as e:
-                # Make sure the task is marked as failed in the database before raising the exception
-                await app.DATABASE.update_task(
-                    task.task_id,
-                    status=TaskStatus.failed,
-                    organization_id=workflow.organization_id,
-                    failure_reason=str(e),
-                )
-                raise e
-            except Exception as e:
-                await app.DATABASE.update_task(
-                    task.task_id,
-                    status=TaskStatus.failed,
-                    organization_id=workflow.organization_id,
-                    failure_reason=str(e),
-                )
-                LOG.exception(
-                    "Failed to get browser state for task",
-                    task_id=task.task_id,
-                    workflow_run_id=workflow_run_id,
-                )
-                raise e
-
-            working_page = await browser_state.get_working_page()
-            if not working_page:
-                LOG.error(
-                    "BrowserState has no page",
-                    workflow_run_id=workflow_run.workflow_run_id,
-                )
-                raise MissingBrowserStatePage(workflow_run_id=workflow_run.workflow_run_id)
-
-            LOG.info(
-                "Navigating to page",
-                url=self.url,
-                workflow_run_id=workflow_run_id,
-                task_id=task.task_id,
-                workflow_id=workflow.workflow_id,
-                organization_id=workflow.organization_id,
-                step_id=step.step_id,
-            )
-
-            if self.url:
-                try:
-                    await working_page.goto(self.url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-                except Error as playright_error:
-                    LOG.warning(f"Error while navigating to url: {str(playright_error)}")
+                except Exception as e:
+                    LOG.exception(
+                        "Failed to get browser state for first task",
+                        task_id=task.task_id,
+                        workflow_run_id=workflow_run_id,
+                    )
                     # Make sure the task is marked as failed in the database before raising the exception
-                    exc = FailedToNavigateToUrl(url=self.url, error_message=str(playright_error))
                     await app.DATABASE.update_task(
                         task.task_id,
                         status=TaskStatus.failed,
                         organization_id=workflow.organization_id,
-                        failure_reason=str(exc),
+                        failure_reason=str(e),
                     )
-                    raise exc
+                    raise e
+            else:
+                # if not the first task block, need to navigate manually
+                browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
+                if browser_state is None:
+                    raise MissingBrowserState(task_id=task.task_id, workflow_run_id=workflow_run_id)
+
+                working_page = await browser_state.get_working_page()
+                if not working_page:
+                    LOG.error(
+                        "BrowserState has no page",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                    )
+                    raise MissingBrowserStatePage(workflow_run_id=workflow_run.workflow_run_id)
+
+                if self.url:
+                    LOG.info(
+                        "Navigating to page",
+                        url=self.url,
+                        workflow_run_id=workflow_run_id,
+                        task_id=task.task_id,
+                        workflow_id=workflow.workflow_id,
+                        organization_id=workflow.organization_id,
+                        step_id=step.step_id,
+                    )
+                    try:
+                        await browser_state.navigate_to_url(page=working_page, url=self.url)
+                    except Exception as e:
+                        await app.DATABASE.update_task(
+                            task.task_id,
+                            status=TaskStatus.failed,
+                            organization_id=workflow.organization_id,
+                            failure_reason=str(e),
+                        )
+                        raise e
 
             try:
                 await app.agent.execute_step(
