@@ -1,7 +1,7 @@
 export const baseHelpTooltipContent = {
   url: "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.",
   navigationGoal:
-    "Give Skyvern an objective. Make sure to include when the block is complete, when it should self-terminate, and any guardrails.",
+    "Give Skyvern an objective. Make sure to include when the block is complete, when it should self-terminate, and any guardrails. Use {{ parameter_name }} to reference a parameter value",
   parameters:
     "Define placeholder values using the “parameters” drop down that you predefine or redefine run-to-run.",
   dataExtractionGoal:
@@ -98,7 +98,7 @@ export const placeholders = {
   navigation: {
     ...basePlaceholderContent,
     navigationGoal:
-      "Give Skyvern an objective. Make sure to include when the task is complete, when it should self-terminate, and any guardrails.",
+      "Navigate to the product page for product with id {{ product_id }}",
   },
   extraction: {
     ...basePlaceholderContent,
@@ -114,7 +114,10 @@ export const placeholders = {
   },
   validation: basePlaceholderContent,
   textPrompt: basePlaceholderContent,
-  login: basePlaceholderContent,
+  login: {
+    ...basePlaceholderContent,
+    navigationGoal: "Login to the website using the {{ credentials }}",
+  },
   loop: basePlaceholderContent,
   sendEmail: basePlaceholderContent,
   upload: basePlaceholderContent,
