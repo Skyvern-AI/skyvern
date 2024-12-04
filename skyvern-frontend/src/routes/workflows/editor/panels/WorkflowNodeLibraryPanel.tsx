@@ -6,6 +6,7 @@ import {
   DownloadIcon,
   EnvelopeClosedIcon,
   FileIcon,
+  ListBulletIcon,
   LockOpen1Icon,
   PlusIcon,
   StopwatchIcon,
@@ -49,6 +50,12 @@ const nodeLibraryItems: Array<{
     description: "Validate the state of the workflow or terminate",
   },
   {
+    nodeType: "task",
+    icon: <ListBulletIcon className="size-6" />,
+    title: "Task Block",
+    description: "Takes actions or extracts information",
+  },
+  {
     nodeType: "textPrompt",
     icon: <CursorTextIcon className="size-6" />,
     title: "Text Prompt Block",
@@ -60,13 +67,6 @@ const nodeLibraryItems: Array<{
     title: "Send Email Block",
     description: "Sends an email",
   },
-  // legacy
-  // {
-  //   nodeType: "task",
-  //   icon: <ListBulletIcon className="size-6" />,
-  //   title: "Task Block",
-  //   description: "Takes actions or extracts information",
-  // },
   {
     nodeType: "loop",
     icon: <UpdateIcon className="size-6" />,
