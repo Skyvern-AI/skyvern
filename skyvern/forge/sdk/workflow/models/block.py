@@ -598,9 +598,6 @@ class ForLoopBlock(Block):
         return list(parameters)
 
     def get_loop_block_context_parameters(self, workflow_run_id: str, loop_data: Any) -> list[ContextParameter]:
-        if not isinstance(loop_data, dict) and not isinstance(loop_data, list):
-            raise ValueError("loop_data should be a dict or a list.")
-
         context_parameters = []
         for loop_block in self.loop_blocks:
             # todo: handle the case where the loop_block is a ForLoopBlock

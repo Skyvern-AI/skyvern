@@ -510,3 +510,19 @@ class WorkflowContextManager:
         await self.workflow_run_contexts[workflow_run_id].register_block_parameters(
             self.aws_client, parameters, organization
         )
+
+    def add_context_parameter(self, workflow_run_id: str, context_parameter: ContextParameter) -> None:
+        self._validate_workflow_run_context(workflow_run_id)
+        self.workflow_run_contexts[workflow_run_id].parameters[context_parameter.key] = context_parameter
+
+    async def set_parameter_values_for_output_parameter_dependent_blocks(
+        self,
+        workflow_run_id: str,
+        output_parameter: OutputParameter,
+        value: dict[str, Any] | list | str | None,
+    ) -> None:
+        self._validate_workflow_run_context(workflow_run_id)
+        await self.workflow_run_contexts[workflow_run_id].set_parameter_values_for_output_parameter_dependent_blocks(
+            output_parameter,
+            value,
+        )
