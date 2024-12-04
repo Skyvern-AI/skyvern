@@ -668,6 +668,13 @@ def trim_element(element: dict) -> dict:
             if not element_text:
                 del queue_ele["text"]
 
+        if (
+            "attributes" in queue_ele
+            and "name" in queue_ele["attributes"]
+            and len(queue_ele["attributes"]["name"]) > 500
+        ):
+            queue_ele["attributes"]["name"] = queue_ele["attributes"]["name"][:500]
+
         if "beforePseudoText" in queue_ele and not queue_ele.get("beforePseudoText"):
             del queue_ele["beforePseudoText"]
 
