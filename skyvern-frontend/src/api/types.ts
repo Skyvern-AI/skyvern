@@ -206,6 +206,7 @@ export type WorkflowRunStatusApiResponse = {
   recording_url: string | null;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
+  downloaded_file_urls: Array<string> | null;
 };
 
 export type TaskGenerationApiResponse = {

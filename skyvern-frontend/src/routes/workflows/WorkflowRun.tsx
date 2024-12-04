@@ -49,6 +49,7 @@ import {
 import { cn } from "@/util/utils";
 import {
   CopyIcon,
+  FileIcon,
   Pencil2Icon,
   PlayIcon,
   ReaderIcon,
@@ -376,6 +377,8 @@ function WorkflowRun() {
     </TableRow>
   );
 
+  const fileUrls = workflowRun?.downloaded_file_urls ?? [];
+
   return (
     <div className="space-y-8">
       <header className="flex justify-between">
@@ -623,6 +626,29 @@ function WorkflowRun() {
             minHeight="96px"
             maxHeight="500px"
           />
+        </div>
+      )}
+      {workflowRunIsFinalized && (
+        <div className="space-y-4">
+          <header>
+            <h2 className="text-lg font-semibold">Downloaded Files</h2>
+          </header>
+          <div className="space-y-2">
+            {fileUrls.length > 0 ? (
+              fileUrls.map((url) => {
+                return (
+                  <div key={url} className="flex gap-2">
+                    <FileIcon className="size-6" />
+                    <a href={url} className="underline underline-offset-4">
+                      <span>{url}</span>
+                    </a>
+                  </div>
+                );
+              })
+            ) : (
+              <div>No files downloaded</div>
+            )}
+          </div>
         </div>
       )}
       {Object.entries(parameters).length > 0 && (
