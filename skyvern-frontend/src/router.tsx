@@ -4,15 +4,13 @@ import { Settings } from "./routes/settings/Settings";
 import { SettingsPageLayout } from "./routes/settings/SettingsPageLayout";
 import { TasksPageLayout } from "./routes/tasks/TasksPageLayout";
 import { CreateNewTaskFormPage } from "./routes/tasks/create/CreateNewTaskFormPage";
-import { CreateNewTaskLayout } from "./routes/tasks/create/CreateNewTaskLayout";
-import { TaskTemplates } from "./routes/tasks/create/TaskTemplates";
 import { RetryTask } from "./routes/tasks/create/retry/RetryTask";
 import { StepArtifactsLayout } from "./routes/tasks/detail/StepArtifactsLayout";
 import { TaskActions } from "./routes/tasks/detail/TaskActions";
 import { TaskDetails } from "./routes/tasks/detail/TaskDetails";
 import { TaskParameters } from "./routes/tasks/detail/TaskParameters";
 import { TaskRecording } from "./routes/tasks/detail/TaskRecording";
-import { TaskList } from "./routes/tasks/list/TaskList";
+import { TasksPage } from "./routes/tasks/list/TasksPage";
 import { WorkflowPage } from "./routes/workflows/WorkflowPage";
 import { WorkflowRun } from "./routes/workflows/WorkflowRun";
 import { WorkflowRunParameters } from "./routes/workflows/WorkflowRunParameters";
@@ -27,7 +25,7 @@ const router = createBrowserRouter([
     children: [
       {
         index: true,
-        element: <Navigate to="/create" />,
+        element: <Navigate to="/tasks" />,
       },
       {
         path: "tasks",
@@ -35,7 +33,21 @@ const router = createBrowserRouter([
         children: [
           {
             index: true,
-            element: <TaskList />,
+            element: <TasksPage />,
+          },
+          {
+            path: "create",
+            element: <Outlet />,
+            children: [
+              {
+                path: ":template",
+                element: <CreateNewTaskFormPage />,
+              },
+              {
+                path: "retry/:taskId",
+                element: <RetryTask />,
+              },
+            ],
           },
           {
             path: ":taskId",
@@ -62,24 +74,6 @@ const router = createBrowserRouter([
                 element: <StepArtifactsLayout />,
               },
             ],
-          },
-        ],
-      },
-      {
-        path: "create",
-        element: <CreateNewTaskLayout />,
-        children: [
-          {
-            index: true,
-            element: <TaskTemplates />,
-          },
-          {
-            path: ":template",
-            element: <CreateNewTaskFormPage />,
-          },
-          {
-            path: "retry/:taskId",
-            element: <RetryTask />,
           },
         ],
       },

@@ -71,7 +71,7 @@ function TaskParameters() {
           value={
             typeof task.request.navigation_payload === "object"
               ? JSON.stringify(task.request.navigation_payload, null, 2)
-              : task.request.navigation_payload
+              : task.request.navigation_payload ?? ""
           }
           readOnly
           minHeight="96px"
@@ -107,7 +107,7 @@ function TaskParameters() {
                   null,
                   2,
                 )
-              : task.request.extracted_information_schema
+              : task.request.extracted_information_schema ?? ""
           }
           readOnly
           minHeight="96px"
