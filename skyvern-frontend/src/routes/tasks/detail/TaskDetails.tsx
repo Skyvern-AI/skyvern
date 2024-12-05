@@ -242,7 +242,7 @@ function TaskDetails() {
             )}
             {taskHasTerminalState && (
               <Button asChild>
-                <Link to={`/create/retry/${task.task_id}`}>
+                <Link to={`/tasks/create/retry/${task.task_id}`}>
                   <PlayIcon className="mr-2 h-4 w-4" />
                   Rerun
                 </Link>

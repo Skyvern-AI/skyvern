@@ -1,7 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
 import { TaskGenerationApiResponse } from "@/api/types";
 import img from "@/assets/promptBoxBg.png";
-import { BookIcon } from "@/components/icons/BookIcon";
 import { CartIcon } from "@/components/icons/CartIcon";
 import { GraphIcon } from "@/components/icons/GraphIcon";
 import { InboxIcon } from "@/components/icons/InboxIcon";
@@ -16,6 +15,7 @@ import {
   GearIcon,
   PaperPlaneIcon,
   Pencil1Icon,
+  PlusIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -96,11 +96,6 @@ const exampleCases = [
     key: "AAPLStockPrice",
     label: "Search for AAPL on Google Finance",
     icon: <GraphIcon className="size-6" />,
-  },
-  {
-    key: "NYTBestseller",
-    label: "Get the top NYT bestseller",
-    icon: <BookIcon className="size-6" />,
   },
   {
     key: "topRankedFootballTeam",
@@ -196,7 +191,7 @@ function PromptBox() {
                     const taskGenerationResponse =
                       await getTaskFromPromptMutation.mutateAsync(prompt);
                     await saveTaskMutation.mutateAsync(taskGenerationResponse);
-                    navigate("/create/from-prompt", {
+                    navigate("/tasks/create/from-prompt", {
                       state: {
                         data: taskGenerationResponse,
                       },
@@ -209,13 +204,22 @@ function PromptBox() {
         </div>
       </div>
       <div className="flex flex-wrap justify-center gap-4 rounded-sm bg-slate-elevation1 p-4">
+        <div
+          className="flex cursor-pointer gap-2 whitespace-normal rounded-sm border-2 border-dashed bg-slate-elevation3 px-4 py-3 hover:bg-slate-elevation5 lg:whitespace-nowrap"
+          onClick={() => {
+            navigate("/tasks/create/blank");
+          }}
+        >
+          <PlusIcon className="size-6" />
+          Build Your Own
+        </div>
         {exampleCases.map((example) => {
           return (
             <div
               key={example.key}
               className="flex cursor-pointer gap-2 whitespace-normal rounded-sm bg-slate-elevation3 px-4 py-3 hover:bg-slate-elevation5 lg:whitespace-nowrap"
               onClick={() => {
-                navigate(`/create/${example.key}`);
+                navigate(`/tasks/create/${example.key}`);
               }}
             >
               <div>{example.icon}</div>
