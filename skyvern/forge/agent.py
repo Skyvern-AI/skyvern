@@ -1639,12 +1639,6 @@ class ForgeAgent:
             latest_action_screenshot_urls = await app.ARTIFACT_MANAGER.get_share_links(
                 latest_action_screenshot_artifacts
             )
-        else:
-            LOG.error(
-                "Failed to get latest action screenshots",
-                task_id=task.task_id,
-                task_status=task.status,
-            )
 
         if task.organization_id:
             try:
