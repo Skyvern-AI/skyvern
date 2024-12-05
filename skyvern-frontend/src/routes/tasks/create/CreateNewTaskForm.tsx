@@ -16,7 +16,7 @@ import {
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
-import { useToast } from "@/components/ui/use-toast";
+import { toast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
@@ -88,7 +88,6 @@ type Section = "base" | "extraction" | "advanced";
 
 function CreateNewTaskForm({ initialValues }: Props) {
   const queryClient = useQueryClient();
-  const { toast } = useToast();
   const credentialGetter = useCredentialGetter();
   const apiCredential = useApiCredential();
   const [activeSections, setActiveSections] = useState<Array<Section>>([

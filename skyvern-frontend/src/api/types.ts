@@ -95,17 +95,18 @@ export type TaskApiResponse = {
 };
 
 export type CreateTaskRequest = {
-  title: string | null;
+  title?: string | null;
   url: string;
-  webhook_callback_url: string | null;
-  navigation_goal: string | null;
-  data_extraction_goal: string | null;
-  navigation_payload: Record<string, unknown> | string | null;
-  extracted_information_schema: Record<string, unknown> | string | null;
-  error_code_mapping: Record<string, string> | null;
-  proxy_location: ProxyLocation | null;
-  totp_verification_url: string | null;
-  totp_identifier: string | null;
+  webhook_callback_url?: string | null;
+  navigation_goal?: string | null;
+  data_extraction_goal?: string | null;
+  navigation_payload?: Record<string, unknown> | string | null;
+  extracted_information_schema?: Record<string, unknown> | string | null;
+  error_code_mapping?: Record<string, string> | null;
+  proxy_location?: ProxyLocation | null;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
+  application?: string | null;
 };
 
 export type User = {

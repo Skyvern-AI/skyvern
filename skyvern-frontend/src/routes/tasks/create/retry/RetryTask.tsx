@@ -22,12 +22,12 @@ function RetryTask() {
       <CreateNewTaskForm
         initialValues={{
           url: task.request.url,
-          navigationGoal: task.request.navigation_goal,
+          navigationGoal: task.request.navigation_goal ?? null,
           navigationPayload:
             typeof task.request.navigation_payload === "string"
               ? task.request.navigation_payload
               : JSON.stringify(task.request.navigation_payload, null, 2),
-          dataExtractionGoal: task.request.data_extraction_goal,
+          dataExtractionGoal: task.request.data_extraction_goal ?? null,
           extractedInformationSchema:
             typeof task.request.extracted_information_schema === "string"
               ? task.request.extracted_information_schema
@@ -36,13 +36,13 @@ function RetryTask() {
                   null,
                   2,
                 ),
-          webhookCallbackUrl: task.request.webhook_callback_url,
-          totpIdentifier: task.request.totp_identifier,
-          totpVerificationUrl: task.request.totp_verification_url,
+          webhookCallbackUrl: task.request.webhook_callback_url ?? null,
+          totpIdentifier: task.request.totp_identifier ?? null,
+          totpVerificationUrl: task.request.totp_verification_url ?? null,
           errorCodeMapping: task.request.error_code_mapping
             ? JSON.stringify(task.request.error_code_mapping, null, 2)
             : "",
-          proxyLocation: task.request.proxy_location,
+          proxyLocation: task.request.proxy_location ?? null,
         }}
       />
     </div>
