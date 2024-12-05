@@ -889,9 +889,14 @@ function checkDisabledFromStyle(element) {
   return false;
 }
 
-function getElementContext(element) {
+// element should always be the parent of stopped_element
+function getElementContext(element, stopped_element) {
   // dfs to collect the non unique_id context
   let fullContext = new Array();
+
+  if (element === stopped_element) {
+    return fullContext;
+  }
 
   // sometimes '*' shows as an after custom style
   const afterCustom = getElementComputedStyle(element, "::after")
@@ -915,7 +920,7 @@ function getElementContext(element) {
       }
     } else if (child.nodeType === Node.ELEMENT_NODE) {
       if (!child.hasAttribute("unique_id") && isElementVisible(child)) {
-        childContext = getElementContext(child);
+        childContext = getElementContext(child, stopped_element);
       }
     }
     if (childContext.length > 0) {
@@ -1320,18 +1325,18 @@ function buildElementTree(starter = document.body, frame, full_tree = false) {
   }
 
   const getContextByParent = (element, ctx) => {
-    // for most elements, we're going 10 layers up to see if we can find "label" as a parent
+    // for most elements, we're going 5 layers up to see if we can find "label" as a parent
     // if found, most likely the context under label is relevant to this element
     let targetParentElements = new Set(["label", "fieldset"]);
 
-    // look up for 10 levels to find the most contextual parent element
+    // look up for 5 levels to find the most contextual parent element
     let targetContextualParent = null;
     let currentEle = getDOMElementBySkyvenElement(element);
     if (!currentEle) {
       return ctx;
     }
     let parentEle = currentEle;
-    for (var i = 0; i < 10; i++) {
+    for (var i = 0; i < 5; i++) {
       parentEle = parentEle.parentElement;
       if (parentEle) {
         if (
@@ -1355,10 +1360,10 @@ function buildElementTree(starter = document.body, frame, full_tree = false) {
       // fieldset is usually within a form or another element that contains the whole context
       targetContextualParent = targetContextualParent.parentElement;
       if (targetContextualParent) {
-        context = getElementContext(targetContextualParent);
+        context = getElementContext(targetContextualParent, currentEle);
       }
     } else {
-      context = getElementContext(targetContextualParent);
+      context = getElementContext(targetContextualParent, currentEle);
     }
     if (context.length > 0) {
       ctx.push(context);
@@ -1440,13 +1445,13 @@ function buildElementTree(starter = document.body, frame, full_tree = false) {
       ) {
         let grandParentElement = parentElement.parentElement;
         if (grandParentElement) {
-          let context = getElementContext(grandParentElement);
+          let context = getElementContext(grandParentElement, curElement);
           if (context.length > 0) {
             ctx.push(context);
           }
         }
       }
-      let context = getElementContext(parentElement);
+      let context = getElementContext(parentElement, curElement);
       if (context.length > 0) {
         ctx.push(context);
       }
