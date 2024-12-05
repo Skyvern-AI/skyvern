@@ -211,16 +211,16 @@ if settings.ENABLE_BEDROCK:
     LLMConfigRegistry.register_config(
         "BEDROCK_AMAZON_NOVA_PRO",
         LLMConfig(
-            "bedrock/amazon.nova-pro-v1:0",
+            "bedrock/us.amazon.nova-pro-v1:0",
             ["AWS_REGION"],
             supports_vision=True,
             add_assistant_prefix=True,
         ),
     )
     LLMConfigRegistry.register_config(
-        "BEDROCK_AMAZON_NOVA_MICRO",
+        "BEDROCK_AMAZON_NOVA_LITE",
         LLMConfig(
-            "bedrock/amazon.nova-micro-v1:0",
+            "bedrock/us.amazon.nova-lite-v1:0",
             ["AWS_REGION"],
             supports_vision=True,
             add_assistant_prefix=True,
