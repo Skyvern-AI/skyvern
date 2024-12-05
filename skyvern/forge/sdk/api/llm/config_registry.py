@@ -208,6 +208,24 @@ if settings.ENABLE_BEDROCK:
             add_assistant_prefix=True,
         ),
     )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_AMAZON_NOVA_PRO",
+        LLMConfig(
+            "bedrock/us.amazon.nova-pro-v1:0",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_AMAZON_NOVA_LITE",
+        LLMConfig(
+            "bedrock/us.amazon.nova-lite-v1:0",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+        ),
+    )
 
 
 if settings.ENABLE_AZURE:
