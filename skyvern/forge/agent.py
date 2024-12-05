@@ -331,6 +331,15 @@ class ForgeAgent:
                     files_to_rename = list(set(list_files_after) - set(list_files_before))
                     for file in files_to_rename:
                         file_extension = Path(file).suffix
+                        if file_extension == ".crdownload":
+                            LOG.warning(
+                                "Detecting incompleted download file, skip the rename",
+                                file=file,
+                                task_id=task.task_id,
+                                workflow_run_id=task.workflow_run_id,
+                            )
+                            continue
+
                         random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
                         random_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
                         if task_block.download_suffix:
