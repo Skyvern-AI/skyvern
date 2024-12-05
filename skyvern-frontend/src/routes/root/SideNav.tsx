@@ -1,75 +1,52 @@
+import { RobotIcon } from "@/components/icons/RobotIcon";
+import { NavLinkGroup } from "@/components/NavLinkGroup";
+import { useSidebarStore } from "@/store/SidebarStore";
 import { cn } from "@/util/utils";
 import {
+  CardStackMinusIcon,
   GearIcon,
   LightningBoltIcon,
-  ListBulletIcon,
-  PlusCircledIcon,
 } from "@radix-ui/react-icons";
-import { NavLink } from "react-router-dom";
 
-type Props = {
-  collapsed: boolean;
-};
+function SideNav() {
+  const { collapsed } = useSidebarStore();
 
-function SideNav({ collapsed }: Props) {
   return (
-    <nav className="space-y-2">
-      <NavLink
-        to="create"
-        className={({ isActive }) => {
-          return cn(
-            "flex h-[3.25rem] items-center gap-4 rounded-2xl px-5 hover:bg-muted",
-            {
-              "bg-muted": isActive,
-            },
-          );
-        }}
-      >
-        <PlusCircledIcon className="h-6 w-6" />
-        {!collapsed && <span className="text-lg">Create</span>}
-      </NavLink>
-      <NavLink
-        to="tasks"
-        className={({ isActive }) => {
-          return cn(
-            "flex h-[3.25rem] items-center gap-4 rounded-2xl px-5 hover:bg-muted",
-            {
-              "bg-muted": isActive,
-            },
-          );
-        }}
-      >
-        <ListBulletIcon className="h-6 w-6" />
-        {!collapsed && <span className="text-lg">Tasks</span>}
-      </NavLink>
-      <NavLink
-        to="workflows"
-        className={({ isActive }) => {
-          return cn(
-            "flex h-[3.25rem] items-center gap-4 rounded-2xl px-5 hover:bg-muted",
-            {
-              "bg-muted": isActive,
-            },
-          );
-        }}
-      >
-        <LightningBoltIcon className="h-6 w-6" />
-        {!collapsed && <span className="text-lg">Workflows</span>}
-      </NavLink>
-      <NavLink
-        to="settings"
-        className={({ isActive }) => {
-          return cn(
-            "flex h-[3.25rem] items-center gap-4 rounded-2xl px-5 hover:bg-muted",
-            {
-              "bg-muted": isActive,
-            },
-          );
-        }}
-      >
-        <GearIcon className="h-6 w-6" />
-        {!collapsed && <span className="text-lg">Settings</span>}
-      </NavLink>
+    <nav
+      className={cn("space-y-5", {
+        "items-center": collapsed,
+      })}
+    >
+      <NavLinkGroup
+        title={"Build"}
+        links={[
+          {
+            label: "Tasks",
+            to: "/tasks",
+            icon: <RobotIcon className="size-6" />,
+          },
+          {
+            label: "Workflows",
+            to: "/workflows",
+            icon: <LightningBoltIcon className="size-6" />,
+          },
+        ]}
+      />
+      <NavLinkGroup
+        title={"General"}
+        links={[
+          {
+            label: "Billing",
+            to: "/billing",
+            icon: <CardStackMinusIcon className="size-6" />,
+          },
+          {
+            label: "Settings",
+            to: "/settings",
+            icon: <GearIcon className="size-6" />,
+          },
+        ]}
+      />
     </nav>
   );
 }
