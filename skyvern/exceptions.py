@@ -250,6 +250,11 @@ class DownloadFileMaxSizeExceeded(SkyvernException):
         super().__init__(f"Download file size exceeded the maximum allowed size of {max_size} MB.")
 
 
+class NoFileDownloadTriggered(SkyvernException):
+    def __init__(self, element_id: str) -> None:
+        super().__init__(f"Clicking on element doesn't trigger the file download. element_id={element_id}")
+
+
 class BitwardenBaseError(SkyvernException):
     def __init__(self, message: str) -> None:
         super().__init__(f"Bitwarden error: {message}")
