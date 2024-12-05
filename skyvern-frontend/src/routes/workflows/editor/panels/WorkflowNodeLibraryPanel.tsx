@@ -11,6 +11,7 @@ import {
   PlusIcon,
   StopwatchIcon,
   UpdateIcon,
+  UploadIcon,
 } from "@radix-ui/react-icons";
 import { WorkflowBlockNode } from "../nodes";
 import { AddNodeProps } from "../FlowRenderer";
@@ -93,12 +94,12 @@ const nodeLibraryItems: Array<{
   //   title: "Download Block",
   //   description: "Downloads a file from S3",
   // },
-  // {
-  //   nodeType: "upload",
-  //   icon: <UploadIcon className="size-6" />,
-  //   title: "Upload Block",
-  //   description: "Uploads a file to S3",
-  // },
+  {
+    nodeType: "upload",
+    icon: <UploadIcon className="size-6" />,
+    title: "Upload Block",
+    description: "Uploads a file to S3",
+  },
   {
     nodeType: "fileDownload",
     icon: <DownloadIcon className="size-6" />,
