@@ -5,6 +5,7 @@ import os
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, List
 
 import pyotp
@@ -13,7 +14,7 @@ from playwright.async_api import FileChooser, Frame, Locator, Page, TimeoutError
 from pydantic import BaseModel
 
 from skyvern.config import settings
-from skyvern.constants import REPO_ROOT_DIR, SKYVERN_ID_ATTR
+from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, REPO_ROOT_DIR, SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     EmptySelect,
     ErrEmptyTweakValue,
@@ -34,6 +35,7 @@ from skyvern.exceptions import (
     NoAutoCompleteOptionMeetCondition,
     NoAvailableOptionFoundForCustomSelection,
     NoElementMatchedForTargetOption,
+    NoFileDownloadTriggered,
     NoIncrementalElementFoundForAutoCompletion,
     NoIncrementalElementFoundForCustomSelection,
     NoSuitableAutoCompleteOption,
@@ -42,11 +44,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.files import (
-    download_file,
-    get_number_of_files_in_directory,
-    get_path_for_workflow_download_directory,
-)
+from skyvern.forge.sdk.api.files import download_file, get_download_dir, list_files_in_directory
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_post
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
@@ -337,16 +335,6 @@ async def handle_click_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    num_downloaded_files_before = 0
-    download_dir = None
-    if task.workflow_run_id:
-        download_dir = get_path_for_workflow_download_directory(task.workflow_run_id)
-        num_downloaded_files_before = get_number_of_files_in_directory(download_dir)
-        LOG.info(
-            "Number of files in download directory before click",
-            num_downloaded_files_before=num_downloaded_files_before,
-            download_dir=download_dir,
-        )
     dom = DomUtil(scraped_page=scraped_page, page=page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     await asyncio.sleep(0.3)
@@ -363,7 +351,7 @@ async def handle_click_action(
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
     if action.download:
-        results = await handle_click_to_download_file_action(action, page, scraped_page, task)
+        results = await handle_click_to_download_file_action(action, page, scraped_page, task, step)
     else:
         results = await chain_click(
             task,
@@ -374,18 +362,6 @@ async def handle_click_action(
             timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
         )
 
-    if results and task.workflow_run_id and download_dir:
-        LOG.info("Sleeping for 5 seconds to let the download finish")
-        await asyncio.sleep(5)
-        num_downloaded_files_after = get_number_of_files_in_directory(download_dir)
-        LOG.info(
-            "Number of files in download directory after click",
-            num_downloaded_files_after=num_downloaded_files_after,
-            download_dir=download_dir,
-        )
-        if num_downloaded_files_after > num_downloaded_files_before:
-            results[-1].download_triggered = True
-
     return results
 
 
@@ -394,19 +370,102 @@ async def handle_click_to_download_file_action(
     page: Page,
     scraped_page: ScrapedPage,
     task: Task,
+    step: Step,
 ) -> list[ActionResult]:
     dom = DomUtil(scraped_page=scraped_page, page=page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     locator = skyvern_element.locator
 
+    download_dir = Path(get_download_dir(workflow_run_id=task.workflow_run_id, task_id=task.task_id))
+    list_files_before = list_files_in_directory(download_dir)
+    LOG.info(
+        "Number of files in download directory before click",
+        num_downloaded_files_before=len(list_files_before),
+        download_dir=download_dir,
+        task_id=task.task_id,
+        step_id=step.step_id,
+        workflow_run_id=task.workflow_run_id,
+    )
+
     try:
         await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
         await page.wait_for_load_state(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
     except Exception as e:
-        LOG.exception("ClickAction with download failed", action=action, exc_info=True)
+        LOG.exception(
+            "ClickAction with download failed",
+            exc_info=True,
+            action=action,
+            task_id=task.task_id,
+            step_id=step.step_id,
+            workflow_run_id=task.workflow_run_id,
+        )
         return [ActionFailure(e, download_triggered=False)]
 
-    return [ActionSuccess()]
+    # wait 5s to start downloading
+    LOG.info(
+        "Sleep for 5s to let download finish",
+        task_id=task.task_id,
+        step_id=step.step_id,
+        workflow_run_id=task.workflow_run_id,
+    )
+    await asyncio.sleep(5)
+    list_files_after = list_files_in_directory(download_dir)
+    LOG.info(
+        "Number of files in download directory after click",
+        num_downloaded_files_after=len(list_files_after),
+        download_dir=download_dir,
+        task_id=task.task_id,
+        step_id=step.step_id,
+        workflow_run_id=task.workflow_run_id,
+    )
+
+    if len(list_files_after) <= len(list_files_before):
+        LOG.warning(
+            "No file to download after click",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            workflow_run_id=task.workflow_run_id,
+        )
+        return [ActionFailure(exception=NoFileDownloadTriggered(action.element_id))]
+
+    # check if there's any file is still downloading
+    downloading_files: list[Path] = []
+    for file in list_files_after:
+        path = Path(file)
+        if path.suffix == ".crdownload":
+            downloading_files.append(path)
+
+    if len(downloading_files) == 0:
+        return [ActionSuccess(download_triggered=True)]
+
+    LOG.info(
+        "File downloading hasn't completed, wait for a while",
+        downloading_files=downloading_files,
+        task_id=task.task_id,
+        step_id=step.step_id,
+        workflow_run_id=task.workflow_run_id,
+    )
+    try:
+        async with asyncio.timeout(BROWSER_DOWNLOAD_TIMEOUT):
+            while len(downloading_files) > 0:
+                new_downloading_files: list[Path] = []
+                for path in downloading_files:
+                    if not path.exists():
+                        continue
+                    new_downloading_files.append(path)
+                downloading_files = new_downloading_files
+                await asyncio.sleep(1)
+
+    except asyncio.TimeoutError:
+        LOG.warning(
+            "There're several long-time downloading files, these files might be broken",
+            downloading_files=downloading_files,
+            task_id=task.task_id,
+            step_id=step.step_id,
+            workflow_run_id=task.workflow_run_id,
+        )
+
+    return [ActionSuccess(download_triggered=True)]
 
 
 async def handle_input_text_action(
