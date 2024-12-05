@@ -1271,66 +1271,61 @@ class SendEmailBlock(Block):
         file_names_by_hash: dict[str, list[str]] = defaultdict(list)
 
         for filename in self._get_file_paths(workflow_run_context, workflow_run_id):
-            path = None
-            try:
-                if filename.startswith("s3://"):
-                    path = await download_from_s3(self.get_async_aws_client(), filename)
-                elif filename.startswith("http://") or filename.startswith("https://"):
-                    path = await download_file(filename)
-                else:
-                    LOG.info("SendEmailBlock: Looking for file locally", filename=filename)
-                    if not os.path.exists(filename):
-                        raise FileNotFoundError(f"File not found: {filename}")
-                    if not os.path.isfile(filename):
-                        raise IsADirectoryError(f"Path is a directory: {filename}")
-
-                    LOG.info("SendEmailBlock: Found file locally", path=path)
-                    path = filename
-
-                if not path:
+            if filename.startswith("s3://"):
+                path = await download_from_s3(self.get_async_aws_client(), filename)
+            elif filename.startswith("http://") or filename.startswith("https://"):
+                path = await download_file(filename)
+            else:
+                LOG.info("SendEmailBlock: Looking for file locally", filename=filename)
+                if not os.path.exists(filename):
                     raise FileNotFoundError(f"File not found: {filename}")
+                if not os.path.isfile(filename):
+                    raise IsADirectoryError(f"Path is a directory: {filename}")
 
-                # Guess the content type based on the file's extension.  Encoding
-                # will be ignored, although we should check for simple things like
-                # gzip'd or compressed files.
-                kind = filetype.guess(path)
-                if kind:
-                    ctype = kind.mime
-                    extension = kind.extension
-                else:
-                    # No guess could be made, or the file is encoded (compressed), so
-                    # use a generic bag-of-bits type.
-                    ctype = "application/octet-stream"
-                    extension = None
+                path = filename
+                LOG.info("SendEmailBlock: Found file locally", path=path)
 
-                maintype, subtype = ctype.split("/", 1)
-                attachment_path = Path(path)
-                attachment_filename = attachment_path.name
+            if not path:
+                raise FileNotFoundError(f"File not found: {filename}")
 
-                # Check if the filename has an extension
-                if not attachment_path.suffix:
-                    # If no extension, guess it based on the MIME type
-                    if extension:
-                        attachment_filename += f".{extension}"
+            # Guess the content type based on the file's extension.  Encoding
+            # will be ignored, although we should check for simple things like
+            # gzip'd or compressed files.
+            kind = filetype.guess(path)
+            if kind:
+                ctype = kind.mime
+                extension = kind.extension
+            else:
+                # No guess could be made, or the file is encoded (compressed), so
+                # use a generic bag-of-bits type.
+                ctype = "application/octet-stream"
+                extension = None
 
-                LOG.info(
-                    "SendEmailBlock: Adding attachment",
-                    filename=attachment_filename,
+            maintype, subtype = ctype.split("/", 1)
+            attachment_path = Path(path)
+            attachment_filename = attachment_path.name
+
+            # Check if the filename has an extension
+            if not attachment_path.suffix:
+                # If no extension, guess it based on the MIME type
+                if extension:
+                    attachment_filename += f".{extension}"
+
+            LOG.info(
+                "SendEmailBlock: Adding attachment",
+                filename=attachment_filename,
+                maintype=maintype,
+                subtype=subtype,
+            )
+            with open(path, "rb") as fp:
+                msg.add_attachment(
+                    fp.read(),
                     maintype=maintype,
                     subtype=subtype,
+                    filename=attachment_filename,
                 )
-                with open(path, "rb") as fp:
-                    msg.add_attachment(
-                        fp.read(),
-                        maintype=maintype,
-                        subtype=subtype,
-                        filename=attachment_filename,
-                    )
-                    file_hash = calculate_sha256_for_file(path)
-                    file_names_by_hash[file_hash].append(path)
-            finally:
-                if path:
-                    os.unlink(path)
+                file_hash = calculate_sha256_for_file(path)
+                file_names_by_hash[file_hash].append(path)
 
         # Calculate file stats based on content hashes
         total_files = sum(len(files) for files in file_names_by_hash.values())
