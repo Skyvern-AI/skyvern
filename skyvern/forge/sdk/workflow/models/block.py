@@ -14,6 +14,7 @@ from email.message import EmailMessage
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal, Union
+from urllib.parse import quote
 
 import filetype
 import structlog
@@ -245,6 +246,8 @@ class BaseTaskBlock(Block):
             self.download_suffix = self.format_block_parameter_template_from_workflow_run_context(
                 self.download_suffix, workflow_run_context
             )
+            # encode the suffix to prevent invalid path style
+            self.download_suffix = quote(string=self.download_suffix, safe="")
 
         if self.navigation_goal:
             self.navigation_goal = self.format_block_parameter_template_from_workflow_run_context(
