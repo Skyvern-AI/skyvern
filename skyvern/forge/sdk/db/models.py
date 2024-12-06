@@ -525,5 +525,7 @@ class ObserverThought(Base):
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
     workflow_run_block_id = Column(String, ForeignKey("workflow_run_blocks.workflow_run_block_id"), nullable=True)
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"), nullable=True)
+    user_input = Column(UnicodeText, nullable=True)
+    observation = Column(String, nullable=True)
     thought = Column(String, nullable=True)
     answer = Column(String, nullable=True)
