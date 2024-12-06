@@ -35,6 +35,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_id,
     generate_workflow_parameter_id,
     generate_workflow_permanent_id,
+    generate_workflow_run_block_id,
     generate_workflow_run_id,
 )
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
@@ -479,7 +480,7 @@ class WorkflowRunBlockModel(Base):
     __tablename__ = "workflow_run_blocks"
     __table_args__ = (Index("wfrb_org_wfr_index", "organization_id", "workflow_run_id"),)
 
-    workflow_run_block_id = Column(String, primary_key=True)
+    workflow_run_block_id = Column(String, primary_key=True, default=generate_workflow_run_block_id)
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=False)
     parent_workflow_run_block_id = Column(
         String, ForeignKey("workflow_run_blocks.workflow_run_block_id"), nullable=True
