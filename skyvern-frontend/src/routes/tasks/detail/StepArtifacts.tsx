@@ -79,6 +79,10 @@ function StepArtifacts({ id, stepProps }: Props) {
     (artifact) => artifact.artifact_type === ArtifactType.HTMLScrape,
   );
 
+  const skyvernLog = artifacts?.filter(
+    (artifact) => artifact.artifact_type === ArtifactType.SkyvernLog,
+  );
+
   return (
     <Tabs
       value={artifact}
@@ -108,6 +112,7 @@ function StepArtifacts({ id, stepProps }: Props) {
         <TabsTrigger value="llm_response_parsed">Action List</TabsTrigger>
         <TabsTrigger value="html_raw">HTML (Raw)</TabsTrigger>
         <TabsTrigger value="llm_request">LLM Request (Raw)</TabsTrigger>
+        <TabsTrigger value="skyvern_log">Skyvern Log</TabsTrigger>
       </TabsList>
       <TabsContent value="info">
         <div className="flex flex-col gap-6 p-4">
@@ -208,6 +213,9 @@ function StepArtifacts({ id, stepProps }: Props) {
       </TabsContent>
       <TabsContent value="llm_request">
         {llmRequest ? <Artifact type="json" artifacts={llmRequest} /> : null}
+      </TabsContent>
+      <TabsContent value="skyvern_log">
+        {skyvernLog ? <Artifact type="json" artifacts={skyvernLog} /> : null}
       </TabsContent>
     </Tabs>
   );
