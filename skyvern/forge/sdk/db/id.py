@@ -44,6 +44,8 @@ BITWARDEN_LOGIN_CREDENTIAL_PARAMETER_PREFIX = "blc"
 BITWARDEN_SENSITIVE_INFORMATION_PARAMETER_PREFIX = "bsi"
 BITWARDEN_CREDIT_CARD_DATA_PARAMETER_PREFIX = "bccd"
 TASK_GENERATION_PREFIX = "tg"
+OBSERVER_RUN_ID = "or"
+OBSERVER_CRUISE_ID = "oc"
 
 
 def generate_workflow_id() -> str:
@@ -139,6 +141,16 @@ def generate_totp_code_id() -> str:
 def generate_action_id() -> str:
     int_id = generate_id()
     return f"a_{int_id}"
+
+
+def generate_observer_run_id() -> str:
+    int_id = generate_id()
+    return f"{OBSERVER_RUN_ID}_{int_id}"
+
+
+def generate_observer_cruise_id() -> str:
+    int_id = generate_id()
+    return f"{OBSERVER_CRUISE_ID}_{int_id}"
 
 
 def generate_id() -> int:
