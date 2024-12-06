@@ -45,7 +45,7 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
-from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
     InvalidEmailClientConfiguration,
     InvalidFileType,
@@ -140,6 +140,17 @@ class Block(BaseModel, abc.ABC):
             status=status,
         )
 
+    def format_block_parameter_template_from_workflow_run_context(
+        self, potential_template: str, workflow_run_context: WorkflowRunContext
+    ) -> str:
+        if not potential_template:
+            return potential_template
+        template = Template(potential_template)
+
+        template_data = workflow_run_context.values.copy()
+        template_data[self.label] = workflow_run_context.get_block_metadata(self.label)
+        return template.render(template_data)
+
     @classmethod
     def get_subclasses(cls) -> tuple[type["Block"], ...]:
         return tuple(cls.__subclasses__())
@@ -151,15 +162,6 @@ class Block(BaseModel, abc.ABC):
     @staticmethod
     def get_async_aws_client() -> AsyncAWSClient:
         return app.WORKFLOW_CONTEXT_MANAGER.aws_client
-
-    @staticmethod
-    def format_block_parameter_template_from_workflow_run_context(
-        potential_template: str, workflow_run_context: WorkflowRunContext
-    ) -> str:
-        if not potential_template:
-            return potential_template
-        template = Template(potential_template)
-        return template.render(workflow_run_context.values)
 
     @abc.abstractmethod
     async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
@@ -659,8 +661,15 @@ class ForLoopBlock(Block):
             context_parameters_with_value = self.get_loop_block_context_parameters(workflow_run_id, loop_over_value)
             for context_parameter in context_parameters_with_value:
                 workflow_run_context.set_value(context_parameter.key, context_parameter.value)
+
             each_loop_output_values: list[dict[str, Any]] = []
             for block_idx, loop_block in enumerate(self.loop_blocks):
+                metadata: BlockMetadata = {
+                    "current_index": loop_idx,
+                    "current_value": loop_over_value,
+                }
+                workflow_run_context.update_block_metadata(loop_block.label, metadata)
+
                 original_loop_block = loop_block
                 loop_block = loop_block.copy()
                 current_block = loop_block

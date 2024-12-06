@@ -25,6 +25,9 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 
+BlockMetadata = dict[str, str | int | float | bool | dict | list]
+
+
 class WorkflowRunContext:
     parameters: dict[str, PARAMETER_TYPE]
     values: dict[str, Any]
@@ -36,9 +39,12 @@ class WorkflowRunContext:
         workflow_output_parameters: list[OutputParameter],
         context_parameters: list[ContextParameter],
     ) -> None:
+        # key is label name
+        self.blocks_metadata: dict[str, BlockMetadata] = {}
         self.parameters = {}
         self.values = {}
         self.secrets = {}
+
         for parameter, run_parameter in workflow_parameter_tuples:
             if parameter.key in self.parameters:
                 prev_value = self.parameters[parameter.key]
@@ -80,6 +86,15 @@ class WorkflowRunContext:
 
     def set_value(self, key: str, value: Any) -> None:
         self.values[key] = value
+
+    def update_block_metadata(self, label: str, metadata: BlockMetadata) -> None:
+        if label in self.blocks_metadata:
+            self.blocks_metadata[label].update(metadata)
+            return
+        self.blocks_metadata[label] = metadata
+
+    def get_block_metadata(self, label: str) -> BlockMetadata:
+        return self.blocks_metadata.get(label, BlockMetadata())
 
     def get_original_secret_value_or_none(self, secret_id_or_value: Any) -> Any:
         """
