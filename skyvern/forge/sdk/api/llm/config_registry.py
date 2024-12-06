@@ -278,7 +278,7 @@ if settings.ENABLE_GEMINI:
         ),
     )
     LLMConfigRegistry.register_config(
-        "GEMINI_FLUSH",
+        "GEMINI_FLASH",
         LLMConfig(
             "gemini/gemini-1.5-flash",
             ["GEMINI_API_KEY"],
