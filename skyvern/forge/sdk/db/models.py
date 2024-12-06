@@ -473,3 +473,24 @@ class ActionModel(Base):
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
+
+class WorkflowRunBlockModel(Base):
+    __tablename__ = "workflow_run_blocks"
+    __table_args__ = (Index("wfrb_org_wfr_index", "organization_id", "workflow_run_id"),)
+
+    workflow_run_block_id = Column(String, primary_key=True)
+    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=False)
+    parent_workflow_run_block_id = Column(
+        String, ForeignKey("workflow_run_blocks.workflow_run_block_id"), nullable=True
+    )
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
+    task_id = Column(String, ForeignKey("tasks.task_id"), nullable=True)
+    label = Column(String, nullable=False)
+    block_type = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    output = Column(JSON, nullable=True)
+    continue_on_failure = Column(Boolean, nullable=False, default=False)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
