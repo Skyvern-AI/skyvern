@@ -36,6 +36,7 @@ ARTIFACT_PREFIX = "a"
 WORKFLOW_PREFIX = "w"
 WORKFLOW_PERMANENT_ID_PREFIX = "wpid"
 WORKFLOW_RUN_PREFIX = "wr"
+WORKFLOW_RUN_BLOCK_PREFIX = "wrb"
 WORKFLOW_PARAMETER_PREFIX = "wp"
 AWS_SECRET_PARAMETER_PREFIX = "asp"
 OUTPUT_PARAMETER_PREFIX = "op"
@@ -53,6 +54,11 @@ def generate_workflow_id() -> str:
 def generate_workflow_permanent_id() -> str:
     int_id = generate_id()
     return f"{WORKFLOW_PERMANENT_ID_PREFIX}_{int_id}"
+
+
+def generate_workflow_run_block_id() -> str:
+    int_id = generate_id()
+    return f"{WORKFLOW_RUN_BLOCK_PREFIX}_{int_id}"
 
 
 def generate_workflow_run_id() -> str:

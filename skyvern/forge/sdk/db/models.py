@@ -35,6 +35,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_id,
     generate_workflow_parameter_id,
     generate_workflow_permanent_id,
+    generate_workflow_run_block_id,
     generate_workflow_run_id,
 )
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
@@ -470,6 +471,27 @@ class ActionModel(Base):
     skyvern_element_data = Column(JSON, nullable=True)
     action_json = Column(JSON, nullable=True)
     confidence_float = Column(Numeric, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
+
+class WorkflowRunBlockModel(Base):
+    __tablename__ = "workflow_run_blocks"
+    __table_args__ = (Index("wfrb_org_wfr_index", "organization_id", "workflow_run_id"),)
+
+    workflow_run_block_id = Column(String, primary_key=True, default=generate_workflow_run_block_id)
+    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=False)
+    parent_workflow_run_block_id = Column(
+        String, ForeignKey("workflow_run_blocks.workflow_run_block_id"), nullable=True
+    )
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
+    task_id = Column(String, ForeignKey("tasks.task_id"), nullable=True)
+    label = Column(String, nullable=True)
+    block_type = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    output = Column(JSON, nullable=True)
+    continue_on_failure = Column(Boolean, nullable=False, default=False)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
