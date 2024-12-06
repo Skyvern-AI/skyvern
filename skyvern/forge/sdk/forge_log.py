@@ -2,6 +2,7 @@ import logging
 
 import structlog
 from structlog.typing import EventDict
+
 from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
 
