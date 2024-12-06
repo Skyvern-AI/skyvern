@@ -25,6 +25,8 @@ from skyvern.forge.sdk.db.id import (
     generate_bitwarden_credit_card_data_parameter_id,
     generate_bitwarden_login_credential_parameter_id,
     generate_bitwarden_sensitive_information_parameter_id,
+    generate_observer_cruise_id,
+    generate_observer_thought_id,
     generate_org_id,
     generate_organization_auth_token_id,
     generate_output_parameter_id,
@@ -157,10 +159,15 @@ class OrganizationAuthTokenModel(Base):
 
 class ArtifactModel(Base):
     __tablename__ = "artifacts"
-    __table_args__ = (Index("org_task_step_index", "organization_id", "task_id", "step_id"),)
+    __table_args__ = (
+        Index("org_task_step_index", "organization_id", "task_id", "step_id"),
+        Index("org_workflow_run_index", "organization_id", "workflow_run_id"),
+    )
 
     artifact_id = Column(String, primary_key=True, index=True, default=generate_artifact_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
+    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"))
+    workflow_run_block_id = Column(String, ForeignKey("workflow_run_blocks.workflow_run_block_id"))
     task_id = Column(String, ForeignKey("tasks.task_id"))
     step_id = Column(String, ForeignKey("steps.step_id"), index=True)
     artifact_type = Column(String)
@@ -495,3 +502,25 @@ class WorkflowRunBlockModel(Base):
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
+
+class ObserverCruise(Base):
+    __tablename__ = "observer_cruises"
+
+    observer_cruise_id = Column(String, primary_key=True, default=generate_observer_cruise_id)
+    status = Column(String, nullable=False, default="created")
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
+    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
+    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), nullable=True)
+
+
+class ObserverThought(Base):
+    __tablename__ = "observer_thoughts"
+
+    observer_thought_id = Column(String, primary_key=True, default=generate_observer_thought_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
+    observer_cruise_id = Column(String, ForeignKey("observer_cruises.observer_cruise_id"), nullable=False)
+    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
+    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), nullable=True)
+    thought = Column(String, nullable=True)
+    answer = Column(String, nullable=True)
