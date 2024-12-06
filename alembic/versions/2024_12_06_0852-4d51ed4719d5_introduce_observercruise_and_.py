@@ -1,8 +1,8 @@
 """Introduce ObserverCruise and ObserverThought. Add workflow_run_block_id and observer_cruise_id to artifacts
 
-Revision ID: 5e266217e9d9
+Revision ID: 4d51ed4719d5
 Revises: de0254717601
-Create Date: 2024-12-06 07:25:50.080125+00:00
+Create Date: 2024-12-06 08:52:52.111448+00:00
 
 """
 
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "5e266217e9d9"
+revision: str = "4d51ed4719d5"
 down_revision: Union[str, None] = "de0254717601"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -48,6 +48,7 @@ def upgrade() -> None:
         sa.Column("organization_id", sa.String(), nullable=True),
         sa.Column("observer_cruise_id", sa.String(), nullable=False),
         sa.Column("workflow_run_id", sa.String(), nullable=True),
+        sa.Column("workflow_run_block_id", sa.String(), nullable=True),
         sa.Column("workflow_id", sa.String(), nullable=True),
         sa.Column("thought", sa.String(), nullable=True),
         sa.Column("answer", sa.String(), nullable=True),
@@ -62,6 +63,10 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(
             ["workflow_id"],
             ["workflows.workflow_id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["workflow_run_block_id"],
+            ["workflow_run_blocks.workflow_run_block_id"],
         ),
         sa.ForeignKeyConstraint(
             ["workflow_run_id"],
