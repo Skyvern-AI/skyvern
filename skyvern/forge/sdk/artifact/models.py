@@ -10,6 +10,8 @@ class ArtifactType(StrEnum):
     RECORDING = "recording"
     BROWSER_CONSOLE_LOG = "browser_console_log"
 
+    SKYVERN_LOG = "skyvern_log"
+
     # DEPRECATED. pls use SCREENSHOT_LLM, SCREENSHOT_ACTION or SCREENSHOT_FINAL
     SCREENSHOT = "screenshot"
 
