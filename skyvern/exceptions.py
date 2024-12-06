@@ -504,11 +504,9 @@ class CachedActionPlanError(SkyvernException):
         super().__init__(message)
 
 
-class InvalidUrl(SkyvernHTTPException):
+class InvalidUrl(SkyvernException):
     def __init__(self, url: str) -> None:
-        super().__init__(
-            f"Invalid URL: {url}. Skyvern supports HTTP and HTTPS urls.", status_code=status.HTTP_400_BAD_REQUEST
-        )
+        super().__init__(f"Invalid URL: {url}. Skyvern supports HTTP and HTTPS urls with max 2083 character length.")
 
 
 class BlockedHost(SkyvernHTTPException):

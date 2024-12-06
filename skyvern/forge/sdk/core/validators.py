@@ -1,9 +1,30 @@
 import ipaddress
+from urllib.parse import urlparse
 
 from pydantic import HttpUrl, ValidationError, parse_obj_as
 
 from skyvern.config import settings
 from skyvern.exceptions import InvalidUrl
+
+
+def prepend_scheme_and_validate_url(url: str) -> str:
+    if not url:
+        return url
+
+    parsed_url = urlparse(url=url)
+    if parsed_url.scheme and parsed_url.scheme not in ["http", "https"]:
+        raise InvalidUrl(url=url)
+
+    # if url doesn't contain any scheme, we prepend `https` to it by default
+    if not parsed_url.scheme:
+        url = f"https://{url}"
+
+    try:
+        HttpUrl(url)
+    except ValidationError:
+        raise InvalidUrl(url=url)
+
+    return url
 
 
 def validate_url(url: str) -> str:

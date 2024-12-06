@@ -4,10 +4,11 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
+from fastapi import status
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
-from skyvern.exceptions import BlockedHost, InvalidTaskStatusTransition, TaskAlreadyCanceled
-from skyvern.forge.sdk.core.validators import is_blocked_host
+from skyvern.exceptions import BlockedHost, InvalidTaskStatusTransition, SkyvernHTTPException, TaskAlreadyCanceled
+from skyvern.forge.sdk.core.validators import is_blocked_host, prepend_scheme_and_validate_url
 from skyvern.forge.sdk.db.enums import TaskType
 
 
@@ -99,28 +100,37 @@ class TaskBase(BaseModel):
 
 
 class TaskRequest(TaskBase):
-    url: HttpUrl = Field(
+    url: str = Field(
         ...,
         description="Starting URL for the task.",
         examples=["https://www.geico.com"],
     )
-    webhook_callback_url: HttpUrl | None = Field(
+    webhook_callback_url: str | None = Field(
         default=None,
         description="The URL to call when the task is completed.",
         examples=["https://my-webhook.com"],
     )
-    totp_verification_url: HttpUrl | None = None
+    totp_verification_url: str | None = None
 
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
     @classmethod
-    def validate_urls(cls, v: HttpUrl | None) -> HttpUrl | None:
-        if not v or not v.host:
+    def validate_urls(cls, url: str | None) -> str | None:
+        if url is None:
+            return None
+
+        try:
+            url = prepend_scheme_and_validate_url(url=url)
+            v = HttpUrl(url=url)
+        except Exception as e:
+            raise SkyvernHTTPException(message=str(e), status_code=status.HTTP_400_BAD_REQUEST)
+
+        if not v.host:
             return None
         host = v.host
         blocked = is_blocked_host(host)
         if blocked:
             raise BlockedHost(host=host)
-        return v
+        return str(v)
 
 
 class TaskStatus(StrEnum):
