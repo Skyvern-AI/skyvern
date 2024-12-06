@@ -72,6 +72,7 @@ from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
 from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.forge.skyvern_log_encoder import SkyvernLogEncoder
 
 LOG = structlog.get_logger()
 
@@ -1773,6 +1774,23 @@ class ForgeAgent:
             step_id=step.step_id,
             diff=update_comparison,
         )
+
+        try:
+            log = skyvern_context.current().log
+            log_json = json.dumps(log, cls=SkyvernLogEncoder, indent=2)
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.SKYVERN_LOG,
+                data=log_json.encode(),
+            )
+        except Exception:
+            LOG.error(
+                "Failed to record skyvern log after action",
+                task_id=step.task_id,
+                step_id=step.step_id,
+                exc_info=True,
+            )
+
         return await app.DATABASE.update_step(
             task_id=step.task_id,
             step_id=step.step_id,
