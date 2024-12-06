@@ -168,6 +168,7 @@ class ArtifactModel(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"))
     workflow_run_block_id = Column(String, ForeignKey("workflow_run_blocks.workflow_run_block_id"))
+    observer_cruise_id = Column(String, ForeignKey("observer_cruises.observer_cruise_id"))
     task_id = Column(String, ForeignKey("tasks.task_id"))
     step_id = Column(String, ForeignKey("steps.step_id"), index=True)
     artifact_type = Column(String)
