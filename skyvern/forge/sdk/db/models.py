@@ -26,7 +26,7 @@ from skyvern.forge.sdk.db.id import (
     generate_bitwarden_login_credential_parameter_id,
     generate_bitwarden_sensitive_information_parameter_id,
     generate_observer_cruise_id,
-    generate_observer_run_id,
+    generate_observer_thought_id,
     generate_org_id,
     generate_organization_auth_token_id,
     generate_output_parameter_id,
@@ -507,7 +507,7 @@ class WorkflowRunBlockModel(Base):
 class ObserverCruise(Base):
     __tablename__ = "observer_cruises"
 
-    observer_cruise_id = Column(String, primary_key=True, default=generate_observer_run_id)
+    observer_cruise_id = Column(String, primary_key=True, default=generate_observer_cruise_id)
     status = Column(String, nullable=False, default="created")
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
@@ -517,7 +517,7 @@ class ObserverCruise(Base):
 class ObserverThought(Base):
     __tablename__ = "observer_thoughts"
 
-    observer_thought_id = Column(String, primary_key=True, default=generate_observer_cruise_id)
+    observer_thought_id = Column(String, primary_key=True, default=generate_observer_thought_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
     observer_cruise_id = Column(String, ForeignKey("observer_cruises.observer_cruise_id"), nullable=False)
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
