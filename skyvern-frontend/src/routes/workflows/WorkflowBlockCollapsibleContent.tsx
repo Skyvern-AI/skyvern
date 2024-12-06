@@ -12,6 +12,7 @@ import { useState } from "react";
 import { cn } from "@/util/utils";
 import { CodeEditor } from "./components/CodeEditor";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
+import { statusIsFinalized } from "../tasks/types";
 
 type Props = {
   task: TaskApiResponse;
@@ -20,7 +21,9 @@ type Props = {
 
 function WorkflowBlockCollapsibleContent({ task, onNavigate }: Props) {
   const [open, setOpen] = useState(false);
-  const [activeTab, setActiveTab] = useState(0);
+  const [activeTab, setActiveTab] = useState<"output" | "goal" | "parameters">(
+    statusIsFinalized(task) ? "output" : "goal",
+  );
 
   const showExtractedInformation = task?.status === Status.Completed;
   const extractedInformation = showExtractedInformation ? (
@@ -120,32 +123,36 @@ function WorkflowBlockCollapsibleContent({ task, onNavigate }: Props) {
             <TableCell colSpan={6} className="border-b">
               <div className="space-y-2 px-6">
                 <div className="flex gap-1">
-                  <div
-                    className={cn(
-                      "cursor-pointer rounded-sm px-3 py-2 text-slate-400 hover:bg-slate-700",
-                      {
-                        "bg-slate-700 text-foreground": activeTab === 0,
-                      },
-                    )}
-                    onClick={() => {
-                      setActiveTab(0);
-                    }}
-                  >
-                    {showExtractedInformation
-                      ? "Extracted Information"
-                      : showFailureReason
-                        ? "Failure Reason"
-                        : ""}
-                  </div>
+                  {statusIsFinalized(task) && (
+                    <div
+                      className={cn(
+                        "cursor-pointer rounded-sm px-3 py-2 text-slate-400 hover:bg-slate-700",
+                        {
+                          "bg-slate-700 text-foreground":
+                            activeTab === "output",
+                        },
+                      )}
+                      onClick={() => {
+                        setActiveTab("output");
+                      }}
+                    >
+                      {showExtractedInformation
+                        ? "Extracted Information"
+                        : showFailureReason
+                          ? "Failure Reason"
+                          : ""}
+                    </div>
+                  )}
+
                   <div
                     className={cn(
                       "cursor-pointer rounded-sm px-3 py-2 text-slate-400 hover:bg-slate-700 hover:text-foreground",
                       {
-                        "bg-slate-700 text-foreground": activeTab === 1,
+                        "bg-slate-700 text-foreground": activeTab === "goal",
                       },
                     )}
                     onClick={() => {
-                      setActiveTab(1);
+                      setActiveTab("goal");
                     }}
                   >
                     Navigation Goal
@@ -154,30 +161,31 @@ function WorkflowBlockCollapsibleContent({ task, onNavigate }: Props) {
                     className={cn(
                       "cursor-pointer rounded-sm px-3 py-2 text-slate-400 hover:bg-slate-700 hover:text-foreground",
                       {
-                        "bg-slate-700 text-foreground": activeTab === 2,
+                        "bg-slate-700 text-foreground":
+                          activeTab === "parameters",
                       },
                     )}
                     onClick={() => {
-                      setActiveTab(2);
+                      setActiveTab("parameters");
                     }}
                   >
                     Parameters
                   </div>
                 </div>
                 <div>
-                  {activeTab === 0 &&
+                  {activeTab === "output" &&
                     (showExtractedInformation
                       ? extractedInformation
                       : showFailureReason
                         ? failureReason
                         : null)}
-                  {activeTab === 1 && (
+                  {activeTab === "goal" && (
                     <AutoResizingTextarea
                       value={task.request.navigation_goal ?? ""}
                       readOnly
                     />
                   )}
-                  {activeTab === 2 && (
+                  {activeTab === "parameters" && (
                     <CodeEditor
                       language="json"
                       value={JSON.stringify(
