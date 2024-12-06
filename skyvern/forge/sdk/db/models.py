@@ -487,7 +487,7 @@ class WorkflowRunBlockModel(Base):
     )
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
     task_id = Column(String, ForeignKey("tasks.task_id"), nullable=True)
-    label = Column(String, nullable=False)
+    label = Column(String, nullable=True)
     block_type = Column(String, nullable=False)
     status = Column(String, nullable=False)
     output = Column(JSON, nullable=True)

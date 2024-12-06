@@ -1,8 +1,8 @@
 """Introduce workflow_run_blocks
 
-Revision ID: 7581e473eaf1
+Revision ID: de0254717601
 Revises: db41106b9f1a
-Create Date: 2024-12-06 00:48:39.821275+00:00
+Create Date: 2024-12-06 01:13:07.932965+00:00
 
 """
 
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "7581e473eaf1"
+revision: str = "de0254717601"
 down_revision: Union[str, None] = "db41106b9f1a"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -28,7 +28,7 @@ def upgrade() -> None:
         sa.Column("parent_workflow_run_block_id", sa.String(), nullable=True),
         sa.Column("organization_id", sa.String(), nullable=True),
         sa.Column("task_id", sa.String(), nullable=True),
-        sa.Column("label", sa.String(), nullable=False),
+        sa.Column("label", sa.String(), nullable=True),
         sa.Column("block_type", sa.String(), nullable=False),
         sa.Column("status", sa.String(), nullable=False),
         sa.Column("output", sa.JSON(), nullable=True),
