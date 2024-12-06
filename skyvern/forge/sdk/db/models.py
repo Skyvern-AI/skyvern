@@ -522,6 +522,7 @@ class ObserverThought(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
     observer_cruise_id = Column(String, ForeignKey("observer_cruises.observer_cruise_id"), nullable=False)
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
+    workflow_run_block_id = Column(String, ForeignKey("workflow_run_blocks.workflow_run_block_id"), nullable=True)
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"), nullable=True)
     thought = Column(String, nullable=True)
     answer = Column(String, nullable=True)
