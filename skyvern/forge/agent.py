@@ -1777,7 +1777,8 @@ class ForgeAgent:
 
         try:
             log = skyvern_context.current().log
-            log_json = json.dumps(log, cls=SkyvernLogEncoder, indent=2)
+            current_step_log = [entry for entry in log if entry.get("step_id", "") == step.step_id]
+            log_json = json.dumps(current_step_log, cls=SkyvernLogEncoder, indent=2)
             await app.ARTIFACT_MANAGER.create_artifact(
                 step=step,
                 artifact_type=ArtifactType.SKYVERN_LOG,
