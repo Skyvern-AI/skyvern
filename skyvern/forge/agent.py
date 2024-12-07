@@ -1637,7 +1637,7 @@ class ForgeAgent:
         if first_step:
             recording_artifact = await app.DATABASE.get_artifact(
                 task_id=task.task_id,
-                step_id=last_step.step_id,
+                step_id=first_step.step_id,
                 artifact_type=ArtifactType.RECORDING,
                 organization_id=task.organization_id,
             )

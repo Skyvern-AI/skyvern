@@ -340,8 +340,6 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-
-
     async def get_latest_step(self, task_id: str, organization_id: str | None = None) -> Step | None:
         try:
             async with self.Session() as session:
