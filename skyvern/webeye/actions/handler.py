@@ -360,8 +360,11 @@ async def handle_click_action(
         )
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
+    initial_pages = len(page.context.pages)
+
+    new_page = None
     if action.download:
-        results = await handle_click_to_download_file_action(action, page, scraped_page, task)
+        results, new_page = await handle_click_to_download_file_action(action, page, scraped_page, task)
     else:
         results = await chain_click(
             task,
@@ -383,6 +386,15 @@ async def handle_click_action(
         )
         if num_downloaded_files_after > num_downloaded_files_before:
             results[-1].download_triggered = True
+        elif new_page:
+            pdf_downloaded = await handle_download_potential_pdf_file_action(
+                new_page=new_page,
+                initial_pages=initial_pages,
+                download_dir=download_dir,
+                task=task,
+            )
+            if pdf_downloaded:
+                results[-1].download_triggered = True
 
     return results
 
@@ -397,15 +409,58 @@ async def handle_click_to_download_file_action(
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     locator = skyvern_element.locator
 
+    new_page = None
     try:
-        await locator.click(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+        try:
+            async with page.context.expect_event("page") as event_info:
+                await locator.click(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+            new_page = await event_info.value
+        except TimeoutError:
+            pass
         await page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
     except Exception as e:
         LOG.exception("ClickAction with download failed", action=action, exc_info=True)
         return [ActionFailure(e, download_triggered=False)]
 
-    return [ActionSuccess()]
+    return [ActionSuccess(), new_page]
 
+
+async def handle_download_potential_pdf_file_action(
+    new_page: Page,
+    initial_pages: int,
+    download_dir: str,
+) -> bool | None:
+    """
+    Handle downloading a PDF file from a new page or the current page.
+    Returns True if PDF was successfully downloaded, False if not, or None if this was not a PDF.
+    """
+    is_pdf = False
+    try:
+        url = new_page.url
+        async with new_page.request.head(url) as response:
+            content_type = response.headers.get('content-type', '')
+            if 'application/pdf' in content_type.lower():
+                is_pdf = True
+                LOG.info("PDF detected, downloading file", url=url)
+                file_path = await download_file(url)
+                # Move file to downloads directory
+                file_name = os.path.basename(file_path)
+                new_path = os.path.join(download_dir, file_name)
+                os.rename(file_path, new_path)
+                LOG.info("Successfully downloaded PDF", new_path=new_path)
+                return True
+    except Exception:
+        LOG.warning("Failed to check/download PDF from new page", exc_info=True)
+        return False
+    finally:
+        if is_pdf:
+            # It's a new tab
+            if len(new_page.context.pages) > initial_pages:
+                await new_page.close()
+            else:
+                await new_page.go_back()
+    
+    return None
 
 async def handle_input_text_action(
     action: actions.InputTextAction,
