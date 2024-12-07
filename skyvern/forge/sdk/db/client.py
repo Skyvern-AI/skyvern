@@ -314,6 +314,34 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_first_step(self, task_id: str, organization_id: str | None = None) -> Step | None:
+        try:
+            async with self.Session() as session:
+                if step := (
+                    await session.scalars(
+                        select(StepModel)
+                        .filter_by(task_id=task_id)
+                        .filter_by(organization_id=organization_id)
+                        .order_by(StepModel.order.asc())
+                    )
+                ).first():
+                    return convert_to_step(step, debug_enabled=self.debug_enabled)
+                else:
+                    LOG.info(
+                        "Latest step not found",
+                        task_id=task_id,
+                        organization_id=organization_id,
+                    )
+                    return None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+
+
     async def get_latest_step(self, task_id: str, organization_id: str | None = None) -> Step | None:
         try:
             async with self.Session() as session:

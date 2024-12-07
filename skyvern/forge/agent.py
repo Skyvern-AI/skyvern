@@ -1633,14 +1633,16 @@ class ForgeAgent:
         if screenshot_artifact:
             screenshot_url = await app.ARTIFACT_MANAGER.get_share_link(screenshot_artifact)
 
-        recording_artifact = await app.DATABASE.get_artifact(
-            task_id=task.task_id,
-            step_id=last_step.step_id,
-            artifact_type=ArtifactType.RECORDING,
-            organization_id=task.organization_id,
-        )
-        if recording_artifact:
-            recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
+        first_step = await app.DATABASE.get_first_step(task_id=task.task_id, organization_id=task.organization_id)
+        if first_step:
+            recording_artifact = await app.DATABASE.get_artifact(
+                task_id=task.task_id,
+                step_id=last_step.step_id,
+                artifact_type=ArtifactType.RECORDING,
+                organization_id=task.organization_id,
+            )
+            if recording_artifact:
+                recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
         # get the artifact of the last TASK_RESPONSE_ACTION_SCREENSHOT_COUNT screenshots and get the screenshot_url
         latest_action_screenshot_artifacts = await app.DATABASE.get_latest_n_artifacts(
