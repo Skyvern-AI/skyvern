@@ -430,11 +430,11 @@ async def handle_click_to_download_file_action(
 
     if len(list_files_after) <= len(list_files_before):
         if new_page or initial_page_url != page.url:
+            download_dir_str = str(download_dir)
             pdf_downloaded = await handle_download_potential_pdf_file_action(
                 new_page=new_page if new_page else page,
                 initial_pages=initial_pages,
-                download_dir=download_dir,
-                task=task,
+                download_dir=download_dir_str,
             )
             if pdf_downloaded:
                 return [ActionSuccess(download_triggered=True)]
@@ -488,7 +488,7 @@ async def handle_click_to_download_file_action(
 
 async def handle_download_potential_pdf_file_action(
     new_page: Page,
-    initial_pages: int,
+    initial_pages: int, 
     download_dir: str,
 ) -> bool | None:
     """
@@ -499,12 +499,12 @@ async def handle_download_potential_pdf_file_action(
     try:
         url = new_page.url
         async with new_page.request.head(url) as response:
-            content_type = response.headers.get('content-type', '')
-            if 'application/pdf' in content_type.lower():
+            content_type = response.headers.get("content-type", "")
+            if "application/pdf" in content_type.lower():
                 is_pdf = True
                 LOG.info("PDF detected, downloading file", url=url)
                 file_path = await download_file(url)
-                # Move file to downloads directory
+                # Move file to downloads directory 
                 file_name = os.path.basename(file_path)
                 new_path = os.path.join(download_dir, file_name)
                 os.rename(file_path, new_path)
