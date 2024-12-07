@@ -350,12 +350,8 @@ async def handle_click_action(
         )
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
-    initial_pages = len(page.context.pages)
-    initial_page_url = page.url
-
-    new_page = None
     if action.download:
-        results, new_page = await handle_click_to_download_file_action(action, page, scraped_page, task, step)
+        results = await handle_click_to_download_file_action(action, page, scraped_page, task, step)
     else:
         results = await chain_click(
             task,
@@ -365,27 +361,6 @@ async def handle_click_action(
             skyvern_element,
             timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
         )
-
-    if results and task.workflow_run_id and download_dir:
-        LOG.info("Sleeping for 5 seconds to let the download finish")
-        await asyncio.sleep(5)
-        num_downloaded_files_after = get_number_of_files_in_directory(download_dir)
-        LOG.info(
-            "Number of files in download directory after click",
-            num_downloaded_files_after=num_downloaded_files_after,
-            download_dir=download_dir,
-        )
-        if num_downloaded_files_after > num_downloaded_files_before:
-            results[-1].download_triggered = True
-        elif new_page or initial_page_url != page.url:
-            pdf_downloaded = await handle_download_potential_pdf_file_action(
-                new_page=new_page if new_page else page,
-                initial_pages=initial_pages,
-                download_dir=download_dir,
-                task=task,
-            )
-            if pdf_downloaded:
-                results[-1].download_triggered = True
 
     return results
 
@@ -411,6 +386,9 @@ async def handle_click_to_download_file_action(
         step_id=step.step_id,
         workflow_run_id=task.workflow_run_id,
     )
+
+    initial_pages = len(page.context.pages)
+    initial_page_url = page.url
 
     new_page = None
     try:
@@ -451,6 +429,15 @@ async def handle_click_to_download_file_action(
     )
 
     if len(list_files_after) <= len(list_files_before):
+        if new_page or initial_page_url != page.url:
+            pdf_downloaded = await handle_download_potential_pdf_file_action(
+                new_page=new_page if new_page else page,
+                initial_pages=initial_pages,
+                download_dir=download_dir,
+                task=task,
+            )
+            if pdf_downloaded:
+                return [ActionSuccess(download_triggered=True)]
         LOG.warning(
             "No file to download after click",
             task_id=task.task_id,
@@ -496,7 +483,7 @@ async def handle_click_to_download_file_action(
             workflow_run_id=task.workflow_run_id,
         )
 
-    return [ActionSuccess(download_triggered=True), new_page]
+    return [ActionSuccess(download_triggered=True)]
 
 
 async def handle_download_potential_pdf_file_action(
