@@ -361,6 +361,7 @@ async def handle_click_action(
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
     initial_pages = len(page.context.pages)
+    initial_page_url = page.url
 
     new_page = None
     if action.download:
@@ -386,9 +387,9 @@ async def handle_click_action(
         )
         if num_downloaded_files_after > num_downloaded_files_before:
             results[-1].download_triggered = True
-        elif new_page:
+        elif new_page or initial_page_url != page.url:
             pdf_downloaded = await handle_download_potential_pdf_file_action(
-                new_page=new_page,
+                new_page=new_page if new_page else page,
                 initial_pages=initial_pages,
                 download_dir=download_dir,
                 task=task,
