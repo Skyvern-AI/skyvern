@@ -1,6 +1,6 @@
 import abc
 
-from skyvern.forge.sdk.models import Organization
+from skyvern.forge.sdk.schemas.organizations import Organization
 
 
 class PermissionChecker(abc.ABC):

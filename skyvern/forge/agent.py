@@ -50,7 +50,8 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.validators import prepend_scheme_and_validate_url
 from skyvern.forge.sdk.db.enums import TaskType
-from skyvern.forge.sdk.models import Organization, Step, StepStatus
+from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, ValidationBlock

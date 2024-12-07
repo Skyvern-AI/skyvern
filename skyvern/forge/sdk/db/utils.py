@@ -22,7 +22,8 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
 )
-from skyvern.forge.sdk.models import Organization, OrganizationAuthToken, Step, StepStatus
+from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskStatus
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,

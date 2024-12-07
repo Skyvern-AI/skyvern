@@ -11,7 +11,7 @@ from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
-from skyvern.forge.sdk.models import Organization
+from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
