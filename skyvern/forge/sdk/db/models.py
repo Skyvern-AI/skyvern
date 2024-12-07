@@ -506,7 +506,7 @@ class WorkflowRunBlockModel(Base):
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
 
-class ObserverCruise(Base):
+class ObserverCruiseModel(Base):
     __tablename__ = "observer_cruises"
 
     observer_cruise_id = Column(String, primary_key=True, default=generate_observer_cruise_id)
@@ -516,7 +516,7 @@ class ObserverCruise(Base):
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"), nullable=True)
 
 
-class ObserverThought(Base):
+class ObserverThoughtModel(Base):
     __tablename__ = "observer_thoughts"
 
     observer_thought_id = Column(String, primary_key=True, default=generate_observer_thought_id)

@@ -183,20 +183,28 @@ class AgentDB:
     async def create_artifact(
         self,
         artifact_id: str,
-        step_id: str,
-        task_id: str,
         artifact_type: str,
         uri: str,
+        step_id: str | None = None,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_run_block_id: str | None = None,
+        observer_cruise_id: str | None = None,
+        observer_thought_id: str | None = None,
         organization_id: str | None = None,
     ) -> Artifact:
         try:
             async with self.Session() as session:
                 new_artifact = ArtifactModel(
                     artifact_id=artifact_id,
-                    task_id=task_id,
-                    step_id=step_id,
                     artifact_type=artifact_type,
                     uri=uri,
+                    task_id=task_id,
+                    step_id=step_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    observer_cruise_id=observer_cruise_id,
+                    observer_thought_id=observer_thought_id,
                     organization_id=organization_id,
                 )
                 session.add(new_artifact)
