@@ -488,7 +488,7 @@ async def handle_click_to_download_file_action(
 
 async def handle_download_potential_pdf_file_action(
     new_page: Page,
-    initial_pages: int, 
+    initial_pages: int,
     download_dir: str,
 ) -> bool | None:
     """
@@ -504,7 +504,7 @@ async def handle_download_potential_pdf_file_action(
                 is_pdf = True
                 LOG.info("PDF detected, downloading file", url=url)
                 file_path = await download_file(url)
-                # Move file to downloads directory 
+                # Move file to downloads directory
                 file_name = os.path.basename(file_path)
                 new_path = os.path.join(download_dir, file_name)
                 os.rename(file_path, new_path)
