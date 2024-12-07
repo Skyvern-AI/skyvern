@@ -9,6 +9,7 @@ from random import uniform
 import structlog
 from playwright.async_api import ElementHandle, Frame, FrameLocator, Locator, Page, TimeoutError
 
+from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     ElementIsNotLabel,
@@ -21,7 +22,6 @@ from skyvern.exceptions import (
     NoneFrameError,
     SkyvernException,
 )
-from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, ScrapedPage, json_to_html, trim_element
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -127,6 +127,9 @@ class SkyvernElement:
         self.locator = locator
         self.hash_value = hash_value
 
+    def __repr__(self) -> str:
+        return f"SkyvernElement({str(self.__static_element)})"
+
     def build_HTML(self, need_trim_element: bool = True, need_skyvern_attrs: bool = True) -> str:
         element_dict = self.get_element_dict()
         if need_trim_element:
@@ -143,8 +146,8 @@ class SkyvernElement:
         if autocomplete and autocomplete == "list":
             return True
 
-        element_id = await self.get_attr("id")
-        if element_id == "location-input":
+        class_name: str | None = await self.get_attr("class")
+        if class_name and "autocomplete-input" in class_name:
             return True
 
         return False
@@ -263,6 +266,22 @@ class SkyvernElement:
     async def is_selectable(self) -> bool:
         return self.get_selectable() or self.get_tag_name() in SELECTABLE_ELEMENT
 
+    async def is_visible(self) -> bool:
+        skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
+        return await skyvern_frame.get_element_visible(await self.get_element_handler())
+
+    async def is_parent_of(self, target: ElementHandle) -> bool:
+        skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
+        return await skyvern_frame.is_parent(await self.get_element_handler(), target)
+
+    async def is_child_of(self, target: ElementHandle) -> bool:
+        skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
+        return await skyvern_frame.is_parent(target, await self.get_element_handler())
+
+    async def is_sibling_of(self, target: ElementHandle) -> bool:
+        skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
+        return await skyvern_frame.is_sibling(await self.get_element_handler(), target)
+
     def get_element_dict(self) -> dict:
         return self.__static_element
 
@@ -294,12 +313,25 @@ class SkyvernElement:
     def get_locator(self) -> Locator:
         return self.locator
 
-    async def get_element_handler(
-        self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> ElementHandle:
+    async def get_element_handler(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> ElementHandle:
         handler = await self.locator.element_handle(timeout=timeout)
         assert handler is not None
         return handler
+
+    async def find_blocking_element(self, dom: DomUtil) -> tuple[SkyvernElement | None, bool]:
+        skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
+        blocking_element_id, blocked = await skyvern_frame.get_blocking_element_id(await self.get_element_handler())
+        if not blocking_element_id:
+            return None, blocked
+        return await dom.get_skyvern_element_by_id(blocking_element_id), blocked
+
+    async def find_element_in_label_children(
+        self, dom: DomUtil, element_type: InteractiveElement
+    ) -> SkyvernElement | None:
+        element_id = self.find_element_id_in_label_children(element_type=element_type)
+        if not element_id:
+            return None
+        return await dom.get_skyvern_element_by_id(element_id=element_id)
 
     def find_element_id_in_label_children(self, element_type: InteractiveElement) -> str | None:
         tag_name = self.get_tag_name()
@@ -334,7 +366,7 @@ class SkyvernElement:
         return None
 
     async def find_label_for(
-        self, dom: DomUtil, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+        self, dom: DomUtil, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS
     ) -> SkyvernElement | None:
         if self.get_tag_name() != "label":
             return None
@@ -353,6 +385,43 @@ class SkyvernElement:
             return None
 
         return await dom.get_skyvern_element_by_id(unique_id)
+
+    async def find_bound_label_by_attr_id(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> Locator | None:
+        if self.get_tag_name() == "label":
+            return None
+
+        element_id: str = await self.get_attr("id", timeout=timeout)
+        if not element_id:
+            return None
+
+        locator = self.get_frame().locator(f"label[for='{element_id}']")
+        cnt = await locator.count()
+        if cnt == 1:
+            return locator
+
+        return None
+
+    async def find_bound_label_by_direct_parent(
+        self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS
+    ) -> Locator | None:
+        if self.get_tag_name() == "label":
+            return None
+
+        parent_locator = self.get_locator().locator("..")
+        cnt = await parent_locator.count()
+        if cnt != 1:
+            return None
+
+        timeout_sec = timeout / 1000
+        async with asyncio.timeout(timeout_sec):
+            tag_name: str | None = await parent_locator.evaluate("el => el.tagName")
+            if not tag_name:
+                return None
+
+            if tag_name.lower() != "label":
+                return None
+
+            return parent_locator
 
     async def find_selectable_child(self, dom: DomUtil) -> SkyvernElement | None:
         # BFS to find the first selectable child
@@ -417,7 +486,7 @@ class SkyvernElement:
         self,
         attr_name: str,
         dynamic: bool = False,
-        timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> typing.Any:
         if not dynamic:
             attr = self.get_attributes().get(attr_name)
@@ -426,12 +495,10 @@ class SkyvernElement:
 
         return await self.locator.get_attribute(attr_name, timeout=timeout)
 
-    async def focus(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
+    async def focus(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().focus(timeout=timeout)
 
-    async def input_sequentially(
-        self, text: str, default_timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> None:
+    async def input_sequentially(self, text: str, default_timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         length = len(text)
         if length > TEXT_PRESS_MAX_LENGTH:
             # if the text is longer than TEXT_PRESS_MAX_LENGTH characters, we will locator.fill in initial texts until the last TEXT_PRESS_MAX_LENGTH characters
@@ -441,22 +508,16 @@ class SkyvernElement:
 
         await self.press_fill(text, timeout=default_timeout)
 
-    async def press_key(
-        self, key: str, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> None:
+    async def press_key(self, key: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().press(key=key, timeout=timeout)
 
-    async def press_fill(
-        self, text: str, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> None:
+    async def press_fill(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().press_sequentially(text, delay=TEXT_INPUT_DELAY, timeout=timeout)
 
-    async def input_fill(
-        self, text: str, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> None:
+    async def input_fill(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().fill(text, timeout=timeout)
 
-    async def input_clear(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
+    async def input_clear(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().clear(timeout=timeout)
 
     async def move_mouse_to_safe(
@@ -464,7 +525,7 @@ class SkyvernElement:
         page: Page,
         task_id: str | None = None,
         step_id: str | None = None,
-        timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> tuple[float, float] | tuple[None, None]:
         element_id = self.get_id()
         try:
@@ -488,7 +549,7 @@ class SkyvernElement:
         return None, None
 
     async def move_mouse_to(
-        self, page: Page, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+        self, page: Page, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS
     ) -> tuple[float, float]:
         bounding_box = await self.get_locator().bounding_box(timeout=timeout)
         if not bounding_box:
@@ -503,9 +564,11 @@ class SkyvernElement:
 
         return dest_x, dest_y
 
-    async def coordinate_click(
-        self, page: Page, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-    ) -> None:
+    async def click_in_javascript(self) -> None:
+        skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
+        await skyvern_frame.click_element_in_javascript(await self.get_element_handler())
+
+    async def coordinate_click(self, page: Page, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         click_x, click_y = await self.move_mouse_to(page=page, timeout=timeout)
         await page.mouse.click(click_x, click_y)
 
@@ -514,7 +577,7 @@ class SkyvernElement:
             frame=self.get_frame(), expression="(element) => element.blur()", arg=await self.get_element_handler()
         )
 
-    async def scroll_into_view(self, timeout: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS) -> None:
+    async def scroll_into_view(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         element_handler = await self.get_element_handler(timeout=timeout)
         try:
             await element_handler.scroll_into_view_if_needed(timeout=timeout)
@@ -526,6 +589,25 @@ class SkyvernElement:
             await self.blur()
             await self.focus(timeout=timeout)
         await asyncio.sleep(2)  # wait for scrolling into the target
+
+    async def calculate_vertical_distance_to(
+        self,
+        target_locator: Locator,
+        mode: typing.Literal["inner", "outer"],
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> float:
+        self_rect = await self.get_locator().bounding_box(timeout=timeout)
+        if self_rect is None:
+            raise Exception("Can't Skyvern element rect")
+
+        target_rect = await target_locator.bounding_box(timeout=timeout)
+        if self_rect is None or target_rect is None:
+            raise Exception("Can't get the target element rect")
+
+        if mode == "inner":
+            return abs(self_rect["y"] + self_rect["height"] - target_rect["y"])
+        else:
+            return abs(self_rect["y"] - (target_rect["y"] + target_rect["height"]))
 
 
 class DomUtil:

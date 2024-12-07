@@ -34,12 +34,11 @@ import { AxiosError } from "axios";
 import { useNavigate } from "react-router-dom";
 import { stringify as convertToYAML } from "yaml";
 import { convert } from "./editor/workflowEditorUtils";
-import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
 import { WorkflowApiResponse } from "./types/workflowTypes";
 import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 
 type Props = {
-  id: string;
+  workflow: WorkflowApiResponse;
 };
 
 function downloadFile(fileName: string, contents: string) {
@@ -58,10 +57,9 @@ function downloadFile(fileName: string, contents: string) {
   document.body.removeChild(element);
 }
 
-function WorkflowActions({ id }: Props) {
+function WorkflowActions({ workflow }: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
-  const { data: workflow } = useWorkflowQuery({ workflowPermanentId: id });
   const navigate = useNavigate();
 
   function handleExport(type: "json" | "yaml") {
@@ -187,7 +185,7 @@ function WorkflowActions({ id }: Props) {
           <Button
             variant="destructive"
             onClick={() => {
-              deleteWorkflowMutation.mutate(id);
+              deleteWorkflowMutation.mutate(workflow.workflow_permanent_id);
             }}
             disabled={deleteWorkflowMutation.isPending}
           >

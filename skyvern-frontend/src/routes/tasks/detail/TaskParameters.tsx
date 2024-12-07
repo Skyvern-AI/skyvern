@@ -71,7 +71,7 @@ function TaskParameters() {
           value={
             typeof task.request.navigation_payload === "object"
               ? JSON.stringify(task.request.navigation_payload, null, 2)
-              : task.request.navigation_payload
+              : task.request.navigation_payload ?? ""
           }
           readOnly
           minHeight="96px"
@@ -107,12 +107,21 @@ function TaskParameters() {
                   null,
                   2,
                 )
-              : task.request.extracted_information_schema
+              : task.request.extracted_information_schema ?? ""
           }
           readOnly
           minHeight="96px"
           maxHeight="500px"
         />
+      </div>
+      <div className="flex gap-16">
+        <div className="w-72">
+          <h1 className="text-lg">Webhook Callback URL</h1>
+          <h2 className="text-base text-slate-400">
+            The URL of a webhook endpoint to send the extracted information
+          </h2>
+        </div>
+        <Input value={task.request.webhook_callback_url ?? ""} readOnly />
       </div>
     </section>
   );

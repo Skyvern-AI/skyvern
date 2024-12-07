@@ -3,21 +3,22 @@ import copy
 import json
 from collections import defaultdict
 from enum import StrEnum
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Self
 
 import structlog
 from playwright.async_api import Frame, Locator, Page
-from pydantic import BaseModel
+from pydantic import BaseModel, PrivateAttr
 
+from skyvern.config import settings
 from skyvern.constants import BUILDING_ELEMENT_TREE_TIMEOUT_MS, SKYVERN_DIR, SKYVERN_ID_ATTR
 from skyvern.exceptions import FailedToTakeScreenshot, UnknownElementTreeFormat
 from skyvern.forge.sdk.api.crypto import calculate_sha256
-from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 CleanupElementTreeFunc = Callable[[Page | Frame, str, list[dict]], Awaitable[list[dict]]]
+ScrapeExcludeFunc = Callable[[Page, Frame], Awaitable[bool]]
 
 RESERVED_ATTRIBUTES = {
     "accept",  # for input file
@@ -211,6 +212,26 @@ class ScrapedPage(BaseModel):
     html: str
     extracted_text: str | None = None
 
+    _browser_state: BrowserState = PrivateAttr()
+    _clean_up_func: CleanupElementTreeFunc = PrivateAttr()
+    _scrape_exclude: ScrapeExcludeFunc | None = PrivateAttr(default=None)
+
+    def __init__(self, **data: Any) -> None:
+        missing_attrs = [attr for attr in ["_browser_state", "_clean_up_func"] if attr not in data]
+        if len(missing_attrs) > 0:
+            raise ValueError(f"Missing required private attributes: {', '.join(missing_attrs)}")
+
+        # popup private attributes
+        browser_state = data.pop("_browser_state")
+        clean_up_func = data.pop("_clean_up_func")
+        scrape_exclude = data.pop("_scrape_exclude")
+
+        super().__init__(**data)
+
+        self._browser_state = browser_state
+        self._clean_up_func = clean_up_func
+        self._scrape_exclude = scrape_exclude
+
     def build_element_tree(self, fmt: ElementTreeFormat = ElementTreeFormat.JSON) -> str:
         if fmt == ElementTreeFormat.JSON:
             return json.dumps(self.element_tree_trimmed)
@@ -220,13 +241,34 @@ class ScrapedPage(BaseModel):
 
         raise UnknownElementTreeFormat(fmt=fmt)
 
+    async def refresh(self) -> Self:
+        refreshed_page = await scrape_website(
+            browser_state=self._browser_state,
+            url=self.url,
+            cleanup_element_tree=self._clean_up_func,
+            scrape_exclude=self._scrape_exclude,
+        )
+        self.elements = refreshed_page.elements
+        self.id_to_css_dict = refreshed_page.id_to_css_dict
+        self.id_to_element_dict = refreshed_page.id_to_element_dict
+        self.id_to_frame_dict = refreshed_page.id_to_frame_dict
+        self.id_to_element_hash = refreshed_page.id_to_element_hash
+        self.hash_to_element_ids = refreshed_page.hash_to_element_ids
+        self.element_tree = refreshed_page.element_tree
+        self.element_tree_trimmed = refreshed_page.element_tree_trimmed
+        self.screenshots = refreshed_page.screenshots or self.screenshots
+        self.html = refreshed_page.html
+        self.extracted_text = refreshed_page.extracted_text
+        self.url = refreshed_page.url
+        return self
+
 
 async def scrape_website(
     browser_state: BrowserState,
     url: str,
     cleanup_element_tree: CleanupElementTreeFunc,
     num_retry: int = 0,
-    scrape_exclude: Callable[[Page, Frame], Awaitable[bool]] | None = None,
+    scrape_exclude: ScrapeExcludeFunc | None = None,
 ) -> ScrapedPage:
     """
     ************************************************************************************************
@@ -251,13 +293,18 @@ async def scrape_website(
     """
     try:
         num_retry += 1
-        return await scrape_web_unsafe(browser_state, url, cleanup_element_tree, scrape_exclude)
+        return await scrape_web_unsafe(
+            browser_state=browser_state,
+            url=url,
+            cleanup_element_tree=cleanup_element_tree,
+            scrape_exclude=scrape_exclude,
+        )
     except Exception as e:
         # NOTE: MAX_SCRAPING_RETRIES is set to 0 in both staging and production
-        if num_retry > SettingsManager.get_settings().MAX_SCRAPING_RETRIES:
+        if num_retry > settings.MAX_SCRAPING_RETRIES:
             LOG.error(
                 "Scraping failed after max retries, aborting.",
-                max_retries=SettingsManager.get_settings().MAX_SCRAPING_RETRIES,
+                max_retries=settings.MAX_SCRAPING_RETRIES,
                 url=url,
                 exc_info=True,
             )
@@ -318,7 +365,7 @@ async def scrape_web_unsafe(
     browser_state: BrowserState,
     url: str,
     cleanup_element_tree: CleanupElementTreeFunc,
-    scrape_exclude: Callable[[Page, Frame], Awaitable[bool]] | None = None,
+    scrape_exclude: ScrapeExcludeFunc | None = None,
 ) -> ScrapedPage:
     """
     Asynchronous function that performs web scraping without any built-in error handling. This function is intended
@@ -331,10 +378,8 @@ async def scrape_web_unsafe(
     :return: Tuple containing Page instance, base64 encoded screenshot, and page elements.
     :note: This function does not handle exceptions. Ensure proper error handling in the calling context.
     """
-    # We only create a new page if one does not exist. This is to allow keeping the same page since we want to
-    # continue working on the same page that we're taking actions on.
-    # *This also means URL is only used when creating a new page, and not when using an existing page.
-    page = await browser_state.get_or_create_page(url)
+    # browser state must have the page instance, otherwise we should not do scraping
+    page = await browser_state.must_get_working_page()
     # Take screenshots of the page with the bounding boxes. We will remove the bounding boxes later.
     # Scroll to the top of the page and take a screenshot.
     # Scroll to the next page and take a screenshot until we reach the end of the page.
@@ -384,6 +429,9 @@ async def scrape_web_unsafe(
         url=page.url,
         html=html,
         extracted_text=text_content,
+        _browser_state=browser_state,
+        _clean_up_func=cleanup_element_tree,
+        _scrape_exclude=scrape_exclude,
     )
 
 
@@ -391,7 +439,7 @@ async def get_interactable_element_tree_in_frame(
     frames: list[Frame],
     elements: list[dict],
     element_tree: list[dict],
-    scrape_exclude: Callable[[Page, Frame], Awaitable[bool]] | None = None,
+    scrape_exclude: ScrapeExcludeFunc | None = None,
 ) -> tuple[list[dict], list[dict]]:
     for frame in frames:
         if frame.is_detached():
@@ -445,7 +493,7 @@ async def get_interactable_element_tree_in_frame(
 
 async def get_interactable_element_tree(
     page: Page,
-    scrape_exclude: Callable[[Page, Frame], Awaitable[bool]] | None = None,
+    scrape_exclude: ScrapeExcludeFunc | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Get the element tree of the page, including all the elements that are interactable.
@@ -552,6 +600,7 @@ class IncrementalScrapePage:
             return None, False
 
         if not interactable:
+            LOG.debug("Find the target element by text, but the element is not interactable", text=text)
             return None, True
 
         return parent_locator, True
@@ -618,6 +667,13 @@ def trim_element(element: dict) -> dict:
             element_text = str(queue_ele["text"]).strip()
             if not element_text:
                 del queue_ele["text"]
+
+        if (
+            "attributes" in queue_ele
+            and "name" in queue_ele["attributes"]
+            and len(queue_ele["attributes"]["name"]) > 500
+        ):
+            queue_ele["attributes"]["name"] = queue_ele["attributes"]["name"][:500]
 
         if "beforePseudoText" in queue_ele and not queue_ele.get("beforePseudoText"):
             del queue_ele["beforePseudoText"]

@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import datetime
 from typing import Any
@@ -6,33 +7,51 @@ import httpx
 import structlog
 
 from skyvern import analytics
-from skyvern.exceptions import FailedToSendWebhook, MissingValueForParameter, WorkflowNotFound, WorkflowRunNotFound
+from skyvern.config import settings
+from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
+from skyvern.exceptions import (
+    FailedToSendWebhook,
+    MissingValueForParameter,
+    SkyvernException,
+    WorkflowNotFound,
+    WorkflowRunNotFound,
+)
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.models import Organization, Step
+from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
+    InvalidWaitBlockTime,
     InvalidWorkflowDefinition,
     WorkflowDefinitionHasDuplicateParameterKeys,
     WorkflowDefinitionHasReservedParameterKeys,
     WorkflowParameterMissingRequiredValue,
 )
 from skyvern.forge.sdk.workflow.models.block import (
+    ActionBlock,
     BlockStatus,
     BlockType,
     BlockTypeVar,
     CodeBlock,
     DownloadToS3Block,
+    ExtractionBlock,
+    FileDownloadBlock,
     FileParserBlock,
     ForLoopBlock,
+    LoginBlock,
+    NavigationBlock,
     SendEmailBlock,
     TaskBlock,
     TextPromptBlock,
     UploadToS3Block,
+    ValidationBlock,
+    WaitBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -54,7 +73,12 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowRunStatusResponse,
 )
-from skyvern.forge.sdk.workflow.models.yaml import BLOCK_YAML_TYPES, ForLoopBlockYAML, WorkflowCreateYAMLRequest
+from skyvern.forge.sdk.workflow.models.yaml import (
+    BLOCK_YAML_TYPES,
+    ForLoopBlockYAML,
+    WorkflowCreateYAMLRequest,
+    WorkflowDefinitionYAML,
+)
 from skyvern.webeye.browser_factory import BrowserState
 
 LOG = structlog.get_logger()
@@ -147,7 +171,14 @@ class WorkflowService:
                 f"Error while setting up workflow run {workflow_run.workflow_run_id}",
                 workflow_run_id=workflow_run.workflow_run_id,
             )
-            await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
+
+            failure_reason = "Setup up workflow failed due to an unexpected exception"
+            if isinstance(e, SkyvernException):
+                failure_reason = f"Setup workflow failed due to an SkyvernException({e.__class__.__name__})"
+
+            await self.mark_workflow_run_as_failed(
+                workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
+            )
             raise e
 
         return workflow_run
@@ -186,8 +217,25 @@ class WorkflowService:
         blocks_cnt = len(blocks)
         block_result = None
         for block_idx, block in enumerate(blocks):
-            is_last_block = block_idx + 1 == blocks_cnt
             try:
+                refreshed_workflow_run = await app.DATABASE.get_workflow_run(
+                    workflow_run_id=workflow_run.workflow_run_id
+                )
+                if refreshed_workflow_run and refreshed_workflow_run.status == WorkflowRunStatus.canceled:
+                    LOG.info(
+                        "Workflow run is canceled, stopping execution inside workflow execution loop",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        block_idx=block_idx,
+                        block_type=block.block_type,
+                        block_label=block.label,
+                    )
+                    await self.clean_up_workflow(
+                        workflow=workflow,
+                        workflow_run=workflow_run,
+                        api_key=api_key,
+                        need_call_webhook=False,
+                    )
+                    return workflow_run
                 parameters = block.get_all_parameters(workflow_run_id)
                 await app.WORKFLOW_CONTEXT_MANAGER.register_block_parameters_for_workflow_run(
                     workflow_run_id, parameters, organization
@@ -197,6 +245,8 @@ class WorkflowService:
                     block_type=block.block_type,
                     workflow_run_id=workflow_run.workflow_run_id,
                     block_idx=block_idx,
+                    block_type_var=block.block_type,
+                    block_label=block.label,
                 )
                 block_result = await block.execute_safe(workflow_run_id=workflow_run_id)
                 if block_result.status == BlockStatus.canceled:
@@ -206,6 +256,8 @@ class WorkflowService:
                         workflow_run_id=workflow_run.workflow_run_id,
                         block_idx=block_idx,
                         block_result=block_result,
+                        block_type_var=block.block_type,
+                        block_label=block.label,
                     )
                     await self.mark_workflow_run_as_canceled(workflow_run_id=workflow_run.workflow_run_id)
                     # We're not sending a webhook here because the workflow run is manually marked as canceled.
@@ -223,24 +275,32 @@ class WorkflowService:
                         workflow_run_id=workflow_run.workflow_run_id,
                         block_idx=block_idx,
                         block_result=block_result,
+                        block_type_var=block.block_type,
+                        block_label=block.label,
                     )
-                    if block.continue_on_failure and not is_last_block:
-                        LOG.warning(
-                            f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} failed but will continue executing the workflow run {workflow_run_id}",
-                            block_type=block.block_type,
-                            workflow_run_id=workflow_run.workflow_run_id,
-                            block_idx=block_idx,
-                            block_result=block_result,
-                            continue_on_failure=block.continue_on_failure,
+                    if not block.continue_on_failure:
+                        failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} failed. failure reason: {block_result.failure_reason}"
+                        await self.mark_workflow_run_as_failed(
+                            workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                         )
-                    else:
-                        await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
                         await self.clean_up_workflow(
                             workflow=workflow,
                             workflow_run=workflow_run,
                             api_key=api_key,
                         )
                         return workflow_run
+
+                    LOG.warning(
+                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} failed but will continue executing the workflow run {workflow_run_id}",
+                        block_type=block.block_type,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        block_idx=block_idx,
+                        block_result=block_result,
+                        continue_on_failure=block.continue_on_failure,
+                        block_type_var=block.block_type,
+                        block_label=block.label,
+                    )
+
                 elif block_result.status == BlockStatus.terminated:
                     LOG.info(
                         f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} was terminated for workflow run {workflow_run_id}, marking workflow run as terminated",
@@ -248,34 +308,66 @@ class WorkflowService:
                         workflow_run_id=workflow_run.workflow_run_id,
                         block_idx=block_idx,
                         block_result=block_result,
+                        block_type_var=block.block_type,
+                        block_label=block.label,
                     )
-                    if block.continue_on_failure and not is_last_block:
-                        LOG.warning(
-                            f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} was terminated for workflow run {workflow_run_id}, but will continue executing the workflow run",
-                            block_type=block.block_type,
-                            workflow_run_id=workflow_run.workflow_run_id,
-                            block_idx=block_idx,
-                            block_result=block_result,
-                            continue_on_failure=block.continue_on_failure,
+
+                    if not block.continue_on_failure:
+                        failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} terminated. Reason: {block_result.failure_reason}"
+                        await self.mark_workflow_run_as_terminated(
+                            workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                         )
-                    else:
-                        await self.mark_workflow_run_as_terminated(workflow_run_id=workflow_run.workflow_run_id)
                         await self.clean_up_workflow(
                             workflow=workflow,
                             workflow_run=workflow_run,
                             api_key=api_key,
                         )
                         return workflow_run
-            except Exception:
+
+                    LOG.warning(
+                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} was terminated for workflow run {workflow_run_id}, but will continue executing the workflow run",
+                        block_type=block.block_type,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        block_idx=block_idx,
+                        block_result=block_result,
+                        continue_on_failure=block.continue_on_failure,
+                        block_type_var=block.block_type,
+                        block_label=block.label,
+                    )
+
+            except Exception as e:
                 LOG.exception(
                     f"Error while executing workflow run {workflow_run.workflow_run_id}",
                     workflow_run_id=workflow_run.workflow_run_id,
+                    block_idx=block_idx,
+                    block_type=block.block_type,
+                    block_label=block.label,
                 )
-                await self.mark_workflow_run_as_failed(workflow_run_id=workflow_run.workflow_run_id)
+
+                exception_message = "unexpected exception"
+                if isinstance(e, SkyvernException):
+                    exception_message = f"unexpected SkyvernException({e.__class__.__name__})"
+
+                failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} failed. failure reason: {exception_message}"
+                await self.mark_workflow_run_as_failed(
+                    workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
+                )
                 await self.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, api_key=api_key)
                 return workflow_run
 
-        await self.mark_workflow_run_as_completed(workflow_run_id=workflow_run.workflow_run_id)
+        refreshed_workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=workflow_run.workflow_run_id)
+        if refreshed_workflow_run and refreshed_workflow_run.status not in (
+            WorkflowRunStatus.canceled,
+            WorkflowRunStatus.failed,
+            WorkflowRunStatus.terminated,
+        ):
+            await self.mark_workflow_run_as_completed(workflow_run_id=workflow_run.workflow_run_id)
+        else:
+            LOG.info(
+                "Workflow run is already canceled, failed, or terminated, not marking as completed",
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_run_status=refreshed_workflow_run.status if refreshed_workflow_run else None,
+            )
         await self.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, api_key=api_key)
         return workflow_run
 
@@ -427,15 +519,17 @@ class WorkflowService:
             status=WorkflowRunStatus.completed,
         )
 
-    async def mark_workflow_run_as_failed(self, workflow_run_id: str) -> None:
+    async def mark_workflow_run_as_failed(self, workflow_run_id: str, failure_reason: str | None) -> None:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as failed",
             workflow_run_id=workflow_run_id,
             workflow_status="failed",
+            failure_reason=failure_reason,
         )
         await app.DATABASE.update_workflow_run(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.failed,
+            failure_reason=failure_reason,
         )
 
     async def mark_workflow_run_as_running(self, workflow_run_id: str) -> None:
@@ -449,15 +543,17 @@ class WorkflowService:
             status=WorkflowRunStatus.running,
         )
 
-    async def mark_workflow_run_as_terminated(self, workflow_run_id: str) -> None:
+    async def mark_workflow_run_as_terminated(self, workflow_run_id: str, failure_reason: str | None) -> None:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as terminated",
             workflow_run_id=workflow_run_id,
             workflow_status="terminated",
+            failure_reason=failure_reason,
         )
         await app.DATABASE.update_workflow_run(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.terminated,
+            failure_reason=failure_reason,
         )
 
     async def mark_workflow_run_as_canceled(self, workflow_run_id: str) -> None:
@@ -687,6 +783,24 @@ class WorkflowService:
         if recording_artifact:
             recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
+        downloaded_file_urls: list[str] | None = None
+        try:
+            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                downloaded_file_urls = await app.STORAGE.get_downloaded_files(
+                    organization_id=workflow.organization_id, task_id=None, workflow_run_id=workflow_run.workflow_run_id
+                )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout to get downloaded files",
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to get downloaded files",
+                exc_info=True,
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
+
         workflow_parameter_tuples = await app.DATABASE.get_workflow_run_parameters(workflow_run_id=workflow_run_id)
         parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
         output_parameter_tuples: list[
@@ -703,6 +817,7 @@ class WorkflowService:
             workflow_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run_id,
             status=workflow_run.status,
+            failure_reason=workflow_run.failure_reason,
             proxy_location=workflow_run.proxy_location,
             webhook_callback_url=workflow_run.webhook_callback_url,
             totp_verification_url=workflow_run.totp_verification_url,
@@ -712,6 +827,7 @@ class WorkflowService:
             parameters=parameters_with_value,
             screenshot_urls=screenshot_urls,
             recording_url=recording_url,
+            downloaded_file_urls=downloaded_file_urls,
             outputs=outputs,
         )
 
@@ -733,7 +849,8 @@ class WorkflowService:
         )
         if browser_state:
             await self.persist_video_data(browser_state, workflow, workflow_run)
-            await self.persist_debug_artifacts(browser_state, tasks[-1], workflow, workflow_run)
+            if tasks:
+                await self.persist_debug_artifacts(browser_state, tasks[-1], workflow, workflow_run)
             if workflow.persist_browser_session and browser_state.browser_artifacts.browser_session_dir:
                 await app.STORAGE.store_browser_session(
                     workflow.organization_id,
@@ -743,6 +860,23 @@ class WorkflowService:
                 LOG.info("Persisted browser session for workflow run", workflow_run_id=workflow_run.workflow_run_id)
 
         await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks_for_tasks(all_workflow_task_ids)
+
+        try:
+            async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                await app.STORAGE.save_downloaded_files(
+                    workflow.organization_id, task_id=None, workflow_run_id=workflow_run.workflow_run_id
+                )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout to save downloaded files",
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to save downloaded files",
+                exc_info=True,
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
 
         if not need_call_webhook:
             return
@@ -1121,7 +1255,7 @@ class WorkflowService:
             raise e
 
     @staticmethod
-    async def _create_output_parameter_for_block(workflow_id: str, block_yaml: BLOCK_YAML_TYPES) -> OutputParameter:
+    async def create_output_parameter_for_block(workflow_id: str, block_yaml: BLOCK_YAML_TYPES) -> OutputParameter:
         output_parameter_key = f"{block_yaml.label}_output"
         return await app.DATABASE.create_output_parameter(
             workflow_id=workflow_id,
@@ -1135,7 +1269,7 @@ class WorkflowService:
     ) -> dict[str, OutputParameter]:
         output_parameters = {}
         for block_yaml in block_yamls:
-            output_parameter = await WorkflowService._create_output_parameter_for_block(
+            output_parameter = await WorkflowService.create_output_parameter_for_block(
                 workflow_id=workflow_id, block_yaml=block_yaml
             )
             output_parameters[block_yaml.label] = output_parameter
@@ -1256,4 +1390,174 @@ class WorkflowService:
                 file_type=block_yaml.file_type,
                 continue_on_failure=block_yaml.continue_on_failure,
             )
+        elif block_yaml.block_type == BlockType.VALIDATION:
+            validation_block_parameters = (
+                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                if block_yaml.parameter_keys
+                else []
+            )
+
+            if not block_yaml.complete_criterion and not block_yaml.terminate_criterion:
+                raise Exception("Both complete criterion and terminate criterion are empty")
+
+            return ValidationBlock(
+                label=block_yaml.label,
+                task_type=TaskType.validation,
+                parameters=validation_block_parameters,
+                output_parameter=output_parameter,
+                complete_criterion=block_yaml.complete_criterion,
+                terminate_criterion=block_yaml.terminate_criterion,
+                error_code_mapping=block_yaml.error_code_mapping,
+                continue_on_failure=block_yaml.continue_on_failure,
+                # only need one step for validation block
+                max_steps_per_run=1,
+            )
+
+        elif block_yaml.block_type == BlockType.ACTION:
+            action_block_parameters = (
+                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                if block_yaml.parameter_keys
+                else []
+            )
+
+            if not block_yaml.navigation_goal:
+                raise Exception("empty action instruction")
+
+            return ActionBlock(
+                label=block_yaml.label,
+                url=block_yaml.url,
+                title=block_yaml.title,
+                task_type=TaskType.action,
+                parameters=action_block_parameters,
+                output_parameter=output_parameter,
+                navigation_goal=block_yaml.navigation_goal,
+                error_code_mapping=block_yaml.error_code_mapping,
+                max_retries=block_yaml.max_retries,
+                complete_on_download=block_yaml.complete_on_download,
+                download_suffix=block_yaml.download_suffix,
+                continue_on_failure=block_yaml.continue_on_failure,
+                totp_verification_url=block_yaml.totp_verification_url,
+                totp_identifier=block_yaml.totp_identifier,
+                cache_actions=block_yaml.cache_actions,
+                max_steps_per_run=1,
+            )
+
+        elif block_yaml.block_type == BlockType.NAVIGATION:
+            navigation_block_parameters = (
+                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                if block_yaml.parameter_keys
+                else []
+            )
+            return NavigationBlock(
+                label=block_yaml.label,
+                url=block_yaml.url,
+                title=block_yaml.title,
+                parameters=navigation_block_parameters,
+                output_parameter=output_parameter,
+                navigation_goal=block_yaml.navigation_goal,
+                error_code_mapping=block_yaml.error_code_mapping,
+                max_steps_per_run=block_yaml.max_steps_per_run,
+                max_retries=block_yaml.max_retries,
+                complete_on_download=block_yaml.complete_on_download,
+                download_suffix=block_yaml.download_suffix,
+                continue_on_failure=block_yaml.continue_on_failure,
+                totp_verification_url=block_yaml.totp_verification_url,
+                totp_identifier=block_yaml.totp_identifier,
+                cache_actions=block_yaml.cache_actions,
+            )
+
+        elif block_yaml.block_type == BlockType.EXTRACTION:
+            extraction_block_parameters = (
+                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                if block_yaml.parameter_keys
+                else []
+            )
+            return ExtractionBlock(
+                label=block_yaml.label,
+                url=block_yaml.url,
+                title=block_yaml.title,
+                parameters=extraction_block_parameters,
+                output_parameter=output_parameter,
+                data_extraction_goal=block_yaml.data_extraction_goal,
+                data_schema=block_yaml.data_schema,
+                max_steps_per_run=block_yaml.max_steps_per_run,
+                max_retries=block_yaml.max_retries,
+                continue_on_failure=block_yaml.continue_on_failure,
+                cache_actions=block_yaml.cache_actions,
+            )
+
+        elif block_yaml.block_type == BlockType.LOGIN:
+            login_block_parameters = (
+                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                if block_yaml.parameter_keys
+                else []
+            )
+            return LoginBlock(
+                label=block_yaml.label,
+                url=block_yaml.url,
+                title=block_yaml.title,
+                parameters=login_block_parameters,
+                output_parameter=output_parameter,
+                navigation_goal=block_yaml.navigation_goal,
+                error_code_mapping=block_yaml.error_code_mapping,
+                max_steps_per_run=block_yaml.max_steps_per_run,
+                max_retries=block_yaml.max_retries,
+                continue_on_failure=block_yaml.continue_on_failure,
+                totp_verification_url=block_yaml.totp_verification_url,
+                totp_identifier=block_yaml.totp_identifier,
+                cache_actions=block_yaml.cache_actions,
+            )
+
+        elif block_yaml.block_type == BlockType.WAIT:
+            if block_yaml.wait_sec <= 0 or block_yaml.wait_sec > settings.WORKFLOW_WAIT_BLOCK_MAX_SEC:
+                raise InvalidWaitBlockTime(settings.WORKFLOW_WAIT_BLOCK_MAX_SEC)
+
+            return WaitBlock(
+                label=block_yaml.label,
+                wait_sec=block_yaml.wait_sec,
+                continue_on_failure=block_yaml.continue_on_failure,
+                output_parameter=output_parameter,
+            )
+
+        elif block_yaml.block_type == BlockType.FILE_DOWNLOAD:
+            file_download_block_parameters = (
+                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                if block_yaml.parameter_keys
+                else []
+            )
+            return FileDownloadBlock(
+                label=block_yaml.label,
+                url=block_yaml.url,
+                title=block_yaml.title,
+                parameters=file_download_block_parameters,
+                output_parameter=output_parameter,
+                navigation_goal=block_yaml.navigation_goal,
+                error_code_mapping=block_yaml.error_code_mapping,
+                max_steps_per_run=block_yaml.max_steps_per_run,
+                max_retries=block_yaml.max_retries,
+                download_suffix=block_yaml.download_suffix,
+                continue_on_failure=block_yaml.continue_on_failure,
+                totp_verification_url=block_yaml.totp_verification_url,
+                totp_identifier=block_yaml.totp_identifier,
+                cache_actions=block_yaml.cache_actions,
+                complete_on_download=True,
+            )
+
         raise ValueError(f"Invalid block type {block_yaml.block_type}")
+
+    async def create_empty_workflow(self, organization: Organization, title: str) -> Workflow:
+        """
+        Create a blank workflow with no blocks
+        """
+        # create a new workflow
+        workflow_create_request = WorkflowCreateYAMLRequest(
+            title=title,
+            workflow_definition=WorkflowDefinitionYAML(
+                parameters=[],
+                blocks=[],
+            ),
+        )
+        return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+            organization=organization,
+            request=workflow_create_request,
+        )

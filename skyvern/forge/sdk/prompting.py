@@ -98,7 +98,7 @@ class PromptEngine:
             str: The populated template.
         """
         try:
-            template = os.path.join(self.model, template)
+            template = "/".join([self.model, template])
             jinja_template = self.env.get_template(f"{template}.j2")
             return jinja_template.render(**kwargs)
         except Exception:

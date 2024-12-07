@@ -12,6 +12,7 @@ export const sampleCases = [
   "AAPLStockPrice",
   "NYTBestseller",
   "topRankedFootballTeam",
+  "extractIntegrationsFromGong",
 ] as const;
 
 export type SampleCase = (typeof sampleCases)[number];

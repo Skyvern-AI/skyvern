@@ -19,6 +19,20 @@ import type { NodeAdderNode } from "./NodeAdderNode/types";
 import { NodeAdderNode as NodeAdderNodeComponent } from "./NodeAdderNode/NodeAdderNode";
 import { StartNode as StartNodeComponent } from "./StartNode/StartNode";
 import type { StartNode } from "./StartNode/types";
+import type { ValidationNode } from "./ValidationNode/types";
+import { ValidationNode as ValidationNodeComponent } from "./ValidationNode/ValidationNode";
+import type { ActionNode } from "./ActionNode/types";
+import { ActionNode as ActionNodeComponent } from "./ActionNode/ActionNode";
+import { NavigationNode } from "./NavigationNode/types";
+import { NavigationNode as NavigationNodeComponent } from "./NavigationNode/NavigationNode";
+import { ExtractionNode } from "./ExtractionNode/types";
+import { ExtractionNode as ExtractionNodeComponent } from "./ExtractionNode/ExtractionNode";
+import { LoginNode } from "./LoginNode/types";
+import { LoginNode as LoginNodeComponent } from "./LoginNode/LoginNode";
+import { WaitNode } from "./WaitNode/types";
+import { WaitNode as WaitNodeComponent } from "./WaitNode/WaitNode";
+import { FileDownloadNode } from "./FileDownloadNode/types";
+import { FileDownloadNode as FileDownloadNodeComponent } from "./FileDownloadNode/FileDownloadNode";
 
 export type UtilityNode = StartNode | NodeAdderNode;
 
@@ -30,7 +44,14 @@ export type WorkflowBlockNode =
   | CodeBlockNode
   | FileParserNode
   | UploadNode
-  | DownloadNode;
+  | DownloadNode
+  | ValidationNode
+  | ActionNode
+  | NavigationNode
+  | ExtractionNode
+  | LoginNode
+  | WaitNode
+  | FileDownloadNode;
 
 export function isUtilityNode(node: AppNode): node is UtilityNode {
   return node.type === "nodeAdder" || node.type === "start";
@@ -53,4 +74,11 @@ export const nodeTypes = {
   download: memo(DownloadNodeComponent),
   nodeAdder: memo(NodeAdderNodeComponent),
   start: memo(StartNodeComponent),
-};
+  validation: memo(ValidationNodeComponent),
+  action: memo(ActionNodeComponent),
+  navigation: memo(NavigationNodeComponent),
+  extraction: memo(ExtractionNodeComponent),
+  login: memo(LoginNodeComponent),
+  wait: memo(WaitNodeComponent),
+  fileDownload: memo(FileDownloadNodeComponent),
+} as const;

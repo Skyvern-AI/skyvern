@@ -31,7 +31,8 @@ import { stringify as convertToYAML } from "yaml";
 import { MAX_STEPS_DEFAULT } from "../constants";
 import { TaskFormSection } from "./TaskFormSection";
 import { savedTaskFormSchema, SavedTaskFormValues } from "./taskFormTypes";
-import { OrganizationApiResponse } from "@/api/types";
+import { OrganizationApiResponse, ProxyLocation } from "@/api/types";
+import { ProxySelector } from "@/components/ProxySelector";
 
 type Props = {
   initialValues: SavedTaskFormValues;
@@ -42,61 +43,35 @@ function transform(value: unknown) {
 }
 
 function createTaskRequestObject(formValues: SavedTaskFormValues) {
-  let extractedInformationSchema = null;
-  if (formValues.extractedInformationSchema) {
-    try {
-      extractedInformationSchema = JSON.parse(
-        formValues.extractedInformationSchema,
-      );
-    } catch (e) {
-      extractedInformationSchema = formValues.extractedInformationSchema;
-    }
-  }
-
-  let errorCodeMapping = null;
-  if (formValues.errorCodeMapping) {
-    try {
-      errorCodeMapping = JSON.parse(formValues.errorCodeMapping);
-    } catch (e) {
-      errorCodeMapping = formValues.errorCodeMapping;
-    }
-  }
-
   return {
+    title: formValues.title,
     url: formValues.url,
     webhook_callback_url: transform(formValues.webhookCallbackUrl),
     navigation_goal: transform(formValues.navigationGoal),
     data_extraction_goal: transform(formValues.dataExtractionGoal),
     proxy_location: transform(formValues.proxyLocation),
     navigation_payload: transform(formValues.navigationPayload),
-    extracted_information_schema: extractedInformationSchema,
+    extracted_information_schema: safeParseMaybeJSONString(
+      formValues.extractedInformationSchema,
+    ),
     totp_verification_url: transform(formValues.totpVerificationUrl),
     totp_identifier: transform(formValues.totpIdentifier),
-    error_code_mapping: errorCodeMapping,
+    error_code_mapping: safeParseMaybeJSONString(formValues.errorCodeMapping),
   };
 }
 
+function safeParseMaybeJSONString(payload: unknown) {
+  if (typeof payload === "string") {
+    try {
+      return JSON.parse(payload);
+    } catch {
+      return payload;
+    }
+  }
+  return payload;
+}
+
 function createTaskTemplateRequestObject(values: SavedTaskFormValues) {
-  let extractedInformationSchema = null;
-  if (values.extractedInformationSchema) {
-    try {
-      extractedInformationSchema = JSON.parse(
-        values.extractedInformationSchema,
-      );
-    } catch (e) {
-      extractedInformationSchema = values.extractedInformationSchema;
-    }
-  }
-
-  let errorCodeMapping = null;
-  if (values.errorCodeMapping) {
-    try {
-      errorCodeMapping = JSON.parse(values.errorCodeMapping);
-    } catch (e) {
-      errorCodeMapping = values.errorCodeMapping;
-    }
-  }
-
   return {
     title: values.title,
     description: values.description,
@@ -109,7 +84,7 @@ function createTaskTemplateRequestObject(values: SavedTaskFormValues) {
           parameter_type: "workflow",
           workflow_parameter_type: "json",
           key: "navigation_payload",
-          default_value: JSON.stringify(values.navigationPayload),
+          default_value: safeParseMaybeJSONString(values.navigationPayload),
         },
       ],
       blocks: [
@@ -119,11 +94,13 @@ function createTaskTemplateRequestObject(values: SavedTaskFormValues) {
           url: values.url,
           navigation_goal: values.navigationGoal,
           data_extraction_goal: values.dataExtractionGoal,
-          data_schema: extractedInformationSchema,
+          data_schema: safeParseMaybeJSONString(
+            values.extractedInformationSchema,
+          ),
           max_steps_per_run: values.maxStepsOverride,
           totp_verification_url: values.totpVerificationUrl,
           totp_identifier: values.totpIdentifier,
-          error_code_mapping: errorCodeMapping,
+          error_code_mapping: safeParseMaybeJSONString(values.errorCodeMapping),
         },
       ],
     },
@@ -157,10 +134,10 @@ function SavedTaskForm({ initialValues }: Props) {
 
   const form = useForm<SavedTaskFormValues>({
     resolver: zodResolver(savedTaskFormSchema),
-    defaultValues: initialValues,
-    values: {
+    defaultValues: {
       ...initialValues,
       maxStepsOverride: initialValues.maxStepsOverride ?? null,
+      proxyLocation: initialValues.proxyLocation ?? ProxyLocation.Residential,
     },
   });
 
@@ -661,6 +638,39 @@ function SavedTaskForm({ initialValues }: Props) {
                       </div>
                     </FormItem>
                   )}
+                />
+                <FormField
+                  control={form.control}
+                  name="proxyLocation"
+                  render={({ field }) => {
+                    return (
+                      <FormItem>
+                        <div className="flex gap-16">
+                          <FormLabel>
+                            <div className="w-72">
+                              <div className="flex items-center gap-2 text-lg">
+                                Proxy Location
+                              </div>
+                              <h2 className="text-sm text-slate-400">
+                                Route Skyvern through one of our available
+                                proxies.
+                              </h2>
+                            </div>
+                          </FormLabel>
+                          <div className="w-full space-y-2">
+                            <FormControl>
+                              <ProxySelector
+                                value={field.value}
+                                onChange={field.onChange}
+                                className="w-48"
+                              />
+                            </FormControl>
+                            <FormMessage />
+                          </div>
+                        </div>
+                      </FormItem>
+                    );
+                  }}
                 />
                 <Separator />
                 <FormField

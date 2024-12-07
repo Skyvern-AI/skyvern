@@ -1,3 +1,4 @@
+import { ProxyLocation } from "@/api/types";
 import { z } from "zod";
 
 const createNewTaskFormSchemaBase = z.object({
@@ -13,12 +14,12 @@ const createNewTaskFormSchemaBase = z.object({
   totpVerificationUrl: z.string().or(z.null()),
   totpIdentifier: z.string().or(z.null()),
   errorCodeMapping: z.string().or(z.null()),
+  proxyLocation: z.nativeEnum(ProxyLocation).or(z.null()),
 });
 
 const savedTaskFormSchemaBase = createNewTaskFormSchemaBase.extend({
   title: z.string().min(1, "Title is required"),
   description: z.string(),
-  proxyLocation: z.string().or(z.null()),
 });
 
 function refineTaskFormValues(

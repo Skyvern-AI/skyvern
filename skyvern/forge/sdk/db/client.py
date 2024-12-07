@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from skyvern.config import settings
 from skyvern.exceptions import WorkflowParameterNotFound
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import (
     ActionModel,
@@ -49,7 +49,8 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_workflow_run_output_parameter,
     convert_to_workflow_run_parameter,
 )
-from skyvern.forge.sdk.models import Organization, OrganizationAuthToken, Step, StepStatus
+from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.tasks import OrderBy, ProxyLocation, SortDirection, Task, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
@@ -74,18 +75,31 @@ from skyvern.webeye.actions.models import AgentStepOutput
 
 LOG = structlog.get_logger()
 
+DB_CONNECT_ARGS: dict[str, Any] = {}
+
+if "postgresql+psycopg" in settings.DATABASE_STRING:
+    DB_CONNECT_ARGS = {"options": f"-c statement_timeout={settings.DATABASE_STATEMENT_TIMEOUT_MS}"}
+elif "postgresql+asyncpg" in settings.DATABASE_STRING:
+    DB_CONNECT_ARGS = {"server_settings": {"statement_timeout": str(settings.DATABASE_STATEMENT_TIMEOUT_MS)}}
+
 
 class AgentDB:
     def __init__(self, database_string: str, debug_enabled: bool = False) -> None:
         super().__init__()
         self.debug_enabled = debug_enabled
-        self.engine = create_async_engine(database_string, json_serializer=_custom_json_serializer)
+        self.engine = create_async_engine(
+            database_string,
+            json_serializer=_custom_json_serializer,
+            connect_args=DB_CONNECT_ARGS,
+        )
         self.Session = async_sessionmaker(bind=self.engine)
 
     async def create_task(
         self,
         url: str,
         title: str | None,
+        complete_criterion: str | None,
+        terminate_criterion: str | None,
         navigation_goal: str | None,
         data_extraction_goal: str | None,
         navigation_payload: dict[str, Any] | list | str | None,
@@ -100,17 +114,22 @@ class AgentDB:
         retry: int | None = None,
         max_steps_per_run: int | None = None,
         error_code_mapping: dict[str, str] | None = None,
+        task_type: str = TaskType.general,
+        application: str | None = None,
     ) -> Task:
         try:
             async with self.Session() as session:
                 new_task = TaskModel(
                     status="created",
+                    task_type=task_type,
                     url=url,
                     title=title,
                     webhook_callback_url=webhook_callback_url,
                     totp_verification_url=totp_verification_url,
                     totp_identifier=totp_identifier,
                     navigation_goal=navigation_goal,
+                    complete_criterion=complete_criterion,
+                    terminate_criterion=terminate_criterion,
                     data_extraction_goal=data_extraction_goal,
                     navigation_payload=navigation_payload,
                     organization_id=organization_id,
@@ -121,6 +140,7 @@ class AgentDB:
                     retry=retry,
                     max_steps_per_run=max_steps_per_run,
                     error_code_mapping=error_code_mapping,
+                    application=application,
                 )
                 session.add(new_task)
                 await session.commit()
@@ -461,6 +481,7 @@ class AgentDB:
         workflow_run_id: str | None = None,
         organization_id: str | None = None,
         only_standalone_tasks: bool = False,
+        application: str | None = None,
         order_by_column: OrderBy = OrderBy.created_at,
         order: SortDirection = SortDirection.desc,
     ) -> list[Task]:
@@ -488,6 +509,8 @@ class AgentDB:
                     query = query.filter(TaskModel.workflow_run_id == workflow_run_id)
                 if only_standalone_tasks:
                     query = query.filter(TaskModel.workflow_run_id.is_(None))
+                if application:
+                    query = query.filter(TaskModel.application == application)
                 order_by_col = getattr(TaskModel, order_by_column)
                 query = (
                     query.order_by(order_by_col.desc() if order == SortDirection.desc else order_by_col.asc())
@@ -1083,13 +1106,16 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
-    async def update_workflow_run(self, workflow_run_id: str, status: WorkflowRunStatus) -> WorkflowRun | None:
+    async def update_workflow_run(
+        self, workflow_run_id: str, status: WorkflowRunStatus, failure_reason: str | None = None
+    ) -> WorkflowRun | None:
         async with self.Session() as session:
             workflow_run = (
                 await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
             ).first()
             if workflow_run:
                 workflow_run.status = status
+                workflow_run.failure_reason = failure_reason
                 await session.commit()
                 await session.refresh(workflow_run)
                 return convert_to_workflow_run(workflow_run)

@@ -1,5 +1,6 @@
 import structlog
 
+from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.exceptions import (
     DuplicateLLMConfigError,
     InvalidLLMConfigError,
@@ -7,7 +8,6 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     NoProviderEnabledError,
 )
 from skyvern.forge.sdk.api.llm.models import LiteLLMParams, LLMConfig, LLMRouterConfig
-from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.get_logger()
 
@@ -46,17 +46,18 @@ class LLMConfigRegistry:
 # if none of the LLM providers are enabled, raise an error
 if not any(
     [
-        SettingsManager.get_settings().ENABLE_OPENAI,
-        SettingsManager.get_settings().ENABLE_ANTHROPIC,
-        SettingsManager.get_settings().ENABLE_AZURE,
-        SettingsManager.get_settings().ENABLE_AZURE_GPT4O_MINI,
-        SettingsManager.get_settings().ENABLE_BEDROCK,
+        settings.ENABLE_OPENAI,
+        settings.ENABLE_ANTHROPIC,
+        settings.ENABLE_AZURE,
+        settings.ENABLE_AZURE_GPT4O_MINI,
+        settings.ENABLE_BEDROCK,
+        settings.ENABLE_GEMINI,
     ]
 ):
     raise NoProviderEnabledError()
 
 
-if SettingsManager.get_settings().ENABLE_OPENAI:
+if settings.ENABLE_OPENAI:
     LLMConfigRegistry.register_config(
         "OPENAI_GPT4_TURBO",
         LLMConfig(
@@ -103,7 +104,7 @@ if SettingsManager.get_settings().ENABLE_OPENAI:
     )
 
 
-if SettingsManager.get_settings().ENABLE_ANTHROPIC:
+if settings.ENABLE_ANTHROPIC:
     LLMConfigRegistry.register_config(
         "ANTHROPIC_CLAUDE3",
         LLMConfig(
@@ -151,7 +152,7 @@ if SettingsManager.get_settings().ENABLE_ANTHROPIC:
         ),
     )
 
-if SettingsManager.get_settings().ENABLE_BEDROCK:
+if settings.ENABLE_BEDROCK:
     # Supported through AWS IAM authentication
     LLMConfigRegistry.register_config(
         "BEDROCK_ANTHROPIC_CLAUDE3_OPUS",
@@ -189,12 +190,49 @@ if SettingsManager.get_settings().ENABLE_BEDROCK:
             add_assistant_prefix=True,
         ),
     )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_INFERENCE_PROFILE",
+        LLMConfig(
+            "bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_V1",
+        LLMConfig(
+            "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_AMAZON_NOVA_PRO",
+        LLMConfig(
+            "bedrock/us.amazon.nova-pro-v1:0",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_AMAZON_NOVA_LITE",
+        LLMConfig(
+            "bedrock/us.amazon.nova-lite-v1:0",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+        ),
+    )
 
-if SettingsManager.get_settings().ENABLE_AZURE:
+
+if settings.ENABLE_AZURE:
     LLMConfigRegistry.register_config(
         "AZURE_OPENAI",
         LLMConfig(
-            f"azure/{SettingsManager.get_settings().AZURE_DEPLOYMENT}",
+            f"azure/{settings.AZURE_DEPLOYMENT}",
             [
                 "AZURE_DEPLOYMENT",
                 "AZURE_API_KEY",
@@ -206,11 +244,11 @@ if SettingsManager.get_settings().ENABLE_AZURE:
         ),
     )
 
-if SettingsManager.get_settings().ENABLE_AZURE_GPT4O_MINI:
+if settings.ENABLE_AZURE_GPT4O_MINI:
     LLMConfigRegistry.register_config(
         "AZURE_OPENAI_GPT4O_MINI",
         LLMConfig(
-            f"azure/{SettingsManager.get_settings().AZURE_GPT4O_MINI_DEPLOYMENT}",
+            f"azure/{settings.AZURE_GPT4O_MINI_DEPLOYMENT}",
             [
                 "AZURE_GPT4O_MINI_DEPLOYMENT",
                 "AZURE_GPT4O_MINI_API_KEY",
@@ -218,12 +256,34 @@ if SettingsManager.get_settings().ENABLE_AZURE_GPT4O_MINI:
                 "AZURE_GPT4O_MINI_API_VERSION",
             ],
             litellm_params=LiteLLMParams(
-                api_base=SettingsManager.get_settings().AZURE_GPT4O_MINI_API_BASE,
-                api_key=SettingsManager.get_settings().AZURE_GPT4O_MINI_API_KEY,
-                api_version=SettingsManager.get_settings().AZURE_GPT4O_MINI_API_VERSION,
+                api_base=settings.AZURE_GPT4O_MINI_API_BASE,
+                api_key=settings.AZURE_GPT4O_MINI_API_KEY,
+                api_version=settings.AZURE_GPT4O_MINI_API_VERSION,
                 model_info={"model_name": "azure/gpt-4o-mini"},
             ),
             supports_vision=True,
             add_assistant_prefix=False,
+        ),
+    )
+
+if settings.ENABLE_GEMINI:
+    LLMConfigRegistry.register_config(
+        "GEMINI_PRO",
+        LLMConfig(
+            "gemini/gemini-1.5-pro",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_output_tokens=8192,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "GEMINI_FLASH",
+        LLMConfig(
+            "gemini/gemini-1.5-flash",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_output_tokens=8192,
         ),
     )

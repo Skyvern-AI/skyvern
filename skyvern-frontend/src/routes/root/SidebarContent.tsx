@@ -22,7 +22,7 @@ function SidebarContent({ useCollapsedState }: Props) {
           {collapsed ? <LogoMinimized /> : <Logo />}
         </div>
       </Link>
-      <SideNav collapsed={collapsed} />
+      <SideNav />
       <div
         className={cn("mt-auto flex min-h-16", {
           "justify-center": collapsed,

@@ -81,7 +81,8 @@
         "workflows/creating-workflows",
         "workflows/getting-workflows",
         "workflows/running-workflows",
-        "workflows/workflow-blocks"
+        "workflows/workflow-blocks",
+        "workflows/what-is-a-parameter"
       ]
     },
     {

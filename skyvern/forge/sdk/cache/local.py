@@ -1,4 +1,5 @@
-from typing import Any
+from datetime import timedelta
+from typing import Any, Union
 
 from cachetools import TTLCache
 
@@ -13,8 +14,7 @@ class LocalCache(BaseCache):
         if key not in self.cache:
             return None
         value = self.cache[key]
-        await self.set(key, value)
         return value
 
-    async def set(self, key: str, value: Any) -> None:
+    async def set(self, key: str, value: Any, ex: Union[int, timedelta, None] = CACHE_EXPIRE_TIME) -> None:
         self.cache[key] = value

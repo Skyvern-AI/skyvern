@@ -10,7 +10,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { basicTimeFormat } from "@/util/timeFormat";
+import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { LatestScreenshot } from "./LatestScreenshot";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
@@ -31,7 +31,7 @@ function RunningTasks() {
         })
         .then((response) => response.data);
     },
-    refetchOnMount: true,
+    refetchOnMount: "always",
   });
 
   if (runningTasks?.length === 0) {
@@ -70,7 +70,9 @@ function RunningTasks() {
             <LatestScreenshot id={task.task_id} />
           </div>
         </CardContent>
-        <CardFooter>Created: {basicTimeFormat(task.created_at)}</CardFooter>
+        <CardFooter title={basicTimeFormat(task.created_at)}>
+          Created: {basicLocalTimeFormat(task.created_at)}
+        </CardFooter>
       </Card>
     );
   });

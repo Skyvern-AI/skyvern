@@ -1,3 +1,5 @@
+import { ProxyLocation } from "@/api/types";
+
 export type WorkflowParameterBase = {
   parameter_type: WorkflowParameterType;
   key: string;
@@ -101,6 +103,23 @@ export type Parameter =
   | BitwardenSensitiveInformationParameter
   | AWSSecretParameter;
 
+export type WorkflowBlock =
+  | TaskBlock
+  | ForLoopBlock
+  | TextPromptBlock
+  | CodeBlock
+  | UploadToS3Block
+  | DownloadToS3Block
+  | SendEmailBlock
+  | FileURLParserBlock
+  | ValidationBlock
+  | ActionBlock
+  | NavigationBlock
+  | ExtractionBlock
+  | LoginBlock
+  | WaitBlock
+  | FileDownloadBlock;
+
 export const WorkflowBlockType = {
   Task: "task",
   ForLoop: "for_loop",
@@ -110,7 +129,14 @@ export const WorkflowBlockType = {
   UploadToS3: "upload_to_s3",
   SendEmail: "send_email",
   FileURLParser: "file_url_parser",
-};
+  Validation: "validation",
+  Action: "action",
+  Navigation: "navigation",
+  Extraction: "extraction",
+  Login: "login",
+  Wait: "wait",
+  FileDownload: "file_download",
+} as const;
 
 export type WorkflowBlockType =
   (typeof WorkflowBlockType)[keyof typeof WorkflowBlockType];
@@ -189,15 +215,91 @@ export type FileURLParserBlock = WorkflowBlockBase & {
   file_type: "csv";
 };
 
-export type WorkflowBlock =
-  | TaskBlock
-  | ForLoopBlock
-  | TextPromptBlock
-  | CodeBlock
-  | UploadToS3Block
-  | DownloadToS3Block
-  | SendEmailBlock
-  | FileURLParserBlock;
+export type ValidationBlock = WorkflowBlockBase & {
+  block_type: "validation";
+  complete_criterion: string | null;
+  terminate_criterion: string | null;
+  error_code_mapping: Record<string, string> | null;
+  parameters: Array<WorkflowParameter>;
+};
+
+export type ActionBlock = WorkflowBlockBase & {
+  block_type: "action";
+  url: string | null;
+  title: string;
+  navigation_goal: string | null;
+  error_code_mapping: Record<string, string> | null;
+  max_retries?: number;
+  max_steps_per_run?: number | null;
+  parameters: Array<WorkflowParameter>;
+  complete_on_download?: boolean;
+  download_suffix?: string | null;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
+  cache_actions: boolean;
+};
+
+export type NavigationBlock = WorkflowBlockBase & {
+  block_type: "navigation";
+  url: string | null;
+  title: string;
+  navigation_goal: string | null;
+  error_code_mapping: Record<string, string> | null;
+  max_retries?: number;
+  max_steps_per_run?: number | null;
+  parameters: Array<WorkflowParameter>;
+  complete_on_download?: boolean;
+  download_suffix?: string | null;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
+  cache_actions: boolean;
+};
+
+export type ExtractionBlock = WorkflowBlockBase & {
+  block_type: "extraction";
+  data_extraction_goal: string | null;
+  url: string | null;
+  title: string;
+  data_schema: Record<string, unknown> | null;
+  max_retries?: number;
+  max_steps_per_run?: number | null;
+  parameters: Array<WorkflowParameter>;
+  cache_actions: boolean;
+};
+
+export type LoginBlock = WorkflowBlockBase & {
+  block_type: "login";
+  url: string | null;
+  title: string;
+  navigation_goal: string | null;
+  error_code_mapping: Record<string, string> | null;
+  max_retries?: number;
+  max_steps_per_run?: number | null;
+  parameters: Array<WorkflowParameter>;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
+  cache_actions: boolean;
+};
+
+export type WaitBlock = WorkflowBlockBase & {
+  block_type: "wait";
+  wait_sec?: number;
+};
+
+export type FileDownloadBlock = WorkflowBlockBase & {
+  block_type: "file_download";
+  url: string | null;
+  title: string;
+  navigation_goal: string | null;
+  error_code_mapping: Record<string, string> | null;
+  max_retries?: number;
+  max_steps_per_run?: number | null;
+  download_suffix?: string | null;
+  parameters: Array<WorkflowParameter>;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
+  cache_actions: boolean;
+};
 
 export type WorkflowDefinition = {
   parameters: Array<Parameter>;
@@ -213,12 +315,20 @@ export type WorkflowApiResponse = {
   version: number;
   description: string;
   workflow_definition: WorkflowDefinition;
-  proxy_location: string;
-  webhook_callback_url: string;
-  totp_verification_url: string;
+  proxy_location: ProxyLocation | null;
+  webhook_callback_url: string | null;
+  persist_browser_session: boolean;
+  totp_verification_url: string | null;
+  totp_identifier: string | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
+};
+
+export type WorkflowSettings = {
+  proxyLocation: ProxyLocation | null;
+  webhookCallbackUrl: string | null;
+  persistBrowserSession: boolean;
 };
 
 export function isOutputParameter(

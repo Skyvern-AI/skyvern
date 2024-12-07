@@ -5,34 +5,37 @@ import os
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, List
 
+import pyotp
 import structlog
-from deprecation import deprecated
 from playwright.async_api import FileChooser, Frame, Locator, Page, TimeoutError
 from pydantic import BaseModel
 
-from skyvern.constants import REPO_ROOT_DIR, SKYVERN_ID_ATTR
+from skyvern.config import settings
+from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, REPO_ROOT_DIR, SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     EmptySelect,
     ErrEmptyTweakValue,
     ErrFoundSelectableElement,
     FailedToFetchSecret,
     FailToClick,
-    FailToFindAutocompleteOption,
     FailToSelectByIndex,
-    FailToSelectByLabel,
     FailToSelectByValue,
     IllegitComplete,
     ImaginaryFileUrl,
     InteractWithDisabledElement,
     InvalidElementForTextInput,
     MissingElement,
+    MissingElementDict,
+    MissingElementInCSSMap,
     MissingFileUrl,
     MultipleElementsFound,
     NoAutoCompleteOptionMeetCondition,
     NoAvailableOptionFoundForCustomSelection,
     NoElementMatchedForTargetOption,
+    NoFileDownloadTriggered,
     NoIncrementalElementFoundForAutoCompletion,
     NoIncrementalElementFoundForCustomSelection,
     NoSuitableAutoCompleteOption,
@@ -41,18 +44,13 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.files import (
-    download_file,
-    get_number_of_files_in_directory,
-    get_path_for_workflow_download_directory,
-)
+from skyvern.forge.sdk.api.files import download_file, get_download_dir, list_files_in_directory
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_post
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
-from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.actions import actions
 from skyvern.webeye.actions.actions import (
     Action,
@@ -73,6 +71,7 @@ from skyvern.webeye.scraper.scraper import (
     ElementTreeFormat,
     IncrementalScrapePage,
     ScrapedPage,
+    hash_element,
     json_to_html,
     trim_element_tree,
 )
@@ -170,6 +169,7 @@ def clean_and_remove_element_tree_factory(
         )
         for check_exist in check_exist_funcs:
             element_tree = remove_exist_elements(element_tree=element_tree, check_exist=check_exist)
+
         return element_tree
 
     return helper_func
@@ -249,7 +249,7 @@ class ActionHandler:
                 handler = ActionHandler._handled_action_types[action.action_type]
                 results = await handler(action, page, scraped_page, task, step)
                 actions_result.extend(results)
-                if not results or type(actions_result[-1]) != ActionSuccess:
+                if not results or not isinstance(actions_result[-1], ActionSuccess):
                     return actions_result
 
                 # do the teardown
@@ -335,16 +335,6 @@ async def handle_click_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    num_downloaded_files_before = 0
-    download_dir = None
-    if task.workflow_run_id:
-        download_dir = get_path_for_workflow_download_directory(task.workflow_run_id)
-        num_downloaded_files_before = get_number_of_files_in_directory(download_dir)
-        LOG.info(
-            "Number of files in download directory before click",
-            num_downloaded_files_before=num_downloaded_files_before,
-            download_dir=download_dir,
-        )
     dom = DomUtil(scraped_page=scraped_page, page=page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     await asyncio.sleep(0.3)
@@ -365,7 +355,7 @@ async def handle_click_action(
 
     new_page = None
     if action.download:
-        results, new_page = await handle_click_to_download_file_action(action, page, scraped_page, task)
+        results, new_page = await handle_click_to_download_file_action(action, page, scraped_page, task, step)
     else:
         results = await chain_click(
             task,
@@ -373,7 +363,7 @@ async def handle_click_action(
             page,
             action,
             skyvern_element,
-            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
         )
 
     if results and task.workflow_run_id and download_dir:
@@ -405,25 +395,108 @@ async def handle_click_to_download_file_action(
     page: Page,
     scraped_page: ScrapedPage,
     task: Task,
+    step: Step,
 ) -> list[ActionResult]:
     dom = DomUtil(scraped_page=scraped_page, page=page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     locator = skyvern_element.locator
 
+    download_dir = Path(get_download_dir(workflow_run_id=task.workflow_run_id, task_id=task.task_id))
+    list_files_before = list_files_in_directory(download_dir)
+    LOG.info(
+        "Number of files in download directory before click",
+        num_downloaded_files_before=len(list_files_before),
+        download_dir=download_dir,
+        task_id=task.task_id,
+        step_id=step.step_id,
+        workflow_run_id=task.workflow_run_id,
+    )
+
     new_page = None
     try:
         try:
             async with page.context.expect_event("page") as event_info:
-                await locator.click(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+                await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
             new_page = await event_info.value
         except TimeoutError:
             pass
-        await page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
+        await page.wait_for_load_state(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
     except Exception as e:
-        LOG.exception("ClickAction with download failed", action=action, exc_info=True)
+        LOG.exception(
+            "ClickAction with download failed",
+            exc_info=True,
+            action=action,
+            task_id=task.task_id,
+            step_id=step.step_id,
+            workflow_run_id=task.workflow_run_id,
+        )
         return [ActionFailure(e, download_triggered=False)]
 
-    return [ActionSuccess(), new_page]
+    # wait 5s to start downloading
+    LOG.info(
+        "Sleep for 5s to let download finish",
+        task_id=task.task_id,
+        step_id=step.step_id,
+        workflow_run_id=task.workflow_run_id,
+    )
+    await asyncio.sleep(5)
+    list_files_after = list_files_in_directory(download_dir)
+    LOG.info(
+        "Number of files in download directory after click",
+        num_downloaded_files_after=len(list_files_after),
+        download_dir=download_dir,
+        task_id=task.task_id,
+        step_id=step.step_id,
+        workflow_run_id=task.workflow_run_id,
+    )
+
+    if len(list_files_after) <= len(list_files_before):
+        LOG.warning(
+            "No file to download after click",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            workflow_run_id=task.workflow_run_id,
+        )
+        return [ActionFailure(exception=NoFileDownloadTriggered(action.element_id))]
+
+    # check if there's any file is still downloading
+    downloading_files: list[Path] = []
+    for file in list_files_after:
+        path = Path(file)
+        if path.suffix == ".crdownload":
+            downloading_files.append(path)
+
+    if len(downloading_files) == 0:
+        return [ActionSuccess(download_triggered=True)]
+
+    LOG.info(
+        "File downloading hasn't completed, wait for a while",
+        downloading_files=downloading_files,
+        task_id=task.task_id,
+        step_id=step.step_id,
+        workflow_run_id=task.workflow_run_id,
+    )
+    try:
+        async with asyncio.timeout(BROWSER_DOWNLOAD_TIMEOUT):
+            while len(downloading_files) > 0:
+                new_downloading_files: list[Path] = []
+                for path in downloading_files:
+                    if not path.exists():
+                        continue
+                    new_downloading_files.append(path)
+                downloading_files = new_downloading_files
+                await asyncio.sleep(1)
+
+    except asyncio.TimeoutError:
+        LOG.warning(
+            "There're several long-time downloading files, these files might be broken",
+            downloading_files=downloading_files,
+            task_id=task.task_id,
+            step_id=step.step_id,
+            workflow_run_id=task.workflow_run_id,
+        )
+
+    return [ActionSuccess(download_triggered=True), new_page]
 
 
 async def handle_download_potential_pdf_file_action(
@@ -474,7 +547,7 @@ async def handle_input_text_action(
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
     incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
-    timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    timeout = settings.BROWSER_ACTION_TIMEOUT_MS
 
     current_text = await get_input_value(skyvern_element.get_tag_name(), skyvern_element.get_locator())
     if current_text == action.text:
@@ -498,6 +571,7 @@ async def handle_input_text_action(
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
     incremental_element: list[dict] = []
+    auto_complete_hacky_flag: bool = False
     # check if it's selectable
     if skyvern_element.get_tag_name() == InteractiveElement.INPUT and not await skyvern_element.is_raw_input():
         select_action = SelectOptionAction(
@@ -546,6 +620,7 @@ async def handle_input_text_action(
             )
             await incremental_scraped.stop_listen_dom_increment()
         else:
+            auto_complete_hacky_flag = True
             try:
                 # TODO: we don't select by value for the auto completion detect case
                 result, _ = await sequentially_select_from_dropdown(
@@ -602,23 +677,52 @@ async def handle_input_text_action(
         if len(text) == 0:
             return [ActionSuccess()]
 
-        if await skyvern_element.is_auto_completion_input():
-            if result := await input_or_auto_complete_input(
-                action=action,
-                page=page,
-                dom=dom,
-                text=text,
-                skyvern_element=skyvern_element,
-                step=step,
-                task=task,
-            ):
-                return [result]
+        if not await skyvern_element.is_raw_input():
+            # parse the input context to help executing input action
+            prompt = prompt_engine.load_prompt(
+                "parse-input-or-select-context",
+                element_id=action.element_id,
+                action_reasoning=action.reasoning,
+                elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
+            )
 
-        await skyvern_element.input_sequentially(text=text)
+            json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+            input_or_select_context = InputOrSelectContext.model_validate(json_response)
+            LOG.info(
+                "Parsed input/select context",
+                context=input_or_select_context,
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+
+            if await skyvern_element.is_auto_completion_input() or input_or_select_context.is_location_input:
+                if result := await input_or_auto_complete_input(
+                    input_or_select_context=input_or_select_context,
+                    page=page,
+                    dom=dom,
+                    text=text,
+                    skyvern_element=skyvern_element,
+                    step=step,
+                    task=task,
+                ):
+                    return [result]
+
+        await incremental_scraped.start_listen_dom_increment()
+
+        try:
+            await skyvern_element.input_sequentially(text=text)
+        finally:
+            incremental_element = await incremental_scraped.get_incremental_element_tree(
+                clean_and_remove_element_tree_factory(task=task, step=step, check_exist_funcs=[dom.check_id_in_dom]),
+            )
+            if len(incremental_element) > 0:
+                auto_complete_hacky_flag = True
+            await incremental_scraped.stop_listen_dom_increment()
+
         return [ActionSuccess()]
     finally:
         # HACK: force to finish missing auto completion input
-        if len(incremental_element) > 0:
+        if auto_complete_hacky_flag:
             LOG.debug(
                 "Trigger input-selection hack, pressing Tab to choose one",
                 action=action,
@@ -642,7 +746,12 @@ async def handle_upload_file_action(
     # ************************************************************************************************************** #
     file_url = await get_actual_value_of_parameter_if_secret(task, action.file_url)
     decoded_url = urllib.parse.unquote(file_url)
-    if file_url not in str(task.navigation_payload) and decoded_url not in str(task.navigation_payload):
+    if (
+        file_url not in str(task.navigation_payload)
+        and file_url not in str(task.navigation_goal)
+        and decoded_url not in str(task.navigation_payload)
+        and decoded_url not in str(task.navigation_goal)
+    ):
         LOG.warning(
             "LLM might be imagining the file url, which is not in navigation payload",
             action=action,
@@ -674,7 +783,7 @@ async def handle_upload_file_action(
         if file_path:
             await locator.set_input_files(
                 file_path,
-                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
             )
 
             # Sleep for 10 seconds after uploading a file to let the page process it
@@ -693,11 +802,11 @@ async def handle_upload_file_action(
             page,
             action,
             skyvern_element,
-            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
         )
 
 
-@deprecated("This function is deprecated. Downloads are handled by the click action handler now.")
+# This function is deprecated. Downloads are handled by the click action handler now.
 async def handle_download_file_action(
     action: actions.DownloadFileAction,
     page: Page,
@@ -717,7 +826,7 @@ async def handle_download_file_action(
 
             locator = skyvern_element.locator
             await locator.click(
-                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
                 modifiers=["Alt"],
             )
 
@@ -827,7 +936,7 @@ async def handle_select_option_action(
             task_id=task.task_id,
             step_id=step.step_id,
         )
-        return await normal_select(action=action, skyvern_element=skyvern_element)
+        return await normal_select(action=action, skyvern_element=skyvern_element, dom=dom, task=task, step=step)
 
     if await skyvern_element.is_checkbox():
         LOG.info(
@@ -865,7 +974,7 @@ async def handle_select_option_action(
         action=action,
     )
 
-    timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    timeout = settings.BROWSER_ACTION_TIMEOUT_MS
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
     incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
     is_open = False
@@ -888,9 +997,9 @@ async def handle_select_option_action(
             await skyvern_element.scroll_into_view()
             await skyvern_element.press_key("ArrowDown")
 
-            # wait 5s for options to load
-            await asyncio.sleep(5)
-            is_open = True
+        # wait 5s for options to load
+        await asyncio.sleep(5)
+        is_open = True
 
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(task=task, step=step, check_exist_funcs=[dom.check_id_in_dom]),
@@ -953,7 +1062,7 @@ async def handle_select_option_action(
     )
     try:
         await incremental_scraped.start_listen_dom_increment()
-        timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+        timeout = settings.BROWSER_ACTION_TIMEOUT_MS
         await skyvern_element.scroll_into_view()
 
         try:
@@ -1017,9 +1126,9 @@ async def handle_checkbox_action(
     locator = skyvern_element.locator
 
     if action.is_checked:
-        await locator.check(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+        await locator.check(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
     else:
-        await locator.uncheck(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+        await locator.uncheck(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
 
     # TODO (suchintan): Why does checking the label work, but not the actual input element?
     return [ActionSuccess()]
@@ -1054,10 +1163,15 @@ async def handle_complete_action(
     step: Step,
 ) -> list[ActionResult]:
     # If this action has a source_action_id, then we need to make sure if the goal is actually completed.
-    if action.source_action_id:
-        LOG.info("CompleteAction has source_action_id, checking if goal is completed")
-        complete_action = await app.agent.check_user_goal_complete(page, scraped_page, task, step)
-        if complete_action is None:
+    if action.source_action_id and task.navigation_goal:
+        LOG.info(
+            "CompleteAction has source_action_id, checking if goal is completed",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            workflow_run_id=task.workflow_run_id,
+        )
+        verified_complete_action = await app.agent.check_user_goal_complete(page, scraped_page, task, step)
+        if verified_complete_action is None:
             return [
                 ActionFailure(
                     exception=IllegitComplete(
@@ -1067,6 +1181,36 @@ async def handle_complete_action(
                     )
                 )
             ]
+        action.verified = True
+
+    if not action.verified and task.navigation_goal:
+        LOG.info(
+            "CompleteAction hasn't been verified, going to verify the user goal",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            workflow_run_id=task.workflow_run_id,
+        )
+        try:
+            verification_result = await app.agent.complete_verify(page, scraped_page, task, step)
+        except Exception as e:
+            LOG.exception(
+                "Failed to verify the complete action",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                workflow_run_id=task.workflow_run_id,
+            )
+            return [ActionFailure(exception=e)]
+
+        if not verification_result.user_goal_achieved:
+            return [ActionFailure(exception=IllegitComplete(data={"error": verification_result.thoughts}))]
+
+        LOG.info(
+            "CompleteAction has been verified successfully",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            workflow_run_id=task.workflow_run_id,
+        )
+        action.verified = True
 
     extracted_data = None
     if action.data_extraction_goal:
@@ -1106,8 +1250,10 @@ async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) ->
     secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
 
     if secret_value == BitwardenConstants.TOTP:
-        secrets = await workflow_run_context.get_secrets_from_password_manager()
-        secret_value = secrets[BitwardenConstants.TOTP]
+        totp_secret_key = workflow_run_context.totp_secret_value_key(parameter)
+        totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
+        totp_secret_no_whitespace = "".join(totp_secret.split())
+        secret_value = pyotp.TOTP(totp_secret_no_whitespace).now()
     return secret_value if secret_value is not None else parameter
 
 
@@ -1117,12 +1263,13 @@ async def chain_click(
     page: Page,
     action: ClickAction | UploadFileAction,
     skyvern_element: SkyvernElement,
-    timeout: int = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+    timeout: int = settings.BROWSER_ACTION_TIMEOUT_MS,
 ) -> List[ActionResult]:
     # Add a defensive page handler here in case a click action opens a file chooser.
     # This automatically dismisses the dialog
     # File choosers are impossible to close if you don't expect one. Instead of dealing with it, close it!
 
+    dom = DomUtil(scraped_page=scraped_page, page=page)
     locator = skyvern_element.locator
     # TODO (suchintan): This should likely result in an ActionFailure -- we can figure out how to do this later!
     LOG.info("Chain click starts", action=action, locator=locator)
@@ -1159,62 +1306,142 @@ async def chain_click(
         LOG.info("Chain click: main element click succeeded", action=action, locator=locator)
         return [ActionSuccess()]
 
-    except Exception:
-        action_results: list[ActionResult] = [ActionFailure(FailToClick(action.element_id))]
+    except Exception as e:
+        action_results: list[ActionResult] = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
 
         if skyvern_element.get_tag_name() == "label":
-            LOG.info(
-                "Chain click: it's a label element. going to try for-click",
-                task_id=task.task_id,
-                action=action,
-                locator=locator,
-            )
             try:
-                if bound_element := await skyvern_element.find_label_for(
-                    dom=DomUtil(scraped_page=scraped_page, page=page)
+                LOG.info(
+                    "Chain click: it's a label element. going to try for-click",
+                    task_id=task.task_id,
+                    action=action,
+                    element=str(skyvern_element),
+                    locator=locator,
+                )
+                if bound_element := await skyvern_element.find_label_for(dom=dom):
+                    await bound_element.get_locator().click(timeout=timeout)
+                    action_results.append(ActionSuccess())
+                    return action_results
+            except Exception as e:
+                action_results.append(ActionFailure(FailToClick(action.element_id, anchor="for", msg=str(e))))
+
+            try:
+                # sometimes the element is the direct chidren of the label, instead of using for="xx" attribute
+                # since it's a click action, the target element we're searching should only be INPUT
+                LOG.info(
+                    "Chain click: it's a label element. going to check for input of the direct chidren",
+                    task_id=task.task_id,
+                    action=action,
+                    element=str(skyvern_element),
+                    locator=locator,
+                )
+                if bound_element := await skyvern_element.find_element_in_label_children(
+                    dom=dom, element_type=InteractiveElement.INPUT
                 ):
                     await bound_element.get_locator().click(timeout=timeout)
                     action_results.append(ActionSuccess())
                     return action_results
-            except Exception:
-                action_results.append(ActionFailure(FailToClick(action.element_id, anchor="for")))
+            except Exception as e:
+                action_results.append(
+                    ActionFailure(FailToClick(action.element_id, anchor="direct_children", msg=str(e)))
+                )
 
-        if skyvern_element.get_tag_name() == InteractiveElement.INPUT:
+        else:
+            try:
+                LOG.info(
+                    "Chain click: it's a non-label element. going to find the bound label element by attribute id and click",
+                    task_id=task.task_id,
+                    action=action,
+                    element=str(skyvern_element),
+                    locator=locator,
+                )
+                if bound_locator := await skyvern_element.find_bound_label_by_attr_id():
+                    await bound_locator.click(timeout=timeout)
+                    action_results.append(ActionSuccess())
+                    return action_results
+            except Exception as e:
+                action_results.append(ActionFailure(FailToClick(action.element_id, anchor="attr_id", msg=str(e))))
+
+            try:
+                # sometimes the element is the direct chidren of the label, instead of using for="xx" attribute
+                # so we check the direct parent if it's a label element
+                LOG.info(
+                    "Chain click: it's a non-label element. going to find the bound label element by direct parent",
+                    task_id=task.task_id,
+                    action=action,
+                    element=str(skyvern_element),
+                    locator=locator,
+                )
+                if bound_locator := await skyvern_element.find_bound_label_by_direct_parent():
+                    await bound_locator.click(timeout=timeout)
+                    action_results.append(ActionSuccess())
+                    return action_results
+            except Exception as e:
+                action_results.append(ActionFailure(FailToClick(action.element_id, anchor="direct_parent", msg=str(e))))
+
+        if not await skyvern_element.is_visible():
             LOG.info(
-                "Chain click: it's an input element. going to try sibling click",
+                "Chain click: exit since the element is not visible on the page anymore",
                 task_id=task.task_id,
                 action=action,
+                element=str(skyvern_element),
                 locator=locator,
             )
-            sibling_action_result = await click_sibling_of_input(locator, timeout=timeout)
-            action_results.append(sibling_action_result)
-            if type(sibling_action_result) == ActionSuccess:
+            return action_results
+
+        blocking_element, blocked = await skyvern_element.find_blocking_element(
+            dom=DomUtil(scraped_page=scraped_page, page=page)
+        )
+        if blocking_element is None:
+            if not blocked:
+                LOG.info(
+                    "Chain click: exit since the element is not blocking by any element",
+                    task_id=task.task_id,
+                    action=action,
+                    element=str(skyvern_element),
+                    locator=locator,
+                )
+                return action_results
+
+            LOG.info(
+                "Chain click: element is blocked by an non-interactable element, going to use javascript click instead of playwright click",
+                task_id=task.task_id,
+                action=action,
+                element=str(skyvern_element),
+                locator=locator,
+            )
+            try:
+                await skyvern_element.click_in_javascript()
+                action_results.append(ActionSuccess())
+                return action_results
+            except Exception as e:
+                action_results.append(ActionFailure(FailToClick(action.element_id, anchor="self_js", msg=str(e))))
                 return action_results
 
         try:
-            parent_locator = locator.locator("..")
-            await parent_locator.click(timeout=timeout)
-
-            LOG.info(
-                "Chain click: successfully clicked parent element",
+            LOG.debug(
+                "Chain click: verifying the blocking element is parent or sibling of the target element",
+                task_id=task.task_id,
                 action=action,
-                parent_locator=parent_locator,
+                element=str(blocking_element),
+                locator=locator,
             )
-            action_results.append(ActionSuccess(interacted_with_parent=True))
-        except Exception:
-            LOG.warning(
-                "Failed to click parent element",
-                action=action,
-                parent_locator=parent_locator,
-                exc_info=True,
-            )
-            action_results.append(
-                ActionFailure(
-                    FailToClick(action.element_id, anchor="parent"),
-                    interacted_with_parent=True,
+            if await blocking_element.is_parent_of(
+                await skyvern_element.get_element_handler()
+            ) or await blocking_element.is_sibling_of(await skyvern_element.get_element_handler()):
+                LOG.info(
+                    "Chain click: element is blocked by other elements, going to click on the blocking element",
+                    task_id=task.task_id,
+                    action=action,
+                    element=str(blocking_element),
+                    locator=locator,
                 )
-            )
-            # We don't raise exception here because we do log the exception, and return ActionFailure as the last action
+
+                await blocking_element.get_locator().click(timeout=timeout)
+                action_results.append(ActionSuccess())
+                return action_results
+        except Exception as e:
+            action_results.append(ActionFailure(FailToClick(action.element_id, anchor="blocking_element", msg=str(e))))
 
         return action_results
     finally:
@@ -1274,9 +1501,7 @@ async def choose_auto_completion_dropdown(
             if cnt == 0:
                 continue
 
-            element_handler = await locator.element_handle(
-                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
-            )
+            element_handler = await locator.element_handle(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
             if not element_handler:
                 continue
 
@@ -1297,7 +1522,8 @@ async def choose_auto_completion_dropdown(
         if len(incremental_element) == 0:
             raise NoIncrementalElementFoundForAutoCompletion(element_id=skyvern_element.get_id(), text=text)
 
-        html = incremental_scraped.build_html_tree(incremental_element)
+        cleaned_incremental_element = remove_duplicated_HTML_element(incremental_element)
+        html = incremental_scraped.build_html_tree(cleaned_incremental_element)
         auto_completion_confirm_prompt = prompt_engine.load_prompt(
             "auto-completion-choose-option",
             field_information=context.field,
@@ -1343,7 +1569,7 @@ async def choose_auto_completion_dropdown(
         if await locator.count() == 0:
             raise MissingElement(element_id=element_id)
 
-        await locator.click(timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS)
+        await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
         clear_input = False
         return result
     except Exception as e:
@@ -1362,8 +1588,20 @@ async def choose_auto_completion_dropdown(
             await skyvern_element.input_clear()
 
 
+def remove_duplicated_HTML_element(elements: list[dict]) -> list[dict]:
+    cache_map = set()
+    new_elements: list[dict] = []
+    for element in elements:
+        key = hash_element(element=element)
+        if key in cache_map:
+            continue
+        cache_map.add(key)
+        new_elements.append(element)
+    return new_elements
+
+
 async def input_or_auto_complete_input(
-    action: actions.InputTextAction,
+    input_or_select_context: InputOrSelectContext,
     page: Page,
     dom: DomUtil,
     text: str,
@@ -1376,22 +1614,6 @@ async def input_or_auto_complete_input(
         task_id=task.task_id,
         step_id=step.step_id,
         element_id=skyvern_element.get_id(),
-    )
-
-    prompt = prompt_engine.load_prompt(
-        "parse-input-or-select-context",
-        element_id=action.element_id,
-        action_reasoning=action.reasoning,
-        elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
-    )
-
-    json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
-    input_or_select_context = InputOrSelectContext.model_validate(json_response)
-    LOG.info(
-        "Parsed input/select context",
-        context=input_or_select_context,
-        task_id=task.task_id,
-        step_id=step.step_id,
     )
 
     # 1. press the orignal text to see if there's a match
@@ -1445,6 +1667,8 @@ async def input_or_auto_complete_input(
             "auto-completion-potential-answers",
             field_information=input_or_select_context.field,
             current_value=current_value,
+            navigation_goal=task.navigation_goal,
+            navigation_payload_str=json.dumps(task.navigation_payload),
         )
 
         LOG.info(
@@ -1496,12 +1720,15 @@ async def input_or_auto_complete_input(
                 current_value=current_value,
                 current_attemp=current_attemp,
             )
+            cleaned_new_elements = remove_duplicated_HTML_element(whole_new_elements)
             prompt = prompt_engine.load_prompt(
                 "auto-completion-tweak-value",
                 field_information=input_or_select_context.field,
                 current_value=current_value,
+                navigation_goal=task.navigation_goal,
+                navigation_payload_str=json.dumps(task.navigation_payload),
                 tried_values=json.dumps(tried_values),
-                popped_up_elements="".join([json_to_html(element) for element in whole_new_elements]),
+                popped_up_elements="".join([json_to_html(element) for element in cleaned_new_elements]),
             )
             json_respone = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
             context_reasoning = json_respone.get("reasoning")
@@ -1519,7 +1746,13 @@ async def input_or_auto_complete_input(
             current_value = new_current_value
 
     else:
-        return ActionFailure(FailToFindAutocompleteOption(current_value=text))
+        LOG.warning(
+            "Auto completion didn't finish, this might leave the input value to be empty.",
+            context=input_or_select_context,
+            step_id=step.step_id,
+            task_id=task.task_id,
+        )
+        return None
 
 
 async def sequentially_select_from_dropdown(
@@ -1668,7 +1901,7 @@ async def select_from_dropdown(
     select_history = [] if select_history is None else select_history
     single_select_result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
 
-    timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    timeout = settings.BROWSER_ACTION_TIMEOUT_MS
 
     if dropdown_menu_element is None:
         dropdown_menu_element = await locate_dropdown_menu(
@@ -1780,7 +2013,7 @@ async def select_from_dropdown(
         await selected_element.get_locator().click(timeout=timeout)
         single_select_result.action_result = ActionSuccess()
         return single_select_result
-    except MissingElement:
+    except (MissingElement, MissingElementDict, MissingElementInCSSMap, MultipleElementsFound):
         if not value:
             raise
 
@@ -1819,7 +2052,7 @@ async def select_from_dropdown_by_value(
     step: Step,
     dropdown_menu_element: SkyvernElement | None = None,
 ) -> ActionResult:
-    timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    timeout = settings.BROWSER_ACTION_TIMEOUT_MS
     await incremental_scraped.get_incremental_element_tree(
         clean_and_remove_element_tree_factory(task=task, step=step, check_exist_funcs=[dom.check_id_in_dom]),
     )
@@ -1953,9 +2186,7 @@ async def locate_dropdown_menu(
 
         # sometimes taking screenshot might scroll away, need to scroll back after the screenshot
         x, y = await skyvern_frame.get_scroll_x_y()
-        screenshot = await head_element.get_locator().screenshot(
-            timeout=SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS
-        )
+        screenshot = await head_element.get_locator().screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
         await skyvern_frame.scroll_to_x_y(x, y)
 
         # TODO: better to send untrimmed HTML without skyvern attributes in the future
@@ -2031,7 +2262,7 @@ async def scroll_down_to_load_all_options(
         step_id=step.step_id if step else "none",
         task_id=task.task_id if task else "none",
     )
-    timeout = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS
+    timeout = settings.BROWSER_ACTION_TIMEOUT_MS
 
     dropdown_menu_element_handle = await scrollable_element.get_locator().element_handle(timeout=timeout)
     if dropdown_menu_element_handle is None:
@@ -2045,12 +2276,10 @@ async def scroll_down_to_load_all_options(
     scroll_pace = 0
     previous_num = await incremental_scraped.get_incremental_elements_num()
 
-    deadline = datetime.now(timezone.utc) + timedelta(
-        milliseconds=SettingsManager.get_settings().OPTION_LOADING_TIMEOUT_MS
-    )
+    deadline = datetime.now(timezone.utc) + timedelta(milliseconds=settings.OPTION_LOADING_TIMEOUT_MS)
     while datetime.now(timezone.utc) < deadline:
         # make sure we can scroll to the bottom
-        scroll_interval = SettingsManager.get_settings().BROWSER_HEIGHT * 5
+        scroll_interval = settings.BROWSER_HEIGHT * 5
         if dropdown_menu_element_handle is None:
             LOG.info("element handle is None, using mouse to scroll down", element_id=scrollable_element.get_id())
             await page.mouse.wheel(0, scroll_interval)
@@ -2095,6 +2324,9 @@ async def scroll_down_to_load_all_options(
 async def normal_select(
     action: actions.SelectOptionAction,
     skyvern_element: SkyvernElement,
+    dom: DomUtil,
+    task: Task,
+    step: Step,
 ) -> List[ActionResult]:
     try:
         current_text = await skyvern_element.get_attr("selected")
@@ -2107,12 +2339,42 @@ async def normal_select(
     is_success = False
     locator = skyvern_element.get_locator()
 
+    prompt = prompt_engine.load_prompt(
+        "parse-input-or-select-context",
+        action_reasoning=action.reasoning,
+        element_id=action.element_id,
+        elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
+    )
+    json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+    input_or_select_context = InputOrSelectContext.model_validate(json_response)
+    LOG.info(
+        "Parsed input/select context",
+        context=input_or_select_context,
+        task_id=task.task_id,
+        step_id=step.step_id,
+    )
+
+    options_html = skyvern_element.build_HTML()
+
+    prompt = prompt_engine.load_prompt(
+        "normal-select",
+        field_information=input_or_select_context.field,
+        required_field=input_or_select_context.is_required,
+        navigation_goal=task.navigation_goal,
+        navigation_payload_str=json.dumps(task.navigation_payload),
+        options=options_html,
+    )
+
+    json_response = await app.LLM_API_HANDLER(prompt=prompt, step=step)
+    index: int | None = json_response.get("index")
+    value: str | None = json_response.get("value")
+
     try:
         await locator.click(
-            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
         )
     except Exception as e:
-        LOG.error(
+        LOG.info(
             "Failed to click before select action",
             exc_info=True,
             action=action,
@@ -2121,46 +2383,28 @@ async def normal_select(
         action_result.append(ActionFailure(e))
         return action_result
 
-    if not is_success and action.option.label is not None:
-        try:
-            # First click by label (if it matches)
-            await locator.select_option(
-                label=action.option.label,
-                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
-            )
-            is_success = True
-            action_result.append(ActionSuccess())
-        except Exception:
-            action_result.append(ActionFailure(FailToSelectByLabel(action.element_id)))
-            LOG.error(
-                "Failed to take select action by label",
-                exc_info=True,
-                action=action,
-                locator=locator,
-            )
-
-    if not is_success and action.option.value is not None:
+    if not is_success and value is not None:
         try:
             # click by value (if it matches)
             await locator.select_option(
-                value=action.option.value,
-                timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+                value=value,
+                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
             )
             is_success = True
             action_result.append(ActionSuccess())
         except Exception:
             action_result.append(ActionFailure(FailToSelectByValue(action.element_id)))
-            LOG.error(
+            LOG.info(
                 "Failed to take select action by value",
                 exc_info=True,
                 action=action,
                 locator=locator,
             )
 
-    if not is_success and action.option.index is not None:
-        if action.option.index >= len(skyvern_element.get_options()):
+    if not is_success and index is not None:
+        if index >= len(skyvern_element.get_options()):
             action_result.append(ActionFailure(OptionIndexOutOfBound(action.element_id)))
-            LOG.error(
+            LOG.info(
                 "option index is out of bound",
                 action=action,
                 locator=locator,
@@ -2169,14 +2413,14 @@ async def normal_select(
             try:
                 # This means the supplied index was for the select element, not a reference to the css dict
                 await locator.select_option(
-                    index=action.option.index,
-                    timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+                    index=index,
+                    timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
                 )
                 is_success = True
                 action_result.append(ActionSuccess())
             except Exception:
                 action_result.append(ActionFailure(FailToSelectByIndex(action.element_id)))
-                LOG.error(
+                LOG.info(
                     "Failed to click on the option by index",
                     exc_info=True,
                     action=action,
@@ -2185,10 +2429,10 @@ async def normal_select(
 
     try:
         await locator.click(
-            timeout=SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
         )
     except Exception as e:
-        LOG.error(
+        LOG.info(
             "Failed to click after select action",
             exc_info=True,
             action=action,
@@ -2248,35 +2492,6 @@ def get_checkbox_id_in_label_children(scraped_page: ScrapedPage, element_id: str
     return None
 
 
-async def click_sibling_of_input(
-    locator: Locator,
-    timeout: int,
-) -> ActionResult:
-    try:
-        input_element = locator.first
-        parent_locator = locator.locator("..")
-        if input_element:
-            input_id = await input_element.get_attribute("id")
-            sibling_label_css = f'label[for="{input_id}"]'
-            label_locator = parent_locator.locator(sibling_label_css)
-            await label_locator.click(timeout=timeout)
-            LOG.info(
-                "Successfully clicked sibling label of input element",
-                sibling_label_css=sibling_label_css,
-            )
-            return ActionSuccess(interacted_with_sibling=True)
-        # Should never get here
-        return ActionFailure(
-            exception=Exception("Failed while trying to click sibling of input element"),
-            interacted_with_sibling=True,
-        )
-    except Exception:
-        LOG.warning("Failed to click sibling label of input element", exc_info=True)
-        return ActionFailure(
-            exception=Exception("Failed while trying to click sibling of input element"),
-        )
-
-
 async def extract_information_for_navigation_goal(
     task: Task,
     step: Step,
@@ -2293,6 +2508,7 @@ async def extract_information_for_navigation_goal(
     element_tree_format = ElementTreeFormat.HTML
     element_tree_in_prompt: str = scraped_page.build_element_tree(element_tree_format)
 
+    scraped_page_refreshed = await scraped_page.refresh()
     extract_information_prompt = prompt_engine.load_prompt(
         prompt_template,
         navigation_goal=task.navigation_goal,
@@ -2300,8 +2516,8 @@ async def extract_information_for_navigation_goal(
         elements=element_tree_in_prompt,
         data_extraction_goal=task.data_extraction_goal,
         extracted_information_schema=task.extracted_information_schema,
-        current_url=scraped_page.url,
-        extracted_text=scraped_page.extracted_text,
+        current_url=scraped_page_refreshed.url,
+        extracted_text=scraped_page_refreshed.extracted_text,
         error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
         utc_datetime=datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
     )
@@ -2369,7 +2585,7 @@ async def poll_verification_code(
     totp_verification_url: str | None = None,
     totp_identifier: str | None = None,
 ) -> str | None:
-    timeout = timedelta(minutes=SettingsManager.get_settings().VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
+    timeout = timedelta(minutes=settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
     start_datetime = datetime.utcnow()
     timeout_datetime = start_datetime + timeout
     org_token = await app.DATABASE.get_valid_org_auth_token(organization_id, OrganizationAuthTokenType.api)
@@ -2377,7 +2593,7 @@ async def poll_verification_code(
         LOG.error("Failed to get organization token when trying to get verification code")
         return None
     # wait for 40 seconds to let the verification code comes in before polling
-    await asyncio.sleep(SettingsManager.get_settings().VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS)
+    await asyncio.sleep(settings.VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS)
     while True:
         # check timeout
         if datetime.utcnow() > timeout_datetime:

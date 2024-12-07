@@ -17,7 +17,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase
 
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
 from skyvern.forge.sdk.db.id import (
     generate_action_id,
     generate_artifact_id,
@@ -25,6 +25,8 @@ from skyvern.forge.sdk.db.id import (
     generate_bitwarden_credit_card_data_parameter_id,
     generate_bitwarden_login_credential_parameter_id,
     generate_bitwarden_sensitive_information_parameter_id,
+    generate_observer_cruise_id,
+    generate_observer_thought_id,
     generate_org_id,
     generate_organization_auth_token_id,
     generate_output_parameter_id,
@@ -35,6 +37,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_id,
     generate_workflow_parameter_id,
     generate_workflow_permanent_id,
+    generate_workflow_run_block_id,
     generate_workflow_run_id,
 )
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
@@ -54,9 +57,12 @@ class TaskModel(Base):
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
     title = Column(String)
+    task_type = Column(String, default=TaskType.general)
     url = Column(String)
     navigation_goal = Column(String)
     data_extraction_goal = Column(String)
+    complete_criterion = Column(String)
+    terminate_criterion = Column(String)
     navigation_payload = Column(JSON)
     extracted_information = Column(JSON)
     failure_reason = Column(String)
@@ -68,6 +74,7 @@ class TaskModel(Base):
     error_code_mapping = Column(JSON, nullable=True)
     errors = Column(JSON, default=[], nullable=False)
     max_steps_per_run = Column(Integer, nullable=True)
+    application = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(
         DateTime,
@@ -80,7 +87,10 @@ class TaskModel(Base):
 
 class StepModel(Base):
     __tablename__ = "steps"
-    __table_args__ = (Index("org_task_index", "organization_id", "task_id"),)
+    __table_args__ = (
+        Index("org_task_index", "organization_id", "task_id"),
+        Index("created_at_org_index", "created_at", "organization_id"),
+    )
 
     step_id = Column(String, primary_key=True, index=True, default=generate_step_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
@@ -149,10 +159,17 @@ class OrganizationAuthTokenModel(Base):
 
 class ArtifactModel(Base):
     __tablename__ = "artifacts"
-    __table_args__ = (Index("org_task_step_index", "organization_id", "task_id", "step_id"),)
+    __table_args__ = (
+        Index("org_task_step_index", "organization_id", "task_id", "step_id"),
+        Index("org_workflow_run_index", "organization_id", "workflow_run_id"),
+    )
 
     artifact_id = Column(String, primary_key=True, index=True, default=generate_artifact_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
+    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"))
+    workflow_run_block_id = Column(String, ForeignKey("workflow_run_blocks.workflow_run_block_id"))
+    observer_cruise_id = Column(String, ForeignKey("observer_cruises.observer_cruise_id"))
+    observer_thought_id = Column(String, ForeignKey("observer_thoughts.observer_thought_id"))
     task_id = Column(String, ForeignKey("tasks.task_id"))
     step_id = Column(String, ForeignKey("steps.step_id"), index=True)
     artifact_type = Column(String)
@@ -211,6 +228,7 @@ class WorkflowRunModel(Base):
     workflow_permanent_id = Column(String, nullable=False, index=True)
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False, index=True)
     status = Column(String, nullable=False)
+    failure_reason = Column(String)
     proxy_location = Column(Enum(ProxyLocation))
     webhook_callback_url = Column(String)
     totp_verification_url = Column(String)
@@ -465,3 +483,49 @@ class ActionModel(Base):
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
+
+class WorkflowRunBlockModel(Base):
+    __tablename__ = "workflow_run_blocks"
+    __table_args__ = (Index("wfrb_org_wfr_index", "organization_id", "workflow_run_id"),)
+
+    workflow_run_block_id = Column(String, primary_key=True, default=generate_workflow_run_block_id)
+    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=False)
+    parent_workflow_run_block_id = Column(
+        String, ForeignKey("workflow_run_blocks.workflow_run_block_id"), nullable=True
+    )
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
+    task_id = Column(String, ForeignKey("tasks.task_id"), nullable=True)
+    label = Column(String, nullable=True)
+    block_type = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    output = Column(JSON, nullable=True)
+    continue_on_failure = Column(Boolean, nullable=False, default=False)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
+
+class ObserverCruise(Base):
+    __tablename__ = "observer_cruises"
+
+    observer_cruise_id = Column(String, primary_key=True, default=generate_observer_cruise_id)
+    status = Column(String, nullable=False, default="created")
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
+    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
+    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), nullable=True)
+
+
+class ObserverThought(Base):
+    __tablename__ = "observer_thoughts"
+
+    observer_thought_id = Column(String, primary_key=True, default=generate_observer_thought_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
+    observer_cruise_id = Column(String, ForeignKey("observer_cruises.observer_cruise_id"), nullable=False)
+    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
+    workflow_run_block_id = Column(String, ForeignKey("workflow_run_blocks.workflow_run_block_id"), nullable=True)
+    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), nullable=True)
+    user_input = Column(UnicodeText, nullable=True)
+    observation = Column(String, nullable=True)
+    thought = Column(String, nullable=True)
+    answer = Column(String, nullable=True)

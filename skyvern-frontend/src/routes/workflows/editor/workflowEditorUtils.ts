@@ -4,15 +4,15 @@ import { Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
 import type {
   AWSSecretParameter,
-  BitwardenSensitiveInformationParameter,
-  ContextParameter,
   OutputParameter,
   Parameter,
   WorkflowApiResponse,
   WorkflowBlock,
   WorkflowParameterValueType,
+  WorkflowSettings,
 } from "../types/workflowTypes";
 import {
+  ActionBlockYAML,
   BlockYAML,
   CodeBlockYAML,
   DownloadToS3BlockYAML,
@@ -23,7 +23,13 @@ import {
   TaskBlockYAML,
   TextPromptBlockYAML,
   UploadToS3BlockYAML,
+  ValidationBlockYAML,
+  NavigationBlockYAML,
   WorkflowCreateYAMLRequest,
+  ExtractionBlockYAML,
+  LoginBlockYAML,
+  WaitBlockYAML,
+  FileDownloadBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -42,14 +48,40 @@ import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
 import { fileParserNodeDefaultData } from "./nodes/FileParserNode/types";
-import { LoopNode, loopNodeDefaultData } from "./nodes/LoopNode/types";
+import {
+  isLoopNode,
+  LoopNode,
+  loopNodeDefaultData,
+} from "./nodes/LoopNode/types";
 import { NodeAdderNode } from "./nodes/NodeAdderNode/types";
 import { sendEmailNodeDefaultData } from "./nodes/SendEmailNode/types";
-import { taskNodeDefaultData } from "./nodes/TaskNode/types";
+import {
+  isStartNode,
+  isWorkflowStartNodeData,
+  StartNode,
+  StartNodeData,
+} from "./nodes/StartNode/types";
+import { isTaskNode, taskNodeDefaultData } from "./nodes/TaskNode/types";
 import { textPromptNodeDefaultData } from "./nodes/TextPromptNode/types";
 import { NodeBaseData } from "./nodes/types";
 import { uploadNodeDefaultData } from "./nodes/UploadNode/types";
-import { StartNode } from "./nodes/StartNode/types";
+import {
+  isValidationNode,
+  validationNodeDefaultData,
+} from "./nodes/ValidationNode/types";
+import { actionNodeDefaultData, isActionNode } from "./nodes/ActionNode/types";
+import {
+  isNavigationNode,
+  navigationNodeDefaultData,
+} from "./nodes/NavigationNode/types";
+import {
+  extractionNodeDefaultData,
+  isExtractionNode,
+} from "./nodes/ExtractionNode/types";
+import { loginNodeDefaultData } from "./nodes/LoginNode/types";
+import { waitNodeDefaultData } from "./nodes/WaitNode/types";
+import { fileDownloadNodeDefaultData } from "./nodes/FileDownloadNode/types";
+import { ProxyLocation } from "@/api/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -135,6 +167,7 @@ function convertToNode(
   const commonData: NodeBaseData = {
     label: block.label,
     continueOnFailure: block.continue_on_failure,
+    editable: true,
   };
   switch (block.block_type) {
     case "task": {
@@ -144,7 +177,6 @@ function convertToNode(
         type: "task",
         data: {
           ...commonData,
-          editable: true,
           url: block.url ?? "",
           navigationGoal: block.navigation_goal ?? "",
           dataExtractionGoal: block.data_extraction_goal ?? "",
@@ -161,6 +193,128 @@ function convertToNode(
         },
       };
     }
+    case "validation": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "validation",
+        data: {
+          ...commonData,
+          errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
+          completeCriterion: block.complete_criterion ?? "",
+          terminateCriterion: block.terminate_criterion ?? "",
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
+    case "action": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "action",
+        data: {
+          ...commonData,
+          url: block.url ?? "",
+          navigationGoal: block.navigation_goal ?? "",
+          errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
+          allowDownloads: block.complete_on_download ?? false,
+          downloadSuffix: block.download_suffix ?? null,
+          maxRetries: block.max_retries ?? null,
+          parameterKeys: block.parameters.map((p) => p.key),
+          totpIdentifier: block.totp_identifier ?? null,
+          totpVerificationUrl: block.totp_verification_url ?? null,
+          cacheActions: block.cache_actions,
+        },
+      };
+    }
+    case "navigation": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "navigation",
+        data: {
+          ...commonData,
+          url: block.url ?? "",
+          navigationGoal: block.navigation_goal ?? "",
+          errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
+          allowDownloads: block.complete_on_download ?? false,
+          downloadSuffix: block.download_suffix ?? null,
+          maxRetries: block.max_retries ?? null,
+          parameterKeys: block.parameters.map((p) => p.key),
+          totpIdentifier: block.totp_identifier ?? null,
+          totpVerificationUrl: block.totp_verification_url ?? null,
+          cacheActions: block.cache_actions,
+          maxStepsOverride: block.max_steps_per_run ?? null,
+        },
+      };
+    }
+    case "extraction": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "extraction",
+        data: {
+          ...commonData,
+          url: block.url ?? "",
+          dataExtractionGoal: block.data_extraction_goal ?? "",
+          dataSchema: JSON.stringify(block.data_schema, null, 2),
+          parameterKeys: block.parameters.map((p) => p.key),
+          maxRetries: block.max_retries ?? null,
+          maxStepsOverride: block.max_steps_per_run ?? null,
+          cacheActions: block.cache_actions,
+        },
+      };
+    }
+    case "login": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "login",
+        data: {
+          ...commonData,
+          url: block.url ?? "",
+          navigationGoal: block.navigation_goal ?? "",
+          errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
+          maxRetries: block.max_retries ?? null,
+          parameterKeys: block.parameters.map((p) => p.key),
+          totpIdentifier: block.totp_identifier ?? null,
+          totpVerificationUrl: block.totp_verification_url ?? null,
+          cacheActions: block.cache_actions,
+          maxStepsOverride: block.max_steps_per_run ?? null,
+        },
+      };
+    }
+    case "wait": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "wait",
+        data: {
+          ...commonData,
+          waitInSeconds: block.wait_sec ?? 1,
+        },
+      };
+    }
+    case "file_download": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "fileDownload",
+        data: {
+          ...commonData,
+          url: block.url ?? "",
+          navigationGoal: block.navigation_goal ?? "",
+          errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
+          downloadSuffix: block.download_suffix ?? null,
+          maxRetries: block.max_retries ?? null,
+          parameterKeys: block.parameters.map((p) => p.key),
+          totpIdentifier: block.totp_identifier ?? null,
+          totpVerificationUrl: block.totp_verification_url ?? null,
+          cacheActions: block.cache_actions,
+          maxStepsOverride: block.max_steps_per_run ?? null,
+        },
+      };
+    }
     case "code": {
       return {
         ...identifiers,
@@ -168,7 +322,6 @@ function convertToNode(
         type: "codeBlock",
         data: {
           ...commonData,
-          editable: true,
           code: block.code,
         },
       };
@@ -180,7 +333,6 @@ function convertToNode(
         type: "sendEmail",
         data: {
           ...commonData,
-          editable: true,
           body: block.body,
           fileAttachments: block.file_attachments.join(", "),
           recipients: block.recipients.join(", "),
@@ -200,9 +352,9 @@ function convertToNode(
         type: "textPrompt",
         data: {
           ...commonData,
-          editable: true,
           prompt: block.prompt,
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
+          parameterKeys: block.parameters.map((p) => p.key),
         },
       };
     }
@@ -213,7 +365,6 @@ function convertToNode(
         type: "loop",
         data: {
           ...commonData,
-          editable: true,
           loopValue: block.loop_over.key,
         },
       };
@@ -225,7 +376,6 @@ function convertToNode(
         type: "fileParser",
         data: {
           ...commonData,
-          editable: true,
           fileUrl: block.file_url,
         },
       };
@@ -238,7 +388,6 @@ function convertToNode(
         type: "download",
         data: {
           ...commonData,
-          editable: true,
           url: block.url,
         },
       };
@@ -251,7 +400,6 @@ function convertToNode(
         type: "upload",
         data: {
           ...commonData,
-          editable: true,
           path: block.path,
         },
       };
@@ -339,12 +487,16 @@ export function edgeWithAddButton(source: string, target: string) {
   };
 }
 
-export function startNode(id: string, parentId?: string): StartNode {
+export function startNode(
+  id: string,
+  data: StartNodeData,
+  parentId?: string,
+): StartNode {
   const node: StartNode = {
     id,
     type: "start",
     position: { x: 0, y: 0 },
-    data: {},
+    data,
     draggable: false,
     connectable: false,
   };
@@ -369,7 +521,10 @@ export function nodeAdderNode(id: string, parentId?: string): NodeAdderNode {
   return node;
 }
 
-function getElements(blocks: Array<WorkflowBlock>): {
+function getElements(
+  blocks: Array<WorkflowBlock>,
+  settings: WorkflowSettings,
+): {
   nodes: Array<AppNode>;
   edges: Array<Edge>;
 } {
@@ -377,7 +532,17 @@ function getElements(blocks: Array<WorkflowBlock>): {
   const nodes: Array<AppNode> = [];
   const edges: Array<Edge> = [];
 
-  data.forEach((d) => {
+  const startNodeId = nanoid();
+  nodes.push(
+    startNode(startNodeId, {
+      withWorkflowSettings: true,
+      persistBrowserSession: settings.persistBrowserSession,
+      proxyLocation: settings.proxyLocation ?? ProxyLocation.Residential,
+      webhookCallbackUrl: settings.webhookCallbackUrl ?? "",
+    }),
+  );
+
+  data.forEach((d, index) => {
     const node = convertToNode(
       {
         id: d.id,
@@ -389,12 +554,23 @@ function getElements(blocks: Array<WorkflowBlock>): {
     if (d.previous) {
       edges.push(edgeWithAddButton(d.previous, d.id));
     }
+    if (index === 0) {
+      edges.push(edgeWithAddButton(startNodeId, d.id));
+    }
   });
 
   const loopBlocks = data.filter((d) => d.block.block_type === "for_loop");
   loopBlocks.forEach((block) => {
     const startNodeId = nanoid();
-    nodes.push(startNode(startNodeId, block.id));
+    nodes.push(
+      startNode(
+        startNodeId,
+        {
+          withWorkflowSettings: false,
+        },
+        block.id,
+      ),
+    );
     const children = data.filter((b) => b.parentId === block.id);
     if (children.length === 0) {
       const adderNodeId = nanoid();
@@ -412,19 +588,12 @@ function getElements(blocks: Array<WorkflowBlock>): {
     }
   });
 
-  const startNodeId = nanoid();
   const adderNodeId = nanoid();
 
-  if (nodes.length === 0) {
-    nodes.push(startNode(startNodeId));
+  if (data.length === 0) {
     nodes.push(nodeAdderNode(adderNodeId));
     edges.push(defaultEdge(startNodeId, adderNodeId));
   } else {
-    const firstNode = data.find(
-      (d) => d.previous === null && d.parentId === null,
-    );
-    nodes.push(startNode(startNodeId));
-    edges.push(edgeWithAddButton(startNodeId, firstNode!.id));
     const lastNode = data.find((d) => d.next === null && d.parentId === null)!;
     edges.push(defaultEdge(lastNode.id, adderNodeId));
     nodes.push(nodeAdderNode(adderNodeId));
@@ -437,7 +606,7 @@ function createNode(
   identifiers: { id: string; parentId?: string },
   nodeType: NonNullable<WorkflowBlockNode["type"]>,
   label: string,
-): AppNode {
+): WorkflowBlockNode {
   const common = {
     draggable: false,
     position: { x: 0, y: 0 },
@@ -450,6 +619,83 @@ function createNode(
         type: "task",
         data: {
           ...taskNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "validation": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "validation",
+        data: {
+          ...validationNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "action": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "action",
+        data: {
+          ...actionNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "navigation": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "navigation",
+        data: {
+          ...navigationNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "extraction": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "extraction",
+        data: {
+          ...extractionNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "login": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "login",
+        data: {
+          ...loginNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "wait": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "wait",
+        data: {
+          ...waitNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "fileDownload": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "fileDownload",
+        data: {
+          ...fileDownloadNodeDefaultData,
           label,
         },
       };
@@ -553,6 +799,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         ...base,
         block_type: "task",
         url: node.data.url,
+        title: node.data.label,
         navigation_goal: node.data.navigationGoal,
         data_extraction_goal: node.data.dataExtractionGoal,
         data_schema: JSONParseSafe(node.data.dataSchema),
@@ -565,6 +812,130 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         }),
         max_steps_per_run: node.data.maxStepsOverride,
         complete_on_download: node.data.allowDownloads,
+        download_suffix: node.data.downloadSuffix,
+        parameter_keys: node.data.parameterKeys,
+        totp_identifier: node.data.totpIdentifier,
+        totp_verification_url: node.data.totpVerificationUrl,
+        cache_actions: node.data.cacheActions,
+      };
+    }
+    case "validation": {
+      return {
+        ...base,
+        block_type: "validation",
+        complete_criterion: node.data.completeCriterion,
+        terminate_criterion: node.data.terminateCriterion,
+        error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
+          string,
+          string
+        > | null,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "action": {
+      return {
+        ...base,
+        block_type: "action",
+        title: node.data.label,
+        navigation_goal: node.data.navigationGoal,
+        error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
+          string,
+          string
+        > | null,
+        url: node.data.url,
+        ...(node.data.maxRetries !== null && {
+          max_retries: node.data.maxRetries,
+        }),
+        complete_on_download: node.data.allowDownloads,
+        download_suffix: node.data.downloadSuffix,
+        parameter_keys: node.data.parameterKeys,
+        totp_identifier: node.data.totpIdentifier,
+        totp_verification_url: node.data.totpVerificationUrl,
+        cache_actions: node.data.cacheActions,
+      };
+    }
+    case "navigation": {
+      return {
+        ...base,
+        block_type: "navigation",
+        title: node.data.label,
+        navigation_goal: node.data.navigationGoal,
+        error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
+          string,
+          string
+        > | null,
+        url: node.data.url,
+        ...(node.data.maxRetries !== null && {
+          max_retries: node.data.maxRetries,
+        }),
+        max_steps_per_run: node.data.maxStepsOverride,
+        complete_on_download: node.data.allowDownloads,
+        download_suffix: node.data.downloadSuffix,
+        parameter_keys: node.data.parameterKeys,
+        totp_identifier: node.data.totpIdentifier,
+        totp_verification_url: node.data.totpVerificationUrl,
+        cache_actions: node.data.cacheActions,
+      };
+    }
+    case "extraction": {
+      return {
+        ...base,
+        block_type: "extraction",
+        url: node.data.url,
+        title: node.data.label,
+        data_extraction_goal: node.data.dataExtractionGoal,
+        data_schema: JSONParseSafe(node.data.dataSchema),
+        ...(node.data.maxRetries !== null && {
+          max_retries: node.data.maxRetries,
+        }),
+        max_steps_per_run: node.data.maxStepsOverride,
+        parameter_keys: node.data.parameterKeys,
+        cache_actions: node.data.cacheActions,
+      };
+    }
+    case "login": {
+      return {
+        ...base,
+        block_type: "login",
+        title: node.data.label,
+        navigation_goal: node.data.navigationGoal,
+        error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
+          string,
+          string
+        > | null,
+        url: node.data.url,
+        ...(node.data.maxRetries !== null && {
+          max_retries: node.data.maxRetries,
+        }),
+        max_steps_per_run: node.data.maxStepsOverride,
+        parameter_keys: node.data.parameterKeys,
+        totp_identifier: node.data.totpIdentifier,
+        totp_verification_url: node.data.totpVerificationUrl,
+        cache_actions: node.data.cacheActions,
+      };
+    }
+    case "wait": {
+      return {
+        ...base,
+        block_type: "wait",
+        wait_sec: node.data.waitInSeconds,
+      };
+    }
+    case "fileDownload": {
+      return {
+        ...base,
+        block_type: "file_download",
+        title: node.data.label,
+        navigation_goal: node.data.navigationGoal,
+        error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
+          string,
+          string
+        > | null,
+        url: node.data.url,
+        ...(node.data.maxRetries !== null && {
+          max_retries: node.data.maxRetries,
+        }),
+        max_steps_per_run: node.data.maxStepsOverride,
         download_suffix: node.data.downloadSuffix,
         parameter_keys: node.data.parameterKeys,
         totp_identifier: node.data.totpIdentifier,
@@ -629,6 +1000,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         llm_key: "",
         prompt: node.data.prompt,
         json_schema: JSONParseSafe(node.data.jsonSchema),
+        parameter_keys: node.data.parameterKeys,
       };
     }
     default: {
@@ -637,9 +1009,48 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
   }
 }
 
-function getWorkflowBlocksUtil(nodes: Array<AppNode>): Array<BlockYAML> {
+function getOrderedChildrenBlocks(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+  parentId: string,
+): Array<BlockYAML> {
+  const parentNode = nodes.find((node) => node.id === parentId);
+  if (!parentNode) {
+    return [];
+  }
+  const blockStartNode = nodes.find(
+    (node) => node.type === "start" && node.parentId === parentId,
+  );
+  if (!blockStartNode) {
+    return [];
+  }
+  const firstChildId = edges.find(
+    (edge) => edge.source === blockStartNode.id,
+  )?.target;
+  const firstChild = nodes.find((node) => node.id === firstChildId);
+  if (!firstChild || !isWorkflowBlockNode(firstChild)) {
+    return [];
+  }
+
+  const children: Array<BlockYAML> = [];
+  let currentNode: WorkflowBlockNode | undefined = firstChild;
+  while (currentNode) {
+    children.push(getWorkflowBlock(currentNode));
+    const nextId = edges.find(
+      (edge) => edge.source === currentNode?.id,
+    )?.target;
+    const next = nodes.find((node) => node.id === nextId);
+    currentNode = next && isWorkflowBlockNode(next) ? next : undefined;
+  }
+  return children;
+}
+
+function getWorkflowBlocksUtil(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+): Array<BlockYAML> {
   return nodes.flatMap((node) => {
-    if (node.parentId) {
+    if (node.parentId || node.type === "start" || node.type === "nodeAdder") {
       return [];
     }
     if (node.type === "loop") {
@@ -649,26 +1060,43 @@ function getWorkflowBlocksUtil(nodes: Array<AppNode>): Array<BlockYAML> {
           label: node.data.label,
           continue_on_failure: node.data.continueOnFailure,
           loop_over_parameter_key: node.data.loopValue,
-          loop_blocks: nodes
-            .filter((n) => n.parentId === node.id)
-            .map((n) => {
-              return getWorkflowBlock(
-                n as Exclude<AppNode, LoopNode | NodeAdderNode | StartNode>,
-              );
-            }),
+          loop_blocks: getOrderedChildrenBlocks(nodes, edges, node.id),
         },
       ];
     }
-    return [
-      getWorkflowBlock(
-        node as Exclude<AppNode, LoopNode | NodeAdderNode | StartNode>,
-      ),
-    ];
+    return [getWorkflowBlock(node as Exclude<WorkflowBlockNode, LoopNode>)];
   });
 }
 
-function getWorkflowBlocks(nodes: Array<AppNode>): Array<BlockYAML> {
-  return getWorkflowBlocksUtil(nodes.filter(isWorkflowBlockNode));
+function getWorkflowBlocks(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+): Array<BlockYAML> {
+  return getWorkflowBlocksUtil(nodes, edges);
+}
+
+function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
+  const defaultSettings = {
+    persistBrowserSession: false,
+    proxyLocation: ProxyLocation.Residential,
+    webhookCallbackUrl: null,
+  };
+  const startNodes = nodes.filter(isStartNode);
+  const startNodeWithWorkflowSettings = startNodes.find(
+    (node) => node.data.withWorkflowSettings,
+  );
+  if (!startNodeWithWorkflowSettings) {
+    return defaultSettings;
+  }
+  const data = startNodeWithWorkflowSettings.data;
+  if (isWorkflowStartNodeData(data)) {
+    return {
+      persistBrowserSession: data.persistBrowserSession,
+      proxyLocation: data.proxyLocation,
+      webhookCallbackUrl: data.webhookCallbackUrl,
+    };
+  }
+  return defaultSettings;
 }
 
 function generateNodeLabel(existingLabels: Array<string>) {
@@ -685,11 +1113,7 @@ function generateNodeLabel(existingLabels: Array<string>) {
  * If a parameter is not displayed in the editor, we should echo its value back when saved.
  */
 function convertEchoParameters(
-  parameters: Array<
-    | ContextParameter
-    | BitwardenSensitiveInformationParameter
-    | AWSSecretParameter
-  >,
+  parameters: Array<AWSSecretParameter>,
 ): Array<ParameterYAML> {
   return parameters.map((parameter) => {
     if (parameter.parameter_type === "aws_secret") {
@@ -697,21 +1121,6 @@ function convertEchoParameters(
         key: parameter.key,
         parameter_type: "aws_secret",
         aws_key: parameter.aws_key,
-      };
-    }
-    if (parameter.parameter_type === "bitwarden_sensitive_information") {
-      return {
-        key: parameter.key,
-        parameter_type: "bitwarden_sensitive_information",
-        bitwarden_collection_id: parameter.bitwarden_collection_id,
-        bitwarden_identity_key: parameter.bitwarden_identity_key,
-        bitwarden_identity_fields: parameter.bitwarden_identity_fields,
-        bitwarden_client_id_aws_secret_key:
-          parameter.bitwarden_client_id_aws_secret_key,
-        bitwarden_client_secret_aws_secret_key:
-          parameter.bitwarden_client_secret_aws_secret_key,
-        bitwarden_master_password_aws_secret_key:
-          parameter.bitwarden_master_password_aws_secret_key,
       };
     }
     throw new Error("Unknown parameter type");
@@ -747,7 +1156,7 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
     if (node.type === "nodeAdder" || node.type === "start") {
       return node;
     }
-    if (node.type === "task") {
+    if (node.type === "task" || node.type === "textPrompt") {
       return {
         ...node,
         data: {
@@ -938,7 +1347,7 @@ function getAvailableOutputParameterKeys(
   return outputParameterKeys;
 }
 
-function convertParameters(
+function convertParametersToParameterYAML(
   parameters: Array<Exclude<Parameter, OutputParameter>>,
 ): Array<ParameterYAML> {
   return parameters.map((parameter) => {
@@ -1001,7 +1410,9 @@ function convertParameters(
   });
 }
 
-function convertBlocks(blocks: Array<WorkflowBlock>): Array<BlockYAML> {
+function convertBlocksToBlockYAML(
+  blocks: Array<WorkflowBlock>,
+): Array<BlockYAML> {
   return blocks.map((block) => {
     const base = {
       label: block.label,
@@ -1012,6 +1423,7 @@ function convertBlocks(blocks: Array<WorkflowBlock>): Array<BlockYAML> {
         const blockYaml: TaskBlockYAML = {
           ...base,
           block_type: "task",
+          title: block.title,
           url: block.url,
           navigation_goal: block.navigation_goal,
           data_extraction_goal: block.data_extraction_goal,
@@ -1028,12 +1440,118 @@ function convertBlocks(blocks: Array<WorkflowBlock>): Array<BlockYAML> {
         };
         return blockYaml;
       }
+      case "validation": {
+        const blockYaml: ValidationBlockYAML = {
+          ...base,
+          block_type: "validation",
+          complete_criterion: block.complete_criterion,
+          terminate_criterion: block.terminate_criterion,
+          error_code_mapping: block.error_code_mapping,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
+      case "action": {
+        const blockYaml: ActionBlockYAML = {
+          ...base,
+          block_type: "action",
+          url: block.url,
+          title: block.title,
+          navigation_goal: block.navigation_goal,
+          error_code_mapping: block.error_code_mapping,
+          max_retries: block.max_retries,
+          complete_on_download: block.complete_on_download,
+          download_suffix: block.download_suffix,
+          parameter_keys: block.parameters.map((p) => p.key),
+          totp_identifier: block.totp_identifier,
+          totp_verification_url: block.totp_verification_url,
+          cache_actions: block.cache_actions,
+        };
+        return blockYaml;
+      }
+      case "navigation": {
+        const blockYaml: NavigationBlockYAML = {
+          ...base,
+          block_type: "navigation",
+          url: block.url,
+          title: block.title,
+          navigation_goal: block.navigation_goal,
+          error_code_mapping: block.error_code_mapping,
+          max_retries: block.max_retries,
+          max_steps_per_run: block.max_steps_per_run,
+          complete_on_download: block.complete_on_download,
+          download_suffix: block.download_suffix,
+          parameter_keys: block.parameters.map((p) => p.key),
+          totp_identifier: block.totp_identifier,
+          totp_verification_url: block.totp_verification_url,
+          cache_actions: block.cache_actions,
+        };
+        return blockYaml;
+      }
+      case "extraction": {
+        const blockYaml: ExtractionBlockYAML = {
+          ...base,
+          block_type: "extraction",
+          url: block.url,
+          title: block.title,
+          data_extraction_goal: block.data_extraction_goal,
+          data_schema: block.data_schema,
+          max_retries: block.max_retries,
+          max_steps_per_run: block.max_steps_per_run,
+          parameter_keys: block.parameters.map((p) => p.key),
+          cache_actions: block.cache_actions,
+        };
+        return blockYaml;
+      }
+      case "login": {
+        const blockYaml: LoginBlockYAML = {
+          ...base,
+          block_type: "login",
+          url: block.url,
+          title: block.title,
+          navigation_goal: block.navigation_goal,
+          error_code_mapping: block.error_code_mapping,
+          max_retries: block.max_retries,
+          max_steps_per_run: block.max_steps_per_run,
+          parameter_keys: block.parameters.map((p) => p.key),
+          totp_identifier: block.totp_identifier,
+          totp_verification_url: block.totp_verification_url,
+          cache_actions: block.cache_actions,
+        };
+        return blockYaml;
+      }
+      case "wait": {
+        const blockYaml: WaitBlockYAML = {
+          ...base,
+          block_type: "wait",
+          wait_sec: block.wait_sec,
+        };
+        return blockYaml;
+      }
+      case "file_download": {
+        const blockYaml: FileDownloadBlockYAML = {
+          ...base,
+          block_type: "file_download",
+          url: block.url,
+          title: block.title,
+          navigation_goal: block.navigation_goal,
+          error_code_mapping: block.error_code_mapping,
+          max_retries: block.max_retries,
+          max_steps_per_run: block.max_steps_per_run,
+          download_suffix: block.download_suffix,
+          parameter_keys: block.parameters.map((p) => p.key),
+          totp_identifier: block.totp_identifier,
+          totp_verification_url: block.totp_verification_url,
+          cache_actions: block.cache_actions,
+        };
+        return blockYaml;
+      }
       case "for_loop": {
         const blockYaml: ForLoopBlockYAML = {
           ...base,
           block_type: "for_loop",
           loop_over_parameter_key: block.loop_over.key,
-          loop_blocks: convertBlocks(block.loop_blocks),
+          loop_blocks: convertBlocksToBlockYAML(block.loop_blocks),
         };
         return blockYaml;
       }
@@ -1112,11 +1630,97 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     webhook_callback_url: workflow.webhook_callback_url,
     totp_verification_url: workflow.totp_verification_url,
     workflow_definition: {
-      parameters: convertParameters(userParameters),
-      blocks: convertBlocks(workflow.workflow_definition.blocks),
+      parameters: convertParametersToParameterYAML(userParameters),
+      blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
     },
     is_saved_task: workflow.is_saved_task,
   };
+}
+
+function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
+  const errors: Array<string> = [];
+
+  const workflowBlockNodes = nodes.filter(isWorkflowBlockNode);
+  if (
+    workflowBlockNodes.length > 0 &&
+    workflowBlockNodes[0]!.type === "validation"
+  ) {
+    const label = workflowBlockNodes[0]!.data.label;
+    errors.push(
+      `${label}: Validation block can't be the first block in a workflow.`,
+    );
+  }
+
+  const actionNodes = nodes.filter(isActionNode);
+  actionNodes.forEach((node) => {
+    if (node.data.navigationGoal.length === 0) {
+      errors.push(`${node.data.label}: Action Instruction is required.`);
+    }
+    try {
+      JSON.parse(node.data.errorCodeMapping);
+    } catch {
+      errors.push(`${node.data.label}: Error messages is not valid JSON.`);
+    }
+  });
+
+  // check loop node parameters
+  const loopNodes: Array<LoopNode> = nodes.filter(isLoopNode);
+  const emptyLoopNodes = loopNodes.filter(
+    (node: LoopNode) => node.data.loopValue === "",
+  );
+  if (emptyLoopNodes.length > 0) {
+    emptyLoopNodes.forEach((node) => {
+      errors.push(`${node.data.label}: Loop value parameter must be selected.`);
+    });
+  }
+
+  // check task node json fields
+  const taskNodes = nodes.filter(isTaskNode);
+  taskNodes.forEach((node) => {
+    try {
+      JSON.parse(node.data.dataSchema);
+    } catch {
+      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+    }
+    try {
+      JSON.parse(node.data.errorCodeMapping);
+    } catch {
+      errors.push(`${node.data.label}: Error messages is not valid JSON.`);
+    }
+  });
+
+  const validationNodes = nodes.filter(isValidationNode);
+  validationNodes.forEach((node) => {
+    try {
+      JSON.parse(node.data.errorCodeMapping);
+    } catch {
+      errors.push(`${node.data.label}: Error messages is not valid JSON`);
+    }
+    if (
+      node.data.completeCriterion.length === 0 &&
+      node.data.terminateCriterion.length === 0
+    ) {
+      errors.push(
+        `${node.data.label}: At least one of completion or termination criteria must be provided`,
+      );
+    }
+  });
+
+  const navigationNodes = nodes.filter(isNavigationNode);
+  navigationNodes.forEach((node) => {
+    if (node.data.navigationGoal.length === 0) {
+      errors.push(`${node.data.label}: Navigation goal is required.`);
+    }
+  });
+
+  const extractionNodes = nodes.filter(isExtractionNode);
+  extractionNodes.forEach((node) => {
+    if (node.data.dataExtractionGoal.length === 0) {
+      errors.push(`${node.data.label}: Data extraction goal is required.`);
+    }
+  });
+
+  return errors;
 }
 
 export {
@@ -1130,12 +1734,14 @@ export {
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,
   getElements,
+  getWorkflowSettings,
   getOutputParameterKey,
   getPreviousNodeIds,
   getUniqueLabelForExistingNode,
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
   getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
   getWorkflowBlocks,
+  getWorkflowErrors,
   isOutputParameterKey,
   layout,
 };

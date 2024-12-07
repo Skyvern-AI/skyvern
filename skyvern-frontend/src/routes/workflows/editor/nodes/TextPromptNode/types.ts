@@ -4,8 +4,7 @@ import { NodeBaseData } from "../types";
 export type TextPromptNodeData = NodeBaseData & {
   prompt: string;
   jsonSchema: string;
-  editable: boolean;
-  label: string;
+  parameterKeys: Array<string>;
 };
 
 export type TextPromptNode = Node<TextPromptNodeData, "textPrompt">;
@@ -16,9 +15,5 @@ export const textPromptNodeDefaultData: TextPromptNodeData = {
   prompt: "",
   jsonSchema: "null",
   continueOnFailure: false,
+  parameterKeys: [],
 } as const;
-
-export const helpTooltipContent = {
-  prompt:
-    "Write a prompt you would like passed into the LLM and specify the output format, if applicable.",
-};

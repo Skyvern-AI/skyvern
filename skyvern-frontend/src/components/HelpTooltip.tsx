@@ -15,7 +15,7 @@ function HelpTooltip({ content }: Props) {
     <TooltipProvider>
       <Tooltip delayDuration={300}>
         <TooltipTrigger asChild>
-          <QuestionMarkCircledIcon className="h-4 w-4" />
+          <QuestionMarkCircledIcon className="size-4" />
         </TooltipTrigger>
         <TooltipContent className="max-w-[250px]">{content}</TooltipContent>
       </Tooltip>

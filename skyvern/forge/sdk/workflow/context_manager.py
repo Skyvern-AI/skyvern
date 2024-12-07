@@ -5,7 +5,8 @@ import structlog
 
 from skyvern.exceptions import BitwardenBaseError, WorkflowRunContextNotInitialized
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
-from skyvern.forge.sdk.models import Organization
+from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
 from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -24,6 +25,9 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 
+BlockMetadata = dict[str, str | int | float | bool | dict | list]
+
+
 class WorkflowRunContext:
     parameters: dict[str, PARAMETER_TYPE]
     values: dict[str, Any]
@@ -35,9 +39,12 @@ class WorkflowRunContext:
         workflow_output_parameters: list[OutputParameter],
         context_parameters: list[ContextParameter],
     ) -> None:
+        # key is label name
+        self.blocks_metadata: dict[str, BlockMetadata] = {}
         self.parameters = {}
         self.values = {}
         self.secrets = {}
+
         for parameter, run_parameter in workflow_parameter_tuples:
             if parameter.key in self.parameters:
                 prev_value = self.parameters[parameter.key]
@@ -79,6 +86,15 @@ class WorkflowRunContext:
 
     def set_value(self, key: str, value: Any) -> None:
         self.values[key] = value
+
+    def update_block_metadata(self, label: str, metadata: BlockMetadata) -> None:
+        if label in self.blocks_metadata:
+            self.blocks_metadata[label].update(metadata)
+            return
+        self.blocks_metadata[label] = metadata
+
+    def get_block_metadata(self, label: str) -> BlockMetadata:
+        return self.blocks_metadata.get(label, BlockMetadata())
 
     def get_original_secret_value_or_none(self, secret_id_or_value: Any) -> Any:
         """
@@ -199,6 +215,8 @@ class WorkflowRunContext:
                     if BitwardenConstants.TOTP in secret_credentials and secret_credentials[BitwardenConstants.TOTP]:
                         totp_secret_id = f"{random_secret_id}_totp"
                         self.secrets[totp_secret_id] = BitwardenConstants.TOTP
+                        totp_secret_value = self.totp_secret_value_key(totp_secret_id)
+                        self.secrets[totp_secret_value] = secret_credentials[BitwardenConstants.TOTP]
                         self.values[parameter.key]["totp"] = totp_secret_id
 
             except BitwardenBaseError as e:
@@ -372,6 +390,14 @@ class WorkflowRunContext:
                 and isinstance(parameter.source, OutputParameter)
                 and parameter.source.key == output_parameter.key
             ):
+                # If task isn't completed, we should skip setting the value
+                if (
+                    isinstance(value, dict)
+                    and "extracted_information" in value
+                    and "status" in value
+                    and value["status"] != TaskStatus.completed
+                ):
+                    continue
                 if isinstance(value, dict) and "errors" in value and value["errors"]:
                     # Is this the correct way to handle errors from task blocks?
                     LOG.error(
@@ -451,6 +477,9 @@ class WorkflowRunContext:
             self.parameters[parameter.key] = parameter
             await self.register_parameter_value(aws_client, parameter, organization)
 
+    def totp_secret_value_key(self, totp_secret_id: str) -> str:
+        return f"{totp_secret_id}_value"
+
 
 class WorkflowContextManager:
     aws_client: AsyncAWSClient
@@ -495,4 +524,20 @@ class WorkflowContextManager:
         self._validate_workflow_run_context(workflow_run_id)
         await self.workflow_run_contexts[workflow_run_id].register_block_parameters(
             self.aws_client, parameters, organization
+        )
+
+    def add_context_parameter(self, workflow_run_id: str, context_parameter: ContextParameter) -> None:
+        self._validate_workflow_run_context(workflow_run_id)
+        self.workflow_run_contexts[workflow_run_id].parameters[context_parameter.key] = context_parameter
+
+    async def set_parameter_values_for_output_parameter_dependent_blocks(
+        self,
+        workflow_run_id: str,
+        output_parameter: OutputParameter,
+        value: dict[str, Any] | list | str | None,
+    ) -> None:
+        self._validate_workflow_run_context(workflow_run_id)
+        await self.workflow_run_contexts[workflow_run_id].set_parameter_values_for_output_parameter_dependent_blocks(
+            output_parameter,
+            value,
         )

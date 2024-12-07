@@ -22,21 +22,23 @@ from pydantic import BaseModel
 from sqlalchemy.exc import OperationalError
 
 from skyvern import analytics
+from skyvern.config import settings
 from skyvern.exceptions import StepNotFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import aws_client
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
-from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.models import Artifact
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
-from skyvern.forge.sdk.models import Organization, Step
+from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.organizations import (
     GetOrganizationAPIKeysResponse,
     GetOrganizationsResponse,
+    Organization,
     OrganizationUpdate,
 )
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration, TaskGenerationBase
@@ -50,7 +52,6 @@ from skyvern.forge.sdk.schemas.tasks import (
     TaskStatus,
 )
 from skyvern.forge.sdk.services import org_auth_service
-from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
@@ -95,7 +96,7 @@ async def webhook(
 
     generated_signature = generate_skyvern_signature(
         payload.decode("utf-8"),
-        SettingsManager.get_settings().SKYVERN_API_KEY,
+        settings.SKYVERN_API_KEY,
     )
 
     LOG.info(
@@ -255,53 +256,7 @@ async def get_task(
     # get latest step
     latest_step = await app.DATABASE.get_latest_step(task_id, organization_id=current_org.organization_id)
     if not latest_step:
-        return task_obj.to_task_response()
-
-    screenshot_url = None
-    # todo (kerem): only access artifacts through the artifact manager instead of db
-    screenshot_artifact = await app.DATABASE.get_latest_artifact(
-        task_id=task_obj.task_id,
-        step_id=latest_step.step_id,
-        artifact_types=[ArtifactType.SCREENSHOT_ACTION, ArtifactType.SCREENSHOT_FINAL],
-        organization_id=current_org.organization_id,
-    )
-    if screenshot_artifact:
-        screenshot_url = await app.ARTIFACT_MANAGER.get_share_link(screenshot_artifact)
-
-    recording_artifact = await app.DATABASE.get_latest_artifact(
-        task_id=task_obj.task_id,
-        artifact_types=[ArtifactType.RECORDING],
-        organization_id=current_org.organization_id,
-    )
-    recording_url = None
-    if recording_artifact:
-        recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
-
-    browser_console_log = await app.DATABASE.get_latest_artifact(
-        task_id=task_obj.task_id,
-        artifact_types=[ArtifactType.BROWSER_CONSOLE_LOG],
-        organization_id=current_org.organization_id,
-    )
-    browser_console_log_url = None
-    if browser_console_log:
-        browser_console_log_url = await app.ARTIFACT_MANAGER.get_share_link(browser_console_log)
-
-    # get the artifact of the last  screenshot and get the screenshot_url
-    latest_action_screenshot_artifacts = await app.DATABASE.get_latest_n_artifacts(
-        task_id=task_obj.task_id,
-        organization_id=task_obj.organization_id,
-        artifact_types=[ArtifactType.SCREENSHOT_ACTION],
-        n=SettingsManager.get_settings().TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
-    )
-    latest_action_screenshot_urls: list[str] | None = None
-    if latest_action_screenshot_artifacts:
-        latest_action_screenshot_urls = await app.ARTIFACT_MANAGER.get_share_links(latest_action_screenshot_artifacts)
-    elif task_obj.status in [TaskStatus.terminated, TaskStatus.completed]:
-        LOG.error(
-            "Failed to get latest action screenshots in task response",
-            task_id=task_id,
-            task_status=task_obj.status,
-        )
+        return await app.agent.build_task_response(task=task_obj)
 
     failure_reason: str | None = None
     if task_obj.status == TaskStatus.failed and (latest_step.output or task_obj.failure_reason):
@@ -319,13 +274,8 @@ async def get_task(
 
             if len(action_results_string) > 0:
                 failure_reason += "(Exceptions: " + str(action_results_string) + ")"
-
-    return task_obj.to_task_response(
-        action_screenshot_urls=latest_action_screenshot_urls,
-        screenshot_url=screenshot_url,
-        recording_url=recording_url,
-        browser_console_log_url=browser_console_log_url,
-        failure_reason=failure_reason,
+    return await app.agent.build_task_response(
+        task=task_obj, last_step=latest_step, failure_reason=failure_reason, need_browser_log=True
     )
 
 
@@ -343,6 +293,15 @@ async def cancel_task(
             detail=f"Task not found {task_id}",
         )
     await app.agent.update_task(task_obj, status=TaskStatus.canceled)
+
+
+@base_router.post("/workflows/runs/{workflow_run_id}/cancel")
+@base_router.post("/workflows/runs/{workflow_run_id}/cancel/", include_in_schema=False)
+async def cancel_workflow_run(
+    workflow_run_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> None:
+    await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
 
 
 @base_router.post(
@@ -372,12 +331,12 @@ async def retry_webhook(
     # get latest step
     latest_step = await app.DATABASE.get_latest_step(task_id, organization_id=current_org.organization_id)
     if not latest_step:
-        return task_obj.to_task_response()
+        return await app.agent.build_task_response(task=task_obj)
 
     # retry the webhook
     await app.agent.execute_task_webhook(task=task_obj, last_step=latest_step, api_key=x_api_key)
 
-    return task_obj.to_task_response()
+    return await app.agent.build_task_response(task=task_obj, last_step=latest_step)
 
 
 @base_router.get("/internal/tasks/{task_id}", response_model=list[Task])
@@ -412,6 +371,7 @@ async def get_agent_tasks(
     workflow_run_id: Annotated[str | None, Query()] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     only_standalone_tasks: bool = Query(False),
+    application: Annotated[str | None, Query()] = None,
     sort: OrderBy = Query(OrderBy.created_at),
     order: SortDirection = Query(SortDirection.desc),
 ) -> Response:
@@ -442,8 +402,9 @@ async def get_agent_tasks(
         only_standalone_tasks=only_standalone_tasks,
         order=order,
         order_by_column=sort,
+        application=application,
     )
-    return ORJSONResponse([task.to_task_response().model_dump() for task in tasks])
+    return ORJSONResponse([(await app.agent.build_task_response(task=task)).model_dump() for task in tasks])
 
 
 @base_router.get("/internal/tasks", tags=["agent"], response_model=list[Task])
@@ -521,7 +482,7 @@ async def get_agent_task_step_artifacts(
         step_id,
         organization_id=current_org.organization_id,
     )
-    if SettingsManager.get_settings().ENV != "local" or SettingsManager.get_settings().GENERATE_PRESIGNED_URLS:
+    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
         signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
         if signed_urls:
             for i, artifact in enumerate(artifacts):
@@ -852,7 +813,7 @@ async def generate_task(
     # check if there's a same user_prompt within the past x Hours
     # in the future, we can use vector db to fetch similar prompts
     existing_task_generation = await app.DATABASE.get_task_generation_by_prompt_hash(
-        user_prompt_hash=user_prompt_hash, query_window_hours=SettingsManager.get_settings().PROMPT_CACHE_WINDOW_HOURS
+        user_prompt_hash=user_prompt_hash, query_window_hours=settings.PROMPT_CACHE_WINDOW_HOURS
     )
     if existing_task_generation:
         new_task_generation = await app.DATABASE.create_task_generation(
@@ -887,7 +848,7 @@ async def generate_task(
             data_extraction_goal=parsed_task_generation_obj.data_extraction_goal,
             extracted_information_schema=parsed_task_generation_obj.extracted_information_schema,
             suggested_title=parsed_task_generation_obj.suggested_title,
-            llm=SettingsManager.get_settings().LLM_KEY,
+            llm=settings.LLM_KEY,
             llm_prompt=llm_prompt,
             llm_response=str(llm_response),
         )

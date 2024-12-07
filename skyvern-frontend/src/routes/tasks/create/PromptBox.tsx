@@ -1,10 +1,23 @@
 import { getClient } from "@/api/AxiosClient";
 import { TaskGenerationApiResponse } from "@/api/types";
 import img from "@/assets/promptBoxBg.png";
+import { CartIcon } from "@/components/icons/CartIcon";
+import { GraphIcon } from "@/components/icons/GraphIcon";
+import { InboxIcon } from "@/components/icons/InboxIcon";
+import { MessageIcon } from "@/components/icons/MessageIcon";
+import { TranslateIcon } from "@/components/icons/TranslateIcon";
+import { TrophyIcon } from "@/components/icons/TrophyIcon";
 import { Textarea } from "@/components/ui/textarea";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { PaperPlaneIcon, ReloadIcon } from "@radix-ui/react-icons";
+import {
+  FileTextIcon,
+  GearIcon,
+  PaperPlaneIcon,
+  Pencil1Icon,
+  PlusIcon,
+  ReloadIcon,
+} from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import { useState } from "react";
@@ -46,43 +59,53 @@ function createTemplateTaskFromTaskGenerationParameters(
 const exampleCases = [
   {
     key: "finditparts",
-    label: "Find a product and add it to cart",
+    label: "Add a product to cart",
+    icon: <CartIcon className="size-6" />,
   },
   {
     key: "geico",
-    label: "Generate an insurance quote",
+    label: "Get an insurance quote",
+    icon: <FileTextIcon className="size-6" />,
   },
   {
     key: "job_application",
-    label: "Apply to a job",
+    label: "Apply for a job",
+    icon: <InboxIcon className="size-6" />,
   },
   {
     key: "california_edd",
-    label: "Fill an online enrollment form",
+    label: "Fill out CA's online EDD",
+    icon: <Pencil1Icon className="size-6" />,
   },
   {
     key: "contact_us_forms",
     label: "Fill a contact us form",
+    icon: <FileTextIcon className="size-6" />,
   },
   {
     key: "bci_seguros",
-    label: "Generate an auto insurance quote in spanish",
+    label: "Get an auto insurance quote in spanish",
+    icon: <TranslateIcon className="size-6" />,
   },
   {
     key: "hackernews",
-    label: "Get the top post on Hackernews",
+    label: "What's the top post on hackernews",
+    icon: <MessageIcon className="size-6" />,
   },
   {
     key: "AAPLStockPrice",
-    label: "Get the stock price of AAPL",
-  },
-  {
-    key: "NYTBestseller",
-    label: "Get the top NYT bestseller",
+    label: "Search for AAPL on Google Finance",
+    icon: <GraphIcon className="size-6" />,
   },
   {
     key: "topRankedFootballTeam",
     label: "Get the top ranked football team",
+    icon: <TrophyIcon className="size-6" />,
+  },
+  {
+    key: "extractIntegrationsFromGong",
+    label: "Extract Integrations from Gong.io",
+    icon: <GearIcon className="size-6" />,
   },
 ];
 
@@ -168,7 +191,7 @@ function PromptBox() {
                     const taskGenerationResponse =
                       await getTaskFromPromptMutation.mutateAsync(prompt);
                     await saveTaskMutation.mutateAsync(taskGenerationResponse);
-                    navigate("/create/from-prompt", {
+                    navigate("/tasks/create/from-prompt", {
                       state: {
                         data: taskGenerationResponse,
                       },
@@ -181,16 +204,26 @@ function PromptBox() {
         </div>
       </div>
       <div className="flex flex-wrap justify-center gap-4 rounded-sm bg-slate-elevation1 p-4">
+        <div
+          className="flex cursor-pointer gap-2 whitespace-normal rounded-sm border-2 border-dashed bg-slate-elevation3 px-4 py-3 hover:bg-slate-elevation5 lg:whitespace-nowrap"
+          onClick={() => {
+            navigate("/tasks/create/blank");
+          }}
+        >
+          <PlusIcon className="size-6" />
+          Build Your Own
+        </div>
         {exampleCases.map((example) => {
           return (
             <div
               key={example.key}
-              className="cursor-pointer whitespace-normal rounded-sm bg-slate-elevation3 px-4 py-3 hover:bg-slate-elevation5 lg:whitespace-nowrap"
+              className="flex cursor-pointer gap-2 whitespace-normal rounded-sm bg-slate-elevation3 px-4 py-3 hover:bg-slate-elevation5 lg:whitespace-nowrap"
               onClick={() => {
-                navigate(`/create/${example.key}`);
+                navigate(`/tasks/create/${example.key}`);
               }}
             >
-              {example.label}
+              <div>{example.icon}</div>
+              <div>{example.label}</div>
             </div>
           );
         })}

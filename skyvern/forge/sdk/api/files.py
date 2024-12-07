@@ -2,6 +2,7 @@ import hashlib
 import mimetypes
 import os
 import re
+import shutil
 import tempfile
 import zipfile
 from pathlib import Path
@@ -11,6 +12,7 @@ import aiohttp
 import structlog
 from multidict import CIMultiDictProxy
 
+from skyvern.config import settings
 from skyvern.constants import REPO_ROOT_DIR
 from skyvern.exceptions import DownloadFileMaxSizeExceeded
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
@@ -20,7 +22,7 @@ LOG = structlog.get_logger()
 
 async def download_from_s3(client: AsyncAWSClient, s3_uri: str) -> str:
     downloaded_bytes = await client.download_file(uri=s3_uri)
-    file_path = tempfile.NamedTemporaryFile(delete=False)
+    file_path = create_named_temporary_file(delete=False)
     file_path.write(downloaded_bytes)
     return file_path.name
 
@@ -56,7 +58,7 @@ async def download_file(url: str, max_size_mb: int | None = None) -> str:
                 a = urlparse(url)
 
                 # Get the file name
-                temp_dir = tempfile.mkdtemp(prefix="skyvern_downloads_")
+                temp_dir = make_temp_directory(prefix="skyvern_downloads_")
 
                 file_name = os.path.basename(a.path)
                 # if no suffix in the URL, we need to parse it from HTTP headers
@@ -112,7 +114,13 @@ def unzip_files(zip_file_path: str, output_dir: str) -> None:
 
 
 def get_path_for_workflow_download_directory(workflow_run_id: str) -> Path:
-    return Path(f"{REPO_ROOT_DIR}/downloads/{workflow_run_id}/")
+    return Path(get_download_dir(workflow_run_id=workflow_run_id, task_id=None))
+
+
+def get_download_dir(workflow_run_id: str | None, task_id: str | None) -> str:
+    download_dir = f"{REPO_ROOT_DIR}/downloads/{workflow_run_id or task_id}"
+    os.makedirs(download_dir, exist_ok=True)
+    return download_dir
 
 
 def list_files_in_directory(directory: Path, recursive: bool = False) -> list[str]:
@@ -151,3 +159,53 @@ def calculate_sha256_for_file(file_path: str) -> str:
         for byte_block in iter(lambda: f.read(4096), b""):
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
+
+
+def create_folder_if_not_exist(dir: str) -> None:
+    path = Path(dir)
+    if path.exists():
+        return
+    path.mkdir(parents=True)
+
+
+def get_skyvern_temp_dir() -> str:
+    temp_dir = settings.TEMP_PATH
+    create_folder_if_not_exist(temp_dir)
+    return temp_dir
+
+
+def make_temp_directory(
+    suffix: str | None = None,
+    prefix: str | None = None,
+) -> str:
+    temp_dir = settings.TEMP_PATH
+    create_folder_if_not_exist(temp_dir)
+    return tempfile.mkdtemp(suffix=suffix, prefix=prefix, dir=temp_dir)
+
+
+def create_named_temporary_file(delete: bool = True) -> tempfile._TemporaryFileWrapper:
+    temp_dir = settings.TEMP_PATH
+    create_folder_if_not_exist(temp_dir)
+    return tempfile.NamedTemporaryFile(dir=temp_dir, delete=delete)
+
+
+def clean_up_dir(dir: str) -> None:
+    if not os.path.exists(dir):
+        return
+
+    if os.path.isfile(dir):
+        os.unlink(dir)
+        return
+
+    for item in os.listdir(dir):
+        item_path = os.path.join(dir, item)
+        if os.path.isfile(item_path) or os.path.islink(item_path):
+            os.unlink(item_path)
+        elif os.path.isdir(item_path):
+            shutil.rmtree(item_path)
+
+    return
+
+
+def clean_up_skyvern_temp_dir() -> None:
+    return clean_up_dir(get_skyvern_temp_dir())

@@ -27,15 +27,11 @@ import { AppNode } from "..";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
-import { TaskNodeParametersPanel } from "./TaskNodeParametersPanel";
-import {
-  dataSchemaExampleValue,
-  errorMappingExampleValue,
-  fieldPlaceholders,
-  helpTooltipContent,
-  type TaskNode,
-} from "./types";
+import { ParametersMultiSelect } from "./ParametersMultiSelect";
+import type { TaskNode } from "./types";
 import { Separator } from "@/components/ui/separator";
+import { dataSchemaExampleValue, errorMappingExampleValue } from "../types";
+import { helpTooltips, placeholders } from "../../helpContent";
 
 function TaskNode({ id, data }: NodeProps<TaskNode>) {
   const { updateNodeData } = useReactFlow();
@@ -118,7 +114,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                 <div className="space-y-2">
                   <div className="flex gap-2">
                     <Label className="text-xs text-slate-300">URL</Label>
-                    <HelpTooltip content={helpTooltipContent["url"]} />
+                    <HelpTooltip content={helpTooltips["task"]["url"]} />
                   </div>
                   <AutoResizingTextarea
                     onChange={(event) => {
@@ -128,7 +124,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       handleChange("url", event.target.value);
                     }}
                     value={inputs.url}
-                    placeholder={fieldPlaceholders["url"]}
+                    placeholder={placeholders["task"]["url"]}
                     className="nopan text-xs"
                   />
                 </div>
@@ -136,7 +132,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                   <div className="flex gap-2">
                     <Label className="text-xs text-slate-300">Goal</Label>
                     <HelpTooltip
-                      content={helpTooltipContent["navigationGoal"]}
+                      content={helpTooltips["task"]["navigationGoal"]}
                     />
                   </div>
                   <AutoResizingTextarea
@@ -147,12 +143,12 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       handleChange("navigationGoal", event.target.value);
                     }}
                     value={inputs.navigationGoal}
-                    placeholder={fieldPlaceholders["navigationGoal"]}
+                    placeholder={placeholders["task"]["navigationGoal"]}
                     className="nopan text-xs"
                   />
                 </div>
                 <div className="space-y-2">
-                  <TaskNodeParametersPanel
+                  <ParametersMultiSelect
                     availableOutputParameters={outputParameterKeys}
                     parameters={data.parameterKeys}
                     onParametersChange={(parameterKeys) => {
@@ -173,7 +169,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       Data Extraction Goal
                     </Label>
                     <HelpTooltip
-                      content={helpTooltipContent["dataExtractionGoal"]}
+                      content={helpTooltips["task"]["dataExtractionGoal"]}
                     />
                   </div>
                   <AutoResizingTextarea
@@ -184,7 +180,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       handleChange("dataExtractionGoal", event.target.value);
                     }}
                     value={inputs.dataExtractionGoal}
-                    placeholder={fieldPlaceholders["dataExtractionGoal"]}
+                    placeholder={placeholders["task"]["dataExtractionGoal"]}
                     className="nopan text-xs"
                   />
                 </div>
@@ -194,7 +190,9 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       <Label className="text-xs text-slate-300">
                         Data Schema
                       </Label>
-                      <HelpTooltip content={helpTooltipContent["dataSchema"]} />
+                      <HelpTooltip
+                        content={helpTooltips["task"]["dataSchema"]}
+                      />
                     </div>
                     <Checkbox
                       checked={inputs.dataSchema !== "null"}
@@ -233,18 +231,18 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
           </AccordionItem>
           <AccordionItem value="advanced" className="border-b-0">
             <AccordionTrigger>Advanced Settings</AccordionTrigger>
-            <AccordionContent className="pl-[1.5rem] pr-1 pt-1">
+            <AccordionContent className="pl-6 pr-1 pt-1">
               <div className="space-y-4">
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
                     <Label className="text-xs font-normal text-slate-300">
                       Max Retries
                     </Label>
-                    <HelpTooltip content={helpTooltipContent["maxRetries"]} />
+                    <HelpTooltip content={helpTooltips["task"]["maxRetries"]} />
                   </div>
                   <Input
                     type="number"
-                    placeholder={fieldPlaceholders["maxRetries"]}
+                    placeholder={placeholders["task"]["maxRetries"]}
                     className="nopan w-52 text-xs"
                     min="0"
                     value={inputs.maxRetries ?? ""}
@@ -266,12 +264,12 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       Max Steps Override
                     </Label>
                     <HelpTooltip
-                      content={helpTooltipContent["maxStepsOverride"]}
+                      content={helpTooltips["task"]["maxStepsOverride"]}
                     />
                   </div>
                   <Input
                     type="number"
-                    placeholder={fieldPlaceholders["maxStepsOverride"]}
+                    placeholder={placeholders["task"]["maxStepsOverride"]}
                     className="nopan w-52 text-xs"
                     min="0"
                     value={inputs.maxStepsOverride ?? ""}
@@ -294,7 +292,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                         Error Messages
                       </Label>
                       <HelpTooltip
-                        content={helpTooltipContent["errorCodeMapping"]}
+                        content={helpTooltips["task"]["errorCodeMapping"]}
                       />
                     </div>
                     <Checkbox
@@ -337,7 +335,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       Continue on Failure
                     </Label>
                     <HelpTooltip
-                      content={helpTooltipContent["continueOnFailure"]}
+                      content={helpTooltips["task"]["continueOnFailure"]}
                     />
                   </div>
                   <div className="w-52">
@@ -357,7 +355,9 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     <Label className="text-xs font-normal text-slate-300">
                       Cache Actions
                     </Label>
-                    <HelpTooltip content={helpTooltipContent["cacheActions"]} />
+                    <HelpTooltip
+                      content={helpTooltips["task"]["cacheActions"]}
+                    />
                   </div>
                   <div className="w-52">
                     <Switch
@@ -378,7 +378,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       Complete on Download
                     </Label>
                     <HelpTooltip
-                      content={helpTooltipContent["completeOnDownload"]}
+                      content={helpTooltips["task"]["completeOnDownload"]}
                     />
                   </div>
                   <div className="w-52">
@@ -398,11 +398,11 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     <Label className="text-xs font-normal text-slate-300">
                       File Suffix
                     </Label>
-                    <HelpTooltip content={helpTooltipContent["fileSuffix"]} />
+                    <HelpTooltip content={helpTooltips["task"]["fileSuffix"]} />
                   </div>
                   <Input
                     type="text"
-                    placeholder={fieldPlaceholders["downloadSuffix"]}
+                    placeholder={placeholders["task"]["downloadSuffix"]}
                     className="nopan w-52 text-xs"
                     value={inputs.downloadSuffix ?? ""}
                     onChange={(event) => {
@@ -420,7 +420,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       2FA Verification URL
                     </Label>
                     <HelpTooltip
-                      content={helpTooltipContent["totpVerificationUrl"]}
+                      content={helpTooltips["task"]["totpVerificationUrl"]}
                     />
                   </div>
                   <AutoResizingTextarea
@@ -431,7 +431,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       handleChange("totpVerificationUrl", event.target.value);
                     }}
                     value={inputs.totpVerificationUrl ?? ""}
-                    placeholder={fieldPlaceholders["totpVerificationUrl"]}
+                    placeholder={placeholders["task"]["totpVerificationUrl"]}
                     className="nopan text-xs"
                   />
                 </div>
@@ -441,7 +441,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       2FA Identifier
                     </Label>
                     <HelpTooltip
-                      content={helpTooltipContent["totpIdentifier"]}
+                      content={helpTooltips["task"]["totpIdentifier"]}
                     />
                   </div>
                   <AutoResizingTextarea
@@ -452,7 +452,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       handleChange("totpIdentifier", event.target.value);
                     }}
                     value={inputs.totpIdentifier ?? ""}
-                    placeholder={fieldPlaceholders["totpIdentifier"]}
+                    placeholder={placeholders["task"]["totpIdentifier"]}
                     className="nopan text-xs"
                   />
                 </div>

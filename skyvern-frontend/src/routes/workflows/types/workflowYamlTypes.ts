@@ -3,6 +3,7 @@ export type WorkflowCreateYAMLRequest = {
   description?: string | null;
   proxy_location?: string | null;
   webhook_callback_url?: string | null;
+  persist_browser_session?: boolean;
   totp_verification_url?: string | null;
   workflow_definition: WorkflowDefinitionYAML;
   is_saved_task?: boolean;
@@ -75,6 +76,13 @@ const BlockTypes = {
   UPLOAD_TO_S3: "upload_to_s3",
   SEND_EMAIL: "send_email",
   FILE_URL_PARSER: "file_url_parser",
+  VALIDATION: "validation",
+  ACTION: "action",
+  NAVIGATION: "navigation",
+  EXTRACTION: "extraction",
+  LOGIN: "login",
+  WAIT: "wait",
+  FILE_DOWNLOAD: "file_download",
 } as const;
 
 export type BlockType = (typeof BlockTypes)[keyof typeof BlockTypes];
@@ -87,7 +95,14 @@ export type BlockYAML =
   | UploadToS3BlockYAML
   | SendEmailBlockYAML
   | FileUrlParserBlockYAML
-  | ForLoopBlockYAML;
+  | ForLoopBlockYAML
+  | ValidationBlockYAML
+  | ActionBlockYAML
+  | NavigationBlockYAML
+  | ExtractionBlockYAML
+  | LoginBlockYAML
+  | WaitBlockYAML
+  | FileDownloadBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: BlockType;
@@ -107,6 +122,91 @@ export type TaskBlockYAML = BlockYAMLBase & {
   max_steps_per_run?: number | null;
   parameter_keys?: Array<string> | null;
   complete_on_download?: boolean;
+  download_suffix?: string | null;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
+  cache_actions: boolean;
+};
+
+export type ValidationBlockYAML = BlockYAMLBase & {
+  block_type: "validation";
+  complete_criterion: string | null;
+  terminate_criterion: string | null;
+  error_code_mapping: Record<string, string> | null;
+  parameter_keys?: Array<string> | null;
+};
+
+export type ActionBlockYAML = BlockYAMLBase & {
+  block_type: "action";
+  url: string | null;
+  title?: string;
+  navigation_goal: string | null;
+  error_code_mapping: Record<string, string> | null;
+  max_retries?: number;
+  parameter_keys?: Array<string> | null;
+  complete_on_download?: boolean;
+  download_suffix?: string | null;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
+  cache_actions: boolean;
+};
+
+export type NavigationBlockYAML = BlockYAMLBase & {
+  block_type: "navigation";
+  url: string | null;
+  title?: string;
+  navigation_goal: string | null;
+  error_code_mapping: Record<string, string> | null;
+  max_retries?: number;
+  max_steps_per_run?: number | null;
+  parameter_keys?: Array<string> | null;
+  complete_on_download?: boolean;
+  download_suffix?: string | null;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
+  cache_actions: boolean;
+};
+
+export type ExtractionBlockYAML = BlockYAMLBase & {
+  block_type: "extraction";
+  url: string | null;
+  title?: string;
+  data_extraction_goal: string | null;
+  data_schema: Record<string, unknown> | null;
+  max_retries?: number;
+  max_steps_per_run?: number | null;
+  parameter_keys?: Array<string> | null;
+  cache_actions: boolean;
+};
+
+export type LoginBlockYAML = BlockYAMLBase & {
+  block_type: "login";
+  url: string | null;
+  title?: string;
+  navigation_goal: string | null;
+  error_code_mapping: Record<string, string> | null;
+  max_retries?: number;
+  max_steps_per_run?: number | null;
+  parameter_keys?: Array<string> | null;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
+  cache_actions: boolean;
+};
+
+export type WaitBlockYAML = BlockYAMLBase & {
+  block_type: "wait";
+  wait_sec?: number;
+};
+
+export type FileDownloadBlockYAML = BlockYAMLBase & {
+  block_type: "file_download";
+  url: string | null;
+  title?: string;
+  navigation_goal: string | null;
+  error_code_mapping: Record<string, string> | null;
+  max_retries?: number;
+  max_steps_per_run?: number | null;
+  parameter_keys?: Array<string> | null;
   download_suffix?: string | null;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;

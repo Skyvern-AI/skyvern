@@ -1,4 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
+import { ProxyLocation } from "@/api/types";
+import { ProxySelector } from "@/components/ProxySelector";
+import { Button } from "@/components/ui/button";
 import {
   Form,
   FormControl,
@@ -7,26 +10,29 @@ import {
   FormLabel,
   FormMessage,
 } from "@/components/ui/form";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useForm } from "react-hook-form";
-import { Link, useParams } from "react-router-dom";
-import { WorkflowParameterInput } from "./WorkflowParameterInput";
-import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { toast } from "@/components/ui/use-toast";
+import { useApiCredential } from "@/hooks/useApiCredential";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { copyText } from "@/util/copyText";
+import { apiBaseUrl } from "@/util/env";
 import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { ToastAction } from "@radix-ui/react-toast";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import fetchToCurl from "fetch-to-curl";
-import { apiBaseUrl } from "@/util/env";
-import { useApiCredential } from "@/hooks/useApiCredential";
-import { copyText } from "@/util/copyText";
-import { WorkflowParameter } from "./types/workflowTypes";
-import { Input } from "@/components/ui/input";
+import { useForm } from "react-hook-form";
+import { Link, useParams } from "react-router-dom";
 import { z } from "zod";
+import { WorkflowParameter } from "./types/workflowTypes";
+import { WorkflowParameterInput } from "./WorkflowParameterInput";
 
 type Props = {
   workflowParameters: Array<WorkflowParameter>;
   initialValues: Record<string, unknown>;
+  initialSettings: {
+    proxyLocation: ProxyLocation;
+    webhookCallbackUrl: string;
+  };
 };
 
 function parseValuesForWorkflowRun(
@@ -60,38 +66,65 @@ function parseValuesForWorkflowRun(
   );
 }
 
-function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
+type RunWorkflowRequestBody = {
+  data: Record<string, unknown>; // workflow parameters and values
+  proxy_location: ProxyLocation | null;
+  webhook_callback_url?: string | null;
+};
+
+function getRunWorkflowRequestBody(
+  values: RunWorkflowFormType,
+  workflowParameters: Array<WorkflowParameter>,
+): RunWorkflowRequestBody {
+  const { webhookCallbackUrl, proxyLocation, ...parameters } = values;
+
+  const parsedParameters = parseValuesForWorkflowRun(
+    parameters,
+    workflowParameters,
+  );
+
+  const body: RunWorkflowRequestBody = {
+    data: parsedParameters,
+    proxy_location: proxyLocation,
+  };
+
+  if (webhookCallbackUrl) {
+    body.webhook_callback_url = webhookCallbackUrl;
+  }
+
+  return body;
+}
+
+type RunWorkflowFormType = Record<string, unknown> & {
+  webhookCallbackUrl: string;
+  proxyLocation: ProxyLocation;
+};
+
+function RunWorkflowForm({
+  workflowParameters,
+  initialValues,
+  initialSettings,
+}: Props) {
   const { workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
-  const form = useForm<Record<string, unknown>>({
-    defaultValues: { ...initialValues, webhookCallbackUrl: null },
+  const form = useForm<RunWorkflowFormType>({
+    defaultValues: {
+      ...initialValues,
+      webhookCallbackUrl: initialSettings.webhookCallbackUrl,
+      proxyLocation: initialSettings.proxyLocation,
+    },
   });
   const apiCredential = useApiCredential();
 
   const runWorkflowMutation = useMutation({
-    mutationFn: async (values: Record<string, unknown>) => {
+    mutationFn: async (values: RunWorkflowFormType) => {
       const client = await getClient(credentialGetter);
-
-      const { webhookCallbackUrl, ...parameters } = values;
-
-      const body: {
-        data: Record<string, unknown>;
-        proxy_location: string;
-        webhook_callback_url?: string;
-      } = {
-        data: parameters,
-        proxy_location: "RESIDENTIAL",
-      };
-
-      if (webhookCallbackUrl) {
-        body.webhook_callback_url = webhookCallbackUrl as string;
-      }
-
-      return client.post<unknown, { data: { workflow_run_id: string } }>(
-        `/workflows/${workflowPermanentId}/run`,
-        body,
-      );
+      const body = getRunWorkflowRequestBody(values, workflowParameters);
+      return client.post<
+        RunWorkflowRequestBody,
+        { data: { workflow_run_id: string } }
+      >(`/workflows/${workflowPermanentId}/run`, body);
     },
     onSuccess: (response) => {
       toast({
@@ -123,8 +156,8 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
     },
   });
 
-  function onSubmit(values: Record<string, unknown>) {
-    const { webhookCallbackUrl, ...parameters } = values;
+  function onSubmit(values: RunWorkflowFormType) {
+    const { webhookCallbackUrl, proxyLocation, ...parameters } = values;
     const parsedParameters = parseValuesForWorkflowRun(
       parameters,
       workflowParameters,
@@ -132,6 +165,7 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
     runWorkflowMutation.mutate({
       ...parsedParameters,
       webhookCallbackUrl,
+      proxyLocation,
     });
   }
 
@@ -216,10 +250,10 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
           <FormField
             key="webhookCallbackUrl"
             control={form.control}
-            name={"webhookCallbackUrl"}
+            name="webhookCallbackUrl"
             rules={{
               validate: (value) => {
-                if (value === null) {
+                if (value === null || value === "") {
                   return;
                 }
                 if (typeof value !== "string") {
@@ -264,6 +298,39 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
               );
             }}
           />
+          <FormField
+            key="proxyLocation"
+            control={form.control}
+            name="proxyLocation"
+            render={({ field }) => {
+              return (
+                <FormItem>
+                  <div className="flex gap-16">
+                    <FormLabel>
+                      <div className="w-72">
+                        <div className="flex items-center gap-2 text-lg">
+                          Proxy Location
+                        </div>
+                        <h2 className="text-sm text-slate-400">
+                          Route Skyvern through one of our available proxies.
+                        </h2>
+                      </div>
+                    </FormLabel>
+                    <div className="w-full space-y-2">
+                      <FormControl>
+                        <ProxySelector
+                          value={field.value}
+                          onChange={field.onChange}
+                          className="w-48"
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </div>
+                  </div>
+                </FormItem>
+              );
+            }}
+          />
         </div>
 
         <div className="flex justify-end gap-2">
@@ -272,22 +339,10 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
             variant="secondary"
             onClick={() => {
               const values = form.getValues();
-              const { webhookCallbackUrl, ...parameters } = values;
-              const parsedParameters = parseValuesForWorkflowRun(
-                parameters,
+              const body = getRunWorkflowRequestBody(
+                values,
                 workflowParameters,
               );
-              const body: {
-                data: Record<string, unknown>;
-                proxy_location: string;
-                webhook_callback_url?: string;
-              } = {
-                data: parsedParameters,
-                proxy_location: "RESIDENTIAL",
-              };
-              if (webhookCallbackUrl) {
-                body.webhook_callback_url = webhookCallbackUrl as string;
-              }
 
               const curl = fetchToCurl({
                 method: "POST",
@@ -298,6 +353,7 @@ function RunWorkflowForm({ workflowParameters, initialValues }: Props) {
                   "x-api-key": apiCredential ?? "<your-api-key>",
                 },
               });
+
               copyText(curl).then(() => {
                 toast({
                   variant: "success",

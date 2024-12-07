@@ -250,6 +250,11 @@ class DownloadFileMaxSizeExceeded(SkyvernException):
         super().__init__(f"Download file size exceeded the maximum allowed size of {max_size} MB.")
 
 
+class NoFileDownloadTriggered(SkyvernException):
+    def __init__(self, element_id: str) -> None:
+        super().__init__(f"Clicking on element doesn't trigger the file download. element_id={element_id}")
+
+
 class BitwardenBaseError(SkyvernException):
     def __init__(self, message: str) -> None:
         super().__init__(f"Bitwarden error: {message}")
@@ -357,8 +362,8 @@ class InputActionOnSelect2Dropdown(SkyvernException):
 
 
 class FailToClick(SkyvernException):
-    def __init__(self, element_id: str, anchor: str = "self"):
-        super().__init__(f"Failed to click({anchor}). element_id={element_id}")
+    def __init__(self, element_id: str, msg: str, anchor: str = "self"):
+        super().__init__(f"Failed to click({anchor}). element_id={element_id}, error_msg={msg}")
 
 
 class FailToSelectByLabel(SkyvernException):
@@ -499,11 +504,9 @@ class CachedActionPlanError(SkyvernException):
         super().__init__(message)
 
 
-class InvalidUrl(SkyvernHTTPException):
+class InvalidUrl(SkyvernException):
     def __init__(self, url: str) -> None:
-        super().__init__(
-            f"Invalid URL: {url}. Skyvern supports HTTP and HTTPS urls.", status_code=status.HTTP_400_BAD_REQUEST
-        )
+        super().__init__(f"Invalid URL: {url}. Skyvern supports HTTP and HTTPS urls with max 2083 character length.")
 
 
 class BlockedHost(SkyvernHTTPException):
@@ -530,3 +533,15 @@ class InteractWithDisabledElement(SkyvernException):
         super().__init__(
             f"The element(id={element_id}) now is disabled, try to interact with it later when it's enabled."
         )
+
+
+class FailedToParseActionInstruction(SkyvernException):
+    def __init__(self, reason: str | None, error_type: str | None):
+        super().__init__(
+            f"Failed to parse the action instruction as '{reason}({error_type})'",
+        )
+
+
+class UnsupportedTaskType(SkyvernException):
+    def __init__(self, task_type: str):
+        super().__init__(f"Not supported task type [{task_type}]")

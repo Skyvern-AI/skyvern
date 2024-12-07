@@ -1,5 +1,21 @@
+import { getClient } from "@/api/AxiosClient";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { toast } from "@/components/ui/use-toast";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
 import { DeleteNodeCallbackContext } from "@/store/DeleteNodeCallbackContext";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { ReloadIcon } from "@radix-ui/react-icons";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Background,
   BackgroundVariant,
@@ -12,16 +28,20 @@ import {
   useNodesState,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import { AxiosError } from "axios";
 import { nanoid } from "nanoid";
 import { useEffect, useState } from "react";
+import { useBlocker, useParams } from "react-router-dom";
+import { stringify as convertToYAML } from "yaml";
 import {
   AWSSecretParameter,
-  BitwardenSensitiveInformationParameter,
   WorkflowApiResponse,
   WorkflowParameterValueType,
+  WorkflowSettings,
 } from "../types/workflowTypes";
 import {
   BitwardenLoginCredentialParameterYAML,
+  BitwardenSensitiveInformationParameterYAML,
   BlockYAML,
   ContextParameterYAML,
   ParameterYAML,
@@ -31,7 +51,12 @@ import {
 import { WorkflowHeader } from "./WorkflowHeader";
 import { WorkflowParametersStateContext } from "./WorkflowParametersStateContext";
 import { edgeTypes } from "./edges";
-import { AppNode, nodeTypes, WorkflowBlockNode } from "./nodes";
+import {
+  AppNode,
+  isWorkflowBlockNode,
+  nodeTypes,
+  WorkflowBlockNode,
+} from "./nodes";
 import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
 import "./reactFlowOverrideStyles.css";
@@ -43,30 +68,12 @@ import {
   getAdditionalParametersForEmailBlock,
   getOutputParameterKey,
   getWorkflowBlocks,
+  getWorkflowErrors,
+  getWorkflowSettings,
   layout,
   nodeAdderNode,
   startNode,
 } from "./workflowEditorUtils";
-import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
-import { useBlocker, useParams } from "react-router-dom";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { getClient } from "@/api/AxiosClient";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { stringify as convertToYAML } from "yaml";
-import { toast } from "@/components/ui/use-toast";
-import { AxiosError } from "axios";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { Button } from "@/components/ui/button";
-import { ReloadIcon } from "@radix-ui/react-icons";
-import { isLoopNode, LoopNode } from "./nodes/LoopNode/types";
-import { isTaskNode } from "./nodes/TaskNode/types";
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -74,6 +81,7 @@ function convertToParametersYAML(
   | WorkflowParameterYAML
   | BitwardenLoginCredentialParameterYAML
   | ContextParameterYAML
+  | BitwardenSensitiveInformationParameterYAML
 > {
   return parameters.map((parameter) => {
     if (parameter.parameterType === "workflow") {
@@ -92,6 +100,20 @@ function convertToParametersYAML(
         key: parameter.key,
         description: parameter.description || null,
         source_parameter_key: parameter.sourceParameterKey,
+      };
+    } else if (parameter.parameterType === "secret") {
+      return {
+        parameter_type: "bitwarden_sensitive_information",
+        key: parameter.key,
+        bitwarden_identity_key: parameter.identityKey,
+        bitwarden_identity_fields: parameter.identityFields,
+        description: parameter.description || null,
+        bitwarden_collection_id: parameter.collectionId,
+        bitwarden_client_id_aws_secret_key: "SKYVERN_BITWARDEN_CLIENT_ID",
+        bitwarden_client_secret_aws_secret_key:
+          "SKYVERN_BITWARDEN_CLIENT_SECRET",
+        bitwarden_master_password_aws_secret_key:
+          "SKYVERN_BITWARDEN_MASTER_PASSWORD",
       };
     } else {
       return {
@@ -131,6 +153,14 @@ export type ParametersState = Array<
       sourceParameterKey: string;
       description?: string | null;
     }
+  | {
+      key: string;
+      parameterType: "secret";
+      identityKey: string;
+      identityFields: Array<string>;
+      collectionId: string;
+      description?: string | null;
+    }
 >;
 
 type Props = {
@@ -167,6 +197,7 @@ function FlowRenderer({
   const [title, setTitle] = useState(initialTitle);
   const nodesInitialized = useNodesInitialized();
   const { hasChanges, setHasChanges } = useWorkflowHasChangesStore();
+  useShouldNotifyWhenClosingTab(hasChanges);
   const blocker = useBlocker(({ currentLocation, nextLocation }) => {
     return hasChanges && nextLocation.pathname !== currentLocation.pathname;
   });
@@ -176,6 +207,7 @@ function FlowRenderer({
       parameters: Array<ParameterYAML>;
       blocks: Array<BlockYAML>;
       title: string;
+      settings: WorkflowSettings;
     }) => {
       if (!workflowPermanentId) {
         return;
@@ -184,8 +216,9 @@ function FlowRenderer({
       const requestBody: WorkflowCreateYAMLRequest = {
         title: data.title,
         description: workflow.description,
-        proxy_location: workflow.proxy_location,
-        webhook_callback_url: workflow.webhook_callback_url,
+        proxy_location: data.settings.proxyLocation,
+        webhook_callback_url: data.settings.webhookCallbackUrl,
+        persist_browser_session: data.settings.persistBrowserSession,
         totp_verification_url: workflow.totp_verification_url,
         workflow_definition: {
           parameters: data.parameters,
@@ -219,7 +252,7 @@ function FlowRenderer({
       setHasChanges(false);
     },
     onError: (error: AxiosError) => {
-      const detail = (error.response?.data as { detail?: string }).detail;
+      const detail = (error.response?.data as { detail?: string })?.detail;
       toast({
         title: "Error",
         description: detail ? detail : error.message,
@@ -242,16 +275,14 @@ function FlowRenderer({
   }, [nodesInitialized]);
 
   async function handleSave() {
-    const blocks = getWorkflowBlocks(nodes);
+    const blocks = getWorkflowBlocks(nodes, edges);
+    const settings = getWorkflowSettings(nodes);
     const parametersInYAMLConvertibleJSON = convertToParametersYAML(parameters);
     const filteredParameters = workflow.workflow_definition.parameters.filter(
       (parameter) => {
-        return (
-          parameter.parameter_type === "aws_secret" ||
-          parameter.parameter_type === "bitwarden_sensitive_information"
-        );
+        return parameter.parameter_type === "aws_secret";
       },
-    ) as Array<AWSSecretParameter | BitwardenSensitiveInformationParameter>;
+    ) as Array<AWSSecretParameter>;
 
     const echoParameters = convertEchoParameters(filteredParameters);
 
@@ -274,6 +305,7 @@ function FlowRenderer({
       ],
       blocks,
       title,
+      settings,
     });
   }
 
@@ -287,15 +319,18 @@ function FlowRenderer({
     const newNodes: Array<AppNode> = [];
     const newEdges: Array<Edge> = [];
     const id = nanoid();
+    const existingLabels = nodes
+      .filter(isWorkflowBlockNode)
+      .map((node) => node.data.label);
     const node = createNode(
       { id, parentId: parent },
       nodeType,
-      generateNodeLabel(nodes.map((node) => node.data.label)),
+      generateNodeLabel(existingLabels),
     );
     newNodes.push(node);
     if (previous) {
       const newEdge = {
-        id: `edge-${previous}-${id}`,
+        id: nanoid(),
         type: "edgeWithAddButton",
         source: previous,
         target: id,
@@ -307,7 +342,7 @@ function FlowRenderer({
     }
     if (next) {
       const newEdge = {
-        id: `edge-${id}-${next}`,
+        id: nanoid(),
         type: connectingEdgeType,
         source: id,
         target: next,
@@ -322,7 +357,9 @@ function FlowRenderer({
       // when loop node is first created it needs an adder node so nodes can be added inside the loop
       const startNodeId = nanoid();
       const adderNodeId = nanoid();
-      newNodes.push(startNode(startNodeId, id));
+      newNodes.push(
+        startNode(startNodeId, { withWorkflowSettings: false }, id),
+      );
       newNodes.push(nodeAdderNode(adderNodeId, id));
       newEdges.push(defaultEdge(startNodeId, adderNodeId));
     }
@@ -349,7 +386,7 @@ function FlowRenderer({
 
   function deleteNode(id: string) {
     const node = nodes.find((node) => node.id === id);
-    if (!node) {
+    if (!node || !isWorkflowBlockNode(node)) {
       return;
     }
     const deletedNodeLabel = node.data.label;
@@ -396,6 +433,19 @@ function FlowRenderer({
           },
         };
       }
+      // TODO: Fix this. When we put these into the same if statement TS fails to recognize that the returned value fits both the task and text prompt node types
+      if (node.type === "textPrompt") {
+        return {
+          ...node,
+          data: {
+            ...node.data,
+            parameterKeys: node.data.parameterKeys.filter(
+              (parameter) =>
+                parameter !== getOutputParameterKey(deletedNodeLabel),
+            ),
+          },
+        };
+      }
       if (node.type === "loop") {
         return {
           ...node,
@@ -412,40 +462,6 @@ function FlowRenderer({
     });
     setHasChanges(true);
     doLayout(newNodesWithUpdatedParameters, newEdges);
-  }
-
-  function getWorkflowErrors(): Array<string> {
-    const errors: Array<string> = [];
-
-    // check loop node parameters
-    const loopNodes: Array<LoopNode> = nodes.filter(isLoopNode);
-    const emptyLoopNodes = loopNodes.filter(
-      (node: LoopNode) => node.data.loopValue === "",
-    );
-    if (emptyLoopNodes.length > 0) {
-      emptyLoopNodes.forEach((node) => {
-        errors.push(
-          `${node.data.label}: Loop value parameter must be selected`,
-        );
-      });
-    }
-
-    // check task node json fields
-    const taskNodes = nodes.filter(isTaskNode);
-    taskNodes.forEach((node) => {
-      try {
-        JSON.parse(node.data.dataSchema);
-      } catch {
-        errors.push(`${node.data.label}: Data schema is not valid JSON`);
-      }
-      try {
-        JSON.parse(node.data.errorCodeMapping);
-      } catch {
-        errors.push(`${node.data.label}: Error messages is not valid JSON`);
-      }
-    });
-
-    return errors;
   }
 
   return (
@@ -567,7 +583,7 @@ function FlowRenderer({
                   }
                 }}
                 onSave={async () => {
-                  const errors = getWorkflowErrors();
+                  const errors = getWorkflowErrors(nodes);
                   if (errors.length > 0) {
                     toast({
                       title: "Can not save workflow because of errors:",

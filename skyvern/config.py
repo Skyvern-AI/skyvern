@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     VIDEO_PATH: str | None = None
     HAR_PATH: str | None = "./har"
     LOG_PATH: str = "./log"
+    TEMP_PATH: str = "./temp"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
     BROWSER_LOADING_TIMEOUT_MS: int = 120000
@@ -26,6 +27,7 @@ class Settings(BaseSettings):
     MAX_RETRIES_PER_STEP: int = 5
     DEBUG_MODE: bool = False
     DATABASE_STRING: str = "postgresql+psycopg://skyvern@localhost/skyvern"
+    DATABASE_STATEMENT_TIMEOUT_MS: int = 60000
     PROMPT_ACTION_HISTORY_WINDOW: int = 1
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
@@ -59,6 +61,7 @@ class Settings(BaseSettings):
     AWS_REGION: str = "us-east-1"
     AWS_S3_BUCKET_UPLOADS: str = "skyvern-uploads"
     MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
+    PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
 
     SKYVERN_TELEMETRY: bool = True
     ANALYTICS_ID: str = "anonymous"
@@ -71,9 +74,7 @@ class Settings(BaseSettings):
 
     # Workflow constant parameters
     WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY: str = "SKYVERN_DOWNLOAD_DIRECTORY"
-
-    # streaming settings
-    STREAMING_FILE_BASE_PATH: str = "/tmp"
+    WORKFLOW_WAIT_BLOCK_MAX_SEC: int = 30 * 60
 
     # Saved browser session settings
     BROWSER_SESSION_BASE_PATH: str = f"{constants.REPO_ROOT_DIR}/browser_sessions"
@@ -103,6 +104,7 @@ class Settings(BaseSettings):
     ENABLE_AZURE: bool = False
     ENABLE_AZURE_GPT4O_MINI: bool = False
     ENABLE_BEDROCK: bool = False
+    ENABLE_GEMINI: bool = False
     # OPENAI
     OPENAI_API_KEY: str | None = None
     # ANTHROPIC
@@ -118,6 +120,9 @@ class Settings(BaseSettings):
     AZURE_GPT4O_MINI_API_KEY: str | None = None
     AZURE_GPT4O_MINI_API_BASE: str | None = None
     AZURE_GPT4O_MINI_API_VERSION: str | None = None
+
+    # GEMINI
+    GEMINI_API_KEY: str | None = None
 
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10

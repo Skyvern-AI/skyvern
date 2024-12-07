@@ -156,7 +156,7 @@ function SavedTaskCard({ workflowId, title, url, description }: Props) {
           },
         )}
         onClick={() => {
-          navigate(workflowId);
+          navigate(`/tasks/create/${workflowId}`);
         }}
       >
         {description}

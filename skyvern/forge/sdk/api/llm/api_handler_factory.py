@@ -7,6 +7,7 @@ from typing import Any
 import litellm
 import structlog
 
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import (
@@ -19,7 +20,6 @@ from skyvern.forge.sdk.api.llm.models import LLMAPIHandler, LLMConfig, LLMRouter
 from skyvern.forge.sdk.api.llm.utils import llm_messages_builder, parse_api_response
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.models import Step
-from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.get_logger()
 
@@ -50,7 +50,7 @@ class LLMAPIHandlerFactory:
             allowed_fails=llm_config.allowed_fails,
             allowed_fails_policy=llm_config.allowed_fails_policy,
             cooldown_time=llm_config.cooldown_time,
-            set_verbose=(False if SettingsManager.get_settings().is_cloud_environment() else llm_config.set_verbose),
+            set_verbose=(False if settings.is_cloud_environment() else llm_config.set_verbose),
             enable_pre_call_checks=True,
         )
         main_model_group = llm_config.main_model_group
@@ -213,7 +213,7 @@ class LLMAPIHandlerFactory:
                 response = await litellm.acompletion(
                     model=llm_config.model_name,
                     messages=messages,
-                    timeout=SettingsManager.get_settings().LLM_CONFIG_TIMEOUT,
+                    timeout=settings.LLM_CONFIG_TIMEOUT,
                     **active_parameters,
                 )
                 LOG.info("LLM API call successful", llm_key=llm_key, model=llm_config.model_name)
@@ -263,7 +263,7 @@ class LLMAPIHandlerFactory:
     def get_api_parameters(llm_config: LLMConfig | LLMRouterConfig) -> dict[str, Any]:
         return {
             "max_tokens": llm_config.max_output_tokens,
-            "temperature": SettingsManager.get_settings().LLM_CONFIG_TEMPERATURE,
+            "temperature": settings.LLM_CONFIG_TEMPERATURE,
         }
 
     @classmethod

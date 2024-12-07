@@ -7,6 +7,7 @@ import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { FlowRenderer } from "./FlowRenderer";
 import { getElements } from "./workflowEditorUtils";
 import { LogoMinimized } from "@/components/LogoMinimized";
+import { WorkflowSettings } from "../types/workflowTypes";
 
 function WorkflowEditor() {
   const { workflowPermanentId } = useParams();
@@ -39,7 +40,13 @@ function WorkflowEditor() {
     return null;
   }
 
-  const elements = getElements(workflow.workflow_definition.blocks);
+  const settings: WorkflowSettings = {
+    persistBrowserSession: workflow.persist_browser_session,
+    proxyLocation: workflow.proxy_location,
+    webhookCallbackUrl: workflow.webhook_callback_url,
+  };
+
+  const elements = getElements(workflow.workflow_definition.blocks, settings);
 
   return (
     <div className="h-screen w-full">
@@ -53,7 +60,8 @@ function WorkflowEditor() {
               (parameter) =>
                 parameter.parameter_type === "workflow" ||
                 parameter.parameter_type === "bitwarden_login_credential" ||
-                parameter.parameter_type === "context",
+                parameter.parameter_type === "context" ||
+                parameter.parameter_type === "bitwarden_sensitive_information",
             )
             .map((parameter) => {
               if (parameter.parameter_type === "workflow") {
@@ -69,6 +77,17 @@ function WorkflowEditor() {
                   key: parameter.key,
                   parameterType: "context",
                   sourceParameterKey: parameter.source.key,
+                  description: parameter.description,
+                };
+              } else if (
+                parameter.parameter_type === "bitwarden_sensitive_information"
+              ) {
+                return {
+                  key: parameter.key,
+                  parameterType: "secret",
+                  collectionId: parameter.bitwarden_collection_id,
+                  identityKey: parameter.bitwarden_identity_key,
+                  identityFields: parameter.bitwarden_identity_fields,
                   description: parameter.description,
                 };
               } else {

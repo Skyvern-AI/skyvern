@@ -5,7 +5,7 @@ from typing import Any, Union
 
 from jose import jwt
 
-from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.config import settings
 
 
 def create_access_token(
@@ -16,13 +16,13 @@ def create_access_token(
         expire = datetime.utcnow() + expires_delta
     else:
         expire = datetime.utcnow() + timedelta(
-            minutes=SettingsManager.get_settings().ACCESS_TOKEN_EXPIRE_MINUTES,
+            minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES,
         )
     to_encode = {"exp": expire, "sub": str(subject)}
     encoded_jwt = jwt.encode(
         to_encode,
-        SettingsManager.get_settings().SECRET_KEY,
-        algorithm=SettingsManager.get_settings().SIGNATURE_ALGORITHM,
+        settings.SECRET_KEY,
+        algorithm=settings.SIGNATURE_ALGORITHM,
     )
     return encoded_jwt
 

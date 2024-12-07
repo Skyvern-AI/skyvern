@@ -6,8 +6,9 @@ import { getSampleForInitialFormValues } from "../data/sampleTaskData";
 import { SampleCase, sampleCases } from "../types";
 import { CreateNewTaskForm } from "./CreateNewTaskForm";
 import { SavedTaskForm } from "./SavedTaskForm";
-import { TaskGenerationApiResponse, WorkflowParameter } from "@/api/types";
+import { TaskGenerationApiResponse } from "@/api/types";
 import { Skeleton } from "@/components/ui/skeleton";
+import { WorkflowParameter } from "@/routes/workflows/types/workflowTypes";
 
 function CreateNewTaskFormPage() {
   const { template } = useParams();
@@ -60,6 +61,7 @@ function CreateNewTaskFormPage() {
             totpIdentifier: null,
             totpVerificationUrl: null,
             webhookCallbackUrl: null,
+            proxyLocation: null,
           }}
         />
       </div>
@@ -119,7 +121,10 @@ function CreateNewTaskFormPage() {
           dataExtractionGoal:
             data.workflow_definition.blocks[0].data_extraction_goal,
           extractedInformationSchema: JSON.stringify(dataSchema, null, 2),
-          navigationPayload,
+          navigationPayload:
+            typeof navigationPayload === "string"
+              ? navigationPayload
+              : JSON.stringify(navigationPayload, null, 2),
           maxStepsOverride,
           totpIdentifier: data.workflow_definition.blocks[0].totp_identifier,
           totpVerificationUrl:

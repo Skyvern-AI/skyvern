@@ -1,17 +1,24 @@
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import {
+  CheckCircledIcon,
   Cross2Icon,
   CursorTextIcon,
   DownloadIcon,
   EnvelopeClosedIcon,
   FileIcon,
   ListBulletIcon,
+  LockOpen1Icon,
   PlusIcon,
+  StopwatchIcon,
   UpdateIcon,
   UploadIcon,
 } from "@radix-ui/react-icons";
 import { WorkflowBlockNode } from "../nodes";
 import { AddNodeProps } from "../FlowRenderer";
+import { ClickIcon } from "@/components/icons/ClickIcon";
+import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
+import { RobotIcon } from "@/components/icons/RobotIcon";
+import { ExtractIcon } from "@/components/icons/ExtractIcon";
 
 const nodeLibraryItems: Array<{
   nodeType: NonNullable<WorkflowBlockNode["type"]>;
@@ -20,53 +27,96 @@ const nodeLibraryItems: Array<{
   description: string;
 }> = [
   {
+    nodeType: "navigation",
+    icon: <RobotIcon className="size-6" />,
+    title: "Navigation Block",
+    description: "Navigate on the page",
+  },
+  {
+    nodeType: "action",
+    icon: <ClickIcon className="size-6" />,
+    title: "Action Block",
+    description: "Take a single action",
+  },
+  {
+    nodeType: "extraction",
+    icon: <ExtractIcon className="size-6" />,
+    title: "Extraction Block",
+    description: "Extract data from the page",
+  },
+  {
+    nodeType: "validation",
+    icon: <CheckCircledIcon className="size-6" />,
+    title: "Validation Block",
+    description: "Validate the state of the workflow or terminate",
+  },
+  {
     nodeType: "task",
-    icon: <ListBulletIcon className="h-6 w-6" />,
+    icon: <ListBulletIcon className="size-6" />,
     title: "Task Block",
     description: "Takes actions or extracts information",
   },
   {
-    nodeType: "loop",
-    icon: <UpdateIcon className="h-6 w-6" />,
-    title: "For Loop Block",
-    description: "Repeats nested elements",
-  },
-  {
     nodeType: "textPrompt",
-    icon: <CursorTextIcon className="h-6 w-6" />,
+    icon: <CursorTextIcon className="size-6" />,
     title: "Text Prompt Block",
     description: "Generates AI response",
   },
   {
     nodeType: "sendEmail",
-    icon: <EnvelopeClosedIcon className="h-6 w-6" />,
+    icon: <EnvelopeClosedIcon className="size-6" />,
     title: "Send Email Block",
     description: "Sends an email",
+  },
+  {
+    nodeType: "loop",
+    icon: <UpdateIcon className="size-6" />,
+    title: "For Loop Block",
+    description: "Repeats nested elements",
   },
   // temporarily removed
   // {
   //   nodeType: "codeBlock",
-  //   icon: <CodeIcon className="h-6 w-6" />,
+  //   icon: <CodeIcon className="size-6" />,
   //   title: "Code Block",
   //   description: "Executes Python code",
   // },
   {
     nodeType: "fileParser",
-    icon: <FileIcon className="h-6 w-6" />,
+    icon: <FileIcon className="size-6" />,
     title: "File Parser Block",
     description: "Downloads and parses a file",
   },
-  {
-    nodeType: "download",
-    icon: <DownloadIcon className="h-6 w-6" />,
-    title: "Download Block",
-    description: "Downloads a file from S3",
-  },
+  // disabled
+  // {
+  //   nodeType: "download",
+  //   icon: <DownloadIcon className="size-6" />,
+  //   title: "Download Block",
+  //   description: "Downloads a file from S3",
+  // },
   {
     nodeType: "upload",
-    icon: <UploadIcon className="h-6 w-6" />,
+    icon: <UploadIcon className="size-6" />,
     title: "Upload Block",
     description: "Uploads a file to S3",
+  },
+  {
+    nodeType: "fileDownload",
+    icon: <DownloadIcon className="size-6" />,
+    title: "File Download Block",
+    description: "Download a file",
+  },
+  {
+    nodeType: "login",
+    icon: <LockOpen1Icon className="size-6" />,
+    title: "Login Block",
+    description: "Login to a website",
+  },
+  {
+    nodeType: "wait",
+    icon: <StopwatchIcon className="size-6" />,
+    title: "Wait Block",
+    description: "Wait for some time",
   },
 ];
 
@@ -91,7 +141,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
             <h1 className="text-lg">Node Library</h1>
             {!first && (
               <Cross2Icon
-                className="h-6 w-6 cursor-pointer"
+                className="size-6 cursor-pointer"
                 onClick={() => {
                   closeWorkflowPanel();
                 }}
@@ -104,46 +154,53 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
               : "Click on the node type you want to add"}
           </span>
         </header>
-        <div className="space-y-2">
-          {nodeLibraryItems.map((item) => {
-            if (workflowPanelData?.disableLoop && item.nodeType === "loop") {
-              return null;
-            }
-            return (
-              <div
-                key={item.nodeType}
-                className="flex cursor-pointer items-center justify-between rounded-sm bg-slate-elevation4 p-4 hover:bg-slate-elevation5"
-                onClick={() => {
-                  onNodeClick({
-                    nodeType: item.nodeType,
-                    next: workflowPanelData?.next ?? null,
-                    parent: workflowPanelData?.parent,
-                    previous: workflowPanelData?.previous ?? null,
-                    connectingEdgeType:
-                      workflowPanelData?.connectingEdgeType ??
-                      "edgeWithAddButton",
-                  });
-                  closeWorkflowPanel();
-                }}
-              >
-                <div className="flex gap-2">
-                  <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-                    {item.icon}
+        <ScrollArea>
+          <ScrollAreaViewport className="max-h-[28rem]">
+            <div className="space-y-2">
+              {nodeLibraryItems.map((item) => {
+                if (
+                  workflowPanelData?.disableLoop &&
+                  item.nodeType === "loop"
+                ) {
+                  return null;
+                }
+                return (
+                  <div
+                    key={item.nodeType}
+                    className="flex cursor-pointer items-center justify-between rounded-sm bg-slate-elevation4 p-4 hover:bg-slate-elevation5"
+                    onClick={() => {
+                      onNodeClick({
+                        nodeType: item.nodeType,
+                        next: workflowPanelData?.next ?? null,
+                        parent: workflowPanelData?.parent,
+                        previous: workflowPanelData?.previous ?? null,
+                        connectingEdgeType:
+                          workflowPanelData?.connectingEdgeType ??
+                          "edgeWithAddButton",
+                      });
+                      closeWorkflowPanel();
+                    }}
+                  >
+                    <div className="flex gap-2">
+                      <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
+                        {item.icon}
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="max-w-64 truncate text-base">
+                          {item.title}
+                        </span>
+                        <span className="text-xs text-slate-400">
+                          {item.description}
+                        </span>
+                      </div>
+                    </div>
+                    <PlusIcon className="size-6" />
                   </div>
-                  <div className="flex flex-col gap-1">
-                    <span className="max-w-64 truncate text-base">
-                      {item.title}
-                    </span>
-                    <span className="text-xs text-slate-400">
-                      {item.description}
-                    </span>
-                  </div>
-                </div>
-                <PlusIcon className="h-6 w-6" />
-              </div>
-            );
-          })}
-        </div>
+                );
+              })}
+            </div>
+          </ScrollAreaViewport>
+        </ScrollArea>
       </div>
     </div>
   );

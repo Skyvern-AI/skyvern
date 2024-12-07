@@ -16,7 +16,6 @@ from skyvern.exceptions import (
     BitwardenLoginError,
     BitwardenLogoutError,
     BitwardenSyncError,
-    BitwardenTOTPError,
     BitwardenUnlockError,
 )
 
@@ -211,37 +210,18 @@ class BitwardenService:
                 collection_id_str = f" in collection with ID: {collection_id}" if collection_id else ""
                 raise BitwardenListItemsError(f"No items found in Bitwarden for URL: {url}{collection_id_str}")
 
-            # TODO (kerem): To make this more robust, we need to store the item id of the totp login item
-            # and use it here to get the TOTP code for that specific item
-            totp_command = ["bw", "get", "totp", domain, "--session", session_key]
-            if bw_organization_id:
-                # We need to add this filter because the TOTP command fails if there are multiple results
-                # For now, we require that the bitwarden organization id has only one totp login item for the domain
-                totp_command.extend(["--organizationid", bw_organization_id])
-            totp_result = BitwardenService.run_command(totp_command)
-
-            if totp_result.stderr and "Event post failed" not in totp_result.stderr:
-                LOG.warning(
-                    "Bitwarden TOTP Error",
-                    error=totp_result.stderr,
-                    e=BitwardenTOTPError(totp_result.stderr),
-                )
-            totp_code = totp_result.stdout
             bitwarden_result: list[BitwardenQueryResult] = [
                 BitwardenQueryResult(
                     credential={
                         BitwardenConstants.USERNAME: item.get("login", {}).get("username", ""),
                         BitwardenConstants.PASSWORD: item.get("login", {}).get("password", ""),
+                        BitwardenConstants.TOTP: item.get("login", {}).get("totp", "") or "",
                     },
                     uris=[uri.get("uri") for uri in item.get("login", {}).get("uris", []) if "uri" in uri],
                 )
                 for item in items
                 if "login" in item
             ]
-
-            if totp_code:
-                for single_result in bitwarden_result:
-                    single_result.credential[BitwardenConstants.TOTP] = totp_code
 
             if len(bitwarden_result) == 0:
                 return {}

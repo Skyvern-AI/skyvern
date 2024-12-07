@@ -12,6 +12,8 @@ export const ArtifactType = {
   HTMLScrape: "html_scrape",
 } as const;
 
+export type ArtifactType = (typeof ArtifactType)[keyof typeof ArtifactType];
+
 export const Status = {
   Created: "created",
   Running: "running",
@@ -25,7 +27,16 @@ export const Status = {
 
 export type Status = (typeof Status)[keyof typeof Status];
 
-export type ArtifactType = (typeof ArtifactType)[keyof typeof ArtifactType];
+export const ProxyLocation = {
+  Residential: "RESIDENTIAL",
+  ResidentialIE: "RESIDENTIAL_IE",
+  ResidentialES: "RESIDENTIAL_ES",
+  ResidentialIN: "RESIDENTIAL_IN",
+  ResidentialJP: "RESIDENTIAL_JP",
+  None: "NONE",
+} as const;
+
+export type ProxyLocation = (typeof ProxyLocation)[keyof typeof ProxyLocation];
 
 export type ArtifactApiResponse = {
   created_at: string;
@@ -82,17 +93,18 @@ export type TaskApiResponse = {
 };
 
 export type CreateTaskRequest = {
-  title: string | null;
+  title?: string | null;
   url: string;
-  webhook_callback_url: string | null;
-  navigation_goal: string | null;
-  data_extraction_goal: string | null;
-  navigation_payload: Record<string, unknown> | string | null;
-  extracted_information_schema: Record<string, unknown> | string | null;
-  error_code_mapping: Record<string, string> | null;
-  proxy_location: string | null;
-  totp_verification_url: string | null;
-  totp_identifier: string | null;
+  webhook_callback_url?: string | null;
+  navigation_goal?: string | null;
+  data_extraction_goal?: string | null;
+  navigation_payload?: Record<string, unknown> | string | null;
+  extracted_information_schema?: Record<string, unknown> | string | null;
+  error_code_mapping?: Record<string, string> | null;
+  proxy_location?: ProxyLocation | null;
+  totp_verification_url?: string | null;
+  totp_identifier?: string | null;
+  application?: string | null;
 };
 
 export type User = {
@@ -117,78 +129,6 @@ export type ApiKeyApiResponse = {
   modified_at: string;
   token_type: string;
   valid: boolean;
-};
-
-export const WorkflowParameterValueType = {
-  String: "string",
-  Integer: "integer",
-  Float: "float",
-  Boolean: "boolean",
-  JSON: "json",
-  FileURL: "file_url",
-} as const;
-
-export type WorkflowParameterValueType =
-  (typeof WorkflowParameterValueType)[keyof typeof WorkflowParameterValueType];
-
-export const WorkflowParameterType = {
-  Workflow: "workflow",
-  Context: "context",
-  Output: "output",
-  AWS_Secret: "aws_secret",
-  Bitwarden_Login_Credential: "bitwarden_login_credential",
-  Bitwarden_Sensitive_Information: "bitwarden_sensitive_information",
-} as const;
-
-export type WorkflowParameterType =
-  (typeof WorkflowParameterType)[keyof typeof WorkflowParameterType];
-
-export type WorkflowParameter = {
-  key: string;
-  description: string | null;
-  workflow_parameter_id: string;
-  parameter_type: WorkflowParameterType;
-  workflow_parameter_type: WorkflowParameterValueType;
-  workflow_id: string;
-  default_value?: string;
-  created_at: string | null;
-  modified_at: string | null;
-  deleted_at: string | null;
-};
-
-export type WorkflowBlock = {
-  label: string;
-  block_type: string;
-  output_parameter?: null;
-  continue_on_failure: boolean;
-  url: string;
-  title: string;
-  navigation_goal: string;
-  data_extraction_goal: string;
-  data_schema: object | null;
-  error_code_mapping: null; // ?
-  max_retries: number | null;
-  max_steps_per_run: number | null;
-  parameters: []; // ?
-};
-
-export type WorkflowApiResponse = {
-  workflow_id: string;
-  organization_id: string;
-  is_saved_task: boolean;
-  title: string;
-  workflow_permanent_id: string;
-  version: number;
-  description: string;
-  workflow_definition: {
-    parameters: Array<WorkflowParameter>;
-    blocks: Array<WorkflowBlock>;
-  };
-  proxy_location: string;
-  webhook_callback_url: string;
-  created_at: string;
-  modified_at: string;
-  deleted_at: string | null;
 };
 
 // TODO complete this
@@ -248,7 +188,7 @@ export type WorkflowRunApiResponse = {
   workflow_run_id: string;
   workflow_id: string;
   status: Status;
-  proxy_location: string;
+  proxy_location: ProxyLocation | null;
   webhook_callback_url: string;
   created_at: string;
   modified_at: string;
@@ -258,7 +198,7 @@ export type WorkflowRunStatusApiResponse = {
   workflow_id: string;
   workflow_run_id: string;
   status: Status;
-  proxy_location: string;
+  proxy_location: ProxyLocation | null;
   webhook_callback_url: string | null;
   created_at: string;
   modified_at: string;
@@ -266,6 +206,8 @@ export type WorkflowRunStatusApiResponse = {
   screenshot_urls: Array<string> | null;
   recording_url: string | null;
   outputs: Record<string, unknown> | null;
+  failure_reason: string | null;
+  downloaded_file_urls: Array<string> | null;
 };
 
 export type TaskGenerationApiResponse = {

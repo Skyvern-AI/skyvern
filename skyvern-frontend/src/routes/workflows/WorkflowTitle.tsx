@@ -1,8 +1,8 @@
 import { getClient } from "@/api/AxiosClient";
-import { WorkflowApiResponse } from "@/api/types";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
+import { WorkflowApiResponse } from "./types/workflowTypes";
 
 type Props = {
   workflowPermanentId: string;

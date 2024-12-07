@@ -1,5 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import { WorkflowApiResponse, WorkflowRunApiResponse } from "@/api/types";
+import { WorkflowRunApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Button } from "@/components/ui/button";
 import {
@@ -20,9 +20,9 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { basicTimeFormat } from "@/util/timeFormat";
+import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
-import { Pencil2Icon } from "@radix-ui/react-icons";
+import { Pencil2Icon, PlayIcon } from "@radix-ui/react-icons";
 import { useQuery } from "@tanstack/react-query";
 import {
   Link,
@@ -30,6 +30,7 @@ import {
   useParams,
   useSearchParams,
 } from "react-router-dom";
+import { WorkflowApiResponse } from "./types/workflowTypes";
 
 function WorkflowPage() {
   const credentialGetter = useCredentialGetter();
@@ -52,6 +53,7 @@ function WorkflowPage() {
         })
         .then((response) => response.data);
     },
+    refetchOnMount: "always",
   });
 
   const { data: workflow, isLoading: workflowIsLoading } =
@@ -88,13 +90,14 @@ function WorkflowPage() {
         <div className="flex gap-2">
           <Button asChild variant="secondary">
             <Link to={`/workflows/${workflowPermanentId}/edit`}>
-              <Pencil2Icon className="mr-2 h-4 w-4" />
-              Edit Workflow
+              <Pencil2Icon className="mr-2 size-4" />
+              Edit
             </Link>
           </Button>
           <Button asChild>
             <Link to={`/workflows/${workflowPermanentId}/run`}>
-              Create New Run
+              <PlayIcon className="mr-2 size-4" />
+              Run
             </Link>
           </Button>
         </div>
@@ -145,8 +148,8 @@ function WorkflowPage() {
                     <TableCell>
                       <StatusBadge status={workflowRun.status} />
                     </TableCell>
-                    <TableCell>
-                      {basicTimeFormat(workflowRun.created_at)}
+                    <TableCell title={basicTimeFormat(workflowRun.created_at)}>
+                      {basicLocalTimeFormat(workflowRun.created_at)}
                     </TableCell>
                   </TableRow>
                 ))

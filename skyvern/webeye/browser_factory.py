@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import tempfile
 import time
 import uuid
 from datetime import datetime
@@ -15,7 +14,7 @@ from playwright.async_api import BrowserContext, ConsoleMessage, Download, Error
 from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
-from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_DOWNLOAD_TIMEOUT, REPO_ROOT_DIR
+from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_DOWNLOAD_TIMEOUT, NAVIGATION_MAX_RETRY_TIME
 from skyvern.exceptions import (
     FailedToNavigateToUrl,
     FailedToReloadPage,
@@ -24,22 +23,15 @@ from skyvern.exceptions import (
     UnknownBrowserType,
     UnknownErrorWhileCreatingBrowserContext,
 )
+from skyvern.forge.sdk.api.files import make_temp_directory
 from skyvern.forge.sdk.core.skyvern_context import current
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
-from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
 
 BrowserCleanupFunc = Callable[[], None] | None
-
-
-def get_download_dir(workflow_run_id: str | None, task_id: str | None) -> str:
-    download_dir = f"{REPO_ROOT_DIR}/downloads/{workflow_run_id or task_id}"
-    LOG.info("Initializing download directory", download_dir=download_dir)
-    os.makedirs(download_dir, exist_ok=True)
-    return download_dir
 
 
 def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> None:
@@ -150,12 +142,14 @@ class BrowserContextFactory:
 
     @staticmethod
     def build_browser_args() -> dict[str, Any]:
-        video_dir = f"{SettingsManager.get_settings().VIDEO_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}"
-        har_dir = f"{SettingsManager.get_settings().HAR_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{BrowserContextFactory.get_subdir()}.har"
+        video_dir = f"{settings.VIDEO_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}"
+        har_dir = (
+            f"{settings.HAR_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{BrowserContextFactory.get_subdir()}.har"
+        )
         return {
-            "user_data_dir": tempfile.mkdtemp(prefix="skyvern_browser_"),
-            "locale": SettingsManager.get_settings().BROWSER_LOCALE,
-            "timezone_id": SettingsManager.get_settings().BROWSER_TIMEZONE,
+            "user_data_dir": make_temp_directory(prefix="skyvern_browser_"),
+            "locale": settings.BROWSER_LOCALE,
+            "timezone_id": settings.BROWSER_TIMEZONE,
             "color_scheme": "no-preference",
             "args": [
                 "--disable-blink-features=AutomationControlled",
@@ -198,7 +192,7 @@ class BrowserContextFactory:
     async def create_browser_context(
         cls, playwright: Playwright, **kwargs: Any
     ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
-        browser_type = SettingsManager.get_settings().BROWSER_TYPE
+        browser_type = settings.BROWSER_TYPE
         browser_context: BrowserContext | None = None
         try:
             creator = cls._creators.get(browser_type)
@@ -352,49 +346,48 @@ class BrowserState:
             LOG.info("browser context is created")
 
         if await self.get_working_page() is None:
-            success = False
-            retries = 0
+            page = await self.browser_context.new_page()
+            await self.set_working_page(page, 0)
+            await self._close_all_other_pages()
 
-            while not success and retries < 3:
-                try:
-                    LOG.info("Creating a new page")
-                    page = await self.browser_context.new_page()
-                    await self.set_working_page(page, 0)
-                    await self._close_all_other_pages()
-                    LOG.info("A new page is created")
-                    if url:
-                        LOG.info(f"Navigating page to {url} and waiting for 5 seconds")
-                        try:
-                            start_time = time.time()
-                            await page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-                            end_time = time.time()
-                            LOG.info(
-                                "Page loading time",
-                                loading_time=end_time - start_time,
-                                url=url,
-                            )
-                            await asyncio.sleep(5)
-                        except Error as playright_error:
-                            LOG.warning(
-                                f"Error while navigating to url: {str(playright_error)}",
-                                exc_info=True,
-                            )
-                            raise FailedToNavigateToUrl(url=url, error_message=str(playright_error))
-                        success = True
-                        LOG.info(f"Successfully went to {url}")
-                    else:
-                        success = True
-                except Exception as e:
-                    LOG.exception(
-                        f"Error while creating or navigating to a new page. Waiting for 5 seconds. Error: {str(e)}",
-                    )
-                    retries += 1
-                    # Wait for 5 seconds before retrying
-                    await asyncio.sleep(5)
-                    if retries >= 3:
-                        LOG.exception(f"Failed to create a new page after 3 retries: {str(e)}")
-                        raise e
-                    LOG.info(f"Retrying to create a new page. Retry count: {retries}")
+            if url:
+                await self.navigate_to_url(page=page, url=url)
+
+    async def navigate_to_url(self, page: Page, url: str, retry_times: int = NAVIGATION_MAX_RETRY_TIME) -> None:
+        navigation_error: Exception = FailedToNavigateToUrl(url=url, error_message="")
+        for retry_time in range(retry_times):
+            LOG.info(f"Trying to navigate to {url} and waiting for 5 seconds.", url=url, retry_time=retry_time)
+            try:
+                start_time = time.time()
+                await page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+                end_time = time.time()
+                LOG.info(
+                    "Page loading time",
+                    loading_time=end_time - start_time,
+                    url=url,
+                )
+                await asyncio.sleep(5)
+                LOG.info(f"Successfully went to {url}", url=url, retry_time=retry_time)
+                return
+
+            except Exception as e:
+                navigation_error = e
+                LOG.warning(
+                    f"Error while navigating to url: {str(navigation_error)}",
+                    exc_info=True,
+                    url=url,
+                    retry_time=retry_time,
+                )
+                # Wait for 5 seconds before retrying
+                await asyncio.sleep(5)
+        else:
+            LOG.exception(
+                f"Failed to navigate to {url} after {retry_times} retries: {str(navigation_error)}",
+                url=url,
+            )
+            if isinstance(navigation_error, Error):
+                raise FailedToNavigateToUrl(url=url, error_message=str(navigation_error))
+            raise navigation_error
 
     async def get_working_page(self) -> Page | None:
         # HACK: currently, assuming the last page is always the working page.
@@ -514,20 +507,29 @@ class BrowserState:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
                 if self.browser_context and close_browser_on_completion:
                     LOG.info("Closing browser context and its pages")
-                    await self.browser_context.close()
+                    try:
+                        await self.browser_context.close()
+                    except Exception:
+                        LOG.warning("Failed to close browser context", exc_info=True)
                     LOG.info("Main browser context and all its pages are closed")
                     if self.browser_cleanup is not None:
-                        self.browser_cleanup()
-                        LOG.info("Main browser cleanup is excuted")
+                        try:
+                            self.browser_cleanup()
+                            LOG.info("Main browser cleanup is excuted")
+                        except Exception:
+                            LOG.warning("Failed to execute browser cleanup", exc_info=True)
         except asyncio.TimeoutError:
             LOG.error("Timeout to close browser context, going to stop playwright directly")
 
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
                 if self.pw and close_browser_on_completion:
-                    LOG.info("Stopping playwright")
-                    await self.pw.stop()
-                    LOG.info("Playwright is stopped")
+                    try:
+                        LOG.info("Stopping playwright")
+                        await self.pw.stop()
+                        LOG.info("Playwright is stopped")
+                    except Exception:
+                        LOG.warning("Failed to stop playwright", exc_info=True)
         except asyncio.TimeoutError:
             LOG.error("Timeout to close playwright, might leave the broswer opening forever")
 

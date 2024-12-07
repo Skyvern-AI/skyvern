@@ -1,6 +1,6 @@
 import { Skeleton } from "@/components/ui/skeleton";
 import { useWorkflowLastRunQuery } from "../hooks/useWorkflowLastRunQuery";
-import { basicTimeFormat } from "@/util/timeFormat";
+import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 
 type Props = {
   workflowId: string;
@@ -21,7 +21,11 @@ function LastRunAtTime({ workflowId }: Props) {
     return <span>N/A</span>;
   }
 
-  return <span>{basicTimeFormat(data.time)}</span>;
+  return (
+    <span title={basicTimeFormat(data.time)}>
+      {basicLocalTimeFormat(data.time)}
+    </span>
+  );
 }
 
 export { LastRunAtTime };

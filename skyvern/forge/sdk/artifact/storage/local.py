@@ -6,16 +6,17 @@ from urllib.parse import unquote, urlparse
 
 import structlog
 
+from skyvern.config import settings
+from skyvern.forge.sdk.api.files import get_download_dir, get_skyvern_temp_dir
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP, BaseStorage
 from skyvern.forge.sdk.models import Step
-from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.get_logger()
 
 
 class LocalStorage(BaseStorage):
-    def __init__(self, artifact_path: str = SettingsManager.get_settings().ARTIFACT_STORAGE_PATH) -> None:
+    def __init__(self, artifact_path: str = settings.ARTIFACT_STORAGE_PATH) -> None:
         self.artifact_path = artifact_path
 
     def build_uri(self, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
@@ -73,24 +74,17 @@ class LocalStorage(BaseStorage):
         return
 
     async def get_streaming_file(self, organization_id: str, file_name: str, use_default: bool = True) -> bytes | None:
-        file_path = Path(f"{SettingsManager.get_settings().STREAMING_FILE_BASE_PATH}/skyvern_screenshot.png")
+        file_path = Path(f"{get_skyvern_temp_dir()}/skyvern_screenshot.png")
         if not use_default:
-            file_path = Path(f"{SettingsManager.get_settings().STREAMING_FILE_BASE_PATH}/{organization_id}/{file_name}")
+            file_path = Path(f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}")
         try:
             with open(file_path, "rb") as f:
                 return f.read()
         except Exception:
-            LOG.exception(
-                "Failed to retrieve streaming file.",
-                organization_id=organization_id,
-                file_name=file_name,
-            )
             return None
 
     async def store_browser_session(self, organization_id: str, workflow_permanent_id: str, directory: str) -> None:
-        stored_folder_path = (
-            Path(SettingsManager.get_settings().BROWSER_SESSION_BASE_PATH) / organization_id / workflow_permanent_id
-        )
+        stored_folder_path = Path(settings.BROWSER_SESSION_BASE_PATH) / organization_id / workflow_permanent_id
         if directory == str(stored_folder_path):
             return
         self._create_directories_if_not_exists(stored_folder_path)
@@ -112,12 +106,27 @@ class LocalStorage(BaseStorage):
                 shutil.copy2(source_file_path, target_file_path)
 
     async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
-        stored_folder_path = (
-            Path(SettingsManager.get_settings().BROWSER_SESSION_BASE_PATH) / organization_id / workflow_permanent_id
-        )
+        stored_folder_path = Path(settings.BROWSER_SESSION_BASE_PATH) / organization_id / workflow_permanent_id
         if not stored_folder_path.exists():
             return None
         return str(stored_folder_path)
+
+    async def save_downloaded_files(
+        self, organization_id: str, task_id: str | None, workflow_run_id: str | None
+    ) -> None:
+        pass
+
+    async def get_downloaded_files(
+        self, organization_id: str, task_id: str | None, workflow_run_id: str | None
+    ) -> list[str]:
+        download_dir = get_download_dir(workflow_run_id=workflow_run_id, task_id=task_id)
+        files: list[str] = []
+        files_and_folders = os.listdir(download_dir)
+        for file_or_folder in files_and_folders:
+            path = os.path.join(download_dir, file_or_folder)
+            if os.path.isfile(path):
+                files.append(f"file://{path}")
+        return files
 
     @staticmethod
     def _parse_uri_to_path(uri: str) -> str:

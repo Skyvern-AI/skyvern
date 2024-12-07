@@ -3,6 +3,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
 
+from skyvern.config import settings
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileType
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
@@ -117,10 +118,10 @@ class TaskBlockYAML(BlockYAML):
     block_type: Literal[BlockType.TASK] = BlockType.TASK  # type: ignore
 
     url: str | None = None
-    title: str = "Untitled Task"
+    title: str = ""
     navigation_goal: str | None = None
     data_extraction_goal: str | None = None
-    data_schema: dict[str, Any] | None = None
+    data_schema: dict[str, Any] | list | None = None
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
@@ -154,6 +155,9 @@ class CodeBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
 
 
+DEFAULT_TEXT_PROMPT_LLM_KEY = settings.SECONDARY_LLM_KEY or settings.LLM_KEY
+
+
 class TextPromptBlockYAML(BlockYAML):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -161,7 +165,7 @@ class TextPromptBlockYAML(BlockYAML):
     # to infer the type of the parameter_type attribute.
     block_type: Literal[BlockType.TEXT_PROMPT] = BlockType.TEXT_PROMPT  # type: ignore
 
-    llm_key: str
+    llm_key: str = DEFAULT_TEXT_PROMPT_LLM_KEY
     prompt: str
     parameter_keys: list[str] | None = None
     json_schema: dict[str, Any] | None = None
@@ -208,6 +212,97 @@ class FileParserBlockYAML(BlockYAML):
     file_type: FileType
 
 
+class ValidationBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION  # type: ignore
+
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
+    error_code_mapping: dict[str, str] | None = None
+    parameter_keys: list[str] | None = None
+
+
+class ActionBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.ACTION] = BlockType.ACTION  # type: ignore
+
+    url: str | None = None
+    title: str = ""
+    navigation_goal: str | None = None
+    error_code_mapping: dict[str, str] | None = None
+    max_retries: int = 0
+    parameter_keys: list[str] | None = None
+    complete_on_download: bool = False
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool = False
+
+
+class NavigationBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.NAVIGATION] = BlockType.NAVIGATION  # type: ignore
+
+    navigation_goal: str
+    url: str | None = None
+    title: str = ""
+    error_code_mapping: dict[str, str] | None = None
+    max_retries: int = 0
+    max_steps_per_run: int | None = None
+    parameter_keys: list[str] | None = None
+    complete_on_download: bool = False
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool = False
+
+
+class ExtractionBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.EXTRACTION] = BlockType.EXTRACTION  # type: ignore
+
+    data_extraction_goal: str
+    url: str | None = None
+    title: str = ""
+    data_schema: dict[str, Any] | list | None = None
+    max_retries: int = 0
+    max_steps_per_run: int | None = None
+    parameter_keys: list[str] | None = None
+    cache_actions: bool = False
+
+
+class LoginBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.LOGIN] = BlockType.LOGIN  # type: ignore
+
+    url: str | None = None
+    title: str = ""
+    navigation_goal: str | None = None
+    error_code_mapping: dict[str, str] | None = None
+    max_retries: int = 0
+    max_steps_per_run: int | None = None
+    parameter_keys: list[str] | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool = False
+
+
+class WaitBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.WAIT] = BlockType.WAIT  # type: ignore
+    wait_sec: int = 0
+
+
+class FileDownloadBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD  # type: ignore
+
+    navigation_goal: str
+    url: str | None = None
+    title: str = ""
+    error_code_mapping: dict[str, str] | None = None
+    max_retries: int = 0
+    max_steps_per_run: int | None = None
+    parameter_keys: list[str] | None = None
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool = False
+
+
 PARAMETER_YAML_SUBCLASSES = (
     AWSSecretParameterYAML
     | BitwardenLoginCredentialParameterYAML
@@ -228,6 +323,13 @@ BLOCK_YAML_SUBCLASSES = (
     | UploadToS3BlockYAML
     | SendEmailBlockYAML
     | FileParserBlockYAML
+    | ValidationBlockYAML
+    | ActionBlockYAML
+    | NavigationBlockYAML
+    | ExtractionBlockYAML
+    | LoginBlockYAML
+    | WaitBlockYAML
+    | FileDownloadBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 

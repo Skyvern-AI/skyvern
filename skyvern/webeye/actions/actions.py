@@ -2,7 +2,6 @@ from enum import StrEnum
 from typing import Annotated, Any, Dict, Type, TypeVar
 
 import structlog
-from deprecation import deprecated
 from litellm import ConfigDict
 from pydantic import BaseModel, Field, ValidationError
 
@@ -66,13 +65,23 @@ class SelectOption(BaseModel):
         return f"SelectOption(label={self.label}, value={self.value}, index={self.index})"
 
 
+class CompleteVerifyResult(BaseModel):
+    user_goal_achieved: bool
+    thoughts: str
+    page_info: str | None = None
+
+    def __repr__(self) -> str:
+        return f"CompleteVerifyResponse(thoughts={self.thoughts}, user_goal_achieved={self.user_goal_achieved}, page_info={self.page_info})"
+
+
 class InputOrSelectContext(BaseModel):
     field: str | None = None
     is_required: bool | None = None
     is_search_bar: bool | None = None  # don't trigger custom-selection logic when it's a search bar
+    is_location_input: bool | None = None  # address input usually requires auto completion
 
     def __repr__(self) -> str:
-        return f"InputOrSelectContext(field={self.field}, is_required={self.is_required}, is_search_bar={self.is_search_bar})"
+        return f"InputOrSelectContext(field={self.field}, is_required={self.is_required}, is_search_bar={self.is_search_bar}, is_location_input={self.is_location_input})"
 
 
 class Action(BaseModel):
@@ -177,7 +186,7 @@ class UploadFileAction(WebAction):
         return f"UploadFileAction(element_id={self.element_id}, file={self.file_url}, is_upload_file_tag={self.is_upload_file_tag})"
 
 
-@deprecated("This action is not used in the current implementation. Click actions are used instead.")
+# this is a deprecated action type
 class DownloadFileAction(WebAction):
     action_type: ActionType = ActionType.DOWNLOAD_FILE
     file_name: str
@@ -226,6 +235,7 @@ class TerminateAction(DecisiveAction):
 
 class CompleteAction(DecisiveAction):
     action_type: ActionType = ActionType.COMPLETE
+    verified: bool = False
     data_extraction_goal: str | None = None
 
 

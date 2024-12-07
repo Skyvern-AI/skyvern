@@ -8,6 +8,16 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -32,15 +42,25 @@ import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { copyText } from "@/util/copyText";
 import { apiBaseUrl, envCredential } from "@/util/env";
-import { basicTimeFormat, timeFormatWithShortDate } from "@/util/timeFormat";
+import {
+  localTimeFormatWithShortDate,
+  timeFormatWithShortDate,
+} from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import {
   CopyIcon,
+  FileIcon,
   Pencil2Icon,
   PlayIcon,
   ReaderIcon,
+  ReloadIcon,
 } from "@radix-ui/react-icons";
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import fetchToCurl from "fetch-to-curl";
 import { useEffect, useState } from "react";
 import {
@@ -49,9 +69,12 @@ import {
   useParams,
   useSearchParams,
 } from "react-router-dom";
-import { TaskActions } from "../tasks/list/TaskActions";
-import { TaskListSkeletonRows } from "../tasks/list/TaskListSkeletonRows";
-import { statusIsNotFinalized, statusIsRunningOrQueued } from "../tasks/types";
+import {
+  statusIsFinalized,
+  statusIsNotFinalized,
+  statusIsRunningOrQueued,
+} from "../tasks/types";
+import { WorkflowBlockCollapsibleContent } from "./WorkflowBlockCollapsibleContent";
 import { CodeEditor } from "./components/CodeEditor";
 import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
 
@@ -73,6 +96,7 @@ function WorkflowRun() {
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const navigate = useNavigate();
   const apiCredential = useApiCredential();
+  const queryClient = useQueryClient();
 
   const { data: workflow, isLoading: workflowIsLoading } = useWorkflowQuery({
     workflowPermanentId,
@@ -101,7 +125,7 @@ function WorkflowRun() {
         if (!query.state.data) {
           return false;
         }
-        return statusIsRunningOrQueued(query.state.data);
+        return statusIsRunningOrQueued(query.state.data) ? "always" : false;
       },
       refetchOnWindowFocus: (query) => {
         if (!query.state.data) {
@@ -130,8 +154,38 @@ function WorkflowRun() {
       return false;
     },
     placeholderData: keepPreviousData,
-    refetchOnMount: workflowRun?.status === Status.Running,
-    refetchOnWindowFocus: workflowRun?.status === Status.Running,
+    refetchOnMount: workflowRun?.status === Status.Running ? "always" : false,
+    refetchOnWindowFocus:
+      workflowRun?.status === Status.Running ? "always" : false,
+  });
+
+  const cancelWorkflowMutation = useMutation({
+    mutationFn: async () => {
+      const client = await getClient(credentialGetter);
+      return client
+        .post(`/workflows/runs/${workflowRunId}/cancel`)
+        .then((response) => response.data);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: ["workflowRun", workflowRunId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["workflowRun", workflowPermanentId, workflowRunId],
+      });
+      toast({
+        variant: "success",
+        title: "Workflow Canceled",
+        description: "The workflow has been successfully canceled.",
+      });
+    },
+    onError: (error) => {
+      toast({
+        variant: "destructive",
+        title: "Error",
+        description: error.message,
+      });
+    },
   });
 
   const currentRunningTask = workflowTasks?.find(
@@ -140,6 +194,10 @@ function WorkflowRun() {
 
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
+
+  const workflowRunIsFinalized = workflowRun && statusIsFinalized(workflowRun);
+
+  const showStream = workflowRun && statusIsNotFinalized(workflowRun);
 
   useEffect(() => {
     if (!workflowRunIsRunningOrQueued) {
@@ -174,6 +232,15 @@ function WorkflowRun() {
             message.status === "terminated"
           ) {
             socket?.close();
+            queryClient.invalidateQueries({
+              queryKey: ["workflowRuns"],
+            });
+            queryClient.invalidateQueries({
+              queryKey: ["workflowRun", workflowPermanentId, workflowRunId],
+            });
+            queryClient.invalidateQueries({
+              queryKey: ["workflowTasks", workflowRunId],
+            });
             if (
               message.status === "failed" ||
               message.status === "terminated"
@@ -208,7 +275,13 @@ function WorkflowRun() {
         socket = null;
       }
     };
-  }, [credentialGetter, workflowRunId, workflowRunIsRunningOrQueued]);
+  }, [
+    credentialGetter,
+    workflowRunId,
+    workflowRunIsRunningOrQueued,
+    queryClient,
+    workflowPermanentId,
+  ]);
 
   function getStream() {
     if (workflowRun?.status === Status.Created) {
@@ -263,25 +336,62 @@ function WorkflowRun() {
 
   const parameters = workflowRun?.parameters ?? {};
 
+  const title = workflowIsLoading ? (
+    <Skeleton className="h-9 w-48" />
+  ) : (
+    <h1 className="text-3xl">{workflow?.title}</h1>
+  );
+
+  const workflowFailureReason = workflowRun?.failure_reason ? (
+    <div
+      className="space-y-2 rounded-md border border-red-600 p-4"
+      style={{
+        backgroundColor: "rgba(220, 38, 38, 0.10)",
+      }}
+    >
+      <div className="font-bold">Workflow Failure Reason</div>
+      <div className="text-sm">{workflowRun.failure_reason}</div>
+    </div>
+  ) : null;
+
+  const skeleton = (
+    <TableRow>
+      <TableCell className="w-10">
+        <Skeleton className="h-6 w-full" />
+      </TableCell>
+      <TableCell className="w-1/5">
+        <Skeleton className="h-6 w-full" />
+      </TableCell>
+      <TableCell className="w-1/6">
+        <Skeleton className="h-6 w-full" />
+      </TableCell>
+      <TableCell className="w-1/4">
+        <Skeleton className="h-6 w-full" />
+      </TableCell>
+      <TableCell className="w-1/8">
+        <Skeleton className="h-6 w-full" />
+      </TableCell>
+      <TableCell className="w-1/5">
+        <Skeleton className="h-6 w-full" />
+      </TableCell>
+    </TableRow>
+  );
+
+  const fileUrls = workflowRun?.downloaded_file_urls ?? [];
+
   return (
     <div className="space-y-8">
       <header className="flex justify-between">
         <div className="space-y-3">
           <div className="flex items-center gap-5">
-            <h1 className="text-3xl">{workflowRunId}</h1>
+            {title}
             {workflowRunIsLoading ? (
               <Skeleton className="h-8 w-28" />
             ) : workflowRun ? (
               <StatusBadge status={workflowRun?.status} />
             ) : null}
           </div>
-          <h2 className="text-2xl text-slate-400">
-            {workflowIsLoading ? (
-              <Skeleton className="h-8 w-48" />
-            ) : (
-              workflow?.title
-            )}
-          </h2>
+          <h2 className="text-2xl text-slate-400">{workflowRunId}</h2>
         </div>
 
         <div className="flex gap-2">
@@ -322,25 +432,60 @@ function WorkflowRun() {
               Edit
             </Link>
           </Button>
-          <Button asChild>
-            <Link
-              to={`/workflows/${workflowPermanentId}/run`}
-              state={{
-                data: parameters,
-              }}
-            >
-              <PlayIcon className="mr-2 h-4 w-4" />
-              Rerun
-            </Link>
-          </Button>
+          {workflowRunIsRunningOrQueued && (
+            <Dialog>
+              <DialogTrigger asChild>
+                <Button variant="destructive">Cancel</Button>
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Are you sure?</DialogTitle>
+                  <DialogDescription>
+                    Are you sure you want to cancel this workflow run?
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogFooter>
+                  <DialogClose asChild>
+                    <Button variant="secondary">Back</Button>
+                  </DialogClose>
+                  <Button
+                    variant="destructive"
+                    onClick={() => {
+                      cancelWorkflowMutation.mutate();
+                    }}
+                    disabled={cancelWorkflowMutation.isPending}
+                  >
+                    {cancelWorkflowMutation.isPending && (
+                      <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+                    )}
+                    Cancel Workflow Run
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+          )}
+          {workflowRunIsFinalized && (
+            <Button asChild>
+              <Link
+                to={`/workflows/${workflowPermanentId}/run`}
+                state={{
+                  data: parameters,
+                }}
+              >
+                <PlayIcon className="mr-2 h-4 w-4" />
+                Rerun
+              </Link>
+            </Button>
+          )}
         </div>
       </header>
-      {workflowRun && statusIsNotFinalized(workflowRun) && (
+      {workflowFailureReason}
+      {showStream && (
         <div className="flex gap-5">
           <div className="w-3/4 shrink-0">
             <AspectRatio ratio={16 / 9}>{getStream()}</AspectRatio>
           </div>
-          <div className="flex w-full flex-col gap-4 rounded-md bg-slate-elevation1 p-4">
+          <div className="flex w-full min-w-0 flex-col gap-4 rounded-md bg-slate-elevation1 p-4">
             <header className="text-lg">Current Task</header>
             {workflowRunIsLoading || !currentRunningTask ? (
               <div>Waiting for a task to start...</div>
@@ -352,7 +497,10 @@ function WorkflowRun() {
                 </div>
                 <div className="flex gap-2 rounded-sm bg-slate-elevation3 p-2">
                   <Label className="text-sm text-slate-400">URL</Label>
-                  <span className="text-sm">
+                  <span
+                    className="truncate text-sm"
+                    title={currentRunningTask.request.url}
+                  >
                     {currentRunningTask.request.url}
                   </span>
                 </div>
@@ -364,9 +512,16 @@ function WorkflowRun() {
                 </div>
                 <div className="flex gap-2 rounded-sm bg-slate-elevation3 p-2">
                   <Label className="text-sm text-slate-400">Created</Label>
-                  <span className="text-sm">
+                  <span
+                    className="truncate text-sm"
+                    title={timeFormatWithShortDate(
+                      currentRunningTask.created_at,
+                    )}
+                  >
                     {currentRunningTask &&
-                      timeFormatWithShortDate(currentRunningTask.created_at)}
+                      localTimeFormatWithShortDate(
+                        currentRunningTask.created_at,
+                      )}
                   </span>
                 </div>
                 <div className="mt-auto flex justify-end">
@@ -390,25 +545,26 @@ function WorkflowRun() {
         </header>
         <div className="rounded-md border">
           <Table>
-            <TableHeader className="rounded-t-md bg-slate-elevation1">
+            <TableHeader className="rounded-t-md bg-slate-elevation2">
               <TableRow>
-                <TableHead className="w-1/4 rounded-tl-md text-slate-400">
-                  ID
+                <TableHead className="w-10 rounded-tl-md"></TableHead>
+                <TableHead className="w-1/5 text-slate-400">
+                  Task Title
                 </TableHead>
+                <TableHead className="w-1/6 text-slate-400">ID</TableHead>
                 <TableHead className="w-1/4 text-slate-400">URL</TableHead>
-                <TableHead className="w-1/6 text-slate-400">Status</TableHead>
-                <TableHead className="w-1/4 text-slate-400">
+                <TableHead className="w-1/8 text-slate-400">Status</TableHead>
+                <TableHead className="w-1/5 rounded-tr-md text-slate-400">
                   Created At
                 </TableHead>
-                <TableHead className="w-1/12 rounded-tr-md" />
               </TableRow>
             </TableHeader>
             <TableBody>
               {workflowTasksIsLoading ? (
-                <TaskListSkeletonRows />
+                skeleton
               ) : workflowTasks?.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={5}>No tasks</TableCell>
+                  <TableCell colSpan={6}>Could not find any tasks</TableCell>
                 </TableRow>
               ) : (
                 workflowTasks
@@ -417,43 +573,11 @@ function WorkflowRun() {
                   )
                   .map((task) => {
                     return (
-                      <TableRow key={task.task_id}>
-                        <TableCell
-                          className="w-1/4 cursor-pointer"
-                          onClick={(event) =>
-                            handleNavigate(event, task.task_id)
-                          }
-                        >
-                          {task.task_id}
-                        </TableCell>
-                        <TableCell
-                          className="w-1/4 max-w-64 cursor-pointer overflow-hidden overflow-ellipsis whitespace-nowrap"
-                          onClick={(event) =>
-                            handleNavigate(event, task.task_id)
-                          }
-                        >
-                          {task.request.url}
-                        </TableCell>
-                        <TableCell
-                          className="w-1/6 cursor-pointer"
-                          onClick={(event) =>
-                            handleNavigate(event, task.task_id)
-                          }
-                        >
-                          <StatusBadge status={task.status} />
-                        </TableCell>
-                        <TableCell
-                          className="w-1/4 cursor-pointer"
-                          onClick={(event) =>
-                            handleNavigate(event, task.task_id)
-                          }
-                        >
-                          {basicTimeFormat(task.created_at)}
-                        </TableCell>
-                        <TableCell className="w-1/12">
-                          <TaskActions task={task} />
-                        </TableCell>
-                      </TableRow>
+                      <WorkflowBlockCollapsibleContent
+                        key={task.task_id}
+                        task={task}
+                        onNavigate={handleNavigate}
+                      />
                     );
                   })
               )}
@@ -490,6 +614,43 @@ function WorkflowRun() {
           </Pagination>
         </div>
       </div>
+      {workflowRunIsFinalized && (
+        <div className="space-y-4">
+          <header>
+            <h2 className="text-lg font-semibold">Block Outputs</h2>
+          </header>
+          <CodeEditor
+            language="json"
+            value={JSON.stringify(workflowRun.outputs, null, 2)}
+            readOnly
+            minHeight="96px"
+            maxHeight="500px"
+          />
+        </div>
+      )}
+      {workflowRunIsFinalized && (
+        <div className="space-y-4">
+          <header>
+            <h2 className="text-lg font-semibold">Downloaded Files</h2>
+          </header>
+          <div className="space-y-2">
+            {fileUrls.length > 0 ? (
+              fileUrls.map((url) => {
+                return (
+                  <div key={url} className="flex gap-2">
+                    <FileIcon className="size-6" />
+                    <a href={url} className="underline underline-offset-4">
+                      <span>{url}</span>
+                    </a>
+                  </div>
+                );
+              })
+            ) : (
+              <div>No files downloaded</div>
+            )}
+          </div>
+        </div>
+      )}
       {Object.entries(parameters).length > 0 && (
         <div className="space-y-4">
           <header>
@@ -502,8 +663,10 @@ function WorkflowRun() {
             return (
               <div key={key} className="flex flex-col gap-2">
                 <Label>{key}</Label>
-                {typeof value === "string" ? (
-                  <Input value={value} readOnly />
+                {typeof value === "string" ||
+                typeof value === "number" ||
+                typeof value === "boolean" ? (
+                  <Input value={String(value)} readOnly />
                 ) : (
                   <CodeEditor
                     value={JSON.stringify(value, null, 2)}

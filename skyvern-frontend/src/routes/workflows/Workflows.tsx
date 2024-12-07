@@ -1,5 +1,4 @@
 import { getClient } from "@/api/AxiosClient";
-import { WorkflowApiResponse, WorkflowRunApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -26,7 +25,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { basicTimeFormat } from "@/util/timeFormat";
+import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import {
   ExclamationTriangleIcon,
@@ -42,6 +41,8 @@ import { ImportWorkflowButton } from "./ImportWorkflowButton";
 import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 import { WorkflowActions } from "./WorkflowActions";
 import { WorkflowTitle } from "./WorkflowTitle";
+import { WorkflowApiResponse } from "./types/workflowTypes";
+import { WorkflowRunApiResponse } from "@/api/types";
 
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
@@ -93,6 +94,7 @@ function Workflows() {
         })
         .then((response) => response.data);
     },
+    refetchOnMount: "always",
   });
 
   const createNewWorkflowMutation = useMutation({
@@ -240,8 +242,9 @@ function Workflows() {
                       onClick={(event) => {
                         handleRowClick(event, workflow.workflow_permanent_id);
                       }}
+                      title={basicTimeFormat(workflow.created_at)}
                     >
-                      {basicTimeFormat(workflow.created_at)}
+                      {basicLocalTimeFormat(workflow.created_at)}
                     </TableCell>
                     <TableCell>
                       <div className="flex justify-end gap-2">
@@ -283,7 +286,7 @@ function Workflows() {
                             <TooltipContent>Create New Run</TooltipContent>
                           </Tooltip>
                         </TooltipProvider>
-                        <WorkflowActions id={workflow.workflow_permanent_id} />
+                        <WorkflowActions workflow={workflow} />
                       </div>
                     </TableCell>
                   </TableRow>
@@ -383,8 +386,11 @@ function Workflows() {
                     <TableCell className="w-1/5">
                       <StatusBadge status={workflowRun.status} />
                     </TableCell>
-                    <TableCell className="w-1/5">
-                      {basicTimeFormat(workflowRun.created_at)}
+                    <TableCell
+                      className="w-1/5"
+                      title={basicTimeFormat(workflowRun.created_at)}
+                    >
+                      {basicLocalTimeFormat(workflowRun.created_at)}
                     </TableCell>
                   </TableRow>
                 );

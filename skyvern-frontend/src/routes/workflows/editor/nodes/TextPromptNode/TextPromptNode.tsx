@@ -1,4 +1,5 @@
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
+import { HelpTooltip } from "@/components/HelpTooltip";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
@@ -6,12 +7,22 @@ import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { CursorTextIcon } from "@radix-ui/react-icons";
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
+import {
+  Handle,
+  NodeProps,
+  Position,
+  useEdges,
+  useNodes,
+  useReactFlow,
+} from "@xyflow/react";
 import { useState } from "react";
+import { AppNode } from "..";
+import { helpTooltips } from "../../helpContent";
+import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
-import { helpTooltipContent, type TextPromptNode } from "./types";
-import { HelpTooltip } from "@/components/HelpTooltip";
+import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
+import { type TextPromptNode } from "./types";
 
 function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
   const { updateNodeData } = useReactFlow();
@@ -21,6 +32,10 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
     prompt: data.prompt,
     jsonSchema: data.jsonSchema,
   });
+
+  const nodes = useNodes<AppNode>();
+  const edges = useEdges();
+  const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
 
   const [label, setLabel] = useNodeLabelChangeHandler({
     id,
@@ -67,7 +82,7 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
         <div className="space-y-2">
           <div className="flex gap-2">
             <Label className="text-xs text-slate-300">Prompt</Label>
-            <HelpTooltip content={helpTooltipContent["prompt"]} />
+            <HelpTooltip content={helpTooltips["textPrompt"]["prompt"]} />
           </div>
           <AutoResizingTextarea
             onChange={(event) => {
@@ -80,6 +95,15 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
             value={inputs.prompt}
             placeholder="What do you want to generate?"
             className="nopan text-xs"
+          />
+        </div>
+        <div className="space-y-2">
+          <ParametersMultiSelect
+            availableOutputParameters={outputParameterKeys}
+            parameters={data.parameterKeys}
+            onParametersChange={(parameterKeys) => {
+              updateNodeData(id, { parameterKeys });
+            }}
           />
         </div>
         <Separator />

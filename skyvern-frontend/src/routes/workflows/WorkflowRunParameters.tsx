@@ -5,6 +5,7 @@ import { useLocation, useParams } from "react-router-dom";
 import { RunWorkflowForm } from "./RunWorkflowForm";
 import { WorkflowApiResponse } from "./types/workflowTypes";
 import { Skeleton } from "@/components/ui/skeleton";
+import { ProxyLocation } from "@/api/types";
 
 function WorkflowRunParameters() {
   const credentialGetter = useCredentialGetter();
@@ -93,6 +94,10 @@ function WorkflowRunParameters() {
       <RunWorkflowForm
         initialValues={initialValues}
         workflowParameters={workflowParameters}
+        initialSettings={{
+          proxyLocation: workflow.proxy_location ?? ProxyLocation.Residential,
+          webhookCallbackUrl: workflow.webhook_callback_url ?? "",
+        }}
       />
     </div>
   );
