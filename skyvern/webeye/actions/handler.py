@@ -520,8 +520,9 @@ async def handle_download_potential_pdf_file_action(
                 await new_page.close()
             else:
                 await new_page.go_back()
-    
+
     return None
+
 
 async def handle_input_text_action(
     action: actions.InputTextAction,
