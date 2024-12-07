@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 import uuid
@@ -27,8 +28,6 @@ from skyvern.forge.sdk.api.files import make_temp_directory
 from skyvern.forge.sdk.core.skyvern_context import current
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.webeye.utils.page import SkyvernFrame
-
-import json
 
 LOG = structlog.get_logger()
 
@@ -158,7 +157,7 @@ class BrowserContextFactory:
         user_data_dir = make_temp_directory(prefix="skyvern_browser_")
         preference_dir = os.path.join(user_data_dir, "Default")
         os.makedirs(preference_dir, mode=0o777, exist_ok=True)
-        with open(preference_dir + "/Preferences", 'w') as f:
+        with open(preference_dir + "/Preferences", "w") as f:
             json.dump(preference, f)
 
         return {
