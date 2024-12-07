@@ -34,10 +34,11 @@ from skyvern.forge.sdk.core.permissions.permission_checker_factory import Permis
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
-from skyvern.forge.sdk.models import Organization, Step
+from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.organizations import (
     GetOrganizationAPIKeysResponse,
     GetOrganizationsResponse,
+    Organization,
     OrganizationUpdate,
 )
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration, TaskGenerationBase

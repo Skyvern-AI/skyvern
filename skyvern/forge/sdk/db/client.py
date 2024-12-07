@@ -49,7 +49,8 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_workflow_run_output_parameter,
     convert_to_workflow_run_parameter,
 )
-from skyvern.forge.sdk.models import Organization, OrganizationAuthToken, Step, StepStatus
+from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.tasks import OrderBy, ProxyLocation, SortDirection, Task, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCode

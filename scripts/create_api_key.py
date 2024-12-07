@@ -5,7 +5,7 @@ import typer
 
 from skyvern.forge.app import DATABASE
 from skyvern.forge.sdk.core import security
-from skyvern.forge.sdk.models import OrganizationAuthToken, OrganizationAuthTokenType
+from skyvern.forge.sdk.schemas.organizations import OrganizationAuthToken, OrganizationAuthTokenType
 
 API_KEY_LIFETIME = timedelta(weeks=5200)
 
