@@ -515,6 +515,8 @@ class ObserverCruiseModel(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"), nullable=True)
+    prompt = Column(UnicodeText, nullable=True)
+    url = Column(String, nullable=True)
 
 
 class ObserverThoughtModel(Base):

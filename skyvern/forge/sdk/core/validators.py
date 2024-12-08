@@ -1,7 +1,7 @@
 import ipaddress
 from urllib.parse import urlparse
 
-from pydantic import HttpUrl, ValidationError, parse_obj_as
+from pydantic import HttpUrl, ValidationError
 
 from skyvern.config import settings
 from skyvern.exceptions import InvalidUrl
@@ -25,17 +25,6 @@ def prepend_scheme_and_validate_url(url: str) -> str:
         raise InvalidUrl(url=url)
 
     return url
-
-
-def validate_url(url: str) -> str:
-    try:
-        if url:
-            # Use parse_obj_as to validate the string as an HttpUrl
-            parse_obj_as(HttpUrl, url)
-        return url
-    except ValidationError:
-        # Handle the validation error
-        raise InvalidUrl(url=url)
 
 
 def is_blocked_host(host: str) -> bool:
