@@ -504,7 +504,7 @@ class CachedActionPlanError(SkyvernException):
         super().__init__(message)
 
 
-class InvalidUrl(SkyvernException):
+class InvalidUrl(SkyvernHTTPException):
     def __init__(self, url: str) -> None:
         super().__init__(f"Invalid URL: {url}. Skyvern supports HTTP and HTTPS urls with max 2083 character length.")
 

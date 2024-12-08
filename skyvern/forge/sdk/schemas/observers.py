@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, HttpUrl
 
 
 class ObserverCruiseStatus(StrEnum):
@@ -23,12 +23,16 @@ class ObserverCruise(BaseModel):
     organization_id: str | None = None
     workflow_run_id: str | None = None
     workflow_id: str | None = None
+    prompt: str | None = None
+    url: HttpUrl | None = None
 
     created_at: datetime
     modified_at: datetime
 
 
 class ObserverThought(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     observer_thought_id: str
     observer_cruise_id: str
     organization_id: str | None = None
