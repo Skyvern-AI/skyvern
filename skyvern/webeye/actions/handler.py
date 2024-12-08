@@ -387,8 +387,17 @@ async def handle_click_to_download_file_action(
         workflow_run_id=task.workflow_run_id,
     )
 
+    initial_pages = len(page.context.pages)
+    initial_page_url = page.url
+
+    new_page = None
     try:
-        await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        try:
+            async with page.context.expect_event("page") as event_info:
+                await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+            new_page = await event_info.value
+        except TimeoutError:
+            pass
         await page.wait_for_load_state(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
     except Exception as e:
         LOG.exception(
@@ -420,6 +429,15 @@ async def handle_click_to_download_file_action(
     )
 
     if len(list_files_after) <= len(list_files_before):
+        if new_page or initial_page_url != page.url:
+            download_dir_str = str(download_dir)
+            pdf_downloaded = await handle_download_potential_pdf_file_action(
+                new_page=new_page if new_page else page,
+                initial_pages=initial_pages,
+                download_dir=download_dir_str,
+            )
+            if pdf_downloaded:
+                return [ActionSuccess(download_triggered=True)]
         LOG.warning(
             "No file to download after click",
             task_id=task.task_id,
@@ -466,6 +484,44 @@ async def handle_click_to_download_file_action(
         )
 
     return [ActionSuccess(download_triggered=True)]
+
+
+async def handle_download_potential_pdf_file_action(
+    new_page: Page,
+    initial_pages: int,
+    download_dir: str,
+) -> bool | None:
+    """
+    Handle downloading a PDF file from a new page or the current page.
+    Returns True if PDF was successfully downloaded, False if not, or None if this was not a PDF.
+    """
+    is_pdf = False
+    try:
+        url = new_page.url
+        async with new_page.request.head(url) as response:
+            content_type = response.headers.get("content-type", "")
+            if "application/pdf" in content_type.lower():
+                is_pdf = True
+                LOG.info("PDF detected, downloading file", url=url)
+                file_path = await download_file(url)
+                # Move file to downloads directory
+                file_name = os.path.basename(file_path)
+                new_path = os.path.join(download_dir, file_name)
+                os.rename(file_path, new_path)
+                LOG.info("Successfully downloaded PDF", new_path=new_path)
+                return True
+    except Exception:
+        LOG.warning("Failed to check/download PDF from new page", exc_info=True)
+        return False
+    finally:
+        if is_pdf:
+            # It's a new tab
+            if len(new_page.context.pages) > initial_pages:
+                await new_page.close()
+            else:
+                await new_page.go_back()
+
+    return None
 
 
 async def handle_input_text_action(
