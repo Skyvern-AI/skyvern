@@ -81,7 +81,7 @@ def set_download_file_listener(browser_context: BrowserContext, **kwargs: Any) -
                         "Add extension according to suggested filename",
                         workflow_run_id=workflow_run_id,
                         task_id=task_id,
-                        filepath=str(file_path) + suffix,
+                        filepath=str(file_path) + suggested_filename_suffix,
                     )
                     suffix = suggested_filename_suffix
                 elif download_url_suffix:
@@ -89,7 +89,7 @@ def set_download_file_listener(browser_context: BrowserContext, **kwargs: Any) -
                         "Add extension according to download url",
                         workflow_run_id=workflow_run_id,
                         task_id=task_id,
-                        filepath=str(file_path) + suffix,
+                        filepath=str(file_path) + download_url_suffix,
                     )
                     suffix = download_url_suffix
 
