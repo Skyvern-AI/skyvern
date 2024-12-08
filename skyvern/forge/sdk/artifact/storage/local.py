@@ -11,7 +11,6 @@ from skyvern.forge.sdk.api.files import get_download_dir, get_skyvern_temp_dir
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP, BaseStorage
 from skyvern.forge.sdk.models import Step
-from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverThought
 
 LOG = structlog.get_logger()
 
@@ -23,18 +22,6 @@ class LocalStorage(BaseStorage):
     def build_uri(self, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
         return f"file://{self.artifact_path}/{step.task_id}/{step.order:02d}_{step.retry_index}_{step.step_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
-
-    def build_observer_thought_uri(
-        self, artifact_id: str, observer_thought: ObserverThought, artifact_type: ArtifactType
-    ) -> str:
-        file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"file://{self.artifact_path}/{settings.ENV}/observers/{observer_thought.observer_cruise_id}/{observer_thought.observer_thought_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
-
-    def build_observer_cruise_uri(
-        self, artifact_id: str, observer_cruise: ObserverCruise, artifact_type: ArtifactType
-    ) -> str:
-        file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"file://{self.artifact_path}/{settings.ENV}/observers/{observer_cruise.observer_cruise_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         file_path = None
