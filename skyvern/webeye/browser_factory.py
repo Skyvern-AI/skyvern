@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 import uuid
@@ -23,7 +24,7 @@ from skyvern.exceptions import (
     UnknownBrowserType,
     UnknownErrorWhileCreatingBrowserContext,
 )
-from skyvern.forge.sdk.api.files import make_temp_directory
+from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
 from skyvern.forge.sdk.core.skyvern_context import current
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -66,40 +67,37 @@ def set_download_file_listener(browser_context: BrowserContext, **kwargs: Any) -
         try:
             workflow_run_id = kwargs.get("workflow_run_id")
             task_id = kwargs.get("task_id")
+            download_dir = Path(get_download_dir(workflow_run_id=workflow_run_id, task_id=task_id))
 
             async with asyncio.timeout(BROWSER_DOWNLOAD_TIMEOUT):
                 file_path = await download.path()
+                suffix = None
+                download_url_suffix = Path(download.url).suffix
+                suggested_filename_suffix = Path(download.suggested_filename).suffix
                 if file_path.suffix:
-                    return
-
-                LOG.info(
-                    "No file extensions, going to add file extension automatically",
-                    workflow_run_id=workflow_run_id,
-                    task_id=task_id,
-                    suggested_filename=download.suggested_filename,
-                    url=download.url,
-                )
-                suffix = Path(download.suggested_filename).suffix
-                if suffix:
+                    suffix = file_path.suffix
+                elif suggested_filename_suffix:
                     LOG.info(
                         "Add extension according to suggested filename",
                         workflow_run_id=workflow_run_id,
                         task_id=task_id,
-                        filepath=str(file_path) + suffix,
+                        filepath=str(file_path) + suggested_filename_suffix,
                     )
-                    file_path.rename(str(file_path) + suffix)
-                    return
-                suffix = Path(download.url).suffix
-                if suffix:
+                    suffix = suggested_filename_suffix
+                elif download_url_suffix:
                     LOG.info(
                         "Add extension according to download url",
                         workflow_run_id=workflow_run_id,
                         task_id=task_id,
-                        filepath=str(file_path) + suffix,
+                        filepath=str(file_path) + download_url_suffix,
                     )
-                    file_path.rename(str(file_path) + suffix)
-                    return
-                # TODO: maybe should try to parse it from URL response
+                    suffix = download_url_suffix
+
+                name = Path(file_path).name
+                if suffix:
+                    name += suffix
+                new_file_path = download_dir / name
+                await download.save_as(new_file_path)
         except asyncio.TimeoutError:
             LOG.error(
                 "timeout to download file, going to cancel the download",
@@ -146,8 +144,21 @@ class BrowserContextFactory:
         har_dir = (
             f"{settings.HAR_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{BrowserContextFactory.get_subdir()}.har"
         )
+
+        preference = {
+            "plugins": {
+                "always_open_pdf_externally": True,
+                "open_pdf_in_system_reader": True,
+            },
+        }
+        user_data_dir = make_temp_directory(prefix="skyvern_browser_")
+        preference_dir = os.path.join(user_data_dir, "Default")
+        os.makedirs(preference_dir, mode=0o777, exist_ok=True)
+        with open(preference_dir + "/Preferences", "w") as f:
+            json.dump(preference, f)
+
         return {
-            "user_data_dir": make_temp_directory(prefix="skyvern_browser_"),
+            "user_data_dir": user_data_dir,
             "locale": settings.BROWSER_LOCALE,
             "timezone_id": settings.BROWSER_TIMEZONE,
             "color_scheme": "no-preference",
