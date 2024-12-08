@@ -135,48 +135,28 @@ class ArtifactManager:
     async def get_share_links(self, artifacts: list[Artifact]) -> list[str] | None:
         return await app.STORAGE.get_share_links(artifacts)
 
-    async def wait_for_upload_aiotasks_for_task(self, task_id: str) -> None:
-        try:
-            st = time.time()
-            async with asyncio.timeout(30):
-                await asyncio.gather(
-                    *[aio_task for aio_task in self.upload_aiotasks_map[task_id] if not aio_task.done()]
-                )
-            LOG.info(
-                f"S3 upload tasks for task_id={task_id} completed in {time.time() - st:.2f}s",
-                task_id=task_id,
-                duration=time.time() - st,
-            )
-        except asyncio.TimeoutError:
-            LOG.error(
-                f"Timeout (30s) while waiting for upload tasks for task_id={task_id}",
-                task_id=task_id,
-            )
-
-        del self.upload_aiotasks_map[task_id]
-
-    async def wait_for_upload_aiotasks_for_tasks(self, task_ids: list[str]) -> None:
+    async def wait_for_upload_aiotasks(self, primary_keys: list[str]) -> None:
         try:
             st = time.time()
             async with asyncio.timeout(30):
                 await asyncio.gather(
                     *[
                         aio_task
-                        for task_id in task_ids
-                        for aio_task in self.upload_aiotasks_map[task_id]
+                        for primary_key in primary_keys
+                        for aio_task in self.upload_aiotasks_map[primary_key]
                         if not aio_task.done()
                     ]
                 )
             LOG.info(
-                f"S3 upload tasks for task_ids={task_ids} completed in {time.time() - st:.2f}s",
-                task_ids=task_ids,
+                f"S3 upload aio tasks for primary_keys={primary_keys} completed in {time.time() - st:.2f}s",
+                primary_keys=primary_keys,
                 duration=time.time() - st,
             )
         except asyncio.TimeoutError:
             LOG.error(
-                f"Timeout (30s) while waiting for upload tasks for task_ids={task_ids}",
-                task_ids=task_ids,
+                f"Timeout (30s) while waiting for upload aio tasks for primary_keys={primary_keys}",
+                primary_keys=primary_keys,
             )
 
-        for task_id in task_ids:
-            del self.upload_aiotasks_map[task_id]
+        for primary_key in primary_keys:
+            del self.upload_aiotasks_map[primary_key]
