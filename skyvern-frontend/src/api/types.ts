@@ -192,6 +192,7 @@ export type WorkflowRunApiResponse = {
   webhook_callback_url: string;
   created_at: string;
   modified_at: string;
+  failure_reason: string | null;
 };
 
 export type WorkflowRunStatusApiResponse = {
