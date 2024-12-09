@@ -2,6 +2,7 @@ There is a screenshot from a part of a web HTML page. Help me confirm if it is a
 
 An open dropdown menu can be defined as:
   - At least one option is visible in the screenshot.
+  - A calendar view or date picker could be considered as an open dropdown menu.
   - Do not consider it an open dropdown menu if the only visible option displays a message like "No results" or "No match".
   - Do not consider it an open dropdown menu if the only visible element displays a placeholder like "Please select", "-", or "Select...".
 
@@ -12,3 +13,8 @@ Reply in JSON format with the following keys:
     "reasoning": str, // the reason why it's a dropdown menu or not a dropdown menu
     "is_opened_dropdown_menu": bool, // true if it's a opened dropdown menu, otherwise false.
 }
+
+Current datetime in UTC, YYYY-MM-DD HH:MM format:
+```
+{{ utc_datetime }}
+```
