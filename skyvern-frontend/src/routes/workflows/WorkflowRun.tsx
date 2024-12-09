@@ -635,12 +635,12 @@ function WorkflowRun() {
           </header>
           <div className="space-y-2">
             {fileUrls.length > 0 ? (
-              fileUrls.map((url) => {
+              fileUrls.map((url, index) => {
                 return (
-                  <div key={url} className="flex gap-2">
+                  <div key={url} title={url} className="flex gap-2">
                     <FileIcon className="size-6" />
                     <a href={url} className="underline underline-offset-4">
-                      <span>{url}</span>
+                      <span>{`File ${index + 1}`}</span>
                     </a>
                   </div>
                 );
