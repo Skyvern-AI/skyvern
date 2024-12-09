@@ -11,6 +11,8 @@ FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
     ArtifactType.SCREENSHOT_LLM: "png",
     ArtifactType.SCREENSHOT_ACTION: "png",
     ArtifactType.SCREENSHOT_FINAL: "png",
+    ArtifactType.SKYVERN_LOG: "log",
+    ArtifactType.SKYVERN_LOG_RAW: "json",
     ArtifactType.LLM_PROMPT: "txt",
     ArtifactType.LLM_REQUEST: "json",
     ArtifactType.LLM_RESPONSE: "json",
