@@ -1815,6 +1815,10 @@ class AgentDB:
         self,
         observer_cruise_id: str,
         status: ObserverCruiseStatus | None = None,
+        workflow_run_id: str | None = None,
+        workflow_id: str | None = None,
+        url: str | None = None,
+        prompt: str | None = None,
         organization_id: str | None = None,
     ) -> ObserverCruise:
         async with self.Session() as session:
@@ -1828,6 +1832,14 @@ class AgentDB:
             if observer_cruise:
                 if status:
                     observer_cruise.status = status
+                if workflow_run_id:
+                    observer_cruise.workflow_run_id = workflow_run_id
+                if workflow_id:
+                    observer_cruise.workflow_id = workflow_id
+                if url:
+                    observer_cruise.url = url
+                if prompt:
+                    observer_cruise.prompt = prompt
                 await session.commit()
                 await session.refresh(observer_cruise)
                 return ObserverCruise.model_validate(observer_cruise)

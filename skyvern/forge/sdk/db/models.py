@@ -518,6 +518,9 @@ class ObserverCruiseModel(Base):
     prompt = Column(UnicodeText, nullable=True)
     url = Column(String, nullable=True)
 
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
 
 class ObserverThoughtModel(Base):
     __tablename__ = "observer_thoughts"
@@ -532,3 +535,6 @@ class ObserverThoughtModel(Base):
     observation = Column(String, nullable=True)
     thought = Column(String, nullable=True)
     answer = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

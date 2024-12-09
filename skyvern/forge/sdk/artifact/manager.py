@@ -9,7 +9,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.models import Step
-from skyvern.forge.sdk.schemas.observers import ObserverThought
+from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverThought
 
 LOG = structlog.get_logger(__name__)
 
@@ -103,12 +103,78 @@ class ArtifactManager:
             path=path,
         )
 
+    async def create_observer_cruise_artifact(
+        self,
+        observer_cruise: ObserverCruise,
+        artifact_type: ArtifactType,
+        data: bytes | None = None,
+        path: str | None = None,
+    ) -> str:
+        artifact_id = generate_artifact_id()
+        uri = app.STORAGE.build_observer_cruise_uri(artifact_id, observer_cruise, artifact_type)
+        return await self._create_artifact(
+            aio_task_primary_key=observer_cruise.observer_cruise_id,
+            artifact_id=artifact_id,
+            artifact_type=artifact_type,
+            uri=uri,
+            observer_cruise_id=observer_cruise.observer_cruise_id,
+            organization_id=observer_cruise.organization_id,
+            data=data,
+            path=path,
+        )
+
+    async def create_llm_artifact(
+        self,
+        data: bytes,
+        artifact_type: ArtifactType,
+        screenshots: list[bytes] | None = None,
+        step: Step | None = None,
+        observer_thought: ObserverThought | None = None,
+        observer_cruise: ObserverCruise | None = None,
+    ) -> None:
+        if step:
+            await self.create_artifact(
+                step=step,
+                artifact_type=artifact_type,
+                data=data,
+            )
+            for screenshot in screenshots or []:
+                await self.create_artifact(
+                    step=step,
+                    artifact_type=ArtifactType.SCREENSHOT_LLM,
+                    data=screenshot,
+                )
+        elif observer_cruise:
+            await self.create_observer_cruise_artifact(
+                observer_cruise=observer_cruise,
+                artifact_type=artifact_type,
+                data=data,
+            )
+            for screenshot in screenshots or []:
+                await self.create_observer_cruise_artifact(
+                    observer_cruise=observer_cruise,
+                    artifact_type=ArtifactType.SCREENSHOT_LLM,
+                    data=screenshot,
+                )
+        elif observer_thought:
+            await self.create_observer_thought_artifact(
+                observer_thought=observer_thought,
+                artifact_type=artifact_type,
+                data=data,
+            )
+            for screenshot in screenshots or []:
+                await self.create_observer_thought_artifact(
+                    observer_thought=observer_thought,
+                    artifact_type=ArtifactType.SCREENSHOT_LLM,
+                    data=screenshot,
+                )
+
     async def update_artifact_data(
         self,
         artifact_id: str | None,
         organization_id: str | None,
         data: bytes,
-        primary_key: Literal["task_id", "observer_thought_id"] = "task_id",
+        primary_key: Literal["task_id", "observer_thought_id", "observer_cruise_id"] = "task_id",
     ) -> None:
         if not artifact_id or not organization_id:
             return None
@@ -125,6 +191,10 @@ class ArtifactManager:
             if not artifact.observer_thought_id:
                 raise ValueError("Observer Thought ID is required to update artifact data.")
             self.upload_aiotasks_map[artifact.observer_thought_id].append(aio_task)
+        elif primary_key == "observer_cruise_id":
+            if not artifact.observer_cruise_id:
+                raise ValueError("Observer Cruise ID is required to update artifact data.")
+            self.upload_aiotasks_map[artifact.observer_cruise_id].append(aio_task)
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         return await app.STORAGE.retrieve_artifact(artifact)
