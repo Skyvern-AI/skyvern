@@ -11,6 +11,7 @@ class ArtifactType(StrEnum):
     BROWSER_CONSOLE_LOG = "browser_console_log"
 
     SKYVERN_LOG = "skyvern_log"
+    SKYVERN_LOG_RAW = "skyvern_log_raw"
 
     # DEPRECATED. pls use SCREENSHOT_LLM, SCREENSHOT_ACTION or SCREENSHOT_FINAL
     SCREENSHOT = "screenshot"

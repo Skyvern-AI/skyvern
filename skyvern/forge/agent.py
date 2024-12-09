@@ -72,6 +72,7 @@ from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
 from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.forge.skyvern_json_encoder import SkyvernJSONLogEncoder
 from skyvern.forge.skyvern_log_encoder import SkyvernLogEncoder
 
 LOG = structlog.get_logger()
@@ -930,7 +931,6 @@ class ForgeAgent:
                         complete_action.task_id = task.task_id
                         complete_action.step_id = step.step_id
                         complete_action.step_order = step.order
-                        complete_action.action_order = len(detailed_agent_step_output.actions_and_results)
                         complete_results = await ActionHandler.handle_action(
                             scraped_page, task, step, working_page, complete_action
                         )
@@ -1778,11 +1778,19 @@ class ForgeAgent:
         try:
             log = skyvern_context.current().log
             current_step_log = [entry for entry in log if entry.get("step_id", "") == step.step_id]
-            log_json = json.dumps(current_step_log, cls=SkyvernLogEncoder, indent=2)
+
+            log_json = json.dumps(current_step_log, cls=SkyvernJSONLogEncoder, indent=2)
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.SKYVERN_LOG_RAW,
+                data=log_json.encode(),
+            )
+
+            formatted_log = SkyvernLogEncoder.encode(current_step_log)
             await app.ARTIFACT_MANAGER.create_artifact(
                 step=step,
                 artifact_type=ArtifactType.SKYVERN_LOG,
-                data=log_json.encode(),
+                data=formatted_log.encode(),
             )
         except Exception:
             LOG.error(

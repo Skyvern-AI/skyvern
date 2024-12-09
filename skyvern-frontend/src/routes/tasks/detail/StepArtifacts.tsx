@@ -215,7 +215,7 @@ function StepArtifacts({ id, stepProps }: Props) {
         {llmRequest ? <Artifact type="json" artifacts={llmRequest} /> : null}
       </TabsContent>
       <TabsContent value="skyvern_log">
-        {skyvernLog ? <Artifact type="json" artifacts={skyvernLog} /> : null}
+        {skyvernLog ? <Artifact type="text" artifacts={skyvernLog} /> : null}
       </TabsContent>
     </Tabs>
   );
