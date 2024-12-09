@@ -1879,6 +1879,7 @@ async def select_from_dropdown(
         navigation_payload_str=json.dumps(task.navigation_payload),
         elements=html,
         select_history=json.dumps(build_sequential_select_history(select_history)) if select_history else "",
+        utc_datetime=datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
     )
 
     LOG.info(
