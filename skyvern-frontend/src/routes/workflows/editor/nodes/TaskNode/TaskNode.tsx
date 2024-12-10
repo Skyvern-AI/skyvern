@@ -1,4 +1,3 @@
-import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import {
   Accordion,
@@ -9,6 +8,7 @@ import {
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
@@ -24,22 +24,28 @@ import {
 } from "@xyflow/react";
 import { useState } from "react";
 import { AppNode } from "..";
+import { helpTooltips, placeholders } from "../../helpContent";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
+import { dataSchemaExampleValue, errorMappingExampleValue } from "../types";
+import { WorkflowBlockParameterSelect } from "../WorkflowBlockParameterSelect";
 import { ParametersMultiSelect } from "./ParametersMultiSelect";
 import type { TaskNode } from "./types";
-import { Separator } from "@/components/ui/separator";
-import { dataSchemaExampleValue, errorMappingExampleValue } from "../types";
-import { helpTooltips, placeholders } from "../../helpContent";
+import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 
 function TaskNode({ id, data }: NodeProps<TaskNode>) {
+  const [parametersPanelField, setParametersPanelField] = useState<
+    string | null
+  >(null);
   const { updateNodeData } = useReactFlow();
   const { editable } = data;
   const deleteNodeCallback = useDeleteNodeCallback();
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
+
   const [label, setLabel] = useNodeLabelChangeHandler({
     id,
     initialValue: data.label,
@@ -70,7 +76,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
   }
 
   return (
-    <div>
+    <div className="relative">
       <Handle
         type="source"
         position={Position.Bottom}
@@ -116,12 +122,12 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     <Label className="text-xs text-slate-300">URL</Label>
                     <HelpTooltip content={helpTooltips["task"]["url"]} />
                   </div>
-                  <AutoResizingTextarea
-                    onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
-                      handleChange("url", event.target.value);
+                  <WorkflowBlockInputTextarea
+                    onIconClick={() => {
+                      setParametersPanelField("url");
+                    }}
+                    onChange={(value) => {
+                      handleChange("url", value);
                     }}
                     value={inputs.url}
                     placeholder={placeholders["task"]["url"]}
@@ -135,12 +141,12 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       content={helpTooltips["task"]["navigationGoal"]}
                     />
                   </div>
-                  <AutoResizingTextarea
-                    onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
-                      handleChange("navigationGoal", event.target.value);
+                  <WorkflowBlockInputTextarea
+                    onIconClick={() => {
+                      setParametersPanelField("navigationGoal");
+                    }}
+                    onChange={(value) => {
+                      handleChange("navigationGoal", value);
                     }}
                     value={inputs.navigationGoal}
                     placeholder={placeholders["task"]["navigationGoal"]}
@@ -172,11 +178,11 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       content={helpTooltips["task"]["dataExtractionGoal"]}
                     />
                   </div>
-                  <AutoResizingTextarea
+                  <WorkflowBlockInputTextarea
+                    onIconClick={() => {
+                      setParametersPanelField("dataExtractionGoal");
+                    }}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       handleChange("dataExtractionGoal", event.target.value);
                     }}
                     value={inputs.dataExtractionGoal}
@@ -197,9 +203,6 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     <Checkbox
                       checked={inputs.dataSchema !== "null"}
                       onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
                         handleChange(
                           "dataSchema",
                           checked
@@ -215,9 +218,6 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                         language="json"
                         value={inputs.dataSchema}
                         onChange={(value) => {
-                          if (!editable) {
-                            return;
-                          }
                           handleChange("dataSchema", value);
                         }}
                         className="nowheel nopan"
@@ -247,9 +247,6 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     min="0"
                     value={inputs.maxRetries ?? ""}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       const value =
                         event.target.value === ""
                           ? null
@@ -274,9 +271,6 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     min="0"
                     value={inputs.maxStepsOverride ?? ""}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       const value =
                         event.target.value === ""
                           ? null
@@ -299,9 +293,6 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       checked={inputs.errorCodeMapping !== "null"}
                       disabled={!editable}
                       onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
                         handleChange(
                           "errorCodeMapping",
                           checked
@@ -317,9 +308,6 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                         language="json"
                         value={inputs.errorCodeMapping}
                         onChange={(value) => {
-                          if (!editable) {
-                            return;
-                          }
                           handleChange("errorCodeMapping", value);
                         }}
                         className="nowheel nopan"
@@ -342,9 +330,6 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     <Switch
                       checked={inputs.continueOnFailure}
                       onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
                         handleChange("continueOnFailure", checked);
                       }}
                     />
@@ -363,9 +348,6 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     <Switch
                       checked={inputs.cacheActions}
                       onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
                         handleChange("cacheActions", checked);
                       }}
                     />
@@ -385,9 +367,6 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     <Switch
                       checked={inputs.allowDownloads}
                       onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
                         handleChange("allowDownloads", checked);
                       }}
                     />
@@ -400,15 +379,15 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     </Label>
                     <HelpTooltip content={helpTooltips["task"]["fileSuffix"]} />
                   </div>
-                  <Input
+                  <WorkflowBlockInput
+                    onIconClick={() => {
+                      setParametersPanelField("downloadSuffix");
+                    }}
                     type="text"
                     placeholder={placeholders["task"]["downloadSuffix"]}
                     className="nopan w-52 text-xs"
                     value={inputs.downloadSuffix ?? ""}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       handleChange("downloadSuffix", event.target.value);
                     }}
                   />
@@ -423,11 +402,11 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       content={helpTooltips["task"]["totpVerificationUrl"]}
                     />
                   </div>
-                  <AutoResizingTextarea
+                  <WorkflowBlockInputTextarea
+                    onIconClick={() => {
+                      setParametersPanelField("totpVerificationUrl");
+                    }}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       handleChange("totpVerificationUrl", event.target.value);
                     }}
                     value={inputs.totpVerificationUrl ?? ""}
@@ -444,11 +423,11 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                       content={helpTooltips["task"]["totpIdentifier"]}
                     />
                   </div>
-                  <AutoResizingTextarea
+                  <WorkflowBlockInputTextarea
+                    onIconClick={() => {
+                      setParametersPanelField("totpIdentifier");
+                    }}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       handleChange("totpIdentifier", event.target.value);
                     }}
                     value={inputs.totpIdentifier ?? ""}
@@ -461,6 +440,25 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
           </AccordionItem>
         </Accordion>
       </div>
+      {typeof parametersPanelField === "string" && (
+        <WorkflowBlockParameterSelect
+          nodeId={id}
+          onClose={() => setParametersPanelField(null)}
+          onAdd={(parameterKey) => {
+            if (parametersPanelField === null || !editable) {
+              return;
+            }
+            if (parametersPanelField in inputs) {
+              const currentValue =
+                inputs[parametersPanelField as keyof typeof inputs];
+              handleChange(
+                parametersPanelField,
+                `${currentValue ?? ""}{{ ${parameterKey} }}`,
+              );
+            }
+          }}
+        />
+      )}
     </div>
   );
 }

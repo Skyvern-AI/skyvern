@@ -7,7 +7,6 @@ import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { Label } from "@/components/ui/label";
-import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Checkbox } from "@/components/ui/checkbox";
 import { errorMappingExampleValue } from "../types";
@@ -21,8 +20,13 @@ import {
 } from "@/components/ui/accordion";
 import { Separator } from "@/components/ui/separator";
 import { helpTooltips } from "../../helpContent";
+import { WorkflowBlockParameterSelect } from "../WorkflowBlockParameterSelect";
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 
 function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
+  const [parametersPanelField, setParametersPanelField] = useState<
+    string | null
+  >(null);
   const { updateNodeData } = useReactFlow();
   const { editable } = data;
   const [label, setLabel] = useNodeLabelChangeHandler({
@@ -83,7 +87,10 @@ function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
         </header>
         <div className="space-y-2">
           <Label className="text-xs text-slate-300">Complete if...</Label>
-          <AutoResizingTextarea
+          <WorkflowBlockInputTextarea
+            onIconClick={() => {
+              setParametersPanelField("completeCriterion");
+            }}
             onChange={(event) => {
               if (!editable) {
                 return;
@@ -96,7 +103,10 @@ function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
         </div>
         <div className="space-y-2">
           <Label className="text-xs text-slate-300">Terminate if...</Label>
-          <AutoResizingTextarea
+          <WorkflowBlockInputTextarea
+            onIconClick={() => {
+              setParametersPanelField("terminateCriterion");
+            }}
             onChange={(event) => {
               if (!editable) {
                 return;
@@ -185,6 +195,25 @@ function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
           </AccordionItem>
         </Accordion>
       </div>
+      {typeof parametersPanelField === "string" && (
+        <WorkflowBlockParameterSelect
+          nodeId={id}
+          onClose={() => setParametersPanelField(null)}
+          onAdd={(parameterKey) => {
+            if (parametersPanelField === null || !editable) {
+              return;
+            }
+            if (parametersPanelField in inputs) {
+              const currentValue =
+                inputs[parametersPanelField as keyof typeof inputs];
+              handleChange(
+                parametersPanelField,
+                `${currentValue ?? ""}{{ ${parameterKey} }}`,
+              );
+            }
+          }}
+        />
+      )}
     </div>
   );
 }

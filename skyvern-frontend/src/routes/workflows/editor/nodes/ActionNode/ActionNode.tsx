@@ -1,4 +1,3 @@
-import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import {
   Accordion,
   AccordionContent,
@@ -22,6 +21,8 @@ import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { Switch } from "@/components/ui/switch";
 import { ClickIcon } from "@/components/icons/ClickIcon";
 import { placeholders, helpTooltips } from "../../helpContent";
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { WorkflowBlockParameterSelect } from "../WorkflowBlockParameterSelect";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -31,6 +32,9 @@ const navigationGoalTooltip =
 const navigationGoalPlaceholder = 'Input {{ name }} into "Name" field.';
 
 function ActionNode({ id, data }: NodeProps<ActionNode>) {
+  const [parametersPanelField, setParametersPanelField] = useState<
+    string | null
+  >(null);
   const { updateNodeData } = useReactFlow();
   const { editable } = data;
   const [label, setLabel] = useNodeLabelChangeHandler({
@@ -102,7 +106,10 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
               <Label className="text-xs text-slate-300">URL</Label>
               <HelpTooltip content={urlTooltip} />
             </div>
-            <AutoResizingTextarea
+            <WorkflowBlockInputTextarea
+              onIconClick={() => {
+                setParametersPanelField("url");
+              }}
               onChange={(event) => {
                 if (!editable) {
                   return;
@@ -121,7 +128,10 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
               </Label>
               <HelpTooltip content={navigationGoalTooltip} />
             </div>
-            <AutoResizingTextarea
+            <WorkflowBlockInputTextarea
+              onIconClick={() => {
+                setParametersPanelField("navigationGoal");
+              }}
               onChange={(event) => {
                 if (!editable) {
                   return;
@@ -309,11 +319,11 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                       content={helpTooltips["action"]["totpVerificationUrl"]}
                     />
                   </div>
-                  <AutoResizingTextarea
+                  <WorkflowBlockInputTextarea
+                    onIconClick={() => {
+                      setParametersPanelField("totpVerificationUrl");
+                    }}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       handleChange("totpVerificationUrl", event.target.value);
                     }}
                     value={inputs.totpVerificationUrl ?? ""}
@@ -330,7 +340,10 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                       content={helpTooltips["action"]["totpIdentifier"]}
                     />
                   </div>
-                  <AutoResizingTextarea
+                  <WorkflowBlockInputTextarea
+                    onIconClick={() => {
+                      setParametersPanelField("totpIdentifier");
+                    }}
                     onChange={(event) => {
                       if (!editable) {
                         return;
@@ -347,6 +360,25 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
           </AccordionItem>
         </Accordion>
       </div>
+      {typeof parametersPanelField === "string" && (
+        <WorkflowBlockParameterSelect
+          nodeId={id}
+          onClose={() => setParametersPanelField(null)}
+          onAdd={(parameterKey) => {
+            if (parametersPanelField === null || !editable) {
+              return;
+            }
+            if (parametersPanelField in inputs) {
+              const currentValue =
+                inputs[parametersPanelField as keyof typeof inputs];
+              handleChange(
+                parametersPanelField,
+                `${currentValue ?? ""}{{ ${parameterKey} }}`,
+              );
+            }
+          }}
+        />
+      )}
     </div>
   );
 }
