@@ -1,4 +1,3 @@
-import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import {
   Accordion,
   AccordionContent,
@@ -22,9 +21,16 @@ import { Switch } from "@/components/ui/switch";
 import type { NavigationNode } from "./types";
 import { RobotIcon } from "@/components/icons/RobotIcon";
 import { helpTooltips, placeholders } from "../../helpContent";
+import { WorkflowBlockParameterSelect } from "../WorkflowBlockParameterSelect";
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 
 function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
   const { updateNodeData } = useReactFlow();
+  const [parametersPanelField, setParametersPanelField] = useState<
+    string | null
+  >(null);
+
   const { editable } = data;
   const [label, setLabel] = useNodeLabelChangeHandler({
     id,
@@ -54,7 +60,7 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
   }
 
   return (
-    <div>
+    <div className="relative">
       <Handle
         type="source"
         position={Position.Bottom}
@@ -96,11 +102,9 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
               <Label className="text-xs text-slate-300">URL</Label>
               <HelpTooltip content={helpTooltips["navigation"]["url"]} />
             </div>
-            <AutoResizingTextarea
+            <WorkflowBlockInputTextarea
+              onIconClick={() => setParametersPanelField("url")}
               onChange={(event) => {
-                if (!editable) {
-                  return;
-                }
                 handleChange("url", event.target.value);
               }}
               value={inputs.url}
@@ -115,11 +119,9 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                 content={helpTooltips["navigation"]["navigationGoal"]}
               />
             </div>
-            <AutoResizingTextarea
+            <WorkflowBlockInputTextarea
+              onIconClick={() => setParametersPanelField("navigationGoal")}
               onChange={(event) => {
-                if (!editable) {
-                  return;
-                }
                 handleChange("navigationGoal", event.target.value);
               }}
               value={inputs.navigationGoal}
@@ -152,9 +154,6 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                     min="0"
                     value={inputs.maxRetries ?? ""}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       const value =
                         event.target.value === ""
                           ? null
@@ -179,9 +178,6 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                     min="0"
                     value={inputs.maxStepsOverride ?? ""}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       const value =
                         event.target.value === ""
                           ? null
@@ -204,9 +200,6 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                       checked={inputs.errorCodeMapping !== "null"}
                       disabled={!editable}
                       onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
                         handleChange(
                           "errorCodeMapping",
                           checked
@@ -222,9 +215,6 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                         language="json"
                         value={inputs.errorCodeMapping}
                         onChange={(value) => {
-                          if (!editable) {
-                            return;
-                          }
                           handleChange("errorCodeMapping", value);
                         }}
                         className="nowheel nopan"
@@ -247,9 +237,6 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                     <Switch
                       checked={inputs.continueOnFailure}
                       onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
                         handleChange("continueOnFailure", checked);
                       }}
                     />
@@ -268,9 +255,6 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                     <Switch
                       checked={inputs.cacheActions}
                       onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
                         handleChange("cacheActions", checked);
                       }}
                     />
@@ -290,9 +274,6 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                     <Switch
                       checked={inputs.allowDownloads}
                       onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
                         handleChange("allowDownloads", checked);
                       }}
                     />
@@ -307,15 +288,15 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                       content={helpTooltips["navigation"]["fileSuffix"]}
                     />
                   </div>
-                  <Input
+                  <WorkflowBlockInput
+                    onIconClick={() => {
+                      setParametersPanelField("downloadSuffix");
+                    }}
                     type="text"
                     placeholder={placeholders["navigation"]["downloadSuffix"]}
                     className="nopan w-52 text-xs"
                     value={inputs.downloadSuffix ?? ""}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       handleChange("downloadSuffix", event.target.value);
                     }}
                   />
@@ -332,11 +313,11 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                       }
                     />
                   </div>
-                  <AutoResizingTextarea
+                  <WorkflowBlockInputTextarea
+                    onIconClick={() => {
+                      setParametersPanelField("totpVerificationUrl");
+                    }}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       handleChange("totpVerificationUrl", event.target.value);
                     }}
                     value={inputs.totpVerificationUrl ?? ""}
@@ -355,11 +336,11 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                       content={helpTooltips["navigation"]["totpIdentifier"]}
                     />
                   </div>
-                  <AutoResizingTextarea
+                  <WorkflowBlockInputTextarea
+                    onIconClick={() => {
+                      setParametersPanelField("totpIdentifier");
+                    }}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       handleChange("totpIdentifier", event.target.value);
                     }}
                     value={inputs.totpIdentifier ?? ""}
@@ -372,6 +353,25 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
           </AccordionItem>
         </Accordion>
       </div>
+      {typeof parametersPanelField === "string" && (
+        <WorkflowBlockParameterSelect
+          nodeId={id}
+          onClose={() => setParametersPanelField(null)}
+          onAdd={(parameterKey) => {
+            if (parametersPanelField === null || !editable) {
+              return;
+            }
+            if (parametersPanelField in inputs) {
+              const currentValue =
+                inputs[parametersPanelField as keyof typeof inputs];
+              handleChange(
+                parametersPanelField,
+                `${currentValue ?? ""}{{ ${parameterKey} }}`,
+              );
+            }
+          }}
+        />
+      )}
     </div>
   );
 }

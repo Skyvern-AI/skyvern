@@ -1,4 +1,3 @@
-import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import {
   Accordion,
   AccordionContent,
@@ -23,8 +22,13 @@ import type { ExtractionNode } from "./types";
 import { ExtractIcon } from "@/components/icons/ExtractIcon";
 
 import { helpTooltips, placeholders } from "../../helpContent";
+import { WorkflowBlockParameterSelect } from "../WorkflowBlockParameterSelect";
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 
 function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
+  const [parametersPanelField, setParametersPanelField] = useState<
+    string | null
+  >(null);
   const { updateNodeData } = useReactFlow();
   const { editable } = data;
   const [label, setLabel] = useNodeLabelChangeHandler({
@@ -96,7 +100,10 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
               content={helpTooltips["extraction"]["dataExtractionGoal"]}
             />
           </div>
-          <AutoResizingTextarea
+          <WorkflowBlockInputTextarea
+            onIconClick={() => {
+              setParametersPanelField("dataExtractionGoal");
+            }}
             onChange={(event) => {
               if (!editable) {
                 return;
@@ -256,6 +263,25 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
           </AccordionItem>
         </Accordion>
       </div>
+      {typeof parametersPanelField === "string" && (
+        <WorkflowBlockParameterSelect
+          nodeId={id}
+          onClose={() => setParametersPanelField(null)}
+          onAdd={(parameterKey) => {
+            if (parametersPanelField === null || !editable) {
+              return;
+            }
+            if (parametersPanelField in inputs) {
+              const currentValue =
+                inputs[parametersPanelField as keyof typeof inputs];
+              handleChange(
+                parametersPanelField,
+                `${currentValue ?? ""}{{ ${parameterKey} }}`,
+              );
+            }
+          }}
+        />
+      )}
     </div>
   );
 }

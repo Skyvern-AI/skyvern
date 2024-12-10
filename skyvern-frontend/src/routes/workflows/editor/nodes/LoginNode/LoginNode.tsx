@@ -1,4 +1,3 @@
-import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import {
   Accordion,
   AccordionContent,
@@ -23,8 +22,13 @@ import type { LoginNode } from "./types";
 import { LockOpen1Icon } from "@radix-ui/react-icons";
 import { CredentialParameterSelector } from "./CredentialParameterSelector";
 import { helpTooltips, placeholders } from "../../helpContent";
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { WorkflowBlockParameterSelect } from "../WorkflowBlockParameterSelect";
 
 function LoginNode({ id, data }: NodeProps<LoginNode>) {
+  const [parametersPanelField, setParametersPanelField] = useState<
+    string | null
+  >(null);
   const { updateNodeData } = useReactFlow();
   const { editable } = data;
   const [label, setLabel] = useNodeLabelChangeHandler({
@@ -53,7 +57,7 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
   }
 
   return (
-    <div>
+    <div className="relative">
       <Handle
         type="source"
         position={Position.Bottom}
@@ -95,11 +99,11 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
               <Label className="text-xs text-slate-300">URL</Label>
               <HelpTooltip content={helpTooltips["login"]["url"]} />
             </div>
-            <AutoResizingTextarea
+            <WorkflowBlockInputTextarea
+              onIconClick={() => {
+                setParametersPanelField("url");
+              }}
               onChange={(event) => {
-                if (!editable) {
-                  return;
-                }
                 handleChange("url", event.target.value);
               }}
               value={inputs.url}
@@ -112,11 +116,11 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
               <Label className="text-xs text-slate-300">Login Goal</Label>
               <HelpTooltip content={helpTooltips["login"]["navigationGoal"]} />
             </div>
-            <AutoResizingTextarea
+            <WorkflowBlockInputTextarea
+              onIconClick={() => {
+                setParametersPanelField("navigationGoal");
+              }}
               onChange={(event) => {
-                if (!editable) {
-                  return;
-                }
                 handleChange("navigationGoal", event.target.value);
               }}
               value={inputs.navigationGoal}
@@ -175,9 +179,6 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                     min="0"
                     value={inputs.maxRetries ?? ""}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       const value =
                         event.target.value === ""
                           ? null
@@ -202,9 +203,6 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                     min="0"
                     value={inputs.maxStepsOverride ?? ""}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       const value =
                         event.target.value === ""
                           ? null
@@ -227,9 +225,6 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                       checked={inputs.errorCodeMapping !== "null"}
                       disabled={!editable}
                       onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
                         handleChange(
                           "errorCodeMapping",
                           checked
@@ -245,9 +240,6 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                         language="json"
                         value={inputs.errorCodeMapping}
                         onChange={(value) => {
-                          if (!editable) {
-                            return;
-                          }
                           handleChange("errorCodeMapping", value);
                         }}
                         className="nowheel nopan"
@@ -270,9 +262,6 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                     <Switch
                       checked={inputs.continueOnFailure}
                       onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
                         handleChange("continueOnFailure", checked);
                       }}
                     />
@@ -291,9 +280,6 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                     <Switch
                       checked={inputs.cacheActions}
                       onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
                         handleChange("cacheActions", checked);
                       }}
                     />
@@ -309,11 +295,11 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                       content={helpTooltips["login"]["totpVerificationUrl"]}
                     />
                   </div>
-                  <AutoResizingTextarea
+                  <WorkflowBlockInputTextarea
+                    onIconClick={() => {
+                      setParametersPanelField("totpVerificationUrl");
+                    }}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       handleChange("totpVerificationUrl", event.target.value);
                     }}
                     value={inputs.totpVerificationUrl ?? ""}
@@ -330,11 +316,11 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                       content={helpTooltips["login"]["totpIdentifier"]}
                     />
                   </div>
-                  <AutoResizingTextarea
+                  <WorkflowBlockInputTextarea
+                    onIconClick={() => {
+                      setParametersPanelField("totpIdentifier");
+                    }}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       handleChange("totpIdentifier", event.target.value);
                     }}
                     value={inputs.totpIdentifier ?? ""}
@@ -347,6 +333,25 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
           </AccordionItem>
         </Accordion>
       </div>
+      {typeof parametersPanelField === "string" && (
+        <WorkflowBlockParameterSelect
+          nodeId={id}
+          onClose={() => setParametersPanelField(null)}
+          onAdd={(parameterKey) => {
+            if (parametersPanelField === null || !editable) {
+              return;
+            }
+            if (parametersPanelField in inputs) {
+              const currentValue =
+                inputs[parametersPanelField as keyof typeof inputs];
+              handleChange(
+                parametersPanelField,
+                `${currentValue ?? ""}{{ ${parameterKey} }}`,
+              );
+            }
+          }}
+        />
+      )}
     </div>
   );
 }
