@@ -787,6 +787,10 @@ const isReactSelectDropdown = (element) => {
 };
 
 function hasNgAttribute(element) {
+  if (!element.attributes[Symbol.iterator]) {
+    return false;
+  }
+
   for (let attr of element.attributes) {
     if (attr.name.startsWith("ng-")) {
       return true;
@@ -1057,27 +1061,33 @@ function buildElementObject(frame, element, interactable, purgeable = false) {
   element.setAttribute("unique_id", element_id);
 
   const attrs = {};
-  for (const attr of element.attributes) {
-    var attrValue = attr.value;
-    if (
-      attr.name === "required" ||
-      attr.name === "aria-required" ||
-      attr.name === "checked" ||
-      attr.name === "aria-checked" ||
-      attr.name === "selected" ||
-      attr.name === "aria-selected" ||
-      attr.name === "readonly" ||
-      attr.name === "aria-readonly" ||
-      attr.name === "disabled" ||
-      attr.name === "aria-disabled"
-    ) {
-      if (attrValue && attrValue.toLowerCase() === "false") {
-        attrValue = false;
-      } else {
-        attrValue = true;
+  if (element.attributes[Symbol.iterator]) {
+    for (const attr of element.attributes) {
+      var attrValue = attr.value;
+      if (
+        attr.name === "required" ||
+        attr.name === "aria-required" ||
+        attr.name === "checked" ||
+        attr.name === "aria-checked" ||
+        attr.name === "selected" ||
+        attr.name === "aria-selected" ||
+        attr.name === "readonly" ||
+        attr.name === "aria-readonly" ||
+        attr.name === "disabled" ||
+        attr.name === "aria-disabled"
+      ) {
+        if (attrValue && attrValue.toLowerCase() === "false") {
+          attrValue = false;
+        } else {
+          attrValue = true;
+        }
       }
+      attrs[attr.name] = attrValue;
     }
-    attrs[attr.name] = attrValue;
+  } else {
+    console.warn(
+      "element.attributes is not iterable. element_id=" + element_id,
+    );
   }
 
   if (
