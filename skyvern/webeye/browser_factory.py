@@ -14,7 +14,7 @@ from playwright.async_api import BrowserContext, ConsoleMessage, Download, Error
 from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
-from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_DOWNLOAD_TIMEOUT, NAVIGATION_MAX_RETRY_TIME
+from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_DOWNLOAD_TIMEOUT, NAVIGATION_MAX_RETRY_TIME, SKYVERN_DIR
 from skyvern.exceptions import (
     FailedToNavigateToUrl,
     FailedToReloadPage,
@@ -23,8 +23,8 @@ from skyvern.exceptions import (
     UnknownBrowserType,
     UnknownErrorWhileCreatingBrowserContext,
 )
-from skyvern.forge.sdk.api.files import make_temp_directory
-from skyvern.forge.sdk.core.skyvern_context import current
+from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
+from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -121,6 +121,11 @@ def set_download_file_listener(browser_context: BrowserContext, **kwargs: Any) -
     browser_context.on("page", listen_to_new_page)
 
 
+def initialize_download_dir() -> str:
+    context = ensure_context()
+    return get_download_dir(context.workflow_run_id, context.task_id)
+
+
 class BrowserContextCreator(Protocol):
     def __call__(
         self, playwright: Playwright, **kwargs: dict[str, Any]
@@ -141,13 +146,28 @@ class BrowserContextFactory:
         return str(uuid.uuid4())
 
     @staticmethod
+    def update_chromium_browser_preferences(user_data_dir: str, download_dir: str) -> None:
+        preference_dst_folder = f"{user_data_dir}/Default"
+        os.makedirs(preference_dst_folder, exist_ok=True)
+
+        preference_dst_file = f"{preference_dst_folder}/Preferences"
+        preference_template = f"{SKYVERN_DIR}/webeye/chromium_preferences.json"
+
+        preference_file_content = ""
+        with open(preference_template, "r") as f:
+            preference_file_content = f.read()
+            preference_file_content = preference_file_content.replace("MASK_SAVEFILE_DEFAULT_DIRECTORY", download_dir)
+            preference_file_content = preference_file_content.replace("MASK_DOWNLOAD_DEFAULT_DIRECTORY", download_dir)
+        with open(preference_dst_file, "w") as f:
+            f.write(preference_file_content)
+
+    @staticmethod
     def build_browser_args() -> dict[str, Any]:
         video_dir = f"{settings.VIDEO_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}"
         har_dir = (
             f"{settings.HAR_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{BrowserContextFactory.get_subdir()}.har"
         )
         return {
-            "user_data_dir": make_temp_directory(prefix="skyvern_browser_"),
             "locale": settings.BROWSER_LOCALE,
             "timezone_id": settings.BROWSER_TIMEZONE,
             "color_scheme": "no-preference",
@@ -261,7 +281,20 @@ class BrowserArtifacts(BaseModel):
 async def _create_headless_chromium(
     playwright: Playwright, **kwargs: dict
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+    user_data_dir = make_temp_directory(prefix="skyvern_browser_")
+    download_dir = initialize_download_dir()
+    BrowserContextFactory.update_chromium_browser_preferences(
+        user_data_dir=user_data_dir,
+        download_dir=download_dir,
+    )
     browser_args = BrowserContextFactory.build_browser_args()
+    browser_args.update(
+        {
+            "user_data_dir": user_data_dir,
+            "downloads_path": download_dir,
+        }
+    )
+
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(har_path=browser_args["record_har_path"])
     browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
     return browser_context, browser_artifacts, None
@@ -270,9 +303,17 @@ async def _create_headless_chromium(
 async def _create_headful_chromium(
     playwright: Playwright, **kwargs: dict
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+    user_data_dir = make_temp_directory(prefix="skyvern_browser_")
+    download_dir = initialize_download_dir()
+    BrowserContextFactory.update_chromium_browser_preferences(
+        user_data_dir=user_data_dir,
+        download_dir=download_dir,
+    )
     browser_args = BrowserContextFactory.build_browser_args()
     browser_args.update(
         {
+            "user_data_dir": user_data_dir,
+            "downloads_path": download_dir,
             "headless": False,
         }
     )
