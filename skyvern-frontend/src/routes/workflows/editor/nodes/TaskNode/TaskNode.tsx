@@ -126,8 +126,8 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     onIconClick={() => {
                       setParametersPanelField("url");
                     }}
-                    onChange={(value) => {
-                      handleChange("url", value);
+                    onChange={(event) => {
+                      handleChange("url", event.target.value);
                     }}
                     value={inputs.url}
                     placeholder={placeholders["task"]["url"]}
@@ -145,8 +145,8 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     onIconClick={() => {
                       setParametersPanelField("navigationGoal");
                     }}
-                    onChange={(value) => {
-                      handleChange("navigationGoal", value);
+                    onChange={(event) => {
+                      handleChange("navigationGoal", event.target.value);
                     }}
                     value={inputs.navigationGoal}
                     placeholder={placeholders["task"]["navigationGoal"]}
