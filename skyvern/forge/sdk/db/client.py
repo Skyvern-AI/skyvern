@@ -729,6 +729,34 @@ class AgentDB:
 
         return convert_to_organization_auth_token(auth_token)
 
+    async def get_artifacts_for_observer_cruise(
+        self,
+        observer_cruise_id: str,
+        organization_id: str | None = None,
+        artifact_types: list[ArtifactType] | None = None,
+    ) -> list[Artifact]:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(ArtifactModel)
+                    .filter_by(observer_cruise_id=observer_cruise_id)
+                    .filter_by(organization_id=organization_id)
+                )
+                if artifact_types:
+                    query = query.filter(ArtifactModel.artifact_type.in_(artifact_types))
+
+                query = query.order_by(ArtifactModel.created_at)
+                if artifacts := (await session.scalars(query)).all():
+                    return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifacts]
+                else:
+                    return []
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def get_artifacts_for_task_step(
         self,
         task_id: str,
