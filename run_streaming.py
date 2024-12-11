@@ -5,7 +5,7 @@ import structlog
 import typer
 
 from skyvern.forge import app
-from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.api.files import get_skyvern_temp_dir
 
 INTERVAL = 1
 LOG = structlog.get_logger()
@@ -13,7 +13,7 @@ LOG = structlog.get_logger()
 
 async def run() -> None:
     file_name = "skyvern_screenshot.png"
-    png_file_path = f"{SettingsManager.get_settings().STREAMING_FILE_BASE_PATH}/{file_name}"
+    png_file_path = f"{get_skyvern_temp_dir()}/{file_name}"
 
     while True:
         # run subprocess to take screenshot
