@@ -135,7 +135,7 @@ function RunWorkflowForm({
           <ToastAction altText="View">
             <Button asChild>
               <Link
-                to={`/workflows/${workflowPermanentId}/${response.data.workflow_run_id}`}
+                to={`/workflows/${workflowPermanentId}/${response.data.workflow_run_id}/blocks`}
               >
                 View
               </Link>
