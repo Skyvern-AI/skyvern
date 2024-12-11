@@ -396,14 +396,14 @@ function Workflows() {
                         if (event.ctrlKey || event.metaKey) {
                           window.open(
                             window.location.origin +
-                              `/workflows/${workflowRun.workflow_permanent_id}/${workflowRun.workflow_run_id}`,
+                              `/workflows/${workflowRun.workflow_permanent_id}/${workflowRun.workflow_run_id}/blocks`,
                             "_blank",
                             "noopener,noreferrer",
                           );
                           return;
                         }
                         navigate(
-                          `/workflows/${workflowRun.workflow_permanent_id}/${workflowRun.workflow_run_id}`,
+                          `/workflows/${workflowRun.workflow_permanent_id}/${workflowRun.workflow_run_id}/blocks`,
                         );
                       }}
                       className="cursor-pointer"
