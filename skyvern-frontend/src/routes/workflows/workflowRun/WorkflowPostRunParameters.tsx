@@ -4,8 +4,13 @@ import { CodeEditor } from "../components/CodeEditor";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 
 function WorkflowPostRunParameters() {
-  const { data: workflowRun } = useWorkflowRunQuery();
+  const { data: workflowRun, isLoading: workflowRunIsLoading } =
+    useWorkflowRunQuery();
   const parameters = workflowRun?.parameters ?? {};
+
+  if (workflowRunIsLoading) {
+    return <div>Loading workflow parameters...</div>;
+  }
 
   return Object.entries(parameters).length > 0 ? (
     <div className="space-y-4 rounded-lg bg-slate-elevation3 px-6 py-5">
