@@ -21,7 +21,7 @@ async def run() -> None:
             f"xwd -root | xwdtopnm 2>/dev/null | pnmtopng > {png_file_path}", shell=True, env={"DISPLAY": ":99"}
         )
 
-        # upload screenshot to S3
+        # FIXME: upload screenshot to S3 with correct organization id
         try:
             await app.STORAGE.save_streaming_file("placeholder_org", file_name)
         except Exception:
