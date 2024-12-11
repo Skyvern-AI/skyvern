@@ -54,6 +54,21 @@ def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: Ev
     return event_dict
 
 
+def skyvern_logs_processor(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    """
+    A custom processor to add skyvern logs to the context
+    """
+    if method_name not in ["info", "warning", "error", "critical", "exception"]:
+        return event_dict
+
+    context = skyvern_context.current()
+    if context:
+        log_entry = dict(event_dict)
+        context.log.append(log_entry)
+
+    return event_dict
+
+
 def setup_logger() -> None:
     """
     Setup the logger with the specified format
@@ -88,7 +103,7 @@ def setup_logger() -> None:
             structlog.processors.format_exc_info,
         ]
         + additional_processors
-        + [renderer],
+        + [skyvern_logs_processor, renderer],
     )
     uvicorn_error = logging.getLogger("uvicorn.error")
     uvicorn_error.disabled = True
