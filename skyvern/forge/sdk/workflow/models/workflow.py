@@ -2,11 +2,9 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, List
 
-from fastapi import status
-from pydantic import BaseModel, HttpUrl, field_validator
+from pydantic import BaseModel, field_validator
 
-from skyvern.exceptions import BlockedHost, SkyvernHTTPException
-from skyvern.forge.sdk.core.validators import is_blocked_host, prepend_scheme_and_validate_url
+from skyvern.forge.sdk.core.validators import validate_url
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicateBlockLabels
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
@@ -25,20 +23,7 @@ class WorkflowRequestBody(BaseModel):
     def validate_urls(cls, url: str | None) -> str | None:
         if url is None:
             return None
-
-        try:
-            url = prepend_scheme_and_validate_url(url=url)
-            v = HttpUrl(url=url)
-        except Exception as e:
-            raise SkyvernHTTPException(message=str(e), status_code=status.HTTP_400_BAD_REQUEST)
-
-        if not v.host:
-            return None
-        host = v.host
-        blocked = is_blocked_host(host)
-        if blocked:
-            raise BlockedHost(host=host)
-        return str(v)
+        return validate_url(url)
 
 
 class RunWorkflowResponse(BaseModel):
