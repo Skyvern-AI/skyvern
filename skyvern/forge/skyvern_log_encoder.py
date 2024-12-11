@@ -3,6 +3,7 @@ from datetime import datetime
 import json
 
 from structlog.dev import ConsoleRenderer
+import structlog
 
 LOG = structlog.get_logger()
 
