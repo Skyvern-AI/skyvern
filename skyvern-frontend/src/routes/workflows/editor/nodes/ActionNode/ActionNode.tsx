@@ -143,6 +143,12 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
               className="nopan text-xs"
             />
           </div>
+          <div className="rounded-md bg-slate-800 p-2">
+            <div className="space-y-1 text-xs text-slate-400">
+              Tip: While executing the action block, Skyvern will only take one
+              action.
+            </div>
+          </div>
         </div>
         <Separator />
         <Accordion type="single" collapsible>
