@@ -142,7 +142,6 @@ class ForLoopBlockYAML(BlockYAML):
 
     loop_over_parameter_key: str
     loop_blocks: list["BLOCK_YAML_SUBCLASSES"]
-    loop_variable_reference: str | None = None
 
 
 class CodeBlockYAML(BlockYAML):
