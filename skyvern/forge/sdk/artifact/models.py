@@ -89,3 +89,9 @@ class Artifact(BaseModel):
     )
     signed_url: str | None = None
     organization_id: str | None = None
+
+
+class LogEntityType(StrEnum):
+    STEP = "step"
+    TASK = "task"
+    WORKFLOW = "workflow"
