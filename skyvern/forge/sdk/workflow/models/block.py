@@ -578,9 +578,9 @@ class LoopBlockExecutedResult(BaseModel):
 class ForLoopBlock(Block):
     block_type: Literal[BlockType.FOR_LOOP] = BlockType.FOR_LOOP
 
-    loop_over: PARAMETER_TYPE | None
-    loop_variable_reference: str | None
     loop_blocks: list[BlockTypeVar]
+    loop_over: PARAMETER_TYPE | None = None
+    loop_variable_reference: str | None = None
 
     def get_all_parameters(
         self,
