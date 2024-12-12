@@ -47,8 +47,10 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
+    FailedToFormatJinjaStyleParameter,
     InvalidEmailClientConfiguration,
     InvalidFileType,
+    NoIterableValueFound,
     NoValidEmailRecipient,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -576,14 +578,17 @@ class LoopBlockExecutedResult(BaseModel):
 class ForLoopBlock(Block):
     block_type: Literal[BlockType.FOR_LOOP] = BlockType.FOR_LOOP
 
-    loop_over: PARAMETER_TYPE
     loop_blocks: list[BlockTypeVar]
+    loop_over: PARAMETER_TYPE | None = None
+    loop_variable_reference: str | None = None
 
     def get_all_parameters(
         self,
         workflow_run_id: str,
     ) -> list[PARAMETER_TYPE]:
-        parameters = {self.loop_over}
+        parameters = set()
+        if self.loop_over is not None:
+            parameters.add(self.loop_over)
 
         for loop_block in self.loop_blocks:
             for parameter in loop_block.get_all_parameters(workflow_run_id):
@@ -599,6 +604,9 @@ class ForLoopBlock(Block):
             for parameter in all_parameters:
                 if isinstance(parameter, ContextParameter):
                     context_parameters.append(parameter)
+
+        if self.loop_over is None:
+            return context_parameters
 
         for context_parameter in context_parameters:
             if context_parameter.source.key != self.loop_over.key:
@@ -620,29 +628,44 @@ class ForLoopBlock(Block):
         return context_parameters
 
     def get_loop_over_parameter_values(self, workflow_run_context: WorkflowRunContext) -> list[Any]:
-        if isinstance(self.loop_over, WorkflowParameter):
-            parameter_value = workflow_run_context.get_value(self.loop_over.key)
-        elif isinstance(self.loop_over, OutputParameter):
-            # If the output parameter is for a TaskBlock, it will be a TaskOutput object. We need to extract the
-            # value from the TaskOutput object's extracted_information field.
-            output_parameter_value = workflow_run_context.get_value(self.loop_over.key)
-            if isinstance(output_parameter_value, dict) and "extracted_information" in output_parameter_value:
-                parameter_value = output_parameter_value["extracted_information"]
-            else:
-                parameter_value = output_parameter_value
-        elif isinstance(self.loop_over, ContextParameter):
-            parameter_value = self.loop_over.value
-            if not parameter_value:
-                source_parameter_value = workflow_run_context.get_value(self.loop_over.source.key)
-                if isinstance(source_parameter_value, dict):
-                    if "extracted_information" in source_parameter_value:
-                        parameter_value = source_parameter_value["extracted_information"].get(self.loop_over.key)
-                    else:
-                        parameter_value = source_parameter_value.get(self.loop_over.key)
+        # parse the value from self.loop_variable_reference and then from self.loop_over
+        if self.loop_variable_reference:
+            value_template = f'{{{{ {self.loop_variable_reference.strip(" {}")} | tojson }}}}'
+            try:
+                value_json = self.format_block_parameter_template_from_workflow_run_context(
+                    value_template, workflow_run_context
+                )
+            except Exception as e:
+                raise FailedToFormatJinjaStyleParameter(value_template, str(e))
+            parameter_value = json.loads(value_json)
+
+        elif self.loop_over is not None:
+            if isinstance(self.loop_over, WorkflowParameter):
+                parameter_value = workflow_run_context.get_value(self.loop_over.key)
+            elif isinstance(self.loop_over, OutputParameter):
+                # If the output parameter is for a TaskBlock, it will be a TaskOutput object. We need to extract the
+                # value from the TaskOutput object's extracted_information field.
+                output_parameter_value = workflow_run_context.get_value(self.loop_over.key)
+                if isinstance(output_parameter_value, dict) and "extracted_information" in output_parameter_value:
+                    parameter_value = output_parameter_value["extracted_information"]
                 else:
-                    raise ValueError("ContextParameter source value should be a dict")
+                    parameter_value = output_parameter_value
+            elif isinstance(self.loop_over, ContextParameter):
+                parameter_value = self.loop_over.value
+                if not parameter_value:
+                    source_parameter_value = workflow_run_context.get_value(self.loop_over.source.key)
+                    if isinstance(source_parameter_value, dict):
+                        if "extracted_information" in source_parameter_value:
+                            parameter_value = source_parameter_value["extracted_information"].get(self.loop_over.key)
+                        else:
+                            parameter_value = source_parameter_value.get(self.loop_over.key)
+                    else:
+                        raise ValueError("ContextParameter source value should be a dict")
+            else:
+                raise NotImplementedError()
+
         else:
-            raise NotImplementedError
+            raise NoIterableValueFound()
 
         if isinstance(parameter_value, list):
             return parameter_value
@@ -725,7 +748,15 @@ class ForLoopBlock(Block):
 
     async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        loop_over_values = self.get_loop_over_parameter_values(workflow_run_context)
+        try:
+            loop_over_values = self.get_loop_over_parameter_values(workflow_run_context)
+        except Exception as e:
+            return self.build_block_result(
+                success=False,
+                failure_reason=f"failed to get loop values: {str(e)}",
+                status=BlockStatus.failed,
+            )
+
         LOG.info(
             f"Number of loop_over values: {len(loop_over_values)}",
             block_type=self.block_type,

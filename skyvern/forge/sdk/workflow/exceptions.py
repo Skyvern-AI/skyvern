@@ -110,5 +110,17 @@ class WorkflowParameterMissingRequiredValue(BaseWorkflowHTTPException):
 
 
 class InvalidWaitBlockTime(SkyvernException):
-    def __init__(self, max_sec: int):
+    def __init__(self, max_sec: int) -> None:
         super().__init__(f"Invalid wait time for wait block, it should be a number between 0 and {max_sec}.")
+
+
+class FailedToFormatJinjaStyleParameter(SkyvernException):
+    def __init__(self, template: str, msg: str) -> None:
+        super().__init__(
+            f"Failed to format Jinja style parameter {template}. Please make sure the variable reference is correct. reason: {msg}"
+        )
+
+
+class NoIterableValueFound(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("No iterable value found for the loop block")
