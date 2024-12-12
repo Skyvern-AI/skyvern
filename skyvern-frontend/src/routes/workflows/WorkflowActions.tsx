@@ -39,6 +39,7 @@ import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 
 type Props = {
   workflow: WorkflowApiResponse;
+  onSuccessfullyDeleted?: () => void;
 };
 
 function downloadFile(fileName: string, contents: string) {
@@ -57,7 +58,7 @@ function downloadFile(fileName: string, contents: string) {
   document.body.removeChild(element);
 }
 
-function WorkflowActions({ workflow }: Props) {
+function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -105,6 +106,7 @@ function WorkflowActions({ workflow }: Props) {
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
       });
+      onSuccessfullyDeleted?.();
     },
     onError: (error: AxiosError) => {
       toast({
@@ -164,7 +166,6 @@ function WorkflowActions({ workflow }: Props) {
               </DropdownMenuSubContent>
             </DropdownMenuPortal>
           </DropdownMenuSub>
-
           <DialogTrigger>
             <DropdownMenuItem className="p-2">
               <GarbageIcon className="mr-2 h-4 w-4 text-destructive" />
@@ -176,7 +177,11 @@ function WorkflowActions({ workflow }: Props) {
       <DialogContent onCloseAutoFocus={(e) => e.preventDefault()}>
         <DialogHeader>
           <DialogTitle>Are you sure?</DialogTitle>
-          <DialogDescription>This workflow will be deleted.</DialogDescription>
+          <DialogDescription>
+            The workflow{" "}
+            <span className="font-semibold text-primary">{workflow.title}</span>{" "}
+            will be deleted.
+          </DialogDescription>
         </DialogHeader>
         <DialogFooter>
           <DialogClose asChild>
