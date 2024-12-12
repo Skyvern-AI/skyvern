@@ -233,7 +233,7 @@ class WorkflowService:
                         workflow=workflow,
                         workflow_run=workflow_run,
                         api_key=api_key,
-                        need_call_webhook=False,
+                        need_call_webhook=True,
                     )
                     return workflow_run
                 parameters = block.get_all_parameters(workflow_run_id)
@@ -881,10 +881,18 @@ class WorkflowService:
         if not need_call_webhook:
             return
 
+        await self.execute_workflow_webhook(workflow_run, api_key)
+
+    async def execute_workflow_webhook(
+        self,
+        workflow_run: WorkflowRun,
+        api_key: str | None = None,
+    ) -> None:
+        workflow_id = workflow_run.workflow_id
         workflow_run_status_response = await self.build_workflow_run_status_response(
-            workflow_permanent_id=workflow.workflow_permanent_id,
+            workflow_permanent_id=workflow_run.workflow_permanent_id,
             workflow_run_id=workflow_run.workflow_run_id,
-            organization_id=workflow.organization_id,
+            organization_id=workflow_run.organization_id,
         )
         LOG.info(
             "Built workflow run status response",
@@ -894,7 +902,7 @@ class WorkflowService:
         if not workflow_run.webhook_callback_url:
             LOG.warning(
                 "Workflow has no webhook callback url. Not sending workflow response",
-                workflow_id=workflow.workflow_id,
+                workflow_id=workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
             )
             return
@@ -902,7 +910,7 @@ class WorkflowService:
         if not api_key:
             LOG.warning(
                 "Request has no api key. Not sending workflow response",
-                workflow_id=workflow.workflow_id,
+                workflow_id=workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
             )
             return
@@ -921,7 +929,7 @@ class WorkflowService:
         }
         LOG.info(
             "Sending webhook run status to webhook callback url",
-            workflow_id=workflow.workflow_id,
+            workflow_id=workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             webhook_callback_url=workflow_run.webhook_callback_url,
             payload=payload,
@@ -934,7 +942,7 @@ class WorkflowService:
             if resp.status_code == 200:
                 LOG.info(
                     "Webhook sent successfully",
-                    workflow_id=workflow.workflow_id,
+                    workflow_id=workflow_id,
                     workflow_run_id=workflow_run.workflow_run_id,
                     resp_code=resp.status_code,
                     resp_text=resp.text,
@@ -942,7 +950,7 @@ class WorkflowService:
             else:
                 LOG.info(
                     "Webhook failed",
-                    workflow_id=workflow.workflow_id,
+                    workflow_id=workflow_id,
                     workflow_run_id=workflow_run.workflow_run_id,
                     webhook_data=payload,
                     resp=resp,
@@ -951,7 +959,7 @@ class WorkflowService:
                 )
         except Exception as e:
             raise FailedToSendWebhook(
-                workflow_id=workflow.workflow_id,
+                workflow_id=workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
             ) from e
 

@@ -285,7 +285,7 @@ class ForgeAgent:
                 task=task,
                 last_step=step,
                 api_key=api_key,
-                need_call_webhook=False,
+                need_call_webhook=True,
             )
             return step, None, None
 
@@ -1544,7 +1544,7 @@ class ForgeAgent:
     async def execute_task_webhook(
         self,
         task: Task,
-        last_step: Step,
+        last_step: Step | None,
         api_key: str | None,
     ) -> None:
         if not api_key:
