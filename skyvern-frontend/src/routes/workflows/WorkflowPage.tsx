@@ -31,6 +31,7 @@ import {
   useSearchParams,
 } from "react-router-dom";
 import { WorkflowApiResponse } from "./types/workflowTypes";
+import { WorkflowActions } from "./WorkflowActions";
 
 function WorkflowPage() {
   const credentialGetter = useCredentialGetter();
@@ -88,6 +89,12 @@ function WorkflowPage() {
           )}
         </div>
         <div className="flex gap-2">
+          {workflow && (
+            <WorkflowActions
+              workflow={workflow}
+              onSuccessfullyDeleted={() => navigate("/workflows")}
+            />
+          )}
           <Button asChild variant="secondary">
             <Link to={`/workflows/${workflowPermanentId}/edit`}>
               <Pencil2Icon className="mr-2 size-4" />
