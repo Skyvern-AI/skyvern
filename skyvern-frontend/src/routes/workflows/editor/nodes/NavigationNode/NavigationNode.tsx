@@ -96,7 +96,7 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
             }}
           />
         </header>
-        <div className="space-y-2">
+        <div className="space-y-4">
           <div className="space-y-2">
             <div className="flex gap-2">
               <Label className="text-xs text-slate-300">URL</Label>
@@ -128,6 +128,12 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
               placeholder={placeholders["navigation"]["navigationGoal"]}
               className="nopan text-xs"
             />
+          </div>
+          <div className="rounded-md bg-slate-800 p-2">
+            <div className="space-y-1 text-xs text-slate-400">
+              Tip: While executing the navigation block, Skyvern will take
+              multiple actions to accomplish a single goal.
+            </div>
           </div>
         </div>
         <Separator />
