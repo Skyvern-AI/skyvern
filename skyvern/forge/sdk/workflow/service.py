@@ -1319,27 +1319,10 @@ class WorkflowService:
                 await WorkflowService.block_yaml_to_block(workflow, loop_block, parameters)
                 for loop_block in block_yaml.loop_blocks
             ]
-
-            loop_over_parameter: Parameter | None = None
-            if block_yaml.loop_over_parameter_key:
-                loop_over_parameter = parameters[block_yaml.loop_over_parameter_key]
-
-            if block_yaml.loop_variable_reference:
-                # it's backaward compatible with jinja style parameter and context paramter
-                # we trim the format like {{ loop_key }} into loop_key to initialize the context parater,
-                # otherwise it might break the context parameter initialization chain, blow up the worklofw parameters
-                # TODO: consider remove this if we totally give up context parameter
-                trimmed_key = block_yaml.loop_variable_reference.strip(" {}")
-                if trimmed_key in parameters:
-                    loop_over_parameter = parameters[trimmed_key]
-
-            if loop_over_parameter is None and not block_yaml.loop_variable_reference:
-                raise Exception("empty loop value parameter")
-
+            loop_over_parameter = parameters[block_yaml.loop_over_parameter_key]
             return ForLoopBlock(
                 label=block_yaml.label,
                 loop_over=loop_over_parameter,
-                loop_variable_reference=block_yaml.loop_variable_reference,
                 loop_blocks=loop_blocks,
                 output_parameter=output_parameter,
                 continue_on_failure=block_yaml.continue_on_failure,
