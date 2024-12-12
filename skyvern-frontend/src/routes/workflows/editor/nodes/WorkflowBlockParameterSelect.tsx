@@ -2,7 +2,7 @@ import { useEdges, useNodes } from "@xyflow/react";
 import { useWorkflowParametersState } from "../useWorkflowParametersState";
 import { AppNode } from ".";
 import { getAvailableOutputParameterKeys } from "../workflowEditorUtils";
-import { Cross2Icon, PlusIcon } from "@radix-ui/react-icons";
+import { PlusIcon } from "@radix-ui/react-icons";
 import { SwitchBar } from "@/components/SwitchBar";
 import { useState } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -10,11 +10,10 @@ import { ScrollAreaViewport } from "@radix-ui/react-scroll-area";
 
 type Props = {
   nodeId: string;
-  onClose: () => void;
   onAdd: (parameterKey: string) => void;
 };
 
-function WorkflowBlockParameterSelect({ nodeId, onClose, onAdd }: Props) {
+function WorkflowBlockParameterSelect({ nodeId, onAdd }: Props) {
   const [content, setContent] = useState("parameters");
   const [workflowParameters] = useWorkflowParametersState();
   const nodes = useNodes<AppNode>();
@@ -29,10 +28,9 @@ function WorkflowBlockParameterSelect({ nodeId, onClose, onAdd }: Props) {
   );
 
   return (
-    <div className="nopan nowheel absolute right-[-296px] top-0 mt-0 w-[280px] cursor-auto space-y-3 rounded-md border border-slate-700 bg-slate-950 p-4">
+    <div className="cursor-auto space-y-3">
       <header className="flex justify-between">
         <h1>Add Parameter</h1>
-        <Cross2Icon className="size-6 cursor-pointer" onClick={onClose} />
       </header>
       <SwitchBar
         onChange={(value) => setContent(value)}
@@ -79,7 +77,7 @@ function WorkflowBlockParameterSelect({ nodeId, onClose, onAdd }: Props) {
                     key={parameterKey}
                     className="flex cursor-pointer justify-between rounded-md bg-slate-elevation1 px-3 py-2 text-xs hover:bg-slate-elevation2"
                     onClick={() => {
-                      onAdd(parameterKey);
+                      onAdd?.(parameterKey);
                     }}
                   >
                     {parameterKey}

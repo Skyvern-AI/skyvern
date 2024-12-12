@@ -20,13 +20,9 @@ import {
 } from "@/components/ui/accordion";
 import { Separator } from "@/components/ui/separator";
 import { helpTooltips } from "../../helpContent";
-import { WorkflowBlockParameterSelect } from "../WorkflowBlockParameterSelect";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 
 function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
-  const [parametersPanelField, setParametersPanelField] = useState<
-    string | null
-  >(null);
   const { updateNodeData } = useReactFlow();
   const { editable } = data;
   const [label, setLabel] = useNodeLabelChangeHandler({
@@ -88,14 +84,9 @@ function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
         <div className="space-y-2">
           <Label className="text-xs text-slate-300">Complete if...</Label>
           <WorkflowBlockInputTextarea
-            onIconClick={() => {
-              setParametersPanelField("completeCriterion");
-            }}
-            onChange={(event) => {
-              if (!editable) {
-                return;
-              }
-              handleChange("completeCriterion", event.target.value);
+            nodeId={id}
+            onChange={(value) => {
+              handleChange("completeCriterion", value);
             }}
             value={inputs.completeCriterion}
             className="nopan text-xs"
@@ -104,14 +95,9 @@ function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
         <div className="space-y-2">
           <Label className="text-xs text-slate-300">Terminate if...</Label>
           <WorkflowBlockInputTextarea
-            onIconClick={() => {
-              setParametersPanelField("terminateCriterion");
-            }}
-            onChange={(event) => {
-              if (!editable) {
-                return;
-              }
-              handleChange("terminateCriterion", event.target.value);
+            nodeId={id}
+            onChange={(value) => {
+              handleChange("terminateCriterion", value);
             }}
             value={inputs.terminateCriterion}
             className="nopan text-xs"
@@ -195,25 +181,6 @@ function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
           </AccordionItem>
         </Accordion>
       </div>
-      {typeof parametersPanelField === "string" && (
-        <WorkflowBlockParameterSelect
-          nodeId={id}
-          onClose={() => setParametersPanelField(null)}
-          onAdd={(parameterKey) => {
-            if (parametersPanelField === null || !editable) {
-              return;
-            }
-            if (parametersPanelField in inputs) {
-              const currentValue =
-                inputs[parametersPanelField as keyof typeof inputs];
-              handleChange(
-                parametersPanelField,
-                `${currentValue ?? ""}{{ ${parameterKey} }}`,
-              );
-            }
-          }}
-        />
-      )}
     </div>
   );
 }
