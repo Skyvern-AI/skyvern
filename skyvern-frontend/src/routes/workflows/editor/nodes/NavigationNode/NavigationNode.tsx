@@ -126,8 +126,11 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
           </div>
           <div className="rounded-md bg-slate-800 p-2">
             <div className="space-y-1 text-xs text-slate-400">
-              Tip: While executing the navigation block, Skyvern will take
-              multiple actions to accomplish a single goal.
+              Tip: Try to phrase your prompt as a goal with an explicit
+              completion criteria. While executing, Skyvern will take as many
+              actions as necessary to accomplish the goal. Use words like
+              "Complete" or "Terminate" to help Skyvern identify when it's
+              finished or when it should give up.
             </div>
           </div>
         </div>
