@@ -341,7 +341,6 @@ class BitwardenService:
                 items = json.loads(items_result.stdout)
             except json.JSONDecodeError:
                 raise BitwardenListItemsError("Failed to parse items JSON. Output: " + items_result.stdout)
-
             if not items:
                 raise BitwardenListItemsError(
                     f"No items found in Bitwarden for identity key: {identity_key} in collection with ID: {collection_id}"
@@ -349,14 +348,11 @@ class BitwardenService:
 
             # Filter the identity items
             # https://bitwarden.com/help/cli/#create lists the type of the identity items as 4
-            identity_items = [item for item in items if item["type"] == 4]
 
-            if len(identity_items) != 1:
-                raise BitwardenListItemsError(
-                    f"Expected exactly one identity item, but found {len(identity_items)} items for identity key: {identity_key} in collection with ID: {collection_id}"
-                )
+            # We may want to filter it by type in the future, but for now we just take the first item and check its identity fields
+            # identity_items = [item for item in items if item["type"] == 4]
 
-            identity_item = identity_items[0]
+            identity_item = items[0]
 
             sensitive_information: dict[str, str] = {}
             for field in identity_fields:
@@ -368,7 +364,11 @@ class BitwardenService:
                         sensitive_information[field] = item["value"]
                         break
 
-                if field in identity_item["identity"] and field not in sensitive_information:
+                if (
+                    "identity" in identity_item
+                    and field in identity_item["identity"]
+                    and field not in sensitive_information
+                ):
                     sensitive_information[field] = identity_item["identity"][field]
 
             return sensitive_information

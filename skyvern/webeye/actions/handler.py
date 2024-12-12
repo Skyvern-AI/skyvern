@@ -14,7 +14,12 @@ from playwright.async_api import FileChooser, Frame, Locator, Page, TimeoutError
 from pydantic import BaseModel
 
 from skyvern.config import settings
-from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, REPO_ROOT_DIR, SKYVERN_ID_ATTR
+from skyvern.constants import (
+    AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
+    BROWSER_DOWNLOAD_TIMEOUT,
+    REPO_ROOT_DIR,
+    SKYVERN_ID_ATTR,
+)
 from skyvern.exceptions import (
     EmptySelect,
     ErrEmptyTweakValue,
@@ -1597,6 +1602,7 @@ async def input_or_auto_complete_input(
 
         prompt = prompt_engine.load_prompt(
             "auto-completion-potential-answers",
+            potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
             field_information=input_or_select_context.field,
             current_value=current_value,
             navigation_goal=task.navigation_goal,
@@ -1604,10 +1610,11 @@ async def input_or_auto_complete_input(
         )
 
         LOG.info(
-            "Ask LLM to give 10 potential values based on the current value",
+            "Ask LLM to give potential values based on the current value",
             current_value=current_value,
             step_id=step.step_id,
             task_id=task.task_id,
+            potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
         )
         json_respone = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
         values: list[dict] = json_respone.get("potential_values", [])
@@ -1879,6 +1886,7 @@ async def select_from_dropdown(
         navigation_payload_str=json.dumps(task.navigation_payload),
         elements=html,
         select_history=json.dumps(build_sequential_select_history(select_history)) if select_history else "",
+        utc_datetime=datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
     )
 
     LOG.info(

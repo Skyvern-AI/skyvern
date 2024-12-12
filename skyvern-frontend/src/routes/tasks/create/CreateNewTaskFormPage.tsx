@@ -121,7 +121,10 @@ function CreateNewTaskFormPage() {
           dataExtractionGoal:
             data.workflow_definition.blocks[0].data_extraction_goal,
           extractedInformationSchema: JSON.stringify(dataSchema, null, 2),
-          navigationPayload,
+          navigationPayload:
+            typeof navigationPayload === "string"
+              ? navigationPayload
+              : JSON.stringify(navigationPayload, null, 2),
           maxStepsOverride,
           totpIdentifier: data.workflow_definition.blocks[0].totp_identifier,
           totpVerificationUrl:

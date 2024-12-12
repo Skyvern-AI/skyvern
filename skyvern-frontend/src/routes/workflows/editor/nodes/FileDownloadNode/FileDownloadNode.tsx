@@ -1,4 +1,3 @@
-import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import {
   Accordion,
@@ -22,6 +21,8 @@ import { NodeActionMenu } from "../NodeActionMenu";
 import { errorMappingExampleValue } from "../types";
 import type { FileDownloadNode } from "./types";
 import { helpTooltips, placeholders } from "../../helpContent";
+import { WorkflowBlockParameterSelect } from "../WorkflowBlockParameterSelect";
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -31,6 +32,9 @@ const navigationGoalTooltip =
 const navigationGoalPlaceholder = "Tell Skyvern which file to download.";
 
 function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
+  const [parametersPanelField, setParametersPanelField] = useState<
+    string | null
+  >(null);
   const { updateNodeData } = useReactFlow();
   const { editable } = data;
   const [label, setLabel] = useNodeLabelChangeHandler({
@@ -104,11 +108,11 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
               <Label className="text-xs text-slate-300">URL</Label>
               <HelpTooltip content={urlTooltip} />
             </div>
-            <AutoResizingTextarea
+            <WorkflowBlockInputTextarea
+              onIconClick={() => {
+                setParametersPanelField("url");
+              }}
               onChange={(event) => {
-                if (!editable) {
-                  return;
-                }
                 handleChange("url", event.target.value);
               }}
               value={inputs.url}
@@ -121,11 +125,11 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
               <Label className="text-xs text-slate-300">Download Goal</Label>
               <HelpTooltip content={navigationGoalTooltip} />
             </div>
-            <AutoResizingTextarea
+            <WorkflowBlockInputTextarea
+              onIconClick={() => {
+                setParametersPanelField("navigationGoal");
+              }}
               onChange={(event) => {
-                if (!editable) {
-                  return;
-                }
                 handleChange("navigationGoal", event.target.value);
               }}
               value={inputs.navigationGoal}
@@ -161,9 +165,6 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                     min="0"
                     value={inputs.maxRetries ?? ""}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       const value =
                         event.target.value === ""
                           ? null
@@ -188,9 +189,6 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                     min="0"
                     value={inputs.maxStepsOverride ?? ""}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       const value =
                         event.target.value === ""
                           ? null
@@ -213,9 +211,6 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                       checked={inputs.errorCodeMapping !== "null"}
                       disabled={!editable}
                       onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
                         handleChange(
                           "errorCodeMapping",
                           checked
@@ -231,9 +226,6 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                         language="json"
                         value={inputs.errorCodeMapping}
                         onChange={(value) => {
-                          if (!editable) {
-                            return;
-                          }
                           handleChange("errorCodeMapping", value);
                         }}
                         className="nowheel nopan"
@@ -256,9 +248,6 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                     <Switch
                       checked={inputs.continueOnFailure}
                       onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
                         handleChange("continueOnFailure", checked);
                       }}
                     />
@@ -277,9 +266,6 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                     <Switch
                       checked={inputs.cacheActions}
                       onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
                         handleChange("cacheActions", checked);
                       }}
                     />
@@ -301,9 +287,6 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                     className="nopan w-52 text-xs"
                     value={inputs.downloadSuffix ?? ""}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       handleChange("downloadSuffix", event.target.value);
                     }}
                   />
@@ -318,11 +301,11 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                       content={helpTooltips["download"]["totpVerificationUrl"]}
                     />
                   </div>
-                  <AutoResizingTextarea
+                  <WorkflowBlockInputTextarea
+                    onIconClick={() => {
+                      setParametersPanelField("totpVerificationUrl");
+                    }}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       handleChange("totpVerificationUrl", event.target.value);
                     }}
                     value={inputs.totpVerificationUrl ?? ""}
@@ -341,11 +324,11 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                       content={helpTooltips["download"]["totpIdentifier"]}
                     />
                   </div>
-                  <AutoResizingTextarea
+                  <WorkflowBlockInputTextarea
+                    onIconClick={() => {
+                      setParametersPanelField("totpIdentifier");
+                    }}
                     onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
                       handleChange("totpIdentifier", event.target.value);
                     }}
                     value={inputs.totpIdentifier ?? ""}
@@ -358,6 +341,25 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
           </AccordionItem>
         </Accordion>
       </div>
+      {typeof parametersPanelField === "string" && (
+        <WorkflowBlockParameterSelect
+          nodeId={id}
+          onClose={() => setParametersPanelField(null)}
+          onAdd={(parameterKey) => {
+            if (parametersPanelField === null || !editable) {
+              return;
+            }
+            if (parametersPanelField in inputs) {
+              const currentValue =
+                inputs[parametersPanelField as keyof typeof inputs];
+              handleChange(
+                parametersPanelField,
+                `${currentValue ?? ""}{{ ${parameterKey} }}`,
+              );
+            }
+          }}
+        />
+      )}
     </div>
   );
 }

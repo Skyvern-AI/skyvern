@@ -1,10 +1,11 @@
 import ipaddress
 from urllib.parse import urlparse
 
-from pydantic import HttpUrl, ValidationError, parse_obj_as
+from fastapi import status
+from pydantic import HttpUrl, ValidationError
 
 from skyvern.config import settings
-from skyvern.exceptions import InvalidUrl
+from skyvern.exceptions import BlockedHost, InvalidUrl, SkyvernHTTPException
 
 
 def prepend_scheme_and_validate_url(url: str) -> str:
@@ -27,17 +28,6 @@ def prepend_scheme_and_validate_url(url: str) -> str:
     return url
 
 
-def validate_url(url: str) -> str:
-    try:
-        if url:
-            # Use parse_obj_as to validate the string as an HttpUrl
-            parse_obj_as(HttpUrl, url)
-        return url
-    except ValidationError:
-        # Handle the validation error
-        raise InvalidUrl(url=url)
-
-
 def is_blocked_host(host: str) -> bool:
     try:
         ip = ipaddress.ip_address(host)
@@ -51,3 +41,19 @@ def is_blocked_host(host: str) -> bool:
         return False
     except Exception:
         return False
+
+
+def validate_url(url: str) -> str | None:
+    try:
+        url = prepend_scheme_and_validate_url(url=url)
+        v = HttpUrl(url=url)
+    except Exception as e:
+        raise SkyvernHTTPException(message=str(e), status_code=status.HTTP_400_BAD_REQUEST)
+
+    if not v.host:
+        return None
+    host = v.host
+    blocked = is_blocked_host(host)
+    if blocked:
+        raise BlockedHost(host=host)
+    return str(v)

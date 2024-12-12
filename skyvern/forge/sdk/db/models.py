@@ -162,13 +162,15 @@ class ArtifactModel(Base):
     __table_args__ = (
         Index("org_task_step_index", "organization_id", "task_id", "step_id"),
         Index("org_workflow_run_index", "organization_id", "workflow_run_id"),
+        Index("org_observer_cruise_index", "organization_id", "observer_cruise_id"),
     )
 
     artifact_id = Column(String, primary_key=True, index=True, default=generate_artifact_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
-    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"))
-    workflow_run_block_id = Column(String, ForeignKey("workflow_run_blocks.workflow_run_block_id"))
-    observer_cruise_id = Column(String, ForeignKey("observer_cruises.observer_cruise_id"))
+    workflow_run_id = Column(String)
+    workflow_run_block_id = Column(String)
+    observer_cruise_id = Column(String)
+    observer_thought_id = Column(String)
     task_id = Column(String, ForeignKey("tasks.task_id"))
     step_id = Column(String, ForeignKey("steps.step_id"), index=True)
     artifact_type = Column(String)
@@ -505,7 +507,7 @@ class WorkflowRunBlockModel(Base):
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
 
-class ObserverCruise(Base):
+class ObserverCruiseModel(Base):
     __tablename__ = "observer_cruises"
 
     observer_cruise_id = Column(String, primary_key=True, default=generate_observer_cruise_id)
@@ -513,9 +515,14 @@ class ObserverCruise(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"), nullable=True)
+    prompt = Column(UnicodeText, nullable=True)
+    url = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
 
-class ObserverThought(Base):
+class ObserverThoughtModel(Base):
     __tablename__ = "observer_thoughts"
 
     observer_thought_id = Column(String, primary_key=True, default=generate_observer_thought_id)
@@ -524,5 +531,10 @@ class ObserverThought(Base):
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
     workflow_run_block_id = Column(String, ForeignKey("workflow_run_blocks.workflow_run_block_id"), nullable=True)
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"), nullable=True)
+    user_input = Column(UnicodeText, nullable=True)
+    observation = Column(String, nullable=True)
     thought = Column(String, nullable=True)
     answer = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

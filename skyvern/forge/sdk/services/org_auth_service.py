@@ -12,7 +12,8 @@ from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.client import AgentDB
-from skyvern.forge.sdk.models import Organization, OrganizationAuthTokenType, TokenPayload
+from skyvern.forge.sdk.models import TokenPayload
+from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthTokenType
 
 AUTHENTICATION_TTL = 60 * 60  # one hour
 CACHE_SIZE = 128

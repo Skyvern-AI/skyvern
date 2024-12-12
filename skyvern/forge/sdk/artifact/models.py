@@ -62,31 +62,15 @@ class Artifact(BaseModel):
     def serialize_datetime_to_isoformat(self, value: datetime) -> str:
         return value.isoformat()
 
-    artifact_id: str = Field(
-        ...,
-        description="The ID of the task artifact.",
-        examples=["6bb1801a-fd80-45e8-899a-4dd723cc602e"],
-    )
-    task_id: str = Field(
-        ...,
-        description="The ID of the task this artifact belongs to.",
-        examples=["50da533e-3904-4401-8a07-c49adf88b5eb"],
-    )
-    step_id: str = Field(
-        ...,
-        description="The ID of the task step this artifact belongs to.",
-        examples=["6bb1801a-fd80-45e8-899a-4dd723cc602e"],
-    )
-    artifact_type: ArtifactType = Field(
-        ...,
-        description="The type of the artifact.",
-        examples=["screenshot"],
-    )
-    uri: str = Field(
-        ...,
-        description="The URI of the artifact.",
-        examples=["/Users/skyvern/hello/world.png"],
-    )
+    artifact_id: str
+    artifact_type: ArtifactType
+    uri: str
+    task_id: str | None = None
+    step_id: str | None = None
+    workflow_run_id: str | None = None
+    workflow_run_block_id: str | None = None
+    observer_cruise_id: str | None = None
+    observer_thought_id: str | None = None
     signed_url: str | None = None
     organization_id: str | None = None
 

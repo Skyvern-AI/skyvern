@@ -17,6 +17,10 @@ import { WorkflowRunParameters } from "./routes/workflows/WorkflowRunParameters"
 import { Workflows } from "./routes/workflows/Workflows";
 import { WorkflowsPageLayout } from "./routes/workflows/WorkflowsPageLayout";
 import { WorkflowEditor } from "./routes/workflows/editor/WorkflowEditor";
+import { WorkflowRunBlocks } from "./routes/workflows/workflowRun/WorkflowRunBlocks";
+import { WorkflowRunOutput } from "./routes/workflows/workflowRun/WorkflowRunOutput";
+import { WorkflowPostRunParameters } from "./routes/workflows/workflowRun/WorkflowPostRunParameters";
+import { WorkflowRunRecording } from "./routes/workflows/workflowRun/WorkflowRunRecording";
 
 const router = createBrowserRouter([
   {
@@ -108,6 +112,29 @@ const router = createBrowserRouter([
               {
                 path: ":workflowRunId",
                 element: <WorkflowRun />,
+                children: [
+                  {
+                    index: true,
+                    element: <Navigate to="blocks" />,
+                  },
+                  {
+                    path: "blocks",
+                    element: <WorkflowRunBlocks />,
+                  },
+                  {
+                    path: "output",
+                    element: <WorkflowRunOutput />,
+                  },
+                  {
+                    path: "parameters",
+                    element: <WorkflowPostRunParameters />,
+                  },
+
+                  {
+                    path: "recording",
+                    element: <WorkflowRunRecording />,
+                  },
+                ],
               },
             ],
           },

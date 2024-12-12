@@ -5,7 +5,7 @@ import structlog
 import typer
 
 from skyvern.forge import app
-from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.api.files import get_skyvern_temp_dir
 
 INTERVAL = 1
 LOG = structlog.get_logger()
@@ -13,7 +13,7 @@ LOG = structlog.get_logger()
 
 async def run() -> None:
     file_name = "skyvern_screenshot.png"
-    png_file_path = f"{SettingsManager.get_settings().STREAMING_FILE_BASE_PATH}/{file_name}"
+    png_file_path = f"{get_skyvern_temp_dir()}/{file_name}"
 
     while True:
         # run subprocess to take screenshot
@@ -21,7 +21,7 @@ async def run() -> None:
             f"xwd -root | xwdtopnm 2>/dev/null | pnmtopng > {png_file_path}", shell=True, env={"DISPLAY": ":99"}
         )
 
-        # upload screenshot to S3
+        # FIXME: upload screenshot to S3 with correct organization id
         try:
             await app.STORAGE.save_streaming_file("placeholder_org", file_name)
         except Exception:

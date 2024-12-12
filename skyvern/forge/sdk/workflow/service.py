@@ -22,7 +22,8 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
-from skyvern.forge.sdk.models import Organization, Step
+from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
@@ -858,7 +859,7 @@ class WorkflowService:
                 )
                 LOG.info("Persisted browser session for workflow run", workflow_run_id=workflow_run.workflow_run_id)
 
-        await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks_for_tasks(all_workflow_task_ids)
+        await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks(all_workflow_task_ids)
 
         try:
             async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):

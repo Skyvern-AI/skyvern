@@ -26,6 +26,9 @@ import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { TaskActions } from "./TaskActions";
 import { TaskListSkeletonRows } from "./TaskListSkeletonRows";
+import { Button } from "@/components/ui/button";
+import { DownloadIcon } from "@radix-ui/react-icons";
+import { downloadBlob } from "@/util/downloadBlob";
 
 type StatusDropdownItem = {
   label: string;
@@ -115,15 +118,47 @@ function TaskHistory() {
     }
   }
 
+  function handleExport() {
+    if (!tasks) {
+      return; // should never happen
+    }
+    const data = ["id,url,status,created,failure_reason"];
+    tasks.forEach((task) => {
+      const row = [
+        task.task_id,
+        task.request.url,
+        task.status,
+        task.created_at,
+        task.failure_reason ?? "",
+      ];
+      data.push(
+        row
+          .map(String) // convert every value to String
+          .map((v) => v.replace(new RegExp('"', "g"), '""')) // escape double quotes
+          .map((v) => `"${v}"`) // quote it
+          .join(","), // comma-separated
+      );
+    });
+    const contents = data.join("\r\n");
+
+    downloadBlob(contents, "export.csv", "data:text/csv;charset=utf-8;");
+  }
+
   return (
     <div className="space-y-4">
       <header className="flex items-center justify-between">
         <h1 className="text-2xl">Task Runs</h1>
-        <StatusFilterDropdown
-          values={statusFilters}
-          onChange={setStatusFilters}
-          options={statusDropdownItems}
-        />
+        <div className="flex gap-2">
+          <StatusFilterDropdown
+            values={statusFilters}
+            onChange={setStatusFilters}
+            options={statusDropdownItems}
+          />
+          <Button variant="secondary" onClick={handleExport}>
+            <DownloadIcon className="mr-2" />
+            Export CSV
+          </Button>
+        </div>
       </header>
       <div className="rounded-md border">
         <Table>

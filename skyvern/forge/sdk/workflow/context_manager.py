@@ -5,7 +5,7 @@ import structlog
 
 from skyvern.exceptions import BitwardenBaseError, WorkflowRunContextNotInitialized
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
-from skyvern.forge.sdk.models import Organization
+from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
 from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError

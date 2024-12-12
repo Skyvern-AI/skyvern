@@ -50,7 +50,8 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.validators import prepend_scheme_and_validate_url
 from skyvern.forge.sdk.db.enums import TaskType
-from skyvern.forge.sdk.models import Organization, Step, StepStatus
+from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, ValidationBlock
@@ -1536,7 +1537,7 @@ class ForgeAgent:
         await self.cleanup_browser_and_create_artifacts(close_browser_on_completion, last_step, task)
 
         # Wait for all tasks to complete before generating the links for the artifacts
-        await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks_for_task(task.task_id)
+        await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([task.task_id])
 
         if need_call_webhook:
             await self.execute_task_webhook(task=task, last_step=last_step, api_key=api_key)
@@ -1633,14 +1634,16 @@ class ForgeAgent:
         if screenshot_artifact:
             screenshot_url = await app.ARTIFACT_MANAGER.get_share_link(screenshot_artifact)
 
-        recording_artifact = await app.DATABASE.get_artifact(
-            task_id=task.task_id,
-            step_id=last_step.step_id,
-            artifact_type=ArtifactType.RECORDING,
-            organization_id=task.organization_id,
-        )
-        if recording_artifact:
-            recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
+        first_step = await app.DATABASE.get_first_step(task_id=task.task_id, organization_id=task.organization_id)
+        if first_step:
+            recording_artifact = await app.DATABASE.get_artifact(
+                task_id=task.task_id,
+                step_id=first_step.step_id,
+                artifact_type=ArtifactType.RECORDING,
+                organization_id=task.organization_id,
+            )
+            if recording_artifact:
+                recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
         # get the artifact of the last TASK_RESPONSE_ACTION_SCREENSHOT_COUNT screenshots and get the screenshot_url
         latest_action_screenshot_artifacts = await app.DATABASE.get_latest_n_artifacts(

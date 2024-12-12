@@ -19,6 +19,8 @@ from skyvern.forge.sdk.db.models import (
     BitwardenCreditCardDataParameterModel,
     BitwardenLoginCredentialParameterModel,
     BitwardenSensitiveInformationParameterModel,
+    ObserverCruiseModel,
+    ObserverThoughtModel,
     OrganizationAuthTokenModel,
     OrganizationModel,
     OutputParameterModel,
@@ -49,7 +51,9 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_workflow_run_output_parameter,
     convert_to_workflow_run_parameter,
 )
-from skyvern.forge.sdk.models import Organization, OrganizationAuthToken, Step, StepStatus
+from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverCruiseStatus, ObserverThought
+from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.tasks import OrderBy, ProxyLocation, SortDirection, Task, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
@@ -182,20 +186,28 @@ class AgentDB:
     async def create_artifact(
         self,
         artifact_id: str,
-        step_id: str,
-        task_id: str,
         artifact_type: str,
         uri: str,
+        step_id: str | None = None,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_run_block_id: str | None = None,
+        observer_cruise_id: str | None = None,
+        observer_thought_id: str | None = None,
         organization_id: str | None = None,
     ) -> Artifact:
         try:
             async with self.Session() as session:
                 new_artifact = ArtifactModel(
                     artifact_id=artifact_id,
-                    task_id=task_id,
-                    step_id=step_id,
                     artifact_type=artifact_type,
                     uri=uri,
+                    task_id=task_id,
+                    step_id=step_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    observer_cruise_id=observer_cruise_id,
+                    observer_thought_id=observer_thought_id,
                     organization_id=organization_id,
                 )
                 session.add(new_artifact)
@@ -306,6 +318,32 @@ class AgentDB:
                 actions = (await session.scalars(query)).all()
                 return [Action.model_validate(action) for action in actions]
 
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_first_step(self, task_id: str, organization_id: str | None = None) -> Step | None:
+        try:
+            async with self.Session() as session:
+                if step := (
+                    await session.scalars(
+                        select(StepModel)
+                        .filter_by(task_id=task_id)
+                        .filter_by(organization_id=organization_id)
+                        .order_by(StepModel.order.asc())
+                    )
+                ).first():
+                    return convert_to_step(step, debug_enabled=self.debug_enabled)
+                else:
+                    LOG.info(
+                        "Latest step not found",
+                        task_id=task_id,
+                        organization_id=organization_id,
+                    )
+                    return None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -690,6 +728,34 @@ class AgentDB:
             await session.refresh(auth_token)
 
         return convert_to_organization_auth_token(auth_token)
+
+    async def get_artifacts_for_observer_cruise(
+        self,
+        observer_cruise_id: str,
+        organization_id: str | None = None,
+        artifact_types: list[ArtifactType] | None = None,
+    ) -> list[Artifact]:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(ArtifactModel)
+                    .filter_by(observer_cruise_id=observer_cruise_id)
+                    .filter_by(organization_id=organization_id)
+                )
+                if artifact_types:
+                    query = query.filter(ArtifactModel.artifact_type.in_(artifact_types))
+
+                query = query.order_by(ArtifactModel.created_at)
+                if artifacts := (await session.scalars(query)).all():
+                    return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifacts]
+                else:
+                    return []
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
 
     async def get_artifacts_for_task_step(
         self,
@@ -1694,3 +1760,115 @@ class AgentDB:
             )
             await session.execute(stmt)
             await session.commit()
+
+    async def get_observer_cruise(
+        self, observer_cruise_id: str, organization_id: str | None = None
+    ) -> ObserverCruise | None:
+        async with self.Session() as session:
+            if observer_cruise := (
+                await session.scalars(
+                    select(ObserverCruiseModel)
+                    .filter_by(observer_cruise_id=observer_cruise_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first():
+                return ObserverCruise.model_validate(observer_cruise)
+            return None
+
+    async def get_observer_thought(
+        self, observer_thought_id: str, organization_id: str | None = None
+    ) -> ObserverThought | None:
+        async with self.Session() as session:
+            if observer_thought := (
+                await session.scalars(
+                    select(ObserverThoughtModel)
+                    .filter_by(observer_thought_id=observer_thought_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first():
+                return ObserverThought.model_validate(observer_thought)
+            return None
+
+    async def create_observer_cruise(
+        self,
+        workflow_run_id: str | None = None,
+        workflow_id: str | None = None,
+        prompt: str | None = None,
+        url: str | None = None,
+        organization_id: str | None = None,
+    ) -> ObserverCruise:
+        async with self.Session() as session:
+            new_observer_cruise = ObserverCruiseModel(
+                workflow_run_id=workflow_run_id,
+                workflow_id=workflow_id,
+                prompt=prompt,
+                url=url,
+                organization_id=organization_id,
+            )
+            session.add(new_observer_cruise)
+            await session.commit()
+            await session.refresh(new_observer_cruise)
+            return ObserverCruise.model_validate(new_observer_cruise)
+
+    async def create_observer_thought(
+        self,
+        observer_cruise_id: str,
+        workflow_run_id: str | None = None,
+        workflow_id: str | None = None,
+        workflow_run_block_id: str | None = None,
+        user_input: str | None = None,
+        observation: str | None = None,
+        thought: str | None = None,
+        answer: str | None = None,
+        organization_id: str | None = None,
+    ) -> ObserverThought:
+        async with self.Session() as session:
+            new_observer_thought = ObserverThoughtModel(
+                observer_cruise_id=observer_cruise_id,
+                workflow_run_id=workflow_run_id,
+                workflow_id=workflow_id,
+                workflow_run_block_id=workflow_run_block_id,
+                user_input=user_input,
+                observation=observation,
+                thought=thought,
+                answer=answer,
+                organization_id=organization_id,
+            )
+            session.add(new_observer_thought)
+            await session.commit()
+            await session.refresh(new_observer_thought)
+            return ObserverThought.model_validate(new_observer_thought)
+
+    async def update_observer_cruise(
+        self,
+        observer_cruise_id: str,
+        status: ObserverCruiseStatus | None = None,
+        workflow_run_id: str | None = None,
+        workflow_id: str | None = None,
+        url: str | None = None,
+        prompt: str | None = None,
+        organization_id: str | None = None,
+    ) -> ObserverCruise:
+        async with self.Session() as session:
+            observer_cruise = (
+                await session.scalars(
+                    select(ObserverCruiseModel)
+                    .filter_by(observer_cruise_id=observer_cruise_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if observer_cruise:
+                if status:
+                    observer_cruise.status = status
+                if workflow_run_id:
+                    observer_cruise.workflow_run_id = workflow_run_id
+                if workflow_id:
+                    observer_cruise.workflow_id = workflow_id
+                if url:
+                    observer_cruise.url = url
+                if prompt:
+                    observer_cruise.prompt = prompt
+                await session.commit()
+                await session.refresh(observer_cruise)
+                return ObserverCruise.model_validate(observer_cruise)
+            raise NotFoundError(f"ObserverCruise {observer_cruise_id} not found")

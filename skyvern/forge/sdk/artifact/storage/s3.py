@@ -15,6 +15,7 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP, BaseStorage
 from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverThought
 
 
 class S3Storage(BaseStorage):
@@ -29,6 +30,18 @@ class S3Storage(BaseStorage):
     def build_log_uri(self, log_entity_type: LogEntityType, log_entity_id: str, artifact_type: ArtifactType) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
         return f"s3://{self.bucket}/{settings.ENV}/logs/{log_entity_type}/{log_entity_id}/{datetime.utcnow().isoformat()}_{artifact_type}.{file_ext}"
+
+    def build_observer_thought_uri(
+        self, artifact_id: str, observer_thought: ObserverThought, artifact_type: ArtifactType
+    ) -> str:
+        file_ext = FILE_EXTENTSION_MAP[artifact_type]
+        return f"s3://{self.bucket}/{settings.ENV}/observers/{observer_thought.observer_cruise_id}/{observer_thought.observer_thought_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+
+    def build_observer_cruise_uri(
+        self, artifact_id: str, observer_cruise: ObserverCruise, artifact_type: ArtifactType
+    ) -> str:
+        file_ext = FILE_EXTENTSION_MAP[artifact_type]
+        return f"s3://{self.bucket}/{settings.ENV}/observers/{observer_cruise.observer_cruise_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         await self.async_client.upload_file(artifact.uri, data)
