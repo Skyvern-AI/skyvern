@@ -21,16 +21,11 @@ import { Switch } from "@/components/ui/switch";
 import type { NavigationNode } from "./types";
 import { RobotIcon } from "@/components/icons/RobotIcon";
 import { helpTooltips, placeholders } from "../../helpContent";
-import { WorkflowBlockParameterSelect } from "../WorkflowBlockParameterSelect";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 
 function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
   const { updateNodeData } = useReactFlow();
-  const [parametersPanelField, setParametersPanelField] = useState<
-    string | null
-  >(null);
-
   const { editable } = data;
   const [label, setLabel] = useNodeLabelChangeHandler({
     id,
@@ -103,9 +98,9 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
               <HelpTooltip content={helpTooltips["navigation"]["url"]} />
             </div>
             <WorkflowBlockInputTextarea
-              onIconClick={() => setParametersPanelField("url")}
-              onChange={(event) => {
-                handleChange("url", event.target.value);
+              nodeId={id}
+              onChange={(value) => {
+                handleChange("url", value);
               }}
               value={inputs.url}
               placeholder={placeholders["navigation"]["url"]}
@@ -120,9 +115,9 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
               />
             </div>
             <WorkflowBlockInputTextarea
-              onIconClick={() => setParametersPanelField("navigationGoal")}
-              onChange={(event) => {
-                handleChange("navigationGoal", event.target.value);
+              nodeId={id}
+              onChange={(value) => {
+                handleChange("navigationGoal", value);
               }}
               value={inputs.navigationGoal}
               placeholder={placeholders["navigation"]["navigationGoal"]}
@@ -295,15 +290,13 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                     />
                   </div>
                   <WorkflowBlockInput
-                    onIconClick={() => {
-                      setParametersPanelField("downloadSuffix");
-                    }}
+                    nodeId={id}
                     type="text"
                     placeholder={placeholders["navigation"]["downloadSuffix"]}
                     className="nopan w-52 text-xs"
                     value={inputs.downloadSuffix ?? ""}
-                    onChange={(event) => {
-                      handleChange("downloadSuffix", event.target.value);
+                    onChange={(value) => {
+                      handleChange("downloadSuffix", value);
                     }}
                   />
                 </div>
@@ -320,11 +313,9 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                     />
                   </div>
                   <WorkflowBlockInputTextarea
-                    onIconClick={() => {
-                      setParametersPanelField("totpVerificationUrl");
-                    }}
-                    onChange={(event) => {
-                      handleChange("totpVerificationUrl", event.target.value);
+                    nodeId={id}
+                    onChange={(value) => {
+                      handleChange("totpVerificationUrl", value);
                     }}
                     value={inputs.totpVerificationUrl ?? ""}
                     placeholder={
@@ -343,11 +334,9 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                     />
                   </div>
                   <WorkflowBlockInputTextarea
-                    onIconClick={() => {
-                      setParametersPanelField("totpIdentifier");
-                    }}
-                    onChange={(event) => {
-                      handleChange("totpIdentifier", event.target.value);
+                    nodeId={id}
+                    onChange={(value) => {
+                      handleChange("totpIdentifier", value);
                     }}
                     value={inputs.totpIdentifier ?? ""}
                     placeholder={placeholders["navigation"]["totpIdentifier"]}
@@ -359,25 +348,6 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
           </AccordionItem>
         </Accordion>
       </div>
-      {typeof parametersPanelField === "string" && (
-        <WorkflowBlockParameterSelect
-          nodeId={id}
-          onClose={() => setParametersPanelField(null)}
-          onAdd={(parameterKey) => {
-            if (parametersPanelField === null || !editable) {
-              return;
-            }
-            if (parametersPanelField in inputs) {
-              const currentValue =
-                inputs[parametersPanelField as keyof typeof inputs];
-              handleChange(
-                parametersPanelField,
-                `${currentValue ?? ""}{{ ${parameterKey} }}`,
-              );
-            }
-          }}
-        />
-      )}
     </div>
   );
 }

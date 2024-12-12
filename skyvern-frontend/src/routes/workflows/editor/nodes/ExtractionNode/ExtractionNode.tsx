@@ -1,34 +1,30 @@
+import { HelpTooltip } from "@/components/HelpTooltip";
+import { ExtractIcon } from "@/components/icons/ExtractIcon";
 import {
   Accordion,
   AccordionContent,
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { Switch } from "@/components/ui/switch";
+import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { useState } from "react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
-import { HelpTooltip } from "@/components/HelpTooltip";
-import { Input } from "@/components/ui/input";
-import { Checkbox } from "@/components/ui/checkbox";
 import { dataSchemaExampleValue } from "../types";
-import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
-import { Switch } from "@/components/ui/switch";
 import type { ExtractionNode } from "./types";
-import { ExtractIcon } from "@/components/icons/ExtractIcon";
 
-import { helpTooltips, placeholders } from "../../helpContent";
-import { WorkflowBlockParameterSelect } from "../WorkflowBlockParameterSelect";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { helpTooltips, placeholders } from "../../helpContent";
 
 function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
-  const [parametersPanelField, setParametersPanelField] = useState<
-    string | null
-  >(null);
   const { updateNodeData } = useReactFlow();
   const { editable } = data;
   const [label, setLabel] = useNodeLabelChangeHandler({
@@ -101,14 +97,12 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
             />
           </div>
           <WorkflowBlockInputTextarea
-            onIconClick={() => {
-              setParametersPanelField("dataExtractionGoal");
-            }}
-            onChange={(event) => {
+            nodeId={id}
+            onChange={(value) => {
               if (!editable) {
                 return;
               }
-              handleChange("dataExtractionGoal", event.target.value);
+              handleChange("dataExtractionGoal", value);
             }}
             value={inputs.dataExtractionGoal}
             placeholder={placeholders["extraction"]["dataExtractionGoal"]}
@@ -263,25 +257,6 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
           </AccordionItem>
         </Accordion>
       </div>
-      {typeof parametersPanelField === "string" && (
-        <WorkflowBlockParameterSelect
-          nodeId={id}
-          onClose={() => setParametersPanelField(null)}
-          onAdd={(parameterKey) => {
-            if (parametersPanelField === null || !editable) {
-              return;
-            }
-            if (parametersPanelField in inputs) {
-              const currentValue =
-                inputs[parametersPanelField as keyof typeof inputs];
-              handleChange(
-                parametersPanelField,
-                `${currentValue ?? ""}{{ ${parameterKey} }}`,
-              );
-            }
-          }}
-        />
-      )}
     </div>
   );
 }
