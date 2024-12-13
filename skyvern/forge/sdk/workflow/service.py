@@ -1313,6 +1313,8 @@ class WorkflowService:
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 cache_actions=block_yaml.cache_actions,
+                complete_criterion=block_yaml.complete_criterion,
+                terminate_criterion=block_yaml.terminate_criterion,
             )
         elif block_yaml.block_type == BlockType.FOR_LOOP:
             loop_blocks = [
@@ -1481,6 +1483,8 @@ class WorkflowService:
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 cache_actions=block_yaml.cache_actions,
+                complete_criterion=block_yaml.complete_criterion,
+                terminate_criterion=block_yaml.terminate_criterion,
             )
 
         elif block_yaml.block_type == BlockType.EXTRACTION:
@@ -1523,6 +1527,8 @@ class WorkflowService:
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 cache_actions=block_yaml.cache_actions,
+                complete_criterion=block_yaml.complete_criterion,
+                terminate_criterion=block_yaml.terminate_criterion,
             )
 
         elif block_yaml.block_type == BlockType.WAIT:
