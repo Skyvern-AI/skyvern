@@ -75,6 +75,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.actions.models import AgentStepOutput
+from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 
 LOG = structlog.get_logger()
 
@@ -1252,6 +1253,7 @@ class AgentDB:
                 workflow_run.failure_reason = failure_reason
                 await session.commit()
                 await session.refresh(workflow_run)
+                await save_workflow_run_logs(workflow_run_id)
                 return convert_to_workflow_run(workflow_run)
             LOG.error(
                 "WorkflowRun not found, nothing to update",
