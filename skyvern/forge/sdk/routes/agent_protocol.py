@@ -2,6 +2,7 @@ import datetime
 import hashlib
 import uuid
 from typing import Annotated, Any
+from enum import Enum
 
 import structlog
 import yaml
@@ -452,6 +453,80 @@ async def get_agent_task_steps(
     analytics.capture("skyvern-oss-agent-task-steps-get")
     steps = await app.DATABASE.get_task_steps(task_id, organization_id=current_org.organization_id)
     return ORJSONResponse([step.model_dump(exclude_none=True) for step in steps])
+
+
+class EntityType(str, Enum):
+    STEP = "step"
+    TASK = "task"
+    WORKFLOW_RUN = "workflow_run"
+    WORKFLOW_RUN_BLOCK = "workflow_run_block"
+
+entity_type_to_param = {
+    EntityType.STEP: "step_id",
+    EntityType.TASK: "task_id",
+    EntityType.WORKFLOW_RUN: "workflow_run_id",
+    EntityType.WORKFLOW_RUN_BLOCK: "workflow_run_block_id",
+}
+
+@base_router.get(
+    "/{entity_type}/{entity_id}/artifacts",
+    tags=["agent"],
+    response_model=list[Artifact],
+)
+@base_router.get(
+    "/{entity_type}/{entity_id}/artifacts/",
+    tags=["agent"],
+    response_model=list[Artifact],
+    include_in_schema=False,
+)
+async def get_agent_entity_artifacts(
+    entity_type: EntityType,
+    entity_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Response:
+    """
+    Get all artifacts for an entity (step, task, workflow_run).
+    
+    Args:
+        entity_type: Type of entity to fetch artifacts for
+        entity_id: ID of the entity
+        current_org: Current organization from auth
+    
+    Returns:
+        List of artifacts for the entity
+    
+    Raises:
+        HTTPException: If entity is not supported
+    """
+
+    if entity_type not in entity_type_to_param:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid entity_type: {entity_type}",
+        )
+
+    analytics.capture("skyvern-oss-agent-entity-artifacts-get")
+
+    params = {
+        "organization_id": current_org.organization_id,
+        entity_type_to_param[entity_type]: entity_id,
+    }
+
+    artifacts = await app.DATABASE.get_artifacts_by_entity_id(**params)
+
+    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
+        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
+        if signed_urls:
+            for i, artifact in enumerate(artifacts):
+                artifact.signed_url = signed_urls[i]
+        else:
+            LOG.warning(
+                "Failed to get signed urls for artifacts",
+                entity_type=entity_type,
+                entity_id=entity_id,
+            )
+
+    return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
 
 @base_router.get(

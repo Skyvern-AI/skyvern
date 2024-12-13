@@ -808,9 +808,9 @@ class AgentDB:
             LOG.exception("UnexpectedError")
             raise
 
-    async def get_artifact_by_entity_id(
+    async def get_artifacts_by_entity_id(
         self,
-        artifact_type: ArtifactType,
+        artifact_type: ArtifactType | None = None,
         task_id: str | None = None,
         step_id: str | None = None,
         workflow_run_id: str | None = None,
@@ -818,11 +818,13 @@ class AgentDB:
         observer_thought_id: str | None = None,
         observer_cruise_id: str | None = None,
         organization_id: str | None = None,
-    ) -> Artifact | None:
+    ) -> list[Artifact]:
         try:
             async with self.Session() as session:
-                query = select(ArtifactModel).filter_by(artifact_type=artifact_type)
+                query = select(ArtifactModel)
 
+                if artifact_type is not None:
+                    query = query.filter_by(artifact_type=artifact_type)
                 if task_id is not None:
                     query = query.filter_by(task_id=task_id)
                 if step_id is not None:
@@ -839,17 +841,41 @@ class AgentDB:
                     query = query.filter_by(organization_id=organization_id)
 
                 query = query.order_by(ArtifactModel.created_at.desc())
-                artifact = (await session.scalars(query)).first()
-                
-                if artifact:
-                    return convert_to_artifact(artifact, self.debug_enabled)
-                return None
+                if artifacts := (
+                    await session.scalars(query)
+                ).all():
+                    return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifacts]
+                else:
+                    return []
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)
             raise
+
+    async def get_artifact_by_entity_id(
+        self,
+        artifact_type: ArtifactType,
+        task_id: str | None = None,
+        step_id: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_run_block_id: str | None = None,
+        observer_thought_id: str | None = None,
+        observer_cruise_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> Artifact | None:
+        artifacts = await self.get_artifacts_by_entity_id(
+            artifact_type=artifact_type,
+            task_id=task_id,
+            step_id=step_id,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            observer_thought_id=observer_thought_id,
+            observer_cruise_id=observer_cruise_id,
+            organization_id=organization_id,
+        )
+        return artifacts[0] if artifacts else None
 
     async def get_artifact(
         self,
