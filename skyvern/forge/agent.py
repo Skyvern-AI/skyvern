@@ -1000,13 +1000,12 @@ class ForgeAgent:
         )
         scraped_page_refreshed = await scraped_page.refresh()
 
-        # TODO: currently, just using the check user goal for complete verification
-        # maybe need a desinged complete criterion in the future
         verification_prompt = prompt_engine.load_prompt(
             "check-user-goal",
             navigation_goal=task.navigation_goal,
             navigation_payload=task.navigation_payload,
             elements=scraped_page_refreshed.build_element_tree(ElementTreeFormat.HTML),
+            complete_criterion=task.complete_criterion,
         )
 
         # this prompt is critical to our agent so let's use the primary LLM API handler
