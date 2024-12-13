@@ -45,7 +45,7 @@ from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import get_path_for_workflow_download_directory, list_files_in_directory, rename_file
-from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.validators import prepend_scheme_and_validate_url
@@ -75,6 +75,8 @@ from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrap
 from skyvern.webeye.utils.page import SkyvernFrame
 from skyvern.forge.skyvern_json_encoder import SkyvernJSONLogEncoder
 from skyvern.forge.skyvern_log_encoder import SkyvernLogEncoder
+
+from skyvern.forge.sdk.log_artifacts import save_step_logs
 
 LOG = structlog.get_logger()
 
@@ -1785,30 +1787,7 @@ class ForgeAgent:
             diff=update_comparison,
         )
 
-        try:
-            log = skyvern_context.current().log
-            current_step_log = [entry for entry in log if entry.get("step_id", "") == step.step_id]
-
-            log_json = json.dumps(current_step_log, cls=SkyvernJSONLogEncoder, indent=2)
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.SKYVERN_LOG_RAW,
-                data=log_json.encode(),
-            )
-
-            formatted_log = SkyvernLogEncoder.encode(current_step_log)
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.SKYVERN_LOG,
-                data=formatted_log.encode(),
-            )
-        except Exception:
-            LOG.error(
-                "Failed to record skyvern log after action",
-                task_id=step.task_id,
-                step_id=step.step_id,
-                exc_info=True,
-            )
+        await save_step_logs(step.step_id)
 
         return await app.DATABASE.update_step(
             task_id=step.task_id,

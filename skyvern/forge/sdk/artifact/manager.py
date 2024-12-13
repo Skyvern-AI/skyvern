@@ -6,7 +6,7 @@ from typing import Literal
 import structlog
 
 from skyvern.forge import app
-from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverThought
@@ -81,6 +81,36 @@ class ArtifactManager:
             data=data,
             path=path,
         )
+
+    async def create_log_artifact(
+        self,
+        log_entity_type: LogEntityType,
+        log_entity_id: str,
+        artifact_type: ArtifactType,
+        step_id: str | None = None,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
+        data: bytes | None = None,
+        path: str | None = None,
+    ) -> str:
+        artifact_id = generate_artifact_id()
+        uri = app.STORAGE.build_log_uri(log_entity_type, log_entity_id, artifact_type)
+        print("[create_log_artifact] uri", uri)
+        return await self._create_artifact(
+            aio_task_primary_key=log_entity_id,
+            artifact_id=artifact_id,
+            artifact_type=artifact_type,
+            uri=uri,
+            step_id=step_id,
+            task_id=task_id,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            data=data,
+            path=path,
+        ) 
 
     async def create_observer_thought_artifact(
         self,

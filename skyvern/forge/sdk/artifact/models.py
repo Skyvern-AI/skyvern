@@ -78,4 +78,5 @@ class Artifact(BaseModel):
 class LogEntityType(StrEnum):
     STEP = "step"
     TASK = "task"
-    WORKFLOW = "workflow"
+    WORKFLOW_RUN = "workflow_run"
+    WORKFLOW_RUN_BLOCK = "workflow_run_block"
