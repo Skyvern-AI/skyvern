@@ -167,6 +167,8 @@ export type NavigationBlockYAML = BlockYAMLBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  complete_criterion: string | null;
+  terminate_criterion: string | null;
 };
 
 export type ExtractionBlockYAML = BlockYAMLBase & {
@@ -193,6 +195,8 @@ export type LoginBlockYAML = BlockYAMLBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  complete_criterion: string | null;
+  terminate_criterion: string | null;
 };
 
 export type WaitBlockYAML = BlockYAMLBase & {

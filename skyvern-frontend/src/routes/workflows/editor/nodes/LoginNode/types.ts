@@ -11,6 +11,8 @@ export type LoginNodeData = NodeBaseData & {
   totpVerificationUrl: string | null;
   totpIdentifier: string | null;
   cacheActions: boolean;
+  completeCriterion: string;
+  terminateCriterion: string;
 };
 
 export type LoginNode = Node<LoginNodeData, "login">;
@@ -29,6 +31,8 @@ export const loginNodeDefaultData: LoginNodeData = {
   totpIdentifier: null,
   continueOnFailure: false,
   cacheActions: false,
+  completeCriterion: "",
+  terminateCriterion: "",
 } as const;
 
 export function isLoginNode(node: Node): node is LoginNode {
