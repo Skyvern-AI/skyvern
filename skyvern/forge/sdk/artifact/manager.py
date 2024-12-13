@@ -13,6 +13,14 @@ from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverThought
 
 LOG = structlog.get_logger(__name__)
 
+PRIMARY_KEY = Literal[
+    "task_id",
+    "observer_thought_id",
+    "observer_cruise_id",
+    "step_id",
+    "workflow_run_id",
+    "workflow_run_block_id",
+]
 
 class ArtifactManager:
     # task_id -> list of aio_tasks for uploading artifacts
@@ -203,7 +211,7 @@ class ArtifactManager:
         artifact_id: str | None,
         organization_id: str | None,
         data: bytes,
-        primary_key: Literal["task_id", "observer_thought_id", "observer_cruise_id"] = "task_id",
+        primary_key: PRIMARY_KEY = "task_id",
     ) -> None:
         if not artifact_id or not organization_id:
             return None
@@ -212,18 +220,12 @@ class ArtifactManager:
             return
         # Fire and forget
         aio_task = asyncio.create_task(app.STORAGE.store_artifact(artifact, data))
-        if primary_key == "task_id":
-            if not artifact.task_id:
-                raise ValueError("Task ID is required to update artifact data.")
-            self.upload_aiotasks_map[artifact.task_id].append(aio_task)
-        elif primary_key == "observer_thought_id":
-            if not artifact.observer_thought_id:
-                raise ValueError("Observer Thought ID is required to update artifact data.")
-            self.upload_aiotasks_map[artifact.observer_thought_id].append(aio_task)
-        elif primary_key == "observer_cruise_id":
-            if not artifact.observer_cruise_id:
-                raise ValueError("Observer Cruise ID is required to update artifact data.")
-            self.upload_aiotasks_map[artifact.observer_cruise_id].append(aio_task)
+
+        print("---",primary_key, artifact[primary_key])
+        if not artifact[primary_key]:
+            raise ValueError(f"{primary_key} is required to update artifact data.")
+        self.upload_aiotasks_map[artifact[primary_key]].append(aio_task)
+
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         return await app.STORAGE.retrieve_artifact(artifact)

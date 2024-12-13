@@ -9,6 +9,18 @@ from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 
 LOG = structlog.get_logger()
 
+def primary_key_from_log_entity_type(log_entity_type: LogEntityType) -> str:
+    if log_entity_type == LogEntityType.STEP:
+        return "step_id"
+    elif log_entity_type == LogEntityType.TASK:
+        return "task_id"
+    elif log_entity_type == LogEntityType.WORKFLOW_RUN:
+        return "workflow_run_id"
+    elif log_entity_type == LogEntityType.WORKFLOW_RUN_BLOCK:
+        return "workflow_run_block_id"
+    else:
+        raise ValueError(f"Invalid log entity type: {log_entity_type}")
+
 async def save_step_logs(step_id: str) -> None:
     log = skyvern_context.current().log
     organization_id = skyvern_context.current().organization_id
@@ -80,30 +92,69 @@ async def _save_log_artifacts(
 ) -> None:
     try:
         log_json = json.dumps(log, cls=SkyvernJSONLogEncoder, indent=2)
-        await app.ARTIFACT_MANAGER.create_log_artifact(
-            organization_id=organization_id,
+
+        log_artifact = await app.DATABASE.get_artifact_by_entity_id(
+            artifact_type=ArtifactType.SKYVERN_LOG_RAW,
             step_id=step_id,
             task_id=task_id,
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
-            log_entity_type=log_entity_type,
-            log_entity_id=log_entity_id,
-            artifact_type=ArtifactType.SKYVERN_LOG_RAW,
-            data=log_json.encode(),
+            organization_id=organization_id,
         )
 
+
+        if log_artifact:
+            print("log_artifact", log_artifact)
+            await app.ARTIFACT_MANAGER.update_artifact_data(
+                artifact_id=log_artifact.artifact_id,
+                organization_id=organization_id,
+                data=log_json.encode(),
+                primary_key=primary_key_from_log_entity_type(log_entity_type),
+            )
+        else:
+            print("log_artifact not found, creating new one")
+            await app.ARTIFACT_MANAGER.create_log_artifact(
+                organization_id=organization_id,
+                step_id=step_id,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                log_entity_type=log_entity_type,
+                log_entity_id=log_entity_id,
+                artifact_type=ArtifactType.SKYVERN_LOG_RAW,
+                data=log_json.encode(),
+            )
+
         formatted_log = SkyvernLogEncoder.encode(log)
-        await app.ARTIFACT_MANAGER.create_log_artifact(
-            organization_id=organization_id,
+
+        formatted_log_artifact = await app.DATABASE.get_artifact_by_entity_id(
+            artifact_type=ArtifactType.SKYVERN_LOG,
             step_id=step_id,
             task_id=task_id,
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
-            log_entity_type=log_entity_type,
-            log_entity_id=log_entity_id,
-            artifact_type=ArtifactType.SKYVERN_LOG,
-            data=formatted_log.encode(),
+            organization_id=organization_id,
         )
+
+        if formatted_log_artifact:
+            await app.ARTIFACT_MANAGER.update_artifact_data(
+                artifact_id=formatted_log_artifact.artifact_id,
+                organization_id=organization_id,
+                data=formatted_log.encode(),
+                primary_key=primary_key_from_log_entity_type(log_entity_type),
+            )
+        else:
+            await app.ARTIFACT_MANAGER.create_log_artifact(
+                organization_id=organization_id,
+                step_id=step_id,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                log_entity_type=log_entity_type,
+                log_entity_id=log_entity_id,
+                artifact_type=ArtifactType.SKYVERN_LOG,
+                data=formatted_log.encode(),
+            )
     except Exception as e:
         LOG.error(
             "Failed to save log artifacts",

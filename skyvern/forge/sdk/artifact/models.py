@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, Field, field_serializer
 
@@ -73,6 +74,9 @@ class Artifact(BaseModel):
     observer_thought_id: str | None = None
     signed_url: str | None = None
     organization_id: str | None = None
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
 
 
 class LogEntityType(StrEnum):
