@@ -1,34 +1,30 @@
+import { HelpTooltip } from "@/components/HelpTooltip";
 import {
   Accordion,
   AccordionContent,
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { Switch } from "@/components/ui/switch";
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
+import { LockOpen1Icon } from "@radix-ui/react-icons";
 import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { useState } from "react";
+import { helpTooltips, placeholders } from "../../helpContent";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
-import { HelpTooltip } from "@/components/HelpTooltip";
-import { Input } from "@/components/ui/input";
-import { Checkbox } from "@/components/ui/checkbox";
 import { errorMappingExampleValue } from "../types";
-import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
-import { Switch } from "@/components/ui/switch";
-import type { LoginNode } from "./types";
-import { LockOpen1Icon } from "@radix-ui/react-icons";
 import { CredentialParameterSelector } from "./CredentialParameterSelector";
-import { helpTooltips, placeholders } from "../../helpContent";
-import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
-import { WorkflowBlockParameterSelect } from "../WorkflowBlockParameterSelect";
+import type { LoginNode } from "./types";
 
 function LoginNode({ id, data }: NodeProps<LoginNode>) {
-  const [parametersPanelField, setParametersPanelField] = useState<
-    string | null
-  >(null);
   const { updateNodeData } = useReactFlow();
   const { editable } = data;
   const [label, setLabel] = useNodeLabelChangeHandler({
@@ -57,7 +53,7 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
   }
 
   return (
-    <div className="relative">
+    <div>
       <Handle
         type="source"
         position={Position.Bottom}
@@ -100,11 +96,9 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
               <HelpTooltip content={helpTooltips["login"]["url"]} />
             </div>
             <WorkflowBlockInputTextarea
-              onIconClick={() => {
-                setParametersPanelField("url");
-              }}
-              onChange={(event) => {
-                handleChange("url", event.target.value);
+              nodeId={id}
+              onChange={(value) => {
+                handleChange("url", value);
               }}
               value={inputs.url}
               placeholder={placeholders["login"]["url"]}
@@ -117,11 +111,9 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
               <HelpTooltip content={helpTooltips["login"]["navigationGoal"]} />
             </div>
             <WorkflowBlockInputTextarea
-              onIconClick={() => {
-                setParametersPanelField("navigationGoal");
-              }}
-              onChange={(event) => {
-                handleChange("navigationGoal", event.target.value);
+              nodeId={id}
+              onChange={(value) => {
+                handleChange("navigationGoal", value);
               }}
               value={inputs.navigationGoal}
               placeholder={placeholders["login"]["navigationGoal"]}
@@ -296,11 +288,9 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                     />
                   </div>
                   <WorkflowBlockInputTextarea
-                    onIconClick={() => {
-                      setParametersPanelField("totpVerificationUrl");
-                    }}
-                    onChange={(event) => {
-                      handleChange("totpVerificationUrl", event.target.value);
+                    nodeId={id}
+                    onChange={(value) => {
+                      handleChange("totpVerificationUrl", value);
                     }}
                     value={inputs.totpVerificationUrl ?? ""}
                     placeholder={placeholders["login"]["totpVerificationUrl"]}
@@ -317,11 +307,9 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                     />
                   </div>
                   <WorkflowBlockInputTextarea
-                    onIconClick={() => {
-                      setParametersPanelField("totpIdentifier");
-                    }}
-                    onChange={(event) => {
-                      handleChange("totpIdentifier", event.target.value);
+                    nodeId={id}
+                    onChange={(value) => {
+                      handleChange("totpIdentifier", value);
                     }}
                     value={inputs.totpIdentifier ?? ""}
                     placeholder={placeholders["login"]["totpIdentifier"]}
@@ -333,25 +321,6 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
           </AccordionItem>
         </Accordion>
       </div>
-      {typeof parametersPanelField === "string" && (
-        <WorkflowBlockParameterSelect
-          nodeId={id}
-          onClose={() => setParametersPanelField(null)}
-          onAdd={(parameterKey) => {
-            if (parametersPanelField === null || !editable) {
-              return;
-            }
-            if (parametersPanelField in inputs) {
-              const currentValue =
-                inputs[parametersPanelField as keyof typeof inputs];
-              handleChange(
-                parametersPanelField,
-                `${currentValue ?? ""}{{ ${parameterKey} }}`,
-              );
-            }
-          }}
-        />
-      )}
     </div>
   );
 }

@@ -10,19 +10,18 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { DownloadIcon } from "@radix-ui/react-icons";
 import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { useState } from "react";
+import { helpTooltips, placeholders } from "../../helpContent";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { errorMappingExampleValue } from "../types";
 import type { FileDownloadNode } from "./types";
-import { helpTooltips, placeholders } from "../../helpContent";
-import { WorkflowBlockParameterSelect } from "../WorkflowBlockParameterSelect";
-import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -32,9 +31,6 @@ const navigationGoalTooltip =
 const navigationGoalPlaceholder = "Tell Skyvern which file to download.";
 
 function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
-  const [parametersPanelField, setParametersPanelField] = useState<
-    string | null
-  >(null);
   const { updateNodeData } = useReactFlow();
   const { editable } = data;
   const [label, setLabel] = useNodeLabelChangeHandler({
@@ -109,11 +105,9 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
               <HelpTooltip content={urlTooltip} />
             </div>
             <WorkflowBlockInputTextarea
-              onIconClick={() => {
-                setParametersPanelField("url");
-              }}
-              onChange={(event) => {
-                handleChange("url", event.target.value);
+              nodeId={id}
+              onChange={(value) => {
+                handleChange("url", value);
               }}
               value={inputs.url}
               placeholder={urlPlaceholder}
@@ -126,11 +120,9 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
               <HelpTooltip content={navigationGoalTooltip} />
             </div>
             <WorkflowBlockInputTextarea
-              onIconClick={() => {
-                setParametersPanelField("navigationGoal");
-              }}
-              onChange={(event) => {
-                handleChange("navigationGoal", event.target.value);
+              nodeId={id}
+              onChange={(value) => {
+                handleChange("navigationGoal", value);
               }}
               value={inputs.navigationGoal}
               placeholder={navigationGoalPlaceholder}
@@ -302,11 +294,9 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                     />
                   </div>
                   <WorkflowBlockInputTextarea
-                    onIconClick={() => {
-                      setParametersPanelField("totpVerificationUrl");
-                    }}
-                    onChange={(event) => {
-                      handleChange("totpVerificationUrl", event.target.value);
+                    nodeId={id}
+                    onChange={(value) => {
+                      handleChange("totpVerificationUrl", value);
                     }}
                     value={inputs.totpVerificationUrl ?? ""}
                     placeholder={
@@ -325,11 +315,9 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                     />
                   </div>
                   <WorkflowBlockInputTextarea
-                    onIconClick={() => {
-                      setParametersPanelField("totpIdentifier");
-                    }}
-                    onChange={(event) => {
-                      handleChange("totpIdentifier", event.target.value);
+                    nodeId={id}
+                    onChange={(value) => {
+                      handleChange("totpIdentifier", value);
                     }}
                     value={inputs.totpIdentifier ?? ""}
                     placeholder={placeholders["download"]["totpIdentifier"]}
@@ -341,25 +329,6 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
           </AccordionItem>
         </Accordion>
       </div>
-      {typeof parametersPanelField === "string" && (
-        <WorkflowBlockParameterSelect
-          nodeId={id}
-          onClose={() => setParametersPanelField(null)}
-          onAdd={(parameterKey) => {
-            if (parametersPanelField === null || !editable) {
-              return;
-            }
-            if (parametersPanelField in inputs) {
-              const currentValue =
-                inputs[parametersPanelField as keyof typeof inputs];
-              handleChange(
-                parametersPanelField,
-                `${currentValue ?? ""}{{ ${parameterKey} }}`,
-              );
-            }
-          }}
-        />
-      )}
     </div>
   );
 }

@@ -131,6 +131,8 @@ class TaskBlockYAML(BlockYAML):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
 
 
 class ForLoopBlockYAML(BlockYAML):
@@ -142,6 +144,7 @@ class ForLoopBlockYAML(BlockYAML):
 
     loop_over_parameter_key: str
     loop_blocks: list["BLOCK_YAML_SUBCLASSES"]
+    loop_variable_reference: str | None = None
 
 
 class CodeBlockYAML(BlockYAML):
@@ -252,6 +255,8 @@ class NavigationBlockYAML(BlockYAML):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
 
 
 class ExtractionBlockYAML(BlockYAML):
@@ -280,6 +285,8 @@ class LoginBlockYAML(BlockYAML):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
 
 
 class WaitBlockYAML(BlockYAML):

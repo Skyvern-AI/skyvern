@@ -155,6 +155,8 @@ export type TaskBlock = WorkflowBlockBase & {
   navigation_goal: string | null;
   data_extraction_goal: string | null;
   data_schema: Record<string, unknown> | null;
+  complete_criterion: string | null;
+  terminate_criterion: string | null;
   error_code_mapping: Record<string, string> | null;
   max_retries?: number;
   max_steps_per_run?: number | null;

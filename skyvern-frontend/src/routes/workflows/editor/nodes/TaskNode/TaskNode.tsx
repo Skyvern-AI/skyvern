@@ -29,16 +29,12 @@ import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { dataSchemaExampleValue, errorMappingExampleValue } from "../types";
-import { WorkflowBlockParameterSelect } from "../WorkflowBlockParameterSelect";
 import { ParametersMultiSelect } from "./ParametersMultiSelect";
 import type { TaskNode } from "./types";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 
 function TaskNode({ id, data }: NodeProps<TaskNode>) {
-  const [parametersPanelField, setParametersPanelField] = useState<
-    string | null
-  >(null);
   const { updateNodeData } = useReactFlow();
   const { editable } = data;
   const deleteNodeCallback = useDeleteNodeCallback();
@@ -55,6 +51,8 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
     url: data.url,
     navigationGoal: data.navigationGoal,
     dataExtractionGoal: data.dataExtractionGoal,
+    completeCriterion: data.completeCriterion,
+    terminateCriterion: data.terminateCriterion,
     dataSchema: data.dataSchema,
     maxRetries: data.maxRetries,
     maxStepsOverride: data.maxStepsOverride,
@@ -76,7 +74,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
   }
 
   return (
-    <div className="relative">
+    <div>
       <Handle
         type="source"
         position={Position.Bottom}
@@ -123,11 +121,9 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     <HelpTooltip content={helpTooltips["task"]["url"]} />
                   </div>
                   <WorkflowBlockInputTextarea
-                    onIconClick={() => {
-                      setParametersPanelField("url");
-                    }}
-                    onChange={(event) => {
-                      handleChange("url", event.target.value);
+                    nodeId={id}
+                    onChange={(value) => {
+                      handleChange("url", value);
                     }}
                     value={inputs.url}
                     placeholder={placeholders["task"]["url"]}
@@ -142,11 +138,9 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     />
                   </div>
                   <WorkflowBlockInputTextarea
-                    onIconClick={() => {
-                      setParametersPanelField("navigationGoal");
-                    }}
-                    onChange={(event) => {
-                      handleChange("navigationGoal", event.target.value);
+                    nodeId={id}
+                    onChange={(value) => {
+                      handleChange("navigationGoal", value);
                     }}
                     value={inputs.navigationGoal}
                     placeholder={placeholders["task"]["navigationGoal"]}
@@ -179,11 +173,9 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     />
                   </div>
                   <WorkflowBlockInputTextarea
-                    onIconClick={() => {
-                      setParametersPanelField("dataExtractionGoal");
-                    }}
-                    onChange={(event) => {
-                      handleChange("dataExtractionGoal", event.target.value);
+                    nodeId={id}
+                    onChange={(value) => {
+                      handleChange("dataExtractionGoal", value);
                     }}
                     value={inputs.dataExtractionGoal}
                     placeholder={placeholders["task"]["dataExtractionGoal"]}
@@ -233,6 +225,20 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
             <AccordionTrigger>Advanced Settings</AccordionTrigger>
             <AccordionContent className="pl-6 pr-1 pt-1">
               <div className="space-y-4">
+                <div className="space-y-2">
+                  <Label className="text-xs text-slate-300">
+                    Complete if...
+                  </Label>
+                  <WorkflowBlockInputTextarea
+                    nodeId={id}
+                    onChange={(value) => {
+                      handleChange("completeCriterion", value);
+                    }}
+                    value={inputs.completeCriterion}
+                    className="nopan text-xs"
+                  />
+                </div>
+                <Separator />
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
                     <Label className="text-xs font-normal text-slate-300">
@@ -380,15 +386,13 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     <HelpTooltip content={helpTooltips["task"]["fileSuffix"]} />
                   </div>
                   <WorkflowBlockInput
-                    onIconClick={() => {
-                      setParametersPanelField("downloadSuffix");
-                    }}
+                    nodeId={id}
                     type="text"
                     placeholder={placeholders["task"]["downloadSuffix"]}
                     className="nopan w-52 text-xs"
                     value={inputs.downloadSuffix ?? ""}
-                    onChange={(event) => {
-                      handleChange("downloadSuffix", event.target.value);
+                    onChange={(value) => {
+                      handleChange("downloadSuffix", value);
                     }}
                   />
                 </div>
@@ -403,11 +407,9 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     />
                   </div>
                   <WorkflowBlockInputTextarea
-                    onIconClick={() => {
-                      setParametersPanelField("totpVerificationUrl");
-                    }}
-                    onChange={(event) => {
-                      handleChange("totpVerificationUrl", event.target.value);
+                    nodeId={id}
+                    onChange={(value) => {
+                      handleChange("totpVerificationUrl", value);
                     }}
                     value={inputs.totpVerificationUrl ?? ""}
                     placeholder={placeholders["task"]["totpVerificationUrl"]}
@@ -424,11 +426,9 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     />
                   </div>
                   <WorkflowBlockInputTextarea
-                    onIconClick={() => {
-                      setParametersPanelField("totpIdentifier");
-                    }}
-                    onChange={(event) => {
-                      handleChange("totpIdentifier", event.target.value);
+                    nodeId={id}
+                    onChange={(value) => {
+                      handleChange("totpIdentifier", value);
                     }}
                     value={inputs.totpIdentifier ?? ""}
                     placeholder={placeholders["task"]["totpIdentifier"]}
@@ -440,25 +440,6 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
           </AccordionItem>
         </Accordion>
       </div>
-      {typeof parametersPanelField === "string" && (
-        <WorkflowBlockParameterSelect
-          nodeId={id}
-          onClose={() => setParametersPanelField(null)}
-          onAdd={(parameterKey) => {
-            if (parametersPanelField === null || !editable) {
-              return;
-            }
-            if (parametersPanelField in inputs) {
-              const currentValue =
-                inputs[parametersPanelField as keyof typeof inputs];
-              handleChange(
-                parametersPanelField,
-                `${currentValue ?? ""}{{ ${parameterKey} }}`,
-              );
-            }
-          }}
-        />
-      )}
     </div>
   );
 }

@@ -22,7 +22,7 @@ import { Switch } from "@/components/ui/switch";
 import { ClickIcon } from "@/components/icons/ClickIcon";
 import { placeholders, helpTooltips } from "../../helpContent";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
-import { WorkflowBlockParameterSelect } from "../WorkflowBlockParameterSelect";
+import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -32,9 +32,6 @@ const navigationGoalTooltip =
 const navigationGoalPlaceholder = 'Input {{ name }} into "Name" field.';
 
 function ActionNode({ id, data }: NodeProps<ActionNode>) {
-  const [parametersPanelField, setParametersPanelField] = useState<
-    string | null
-  >(null);
   const { updateNodeData } = useReactFlow();
   const { editable } = data;
   const [label, setLabel] = useNodeLabelChangeHandler({
@@ -107,14 +104,9 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
               <HelpTooltip content={urlTooltip} />
             </div>
             <WorkflowBlockInputTextarea
-              onIconClick={() => {
-                setParametersPanelField("url");
-              }}
-              onChange={(event) => {
-                if (!editable) {
-                  return;
-                }
-                handleChange("url", event.target.value);
+              nodeId={id}
+              onChange={(value) => {
+                handleChange("url", value);
               }}
               value={inputs.url}
               placeholder={placeholders["action"]["url"]}
@@ -129,19 +121,20 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
               <HelpTooltip content={navigationGoalTooltip} />
             </div>
             <WorkflowBlockInputTextarea
-              onIconClick={() => {
-                setParametersPanelField("navigationGoal");
-              }}
-              onChange={(event) => {
-                if (!editable) {
-                  return;
-                }
-                handleChange("navigationGoal", event.target.value);
+              nodeId={id}
+              onChange={(value) => {
+                handleChange("navigationGoal", value);
               }}
               value={inputs.navigationGoal}
               placeholder={navigationGoalPlaceholder}
               className="nopan text-xs"
             />
+          </div>
+          <div className="rounded-md bg-slate-800 p-2">
+            <div className="space-y-1 text-xs text-slate-400">
+              Tip: While executing the action block, Skyvern will only take one
+              action.
+            </div>
           </div>
         </div>
         <Separator />
@@ -296,16 +289,14 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                       content={helpTooltips["action"]["fileSuffix"]}
                     />
                   </div>
-                  <Input
+                  <WorkflowBlockInput
+                    nodeId={id}
                     type="text"
                     placeholder={placeholders["action"]["downloadSuffix"]}
                     className="nopan w-52 text-xs"
                     value={inputs.downloadSuffix ?? ""}
-                    onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
-                      handleChange("downloadSuffix", event.target.value);
+                    onChange={(value) => {
+                      handleChange("downloadSuffix", value);
                     }}
                   />
                 </div>
@@ -320,11 +311,9 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                     />
                   </div>
                   <WorkflowBlockInputTextarea
-                    onIconClick={() => {
-                      setParametersPanelField("totpVerificationUrl");
-                    }}
-                    onChange={(event) => {
-                      handleChange("totpVerificationUrl", event.target.value);
+                    nodeId={id}
+                    onChange={(value) => {
+                      handleChange("totpVerificationUrl", value);
                     }}
                     value={inputs.totpVerificationUrl ?? ""}
                     placeholder={placeholders["action"]["totpVerificationUrl"]}
@@ -341,14 +330,9 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                     />
                   </div>
                   <WorkflowBlockInputTextarea
-                    onIconClick={() => {
-                      setParametersPanelField("totpIdentifier");
-                    }}
-                    onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
-                      handleChange("totpIdentifier", event.target.value);
+                    nodeId={id}
+                    onChange={(value) => {
+                      handleChange("totpIdentifier", value);
                     }}
                     value={inputs.totpIdentifier ?? ""}
                     placeholder={placeholders["action"]["totpIdentifier"]}
@@ -360,25 +344,6 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
           </AccordionItem>
         </Accordion>
       </div>
-      {typeof parametersPanelField === "string" && (
-        <WorkflowBlockParameterSelect
-          nodeId={id}
-          onClose={() => setParametersPanelField(null)}
-          onAdd={(parameterKey) => {
-            if (parametersPanelField === null || !editable) {
-              return;
-            }
-            if (parametersPanelField in inputs) {
-              const currentValue =
-                inputs[parametersPanelField as keyof typeof inputs];
-              handleChange(
-                parametersPanelField,
-                `${currentValue ?? ""}{{ ${parameterKey} }}`,
-              );
-            }
-          }}
-        />
-      )}
     </div>
   );
 }
