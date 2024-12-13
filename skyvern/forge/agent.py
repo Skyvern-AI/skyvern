@@ -45,7 +45,7 @@ from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import get_path_for_workflow_download_directory, list_files_in_directory, rename_file
-from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.validators import prepend_scheme_and_validate_url
@@ -74,7 +74,7 @@ from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
 from skyvern.webeye.utils.page import SkyvernFrame
 
-from skyvern.forge.sdk.log_artifacts import save_step_logs
+from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 
 LOG = structlog.get_logger()
 
@@ -1819,6 +1819,7 @@ class ForgeAgent:
             for key, value in updates.items()
             if getattr(task, key) != value
         }
+        await save_task_logs(task.task_id)
         LOG.info("Updating task in db", task_id=task.task_id, diff=update_comparison)
         return await app.DATABASE.update_task(
             task.task_id,
