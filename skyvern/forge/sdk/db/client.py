@@ -808,6 +808,49 @@ class AgentDB:
             LOG.exception("UnexpectedError")
             raise
 
+    async def get_artifact_by_entity_id(
+        self,
+        artifact_type: ArtifactType,
+        task_id: str | None = None,
+        step_id: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_run_block_id: str | None = None,
+        observer_thought_id: str | None = None,
+        observer_cruise_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> Artifact | None:
+        try:
+            async with self.Session() as session:
+                query = select(ArtifactModel).filter_by(artifact_type=artifact_type)
+
+                if task_id is not None:
+                    query = query.filter_by(task_id=task_id)
+                if step_id is not None:
+                    query = query.filter_by(step_id=step_id)
+                if workflow_run_id is not None:
+                    query = query.filter_by(workflow_run_id=workflow_run_id)
+                if workflow_run_block_id is not None:
+                    query = query.filter_by(workflow_run_block_id=workflow_run_block_id)
+                if observer_thought_id is not None:
+                    query = query.filter_by(observer_thought_id=observer_thought_id)
+                if observer_cruise_id is not None:
+                    query = query.filter_by(observer_cruise_id=observer_cruise_id)
+                if organization_id is not None:
+                    query = query.filter_by(organization_id=organization_id)
+
+                query = query.order_by(ArtifactModel.created_at.desc())
+                artifact = (await session.scalars(query)).first()
+                
+                if artifact:
+                    return convert_to_artifact(artifact, self.debug_enabled)
+                return None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def get_artifact(
         self,
         task_id: str,
