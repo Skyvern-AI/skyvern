@@ -53,7 +53,7 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
   }
 
   return (
-    <div className="relative">
+    <div>
       <Handle
         type="source"
         position={Position.Bottom}

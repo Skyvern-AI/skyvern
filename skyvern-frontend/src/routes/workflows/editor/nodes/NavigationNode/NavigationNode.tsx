@@ -55,7 +55,7 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
   }
 
   return (
-    <div className="relative">
+    <div>
       <Handle
         type="source"
         position={Position.Bottom}

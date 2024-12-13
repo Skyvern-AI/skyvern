@@ -190,6 +190,8 @@ function convertToNode(
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           cacheActions: block.cache_actions,
+          completeCriterion: block.complete_criterion ?? "",
+          terminateCriterion: block.terminate_criterion ?? "",
         },
       };
     }
@@ -802,6 +804,8 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         title: node.data.label,
         navigation_goal: node.data.navigationGoal,
         data_extraction_goal: node.data.dataExtractionGoal,
+        complete_criterion: node.data.completeCriterion,
+        terminate_criterion: node.data.terminateCriterion,
         data_schema: JSONParseSafe(node.data.dataSchema),
         error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
           string,
@@ -1427,6 +1431,8 @@ function convertBlocksToBlockYAML(
           url: block.url,
           navigation_goal: block.navigation_goal,
           data_extraction_goal: block.data_extraction_goal,
+          complete_criterion: block.complete_criterion,
+          terminate_criterion: block.terminate_criterion,
           data_schema: block.data_schema,
           error_code_mapping: block.error_code_mapping,
           max_retries: block.max_retries,
