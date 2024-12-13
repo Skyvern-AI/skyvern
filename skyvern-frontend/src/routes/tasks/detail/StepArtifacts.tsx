@@ -7,7 +7,7 @@ import {
 import { StatusBadge } from "@/components/StatusBadge";
 import { Label } from "@/components/ui/label";
 import { useQuery } from "@tanstack/react-query";
-import { useParams, useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router-dom";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -25,7 +25,6 @@ type Props = {
 function StepArtifacts({ id, stepProps }: Props) {
   const [searchParams, setSearchParams] = useSearchParams();
   const artifact = searchParams.get("artifact") ?? "info";
-  const { taskId } = useParams();
   const credentialGetter = useCredentialGetter();
   const {
     data: artifacts,
@@ -33,11 +32,11 @@ function StepArtifacts({ id, stepProps }: Props) {
     isError,
     error,
   } = useQuery<Array<ArtifactApiResponse>>({
-    queryKey: ["task", taskId, "steps", id, "artifacts"],
+    queryKey: ["step", id, "artifacts"],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client
-        .get(`/tasks/${taskId}/steps/${id}/artifacts`)
+        .get(`/step/${id}/artifacts`)
         .then((response) => response.data);
     },
   });
