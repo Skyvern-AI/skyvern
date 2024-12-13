@@ -221,7 +221,6 @@ class ArtifactManager:
         # Fire and forget
         aio_task = asyncio.create_task(app.STORAGE.store_artifact(artifact, data))
 
-        print("---",primary_key, artifact[primary_key])
         if not artifact[primary_key]:
             raise ValueError(f"{primary_key} is required to update artifact data.")
         self.upload_aiotasks_map[artifact[primary_key]].append(aio_task)

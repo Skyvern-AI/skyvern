@@ -104,7 +104,6 @@ async def _save_log_artifacts(
 
 
         if log_artifact:
-            print("log_artifact", log_artifact)
             await app.ARTIFACT_MANAGER.update_artifact_data(
                 artifact_id=log_artifact.artifact_id,
                 organization_id=organization_id,
@@ -112,7 +111,6 @@ async def _save_log_artifacts(
                 primary_key=primary_key_from_log_entity_type(log_entity_type),
             )
         else:
-            print("log_artifact not found, creating new one")
             await app.ARTIFACT_MANAGER.create_log_artifact(
                 organization_id=organization_id,
                 step_id=step_id,
