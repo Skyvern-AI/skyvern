@@ -7,6 +7,8 @@ export type TaskNodeData = NodeBaseData & {
   dataExtractionGoal: string;
   errorCodeMapping: string;
   dataSchema: string;
+  completeCriterion: string;
+  terminateCriterion: string;
   maxRetries: number | null;
   maxStepsOverride: number | null;
   allowDownloads: boolean;
@@ -25,6 +27,8 @@ export const taskNodeDefaultData: TaskNodeData = {
   dataExtractionGoal: "",
   errorCodeMapping: "null",
   dataSchema: "null",
+  completeCriterion: "",
+  terminateCriterion: "",
   maxRetries: null,
   maxStepsOverride: null,
   allowDownloads: false,

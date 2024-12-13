@@ -51,6 +51,8 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
     url: data.url,
     navigationGoal: data.navigationGoal,
     dataExtractionGoal: data.dataExtractionGoal,
+    completeCriterion: data.completeCriterion,
+    terminateCriterion: data.terminateCriterion,
     dataSchema: data.dataSchema,
     maxRetries: data.maxRetries,
     maxStepsOverride: data.maxStepsOverride,
@@ -72,7 +74,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
   }
 
   return (
-    <div className="relative">
+    <div>
       <Handle
         type="source"
         position={Position.Bottom}
@@ -223,6 +225,20 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
             <AccordionTrigger>Advanced Settings</AccordionTrigger>
             <AccordionContent className="pl-6 pr-1 pt-1">
               <div className="space-y-4">
+                <div className="space-y-2">
+                  <Label className="text-xs text-slate-300">
+                    Complete if...
+                  </Label>
+                  <WorkflowBlockInputTextarea
+                    nodeId={id}
+                    onChange={(value) => {
+                      handleChange("completeCriterion", value);
+                    }}
+                    value={inputs.completeCriterion}
+                    className="nopan text-xs"
+                  />
+                </div>
+                <Separator />
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
                     <Label className="text-xs font-normal text-slate-300">
