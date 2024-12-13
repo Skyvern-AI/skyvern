@@ -73,8 +73,6 @@ from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
 from skyvern.webeye.utils.page import SkyvernFrame
-from skyvern.forge.skyvern_json_encoder import SkyvernJSONLogEncoder
-from skyvern.forge.skyvern_log_encoder import SkyvernLogEncoder
 
 from skyvern.forge.sdk.log_artifacts import save_step_logs
 

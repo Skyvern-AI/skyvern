@@ -97,7 +97,6 @@ class ArtifactManager:
     ) -> str:
         artifact_id = generate_artifact_id()
         uri = app.STORAGE.build_log_uri(log_entity_type, log_entity_id, artifact_type)
-        print("[create_log_artifact] uri", uri)
         return await self._create_artifact(
             aio_task_primary_key=log_entity_id,
             artifact_id=artifact_id,

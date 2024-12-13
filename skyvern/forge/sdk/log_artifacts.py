@@ -20,6 +20,7 @@ async def save_step_logs(step_id: str) -> None:
         log_entity_type=LogEntityType.STEP,
         log_entity_id=step_id,
         organization_id=organization_id,
+        step_id=step_id,
     )
 
 
@@ -34,6 +35,7 @@ async def save_task_logs(task_id: str) -> None:
         log_entity_type=LogEntityType.TASK,
         log_entity_id=task_id,
         organization_id=organization_id,
+        task_id=task_id,
     )
 
 

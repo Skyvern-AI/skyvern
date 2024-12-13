@@ -5,6 +5,7 @@ import json
 from structlog.dev import ConsoleRenderer
 import structlog
 
+from skyvern.forge.skyvern_json_encoder import SkyvernJSONLogEncoder
 LOG = structlog.get_logger()
 
 class SkyvernLogEncoder:
@@ -16,12 +17,9 @@ class SkyvernLogEncoder:
             colors=False,
         )
 
-    @staticmethod
-    def _format_value(value: Any) -> str:
-        """Format complex values into readable strings."""
-        if isinstance(value, (dict, list)):
-            return json.dumps(value, sort_keys=True)
-        return str(value)
+    @classmethod
+    def _format_value(cls, value):
+        return SkyvernJSONLogEncoder.dumps(value, sort_keys=True)
 
     @staticmethod
     def _parse_json_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
