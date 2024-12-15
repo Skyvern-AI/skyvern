@@ -997,3 +997,21 @@ async def get_browser_sessions(
         )
         for session_id in session_ids
     ]
+
+@base_router.post(
+    "/browser_sessions",
+    response_model=BrowserSessionResponse,
+)
+@base_router.post(
+    "/browser_sessions/",
+    response_model=BrowserSessionResponse,
+    include_in_schema=False,
+) 
+async def create_browser_session(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BrowserSessionResponse:
+    session_id, _ = await app.PERSISTENT_SESSIONS_MANAGER.create_session(current_org.organization_id)
+    return BrowserSessionResponse(
+        session_id=session_id,
+        organization_id=current_org.organization_id,
+    )

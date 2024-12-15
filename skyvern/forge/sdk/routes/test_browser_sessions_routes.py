@@ -101,4 +101,33 @@ async def test_get_browser_sessions_success():
         for session in response_data:
             assert session["organization_id"] == org_id
 
+@pytest.mark.asyncio
+async def test_create_browser_session_success():
+    """Test successful creation of a browser session"""
+    org_id = "test-org-456"
+    expected_session_id = "new-session-789"
+    
+    x_api_key, mock_org, mock_get_current_org = setup_auth_mocks(org_id)
+    
+    persistent_sessions_manager = PersistentSessionsManager()
+
+    with patch('skyvern.forge.sdk.services.org_auth_service.get_current_org', new=mock_get_current_org), \
+         patch('skyvern.forge.sdk.services.org_auth_service._get_current_org_cached', 
+               new_callable=AsyncMock, return_value=mock_org), \
+         patch('skyvern.forge.app.PERSISTENT_SESSIONS_MANAGER', new=persistent_sessions_manager), \
+         patch.object(persistent_sessions_manager, 'create_session', 
+                     new_callable=AsyncMock, return_value=(expected_session_id, None)):
+        
+        response = client.post(
+            "/browser_sessions", 
+            headers={"X-API-Key": x_api_key}
+        )
+        
+        assert response.status_code == 200
+        response_data = response.json()
+        assert response_data["session_id"] == expected_session_id
+        assert response_data["organization_id"] == org_id
+        
+        persistent_sessions_manager.create_session.assert_called_once_with(org_id)
+
 
