@@ -1,11 +1,11 @@
 import { apiBaseUrl, envCredential } from "./util/env";
 
-interface Window {
-  devCommands: {
-    createBrowserSession: () => Promise<void>;
-    listBrowserSessions: () => Promise<void>;
-  };
-}
+export type DevCommands = {
+  createBrowserSession: () => Promise<void>;
+  listBrowserSessions: () => Promise<void>;
+  setValue: (key: string, value: unknown) => void;
+  getValue: (key: string) => unknown;
+};
 
 export function initDevCommands() {
   if (!envCredential) {
@@ -65,9 +65,20 @@ export function initDevCommands() {
     }
   }
 
+  function setValue(key: string, value: unknown) {
+    localStorage.setItem(key, JSON.stringify(value));
+  }
+
+  function getValue(key: string) {
+    const value = localStorage.getItem(key);
+    return value ? JSON.parse(value) : null;
+  }
+
   (window as unknown as Window).devCommands = {
     createBrowserSession,
     listBrowserSessions,
+    setValue,
+    getValue,
   };
 
   console.log("Dev commands initialized. Available commands:");

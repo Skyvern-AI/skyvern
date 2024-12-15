@@ -81,6 +81,9 @@ function createTaskRequestObject(
     totp_verification_url: transform(formValues.totpVerificationUrl),
     totp_identifier: transform(formValues.totpIdentifier),
     error_code_mapping: errorCodeMapping,
+    reuse_browser_session:
+      (window.devCommands?.getValue("browserSessionId") as unknown as string) ??
+      null,
   };
 }
 
