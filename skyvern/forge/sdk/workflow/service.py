@@ -15,6 +15,7 @@ from skyvern.exceptions import (
     SkyvernException,
     WorkflowNotFound,
     WorkflowRunNotFound,
+    BrowserSessionNotFound,
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -114,6 +115,15 @@ class WorkflowService:
             LOG.error(f"Workflow {workflow_permanent_id} not found", workflow_version=version)
             raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
         workflow_id = workflow.workflow_id
+        if workflow_request.browser_session_id:
+            reusable_browser_session = app.PERSISTENT_SESSIONS_MANAGER.get_session(
+                organization_id=organization_id,
+                session_id=workflow_request.browser_session_id,
+            )
+            if reusable_browser_session is None:
+                raise BrowserSessionNotFound(browser_session_id=workflow_request.browser_session_id)
+            reusable_browser_session.reset_timeout()
+
         if workflow_request.proxy_location is None and workflow.proxy_location is not None:
             workflow_request.proxy_location = workflow.proxy_location
         if workflow_request.webhook_callback_url is None and workflow.webhook_callback_url is not None:
@@ -140,6 +150,7 @@ class WorkflowService:
                 workflow_id=workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
                 max_steps_override=max_steps_override,
+                reuse_browser_session=workflow_request.browser_session_id,
             )
         )
 

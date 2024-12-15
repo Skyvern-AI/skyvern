@@ -105,7 +105,6 @@ export type CreateTaskRequest = {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   application?: string | null;
-  reuse_browser_session?: string | null;
 };
 
 export type User = {
