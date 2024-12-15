@@ -8,7 +8,7 @@ from playwright.async_api import async_playwright
 
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.webeye.browser_factory import BrowserContextFactory, BrowserState
-
+from skyvern.webeye.models import BrowserSessionResponse
 LOG = structlog.get_logger()
 
 
@@ -98,6 +98,12 @@ class PersistentSessionsManager:
             session_ids = list(self.sessions[organization_id].keys())
             for session_id in session_ids:
                 await self.close_session(organization_id, session_id)
+
+    async def build_browser_session_response(self, organization_id: str, session_id: str) -> BrowserSessionResponse:
+        return BrowserSessionResponse(
+            session_id=session_id,
+            organization_id=organization_id,
+        )
 
     @classmethod
     async def close(cls) -> None:

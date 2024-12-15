@@ -16,6 +16,7 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.webeye.browser_manager import BrowserManager
+from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
 from skyvern.webeye.scraper.scraper import ScrapeExcludeFunc
 
 SETTINGS_MANAGER = SettingsManager.get_settings()
@@ -37,6 +38,7 @@ SECONDARY_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
 WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
 WORKFLOW_SERVICE = WorkflowService()
 AGENT_FUNCTION = AgentFunction()
+PERSISTENT_SESSIONS_MANAGER = PersistentSessionsManager()
 scrape_exclude: ScrapeExcludeFunc | None = None
 authentication_function: Callable[[str], Awaitable[Organization]] | None = None
 setup_api_app: Callable[[FastAPI], None] | None = None
