@@ -567,6 +567,7 @@ async def execute_workflow(
         organization_id=current_org.organization_id,
         workflow_id=workflow_run.workflow_id,
         workflow_run_id=workflow_run.workflow_run_id,
+        browser_session_id=workflow_request.browser_session_id,
         max_steps_override=x_max_steps_override,
         api_key=x_api_key,
     )

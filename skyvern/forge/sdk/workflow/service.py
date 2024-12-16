@@ -199,11 +199,14 @@ class WorkflowService:
         workflow_run_id: str,
         api_key: str,
         organization: Organization,
+        browser_session_id: str | None,
     ) -> WorkflowRun:
         """Execute a workflow."""
         organization_id = organization.organization_id
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id)
         workflow = await self.get_workflow(workflow_id=workflow_run.workflow_id, organization_id=organization_id)
+
+        uses_persistent_browser_state = browser_session_id is not None
 
         # Set workflow run status to running, create workflow run parameters
         await self.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
@@ -245,6 +248,7 @@ class WorkflowService:
                         workflow_run=workflow_run,
                         api_key=api_key,
                         need_call_webhook=True,
+                        close_browser_on_completion=not uses_persistent_browser_state,
                     )
                     return workflow_run
                 parameters = block.get_all_parameters(workflow_run_id)
@@ -277,6 +281,7 @@ class WorkflowService:
                         workflow_run=workflow_run,
                         api_key=api_key,
                         need_call_webhook=False,
+                        close_browser_on_completion=not uses_persistent_browser_state,
                     )
                     return workflow_run
                 elif block_result.status == BlockStatus.failed:
@@ -298,6 +303,7 @@ class WorkflowService:
                             workflow=workflow,
                             workflow_run=workflow_run,
                             api_key=api_key,
+                            close_browser_on_completion=not uses_persistent_browser_state,
                         )
                         return workflow_run
 
@@ -332,6 +338,7 @@ class WorkflowService:
                             workflow=workflow,
                             workflow_run=workflow_run,
                             api_key=api_key,
+                            close_browser_on_completion=not uses_persistent_browser_state,
                         )
                         return workflow_run
 
@@ -363,7 +370,12 @@ class WorkflowService:
                 await self.mark_workflow_run_as_failed(
                     workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                 )
-                await self.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, api_key=api_key)
+                await self.clean_up_workflow(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    api_key=api_key,
+                    close_browser_on_completion=not uses_persistent_browser_state,
+                )
                 return workflow_run
 
         refreshed_workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=workflow_run.workflow_run_id)
@@ -379,7 +391,12 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 workflow_run_status=refreshed_workflow_run.status if refreshed_workflow_run else None,
             )
-        await self.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, api_key=api_key)
+        await self.clean_up_workflow(
+            workflow=workflow,
+            workflow_run=workflow_run,
+            api_key=api_key,
+            close_browser_on_completion=not uses_persistent_browser_state,
+        )
         return workflow_run
 
     async def create_workflow(
