@@ -945,6 +945,7 @@ class ForgeAgent:
                         complete_action.task_id = task.task_id
                         complete_action.step_id = step.step_id
                         complete_action.step_order = step.order
+                        complete_action.action_order = len(detailed_agent_step_output.actions_and_results)
                         complete_results = await ActionHandler.handle_action(
                             scraped_page, task, step, working_page, complete_action
                         )
