@@ -515,6 +515,7 @@ class ObserverCruiseModel(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"), nullable=True)
+    workflow_permanent_id = Column(String, nullable=True)
     prompt = Column(UnicodeText, nullable=True)
     url = Column(String, nullable=True)
 
@@ -531,6 +532,7 @@ class ObserverThoughtModel(Base):
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
     workflow_run_block_id = Column(String, ForeignKey("workflow_run_blocks.workflow_run_block_id"), nullable=True)
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"), nullable=True)
+    workflow_permanent_id = Column(String, nullable=True)
     user_input = Column(UnicodeText, nullable=True)
     observation = Column(String, nullable=True)
     thought = Column(String, nullable=True)
