@@ -31,6 +31,7 @@ from skyvern.exceptions import (
     IllegitComplete,
     ImaginaryFileUrl,
     InteractWithDisabledElement,
+    InteractWithDropdownContainer,
     InvalidElementForTextInput,
     MissingElement,
     MissingElementDict,
@@ -571,15 +572,27 @@ async def handle_input_text_action(
                     task=task,
                     target_value=text,
                 )
-                if result is not None:
+                if result is not None and result.success:
                     return [result]
-                LOG.info(
-                    "It might not be a selectable auto-completion input, exit the custom selection mode",
-                    task_id=task.task_id,
-                    step_id=step.step_id,
-                    element_id=skyvern_element.get_id(),
-                    action=action,
-                )
+
+                if result is None:
+                    LOG.info(
+                        "It might not be a selectable auto-completion input, exit the custom selection mode",
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        element_id=skyvern_element.get_id(),
+                        action=action,
+                    )
+                else:
+                    LOG.warning(
+                        "Custom selection returned an error, continue to input text",
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        element_id=skyvern_element.get_id(),
+                        action=action,
+                        err_msg=result.exception_message,
+                    )
+
             except Exception:
                 await skyvern_element.scroll_into_view()
                 LOG.warning(
@@ -1951,6 +1964,12 @@ async def select_from_dropdown(
 
     try:
         selected_element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
+        if await selected_element.get_attr("role") == "listbox":
+            single_select_result.action_result = ActionFailure(
+                exception=InteractWithDropdownContainer(element_id=element_id)
+            )
+            return single_select_result
+
         await selected_element.scroll_into_view()
         await selected_element.get_locator().click(timeout=timeout)
         single_select_result.action_result = ActionSuccess()
