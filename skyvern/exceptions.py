@@ -545,3 +545,10 @@ class FailedToParseActionInstruction(SkyvernException):
 class UnsupportedTaskType(SkyvernException):
     def __init__(self, task_type: str):
         super().__init__(f"Not supported task type [{task_type}]")
+
+
+class InteractWithDropdownContainer(SkyvernException):
+    def __init__(self, element_id: str):
+        super().__init__(
+            f"Select on the dropdown container instead of the option, try again with another element. element_id={element_id}"
+        )
