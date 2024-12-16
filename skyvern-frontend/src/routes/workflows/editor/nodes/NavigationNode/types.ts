@@ -5,6 +5,8 @@ export type NavigationNodeData = NodeBaseData & {
   url: string;
   navigationGoal: string;
   errorCodeMapping: string;
+  completeCriterion: string;
+  terminateCriterion: string;
   maxRetries: number | null;
   maxStepsOverride: number | null;
   allowDownloads: boolean;
@@ -21,6 +23,8 @@ export const navigationNodeDefaultData: NavigationNodeData = {
   label: "",
   url: "",
   navigationGoal: "",
+  completeCriterion: "",
+  terminateCriterion: "",
   errorCodeMapping: "null",
   maxRetries: null,
   maxStepsOverride: null,

@@ -1,5 +1,6 @@
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo
 
 
 @dataclass
@@ -10,6 +11,7 @@ class SkyvernContext:
     workflow_id: str | None = None
     workflow_run_id: str | None = None
     max_steps_override: int | None = None
+    tz_info: ZoneInfo | None = None
     totp_codes: dict[str, str | None] = field(default_factory=dict)
     log: list[dict] = field(default_factory=list)
 

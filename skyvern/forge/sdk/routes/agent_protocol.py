@@ -285,6 +285,7 @@ async def get_task(
 async def cancel_task(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_api_key: Annotated[str | None, Header()] = None,
 ) -> None:
     analytics.capture("skyvern-oss-agent-task-get")
     task_obj = await app.DATABASE.get_task(task_id, organization_id=current_org.organization_id)
@@ -293,7 +294,11 @@ async def cancel_task(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Task not found {task_id}",
         )
-    await app.agent.update_task(task_obj, status=TaskStatus.canceled)
+    task = await app.agent.update_task(task_obj, status=TaskStatus.canceled)
+    # get latest step
+    latest_step = await app.DATABASE.get_latest_step(task_id, organization_id=current_org.organization_id)
+    # retry the webhook
+    await app.agent.execute_task_webhook(task=task, last_step=latest_step, api_key=x_api_key)
 
 
 @base_router.post("/workflows/runs/{workflow_run_id}/cancel")
@@ -301,8 +306,16 @@ async def cancel_task(
 async def cancel_workflow_run(
     workflow_run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_api_key: Annotated[str | None, Header()] = None,
 ) -> None:
+    workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=workflow_run_id)
+    if not workflow_run:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow run not found {workflow_run_id}",
+        )
     await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
+    await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=x_api_key)
 
 
 @base_router.post(

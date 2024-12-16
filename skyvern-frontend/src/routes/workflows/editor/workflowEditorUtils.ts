@@ -247,6 +247,8 @@ function convertToNode(
           totpVerificationUrl: block.totp_verification_url ?? null,
           cacheActions: block.cache_actions,
           maxStepsOverride: block.max_steps_per_run ?? null,
+          completeCriterion: block.complete_criterion ?? "",
+          terminateCriterion: block.terminate_criterion ?? "",
         },
       };
     }
@@ -283,6 +285,8 @@ function convertToNode(
           totpVerificationUrl: block.totp_verification_url ?? null,
           cacheActions: block.cache_actions,
           maxStepsOverride: block.max_steps_per_run ?? null,
+          completeCriterion: block.complete_criterion ?? "",
+          terminateCriterion: block.terminate_criterion ?? "",
         },
       };
     }
@@ -879,6 +883,8 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         cache_actions: node.data.cacheActions,
+        complete_criterion: node.data.completeCriterion,
+        terminate_criterion: node.data.terminateCriterion,
       };
     }
     case "extraction": {
@@ -916,6 +922,8 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         cache_actions: node.data.cacheActions,
+        complete_criterion: node.data.completeCriterion,
+        terminate_criterion: node.data.terminateCriterion,
       };
     }
     case "wait": {
@@ -1491,6 +1499,8 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           cache_actions: block.cache_actions,
+          complete_criterion: block.complete_criterion,
+          terminate_criterion: block.terminate_criterion,
         };
         return blockYaml;
       }
@@ -1523,6 +1533,8 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           cache_actions: block.cache_actions,
+          complete_criterion: block.complete_criterion,
+          terminate_criterion: block.terminate_criterion,
         };
         return blockYaml;
       }
