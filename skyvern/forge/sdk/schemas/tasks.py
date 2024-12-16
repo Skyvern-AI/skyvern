@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -24,6 +25,46 @@ class ProxyLocation(StrEnum):
     RESIDENTIAL_IN = "RESIDENTIAL_IN"
     RESIDENTIAL_JP = "RESIDENTIAL_JP"
     NONE = "NONE"
+
+
+def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
+    if proxy_location == ProxyLocation.NONE:
+        return None
+
+    if proxy_location == ProxyLocation.US_CA:
+        return ZoneInfo("America/Los_Angeles")
+
+    if proxy_location == ProxyLocation.US_NY:
+        return ZoneInfo("America/New_York")
+
+    if proxy_location == ProxyLocation.US_TX:
+        return ZoneInfo("America/Chicago")
+
+    if proxy_location == ProxyLocation.US_FL:
+        return ZoneInfo("America/New_York")
+
+    if proxy_location == ProxyLocation.US_WA:
+        return ZoneInfo("America/New_York")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL:
+        return ZoneInfo("America/New_York")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_ES:
+        return ZoneInfo("Europe/Madrid")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_IE:
+        return ZoneInfo("Europe/Dublin")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_GB:
+        return ZoneInfo("Europe/London")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_IN:
+        return ZoneInfo("Asia/Kolkata")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_JP:
+        return ZoneInfo("Asia/Kolkata")
+
+    return None
 
 
 class TaskBase(BaseModel):

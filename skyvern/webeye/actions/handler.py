@@ -52,6 +52,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import download_file, get_download_dir, list_files_in_directory
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_post
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
+from skyvern.forge.sdk.core.skyvern_context import ensure_context
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
@@ -1877,6 +1878,7 @@ async def select_from_dropdown(
 
     html = incremental_scraped.build_html_tree(element_tree=trimmed_element_tree)
 
+    skyvern_context = ensure_context()
     prompt = prompt_engine.load_prompt(
         "custom-select",
         field_information=context.field,
@@ -1886,7 +1888,7 @@ async def select_from_dropdown(
         navigation_payload_str=json.dumps(task.navigation_payload),
         elements=html,
         select_history=json.dumps(build_sequential_select_history(select_history)) if select_history else "",
-        utc_datetime=datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+        local_datetime=datetime.now(skyvern_context.tz_info).isoformat(),
     )
 
     LOG.info(
@@ -2449,6 +2451,8 @@ async def extract_information_for_navigation_goal(
     element_tree_in_prompt: str = scraped_page.build_element_tree(element_tree_format)
 
     scraped_page_refreshed = await scraped_page.refresh()
+
+    context = ensure_context()
     extract_information_prompt = prompt_engine.load_prompt(
         prompt_template,
         navigation_goal=task.navigation_goal,
@@ -2459,7 +2463,7 @@ async def extract_information_for_navigation_goal(
         current_url=scraped_page_refreshed.url,
         extracted_text=scraped_page_refreshed.extracted_text,
         error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
-        utc_datetime=datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+        local_datetime=datetime.now(context.tz_info).isoformat(),
     )
 
     json_response = await app.LLM_API_HANDLER(
