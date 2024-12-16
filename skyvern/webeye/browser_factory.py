@@ -25,7 +25,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation
+from skyvern.forge.sdk.schemas.tasks import ProxyLocation, get_tzinfo_from_proxy
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -128,7 +128,7 @@ def initialize_download_dir() -> str:
 
 class BrowserContextCreator(Protocol):
     def __call__(
-        self, playwright: Playwright, **kwargs: dict[str, Any]
+        self, playwright: Playwright, proxy_location: ProxyLocation | None = None, **kwargs: dict[str, Any]
     ) -> Awaitable[tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]]: ...
 
 
@@ -162,14 +162,13 @@ class BrowserContextFactory:
             f.write(preference_file_content)
 
     @staticmethod
-    def build_browser_args() -> dict[str, Any]:
+    def build_browser_args(proxy_location: ProxyLocation | None = None) -> dict[str, Any]:
         video_dir = f"{settings.VIDEO_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}"
         har_dir = (
             f"{settings.HAR_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{BrowserContextFactory.get_subdir()}.har"
         )
-        return {
+        args = {
             "locale": settings.BROWSER_LOCALE,
-            "timezone_id": settings.BROWSER_TIMEZONE,
             "color_scheme": "no-preference",
             "args": [
                 "--disable-blink-features=AutomationControlled",
@@ -187,6 +186,11 @@ class BrowserContextFactory:
                 "height": settings.BROWSER_HEIGHT,
             },
         }
+
+        if proxy_location:
+            if tz_info := get_tzinfo_from_proxy(proxy_location=proxy_location):
+                args["timezone_id"] = tz_info.key
+        return args
 
     @staticmethod
     def build_browser_artifacts(
@@ -221,6 +225,12 @@ class BrowserContextFactory:
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
             set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
             set_download_file_listener(browser_context=browser_context, **kwargs)
+
+            proxy_location: ProxyLocation | None = kwargs.get("proxy_location")
+            if proxy_location is not None:
+                context = ensure_context()
+                context.tz_info = get_tzinfo_from_proxy(proxy_location)
+
             return browser_context, browser_artifacts, cleanup_func
         except Exception as e:
             if browser_context is not None:
@@ -279,7 +289,7 @@ class BrowserArtifacts(BaseModel):
 
 
 async def _create_headless_chromium(
-    playwright: Playwright, **kwargs: dict
+    playwright: Playwright, proxy_location: ProxyLocation | None = None, **kwargs: dict
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     user_data_dir = make_temp_directory(prefix="skyvern_browser_")
     download_dir = initialize_download_dir()
@@ -287,7 +297,7 @@ async def _create_headless_chromium(
         user_data_dir=user_data_dir,
         download_dir=download_dir,
     )
-    browser_args = BrowserContextFactory.build_browser_args()
+    browser_args = BrowserContextFactory.build_browser_args(proxy_location=proxy_location)
     browser_args.update(
         {
             "user_data_dir": user_data_dir,
@@ -301,7 +311,7 @@ async def _create_headless_chromium(
 
 
 async def _create_headful_chromium(
-    playwright: Playwright, **kwargs: dict
+    playwright: Playwright, proxy_location: ProxyLocation | None = None, **kwargs: dict
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     user_data_dir = make_temp_directory(prefix="skyvern_browser_")
     download_dir = initialize_download_dir()
@@ -309,7 +319,7 @@ async def _create_headful_chromium(
         user_data_dir=user_data_dir,
         download_dir=download_dir,
     )
-    browser_args = BrowserContextFactory.build_browser_args()
+    browser_args = BrowserContextFactory.build_browser_args(proxy_location=proxy_location)
     browser_args.update(
         {
             "user_data_dir": user_data_dir,

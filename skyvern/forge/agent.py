@@ -1310,6 +1310,7 @@ class ForgeAgent:
         if not template:
             raise UnsupportedTaskType(task_type=task_type)
 
+        context = skyvern_context.ensure_context()
         return prompt_engine.load_prompt(
             template=template,
             navigation_goal=navigation_goal,
@@ -1320,7 +1321,7 @@ class ForgeAgent:
             data_extraction_goal=task.data_extraction_goal,
             action_history=actions_and_results_str,
             error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
-            utc_datetime=datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+            local_datetime=datetime.now(context.tz_info).isoformat(),
             verification_code_check=verification_code_check,
             complete_criterion=task.complete_criterion,
             terminate_criterion=task.terminate_criterion,
