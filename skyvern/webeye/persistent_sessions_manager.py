@@ -53,7 +53,13 @@ class PersistentSessionsManager:
             organization_id=organization_id,
         )
 
-        browser_context.on("close", lambda: self.sessions[organization_id].pop(session_id))
+        def on_context_close():
+            if organization_id in self.sessions:
+                self.sessions[organization_id].pop(session_id, None)
+                if not self.sessions[organization_id]:
+                    self.sessions.pop(organization_id, None)
+
+        browser_context.on("close", on_context_close)
         
         browser_state = BrowserState(
             pw=pw,
