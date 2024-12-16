@@ -10,6 +10,8 @@ from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.webeye.browser_factory import BrowserContextFactory, BrowserState, VideoArtifact
 
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge import app
 LOG = structlog.get_logger()
 
 
@@ -94,16 +96,25 @@ class BrowserManager:
         if browser_state is not None:
             return browser_state
 
-        LOG.info(
-            "Creating browser state for workflow run",
-            workflow_run_id=workflow_run.workflow_run_id,
-        )
-        browser_state = await self._create_browser_state(
-            workflow_run.proxy_location,
-            url=url,
-            workflow_run_id=workflow_run.workflow_run_id,
-            organization_id=workflow_run.organization_id,
-        )
+        context = skyvern_context.current()
+        if context.browser_session_id:
+            LOG.info("Getting browser state for workflow run from persistent sessions manager", browser_session_id=context.browser_session_id)
+            browser_state = app.PERSISTENT_SESSIONS_MANAGER.get_session(context.organization_id, context.browser_session_id)
+            if browser_state is None:
+                LOG.warning("Browser state not found in persistent sessions manager", browser_session_id=context.browser_session_id)
+
+        if browser_state is None:
+            LOG.info(
+                "Creating browser state for workflow run",
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
+            browser_state = await self._create_browser_state(
+                workflow_run.proxy_location,
+                url=url,
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=workflow_run.organization_id,
+            )
+
         self.pages[workflow_run.workflow_run_id] = browser_state
 
         # The URL here is only used when creating a new page, and not when using an existing page.
