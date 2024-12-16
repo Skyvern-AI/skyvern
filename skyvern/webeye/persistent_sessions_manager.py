@@ -52,6 +52,8 @@ class PersistentSessionsManager:
             url=url,
             organization_id=organization_id,
         )
+
+        browser_context.on("close", lambda: self.sessions[organization_id].pop(session_id))
         
         browser_state = BrowserState(
             pw=pw,
