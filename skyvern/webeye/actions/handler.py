@@ -660,7 +660,7 @@ async def handle_input_text_action(
         return [ActionSuccess()]
     finally:
         # HACK: force to finish missing auto completion input
-        if auto_complete_hacky_flag:
+        if auto_complete_hacky_flag and not await skyvern_element.is_raw_input():
             LOG.debug(
                 "Trigger input-selection hack, pressing Tab to choose one",
                 action=action,
