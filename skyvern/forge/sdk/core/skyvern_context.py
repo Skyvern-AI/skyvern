@@ -12,6 +12,7 @@ class SkyvernContext:
     workflow_run_id: str | None = None
     max_steps_override: int | None = None
     tz_info: ZoneInfo | None = None
+    browser_session_id: str | None = None
     totp_codes: dict[str, str | None] = field(default_factory=dict)
 
     def __repr__(self) -> str:

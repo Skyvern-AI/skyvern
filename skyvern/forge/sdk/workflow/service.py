@@ -122,7 +122,7 @@ class WorkflowService:
             )
             if reusable_browser_session is None:
                 raise BrowserSessionNotFound(browser_session_id=workflow_request.browser_session_id)
-            reusable_browser_session.reset_timeout()
+            # reusable_browser_session.reset_timeout()
 
         if workflow_request.proxy_location is None and workflow.proxy_location is not None:
             workflow_request.proxy_location = workflow.proxy_location
@@ -150,7 +150,7 @@ class WorkflowService:
                 workflow_id=workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
                 max_steps_override=max_steps_override,
-                reuse_browser_session=workflow_request.browser_session_id,
+                browser_session_id=workflow_request.browser_session_id,
             )
         )
 
