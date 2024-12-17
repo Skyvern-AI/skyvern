@@ -397,6 +397,13 @@ async def handle_click_action(
                     step_id=step.step_id,
                     workflow_run_id=task.workflow_run_id,
                 )
+                if page == browser_state.browser_context.pages[-1]:
+                    LOG.warning(
+                        "The extra page is the current page, closing it",
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        workflow_run_id=task.workflow_run_id,
+                    )
                 # close the extra page
                 await browser_state.browser_context.pages[-1].close()
     else:
