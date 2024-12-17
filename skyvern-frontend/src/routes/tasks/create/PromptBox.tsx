@@ -123,9 +123,7 @@ const exampleCases = [
 function PromptBox() {
   const navigate = useNavigate();
   const [prompt, setPrompt] = useState<string>("");
-  const [selectValue, setSelectValue] = useState(
-    observerFeatureEnabled ? "v2" : "v1",
-  );
+  const [selectValue, setSelectValue] = useState("v1");
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
 
@@ -241,16 +239,6 @@ function PromptBox() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent className="border-slate-500 bg-slate-elevation3">
-                  <CustomSelectItem value="v2" className="hover:bg-slate-800">
-                    <div className="space-y-2">
-                      <div>
-                        <SelectItemText>Skyvern 2.0 (Observer)</SelectItemText>
-                      </div>
-                      <div className="text-xs text-slate-400">
-                        best for complex tasks
-                      </div>
-                    </div>
-                  </CustomSelectItem>
                   <CustomSelectItem value="v1">
                     <div className="space-y-2">
                       <div>
@@ -258,6 +246,16 @@ function PromptBox() {
                       </div>
                       <div className="text-xs text-slate-400">
                         best for simple tasks
+                      </div>
+                    </div>
+                  </CustomSelectItem>
+                  <CustomSelectItem value="v2" className="hover:bg-slate-800">
+                    <div className="space-y-2">
+                      <div>
+                        <SelectItemText>Skyvern 2.0 (Observer)</SelectItemText>
+                      </div>
+                      <div className="text-xs text-slate-400">
+                        best for complex tasks
                       </div>
                     </div>
                   </CustomSelectItem>
