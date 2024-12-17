@@ -1881,18 +1881,17 @@ class AgentDB:
                 return ObserverCruise.model_validate(observer_cruise)
             raise NotFoundError(f"ObserverCruise {observer_cruise_id} not found")
 
-
     async def get_active_persistent_browser_session_ids(self, organization_id: str) -> List[str]:
         async with self.Session() as session:
             result = await session.execute(
-                select(PersistentBrowserSessionModel.persistent_browser_session_id)
-                .where(PersistentBrowserSessionModel.organization_id == organization_id, PersistentBrowserSessionModel.deleted_at.is_(None))
+                select(PersistentBrowserSessionModel.persistent_browser_session_id).where(
+                    PersistentBrowserSessionModel.organization_id == organization_id,
+                    PersistentBrowserSessionModel.deleted_at.is_(None),
+                )
             )
             return result.scalars().all()
 
-    async def delete_persistent_browser_session(
-        self, persistent_browser_session_id: str, organization_id: str
-    ) -> None:
+    async def delete_persistent_browser_session(self, persistent_browser_session_id: str, organization_id: str) -> None:
         async with self.Session() as session:
             stmt = delete(PersistentBrowserSessionModel).where(
                 and_(
@@ -1910,11 +1909,15 @@ class AgentDB:
         deleted_at: datetime.datetime,
     ) -> None:
         async with self.Session() as session:
-            stmt = update(PersistentBrowserSessionModel).where(
-                and_(
-                    PersistentBrowserSessionModel.persistent_browser_session_id == persistent_browser_session_id,
-                    PersistentBrowserSessionModel.organization_id == organization_id,
+            stmt = (
+                update(PersistentBrowserSessionModel)
+                .where(
+                    and_(
+                        PersistentBrowserSessionModel.persistent_browser_session_id == persistent_browser_session_id,
+                        PersistentBrowserSessionModel.organization_id == organization_id,
+                    )
                 )
-            ).values(deleted_at=deleted_at)
+                .values(deleted_at=deleted_at)
+            )
             await session.execute(stmt)
             await session.commit()

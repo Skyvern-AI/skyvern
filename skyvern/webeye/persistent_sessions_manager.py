@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
 import datetime
+from typing import Dict, List, Optional, Tuple
 
 import structlog
 from playwright.async_api import async_playwright
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyvern.forge.sdk.db.client import get_async_session
 from skyvern.forge.sdk.db.id import generate_persistent_browser_session_id
@@ -32,10 +31,9 @@ class PersistentSessionsManager:
         """Get all active session IDs for an organization."""
         async with get_async_session() as session:
             result = await session.execute(
-                select(PersistentBrowserSessionModel.persistent_browser_session_id)
-                .where(
+                select(PersistentBrowserSessionModel.persistent_browser_session_id).where(
                     PersistentBrowserSessionModel.organization_id == organization_id,
-                    PersistentBrowserSessionModel.deleted_at.is_(None)
+                    PersistentBrowserSessionModel.deleted_at.is_(None),
                 )
             )
             return [row[0] for row in result.all()]
@@ -52,13 +50,13 @@ class PersistentSessionsManager:
     ) -> Tuple[str, BrowserState]:
         """Create a new browser session for an organization and return its ID with the browser state."""
         session_id = generate_persistent_browser_session_id()
-        
+
         LOG.info(
             "Creating new browser session",
             organization_id=organization_id,
             session_id=session_id,
         )
-        
+
         # Create database record
         async with get_async_session() as session:
             db_session = PersistentBrowserSessionModel(
@@ -82,7 +80,7 @@ class PersistentSessionsManager:
             await self.close_session(organization_id, session_id)
 
         browser_context.on("close", lambda: asyncio.create_task(on_context_close()))
-        
+
         browser_state = BrowserState(
             pw=pw,
             browser_context=browser_context,
@@ -118,10 +116,9 @@ class PersistentSessionsManager:
             # Mark as deleted in database
             async with get_async_session() as session:
                 result = await session.execute(
-                    select(PersistentBrowserSessionModel)
-                    .where(
+                    select(PersistentBrowserSessionModel).where(
                         PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
-                        PersistentBrowserSessionModel.organization_id == organization_id
+                        PersistentBrowserSessionModel.organization_id == organization_id,
                     )
                 )
                 db_session = result.scalar_one_or_none()
@@ -148,14 +145,10 @@ class PersistentSessionsManager:
         instance = cls()
         async with get_async_session() as session:
             result = await session.execute(
-                select(PersistentBrowserSessionModel)
-                .where(PersistentBrowserSessionModel.deleted_at.is_(None))
+                select(PersistentBrowserSessionModel).where(PersistentBrowserSessionModel.deleted_at.is_(None))
             )
             active_sessions = result.scalars().all()
-            
+
             for db_session in active_sessions:
-                await instance.close_session(
-                    db_session.organization_id,
-                    db_session.persistent_browser_session_id
-                )
+                await instance.close_session(db_session.organization_id, db_session.persistent_browser_session_id)
         LOG.info("PersistentSessionsManager is closed")
