@@ -1,8 +1,8 @@
 """introduce persistent browser sessions
 
-Revision ID: 55cabeeb1590
+Revision ID: 282b0548d443
 Revises: 411dd89f3df9
-Create Date: 2024-12-17 17:23:53.236841+00:00
+Create Date: 2024-12-17 18:41:30.400052+00:00
 
 """
 
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "55cabeeb1590"
+revision: str = "282b0548d443"
 down_revision: Union[str, None] = "411dd89f3df9"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -29,6 +29,7 @@ def upgrade() -> None:
         sa.Column("runnable_id", sa.String(), nullable=False),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.Column("modified_at", sa.DateTime(), nullable=False),
+        sa.Column("deleted_at", sa.DateTime(), nullable=True),
         sa.ForeignKeyConstraint(
             ["organization_id"],
             ["organizations.organization_id"],
