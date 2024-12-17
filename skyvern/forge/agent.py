@@ -50,6 +50,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.validators import prepend_scheme_and_validate_url
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
@@ -73,8 +74,6 @@ from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
 from skyvern.webeye.utils.page import SkyvernFrame
-
-from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 
 LOG = structlog.get_logger()
 

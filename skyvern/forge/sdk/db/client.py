@@ -51,6 +51,7 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_workflow_run_output_parameter,
     convert_to_workflow_run_parameter,
 )
+from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverCruiseStatus, ObserverThought
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
@@ -75,7 +76,6 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.actions.models import AgentStepOutput
-from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 
 LOG = structlog.get_logger()
 
@@ -842,9 +842,7 @@ class AgentDB:
                     query = query.filter_by(organization_id=organization_id)
 
                 query = query.order_by(ArtifactModel.created_at.desc())
-                if artifacts := (
-                    await session.scalars(query)
-                ).all():
+                if artifacts := (await session.scalars(query)).all():
                     return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifacts]
                 else:
                     return []

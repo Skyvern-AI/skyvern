@@ -1,31 +1,15 @@
 import json
+
 import structlog
 
-import functools
-from typing import Callable
-
 from skyvern.forge import app
+from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.skyvern_json_encoder import SkyvernJSONLogEncoder
 from skyvern.forge.skyvern_log_encoder import SkyvernLogEncoder
-from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 
 LOG = structlog.get_logger()
 
-def with_skyvern_context(func: Callable):
-    """
-    Decorator to ensure the presence of a Skyvern context for a function.
-    If no context is available, the function will not execute.
-    """
-    @functools.wraps(func)
-    async def wrapper(*args, **kwargs):
-        context = skyvern_context.current()
-        if not context:
-            LOG.warning("No Skyvern context found, skipping function execution", func=func.__name__)
-            return
-        return await func(*args, **kwargs)
-
-    return wrapper
 
 def primary_key_from_log_entity_type(log_entity_type: LogEntityType) -> str:
     if log_entity_type == LogEntityType.STEP:
@@ -39,10 +23,11 @@ def primary_key_from_log_entity_type(log_entity_type: LogEntityType) -> str:
     else:
         raise ValueError(f"Invalid log entity type: {log_entity_type}")
 
-@with_skyvern_context
+
 async def save_step_logs(step_id: str) -> None:
-    log = skyvern_context.current().log
-    organization_id = skyvern_context.current().organization_id
+    context = skyvern_context.ensure_context()
+    log = context.log
+    organization_id = context.organization_id
 
     current_step_log = [entry for entry in log if entry.get("step_id", "") == step_id]
 
@@ -55,10 +40,10 @@ async def save_step_logs(step_id: str) -> None:
     )
 
 
-@with_skyvern_context
 async def save_task_logs(task_id: str) -> None:
-    log = skyvern_context.current().log
-    organization_id = skyvern_context.current().organization_id
+    context = skyvern_context.ensure_context()
+    log = context.log
+    organization_id = context.organization_id
 
     current_task_log = [entry for entry in log if entry.get("task_id", "") == task_id]
 
@@ -71,10 +56,10 @@ async def save_task_logs(task_id: str) -> None:
     )
 
 
-@with_skyvern_context
 async def save_workflow_run_logs(workflow_run_id: str) -> None:
-    log = skyvern_context.current().log
-    organization_id = skyvern_context.current().organization_id
+    context = skyvern_context.ensure_context()
+    log = context.log
+    organization_id = context.organization_id
 
     current_workflow_run_log = [entry for entry in log if entry.get("workflow_run_id", "") == workflow_run_id]
 
@@ -87,11 +72,13 @@ async def save_workflow_run_logs(workflow_run_id: str) -> None:
     )
 
 
-@with_skyvern_context
 async def save_workflow_run_block_logs(workflow_run_block_id: str) -> None:
-    log = skyvern_context.current().log
-    organization_id = skyvern_context.current().organization_id
-    current_workflow_run_block_log = [entry for entry in log if entry.get("workflow_run_block_id", "") == workflow_run_block_id]
+    context = skyvern_context.ensure_context()
+    log = context.log
+    organization_id = context.organization_id
+    current_workflow_run_block_log = [
+        entry for entry in log if entry.get("workflow_run_block_id", "") == workflow_run_block_id
+    ]
 
     await _save_log_artifacts(
         log=current_workflow_run_block_log,
@@ -106,7 +93,7 @@ async def _save_log_artifacts(
     log: list[dict],
     log_entity_type: LogEntityType,
     log_entity_id: str,
-    organization_id: str,
+    organization_id: str | None,
     step_id: str | None = None,
     task_id: str | None = None,
     workflow_run_id: str | None = None,
@@ -123,7 +110,6 @@ async def _save_log_artifacts(
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
         )
-
 
         if log_artifact:
             await app.ARTIFACT_MANAGER.update_artifact_data(
@@ -175,7 +161,7 @@ async def _save_log_artifacts(
                 artifact_type=ArtifactType.SKYVERN_LOG,
                 data=formatted_log.encode(),
             )
-    except Exception as e:
+    except Exception:
         LOG.error(
             "Failed to save log artifacts",
             log_entity_type=log_entity_type,
@@ -187,4 +173,3 @@ async def _save_log_artifacts(
             workflow_run_block_id=workflow_run_block_id,
             exc_info=True,
         )
-

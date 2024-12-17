@@ -1,8 +1,8 @@
 import datetime
 import hashlib
 import uuid
-from typing import Annotated, Any
 from enum import Enum
+from typing import Annotated, Any
 
 import structlog
 import yaml
@@ -474,12 +474,14 @@ class EntityType(str, Enum):
     WORKFLOW_RUN = "workflow_run"
     WORKFLOW_RUN_BLOCK = "workflow_run_block"
 
+
 entity_type_to_param = {
     EntityType.STEP: "step_id",
     EntityType.TASK: "task_id",
     EntityType.WORKFLOW_RUN: "workflow_run_id",
     EntityType.WORKFLOW_RUN_BLOCK: "workflow_run_block_id",
 }
+
 
 @base_router.get(
     "/{entity_type}/{entity_id}/artifacts",
@@ -499,15 +501,15 @@ async def get_agent_entity_artifacts(
 ) -> Response:
     """
     Get all artifacts for an entity (step, task, workflow_run).
-    
+
     Args:
         entity_type: Type of entity to fetch artifacts for
         entity_id: ID of the entity
         current_org: Current organization from auth
-    
+
     Returns:
         List of artifacts for the entity
-    
+
     Raises:
         HTTPException: If entity is not supported
     """
@@ -525,7 +527,7 @@ async def get_agent_entity_artifacts(
         entity_type_to_param[entity_type]: entity_id,
     }
 
-    artifacts = await app.DATABASE.get_artifacts_by_entity_id(**params)
+    artifacts = await app.DATABASE.get_artifacts_by_entity_id(**params)  # type: ignore
 
     if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
         signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)

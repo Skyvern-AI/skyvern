@@ -1,7 +1,6 @@
 import asyncio
 import time
 from collections import defaultdict
-from typing import Literal
 
 import structlog
 
@@ -13,14 +12,6 @@ from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverThought
 
 LOG = structlog.get_logger(__name__)
 
-PRIMARY_KEY = Literal[
-    "task_id",
-    "observer_thought_id",
-    "observer_cruise_id",
-    "step_id",
-    "workflow_run_id",
-    "workflow_run_block_id",
-]
 
 class ArtifactManager:
     # task_id -> list of aio_tasks for uploading artifacts
@@ -117,7 +108,7 @@ class ArtifactManager:
             organization_id=organization_id,
             data=data,
             path=path,
-        ) 
+        )
 
     async def create_observer_thought_artifact(
         self,
@@ -211,7 +202,7 @@ class ArtifactManager:
         artifact_id: str | None,
         organization_id: str | None,
         data: bytes,
-        primary_key: PRIMARY_KEY = "task_id",
+        primary_key: str = "task_id",
     ) -> None:
         if not artifact_id or not organization_id:
             return None
@@ -224,7 +215,6 @@ class ArtifactManager:
         if not artifact[primary_key]:
             raise ValueError(f"{primary_key} is required to update artifact data.")
         self.upload_aiotasks_map[artifact[primary_key]].append(aio_task)
-
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         return await app.STORAGE.retrieve_artifact(artifact)
