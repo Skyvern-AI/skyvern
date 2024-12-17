@@ -358,7 +358,47 @@ async def handle_click_action(
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
     if action.download:
-        results = await handle_click_to_download_file_action(action, page, scraped_page, task, step)
+        # get the initial page count
+        browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
+        initial_page_count = 0
+        if browser_state is not None:
+            initial_page_count = len(browser_state.browser_context.pages if browser_state.browser_context else [])
+        LOG.info(
+            "Page count before download file action",
+            initial_page_count=initial_page_count,
+            task_id=task.task_id,
+            step_id=step.step_id,
+            workflow_run_id=task.workflow_run_id,
+        )
+        try:
+            results = await handle_click_to_download_file_action(action, page, scraped_page, task, step)
+        except Exception:
+            raise
+        finally:
+            # get the page count after download
+            page_count_after_download = 0
+            if browser_state is not None:
+                page_count_after_download = len(
+                    browser_state.browser_context.pages if browser_state.browser_context else []
+                )
+
+            LOG.info(
+                "Page count after download file action",
+                initial_page_count=initial_page_count,
+                page_count_after_download=page_count_after_download,
+                task_id=task.task_id,
+                step_id=step.step_id,
+                workflow_run_id=task.workflow_run_id,
+            )
+            if page_count_after_download > initial_page_count and browser_state and browser_state.browser_context:
+                LOG.info(
+                    "Extra page opened after download, closing it",
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    workflow_run_id=task.workflow_run_id,
+                )
+                # close the extra page
+                await browser_state.browser_context.pages[-1].close()
     else:
         results = await chain_click(
             task,
