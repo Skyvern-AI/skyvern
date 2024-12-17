@@ -10,6 +10,8 @@ export const ArtifactType = {
   LLMPrompt: "llm_prompt",
   LLMRequest: "llm_request",
   HTMLScrape: "html_scrape",
+  SkyvernLog: "skyvern_log",
+  SkyvernLogRaw: "skyvern_log_raw",
 } as const;
 
 export type ArtifactType = (typeof ArtifactType)[keyof typeof ArtifactType];

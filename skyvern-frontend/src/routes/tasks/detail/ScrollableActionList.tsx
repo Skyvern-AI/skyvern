@@ -11,7 +11,6 @@ import {
 } from "@radix-ui/react-icons";
 import { useQueryClient } from "@tanstack/react-query";
 import { ReactNode, useRef } from "react";
-import { useParams } from "react-router-dom";
 import { ActionTypePill } from "./ActionTypePill";
 
 type Props = {
@@ -33,7 +32,6 @@ function ScrollableActionList({
   showStreamOption,
   taskDetails,
 }: Props) {
-  const { taskId } = useParams();
   const queryClient = useQueryClient();
   const credentialGetter = useCredentialGetter();
   const refs = useRef<Array<HTMLDivElement | null>>(
@@ -65,11 +63,11 @@ function ScrollableActionList({
           onClick={() => onActiveIndexChange(i)}
           onMouseEnter={() => {
             queryClient.prefetchQuery({
-              queryKey: ["task", taskId, "steps", action.stepId, "artifacts"],
+              queryKey: ["step", action.stepId, "artifacts"],
               queryFn: async () => {
                 const client = await getClient(credentialGetter);
                 return client
-                  .get(`/tasks/${taskId}/steps/${action.stepId}/artifacts`)
+                  .get(`/step/${action.stepId}/artifacts`)
                   .then((response) => response.data);
               },
             });

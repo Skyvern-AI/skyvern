@@ -1,12 +1,11 @@
 import asyncio
 import time
 from collections import defaultdict
-from typing import Literal
 
 import structlog
 
 from skyvern.forge import app
-from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverThought
@@ -78,6 +77,35 @@ class ArtifactManager:
             step_id=step.step_id,
             task_id=step.task_id,
             organization_id=step.organization_id,
+            data=data,
+            path=path,
+        )
+
+    async def create_log_artifact(
+        self,
+        log_entity_type: LogEntityType,
+        log_entity_id: str,
+        artifact_type: ArtifactType,
+        step_id: str | None = None,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
+        data: bytes | None = None,
+        path: str | None = None,
+    ) -> str:
+        artifact_id = generate_artifact_id()
+        uri = app.STORAGE.build_log_uri(log_entity_type, log_entity_id, artifact_type)
+        return await self._create_artifact(
+            aio_task_primary_key=log_entity_id,
+            artifact_id=artifact_id,
+            artifact_type=artifact_type,
+            uri=uri,
+            step_id=step_id,
+            task_id=task_id,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
             data=data,
             path=path,
         )
@@ -174,7 +202,7 @@ class ArtifactManager:
         artifact_id: str | None,
         organization_id: str | None,
         data: bytes,
-        primary_key: Literal["task_id", "observer_thought_id", "observer_cruise_id"] = "task_id",
+        primary_key: str = "task_id",
     ) -> None:
         if not artifact_id or not organization_id:
             return None
@@ -183,18 +211,10 @@ class ArtifactManager:
             return
         # Fire and forget
         aio_task = asyncio.create_task(app.STORAGE.store_artifact(artifact, data))
-        if primary_key == "task_id":
-            if not artifact.task_id:
-                raise ValueError("Task ID is required to update artifact data.")
-            self.upload_aiotasks_map[artifact.task_id].append(aio_task)
-        elif primary_key == "observer_thought_id":
-            if not artifact.observer_thought_id:
-                raise ValueError("Observer Thought ID is required to update artifact data.")
-            self.upload_aiotasks_map[artifact.observer_thought_id].append(aio_task)
-        elif primary_key == "observer_cruise_id":
-            if not artifact.observer_cruise_id:
-                raise ValueError("Observer Cruise ID is required to update artifact data.")
-            self.upload_aiotasks_map[artifact.observer_cruise_id].append(aio_task)
+
+        if not artifact[primary_key]:
+            raise ValueError(f"{primary_key} is required to update artifact data.")
+        self.upload_aiotasks_map[artifact[primary_key]].append(aio_task)
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         return await app.STORAGE.retrieve_artifact(artifact)

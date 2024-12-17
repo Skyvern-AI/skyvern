@@ -50,6 +50,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.validators import prepend_scheme_and_validate_url
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
@@ -1783,6 +1784,9 @@ class ForgeAgent:
             step_id=step.step_id,
             diff=update_comparison,
         )
+
+        await save_step_logs(step.step_id)
+
         return await app.DATABASE.update_step(
             task_id=step.task_id,
             step_id=step.step_id,
@@ -1815,6 +1819,7 @@ class ForgeAgent:
             for key, value in updates.items()
             if getattr(task, key) != value
         }
+        await save_task_logs(task.task_id)
         LOG.info("Updating task in db", task_id=task.task_id, diff=update_comparison)
         return await app.DATABASE.update_task(
             task.task_id,
