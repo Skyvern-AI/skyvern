@@ -19,4 +19,13 @@ if (!artifactApiBaseUrl) {
   console.warn("artifactApiBaseUrl environment variable was not set");
 }
 
-export { apiBaseUrl, environment, envCredential, artifactApiBaseUrl };
+const observerEnabled = import.meta.env.VITE_OBSERVER_ENABLED as string;
+const observerFeatureEnabled = observerEnabled === "true";
+
+export {
+  apiBaseUrl,
+  environment,
+  envCredential,
+  artifactApiBaseUrl,
+  observerFeatureEnabled,
+};
