@@ -237,14 +237,14 @@ function PromptBox() {
             />
             {observerFeatureEnabled && (
               <Select value={selectValue} onValueChange={setSelectValue}>
-                <SelectTrigger className="w-32 focus:ring-0">
+                <SelectTrigger className="w-48 focus:ring-0">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent className="border-slate-500 bg-slate-elevation3">
                   <CustomSelectItem value="v2" className="hover:bg-slate-800">
                     <div className="space-y-2">
                       <div>
-                        <SelectItemText>Observer</SelectItemText>
+                        <SelectItemText>Skyvern 2.0 (Observer)</SelectItemText>
                       </div>
                       <div className="text-xs text-slate-400">
                         best for complex tasks
@@ -254,7 +254,7 @@ function PromptBox() {
                   <CustomSelectItem value="v1">
                     <div className="space-y-2">
                       <div>
-                        <SelectItemText>Task</SelectItemText>
+                        <SelectItemText>Skyvern 1.0 (Tasks)</SelectItemText>
                       </div>
                       <div className="text-xs text-slate-400">
                         best for simple tasks
