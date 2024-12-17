@@ -666,12 +666,18 @@ async def get_workflow_run_events(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
     )
-    workflow_run_events = [
-        WorkflowRunEvent(
+    workflow_run_events: list[WorkflowRunEvent] = []
+    for task in tasks:
+        block_type = BlockType.TASK
+        if not task.navigation_goal and task.data_extraction_goal:
+            block_type = BlockType.EXTRACTION
+        elif task.navigation_goal and not task.data_extraction_goal:
+            block_type = BlockType.NAVIGATION
+        event = WorkflowRunEvent(
             type=WorkflowRunEventType.block,
             block=WorkflowRunBlock(
                 workflow_run_id=workflow_run_id,
-                block_type=BlockType.TASK,
+                block_type=block_type,
                 label=task.title,
                 title=task.title,
                 url=task.url,
@@ -687,8 +693,7 @@ async def get_workflow_run_events(
             created_at=task.created_at,
             modified_at=task.modified_at,
         )
-        for task in tasks
-    ]
+        workflow_run_events.append(event)
     # get all the actions for all the tasks
     actions = await app.DATABASE.get_tasks_actions(
         [task.task_id for task in tasks], organization_id=current_org.organization_id
