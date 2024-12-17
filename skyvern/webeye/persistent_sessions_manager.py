@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import uuid
 from typing import Dict, List, Optional, Tuple
 
 import structlog
 from playwright.async_api import async_playwright
 
+from skyvern.forge.sdk.db.id import generate_persistent_browser_session_id
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.webeye.browser_factory import BrowserContextFactory, BrowserState
 from skyvern.webeye.models import BrowserSessionResponse
@@ -37,7 +37,7 @@ class PersistentSessionsManager:
         url: str | None = None,
     ) -> Tuple[str, BrowserState]:
         """Create a new browser session for an organization and return its ID with the browser state."""
-        session_id = str(uuid.uuid4())
+        session_id = generate_persistent_browser_session_id()
         
         LOG.info(
             "Creating new browser session",
