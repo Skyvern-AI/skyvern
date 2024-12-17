@@ -38,7 +38,7 @@ SECONDARY_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
 WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
 WORKFLOW_SERVICE = WorkflowService()
 AGENT_FUNCTION = AgentFunction()
-PERSISTENT_SESSIONS_MANAGER = PersistentSessionsManager()
+PERSISTENT_SESSIONS_MANAGER = PersistentSessionsManager(database=DATABASE)
 scrape_exclude: ScrapeExcludeFunc | None = None
 authentication_function: Callable[[str], Awaitable[Organization]] | None = None
 setup_api_app: Callable[[FastAPI], None] | None = None
