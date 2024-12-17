@@ -46,6 +46,7 @@ BITWARDEN_CREDIT_CARD_DATA_PARAMETER_PREFIX = "bccd"
 TASK_GENERATION_PREFIX = "tg"
 OBSERVER_CRUISE_ID = "oc"
 OBSERVER_THOUGHT_ID = "ot"
+PERSISTENT_BROWSER_SESSION_ID = "pbs"
 
 
 def generate_workflow_id() -> str:
@@ -151,6 +152,11 @@ def generate_observer_cruise_id() -> str:
 def generate_observer_thought_id() -> str:
     int_id = generate_id()
     return f"{OBSERVER_THOUGHT_ID}_{int_id}"
+
+
+def generate_persistent_browser_session_id() -> str:
+    int_id = generate_id()
+    return f"{PERSISTENT_BROWSER_SESSION_ID}_{int_id}"
 
 
 def generate_id() -> int:
