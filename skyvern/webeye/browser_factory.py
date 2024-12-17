@@ -63,10 +63,9 @@ def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: 
 
 def set_download_file_listener(browser_context: BrowserContext, **kwargs: Any) -> None:
     async def listen_to_download(download: Download) -> None:
+        workflow_run_id = kwargs.get("workflow_run_id")
+        task_id = kwargs.get("task_id")
         try:
-            workflow_run_id = kwargs.get("workflow_run_id")
-            task_id = kwargs.get("task_id")
-
             async with asyncio.timeout(BROWSER_DOWNLOAD_TIMEOUT):
                 file_path = await download.path()
                 if file_path.suffix:
