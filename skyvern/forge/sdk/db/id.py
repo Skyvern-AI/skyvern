@@ -48,6 +48,7 @@ OBSERVER_CRUISE_ID = "oc"
 OBSERVER_THOUGHT_ID = "ot"
 PERSISTENT_BROWSER_SESSION_ID = "pbs"
 
+
 def generate_workflow_id() -> str:
     int_id = generate_id()
     return f"{WORKFLOW_PREFIX}_{int_id}"
