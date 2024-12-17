@@ -103,11 +103,11 @@ class DomUtils {
     // Inline elements with font-size: 0px; will declare a height of zero, even if a child with
     // non-zero font-size contains text.
     let isInlineZeroHeight = function () {
-      const elementComputedStyle = window.getComputedStyle(element, null);
+      const elementComputedStyle = getElementComputedStyle(element, null);
       const isInlineZeroFontSize =
         0 ===
-          elementComputedStyle.getPropertyValue("display").indexOf("inline") &&
-        elementComputedStyle.getPropertyValue("font-size") === "0px";
+          elementComputedStyle?.getPropertyValue("display").indexOf("inline") &&
+        elementComputedStyle?.getPropertyValue("font-size") === "0px";
       // Override the function to return this value for the rest of this context.
       isInlineZeroHeight = () => isInlineZeroFontSize;
       return isInlineZeroFontSize;
@@ -119,7 +119,10 @@ class DomUtils {
       let computedStyle;
       if ((clientRect.width === 0 || clientRect.height === 0) && testChildren) {
         for (const child of Array.from(element.children)) {
-          computedStyle = window.getComputedStyle(child, null);
+          computedStyle = getElementComputedStyle(child, null);
+          if (!computedStyle) {
+            continue;
+          }
           // Ignore child elements which are not floated and not absolutely positioned for parent
           // elements with zero width/height, as long as the case described at isInlineZeroHeight
           // does not apply.
@@ -157,7 +160,10 @@ class DomUtils {
           continue;
 
         // eliminate invisible elements (see test_harnesses/visibility_test.html)
-        computedStyle = window.getComputedStyle(element, null);
+        computedStyle = getElementComputedStyle(element, null);
+        if (!computedStyle) {
+          continue;
+        }
         if (computedStyle.getPropertyValue("visibility") !== "visible")
           continue;
 
@@ -173,6 +179,7 @@ class DomUtils {
     const style = getComputedStyle(box);
     const rect = box.getBoundingClientRect();
     if (
+      style &&
       style.position === "static" &&
       !/content|paint|strict/.test(style.contain || "")
     ) {
@@ -370,7 +377,7 @@ function expectHitTarget(hitPoint, targetElement) {
       elements[0] &&
       parentElementOrShadowHost(singleElement) === elements[0]
     ) {
-      const style = window.getComputedStyle(singleElement);
+      const style = getElementComputedStyle(singleElement);
       if (style?.display === "contents") {
         // Workaround a case where elementsFromPoint misses the inner-most element with display:contents.
         // https://bugs.chromium.org/p/chromium/issues/detail?id=1342092
@@ -675,8 +682,8 @@ function isInteractable(element) {
     tagName === "li" ||
     tagName === "p"
   ) {
-    const computedStyle = window.getComputedStyle(element);
-    if (computedStyle.cursor === "pointer") {
+    const elementCursor = getElementComputedStyle(element)?.cursor;
+    if (elementCursor === "pointer") {
       return true;
     }
     // FIXME: hardcode to fix the bug about hover style now
@@ -685,7 +692,7 @@ function isInteractable(element) {
     }
 
     // auto for <a> is equal to pointer for <a>
-    if (tagName == "a" && computedStyle.cursor === "auto") {
+    if (tagName == "a" && elementCursor === "auto") {
       return true;
     }
   }
@@ -709,7 +716,10 @@ function isScrollable(element) {
 }
 
 function isScrollableOverflow(element) {
-  const style = window.getComputedStyle(element);
+  const style = getElementComputedStyle(element);
+  if (!style) {
+    return false;
+  }
   return (
     style.overflow === "auto" ||
     style.overflow === "scroll" ||
@@ -871,11 +881,14 @@ const checkStringIncludeRequire = (str) => {
 };
 
 const checkRequiredFromStyle = (element) => {
-  const afterCustom = getElementComputedStyle(element, "::after")
-    .getPropertyValue("content")
-    .replace(/"/g, "");
-  if (checkStringIncludeRequire(afterCustom)) {
-    return true;
+  const afterCustomStyle = getElementComputedStyle(element, "::after");
+  if (afterCustomStyle) {
+    const afterCustom = afterCustomStyle
+      .getPropertyValue("content")
+      .replace(/"/g, "");
+    if (checkStringIncludeRequire(afterCustom)) {
+      return true;
+    }
   }
 
   if (!element.className || typeof element.className !== "string") {
@@ -903,15 +916,19 @@ function getElementContext(element, stopped_element) {
   }
 
   // sometimes '*' shows as an after custom style
-  const afterCustom = getElementComputedStyle(element, "::after")
-    .getPropertyValue("content")
-    .replace(/"/g, "");
-  if (
-    afterCustom.toLowerCase().includes("*") ||
-    afterCustom.toLowerCase().includes("require")
-  ) {
-    fullContext.push(afterCustom);
+  const afterCustomStyle = getElementComputedStyle(element, "::after");
+  if (afterCustomStyle) {
+    const afterCustom = afterCustomStyle
+      .getPropertyValue("content")
+      .replace(/"/g, "");
+    if (
+      afterCustom.toLowerCase().includes("*") ||
+      afterCustom.toLowerCase().includes("require")
+    ) {
+      fullContext.push(afterCustom);
+    }
   }
+
   if (element.childNodes.length === 0) {
     return fullContext.join(";");
   }
@@ -1823,10 +1840,10 @@ function scrollToNextPage(draw_boxes) {
 
 function isWindowScrollable() {
   // Check if the body's overflow style is set to hidden
-  const bodyOverflow = window.getComputedStyle(document.body).overflow;
-  const htmlOverflow = window.getComputedStyle(
+  const bodyOverflow = getElementComputedStyle(document.body)?.overflow;
+  const htmlOverflow = getElementComputedStyle(
     document.documentElement,
-  ).overflow;
+  )?.overflow;
 
   // Check if the document height is greater than the window height
   const isScrollable =
@@ -1939,8 +1956,8 @@ if (window.globalObserverForDOMIncrement === undefined) {
           // TODO: need to confirm that elemnent is hidden previously
           const node = mutation.target;
           if (node.nodeType === Node.TEXT_NODE) continue;
-          const newStyle = window.getComputedStyle(node);
-          const newDisplay = newStyle.display;
+          const newStyle = getElementComputedStyle(node);
+          const newDisplay = newStyle?.display;
           if (newDisplay !== "none") {
             window.globalOneTimeIncrementElements.push({
               targetNode: node,
@@ -1956,8 +1973,8 @@ if (window.globalObserverForDOMIncrement === undefined) {
             !isClassNameIncludesHidden(mutation.oldValue)
           )
             continue;
-          const newStyle = window.getComputedStyle(node);
-          const newDisplay = newStyle.display;
+          const newStyle = getElementComputedStyle(node);
+          const newDisplay = newStyle?.display;
           if (newDisplay !== "none") {
             window.globalOneTimeIncrementElements.push({
               targetNode: node,
