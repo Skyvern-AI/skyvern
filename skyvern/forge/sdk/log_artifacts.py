@@ -3,7 +3,6 @@ import json
 import structlog
 
 from skyvern.config import settings
-
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 from skyvern.forge.sdk.core import skyvern_context
@@ -11,6 +10,7 @@ from skyvern.forge.skyvern_json_encoder import SkyvernJSONLogEncoder
 from skyvern.forge.skyvern_log_encoder import SkyvernLogEncoder
 
 LOG = structlog.get_logger()
+
 
 def primary_key_from_log_entity_type(log_entity_type: LogEntityType) -> str:
     if log_entity_type == LogEntityType.STEP:
