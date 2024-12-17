@@ -30,6 +30,7 @@ from skyvern.forge.sdk.db.id import (
     generate_org_id,
     generate_organization_auth_token_id,
     generate_output_parameter_id,
+    generate_persistent_browser_session_id,
     generate_step_id,
     generate_task_generation_id,
     generate_task_id,
@@ -39,7 +40,6 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_permanent_id,
     generate_workflow_run_block_id,
     generate_workflow_run_id,
-    generate_persistent_browser_session_id,
 )
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 
@@ -541,6 +541,7 @@ class ObserverThoughtModel(Base):
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
 
 class PersistentBrowserSessionModel(Base):
     __tablename__ = "persistent_browser_sessions"
