@@ -726,7 +726,7 @@ async def get_workflow_run_events(
                     modified_at=thought.modified_at,
                 )
             )
-    workflow_run_events.sort(key=lambda x: x.created_at, reverse=True)
+    workflow_run_events.sort(key=lambda x: x.created_at)
     return workflow_run_events
 
 
