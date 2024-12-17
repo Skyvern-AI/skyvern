@@ -1,5 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import { ObserverCruise, TaskGenerationApiResponse } from "@/api/types";
+import { TaskGenerationApiResponse } from "@/api/types";
 import img from "@/assets/promptBoxBg.png";
 import { CartIcon } from "@/components/icons/CartIcon";
 import { GraphIcon } from "@/components/icons/GraphIcon";
@@ -7,19 +7,9 @@ import { InboxIcon } from "@/components/icons/InboxIcon";
 import { MessageIcon } from "@/components/icons/MessageIcon";
 import { TranslateIcon } from "@/components/icons/TranslateIcon";
 import { TrophyIcon } from "@/components/icons/TrophyIcon";
-import { Button } from "@/components/ui/button";
-import {
-  CustomSelectItem,
-  Select,
-  SelectContent,
-  SelectItemText,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { observerFeatureEnabled } from "@/util/env";
 import {
   FileTextIcon,
   GearIcon,
@@ -28,11 +18,10 @@ import {
   PlusIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { ToastAction } from "@radix-ui/react-toast";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { stringify as convertToYAML } from "yaml";
 
 function createTemplateTaskFromTaskGenerationParameters(
@@ -123,52 +112,8 @@ const exampleCases = [
 function PromptBox() {
   const navigate = useNavigate();
   const [prompt, setPrompt] = useState<string>("");
-  const [selectValue, setSelectValue] = useState(
-    observerFeatureEnabled ? "v2" : "v1",
-  );
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
-
-  const startObserverCruiseMutation = useMutation({
-    mutationFn: async (prompt: string) => {
-      const client = await getClient(credentialGetter);
-      return client.post<{ user_prompt: string }, { data: ObserverCruise }>(
-        "/cruise",
-        { user_prompt: prompt },
-      );
-    },
-    onSuccess: (response) => {
-      toast({
-        variant: "success",
-        title: "Workflow Run Created",
-        description: `Workflow run created successfully.`,
-        action: (
-          <ToastAction altText="View">
-            <Button asChild>
-              <Link
-                to={`/workflows/${response.data.workflow_permanent_id}/${response.data.workflow_run_id}`}
-              >
-                View
-              </Link>
-            </Button>
-          </ToastAction>
-        ),
-      });
-      queryClient.invalidateQueries({
-        queryKey: ["workflowRuns"],
-      });
-      queryClient.invalidateQueries({
-        queryKey: ["workflows"],
-      });
-    },
-    onError: (error: AxiosError) => {
-      toast({
-        variant: "destructive",
-        title: "Error creating workflow run from prompt",
-        description: error.message,
-      });
-    },
-  });
 
   const getTaskFromPromptMutation = useMutation({
     mutationFn: async (prompt: string) => {
@@ -235,48 +180,14 @@ function PromptBox() {
               placeholder="Enter your prompt..."
               rows={1}
             />
-            {observerFeatureEnabled && (
-              <Select value={selectValue} onValueChange={setSelectValue}>
-                <SelectTrigger className="w-32 focus:ring-0">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent className="border-slate-500 bg-slate-elevation3">
-                  <CustomSelectItem value="v2" className="hover:bg-slate-800">
-                    <div className="space-y-2">
-                      <div>
-                        <SelectItemText>Observer</SelectItemText>
-                      </div>
-                      <div className="text-xs text-slate-400">
-                        best for complex tasks
-                      </div>
-                    </div>
-                  </CustomSelectItem>
-                  <CustomSelectItem value="v1">
-                    <div className="space-y-2">
-                      <div>
-                        <SelectItemText>Task</SelectItemText>
-                      </div>
-                      <div className="text-xs text-slate-400">
-                        best for simple tasks
-                      </div>
-                    </div>
-                  </CustomSelectItem>
-                </SelectContent>
-              </Select>
-            )}
-            <div className="flex items-center">
-              {startObserverCruiseMutation.isPending ||
-              getTaskFromPromptMutation.isPending ||
+            <div className="h-full">
+              {getTaskFromPromptMutation.isPending ||
               saveTaskMutation.isPending ? (
                 <ReloadIcon className="h-6 w-6 animate-spin" />
               ) : (
                 <PaperPlaneIcon
                   className="h-6 w-6 cursor-pointer"
                   onClick={async () => {
-                    if (observerFeatureEnabled && selectValue === "v2") {
-                      startObserverCruiseMutation.mutate(prompt);
-                      return;
-                    }
                     const taskGenerationResponse =
                       await getTaskFromPromptMutation.mutateAsync(prompt);
                     await saveTaskMutation.mutateAsync(taskGenerationResponse);

@@ -233,15 +233,3 @@ export type ActionsApiResponse = {
   intention: string | null;
   response: string | null;
 };
-
-export type ObserverCruise = {
-  observer_cruise_id: string;
-  status: Status;
-  workflow_run_id: string | null;
-  workflow_id: string | null;
-  workflow_permanent_id: string | null;
-  prompt: string | null;
-  url: string | null;
-  created_at: string;
-  modified_at: string;
-};
