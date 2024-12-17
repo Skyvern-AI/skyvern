@@ -1864,6 +1864,7 @@ class AgentDB:
         self,
         workflow_run_id: str | None = None,
         workflow_id: str | None = None,
+        workflow_permanent_id: str | None = None,
         prompt: str | None = None,
         url: str | None = None,
         organization_id: str | None = None,
@@ -1872,6 +1873,7 @@ class AgentDB:
             new_observer_cruise = ObserverCruiseModel(
                 workflow_run_id=workflow_run_id,
                 workflow_id=workflow_id,
+                workflow_permanent_id=workflow_permanent_id,
                 prompt=prompt,
                 url=url,
                 organization_id=organization_id,
@@ -1886,6 +1888,7 @@ class AgentDB:
         observer_cruise_id: str,
         workflow_run_id: str | None = None,
         workflow_id: str | None = None,
+        workflow_permanent_id: str | None = None,
         workflow_run_block_id: str | None = None,
         user_input: str | None = None,
         observation: str | None = None,
@@ -1898,6 +1901,7 @@ class AgentDB:
                 observer_cruise_id=observer_cruise_id,
                 workflow_run_id=workflow_run_id,
                 workflow_id=workflow_id,
+                workflow_permanent_id=workflow_permanent_id,
                 workflow_run_block_id=workflow_run_block_id,
                 user_input=user_input,
                 observation=observation,
@@ -1916,6 +1920,7 @@ class AgentDB:
         status: ObserverCruiseStatus | None = None,
         workflow_run_id: str | None = None,
         workflow_id: str | None = None,
+        workflow_permanent_id: str | None = None,
         url: str | None = None,
         prompt: str | None = None,
         organization_id: str | None = None,
@@ -1935,6 +1940,8 @@ class AgentDB:
                     observer_cruise.workflow_run_id = workflow_run_id
                 if workflow_id:
                     observer_cruise.workflow_id = workflow_id
+                if workflow_permanent_id:
+                    observer_cruise.workflow_permanent_id = workflow_permanent_id
                 if url:
                     observer_cruise.url = url
                 if prompt:

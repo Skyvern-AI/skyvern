@@ -23,6 +23,7 @@ class ObserverCruise(BaseModel):
     organization_id: str | None = None
     workflow_run_id: str | None = None
     workflow_id: str | None = None
+    workflow_permanent_id: str | None = None
     prompt: str | None = None
     url: HttpUrl | None = None
 
@@ -39,6 +40,7 @@ class ObserverThought(BaseModel):
     workflow_run_id: str | None = None
     workflow_run_block_id: str | None = None
     workflow_id: str | None = None
+    workflow_permanent_id: str | None = None
     user_input: str | None = None
     observation: str | None = None
     thought: str | None = None

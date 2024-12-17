@@ -172,9 +172,9 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
             )
 
-            failure_reason = "Setup up workflow failed due to an unexpected exception"
+            failure_reason = f"Setup workflow failed due to an unexpected exception: {str(e)}"
             if isinstance(e, SkyvernException):
-                failure_reason = f"Setup workflow failed due to an SkyvernException({e.__class__.__name__})"
+                failure_reason = f"Setup workflow failed due to an SkyvernException({e.__class__.__name__}): {str(e)}"
 
             await self.mark_workflow_run_as_failed(
                 workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason

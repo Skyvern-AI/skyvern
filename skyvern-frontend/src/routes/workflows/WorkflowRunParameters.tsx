@@ -27,6 +27,10 @@ function WorkflowRunParameters() {
     (parameter) => parameter.parameter_type === "workflow",
   );
 
+  const proxyLocation = location.state
+    ? (location.state.proxyLocation as ProxyLocation)
+    : null;
+
   const initialValues = location.state?.data
     ? location.state.data
     : workflowParameters?.reduce(
@@ -95,7 +99,10 @@ function WorkflowRunParameters() {
         initialValues={initialValues}
         workflowParameters={workflowParameters}
         initialSettings={{
-          proxyLocation: workflow.proxy_location ?? ProxyLocation.Residential,
+          proxyLocation:
+            proxyLocation ??
+            workflow.proxy_location ??
+            ProxyLocation.Residential,
           webhookCallbackUrl: workflow.webhook_callback_url ?? "",
         }}
       />

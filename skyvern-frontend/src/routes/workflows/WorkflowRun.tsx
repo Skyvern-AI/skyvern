@@ -30,6 +30,7 @@ import { statusIsFinalized, statusIsRunningOrQueued } from "../tasks/types";
 import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "./hooks/useWorkflowRunQuery";
 import { cn } from "@/util/utils";
+import { ProxyLocation } from "@/api/types";
 
 function WorkflowRun() {
   const { workflowRunId, workflowPermanentId } = useParams();
@@ -79,6 +80,8 @@ function WorkflowRun() {
   const workflowRunIsFinalized = workflowRun && statusIsFinalized(workflowRun);
 
   const parameters = workflowRun?.parameters ?? {};
+  const proxyLocation =
+    workflowRun?.proxy_location ?? ProxyLocation.Residential;
 
   const title = workflowIsLoading ? (
     <Skeleton className="h-9 w-48" />
@@ -189,6 +192,7 @@ function WorkflowRun() {
                 to={`/workflows/${workflowPermanentId}/run`}
                 state={{
                   data: parameters,
+                  proxyLocation,
                 }}
               >
                 <PlayIcon className="mr-2 h-4 w-4" />
