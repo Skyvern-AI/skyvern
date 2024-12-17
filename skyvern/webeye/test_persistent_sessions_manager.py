@@ -5,6 +5,10 @@ import pytest
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
 
+import datetime
+from sqlalchemy import select
+from skyvern.forge.sdk.db.models import PersistentBrowserSessionModel
+
 
 class MockPage(AsyncMock):
     def __init__(self, *args, **kwargs):
@@ -100,16 +104,31 @@ async def sessions_manager(mock_playwright, mock_browser_state_class):
     await manager.close()
 
 
-async def test_create_session(sessions_manager):
+@pytest.fixture
+async def db_session():
+    async with get_async_session() as session:
+        yield session
+
+
+async def test_create_session(sessions_manager, db_session):
     org_id = "test_org"
     session_id, browser_state = await sessions_manager.create_session(
         organization_id=org_id,
         url="https://example.com"
     )
     
+    # Check browser state
     assert isinstance(browser_state, BrowserState)
-    assert session_id in sessions_manager.sessions[org_id]
-    assert len(sessions_manager.get_active_session_ids(org_id)) == 1
+    assert session_id in sessions_manager._browser_states
+    
+    # Check database record
+    result = await db_session.execute(
+        select(PersistentBrowserSessionModel)
+        .where(PersistentBrowserSessionModel.persistent_browser_session_id == session_id)
+    )
+    db_session = result.scalar_one()
+    assert db_session.organization_id == org_id
+    assert db_session.deleted_at is None
 
 
 async def test_get_session(sessions_manager):
@@ -142,7 +161,7 @@ async def test_get_active_session_ids(sessions_manager):
     assert len(sessions_manager.get_active_session_ids("non_existent_org")) == 0
 
 
-async def test_close_session(sessions_manager):
+async def test_close_session(sessions_manager, db_session):
     org_id = "test_org"
     session_id, browser_state = await sessions_manager.create_session(
         organization_id=org_id
@@ -150,9 +169,16 @@ async def test_close_session(sessions_manager):
     
     await sessions_manager.close_session(org_id, session_id)
     
-    # Verify the session was removed
-    assert session_id not in sessions_manager.get_active_session_ids(org_id)
-    assert org_id not in sessions_manager.sessions
+    # Verify browser state was removed
+    assert session_id not in sessions_manager._browser_states
+    
+    # Verify database record was marked as deleted
+    result = await db_session.execute(
+        select(PersistentBrowserSessionModel)
+        .where(PersistentBrowserSessionModel.persistent_browser_session_id == session_id)
+    )
+    db_session = result.scalar_one()
+    assert db_session.deleted_at is not None
 
 
 async def test_close_all_sessions(sessions_manager):
