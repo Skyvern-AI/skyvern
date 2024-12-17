@@ -32,7 +32,7 @@ from skyvern.forge.sdk.artifact.models import Artifact
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.organizations import (
@@ -669,10 +669,15 @@ async def get_workflow_run_events(
     workflow_run_events: list[WorkflowRunEvent] = []
     for task in tasks:
         block_type = BlockType.TASK
-        if not task.navigation_goal and task.data_extraction_goal:
-            block_type = BlockType.EXTRACTION
-        elif task.navigation_goal and not task.data_extraction_goal:
-            block_type = BlockType.NAVIGATION
+        if task.task_type == TaskType.general:
+            if not task.navigation_goal and task.data_extraction_goal:
+                block_type = BlockType.EXTRACTION
+            elif task.navigation_goal and not task.data_extraction_goal:
+                block_type = BlockType.NAVIGATION
+        elif task.task_type == TaskType.validation:
+            block_type = BlockType.VALIDATION
+        elif task.task_type == TaskType.action:
+            block_type = BlockType.ACTION
         event = WorkflowRunEvent(
             type=WorkflowRunEventType.block,
             block=WorkflowRunBlock(
