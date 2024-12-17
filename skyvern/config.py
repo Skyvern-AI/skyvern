@@ -131,6 +131,8 @@ class Settings(BaseSettings):
 
     SVG_MAX_LENGTH: int = 100000
 
+    ENABLE_LOG_ARTIFACTS: bool = False
+
     def is_cloud_environment(self) -> bool:
         """
         :return: True if env is not local, else False

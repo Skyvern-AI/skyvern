@@ -2,6 +2,8 @@ import json
 
 import structlog
 
+from skyvern.config import settings
+
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 from skyvern.forge.sdk.core import skyvern_context
@@ -9,7 +11,6 @@ from skyvern.forge.skyvern_json_encoder import SkyvernJSONLogEncoder
 from skyvern.forge.skyvern_log_encoder import SkyvernLogEncoder
 
 LOG = structlog.get_logger()
-
 
 def primary_key_from_log_entity_type(log_entity_type: LogEntityType) -> str:
     if log_entity_type == LogEntityType.STEP:
@@ -25,6 +26,9 @@ def primary_key_from_log_entity_type(log_entity_type: LogEntityType) -> str:
 
 
 async def save_step_logs(step_id: str) -> None:
+    if not settings.ENABLE_LOG_ARTIFACTS:
+        return
+
     context = skyvern_context.ensure_context()
     log = context.log
     organization_id = context.organization_id
@@ -41,6 +45,9 @@ async def save_step_logs(step_id: str) -> None:
 
 
 async def save_task_logs(task_id: str) -> None:
+    if not settings.ENABLE_LOG_ARTIFACTS:
+        return
+
     context = skyvern_context.ensure_context()
     log = context.log
     organization_id = context.organization_id
@@ -57,6 +64,9 @@ async def save_task_logs(task_id: str) -> None:
 
 
 async def save_workflow_run_logs(workflow_run_id: str) -> None:
+    if not settings.ENABLE_LOG_ARTIFACTS:
+        return
+
     context = skyvern_context.ensure_context()
     log = context.log
     organization_id = context.organization_id
@@ -73,6 +83,9 @@ async def save_workflow_run_logs(workflow_run_id: str) -> None:
 
 
 async def save_workflow_run_block_logs(workflow_run_block_id: str) -> None:
+    if not settings.ENABLE_LOG_ARTIFACTS:
+        return
+
     context = skyvern_context.ensure_context()
     log = context.log
     organization_id = context.organization_id
@@ -100,6 +113,9 @@ async def _save_log_artifacts(
     workflow_run_block_id: str | None = None,
 ) -> None:
     try:
+        if not settings.ENABLE_LOG_ARTIFACTS:
+            return
+
         log_json = json.dumps(log, cls=SkyvernJSONLogEncoder, indent=2)
 
         log_artifact = await app.DATABASE.get_artifact_by_entity_id(

@@ -17,6 +17,9 @@ import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { Artifact } from "./Artifact";
 
+const enable_log_artifacts =
+  import.meta.env.VITE_ENABLE_LOG_ARTIFACTS === "true";
+
 type Props = {
   id: string;
   stepProps: StepApiResponse;
@@ -111,7 +114,9 @@ function StepArtifacts({ id, stepProps }: Props) {
         <TabsTrigger value="llm_response_parsed">Action List</TabsTrigger>
         <TabsTrigger value="html_raw">HTML (Raw)</TabsTrigger>
         <TabsTrigger value="llm_request">LLM Request (Raw)</TabsTrigger>
-        <TabsTrigger value="skyvern_log">Skyvern Log</TabsTrigger>
+        {enable_log_artifacts && (
+          <TabsTrigger value="skyvern_log">Skyvern Log</TabsTrigger>
+        )}
       </TabsList>
       <TabsContent value="info">
         <div className="flex flex-col gap-6 p-4">
@@ -213,9 +218,11 @@ function StepArtifacts({ id, stepProps }: Props) {
       <TabsContent value="llm_request">
         {llmRequest ? <Artifact type="json" artifacts={llmRequest} /> : null}
       </TabsContent>
-      <TabsContent value="skyvern_log">
-        {skyvernLog ? <Artifact type="text" artifacts={skyvernLog} /> : null}
-      </TabsContent>
+      {enable_log_artifacts && (
+        <TabsContent value="skyvern_log">
+          {skyvernLog ? <Artifact type="text" artifacts={skyvernLog} /> : null}
+        </TabsContent>
+      )}
     </Tabs>
   );
 }
