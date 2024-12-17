@@ -1819,6 +1819,7 @@ class AgentDB:
                     select(ObserverThoughtModel)
                     .filter_by(observer_cruise_id=observer_cruise_id)
                     .filter_by(organization_id=organization_id)
+                    .order_by(ObserverThoughtModel.created_at)
                 )
             ).all()
             return [ObserverThought.model_validate(thought) for thought in observer_thoughts]
