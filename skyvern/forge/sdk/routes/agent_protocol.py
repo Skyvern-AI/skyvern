@@ -51,12 +51,14 @@ from skyvern.forge.sdk.schemas.tasks import (
     TaskResponse,
     TaskStatus,
 )
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunEvent, WorkflowRunEventType
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
     WorkflowParameterMissingRequiredValue,
 )
+from skyvern.forge.sdk.workflow.models.block import BlockType
 from skyvern.forge.sdk.workflow.models.workflow import (
     RunWorkflowResponse,
     Workflow,
@@ -641,6 +643,81 @@ async def get_workflow_run(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
     )
+
+
+@base_router.get(
+    "/workflows/{workflow_id}/runs/{workflow_run_id}/events",
+)
+@base_router.get(
+    "/workflows/{workflow_id}/runs/{workflow_run_id}/events/",
+)
+async def get_workflow_run_events(
+    workflow_id: str,
+    workflow_run_id: str,
+    observer_cruise_id: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> list[WorkflowRunEvent]:
+    # get all the tasks for the workflow run
+    tasks = await app.DATABASE.get_tasks(
+        page,
+        page_size,
+        workflow_run_id=workflow_run_id,
+        organization_id=current_org.organization_id,
+    )
+    workflow_run_events = [
+        WorkflowRunEvent(
+            type=WorkflowRunEventType.block,
+            block=WorkflowRunBlock(
+                workflow_run_id=workflow_run_id,
+                block_type=BlockType.TASK,
+                label=task.title,
+                title=task.title,
+                url=task.url,
+                status=task.status,
+                navigation_goal=task.navigation_goal,
+                data_extraction_goal=task.data_extraction_goal,
+                data_schema=task.extracted_information_schema,
+                terminate_criterion=task.terminate_criterion,
+                complete_criterion=task.complete_criterion,
+                created_at=task.created_at,
+                modified_at=task.modified_at,
+            ),
+            created_at=task.created_at,
+            modified_at=task.modified_at,
+        )
+        for task in tasks
+    ]
+    # get all the actions for all the tasks
+    actions = await app.DATABASE.get_tasks_actions(
+        [task.task_id for task in tasks], organization_id=current_org.organization_id
+    )
+    for action in actions:
+        workflow_run_events.append(
+            WorkflowRunEvent(
+                type=WorkflowRunEventType.action,
+                action=action,
+                created_at=action.created_at or datetime.datetime.utcnow(),
+                modified_at=action.modified_at or datetime.datetime.utcnow(),
+            )
+        )
+    # get all the thoughts for the cruise
+    if observer_cruise_id:
+        thoughts = await app.DATABASE.get_observer_cruise_thoughts(
+            observer_cruise_id, organization_id=current_org.organization_id
+        )
+        for thought in thoughts:
+            workflow_run_events.append(
+                WorkflowRunEvent(
+                    type=WorkflowRunEventType.thought,
+                    thought=thought,
+                    created_at=thought.created_at,
+                    modified_at=thought.modified_at,
+                )
+            )
+    workflow_run_events.sort(key=lambda x: x.created_at, reverse=True)
+    return workflow_run_events
 
 
 @base_router.get(

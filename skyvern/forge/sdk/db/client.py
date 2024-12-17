@@ -325,6 +325,25 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_tasks_actions(self, task_ids: list[str], organization_id: str | None = None) -> list[Action]:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(ActionModel)
+                    .filter(ActionModel.organization_id == organization_id)
+                    .filter(ActionModel.task_id.in_(task_ids))
+                    .order_by(ActionModel.created_at)
+                )
+                actions = (await session.scalars(query)).all()
+                return [Action.model_validate(action) for action in actions]
+
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def get_first_step(self, task_id: str, organization_id: str | None = None) -> Step | None:
         try:
             async with self.Session() as session:
@@ -1788,6 +1807,21 @@ class AgentDB:
             ).first():
                 return ObserverThought.model_validate(observer_thought)
             return None
+
+    async def get_observer_cruise_thoughts(
+        self,
+        observer_cruise_id: str,
+        organization_id: str | None = None,
+    ) -> list[ObserverThought]:
+        async with self.Session() as session:
+            observer_thoughts = (
+                await session.scalars(
+                    select(ObserverThoughtModel)
+                    .filter_by(observer_cruise_id=observer_cruise_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).all()
+            return [ObserverThought.model_validate(thought) for thought in observer_thoughts]
 
     async def create_observer_cruise(
         self,
