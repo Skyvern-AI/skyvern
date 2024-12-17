@@ -1134,7 +1134,11 @@ function buildElementObject(frame, element, interactable, purgeable = false) {
   }
 
   if (elementTagNameLower === "input" || elementTagNameLower === "textarea") {
-    attrs["value"] = element.value;
+    if (element.type === "password") {
+      attrs["value"] = element.value ? "*".repeat(element.value.length) : "";
+    } else {
+      attrs["value"] = element.value;
+    }
   }
 
   let elementObj = {
