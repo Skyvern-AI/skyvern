@@ -248,6 +248,7 @@ class WorkflowService:
                         api_key=api_key,
                         need_call_webhook=True,
                         close_browser_on_completion=not uses_persistent_browser_state,
+                        browser_session_id=browser_session_id,
                     )
                     return workflow_run
                 parameters = block.get_all_parameters(workflow_run_id)
@@ -284,6 +285,7 @@ class WorkflowService:
                         api_key=api_key,
                         need_call_webhook=False,
                         close_browser_on_completion=not uses_persistent_browser_state,
+                        browser_session_id=browser_session_id,
                     )
                     return workflow_run
                 elif block_result.status == BlockStatus.failed:
@@ -306,6 +308,7 @@ class WorkflowService:
                             workflow_run=workflow_run,
                             api_key=api_key,
                             close_browser_on_completion=not uses_persistent_browser_state,
+                            browser_session_id=browser_session_id,
                         )
                         return workflow_run
 
@@ -341,6 +344,7 @@ class WorkflowService:
                             workflow_run=workflow_run,
                             api_key=api_key,
                             close_browser_on_completion=not uses_persistent_browser_state,
+                            browser_session_id=browser_session_id,
                         )
                         return workflow_run
 
@@ -377,6 +381,7 @@ class WorkflowService:
                     workflow_run=workflow_run,
                     api_key=api_key,
                     close_browser_on_completion=not uses_persistent_browser_state,
+                    browser_session_id=browser_session_id,
                 )
                 return workflow_run
 
@@ -398,6 +403,7 @@ class WorkflowService:
             workflow_run=workflow_run,
             api_key=api_key,
             close_browser_on_completion=not uses_persistent_browser_state,
+            browser_session_id=browser_session_id,
         )
         return workflow_run
 
@@ -868,6 +874,7 @@ class WorkflowService:
         api_key: str | None = None,
         close_browser_on_completion: bool = True,
         need_call_webhook: bool = True,
+        browser_session_id: str | None = None,
     ) -> None:
         analytics.capture("skyvern-oss-agent-workflow-status", {"status": workflow_run.status})
         tasks = await self.get_tasks_by_workflow_run_id(workflow_run.workflow_run_id)
@@ -877,6 +884,10 @@ class WorkflowService:
             all_workflow_task_ids,
             close_browser_on_completion,
         )
+
+        if browser_session_id:
+            await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(browser_session_id)
+
         if browser_state:
             await self.persist_video_data(browser_state, workflow, workflow_run)
             if tasks:

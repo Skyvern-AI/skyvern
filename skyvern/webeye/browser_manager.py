@@ -107,6 +107,11 @@ class BrowserManager:
             if browser_state is None:
                 LOG.warning("Browser state not found in persistent sessions manager", browser_session_id=browser_session_id)
             else:
+                await app.PERSISTENT_SESSIONS_MANAGER.occupy_browser_session(
+                    browser_session_id,
+                    runnable_type="workflow_run",
+                    runnable_id=workflow_run.workflow_run_id,
+                )
                 page = await browser_state.get_working_page()
                 if page:
                     await browser_state.navigate_to_url(page=page, url=url)

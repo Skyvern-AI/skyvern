@@ -1934,6 +1934,29 @@ class AgentDB:
             )
             await session.commit()
 
+    async def occupy_persistent_browser_session(
+        self, session_id: str, runnable_type: str, runnable_id: str
+    ) -> None:
+        """Occupy a specific persistent browser session."""
+        async with self.Session() as session:
+            await session.execute(
+                update(PersistentBrowserSessionModel).where(
+                    PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
+                    PersistentBrowserSessionModel.deleted_at.is_(None),
+                ).values(runnable_type=runnable_type, runnable_id=runnable_id)
+            )
+            await session.commit()
+
+    async def release_persistent_browser_session(self, session_id: str) -> None:
+        """Release a specific persistent browser session."""
+        async with self.Session() as session:
+            await session.execute(
+                update(PersistentBrowserSessionModel).where(
+                    PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
+                ).values(runnable_type=None, runnable_id=None)
+            )
+            await session.commit()
+
     async def get_all_active_persistent_browser_sessions(self) -> List[PersistentBrowserSessionModel]:
         """Get all active persistent browser sessions across all organizations."""
         async with self.Session() as session:

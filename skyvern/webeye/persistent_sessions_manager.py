@@ -96,6 +96,21 @@ class PersistentSessionsManager:
 
         return browser_session, browser_state
 
+    async def occupy_browser_session(
+        self,
+        session_id: str,
+        runnable_type: str,
+        runnable_id: str,
+    ) -> None:
+        """Occupy a specific browser session."""
+        await self.database.occupy_persistent_browser_session(session_id, runnable_type, runnable_id)
+
+
+    async def release_browser_session(self, session_id: str) -> None:
+        """Release a specific browser session."""
+        await self.database.release_persistent_browser_session(session_id)
+
+
     async def close_session(self, organization_id: str, session_id: str) -> None:
         """Close a specific browser session."""
         browser_state = self.get_browser_state(session_id)
