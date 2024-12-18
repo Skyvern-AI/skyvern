@@ -1,8 +1,8 @@
-"""add index to ObserverThoughtModel db table
+"""add observer_cruise_index to the observer_thoughts table
 
-Revision ID: cf45479f484c
-Revises: 411dd89f3df9
-Create Date: 2024-12-17 06:51:04.086890+00:00
+Revision ID: f81d59b4aed5
+Revises: 282b0548d443
+Create Date: 2024-12-18 05:37:23.366137+00:00
 
 """
 
@@ -11,8 +11,8 @@ from typing import Sequence, Union
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "cf45479f484c"
-down_revision: Union[str, None] = "411dd89f3df9"
+revision: str = "f81d59b4aed5"
+down_revision: Union[str, None] = "282b0548d443"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
