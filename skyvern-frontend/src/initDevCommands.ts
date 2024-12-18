@@ -4,6 +4,7 @@ export type DevCommands = {
   createBrowserSession: () => Promise<void>;
   listBrowserSessions: () => Promise<void>;
   getBrowserSession: (sessionId: string) => Promise<void>;
+  closeBrowserSessions: () => Promise<void>;
   setValue: (key: string, value: unknown) => void;
   getValue: (key: string) => unknown;
 };
@@ -95,6 +96,32 @@ export function initDevCommands() {
     }
   }
 
+  async function closeBrowserSessions() {
+    try {
+      const response = await fetch(`${apiBaseUrl}/browser_sessions/close`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": envCredential!,
+        },
+        credentials: "include",
+      });
+
+      if (!response.ok) {
+        throw new Error(
+          `Failed to close browser sessions: ${response.statusText}`,
+        );
+      }
+
+      const data = await response.json();
+      console.log("Browser sessions:", data);
+      return undefined;
+    } catch (error) {
+      console.error("Error closing browser sessions:", error);
+      throw error;
+    }
+  }
+
   function setValue(key: string, value: unknown) {
     localStorage.setItem(key, JSON.stringify(value));
   }
@@ -108,6 +135,7 @@ export function initDevCommands() {
     createBrowserSession,
     listBrowserSessions,
     getBrowserSession,
+    closeBrowserSessions,
     setValue,
     getValue,
   };
@@ -116,4 +144,5 @@ export function initDevCommands() {
   console.log("- window.devCommands.createBrowserSession()");
   console.log("- window.devCommands.listBrowserSessions()");
   console.log("- window.devCommands.getBrowserSession(sessionId)");
+  console.log("- window.devCommands.closeBrowserSessions()");
 }

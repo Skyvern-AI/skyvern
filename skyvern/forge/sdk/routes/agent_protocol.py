@@ -1012,3 +1012,20 @@ async def create_browser_session(
     browser_session, _ = await app.PERSISTENT_SESSIONS_MANAGER.create_session(current_org.organization_id)
     return BrowserSessionResponse.from_browser_session(browser_session)
 
+@base_router.post(
+    "/browser_sessions/close",
+)
+@base_router.post(
+    "/browser_sessions/close/",
+    include_in_schema=False,
+) 
+async def close_browser_sessions(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ORJSONResponse:
+    await app.PERSISTENT_SESSIONS_MANAGER.close_all_sessions(current_org.organization_id)
+    return ORJSONResponse(
+        content={"message": "All browser sessions closed"},
+        status_code=200,
+        media_type="application/json",
+    )
+

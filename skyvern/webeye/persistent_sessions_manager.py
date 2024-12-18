@@ -98,7 +98,7 @@ class PersistentSessionsManager:
 
     async def close_session(self, organization_id: str, session_id: str) -> None:
         """Close a specific browser session."""
-        browser_state = self.get_session(organization_id, session_id)
+        browser_state = self.get_browser_state(session_id)
         if browser_state:
             LOG.info(
                 "Closing browser session",
@@ -108,24 +108,13 @@ class PersistentSessionsManager:
             await browser_state.close()
 
             # Mark as deleted in database
-            await self.database.mark_persistent_browser_session_deleted(session_id, organization_id)
+        await self.database.mark_persistent_browser_session_deleted(session_id, organization_id)
 
     async def close_all_sessions(self, organization_id: str) -> None:
         """Close all browser sessions for an organization."""
-        session_ids = await self.get_active_session_ids(organization_id)
-        for session_id in session_ids:
-            await self.close_session(organization_id, session_id)
-
-    async def build_browser_session_response(self, browser_session: PersistentBrowserSessionModel) -> BrowserSessionResponse:
-        return BrowserSessionResponse(
-            session_id=browser_session.persistent_browser_session_id,
-            organization_id=browser_session.organization_id,
-            runnable_type=browser_session.runnable_type,
-            runnable_id=browser_session.runnable_id,
-            created_at=browser_session.created_at,
-            modified_at=browser_session.modified_at,
-            deleted_at=browser_session.deleted_at,
-        )
+        browser_sessions = await self.database.get_active_persistent_browser_sessions(organization_id)
+        for browser_session in browser_sessions:
+            await self.close_session(organization_id, browser_session.persistent_browser_session_id)
 
     @classmethod
     async def close(cls) -> None:

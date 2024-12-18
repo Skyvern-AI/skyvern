@@ -1925,10 +1925,13 @@ class AgentDB:
     async def mark_persistent_browser_session_deleted(self, session_id: str, organization_id: str) -> None:
         """Mark a persistent browser session as deleted."""
         async with self.Session() as session:
-            db_session = await self.get_persistent_browser_session(session_id, organization_id)
-            if db_session:
-                db_session.deleted_at = datetime.utcnow()
-                await session.commit()
+            await session.execute(
+                update(PersistentBrowserSessionModel).where(
+                    PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
+                    PersistentBrowserSessionModel.organization_id == organization_id,
+                ).values(deleted_at=datetime.utcnow())
+            )
+            await session.commit()
 
     async def get_all_active_persistent_browser_sessions(self) -> List[PersistentBrowserSessionModel]:
         """Get all active persistent browser sessions across all organizations."""
