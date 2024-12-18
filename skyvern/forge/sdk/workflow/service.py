@@ -262,7 +262,10 @@ class WorkflowService:
                     block_type_var=block.block_type,
                     block_label=block.label,
                 )
-                block_result = await block.execute_safe(workflow_run_id=workflow_run_id)
+                block_result = await block.execute_safe(
+                    workflow_run_id=workflow_run_id,
+                    browser_session_id=browser_session_id,
+                )
                 if block_result.status == BlockStatus.canceled:
                     LOG.info(
                         f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} was canceled for workflow run {workflow_run_id}, cancelling workflow run",

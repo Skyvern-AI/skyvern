@@ -1924,6 +1924,7 @@ class AgentDB:
 
     async def mark_persistent_browser_session_deleted(self, session_id: str, organization_id: str) -> None:
         """Mark a persistent browser session as deleted."""
+        LOG.info("Marking persistent browser session as deleted", session_id=session_id, organization_id=organization_id)
         async with self.Session() as session:
             await session.execute(
                 update(PersistentBrowserSessionModel).where(
