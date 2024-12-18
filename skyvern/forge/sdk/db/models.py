@@ -526,6 +526,7 @@ class ObserverCruiseModel(Base):
 
 class ObserverThoughtModel(Base):
     __tablename__ = "observer_thoughts"
+    __table_args__ = (Index("observer_cruise_index", "organization_id", "observer_cruise_id"),)
 
     observer_thought_id = Column(String, primary_key=True, default=generate_observer_thought_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
