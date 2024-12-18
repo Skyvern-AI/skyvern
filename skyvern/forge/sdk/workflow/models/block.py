@@ -311,6 +311,9 @@ class BaseTaskBlock(Block):
         current_running_task: Task | None = None
         workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(workflow_run_id=workflow_run_id)
         workflow = await app.WORKFLOW_SERVICE.get_workflow(workflow_id=workflow_run.workflow_id)
+
+        persistent_browser_session_id = kwargs.get("browser_session_id")
+
         # if the task url is parameterized, we need to get the value from the workflow run context
         if self.url and workflow_run_context.has_parameter(self.url) and workflow_run_context.has_value(self.url):
             task_url_parameter_value = workflow_run_context.get_value(self.url)
@@ -379,7 +382,9 @@ class BaseTaskBlock(Block):
                 # the first task block will create the browser state and do the navigation
                 try:
                     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                        workflow_run=workflow_run, url=self.url
+                        workflow_run=workflow_run,
+                        url=self.url,
+                        browser_session_id=persistent_browser_session_id,
                     )
                 except Exception as e:
                     LOG.exception(

@@ -91,17 +91,21 @@ class BrowserManager:
         )
         return browser_state
 
-    async def get_or_create_for_workflow_run(self, workflow_run: WorkflowRun, url: str | None = None) -> BrowserState:
+    async def get_or_create_for_workflow_run(
+        self,
+        workflow_run: WorkflowRun,
+        url: str | None = None,
+        browser_session_id: str | None = None,
+    ) -> BrowserState:
         browser_state = self.get_for_workflow_run(workflow_run_id=workflow_run.workflow_run_id)
         if browser_state is not None:
             return browser_state
 
-        context = skyvern_context.current()
-        if context.browser_session_id:
-            LOG.info("Getting browser state for workflow run from persistent sessions manager", browser_session_id=context.browser_session_id)
-            browser_state = app.PERSISTENT_SESSIONS_MANAGER.get_session(context.organization_id, context.browser_session_id)
+        if browser_session_id:
+            LOG.info("Getting browser state for workflow run from persistent sessions manager", browser_session_id=browser_session_id)
+            browser_state = app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id)
             if browser_state is None:
-                LOG.warning("Browser state not found in persistent sessions manager", browser_session_id=context.browser_session_id)
+                LOG.warning("Browser state not found in persistent sessions manager", browser_session_id=browser_session_id)
             else:
                 page = await browser_state.get_working_page()
                 if page:

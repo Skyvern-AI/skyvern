@@ -115,6 +115,7 @@ class ForgeAgent:
         workflow_run_context: WorkflowRunContext,
         task_order: int,
         task_retry: int,
+        browser_session_id: str | None = None,
     ) -> tuple[Task, Step]:
         task_block_parameters = task_block.parameters
         navigation_payload = {}
