@@ -970,10 +970,11 @@ async def get_browser_session_by_id(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> BrowserSessionResponse:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
-    return await app.PERSISTENT_SESSIONS_MANAGER.build_browser_session_response(
-        organization_id=current_org.organization_id,
-        session_id=browser_session_id,
+    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+        browser_session_id,
+        current_org.organization_id,
     )
+    return BrowserSessionResponse.from_browser_session(browser_session)
 
 
 @base_router.get(

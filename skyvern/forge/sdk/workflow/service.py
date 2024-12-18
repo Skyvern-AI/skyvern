@@ -116,8 +116,7 @@ class WorkflowService:
             raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
         workflow_id = workflow.workflow_id
         if workflow_request.browser_session_id:
-            reusable_browser_session = app.PERSISTENT_SESSIONS_MANAGER.get_session(
-                organization_id=organization_id,
+            reusable_browser_session = app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
                 session_id=workflow_request.browser_session_id,
             )
             if reusable_browser_session is None:
