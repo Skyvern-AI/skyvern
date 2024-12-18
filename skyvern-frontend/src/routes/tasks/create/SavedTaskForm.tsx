@@ -157,6 +157,13 @@ function SavedTaskForm({ initialValues }: Props) {
         })
         .then(() => {
           const taskRequest = createTaskRequestObject(formValues);
+
+          // if (window.devCommands?.getValue("browserSessionId")) {
+          //   taskRequest.browser_session_id = window.devCommands.getValue(
+          //     "browserSessionId",
+          //   ) as unknown as string;
+          // }
+
           const includeOverrideHeader =
             formValues.maxStepsOverride !== null &&
             formValues.maxStepsOverride !== MAX_STEPS_DEFAULT;

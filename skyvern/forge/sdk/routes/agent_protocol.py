@@ -153,6 +153,7 @@ async def create_agent_task(
         organization_id=current_org.organization_id,
         max_steps_override=x_max_steps_override,
         api_key=x_api_key,
+        browser_session_id=task.browser_session_id,
     )
     return CreateTaskResponse(task_id=created_task.task_id)
 
