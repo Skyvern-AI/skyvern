@@ -992,10 +992,7 @@ async def get_browser_sessions(
     analytics.capture("skyvern-oss-agent-browser-sessions-get")
     browser_sessions = await app.PERSISTENT_SESSIONS_MANAGER.get_active_sessions(current_org.organization_id)
     return [
-        await app.PERSISTENT_SESSIONS_MANAGER.build_browser_session_response(
-            organization_id=current_org.organization_id,
-            session_id=browser_session.persistent_browser_session_id,
-        )
+        BrowserSessionResponse.from_browser_session(browser_session)
         for browser_session in browser_sessions
     ]
 
@@ -1012,6 +1009,5 @@ async def create_browser_session(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> BrowserSessionResponse:
     browser_session, _ = await app.PERSISTENT_SESSIONS_MANAGER.create_session(current_org.organization_id)
-    print("===", browser_session)
     return BrowserSessionResponse.from_browser_session(browser_session)
 

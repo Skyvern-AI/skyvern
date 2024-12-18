@@ -1880,16 +1880,17 @@ class AgentDB:
                 return ObserverCruise.model_validate(observer_cruise)
             raise NotFoundError(f"ObserverCruise {observer_cruise_id} not found")
 
-    async def get_active_persistent_browser_sessions(self, organization_id: str) -> List[str]:
-        """Get all active persistent browser session IDs for an organization."""
+    async def get_active_persistent_browser_sessions(self, organization_id: str) -> List[PersistentBrowserSession]:
+        """Get all active persistent browser sessions for an organization."""
         async with self.Session() as session:
             result = await session.execute(
-                select(PersistentBrowserSessionModel.persistent_browser_session_id).where(
+                select(PersistentBrowserSessionModel).where(
                     PersistentBrowserSessionModel.organization_id == organization_id,
                     PersistentBrowserSessionModel.deleted_at.is_(None),
                 )
             )
-            return result.scalars().all()
+            sessions = result.scalars().all()
+            return [PersistentBrowserSession.model_validate(session) for session in sessions]
 
     async def get_persistent_browser_session(self, session_id: str, organization_id: str) -> Optional[PersistentBrowserSessionModel]:
         """Get a specific persistent browser session."""
