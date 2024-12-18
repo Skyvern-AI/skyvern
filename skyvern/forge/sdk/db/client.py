@@ -380,6 +380,7 @@ class AgentDB:
                         .filter_by(task_id=task_id)
                         .filter_by(organization_id=organization_id)
                         .order_by(StepModel.order.desc())
+                        .order_by(StepModel.retry_index.desc())
                     )
                 ).first():
                     return convert_to_step(step, debug_enabled=self.debug_enabled)
