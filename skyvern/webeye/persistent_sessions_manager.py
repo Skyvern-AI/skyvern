@@ -18,7 +18,6 @@ LOG = structlog.get_logger()
 
 class PersistentSessionsManager:
     instance = None
-    # Store BrowserState objects in memory since they can't be serialized to DB
     _browser_states: Dict[str, BrowserState] = dict()
 
     def __init__(self, database: AgentDB):
@@ -30,12 +29,12 @@ class PersistentSessionsManager:
             cls.instance.database = database
         return cls.instance
 
-    async def get_active_session_ids(self, organization_id: str) -> List[str]:
+    async def get_active_sessions(self, organization_id: str) -> List[str]:
         """Get all active session IDs for an organization."""
-        return await self.database.get_active_persistent_browser_session_ids(organization_id)
+        return await self.database.get_active_persistent_browser_sessions(organization_id)
 
-    def get_session(self, organization_id: str, session_id: str) -> Optional[BrowserState]:
-        """Get a specific browser session by organization ID and session ID."""
+    def get_session(self, session_id: str) -> Optional[BrowserState]:
+        """Get a specific browser session by session ID."""
         return self._browser_states.get(session_id)
 
     async def create_session(
@@ -43,18 +42,23 @@ class PersistentSessionsManager:
         organization_id: str,
         proxy_location: ProxyLocation | None = None,
         url: str | None = None,
+        runnable_id: str | None = None,
+        runnable_type: str | None = None,
     ) -> Tuple[str, BrowserState]:
         """Create a new browser session for an organization and return its ID with the browser state."""
-        session_id = generate_persistent_browser_session_id()
         
         LOG.info(
             "Creating new browser session",
             organization_id=organization_id,
-            session_id=session_id,
         )
         
-        # Create database record
-        await self.database.create_persistent_browser_session(session_id, organization_id)
+        browser_session = await self.database.create_persistent_browser_session(
+            organization_id=organization_id,
+            runnable_type=runnable_type,
+            runnable_id=runnable_id,
+        )
+
+        session_id = browser_session.persistent_browser_session_id
 
         pw = await async_playwright().start()
         browser_context, browser_artifacts, browser_cleanup = await BrowserContextFactory.create_browser_context(
@@ -79,7 +83,6 @@ class PersistentSessionsManager:
 
         self._browser_states[session_id] = browser_state
 
-        # Create initial page if URL is provided
         if url:
             await browser_state.get_or_create_page(
                 url=url,
@@ -99,7 +102,6 @@ class PersistentSessionsManager:
                 session_id=session_id,
             )
             await browser_state.close()
-            self._browser_states.pop(session_id, None)
 
             # Mark as deleted in database
             await self.database.mark_persistent_browser_session_deleted(session_id, organization_id)
@@ -110,10 +112,15 @@ class PersistentSessionsManager:
         for session_id in session_ids:
             await self.close_session(organization_id, session_id)
 
-    async def build_browser_session_response(self, organization_id: str, session_id: str) -> BrowserSessionResponse:
+    async def build_browser_session_response(self, browser_session: PersistentBrowserSessionModel) -> BrowserSessionResponse:
         return BrowserSessionResponse(
-            session_id=session_id,
-            organization_id=organization_id,
+            session_id=browser_session.persistent_browser_session_id,
+            organization_id=browser_session.organization_id,
+            runnable_type=browser_session.runnable_type,
+            runnable_id=browser_session.runnable_id,
+            created_at=browser_session.created_at,
+            modified_at=browser_session.modified_at,
+            deleted_at=browser_session.deleted_at,
         )
 
     @classmethod

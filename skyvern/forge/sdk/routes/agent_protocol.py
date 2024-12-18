@@ -990,13 +990,13 @@ async def get_browser_sessions(
 ) -> list[BrowserSessionResponse]:
     """Get all active browser sessions for the organization"""
     analytics.capture("skyvern-oss-agent-browser-sessions-get")
-    session_ids = await app.PERSISTENT_SESSIONS_MANAGER.get_active_session_ids(current_org.organization_id)
+    browser_sessions = await app.PERSISTENT_SESSIONS_MANAGER.get_active_sessions(current_org.organization_id)
     return [
         await app.PERSISTENT_SESSIONS_MANAGER.build_browser_session_response(
             organization_id=current_org.organization_id,
-            session_id=session_id,
+            session_id=browser_session.persistent_browser_session_id,
         )
-        for session_id in session_ids
+        for browser_session in browser_sessions
     ]
 
 @base_router.post(

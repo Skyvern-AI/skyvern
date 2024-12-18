@@ -1879,7 +1879,7 @@ class AgentDB:
                 return ObserverCruise.model_validate(observer_cruise)
             raise NotFoundError(f"ObserverCruise {observer_cruise_id} not found")
 
-    async def get_active_persistent_browser_session_ids(self, organization_id: str) -> List[str]:
+    async def get_active_persistent_browser_sessions(self, organization_id: str) -> List[str]:
         """Get all active persistent browser session IDs for an organization."""
         async with self.Session() as session:
             result = await session.execute(
@@ -1888,7 +1888,7 @@ class AgentDB:
                     PersistentBrowserSessionModel.deleted_at.is_(None),
                 )
             )
-            return [row[0] for row in result.all()]
+            return result.scalars().all()
 
     async def get_persistent_browser_session(self, session_id: str, organization_id: str) -> Optional[PersistentBrowserSessionModel]:
         """Get a specific persistent browser session."""
@@ -1902,15 +1902,17 @@ class AgentDB:
             return result.scalar_one_or_none()
 
     async def create_persistent_browser_session(
-        self, session_id: str, organization_id: str
+        self,
+        organization_id: str,
+        runnable_type: str,
+        runnable_id: str,
     ) -> PersistentBrowserSessionModel:
         """Create a new persistent browser session."""
         async with self.Session() as session:
             db_session = PersistentBrowserSessionModel(
-                persistent_browser_session_id=session_id,
                 organization_id=organization_id,
-                runnable_type="browser_session",
-                runnable_id=session_id,
+                runnable_type=runnable_type,
+                runnable_id=runnable_id,
             )
             session.add(db_session)
             await session.commit()
