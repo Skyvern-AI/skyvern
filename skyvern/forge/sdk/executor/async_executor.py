@@ -36,6 +36,7 @@ class AsyncExecutor(abc.ABC):
         workflow_run_id: str,
         max_steps_override: int | None,
         api_key: str | None,
+        browser_session_id: str | None,
         **kwargs: dict,
     ) -> None:
         pass
@@ -93,6 +94,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         workflow_run_id: str,
         max_steps_override: int | None,
         api_key: str | None,
+        browser_session_id: str | None,
         **kwargs: dict,
     ) -> None:
         LOG.info(
@@ -109,4 +111,5 @@ class BackgroundTaskExecutor(AsyncExecutor):
             workflow_run_id=workflow_run_id,
             api_key=api_key,
             organization=organization,
+            browser_session_id=browser_session_id,
         )

@@ -15,6 +15,7 @@ from skyvern.exceptions import (
     SkyvernException,
     WorkflowNotFound,
     WorkflowRunNotFound,
+    BrowserSessionNotFound,
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -114,6 +115,15 @@ class WorkflowService:
             LOG.error(f"Workflow {workflow_permanent_id} not found", workflow_version=version)
             raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
         workflow_id = workflow.workflow_id
+        if workflow_request.browser_session_id:
+            reusable_browser_session = app.PERSISTENT_SESSIONS_MANAGER.get_session(
+                organization_id=organization_id,
+                session_id=workflow_request.browser_session_id,
+            )
+            if reusable_browser_session is None:
+                raise BrowserSessionNotFound(browser_session_id=workflow_request.browser_session_id)
+            # reusable_browser_session.reset_timeout()
+
         if workflow_request.proxy_location is None and workflow.proxy_location is not None:
             workflow_request.proxy_location = workflow.proxy_location
         if workflow_request.webhook_callback_url is None and workflow.webhook_callback_url is not None:
@@ -140,6 +150,7 @@ class WorkflowService:
                 workflow_id=workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
                 max_steps_override=max_steps_override,
+                browser_session_id=workflow_request.browser_session_id,
             )
         )
 
@@ -188,11 +199,14 @@ class WorkflowService:
         workflow_run_id: str,
         api_key: str,
         organization: Organization,
+        browser_session_id: str | None,
     ) -> WorkflowRun:
         """Execute a workflow."""
         organization_id = organization.organization_id
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id)
         workflow = await self.get_workflow(workflow_id=workflow_run.workflow_id, organization_id=organization_id)
+
+        uses_persistent_browser_state = browser_session_id is not None
 
         # Set workflow run status to running, create workflow run parameters
         await self.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
@@ -234,6 +248,7 @@ class WorkflowService:
                         workflow_run=workflow_run,
                         api_key=api_key,
                         need_call_webhook=True,
+                        close_browser_on_completion=not uses_persistent_browser_state,
                     )
                     return workflow_run
                 parameters = block.get_all_parameters(workflow_run_id)
@@ -266,6 +281,7 @@ class WorkflowService:
                         workflow_run=workflow_run,
                         api_key=api_key,
                         need_call_webhook=False,
+                        close_browser_on_completion=not uses_persistent_browser_state,
                     )
                     return workflow_run
                 elif block_result.status == BlockStatus.failed:
@@ -287,6 +303,7 @@ class WorkflowService:
                             workflow=workflow,
                             workflow_run=workflow_run,
                             api_key=api_key,
+                            close_browser_on_completion=not uses_persistent_browser_state,
                         )
                         return workflow_run
 
@@ -321,6 +338,7 @@ class WorkflowService:
                             workflow=workflow,
                             workflow_run=workflow_run,
                             api_key=api_key,
+                            close_browser_on_completion=not uses_persistent_browser_state,
                         )
                         return workflow_run
 
@@ -352,7 +370,12 @@ class WorkflowService:
                 await self.mark_workflow_run_as_failed(
                     workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                 )
-                await self.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, api_key=api_key)
+                await self.clean_up_workflow(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    api_key=api_key,
+                    close_browser_on_completion=not uses_persistent_browser_state,
+                )
                 return workflow_run
 
         refreshed_workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=workflow_run.workflow_run_id)
@@ -368,7 +391,12 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 workflow_run_status=refreshed_workflow_run.status if refreshed_workflow_run else None,
             )
-        await self.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, api_key=api_key)
+        await self.clean_up_workflow(
+            workflow=workflow,
+            workflow_run=workflow_run,
+            api_key=api_key,
+            close_browser_on_completion=not uses_persistent_browser_state,
+        )
         return workflow_run
 
     async def create_workflow(

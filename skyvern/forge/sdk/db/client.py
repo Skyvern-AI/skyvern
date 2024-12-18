@@ -1,6 +1,6 @@
 import json
 from datetime import datetime, timedelta
-from typing import Any, Sequence
+from typing import Any, List, Sequence, Optional
 
 import structlog
 from sqlalchemy import and_, delete, func, select, update
@@ -24,6 +24,7 @@ from skyvern.forge.sdk.db.models import (
     OrganizationAuthTokenModel,
     OrganizationModel,
     OutputParameterModel,
+    PersistentBrowserSessionModel,
     StepModel,
     TaskGenerationModel,
     TaskModel,
@@ -1259,9 +1260,7 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
-    async def update_workflow_run(
-        self, workflow_run_id: str, status: WorkflowRunStatus, failure_reason: str | None = None
-    ) -> WorkflowRun | None:
+    async def update_workflow_run(self, workflow_run_id: str, status: WorkflowRunStatus, failure_reason: str | None = None) -> WorkflowRun | None:
         async with self.Session() as session:
             workflow_run = (
                 await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
@@ -1984,3 +1983,60 @@ class AgentDB:
                 await session.refresh(observer_cruise)
                 return ObserverCruise.model_validate(observer_cruise)
             raise NotFoundError(f"ObserverCruise {observer_cruise_id} not found")
+
+    async def get_active_persistent_browser_sessions(self, organization_id: str) -> List[str]:
+        """Get all active persistent browser session IDs for an organization."""
+        async with self.Session() as session:
+            result = await session.execute(
+                select(PersistentBrowserSessionModel.persistent_browser_session_id).where(
+                    PersistentBrowserSessionModel.organization_id == organization_id,
+                    PersistentBrowserSessionModel.deleted_at.is_(None),
+                )
+            )
+            return result.scalars().all()
+
+    async def get_persistent_browser_session(self, session_id: str, organization_id: str) -> Optional[PersistentBrowserSessionModel]:
+        """Get a specific persistent browser session."""
+        async with self.Session() as session:
+            result = await session.execute(
+                select(PersistentBrowserSessionModel).where(
+                    PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
+                    PersistentBrowserSessionModel.organization_id == organization_id,
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def create_persistent_browser_session(
+        self,
+        organization_id: str,
+        runnable_type: str,
+        runnable_id: str,
+    ) -> PersistentBrowserSessionModel:
+        """Create a new persistent browser session."""
+        async with self.Session() as session:
+            db_session = PersistentBrowserSessionModel(
+                organization_id=organization_id,
+                runnable_type=runnable_type,
+                runnable_id=runnable_id,
+            )
+            session.add(db_session)
+            await session.commit()
+            return db_session
+
+    async def mark_persistent_browser_session_deleted(self, session_id: str, organization_id: str) -> None:
+        """Mark a persistent browser session as deleted."""
+        async with self.Session() as session:
+            db_session = await self.get_persistent_browser_session(session_id, organization_id)
+            if db_session:
+                db_session.deleted_at = datetime.utcnow()
+                await session.commit()
+
+    async def get_all_active_persistent_browser_sessions(self) -> List[PersistentBrowserSessionModel]:
+        """Get all active persistent browser sessions across all organizations."""
+        async with self.Session() as session:
+            result = await session.execute(
+                select(PersistentBrowserSessionModel).where(
+                    PersistentBrowserSessionModel.deleted_at.is_(None)
+                )
+            )
+            return result.scalars().all()

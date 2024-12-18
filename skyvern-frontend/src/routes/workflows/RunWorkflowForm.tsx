@@ -70,6 +70,7 @@ type RunWorkflowRequestBody = {
   data: Record<string, unknown>; // workflow parameters and values
   proxy_location: ProxyLocation | null;
   webhook_callback_url?: string | null;
+  browser_session_id?: string | null;
 };
 
 function getRunWorkflowRequestBody(
@@ -87,6 +88,12 @@ function getRunWorkflowRequestBody(
     data: parsedParameters,
     proxy_location: proxyLocation,
   };
+
+  if (window.devCommands?.getValue("browserSessionId")) {
+    body.browser_session_id = window.devCommands.getValue(
+      "browserSessionId",
+    ) as unknown as string;
+  }
 
   if (webhookCallbackUrl) {
     body.webhook_callback_url = webhookCallbackUrl;

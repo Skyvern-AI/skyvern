@@ -69,6 +69,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
 from skyvern.webeye.actions.actions import Action
+from skyvern.webeye.models import BrowserSessionResponse
 
 base_router = APIRouter()
 
@@ -645,6 +646,7 @@ async def execute_workflow(
         organization_id=current_org.organization_id,
         workflow_id=workflow_run.workflow_id,
         workflow_run_id=workflow_run.workflow_run_id,
+        browser_session_id=workflow_request.browser_session_id,
         max_steps_override=x_max_steps_override,
         api_key=x_api_key,
     )
@@ -1116,4 +1118,65 @@ async def upload_file(
         content={"s3_uri": uploaded_s3_uri, "presigned_url": presigned_url},
         status_code=200,
         media_type="application/json",
+    )
+
+@base_router.get(
+    "/browser_sessions/{browser_session_id}",
+    response_model=BrowserSessionResponse,
+)
+@base_router.get(
+    "/browser_sessions/{browser_session_id}/",
+    response_model=BrowserSessionResponse,
+    include_in_schema=False,
+)
+async def get_browser_session_by_id(
+    browser_session_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BrowserSessionResponse:
+    analytics.capture("skyvern-oss-agent-workflow-run-get")
+    return await app.PERSISTENT_SESSIONS_MANAGER.build_browser_session_response(
+        organization_id=current_org.organization_id,
+        session_id=browser_session_id,
+    )
+
+
+@base_router.get(
+    "/browser_sessions",
+    response_model=list[BrowserSessionResponse],
+)
+@base_router.get(
+    "/browser_sessions/",
+    response_model=list[BrowserSessionResponse],
+    include_in_schema=False,
+)
+async def get_browser_sessions(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> list[BrowserSessionResponse]:
+    """Get all active browser sessions for the organization"""
+    analytics.capture("skyvern-oss-agent-browser-sessions-get")
+    browser_sessions = await app.PERSISTENT_SESSIONS_MANAGER.get_active_sessions(current_org.organization_id)
+    return [
+        await app.PERSISTENT_SESSIONS_MANAGER.build_browser_session_response(
+            organization_id=current_org.organization_id,
+            session_id=browser_session.persistent_browser_session_id,
+        )
+        for browser_session in browser_sessions
+    ]
+
+@base_router.post(
+    "/browser_sessions",
+    response_model=BrowserSessionResponse,
+)
+@base_router.post(
+    "/browser_sessions/",
+    response_model=BrowserSessionResponse,
+    include_in_schema=False,
+) 
+async def create_browser_session(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BrowserSessionResponse:
+    session_id, _ = await app.PERSISTENT_SESSIONS_MANAGER.create_session(current_org.organization_id)
+    return BrowserSessionResponse(
+        session_id=session_id,
+        organization_id=current_org.organization_id,
     )

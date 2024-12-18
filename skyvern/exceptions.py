@@ -552,3 +552,11 @@ class InteractWithDropdownContainer(SkyvernException):
         super().__init__(
             f"Select on the dropdown container instead of the option, try again with another element. element_id={element_id}"
         )
+
+
+class BrowserSessionNotFound(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str):
+        super().__init__(
+            f"Browser session not found. browser_session_id={browser_session_id}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )

@@ -403,6 +403,9 @@ class BrowserState:
             if url:
                 await self.navigate_to_url(page=page, url=url)
 
+    async def update_attributes(self, **kwargs):
+        pass
+
     async def navigate_to_url(self, page: Page, url: str, retry_times: int = NAVIGATION_MAX_RETRY_TIME) -> None:
         navigation_error: Exception = FailedToNavigateToUrl(url=url, error_message="")
         for retry_time in range(retry_times):
