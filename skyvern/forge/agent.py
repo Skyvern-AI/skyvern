@@ -245,8 +245,10 @@ class ForgeAgent:
         api_key: str | None = None,
         close_browser_on_completion: bool = True,
         task_block: BaseTaskBlock | None = None,
+        browser_session_id: str | None = None,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
         workflow_run: WorkflowRun | None = None
+
         if task.workflow_run_id:
             workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=task.workflow_run_id)
             if workflow_run and workflow_run.status == WorkflowRunStatus.canceled:
@@ -287,6 +289,7 @@ class ForgeAgent:
                 last_step=step,
                 api_key=api_key,
                 need_call_webhook=True,
+                browser_session_id=browser_session_id,
             )
             return step, None, None
 
@@ -1100,14 +1103,23 @@ class ForgeAgent:
             )
 
     async def _initialize_execution_state(
-        self, task: Task, step: Step, workflow_run: WorkflowRun | None = None
+        self,
+        task: Task,
+        step: Step,
+        workflow_run: WorkflowRun | None = None,
+        browser_session_id: str | None = None,
     ) -> tuple[Step, BrowserState, DetailedAgentStepOutput]:
         if workflow_run:
             browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                workflow_run=workflow_run, url=task.url
+                workflow_run=workflow_run,
+                url=task.url,
+                browser_session_id=browser_session_id,
             )
         else:
-            browser_state = await app.BROWSER_MANAGER.get_or_create_for_task(task)
+            browser_state = await app.BROWSER_MANAGER.get_or_create_for_task(
+                task=task,
+                browser_session_id=browser_session_id,
+            )
         # Initialize video artifact for the task here, afterwards it'll only get updated
         if browser_state and browser_state.browser_artifacts:
             video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(

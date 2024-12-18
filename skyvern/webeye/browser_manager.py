@@ -68,10 +68,31 @@ class BrowserManager:
 
         return None
 
-    async def get_or_create_for_task(self, task: Task) -> BrowserState:
+    async def get_or_create_for_task(
+        self,
+        task: Task,
+        browser_session_id: str | None = None,
+    ) -> BrowserState:
         browser_state = self.get_for_task(task_id=task.task_id, workflow_run_id=task.workflow_run_id)
         if browser_state is not None:
             return browser_state
+
+        if browser_session_id:
+            LOG.info("Getting browser state for workflow run from persistent sessions manager", browser_session_id=browser_session_id)
+            browser_state = app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id)
+            if browser_state is None:
+                LOG.warning("Browser state not found in persistent sessions manager", browser_session_id=browser_session_id)
+            else:
+                await app.PERSISTENT_SESSIONS_MANAGER.occupy_browser_session(
+                    browser_session_id,
+                    runnable_type="task",
+                    runnable_id=task.task_id,
+                )
+                page = await browser_state.get_working_page()
+                if page:
+                    await browser_state.navigate_to_url(page=page, url=url)
+                else:
+                    LOG.warning("Browser state has no page", workflow_run_id=workflow_run.workflow_run_id)
 
         LOG.info("Creating browser state for task", task_id=task.task_id)
         browser_state = await self._create_browser_state(

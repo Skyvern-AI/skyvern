@@ -51,9 +51,12 @@ class BackgroundTaskExecutor(AsyncExecutor):
         organization_id: str,
         max_steps_override: int | None,
         api_key: str | None,
+        browser_session_id: str | None,
         **kwargs: dict,
     ) -> None:
         LOG.info("Executing task using background task executor", task_id=task_id)
+
+        close_browser_on_completion = browser_session_id is None
 
         organization = await app.DATABASE.get_organization(organization_id)
         if organization is None:
@@ -83,6 +86,8 @@ class BackgroundTaskExecutor(AsyncExecutor):
             task,
             step,
             api_key,
+            close_browser_on_completion=close_browser_on_completion,
+            browser_session_id=browser_session_id,
         )
 
     async def execute_workflow(
