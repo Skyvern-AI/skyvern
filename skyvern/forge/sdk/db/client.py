@@ -2,6 +2,7 @@ import json
 from datetime import datetime, timedelta
 from typing import Any, List, Sequence, Optional
 
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 import structlog
 from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.exc import SQLAlchemyError
@@ -1914,9 +1915,11 @@ class AgentDB:
                 runnable_type=runnable_type,
                 runnable_id=runnable_id,
             )
+            print(db_session)
             session.add(db_session)
             await session.commit()
-            return db_session
+            await session.refresh(db_session)
+            return PersistentBrowserSession.model_validate(db_session)
 
     async def mark_persistent_browser_session_deleted(self, session_id: str, organization_id: str) -> None:
         """Mark a persistent browser session as deleted."""

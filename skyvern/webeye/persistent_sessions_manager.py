@@ -57,7 +57,7 @@ class PersistentSessionsManager:
             runnable_type=runnable_type,
             runnable_id=runnable_id,
         )
-
+        print("---", browser_session)
         session_id = browser_session.persistent_browser_session_id
 
         pw = await async_playwright().start()
@@ -90,7 +90,7 @@ class PersistentSessionsManager:
                 organization_id=organization_id,
             )
 
-        return session_id, browser_state
+        return browser_session, browser_state
 
     async def close_session(self, organization_id: str, session_id: str) -> None:
         """Close a specific browser session."""

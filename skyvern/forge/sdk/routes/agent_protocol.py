@@ -1011,8 +1011,7 @@ async def get_browser_sessions(
 async def create_browser_session(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> BrowserSessionResponse:
-    session_id, _ = await app.PERSISTENT_SESSIONS_MANAGER.create_session(current_org.organization_id)
-    return BrowserSessionResponse(
-        session_id=session_id,
-        organization_id=current_org.organization_id,
-    )
+    browser_session, _ = await app.PERSISTENT_SESSIONS_MANAGER.create_session(current_org.organization_id)
+    print("===", browser_session)
+    return BrowserSessionResponse.from_browser_session(browser_session)
+
