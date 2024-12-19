@@ -86,7 +86,14 @@ function WorkflowRun() {
   const title = workflowIsLoading ? (
     <Skeleton className="h-9 w-48" />
   ) : (
-    <h1 className="text-3xl">{workflow?.title}</h1>
+    <h1 className="text-3xl">
+      <Link
+        className="hover:underline hover:underline-offset-2"
+        to={`/workflows/${workflowPermanentId}/runs`}
+      >
+        {workflow?.title}
+      </Link>
+    </h1>
   );
 
   const workflowFailureReason = workflowRun?.failure_reason ? (
