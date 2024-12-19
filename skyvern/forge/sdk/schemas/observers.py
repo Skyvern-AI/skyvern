@@ -1,7 +1,11 @@
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, HttpUrl
+from pydantic import BaseModel, ConfigDict, HttpUrl, field_validator
+
+from skyvern.forge.sdk.core.validators import validate_url
+
+DEFAULT_WORKFLOW_TITLE = "New Workflow"
 
 
 class ObserverCruiseStatus(StrEnum):
@@ -48,3 +52,20 @@ class ObserverThought(BaseModel):
 
     created_at: datetime
     modified_at: datetime
+
+
+class ObserverMetadata(BaseModel):
+    url: str
+    workflow_title: str = DEFAULT_WORKFLOW_TITLE
+
+    @field_validator("url")
+    @classmethod
+    def validate_urls(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return validate_url(v)
+
+
+class CruiseRequest(BaseModel):
+    user_prompt: str
+    url: HttpUrl | None = None

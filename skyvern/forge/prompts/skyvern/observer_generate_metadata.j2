@@ -1,0 +1,20 @@
+You're to assist the user to achieve the user goal in the browser. Given the user input, what is the url to type into the browser? Also come up with a proper title for this goal to achieve.
+
+MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
+
+Reply in JSON format with the following keys:
+{
+  "thoughts": str, // Think step by step. If the user specifically mentioned which website it is to use, let's use that url. If the user doesn't specifify a specific website, to achieve what the user wants to do, what is most likely website url for achieving the goal? 
+  "url": str, // The url to type into the browser. DO NOT change the url if user specified one.
+  "title": str, // A descriptive and informative title for the goal. Use no more than 5 words
+}
+
+User goal:
+```
+{{ user_goal }}
+```{% if user_url %}
+
+Starting url provided by user:
+```
+{{ user_url }}
+```{% endif %}

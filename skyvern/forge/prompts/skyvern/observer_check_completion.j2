@@ -1,0 +1,22 @@
+You're to assist the user to achieve the user goal in the web, given the user goal and the mini tasks that have been completed by the user along the way.
+
+Reply in JSON format with the following keys:
+{
+  "thoughts": str, // Think step by step. Would completing the tasks in the task history be good enough to achieve the user goal? If more tasks need to be completed to achieve the goal, what would be the next task?
+  "user_goal_achieved": bool, // True if the user goal has been completed, false otherwise. If the user wants to extract information along side the goal, make sure the extract task has happened before claiming that the goal is achieved.
+}
+
+User goal:
+```
+{{ user_goal }}
+```
+
+Task history (the earliest task is the first in the list and the latest is the last in the list):
+```
+{{ task_history }}
+```
+
+Current datetime, ISO format:
+```
+{{ local_datetime }}
+```

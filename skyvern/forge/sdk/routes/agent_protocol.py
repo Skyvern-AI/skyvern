@@ -36,6 +36,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.schemas.observers import CruiseRequest, ObserverCruise
 from skyvern.forge.sdk.schemas.organizations import (
     GetOrganizationAPIKeysResponse,
     GetOrganizationsResponse,
@@ -53,7 +54,7 @@ from skyvern.forge.sdk.schemas.tasks import (
     TaskStatus,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunEvent, WorkflowRunEventType
-from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services import observer_service, org_auth_service
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
@@ -1117,3 +1118,31 @@ async def upload_file(
         status_code=200,
         media_type="application/json",
     )
+
+
+@base_router.post("/cruise")
+@base_router.post("/cruise/", include_in_schema=False)
+async def observer_cruise(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    data: CruiseRequest,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+    x_max_iterations_override: Annotated[int | None, Header()] = None,
+) -> ObserverCruise:
+    if x_max_iterations_override:
+        LOG.info("Overriding max iterations for observer", max_iterations_override=x_max_iterations_override)
+
+    observer_cruise = await observer_service.initialize_observer_cruise(
+        organization=organization,
+        user_prompt=data.user_prompt,
+        user_url=str(data.url) if data.url else None,
+    )
+    analytics.capture("skyvern-oss-agent-observer-cruise", data={"url": observer_cruise.url})
+    await AsyncExecutorFactory.get_executor().execute_cruise(
+        request=request,
+        background_tasks=background_tasks,
+        organization_id=organization.organization_id,
+        observer_cruise_id=observer_cruise.observer_cruise_id,
+        max_iterations_override=x_max_iterations_override,
+    )
+    return observer_cruise

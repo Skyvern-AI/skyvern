@@ -552,3 +552,8 @@ class InteractWithDropdownContainer(SkyvernException):
         super().__init__(
             f"Select on the dropdown container instead of the option, try again with another element. element_id={element_id}"
         )
+
+
+class UrlGenerationFailure(SkyvernHTTPException):
+    def __init__(self) -> None:
+        super().__init__("Failed to generate the url for the prompt")

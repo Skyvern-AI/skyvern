@@ -1,0 +1,25 @@
+You're to assist the user to extract data from the web. Given the data extraction goal, DOM elements in the list and the screenshots of the website, design the schema for the data output.
+
+MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
+
+Reply in JSON format with the following keys:
+{
+  "schema": JSON, // the schema of the output data to extract. Use JSON Schema specification style.
+}
+
+The URL of the page you're on right now is `{{ current_url }}`.
+
+Clickable elements from the page:
+```
+{{ elements }}
+```
+
+Data extraction goal:
+```
+{{ data_extraction_goal }}
+```
+
+Current datetime, ISO format:
+```
+{{ local_datetime }}
+```

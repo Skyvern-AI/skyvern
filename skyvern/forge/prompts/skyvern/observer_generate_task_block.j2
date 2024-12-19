@@ -1,0 +1,26 @@
+You're to assist the user to achieve the user goal in the web, given the DOM elements in the list, the screenshots of the website and the user plan. Help user generate the navigation goal and data extraction goal if any.
+
+User is planning to {% if is_link %}go to a list of links{% else %}go through a list of values{% endif %} and and take the same task with each {% if is_link %}link{% else %}value{% endif %} in the list. Here's the specific plan:
+```
+{{ plan }}
+```
+
+{% if is_link %}Links{% else %}Values{% endif %} the user will go through:
+```
+{{ loop_values }}
+```
+
+MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
+
+Reply in JSON format with the following keys:
+{
+  "thoughts": str, // Think step by step. What would the use do to achieve the goal.
+  "navigation_goal": str, // What kind things the user needs to do in the web achieve the plan and finally get the data to extract. Include all the data needed to complete the goal here.{% if is_link %} The user already has the link to go to the target page first, in order to start executing the plan. So state the navigation goal from the perspective of already being on the target page. What does the user need to do from there?{% endif %}
+  "data_extraction_goal": str, // If the user needs to extract/retrieve data from the site after navigation goal is achieved, define that extraction goal here. null if no data needs to be extracted.
+  "data_schema": json, // the schema of the output data. use JSON schema specification style. All fields should be optional as we optimize to extract as much data as possible
+}
+
+Current datetime, ISO format:
+```
+{{ local_datetime }}
+```
