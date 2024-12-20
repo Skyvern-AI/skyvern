@@ -84,6 +84,7 @@ class BlockType(StrEnum):
 
 
 class BlockStatus(StrEnum):
+    running = "running"
     completed = "completed"
     failed = "failed"
     terminated = "terminated"

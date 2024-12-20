@@ -15,7 +15,6 @@ class WorkflowRunBlock(BaseModel):
     parent_workflow_run_block_id: str | None = None
     block_type: BlockType
     label: str | None = None
-    title: str | None = None
     status: str | None = None
     output: dict | list | str | None = None
     continue_on_failure: bool = False

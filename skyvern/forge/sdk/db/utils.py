@@ -18,6 +18,7 @@ from skyvern.forge.sdk.db.models import (
     TaskModel,
     WorkflowModel,
     WorkflowParameterModel,
+    WorkflowRunBlockModel,
     WorkflowRunModel,
     WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
@@ -25,6 +26,8 @@ from skyvern.forge.sdk.db.models import (
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskStatus
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.models.block import BlockStatus, BlockType
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     BitwardenLoginCredentialParameter,
@@ -368,3 +371,31 @@ def convert_to_workflow_run_parameter(
         value=workflow_parameter.workflow_parameter_type.convert_value(workflow_run_parameter_model.value),
         created_at=workflow_run_parameter_model.created_at,
     )
+
+
+def convert_to_workflow_run_block(
+    workflow_run_block_model: WorkflowRunBlockModel,
+    task: Task | None = None,
+) -> WorkflowRunBlock:
+    block = WorkflowRunBlock(
+        workflow_run_block_id=workflow_run_block_model.workflow_run_block_id,
+        workflow_run_id=workflow_run_block_model.workflow_run_id,
+        parent_workflow_run_block_id=workflow_run_block_model.parent_workflow_run_block_id,
+        block_type=BlockType(workflow_run_block_model.block_type),
+        label=workflow_run_block_model.label,
+        status=BlockStatus(workflow_run_block_model.status),
+        output=workflow_run_block_model.output,
+        continue_on_failure=workflow_run_block_model.continue_on_failure,
+        task_id=workflow_run_block_model.task_id,
+        created_at=workflow_run_block_model.created_at,
+        modified_at=workflow_run_block_model.modified_at,
+    )
+    if task:
+        block.url = task.url
+        block.navigation_goal = task.navigation_goal
+        block.data_extraction_goal = task.data_extraction_goal
+        block.data_schema = task.extracted_information_schema
+        block.terminate_criterion = task.terminate_criterion
+        block.complete_criterion = task.complete_criterion
+
+    return block
