@@ -386,6 +386,7 @@ def convert_to_workflow_run_block(
         status=BlockStatus(workflow_run_block_model.status),
         output=workflow_run_block_model.output,
         continue_on_failure=workflow_run_block_model.continue_on_failure,
+        failure_reason=workflow_run_block_model.failure_reason,
         task_id=workflow_run_block_model.task_id,
         created_at=workflow_run_block_model.created_at,
         modified_at=workflow_run_block_model.modified_at,

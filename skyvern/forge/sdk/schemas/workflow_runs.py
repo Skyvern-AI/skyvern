@@ -18,6 +18,7 @@ class WorkflowRunBlock(BaseModel):
     status: str | None = None
     output: dict | list | str | None = None
     continue_on_failure: bool = False
+    failure_reason: str | None = None
     task_id: str | None = None
     url: str | None = None
     navigation_goal: str | None = None

@@ -2027,11 +2027,16 @@ class AgentDB:
         workflow_run_block_id: str,
         status: BlockStatus | None = None,
         output: dict | list | str | None = None,
+        failure_reason: str | None = None,
+        task_id: str | None = None,
+        organization_id: str | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             workflow_run_block = (
                 await session.scalars(
-                    select(WorkflowRunBlockModel).filter_by(workflow_run_block_id=workflow_run_block_id)
+                    select(WorkflowRunBlockModel)
+                    .filter_by(workflow_run_block_id=workflow_run_block_id)
+                    .filter_by(organization_id=organization_id)
                 )
             ).first()
             if workflow_run_block:
@@ -2039,6 +2044,10 @@ class AgentDB:
                     workflow_run_block.status = status
                 if output:
                     workflow_run_block.output = output
+                if task_id:
+                    workflow_run_block.task_id = task_id
+                if failure_reason:
+                    workflow_run_block.failure_reason = failure_reason
                 await session.commit()
                 await session.refresh(workflow_run_block)
             else:
@@ -2048,3 +2057,24 @@ class AgentDB:
         if task_id:
             task = await self.get_task(task_id, organization_id=workflow_run_block.organization_id)
         return convert_to_workflow_run_block(workflow_run_block, task=task)
+
+    async def get_workflow_run_block(
+        self,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+    ) -> WorkflowRunBlock:
+        async with self.Session() as session:
+            workflow_run_block = (
+                await session.scalars(
+                    select(WorkflowRunBlockModel)
+                    .filter_by(workflow_run_block_id=workflow_run_block_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if workflow_run_block:
+                task = None
+                task_id = workflow_run_block.task_id
+                if task_id:
+                    task = await self.get_task(task_id, organization_id=organization_id)
+                return convert_to_workflow_run_block(workflow_run_block, task=task)
+            raise NotFoundError(f"WorkflowRunBlock {workflow_run_block_id} not found")
