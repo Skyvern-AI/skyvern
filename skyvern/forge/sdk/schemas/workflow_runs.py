@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
@@ -10,7 +12,7 @@ from skyvern.webeye.actions.actions import Action
 
 
 class WorkflowRunBlock(BaseModel):
-    workflow_run_block_id: str = "placeholder"
+    workflow_run_block_id: str
     workflow_run_id: str
     parent_workflow_run_block_id: str | None = None
     block_type: BlockType
@@ -26,20 +28,27 @@ class WorkflowRunBlock(BaseModel):
     data_schema: dict[str, Any] | list | str | None = None
     terminate_criterion: str | None = None
     complete_criterion: str | None = None
+    actions: list[Action] = []
     created_at: datetime
     modified_at: datetime
 
+    # for loop block
+    loop_values: list[Any] | None = None
 
-class WorkflowRunEventType(StrEnum):
-    action = "action"
+    # block inside a loop block
+    current_item: Any | None = None
+    current_index: int | None = None
+
+
+class WorkflowRunTimelineType(StrEnum):
     thought = "thought"
     block = "block"
 
 
-class WorkflowRunEvent(BaseModel):
-    type: WorkflowRunEventType
-    action: Action | None = None
-    thought: ObserverThought | None = None
+class WorkflowRunTimeline(BaseModel):
+    type: WorkflowRunTimelineType
     block: WorkflowRunBlock | None = None
+    thought: ObserverThought | None = None
+    children: list[WorkflowRunTimeline] = []
     created_at: datetime
     modified_at: datetime

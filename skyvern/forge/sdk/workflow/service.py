@@ -25,6 +25,7 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
     InvalidWaitBlockTime,
@@ -1602,3 +1603,39 @@ class WorkflowService:
             organization=organization,
             request=workflow_create_request,
         )
+
+    async def get_workflow_run_timeline(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+    ) -> list[WorkflowRunTimeline]:
+        """
+        build the tree structure of the workflow run timeline
+        """
+        worfklow_run_blocks = await app.DATABASE.get_workflow_run_blocks(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        # task_ids = [block.task_id for block in worfklow_run_blocks if block.task_id]
+        # tasks = await app.DATABASE.get_tasks_by_ids(task_ids, organization_id=organization_id)
+        # task_map = {task.task_id: task for task in tasks}
+        result = []
+        block_map: dict[str, WorkflowRunTimeline] = {}
+        while worfklow_run_blocks:
+            block = worfklow_run_blocks.pop(0)
+            workflow_run_timeline = WorkflowRunTimeline(
+                type=WorkflowRunTimelineType.block,
+                block=block,
+                created_at=block.created_at,
+                modified_at=block.modified_at,
+            )
+            if block.parent_worfklow_run_block_id:
+                if block.parent_worfklow_run_block_id in block_map:
+                    block_map[block.parent_worfklow_run_block_id].children.append(workflow_run_timeline)
+                result.append(WorkflowRunTimeline(block=block, children=[]))
+            else:
+                for parent in result:
+                    if parent.block.block_id == block.parent_block_id:
+                        parent.children.append(WorkflowRunTimeline(block=block, children=[]))
+                        break
+        return []

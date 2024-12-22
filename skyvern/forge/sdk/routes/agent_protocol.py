@@ -53,7 +53,7 @@ from skyvern.forge.sdk.schemas.tasks import (
     TaskResponse,
     TaskStatus,
 )
-from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunEvent, WorkflowRunEventType
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.services import observer_service, org_auth_service
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
@@ -727,27 +727,32 @@ async def get_workflow_run(
 
 
 @base_router.get(
-    "/workflows/{workflow_id}/runs/{workflow_run_id}/events",
+    "/workflows/{workflow_id}/runs/{workflow_run_id}/timeline",
 )
 @base_router.get(
-    "/workflows/{workflow_id}/runs/{workflow_run_id}/events/",
+    "/workflows/{workflow_id}/runs/{workflow_run_id}/timeline/",
 )
-async def get_workflow_run_events(
+async def get_workflow_run_timeline(
     workflow_id: str,
     workflow_run_id: str,
     observer_cruise_id: str | None = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1),
     current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> list[WorkflowRunEvent]:
-    # get all the tasks for the workflow run
-    tasks = await app.DATABASE.get_tasks(
-        page,
-        page_size,
+) -> list[WorkflowRunTimeline]:
+    # get all the workflow run blocks
+    worfklow_run_blocks = await app.DATABASE.get_workflow_run_blocks(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
     )
-    workflow_run_events: list[WorkflowRunEvent] = []
+    task_ids = [block.task_id for block in worfklow_run_blocks if block.task_id]
+    tasks = await app.DATABASE.get_tasks_by_ids(task_ids, organization_id=current_org.organization_id)
+    task_map = {task.task_id: task for task in tasks}
+    # build tree structure
+
+    # get all the tasks for the workflow run
+    tasks = await app.DATABASE.get_tasks()
+    workflow_run_events: list[WorkflowRunTimeline] = []
     for task in tasks:
         block_type = BlockType.TASK
         if task.task_type == TaskType.general:
@@ -759,13 +764,12 @@ async def get_workflow_run_events(
             block_type = BlockType.VALIDATION
         elif task.task_type == TaskType.action:
             block_type = BlockType.ACTION
-        event = WorkflowRunEvent(
-            type=WorkflowRunEventType.block,
+        event = WorkflowRunTimeline(
+            type=WorkflowRunTimelineType.block,
             block=WorkflowRunBlock(
                 workflow_run_id=workflow_run_id,
                 block_type=block_type,
                 label=task.title,
-                title=task.title,
                 url=task.url,
                 status=task.status,
                 navigation_goal=task.navigation_goal,
@@ -785,14 +789,8 @@ async def get_workflow_run_events(
         [task.task_id for task in tasks], organization_id=current_org.organization_id
     )
     for action in actions:
-        workflow_run_events.append(
-            WorkflowRunEvent(
-                type=WorkflowRunEventType.action,
-                action=action,
-                created_at=action.created_at or datetime.datetime.utcnow(),
-                modified_at=action.modified_at or datetime.datetime.utcnow(),
-            )
-        )
+        # TODO:
+        continue
     # get all the thoughts for the cruise
     if observer_cruise_id:
         thoughts = await app.DATABASE.get_observer_cruise_thoughts(
@@ -800,8 +798,8 @@ async def get_workflow_run_events(
         )
         for thought in thoughts:
             workflow_run_events.append(
-                WorkflowRunEvent(
-                    type=WorkflowRunEventType.thought,
+                WorkflowRunTimeline(
+                    type=WorkflowRunTimelineType.thought,
                     thought=thought,
                     created_at=thought.created_at,
                     modified_at=thought.modified_at,
