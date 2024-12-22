@@ -329,7 +329,7 @@ async def run_observer_cruise(
             break
 
         # generate the extraction task
-        block_result = await block.execute_safe(workflow_run_id=workflow_run_id)
+        block_result = await block.execute_safe(workflow_run_id=workflow_run_id, organization_id=organization_id)
 
         # refresh workflow
         yaml_blocks.extend(block_yaml_list)
@@ -534,7 +534,10 @@ async def _generate_loop_task(
     )
 
     # execute the extraction block
-    extraction_block_result = await extraction_block_for_loop.execute_safe(workflow_run_id=workflow_run_id)
+    extraction_block_result = await extraction_block_for_loop.execute_safe(
+        workflow_run_id=workflow_run_id,
+        organization_id=observer_cruise.organization_id,
+    )
     LOG.info("Extraction block result", extraction_block_result=extraction_block_result)
     if extraction_block_result.success is False:
         LOG.error(
