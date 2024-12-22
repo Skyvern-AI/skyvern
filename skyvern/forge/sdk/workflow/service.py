@@ -570,8 +570,10 @@ class WorkflowService:
             status=WorkflowRunStatus.canceled,
         )
 
-    async def get_workflow_run(self, workflow_run_id: str) -> WorkflowRun:
-        workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=workflow_run_id)
+    async def get_workflow_run(self, workflow_run_id: str, organization_id: str | None = None) -> WorkflowRun:
+        workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run_id=workflow_run_id, organization_id=organization_id
+        )
         if not workflow_run:
             raise WorkflowRunNotFound(workflow_run_id)
         return workflow_run
