@@ -1905,7 +1905,7 @@ class AgentDB:
                 return ObserverThought.model_validate(observer_thought)
             return None
 
-    async def get_observer_cruise_thoughts(
+    async def get_observer_thoughts(
         self,
         observer_cruise_id: str,
         organization_id: str | None = None,

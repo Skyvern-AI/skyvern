@@ -15,6 +15,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverCruiseStatus, ObserverMetadata
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.workflow.models.block import (
     BlockResult,
     BlockStatus,
@@ -776,3 +777,19 @@ def _generate_random_string(length: int = 5) -> str:
     # Use the current timestamp as the seed
     random.seed(os.urandom(16))
     return "".join(random.choices(RANDOM_STRING_POOL, k=length))
+
+
+async def get_observer_thought_timelines(
+    observer_cruise_id: str,
+    organization_id: str | None = None,
+) -> list[WorkflowRunTimeline]:
+    observer_thoughts = await app.DATABASE.get_observer_thoughts(observer_cruise_id, organization_id=organization_id)
+    return [
+        WorkflowRunTimeline(
+            type=WorkflowRunTimelineType.thought,
+            thought=thought,
+            created_at=thought.created_at,
+            modified_at=thought.modified_at,
+        )
+        for thought in observer_thoughts
+    ]

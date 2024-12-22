@@ -33,7 +33,7 @@ from skyvern.forge.sdk.artifact.models import Artifact
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.observers import CruiseRequest, ObserverCruise
@@ -53,14 +53,13 @@ from skyvern.forge.sdk.schemas.tasks import (
     TaskResponse,
     TaskStatus,
 )
-from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline
 from skyvern.forge.sdk.services import observer_service, org_auth_service
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
     WorkflowParameterMissingRequiredValue,
 )
-from skyvern.forge.sdk.workflow.models.block import BlockType
 from skyvern.forge.sdk.workflow.models.workflow import (
     RunWorkflowResponse,
     Workflow,
@@ -741,72 +740,18 @@ async def get_workflow_run_timeline(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRunTimeline]:
     # get all the workflow run blocks
-    worfklow_run_blocks = await app.DATABASE.get_workflow_run_blocks(
+    workflow_run_block_timeline = await app.WORKFLOW_SERVICE.get_workflow_run_timeline(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
     )
-    task_ids = [block.task_id for block in worfklow_run_blocks if block.task_id]
-    tasks = await app.DATABASE.get_tasks_by_ids(task_ids, organization_id=current_org.organization_id)
-    task_map = {task.task_id: task for task in tasks}
-    # build tree structure
-
-    # get all the tasks for the workflow run
-    tasks = await app.DATABASE.get_tasks()
-    workflow_run_events: list[WorkflowRunTimeline] = []
-    for task in tasks:
-        block_type = BlockType.TASK
-        if task.task_type == TaskType.general:
-            if not task.navigation_goal and task.data_extraction_goal:
-                block_type = BlockType.EXTRACTION
-            elif task.navigation_goal and not task.data_extraction_goal:
-                block_type = BlockType.NAVIGATION
-        elif task.task_type == TaskType.validation:
-            block_type = BlockType.VALIDATION
-        elif task.task_type == TaskType.action:
-            block_type = BlockType.ACTION
-        event = WorkflowRunTimeline(
-            type=WorkflowRunTimelineType.block,
-            block=WorkflowRunBlock(
-                workflow_run_id=workflow_run_id,
-                block_type=block_type,
-                label=task.title,
-                url=task.url,
-                status=task.status,
-                navigation_goal=task.navigation_goal,
-                data_extraction_goal=task.data_extraction_goal,
-                data_schema=task.extracted_information_schema,
-                terminate_criterion=task.terminate_criterion,
-                complete_criterion=task.complete_criterion,
-                created_at=task.created_at,
-                modified_at=task.modified_at,
-            ),
-            created_at=task.created_at,
-            modified_at=task.modified_at,
-        )
-        workflow_run_events.append(event)
-    # get all the actions for all the tasks
-    actions = await app.DATABASE.get_tasks_actions(
-        [task.task_id for task in tasks], organization_id=current_org.organization_id
-    )
-    for action in actions:
-        # TODO:
-        continue
-    # get all the thoughts for the cruise
     if observer_cruise_id:
-        thoughts = await app.DATABASE.get_observer_cruise_thoughts(
-            observer_cruise_id, organization_id=current_org.organization_id
+        observer_thought_timeline = await observer_service.get_observer_thought_timelines(
+            observer_cruise_id=observer_cruise_id,
+            organization_id=current_org.organization_id,
         )
-        for thought in thoughts:
-            workflow_run_events.append(
-                WorkflowRunTimeline(
-                    type=WorkflowRunTimelineType.thought,
-                    thought=thought,
-                    created_at=thought.created_at,
-                    modified_at=thought.modified_at,
-                )
-            )
-    workflow_run_events.sort(key=lambda x: x.created_at)
-    return workflow_run_events
+        workflow_run_block_timeline.extend(observer_thought_timeline)
+    workflow_run_block_timeline.sort(key=lambda x: x.created_at)
+    return workflow_run_block_timeline
 
 
 @base_router.get(
