@@ -249,7 +249,8 @@ class WorkflowService:
                     block_label=block.label,
                 )
                 block_result = await block.execute_safe(
-                    workflow_run_id=workflow_run_id, organization_id=organization_id
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
                 )
                 if block_result.status == BlockStatus.canceled:
                     LOG.info(

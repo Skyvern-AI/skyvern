@@ -870,7 +870,7 @@ class ForLoopBlock(Block):
             workflow_run_block_id=workflow_run_block_id,
             workflow_run_context=workflow_run_context,
             loop_over_values=loop_over_values,
-            # TODO: pass organization_id
+            organization_id=organization_id,
         )
         await self.record_output_parameter_value(
             workflow_run_context, workflow_run_id, loop_executed_result.outputs_with_loop_values
