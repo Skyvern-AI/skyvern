@@ -84,3 +84,4 @@ class LogEntityType(StrEnum):
     TASK = "task"
     WORKFLOW_RUN = "workflow_run"
     WORKFLOW_RUN_BLOCK = "workflow_run_block"
+    OBSERVER = "observer"
