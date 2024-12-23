@@ -1891,6 +1891,22 @@ class AgentDB:
                 return ObserverCruise.model_validate(observer_cruise)
             return None
 
+    async def get_observer_cruise_by_workflow_run_id(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+    ) -> ObserverCruise | None:
+        async with self.Session() as session:
+            if observer_cruise := (
+                await session.scalars(
+                    select(ObserverCruiseModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_run_id=workflow_run_id)
+                )
+            ).first():
+                return ObserverCruise.model_validate(observer_cruise)
+            return None
+
     async def get_observer_thought(
         self, observer_thought_id: str, organization_id: str | None = None
     ) -> ObserverThought | None:

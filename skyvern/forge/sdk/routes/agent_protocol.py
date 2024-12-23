@@ -734,21 +734,24 @@ async def get_workflow_run(
     "/workflows/{workflow_id}/runs/{workflow_run_id}/timeline/",
 )
 async def get_workflow_run_timeline(
-    workflow_id: str,
     workflow_run_id: str,
-    observer_cruise_id: str | None = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRunTimeline]:
+    # get observer cruise by workflow run id
+    observer_cruise_obj = await app.DATABASE.get_observer_cruise_by_workflow_run_id(
+        workflow_run_id=workflow_run_id,
+        organization_id=current_org.organization_id,
+    )
     # get all the workflow run blocks
     workflow_run_block_timeline = await app.WORKFLOW_SERVICE.get_workflow_run_timeline(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
     )
-    if observer_cruise_id:
+    if observer_cruise_obj and observer_cruise_obj.observer_cruise_id:
         observer_thought_timeline = await observer_service.get_observer_thought_timelines(
-            observer_cruise_id=observer_cruise_id,
+            observer_cruise_id=observer_cruise_obj.observer_cruise_id,
             organization_id=current_org.organization_id,
         )
         workflow_run_block_timeline.extend(observer_thought_timeline)
