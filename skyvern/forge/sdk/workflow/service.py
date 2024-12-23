@@ -1616,13 +1616,22 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )
+        # get all the actions for all workflow run blocks
+        task_ids = [block.task_id for block in workflow_run_blocks if block.task_id]
+        task_id_to_block: dict[str, WorkflowRunBlock] = {
+            block.task_id: block for block in workflow_run_blocks if block.task_id
+        }
+        actions = await app.DATABASE.get_tasks_actions(task_ids=task_ids, organization_id=organization_id)
+        for action in actions:
+            if not action.task_id:
+                continue
+            task_block = task_id_to_block[action.task_id]
+            task_block.actions.append(action)
+
         result = []
         block_map: dict[str, WorkflowRunTimeline] = {}
-        task_id_to_block: dict[str, WorkflowRunBlock] = {}
         while workflow_run_blocks:
             block = workflow_run_blocks.pop(0)
-            if block.task_id:
-                task_id_to_block[block.task_id] = block
             workflow_run_timeline = WorkflowRunTimeline(
                 type=WorkflowRunTimelineType.block,
                 block=block,
@@ -1637,14 +1646,5 @@ class WorkflowService:
                     workflow_run_blocks.append(block)
             else:
                 result.append(workflow_run_timeline)
-
-        # get all the actions for all workflow run blocks
-        task_ids = [block.task_id for block in workflow_run_blocks if block.task_id]
-        actions = await app.DATABASE.get_tasks_actions(task_ids=task_ids, organization_id=organization_id)
-        for action in actions:
-            if not action.task_id:
-                continue
-            task_block = task_id_to_block[action.task_id]
-            task_block.actions.append(action)
 
         return result
