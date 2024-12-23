@@ -478,6 +478,7 @@ class EntityType(str, Enum):
     TASK = "task"
     WORKFLOW_RUN = "workflow_run"
     WORKFLOW_RUN_BLOCK = "workflow_run_block"
+    OBSERVER_THOUGHT = "observer_thought"
 
 
 entity_type_to_param = {
@@ -485,6 +486,7 @@ entity_type_to_param = {
     EntityType.TASK: "task_id",
     EntityType.WORKFLOW_RUN: "workflow_run_id",
     EntityType.WORKFLOW_RUN_BLOCK: "workflow_run_block_id",
+    EntityType.OBSERVER_THOUGHT: "observer_thought_id",
 }
 
 

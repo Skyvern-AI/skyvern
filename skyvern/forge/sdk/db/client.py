@@ -1975,6 +1975,37 @@ class AgentDB:
             await session.refresh(new_observer_thought)
             return ObserverThought.model_validate(new_observer_thought)
 
+    async def update_observer_thought(
+        self,
+        observer_thought_id: str,
+        workflow_run_block_id: str | None = None,
+        observation: str | None = None,
+        thought: str | None = None,
+        answer: str | None = None,
+        organization_id: str | None = None,
+    ) -> ObserverThought:
+        async with self.Session() as session:
+            observer_thought = (
+                await session.scalars(
+                    select(ObserverThoughtModel)
+                    .filter_by(observer_thought_id=observer_thought_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if observer_thought:
+                if workflow_run_block_id:
+                    observer_thought.workflow_run_block_id = workflow_run_block_id
+                if observation:
+                    observer_thought.observation = observation
+                if thought:
+                    observer_thought.thought = thought
+                if answer:
+                    observer_thought.answer = answer
+                await session.commit()
+                await session.refresh(observer_thought)
+                return ObserverThought.model_validate(observer_thought)
+            raise NotFoundError(f"ObserverThought {observer_thought_id}")
+
     async def update_observer_cruise(
         self,
         observer_cruise_id: str,

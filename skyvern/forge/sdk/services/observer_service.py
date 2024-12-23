@@ -231,8 +231,17 @@ async def run_observer_cruise(
             task_history=task_history,
             local_datetime=datetime.now(context.tz_info).isoformat(),
         )
+        observer_thought = await app.DATABASE.create_observer_thought(
+            observer_cruise_id=observer_cruise_id,
+            organization_id=organization_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_id=workflow.workflow_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+        )
         observer_response = await app.LLM_API_HANDLER(
-            prompt=observer_prompt, screenshots=scraped_page.screenshots, observer_cruise=observer_cruise
+            prompt=observer_prompt,
+            screenshots=scraped_page.screenshots,
+            observer_thought=observer_thought,
         )
         LOG.info(
             "Observer response",
@@ -247,12 +256,9 @@ async def run_observer_cruise(
         thoughts: str = observer_response.get("thoughts", "")
         plan: str = observer_response.get("plan", "")
         # Create and save observer thought
-        await app.DATABASE.create_observer_thought(
-            observer_cruise_id=observer_cruise_id,
+        await app.DATABASE.update_observer_thought(
+            observer_thought_id=observer_thought.observer_thought_id,
             organization_id=organization_id,
-            workflow_run_id=workflow_run.workflow_run_id,
-            workflow_id=workflow.workflow_id,
-            workflow_permanent_id=workflow.workflow_permanent_id,
             thought=thoughts,
             observation=observation,
             answer=plan,
