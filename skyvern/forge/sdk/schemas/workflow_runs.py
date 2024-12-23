@@ -36,7 +36,7 @@ class WorkflowRunBlock(BaseModel):
     loop_values: list[Any] | None = None
 
     # block inside a loop block
-    current_item: Any | None = None
+    current_value: str | None = None
     current_index: int | None = None
 
 
