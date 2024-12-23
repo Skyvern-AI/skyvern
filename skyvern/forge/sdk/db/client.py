@@ -1891,6 +1891,22 @@ class AgentDB:
                 return ObserverCruise.model_validate(observer_cruise)
             return None
 
+    async def get_observer_cruise_by_workflow_run_id(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+    ) -> ObserverCruise | None:
+        async with self.Session() as session:
+            if observer_cruise := (
+                await session.scalars(
+                    select(ObserverCruiseModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_run_id=workflow_run_id)
+                )
+            ).first():
+                return ObserverCruise.model_validate(observer_cruise)
+            return None
+
     async def get_observer_thought(
         self, observer_thought_id: str, organization_id: str | None = None
     ) -> ObserverThought | None:
@@ -2087,6 +2103,12 @@ class AgentDB:
         loop_values: list | None = None,
         current_value: str | None = None,
         current_index: int | None = None,
+        recipients: list[str] | None = None,
+        attachments: list[str] | None = None,
+        subject: str | None = None,
+        body: str | None = None,
+        prompt: str | None = None,
+        wait_sec: int | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             workflow_run_block = (
@@ -2111,6 +2133,18 @@ class AgentDB:
                     workflow_run_block.current_value = current_value
                 if current_index:
                     workflow_run_block.current_index = current_index
+                if recipients:
+                    workflow_run_block.recipients = recipients
+                if attachments:
+                    workflow_run_block.attachments = attachments
+                if subject:
+                    workflow_run_block.subject = subject
+                if body:
+                    workflow_run_block.body = body
+                if prompt:
+                    workflow_run_block.prompt = prompt
+                if wait_sec:
+                    workflow_run_block.wait_sec = wait_sec
                 await session.commit()
                 await session.refresh(workflow_run_block)
             else:
