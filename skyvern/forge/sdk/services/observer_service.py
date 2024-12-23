@@ -161,7 +161,7 @@ async def run_observer_cruise(
 
     workflow_run_id = observer_cruise.workflow_run_id
 
-    workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(workflow_run_id)
+    workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(workflow_run_id, organization_id=organization_id)
     if not workflow_run:
         LOG.error("Workflow run not found", workflow_run_id=workflow_run_id)
         return None
@@ -483,7 +483,10 @@ async def handle_block_result(
                 workflow_run=workflow_run,
             )
     # refresh workflow run model
-    return await app.WORKFLOW_SERVICE.get_workflow_run(workflow_run_id=workflow_run_id)
+    return await app.WORKFLOW_SERVICE.get_workflow_run(
+        workflow_run_id=workflow_run_id,
+        organization_id=workflow.organization_id,
+    )
 
 
 async def _set_up_workflow_context(workflow_id: str, workflow_run_id: str) -> None:

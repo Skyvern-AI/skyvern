@@ -1283,12 +1283,13 @@ class AgentDB:
             )
             return None
 
-    async def get_workflow_run(self, workflow_run_id: str) -> WorkflowRun | None:
+    async def get_workflow_run(self, workflow_run_id: str, organization_id: str | None = None) -> WorkflowRun | None:
         try:
             async with self.Session() as session:
-                if workflow_run := (
-                    await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
-                ).first():
+                get_workflow_run_query = select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id)
+                if organization_id:
+                    get_workflow_run_query = get_workflow_run_query.filter_by(organization_id=organization_id)
+                if workflow_run := (await session.scalars(get_workflow_run_query)).first():
                     return convert_to_workflow_run(workflow_run)
                 return None
         except SQLAlchemyError:
