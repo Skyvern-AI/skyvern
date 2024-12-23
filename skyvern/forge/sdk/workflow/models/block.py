@@ -98,6 +98,7 @@ class BlockResult:
     output_parameter_value: dict[str, Any] | list | str | None = None
     status: BlockStatus | None = None
     failure_reason: str | None = None
+    workflow_run_block_id: str | None = None
 
 
 class Block(BaseModel, abc.ABC):
@@ -155,6 +156,7 @@ class Block(BaseModel, abc.ABC):
             output_parameter=self.output_parameter,
             output_parameter_value=output_parameter_value,
             status=status,
+            workflow_run_block_id=workflow_run_block_id,
         )
 
     def format_block_parameter_template_from_workflow_run_context(
@@ -777,6 +779,21 @@ class ForLoopBlock(Block):
                         "output_value": workflow_run_context.get_value(block_output.output_parameter.key),
                     }
                 )
+                try:
+                    if block_output.workflow_run_block_id:
+                        await app.DATABASE.update_workflow_run_block(
+                            workflow_run_block_id=block_output.workflow_run_block_id,
+                            organization_id=organization_id,
+                            current_value=str(loop_over_value),
+                            current_index=loop_idx,
+                        )
+                except Exception:
+                    LOG.warning(
+                        "Failed to update workflow run block",
+                        workflow_run_block_id=block_output.workflow_run_block_id,
+                        loop_over_value=loop_over_value,
+                        loop_idx=loop_idx,
+                    )
                 loop_block = original_loop_block
                 block_outputs.append(block_output)
                 if block_output.status == BlockStatus.canceled:
@@ -832,6 +849,12 @@ class ForLoopBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
+
+        await app.DATABASE.update_workflow_run_block(
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            loop_values=loop_over_values,
+        )
 
         LOG.info(
             f"Number of loop_over values: {len(loop_over_values)}",

@@ -504,6 +504,9 @@ class WorkflowRunBlockModel(Base):
     output = Column(JSON, nullable=True)
     continue_on_failure = Column(Boolean, nullable=False, default=False)
     failure_reason = Column(String, nullable=True)
+    loop_values = Column(JSON, nullable=True)
+    current_value = Column(String, nullable=True)
+    current_index = Column(Integer, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

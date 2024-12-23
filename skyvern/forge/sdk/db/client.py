@@ -2084,6 +2084,9 @@ class AgentDB:
         failure_reason: str | None = None,
         task_id: str | None = None,
         organization_id: str | None = None,
+        loop_values: list | None = None,
+        current_value: str | None = None,
+        current_index: int | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             workflow_run_block = (
@@ -2102,6 +2105,12 @@ class AgentDB:
                     workflow_run_block.task_id = task_id
                 if failure_reason:
                     workflow_run_block.failure_reason = failure_reason
+                if loop_values:
+                    workflow_run_block.loop_values = loop_values
+                if current_value:
+                    workflow_run_block.current_value = current_value
+                if current_index:
+                    workflow_run_block.current_index = current_index
                 await session.commit()
                 await session.refresh(workflow_run_block)
             else:
