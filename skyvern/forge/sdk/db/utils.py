@@ -394,6 +394,7 @@ def convert_to_workflow_run_block(
     if task:
         block.url = task.url
         block.navigation_goal = task.navigation_goal
+        block.navigation_payload = task.navigation_payload
         block.data_extraction_goal = task.data_extraction_goal
         block.data_schema = task.extracted_information_schema
         block.terminate_criterion = task.terminate_criterion
