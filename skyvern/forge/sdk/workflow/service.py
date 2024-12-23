@@ -360,7 +360,8 @@ class WorkflowService:
                 return workflow_run
 
         refreshed_workflow_run = await app.DATABASE.get_workflow_run(
-            workflow_run_id=workflow_run.workflow_run_id, organization_id=organization_id
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=organization_id,
         )
         if refreshed_workflow_run and refreshed_workflow_run.status not in (
             WorkflowRunStatus.canceled,

@@ -312,7 +312,8 @@ async def cancel_workflow_run(
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> None:
     workflow_run = await app.DATABASE.get_workflow_run(
-        workflow_run_id=workflow_run_id, organization_id=current_org.organization_id
+        workflow_run_id=workflow_run_id,
+        organization_id=current_org.organization_id,
     )
     if not workflow_run:
         raise HTTPException(
