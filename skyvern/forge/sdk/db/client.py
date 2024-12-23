@@ -2087,6 +2087,12 @@ class AgentDB:
         loop_values: list | None = None,
         current_value: str | None = None,
         current_index: int | None = None,
+        recipients: list[str] | None = None,
+        attachments: list[str] | None = None,
+        subject: str | None = None,
+        body: str | None = None,
+        prompt: str | None = None,
+        wait_sec: int | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             workflow_run_block = (
@@ -2111,6 +2117,18 @@ class AgentDB:
                     workflow_run_block.current_value = current_value
                 if current_index:
                     workflow_run_block.current_index = current_index
+                if recipients:
+                    workflow_run_block.recipients = recipients
+                if attachments:
+                    workflow_run_block.attachments = attachments
+                if subject:
+                    workflow_run_block.subject = subject
+                if body:
+                    workflow_run_block.body = body
+                if prompt:
+                    workflow_run_block.prompt = prompt
+                if wait_sec:
+                    workflow_run_block.wait_sec = wait_sec
                 await session.commit()
                 await session.refresh(workflow_run_block)
             else:

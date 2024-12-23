@@ -1067,6 +1067,11 @@ class TextPromptBlock(Block):
     ) -> BlockResult:
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        await app.DATABASE.update_workflow_run_block(
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            prompt=self.prompt,
+        )
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
@@ -1535,6 +1540,14 @@ class SendEmailBlock(Block):
         self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        await app.DATABASE.update_workflow_run_block(
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            recipients=self.recipients,
+            attachments=self.file_attachments,
+            subject=self.subject,
+            body=self.body,
+        )
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
@@ -1692,6 +1705,11 @@ class WaitBlock(Block):
         self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
     ) -> BlockResult:
         # TODO: we need to support to interrupt the sleep when the workflow run failed/cancelled/terminated
+        await app.DATABASE.update_workflow_run_block(
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            wait_sec=self.wait_sec,
+        )
         LOG.info(
             "Going to pause the workflow for a while",
             second=self.wait_sec,

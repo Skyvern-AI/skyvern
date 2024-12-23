@@ -504,9 +504,23 @@ class WorkflowRunBlockModel(Base):
     output = Column(JSON, nullable=True)
     continue_on_failure = Column(Boolean, nullable=False, default=False)
     failure_reason = Column(String, nullable=True)
+
+    # for loop block
     loop_values = Column(JSON, nullable=True)
     current_value = Column(String, nullable=True)
     current_index = Column(Integer, nullable=True)
+
+    # email block
+    recipients = Column(JSON, nullable=True)
+    attachments = Column(JSON, nullable=True)
+    subject = Column(String, nullable=True)
+    body = Column(String, nullable=True)
+
+    # prompt block
+    prompt = Column(String, nullable=True)
+
+    # wait block
+    wait_sec = Column(Integer, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -514,6 +528,7 @@ class WorkflowRunBlockModel(Base):
 
 class ObserverCruiseModel(Base):
     __tablename__ = "observer_cruises"
+    __table_args__ = (Index("oc_org_wfr_index", "organization_id", "workflow_run_id"),)
 
     observer_cruise_id = Column(String, primary_key=True, default=generate_observer_cruise_id)
     status = Column(String, nullable=False, default="created")
