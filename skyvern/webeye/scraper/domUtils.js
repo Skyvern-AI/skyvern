@@ -1548,7 +1548,8 @@ function buildElementTree(starter = document.body, frame, full_tree = false) {
         if (
           labelElement &&
           labelElement.childElementCount === 0 &&
-          !labelElement.getAttribute("for")
+          !labelElement.getAttribute("for") &&
+          !element.text
         ) {
           continue;
         }
