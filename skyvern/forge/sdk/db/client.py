@@ -1286,11 +1286,7 @@ class AgentDB:
     async def get_workflow_run(self, workflow_run_id: str, organization_id: str | None = None) -> WorkflowRun | None:
         try:
             async with self.Session() as session:
-                get_workflow_run_query = (
-                    select(WorkflowRunModel)
-                    .filter_by(workflow_run_id=workflow_run_id)
-                    .filter(WorkflowModel.deleted_at.is_(None))
-                )
+                get_workflow_run_query = select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id)
                 if organization_id:
                     get_workflow_run_query = get_workflow_run_query.filter_by(organization_id=organization_id)
                 if workflow_run := (await session.scalars(get_workflow_run_query)).first():
