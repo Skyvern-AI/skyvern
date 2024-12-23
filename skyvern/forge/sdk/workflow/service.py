@@ -1630,7 +1630,9 @@ class WorkflowService:
 
         result = []
         block_map: dict[str, WorkflowRunTimeline] = {}
+        counter = 0
         while workflow_run_blocks:
+            counter += 1
             block = workflow_run_blocks.pop(0)
             workflow_run_timeline = WorkflowRunTimeline(
                 type=WorkflowRunTimelineType.block,
@@ -1646,5 +1648,10 @@ class WorkflowService:
                     workflow_run_blocks.append(block)
             else:
                 result.append(workflow_run_timeline)
+                block_map[block.workflow_run_block_id] = workflow_run_timeline
+
+            if counter > 1000:
+                LOG.error("Too many blocks in the workflow run", workflow_run_id=workflow_run_id)
+                break
 
         return result
