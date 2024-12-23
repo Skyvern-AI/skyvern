@@ -171,7 +171,9 @@ async def workflow_run_streaming(
                 )
                 return
 
-            workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=workflow_run_id)
+            workflow_run = await app.DATABASE.get_workflow_run(
+                workflow_run_id=workflow_run_id, organization_id=organization_id
+            )
             if not workflow_run or workflow_run.organization_id != organization_id:
                 LOG.info(
                     "WofklowRun Streaming: Workflow not found",

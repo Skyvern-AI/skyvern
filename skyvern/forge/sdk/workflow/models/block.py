@@ -352,10 +352,12 @@ class BaseTaskBlock(Block):
         will_retry = True
         current_running_task: Task | None = None
         workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
-            workflow_run_id=workflow_run_id, organization_id=organization_id
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
         )
         workflow = await app.WORKFLOW_SERVICE.get_workflow(
-            workflow_id=workflow_run.workflow_id, organization_id=organization_id
+            workflow_id=workflow_run.workflow_id,
+            organization_id=organization_id,
         )
         # if the task url is parameterized, we need to get the value from the workflow run context
         if self.url and workflow_run_context.has_parameter(self.url) and workflow_run_context.has_value(self.url):

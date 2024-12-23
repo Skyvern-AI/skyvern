@@ -248,7 +248,9 @@ class ForgeAgent:
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
         workflow_run: WorkflowRun | None = None
         if task.workflow_run_id:
-            workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=task.workflow_run_id)
+            workflow_run = await app.DATABASE.get_workflow_run(
+                workflow_run_id=task.workflow_run_id, organization_id=organization.organization_id
+            )
             if workflow_run and workflow_run.status == WorkflowRunStatus.canceled:
                 LOG.info(
                     "Workflow run is canceled, stopping execution inside task",
