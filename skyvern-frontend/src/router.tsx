@@ -118,6 +118,10 @@ const router = createBrowserRouter([
                     element: <Navigate to="overview" />,
                   },
                   {
+                    path: "blocks",
+                    element: <Navigate to="overview" />,
+                  },
+                  {
                     path: "overview",
                     element: <WorkflowRunOverview />,
                   },
