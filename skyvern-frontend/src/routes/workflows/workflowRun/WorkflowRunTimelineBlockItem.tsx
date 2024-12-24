@@ -45,6 +45,7 @@ function WorkflowRunTimelineBlockItem({
       {subBlocks.map((block) => {
         return (
           <WorkflowRunTimelineBlockItem
+            key={block.workflow_run_block_id}
             block={block}
             activeItem={activeItem}
             onActionClick={onActionClick}
