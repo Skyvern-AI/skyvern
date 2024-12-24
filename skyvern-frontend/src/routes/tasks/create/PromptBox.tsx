@@ -19,7 +19,6 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { observerFeatureEnabled } from "@/util/env";
 import {
   FileTextIcon,
   GearIcon,
@@ -233,35 +232,33 @@ function PromptBox() {
               placeholder="Enter your prompt..."
               rows={1}
             />
-            {observerFeatureEnabled && (
-              <Select value={selectValue} onValueChange={setSelectValue}>
-                <SelectTrigger className="w-48 focus:ring-0">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent className="border-slate-500 bg-slate-elevation3">
-                  <CustomSelectItem value="v1">
-                    <div className="space-y-2">
-                      <div>
-                        <SelectItemText>Skyvern 1.0 (Tasks)</SelectItemText>
-                      </div>
-                      <div className="text-xs text-slate-400">
-                        best for simple tasks
-                      </div>
+            <Select value={selectValue} onValueChange={setSelectValue}>
+              <SelectTrigger className="w-48 focus:ring-0">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent className="border-slate-500 bg-slate-elevation3">
+                <CustomSelectItem value="v1">
+                  <div className="space-y-2">
+                    <div>
+                      <SelectItemText>Skyvern 1.0 (Tasks)</SelectItemText>
                     </div>
-                  </CustomSelectItem>
-                  <CustomSelectItem value="v2" className="hover:bg-slate-800">
-                    <div className="space-y-2">
-                      <div>
-                        <SelectItemText>Skyvern 2.0 (Observer)</SelectItemText>
-                      </div>
-                      <div className="text-xs text-slate-400">
-                        best for complex tasks
-                      </div>
+                    <div className="text-xs text-slate-400">
+                      best for simple tasks
                     </div>
-                  </CustomSelectItem>
-                </SelectContent>
-              </Select>
-            )}
+                  </div>
+                </CustomSelectItem>
+                <CustomSelectItem value="v2" className="hover:bg-slate-800">
+                  <div className="space-y-2">
+                    <div>
+                      <SelectItemText>Skyvern 2.0 (Observer)</SelectItemText>
+                    </div>
+                    <div className="text-xs text-slate-400">
+                      best for complex tasks
+                    </div>
+                  </div>
+                </CustomSelectItem>
+              </SelectContent>
+            </Select>
             <div className="flex items-center">
               {startObserverCruiseMutation.isPending ||
               getTaskFromPromptMutation.isPending ||
@@ -271,7 +268,7 @@ function PromptBox() {
                 <PaperPlaneIcon
                   className="h-6 w-6 cursor-pointer"
                   onClick={async () => {
-                    if (observerFeatureEnabled && selectValue === "v2") {
+                    if (selectValue === "v2") {
                       startObserverCruiseMutation.mutate(prompt);
                       return;
                     }

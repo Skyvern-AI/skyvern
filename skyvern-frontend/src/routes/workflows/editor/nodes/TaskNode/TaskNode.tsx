@@ -10,10 +10,12 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
+import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
-import { ListBulletIcon } from "@radix-ui/react-icons";
+import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 import {
   Handle,
   NodeProps,
@@ -29,10 +31,9 @@ import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { dataSchemaExampleValue, errorMappingExampleValue } from "../types";
+import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { ParametersMultiSelect } from "./ParametersMultiSelect";
 import type { TaskNode } from "./types";
-import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
-import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 
 function TaskNode({ id, data }: NodeProps<TaskNode>) {
   const { updateNodeData } = useReactFlow();
@@ -91,7 +92,10 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
         <div className="flex h-[2.75rem] justify-between">
           <div className="flex gap-2">
             <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <ListBulletIcon className="h-6 w-6" />
+              <WorkflowBlockIcon
+                workflowBlockType={WorkflowBlockTypes.Task}
+                className="size-6"
+              />
             </div>
             <div className="flex flex-col gap-1">
               <EditableNodeTitle

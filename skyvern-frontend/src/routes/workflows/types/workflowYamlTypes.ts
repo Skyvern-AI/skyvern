@@ -1,3 +1,5 @@
+import { WorkflowBlockType } from "./workflowTypes";
+
 export type WorkflowCreateYAMLRequest = {
   title: string;
   description?: string | null;
@@ -67,26 +69,6 @@ export type OutputParameterYAML = ParameterYAMLBase & {
   parameter_type: "output";
 };
 
-const BlockTypes = {
-  TASK: "task",
-  FOR_LOOP: "for_loop",
-  CODE: "code",
-  TEXT_PROMPT: "text_prompt",
-  DOWNLOAD_TO_S3: "download_to_s3",
-  UPLOAD_TO_S3: "upload_to_s3",
-  SEND_EMAIL: "send_email",
-  FILE_URL_PARSER: "file_url_parser",
-  VALIDATION: "validation",
-  ACTION: "action",
-  NAVIGATION: "navigation",
-  EXTRACTION: "extraction",
-  LOGIN: "login",
-  WAIT: "wait",
-  FILE_DOWNLOAD: "file_download",
-} as const;
-
-export type BlockType = (typeof BlockTypes)[keyof typeof BlockTypes];
-
 export type BlockYAML =
   | TaskBlockYAML
   | CodeBlockYAML
@@ -105,7 +87,7 @@ export type BlockYAML =
   | FileDownloadBlockYAML;
 
 export type BlockYAMLBase = {
-  block_type: BlockType;
+  block_type: WorkflowBlockType;
   label: string;
   continue_on_failure?: boolean;
 };

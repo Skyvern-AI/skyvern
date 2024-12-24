@@ -1,24 +1,10 @@
-import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
-import {
-  CheckCircledIcon,
-  Cross2Icon,
-  CursorTextIcon,
-  DownloadIcon,
-  EnvelopeClosedIcon,
-  FileIcon,
-  ListBulletIcon,
-  LockOpen1Icon,
-  PlusIcon,
-  StopwatchIcon,
-  UpdateIcon,
-  UploadIcon,
-} from "@radix-ui/react-icons";
-import { WorkflowBlockNode } from "../nodes";
-import { AddNodeProps } from "../FlowRenderer";
-import { ClickIcon } from "@/components/icons/ClickIcon";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
-import { RobotIcon } from "@/components/icons/RobotIcon";
-import { ExtractIcon } from "@/components/icons/ExtractIcon";
+import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { Cross2Icon, PlusIcon } from "@radix-ui/react-icons";
+import { WorkflowBlockTypes } from "../../types/workflowTypes";
+import { AddNodeProps } from "../FlowRenderer";
+import { WorkflowBlockNode } from "../nodes";
+import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
 
 const nodeLibraryItems: Array<{
   nodeType: NonNullable<WorkflowBlockNode["type"]>;
@@ -28,93 +14,166 @@ const nodeLibraryItems: Array<{
 }> = [
   {
     nodeType: "navigation",
-    icon: <RobotIcon className="size-6" />,
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Navigation}
+        className="size-6"
+      />
+    ),
     title: "Navigation Block",
     description: "Navigate on the page",
   },
   {
     nodeType: "action",
-    icon: <ClickIcon className="size-6" />,
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Action}
+        className="size-6"
+      />
+    ),
     title: "Action Block",
     description: "Take a single action",
   },
   {
     nodeType: "extraction",
-    icon: <ExtractIcon className="size-6" />,
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Extraction}
+        className="size-6"
+      />
+    ),
     title: "Extraction Block",
     description: "Extract data from the page",
   },
   {
     nodeType: "validation",
-    icon: <CheckCircledIcon className="size-6" />,
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Validation}
+        className="size-6"
+      />
+    ),
     title: "Validation Block",
     description: "Validate the state of the workflow or terminate",
   },
   {
     nodeType: "task",
-    icon: <ListBulletIcon className="size-6" />,
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Task}
+        className="size-6"
+      />
+    ),
     title: "Task Block",
     description: "Takes actions or extracts information",
   },
   {
     nodeType: "textPrompt",
-    icon: <CursorTextIcon className="size-6" />,
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.TextPrompt}
+        className="size-6"
+      />
+    ),
     title: "Text Prompt Block",
     description: "Generates AI response",
   },
   {
     nodeType: "sendEmail",
-    icon: <EnvelopeClosedIcon className="size-6" />,
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.SendEmail}
+        className="size-6"
+      />
+    ),
     title: "Send Email Block",
     description: "Sends an email",
   },
   {
     nodeType: "loop",
-    icon: <UpdateIcon className="size-6" />,
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.ForLoop}
+        className="size-6"
+      />
+    ),
     title: "For Loop Block",
     description: "Repeats nested elements",
   },
   // temporarily removed
   // {
   //   nodeType: "codeBlock",
-  //   icon: <CodeIcon className="size-6" />,
+  //   icon: <WorkflowBlockIcon
+  //   workflowBlockType={WorkflowBlockTypes.Code}
+  //   className="size-6"
+  // />,
   //   title: "Code Block",
   //   description: "Executes Python code",
   // },
   {
     nodeType: "fileParser",
-    icon: <FileIcon className="size-6" />,
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.FileURLParser}
+        className="size-6"
+      />
+    ),
     title: "File Parser Block",
     description: "Downloads and parses a file",
   },
   // disabled
   // {
   //   nodeType: "download",
-  //   icon: <DownloadIcon className="size-6" />,
+  //   icon: (
+  //     <WorkflowBlockIcon
+  //       workflowBlockType={WorkflowBlockTypes.DownloadToS3}
+  //       className="size-6"
+  //     />
+  //   ),
   //   title: "Download Block",
   //   description: "Downloads a file from S3",
   // },
   {
     nodeType: "upload",
-    icon: <UploadIcon className="size-6" />,
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.UploadToS3}
+        className="size-6"
+      />
+    ),
     title: "Upload Block",
     description: "Uploads a file to S3",
   },
   {
     nodeType: "fileDownload",
-    icon: <DownloadIcon className="size-6" />,
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.FileDownload}
+        className="size-6"
+      />
+    ),
     title: "File Download Block",
     description: "Download a file",
   },
   {
     nodeType: "login",
-    icon: <LockOpen1Icon className="size-6" />,
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Login}
+        className="size-6"
+      />
+    ),
     title: "Login Block",
     description: "Login to a website",
   },
   {
     nodeType: "wait",
-    icon: <StopwatchIcon className="size-6" />,
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Wait}
+        className="size-6"
+      />
+    ),
     title: "Wait Block",
     description: "Wait for some time",
   },

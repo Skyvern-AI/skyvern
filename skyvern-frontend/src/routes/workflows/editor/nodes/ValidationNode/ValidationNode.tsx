@@ -1,26 +1,27 @@
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
-import type { ValidationNode } from "./types";
-import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
-import { useState } from "react";
-import { CheckCircledIcon } from "@radix-ui/react-icons";
-import { EditableNodeTitle } from "../components/EditableNodeTitle";
-import { NodeActionMenu } from "../NodeActionMenu";
-import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
-import { Label } from "@/components/ui/label";
 import { HelpTooltip } from "@/components/HelpTooltip";
-import { Checkbox } from "@/components/ui/checkbox";
-import { errorMappingExampleValue } from "../types";
-import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
-import { Switch } from "@/components/ui/switch";
 import {
   Accordion,
   AccordionContent,
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { helpTooltips } from "../../helpContent";
+import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
+import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
+import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
+import { useState } from "react";
+import { helpTooltips } from "../../helpContent";
+import { EditableNodeTitle } from "../components/EditableNodeTitle";
+import { NodeActionMenu } from "../NodeActionMenu";
+import { errorMappingExampleValue } from "../types";
+import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
+import type { ValidationNode } from "./types";
 
 function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
   const { updateNodeData } = useReactFlow();
@@ -62,7 +63,10 @@ function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
         <header className="flex h-[2.75rem] justify-between">
           <div className="flex gap-2">
             <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <CheckCircledIcon className="size-6" />
+              <WorkflowBlockIcon
+                workflowBlockType={WorkflowBlockTypes.Validation}
+                className="size-6"
+              />
             </div>
             <div className="flex flex-col gap-1">
               <EditableNodeTitle

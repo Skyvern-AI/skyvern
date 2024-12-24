@@ -139,14 +139,14 @@ function WorkflowPage() {
                       if (event.ctrlKey || event.metaKey) {
                         window.open(
                           window.location.origin +
-                            `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/blocks`,
+                            `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/overview`,
                           "_blank",
                           "noopener,noreferrer",
                         );
                         return;
                       }
                       navigate(
-                        `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/blocks`,
+                        `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/overview`,
                       );
                     }}
                     className="cursor-pointer"

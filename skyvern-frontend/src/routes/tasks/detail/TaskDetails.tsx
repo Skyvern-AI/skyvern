@@ -4,6 +4,8 @@ import {
   TaskApiResponse,
   WorkflowRunStatusApiResponse,
 } from "@/api/types";
+import { StatusBadge } from "@/components/StatusBadge";
+import { SwitchBarNavigation } from "@/components/SwitchBarNavigation";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -18,20 +20,18 @@ import {
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/use-toast";
+import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { cn } from "@/util/utils";
+import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+import { copyText } from "@/util/copyText";
+import { apiBaseUrl } from "@/util/env";
 import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, NavLink, Outlet, useParams } from "react-router-dom";
-import { useTaskQuery } from "./hooks/useTaskQuery";
 import fetchToCurl from "fetch-to-curl";
-import { apiBaseUrl } from "@/util/env";
-import { useApiCredential } from "@/hooks/useApiCredential";
-import { copyText } from "@/util/copyText";
-import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
-import { StatusBadge } from "@/components/StatusBadge";
-import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import { Link, Outlet, useParams } from "react-router-dom";
 import { statusIsFinalized } from "../types";
+import { useTaskQuery } from "./hooks/useTaskQuery";
 
 function createTaskRequestObject(values: TaskApiResponse) {
   return {
@@ -257,7 +257,7 @@ function TaskDetails() {
             workflow &&
             workflowRun && (
               <Link
-                to={`/workflows/${workflow.workflow_permanent_id}/${workflowRun.workflow_run_id}/blocks`}
+                to={`/workflows/${workflow.workflow_permanent_id}/${workflowRun.workflow_run_id}/overview`}
               >
                 {workflow.title}
               </Link>
@@ -274,64 +274,26 @@ function TaskDetails() {
           {failureReason}
         </>
       )}
-      <div className="flex w-fit gap-2 rounded-sm border border-slate-700 p-2">
-        <NavLink
-          to="actions"
-          replace
-          className={({ isActive }) => {
-            return cn(
-              "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
-              {
-                "bg-slate-700": isActive,
-              },
-            );
-          }}
-        >
-          Actions
-        </NavLink>
-        <NavLink
-          to="recording"
-          replace
-          className={({ isActive }) => {
-            return cn(
-              "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
-              {
-                "bg-slate-700": isActive,
-              },
-            );
-          }}
-        >
-          Recording
-        </NavLink>
-        <NavLink
-          to="parameters"
-          replace
-          className={({ isActive }) => {
-            return cn(
-              "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
-              {
-                "bg-slate-700": isActive,
-              },
-            );
-          }}
-        >
-          Parameters
-        </NavLink>
-        <NavLink
-          to="diagnostics"
-          replace
-          className={({ isActive }) => {
-            return cn(
-              "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
-              {
-                "bg-slate-700": isActive,
-              },
-            );
-          }}
-        >
-          Diagnostics
-        </NavLink>
-      </div>
+      <SwitchBarNavigation
+        options={[
+          {
+            label: "Actions",
+            to: "actions",
+          },
+          {
+            label: "Recording",
+            to: "recording",
+          },
+          {
+            label: "Parameters",
+            to: "parameters",
+          },
+          {
+            label: "Diagnostics",
+            to: "diagnostics",
+          },
+        ]}
+      />
       <Outlet />
     </div>
   );

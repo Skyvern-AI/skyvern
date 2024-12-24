@@ -35,6 +35,14 @@ export function statusIsFinalized({ status }: { status: Status }): boolean {
   );
 }
 
+export function statusIsAFailureType({ status }: { status: Status }): boolean {
+  return (
+    status === Status.Failed ||
+    status === Status.Terminated ||
+    status === Status.TimedOut
+  );
+}
+
 export function statusIsRunningOrQueued({
   status,
 }: {
