@@ -3,36 +3,31 @@ import { ArtifactApiResponse, ArtifactType, Status } from "@/api/types";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
-import { getImageURL } from "./artifactUtils";
 import { ReloadIcon } from "@radix-ui/react-icons";
-import { statusIsNotFinalized } from "../types";
+import { statusIsNotFinalized } from "@/routes/tasks/types";
+import { getImageURL } from "@/routes/tasks/detail/artifactUtils";
 
 type Props = {
-  stepId: string;
-  index: number;
+  observerThoughtId: string;
   taskStatus?: Status; // to give a hint that screenshot may not be available if task is not finalized
 };
 
-function ActionScreenshot({ stepId, index, taskStatus }: Props) {
+function ObserverThoughtScreenshot({ observerThoughtId, taskStatus }: Props) {
   const credentialGetter = useCredentialGetter();
 
-  const {
-    data: artifacts,
-    isLoading,
-    isFetching,
-  } = useQuery<Array<ArtifactApiResponse>>({
-    queryKey: ["step", stepId, "artifacts"],
+  const { data: artifacts, isLoading } = useQuery<Array<ArtifactApiResponse>>({
+    queryKey: ["observerThought", observerThoughtId, "artifacts"],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client
-        .get(`/step/${stepId}/artifacts`)
+        .get(`/observer_thought/${observerThoughtId}/artifacts`)
         .then((response) => response.data);
     },
     refetchInterval: (query) => {
       const data = query.state.data;
       const screenshot = data?.filter(
-        (artifact) => artifact.artifact_type === ArtifactType.ActionScreenshot,
-      )?.[index];
+        (artifact) => artifact.artifact_type === ArtifactType.LLMScreenshot,
+      )?.[0];
       if (!screenshot) {
         return 5000;
       }
@@ -40,11 +35,11 @@ function ActionScreenshot({ stepId, index, taskStatus }: Props) {
     },
   });
 
-  const actionScreenshots = artifacts?.filter(
-    (artifact) => artifact.artifact_type === ArtifactType.ActionScreenshot,
+  const llmScreenshots = artifacts?.filter(
+    (artifact) => artifact.artifact_type === ArtifactType.LLMScreenshot,
   );
 
-  const screenshot = actionScreenshots?.[index];
+  const screenshot = llmScreenshots?.[0];
 
   if (isLoading) {
     return (
@@ -61,13 +56,6 @@ function ActionScreenshot({ stepId, index, taskStatus }: Props) {
     statusIsNotFinalized({ status: taskStatus })
   ) {
     return <div>The screenshot for this action is not available yet.</div>;
-  } else if (isFetching) {
-    return (
-      <div className="flex h-full items-center justify-center gap-2 bg-slate-elevation1">
-        <ReloadIcon className="h-6 w-6 animate-spin" />
-        <div>Loading screenshot...</div>
-      </div>
-    );
   }
 
   if (!screenshot) {
@@ -85,4 +73,4 @@ function ActionScreenshot({ stepId, index, taskStatus }: Props) {
   );
 }
 
-export { ActionScreenshot };
+export { ObserverThoughtScreenshot };

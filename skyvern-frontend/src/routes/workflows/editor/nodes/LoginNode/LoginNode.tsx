@@ -14,13 +14,14 @@ import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTexta
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
-import { LockOpen1Icon } from "@radix-ui/react-icons";
+import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { useState } from "react";
 import { helpTooltips, placeholders } from "../../helpContent";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { errorMappingExampleValue } from "../types";
+import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { CredentialParameterSelector } from "./CredentialParameterSelector";
 import type { LoginNode } from "./types";
 
@@ -72,7 +73,10 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
         <header className="flex h-[2.75rem] justify-between">
           <div className="flex gap-2">
             <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <LockOpen1Icon className="size-6" />
+              <WorkflowBlockIcon
+                workflowBlockType={WorkflowBlockTypes.Login}
+                className="size-6"
+              />
             </div>
             <div className="flex flex-col gap-1">
               <EditableNodeTitle

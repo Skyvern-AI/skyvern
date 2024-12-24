@@ -19,10 +19,11 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { errorMappingExampleValue } from "../types";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { Switch } from "@/components/ui/switch";
-import { ClickIcon } from "@/components/icons/ClickIcon";
 import { placeholders, helpTooltips } from "../../helpContent";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
+import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
+import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -78,7 +79,10 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
         <header className="flex h-[2.75rem] justify-between">
           <div className="flex gap-2">
             <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <ClickIcon className="size-6" />
+              <WorkflowBlockIcon
+                workflowBlockType={WorkflowBlockTypes.Action}
+                className="size-6"
+              />
             </div>
             <div className="flex flex-col gap-1">
               <EditableNodeTitle

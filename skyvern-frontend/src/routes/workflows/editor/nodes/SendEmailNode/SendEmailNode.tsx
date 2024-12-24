@@ -4,12 +4,13 @@ import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
-import { EnvelopeClosedIcon } from "@radix-ui/react-icons";
+import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { useState } from "react";
 import { helpTooltips } from "../../helpContent";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
+import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { type SendEmailNode } from "./types";
 
 function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
@@ -52,7 +53,10 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
         <div className="flex h-[2.75rem] justify-between">
           <div className="flex gap-2">
             <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <EnvelopeClosedIcon className="h-6 w-6" />
+              <WorkflowBlockIcon
+                workflowBlockType={WorkflowBlockTypes.SendEmail}
+                className="size-6"
+              />
             </div>
             <div className="flex flex-col gap-1">
               <EditableNodeTitle

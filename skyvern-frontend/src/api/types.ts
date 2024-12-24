@@ -223,6 +223,7 @@ export type TaskGenerationApiResponse = {
 };
 
 export type ActionsApiResponse = {
+  action_id: string;
   action_type: ActionType;
   status: Status;
   task_id: string | null;
