@@ -109,7 +109,7 @@ function WorkflowRunOverview() {
       </div>
       <div className="w-1/3 min-w-0 rounded bg-slate-elevation1 p-4">
         <ScrollArea>
-          <ScrollAreaViewport className="max-h-[42rem]">
+          <ScrollAreaViewport className="max-h-[40rem]">
             <div className="space-y-4">
               <div className="gap-2"></div>
               {workflowRunIsNotFinalized && (
