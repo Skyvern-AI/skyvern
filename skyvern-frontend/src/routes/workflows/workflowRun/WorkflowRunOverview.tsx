@@ -67,8 +67,10 @@ function WorkflowRunOverview() {
             timelineItem.block.actions &&
             timelineItem.block.actions.length > 0
           ) {
-            return timelineItem.block
-              .actions[0] as WorkflowRunOverviewActiveElement;
+            const last = timelineItem.block.actions.length - 1;
+            return timelineItem.block.actions[
+              last
+            ] as WorkflowRunOverviewActiveElement;
           }
           return timelineItem.block;
         }
