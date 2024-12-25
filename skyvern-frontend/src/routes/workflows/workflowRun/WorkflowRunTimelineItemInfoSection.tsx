@@ -1,11 +1,10 @@
-import { ActionsApiResponse, Status } from "@/api/types";
+import { Status } from "@/api/types";
 import {
   hasExtractedInformation,
   isAction,
+  isActionItem,
   isObserverThought,
   isWorkflowRunBlock,
-  ObserverThought,
-  WorkflowRunBlock,
 } from "../types/workflowRunTypes";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CodeEditor } from "../components/CodeEditor";
@@ -13,17 +12,15 @@ import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResi
 import { WorkflowBlockTypes } from "../types/workflowTypes";
 import { statusIsAFailureType } from "@/routes/tasks/types";
 import { SendEmailBlockInfo } from "./blockInfo/SendEmailBlockInfo";
+import { WorkflowRunOverviewActiveElement } from "./WorkflowRunOverview";
 
 type Props = {
-  item:
-    | ActionsApiResponse
-    | ObserverThought
-    | WorkflowRunBlock
-    | "stream"
-    | null;
+  activeItem: WorkflowRunOverviewActiveElement;
 };
 
-function WorkflowRunTimelineItemInfoSection({ item }: Props) {
+function WorkflowRunTimelineItemInfoSection({ activeItem }: Props) {
+  const item = isActionItem(activeItem) ? activeItem.block : activeItem;
+
   if (!item) {
     return null;
   }
