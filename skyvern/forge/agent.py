@@ -48,7 +48,6 @@ from skyvern.forge.sdk.api.files import get_path_for_workflow_download_directory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
-from skyvern.forge.sdk.core.validators import prepend_scheme_and_validate_url
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -141,11 +140,6 @@ class ForgeAgent:
 
             task_url = working_page.url
 
-        task_url = prepend_scheme_and_validate_url(task_url)
-        totp_verification_url = task_block.totp_verification_url
-        if totp_verification_url:
-            totp_verification_url = prepend_scheme_and_validate_url(totp_verification_url)
-
         task = await app.DATABASE.create_task(
             url=task_url,
             task_type=task_block.task_type,
@@ -153,7 +147,7 @@ class ForgeAgent:
             terminate_criterion=task_block.terminate_criterion,
             title=task_block.title or task_block.label,
             webhook_callback_url=None,
-            totp_verification_url=totp_verification_url,
+            totp_verification_url=task_block.totp_verification_url,
             totp_identifier=task_block.totp_identifier,
             navigation_goal=task_block.navigation_goal,
             data_extraction_goal=task_block.data_extraction_goal,

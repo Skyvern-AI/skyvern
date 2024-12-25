@@ -44,6 +44,7 @@ from skyvern.forge.sdk.api.files import (
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.core.validators import prepend_scheme_and_validate_url
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
@@ -290,6 +291,7 @@ class BaseTaskBlock(Block):
 
         if self.url:
             self.url = self.format_block_parameter_template_from_workflow_run_context(self.url, workflow_run_context)
+            self.url = prepend_scheme_and_validate_url(self.url)
 
         if self.totp_identifier:
             self.totp_identifier = self.format_block_parameter_template_from_workflow_run_context(
@@ -300,6 +302,7 @@ class BaseTaskBlock(Block):
             self.totp_verification_url = self.format_block_parameter_template_from_workflow_run_context(
                 self.totp_verification_url, workflow_run_context
             )
+            self.totp_verification_url = prepend_scheme_and_validate_url(self.totp_verification_url)
 
         if self.download_suffix:
             self.download_suffix = self.format_block_parameter_template_from_workflow_run_context(
