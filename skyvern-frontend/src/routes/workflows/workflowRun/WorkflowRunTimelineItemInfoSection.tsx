@@ -53,6 +53,14 @@ function WorkflowRunTimelineItemInfoSection({ activeItem }: Props) {
     );
   }
   if (isWorkflowRunBlock(item)) {
+    const showExtractedInformationTab = item.status === Status.Completed;
+    const showFailureReasonTab =
+      item.status && statusIsAFailureType({ status: item.status });
+    const defaultTab = showExtractedInformationTab
+      ? "extracted_information"
+      : showFailureReasonTab
+        ? "failure_reason"
+        : "navigation_goal";
     if (
       item.block_type === WorkflowBlockTypes.Task ||
       item.block_type === WorkflowBlockTypes.Navigation ||
@@ -64,9 +72,8 @@ function WorkflowRunTimelineItemInfoSection({ activeItem }: Props) {
     ) {
       return (
         <div className="rounded bg-slate-elevation1 p-4">
-          <Tabs key={item.block_type} defaultValue="navigation_goal">
+          <Tabs key={item.block_type} defaultValue={defaultTab}>
             <TabsList>
-              <TabsTrigger value="navigation_goal">Navigation Goal</TabsTrigger>
               {item.status === Status.Completed && (
                 <TabsTrigger value="extracted_information">
                   Extracted Information
@@ -75,14 +82,9 @@ function WorkflowRunTimelineItemInfoSection({ activeItem }: Props) {
               {item.status && statusIsAFailureType({ status: item.status }) && (
                 <TabsTrigger value="failure_reason">Failure Reason</TabsTrigger>
               )}
+              <TabsTrigger value="navigation_goal">Navigation Goal</TabsTrigger>
               <TabsTrigger value="parameters">Parameters</TabsTrigger>
             </TabsList>
-            <TabsContent value="navigation_goal">
-              <AutoResizingTextarea
-                value={item.navigation_goal ?? ""}
-                readOnly
-              />
-            </TabsContent>
             {item.status === Status.Completed && (
               <TabsContent value="extracted_information">
                 <CodeEditor
@@ -112,6 +114,12 @@ function WorkflowRunTimelineItemInfoSection({ activeItem }: Props) {
                 />
               </TabsContent>
             )}
+            <TabsContent value="navigation_goal">
+              <AutoResizingTextarea
+                value={item.navigation_goal ?? ""}
+                readOnly
+              />
+            </TabsContent>
             <TabsContent value="parameters">
               <CodeEditor
                 value={JSON.stringify(item.navigation_payload, null, 2)}
