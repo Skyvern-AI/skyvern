@@ -1,19 +1,21 @@
-import { ActionsApiResponse } from "@/api/types";
 import {
-  isAction,
+  isActionItem,
   isWorkflowRunBlock,
   WorkflowRunBlock,
 } from "../types/workflowRunTypes";
 import { ActionCard } from "./ActionCard";
 import { BlockCard } from "./BlockCard";
-import { WorkflowRunOverviewActiveElement } from "./WorkflowRunOverview";
+import {
+  ActionItem,
+  WorkflowRunOverviewActiveElement,
+} from "./WorkflowRunOverview";
 
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
   block: WorkflowRunBlock;
   subBlocks: Array<WorkflowRunBlock>;
   onBlockItemClick: (block: WorkflowRunBlock) => void;
-  onActionClick: (action: ActionsApiResponse) => void;
+  onActionClick: (action: ActionItem) => void;
 };
 
 function WorkflowRunTimelineBlockItem({
@@ -33,11 +35,16 @@ function WorkflowRunTimelineBlockItem({
             key={action.action_id}
             action={action}
             active={
-              isAction(activeItem) && activeItem.action_id === action.action_id
+              isActionItem(activeItem) &&
+              activeItem.action.action_id === action.action_id
             }
             index={actions.length - index}
             onClick={() => {
-              onActionClick(action);
+              const actionItem: ActionItem = {
+                block,
+                action,
+              };
+              onActionClick(actionItem);
             }}
           />
         );

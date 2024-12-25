@@ -1,5 +1,6 @@
 import { ActionsApiResponse, Status } from "@/api/types";
 import { isTaskVariantBlock, WorkflowBlockType } from "./workflowTypes";
+import { ActionItem } from "../workflowRun/WorkflowRunOverview";
 
 export const WorkflowRunTimelineItemTypes = {
   Thought: "thought",
@@ -121,6 +122,17 @@ export function isObserverThought(item: unknown): item is ObserverThought {
 
 export function isAction(item: unknown): item is ActionsApiResponse {
   return typeof item === "object" && item !== null && "action_id" in item;
+}
+
+export function isActionItem(item: unknown): item is ActionItem {
+  return (
+    typeof item === "object" &&
+    item !== null &&
+    "block" in item &&
+    isWorkflowRunBlock(item.block) &&
+    "action" in item &&
+    isAction(item.action)
+  );
 }
 
 export function hasExtractedInformation(

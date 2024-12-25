@@ -9,7 +9,7 @@ import { ActionScreenshot } from "@/routes/tasks/detail/ActionScreenshot";
 import { WorkflowRunTimelineBlockItem } from "./WorkflowRunTimelineBlockItem";
 import { ThoughtCard } from "./ThoughtCard";
 import {
-  isAction,
+  isActionItem,
   isBlockItem,
   isObserverThought,
   isThoughtItem,
@@ -24,8 +24,13 @@ import { WorkflowRunTimelineItemInfoSection } from "./WorkflowRunTimelineItemInf
 import { ObserverThoughtScreenshot } from "./ObserverThoughtScreenshot";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 
+export type ActionItem = {
+  block: WorkflowRunBlock;
+  action: ActionsApiResponse;
+};
+
 export type WorkflowRunOverviewActiveElement =
-  | ActionsApiResponse
+  | ActionItem
   | ObserverThought
   | WorkflowRunBlock
   | "stream"
@@ -68,9 +73,11 @@ function WorkflowRunOverview() {
             timelineItem.block.actions.length > 0
           ) {
             const last = timelineItem.block.actions.length - 1;
-            return timelineItem.block.actions[
-              last
-            ] as WorkflowRunOverviewActiveElement;
+            const actionItem: ActionItem = {
+              block: timelineItem.block,
+              action: timelineItem.block.actions[last]!,
+            };
+            return actionItem;
           }
           return timelineItem.block;
         }
@@ -89,10 +96,10 @@ function WorkflowRunOverview() {
       <div className="w-2/3 space-y-4">
         <AspectRatio ratio={16 / 9} className="overflow-y-hidden">
           {selection === "stream" && <WorkflowRunStream />}
-          {selection !== "stream" && isAction(selection) && (
+          {selection !== "stream" && isActionItem(selection) && (
             <ActionScreenshot
-              index={selection.action_order ?? 0}
-              stepId={selection.step_id ?? ""}
+              index={selection.action.action_order ?? 0}
+              stepId={selection.action.step_id ?? ""}
             />
           )}
           {isWorkflowRunBlock(selection) && (
@@ -107,7 +114,7 @@ function WorkflowRunOverview() {
           )}
         </AspectRatio>
 
-        <WorkflowRunTimelineItemInfoSection item={selection} />
+        <WorkflowRunTimelineItemInfoSection activeItem={selection} />
       </div>
       <div className="w-1/3 min-w-0 rounded bg-slate-elevation1 p-4">
         <ScrollArea>
