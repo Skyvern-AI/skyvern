@@ -28,7 +28,9 @@ function ThoughtCard({ thought, onClick, active }: Props) {
           <span className="text-xs">Decision</span>
         </div>
       </div>
-      <div className="text-xs text-slate-400">{thought.answer}</div>
+      <div className="text-xs text-slate-400">
+        {thought.answer || thought.thought}
+      </div>
     </div>
   );
 }
