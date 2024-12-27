@@ -41,6 +41,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_run_block_id,
     generate_workflow_run_id,
 )
+from skyvern.forge.sdk.schemas.observers import ObserverThoughtType
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 
 
@@ -558,6 +559,10 @@ class ObserverThoughtModel(Base):
     observation = Column(String, nullable=True)
     thought = Column(String, nullable=True)
     answer = Column(String, nullable=True)
+
+    observer_thought_type = Column(String, nullable=True, default=ObserverThoughtType.plan)
+    observer_thought_scenario = Column(String, nullable=True)
+    output = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
