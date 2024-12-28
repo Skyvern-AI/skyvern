@@ -887,7 +887,14 @@ async def get_observer_thought_timelines(
     observer_cruise_id: str,
     organization_id: str | None = None,
 ) -> list[WorkflowRunTimeline]:
-    observer_thoughts = await app.DATABASE.get_observer_thoughts(observer_cruise_id, organization_id=organization_id)
+    observer_thoughts = await app.DATABASE.get_observer_thoughts(
+        observer_cruise_id,
+        organization_id=organization_id,
+        observer_thought_types=[
+            ObserverThoughtType.plan,
+            ObserverThoughtType.user_goal_check,
+        ],
+    )
     return [
         WorkflowRunTimeline(
             type=WorkflowRunTimelineType.thought,
