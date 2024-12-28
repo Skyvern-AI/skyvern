@@ -17,6 +17,7 @@ from skyvern.forge.sdk.schemas.observers import (
     ObserverCruise,
     ObserverCruiseStatus,
     ObserverMetadata,
+    ObserverThought,
     ObserverThoughtScenario,
     ObserverThoughtType,
 )
@@ -91,7 +92,7 @@ async def initialize_observer_cruise(
     )
 
     metadata_prompt = prompt_engine.load_prompt("observer_generate_metadata", user_goal=user_prompt, user_url=user_url)
-    metadata_response = await app.SECONDARY_LLM_API_HANDLER(prompt=metadata_prompt, observer_cruise=observer_cruise)
+    metadata_response = await app.SECONDARY_LLM_API_HANDLER(prompt=metadata_prompt, observer_thought=observer_thought)
     # validate
     LOG.info(f"Initialized observer initial response: {metadata_response}")
     url: str = metadata_response.get("url", "")
@@ -423,6 +424,7 @@ async def run_observer_cruise(
                 prompt=observer_completion_prompt,
                 observer_cruise=observer_thought,
             )
+            await _record_thought_screenshot(observer_thought=observer_thought, workflow_run_id=workflow_run_id)
             LOG.info(
                 "Observer completion check response",
                 completion_resp=completion_resp,
@@ -895,3 +897,18 @@ async def get_observer_thought_timelines(
         )
         for thought in observer_thoughts
     ]
+
+
+async def _record_thought_screenshot(observer_thought: ObserverThought, workflow_run_id: str) -> None:
+    # get the browser state for the workflow run
+    browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
+    if not browser_state:
+        LOG.warning("No browser state found for the workflow run", workflow_run_id=workflow_run_id)
+        return
+    # get the screenshot for the workflow run
+    screenshot = await browser_state.take_screenshot(full_page=True)
+    await app.ARTIFACT_MANAGER.create_observer_thought_artifact(
+        observer_thought=observer_thought,
+        artifact_type=ArtifactType.SCREENSHOT_LLM,
+        data=screenshot,
+    )

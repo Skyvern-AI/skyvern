@@ -16,6 +16,7 @@ from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityT
 from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP, BaseStorage
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverThought
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
 
 class S3Storage(BaseStorage):
@@ -42,6 +43,12 @@ class S3Storage(BaseStorage):
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
         return f"s3://{self.bucket}/{settings.ENV}/observers/{observer_cruise.observer_cruise_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+
+    def build_workflow_run_block_uri(
+        self, artifact_id: str, workflow_run_block: WorkflowRunBlock, artifact_type: ArtifactType
+    ) -> str:
+        file_ext = FILE_EXTENTSION_MAP[artifact_type]
+        return f"s3://{self.bucket}/{settings.ENV}/workflow_runs/{workflow_run_block.workflow_run_id}/{workflow_run_block.workflow_run_block_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         await self.async_client.upload_file(artifact.uri, data)

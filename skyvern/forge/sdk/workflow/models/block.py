@@ -43,6 +43,7 @@ from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
@@ -205,6 +206,18 @@ class Block(BaseModel, abc.ABC):
                 block_type=self.block_type,
                 continue_on_failure=self.continue_on_failure,
             )
+            # create a screenshot
+            browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+            if not browser_state:
+                LOG.warning("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
+            else:
+                screenshot = await browser_state.take_screenshot(full_page=True)
+                if screenshot:
+                    await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
+                        workflow_run_block=workflow_run_block,
+                        artifact_type=ArtifactType.SCREENSHOT_LLM,
+                        data=screenshot,
+                    )
             workflow_run_block_id = workflow_run_block.workflow_run_block_id
             return await self.execute(workflow_run_id, workflow_run_block_id, organization_id=organization_id, **kwargs)
         except Exception as e:
