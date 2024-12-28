@@ -24,7 +24,6 @@ function ActionScreenshot({ stepId, index, taskStatus }: Props) {
     queryKey: ["step", stepId, "artifacts"],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
-      console.log("--------- prefetching artifacts for step");
       return client
         .get(`/step/${stepId}/artifacts`)
         .then((response) => response.data);

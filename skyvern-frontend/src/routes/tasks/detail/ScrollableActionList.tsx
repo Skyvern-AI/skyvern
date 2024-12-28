@@ -66,7 +66,6 @@ function ScrollableActionList({
               queryKey: ["step", action.stepId, "artifacts"],
               queryFn: async () => {
                 const client = await getClient(credentialGetter);
-                console.log("prefetching artifacts for step", action.stepId);
                 return client
                   .get(`/step/${action.stepId}/artifacts`)
                   .then((response) => response.data);
