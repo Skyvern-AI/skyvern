@@ -14,6 +14,7 @@ from skyvern.webeye.actions.actions import Action
 class WorkflowRunBlock(BaseModel):
     workflow_run_block_id: str
     workflow_run_id: str
+    organization_id: str | None = None
     parent_workflow_run_block_id: str | None = None
     block_type: BlockType
     label: str | None = None
