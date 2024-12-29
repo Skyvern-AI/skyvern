@@ -9,6 +9,7 @@ from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityT
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverThought
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
 LOG = structlog.get_logger(__name__)
 
@@ -147,6 +148,27 @@ class ArtifactManager:
             uri=uri,
             observer_cruise_id=observer_cruise.observer_cruise_id,
             organization_id=observer_cruise.organization_id,
+            data=data,
+            path=path,
+        )
+
+    async def create_workflow_run_block_artifact(
+        self,
+        workflow_run_block: WorkflowRunBlock,
+        artifact_type: ArtifactType,
+        data: bytes | None = None,
+        path: str | None = None,
+    ) -> str:
+        artifact_id = generate_artifact_id()
+        uri = app.STORAGE.build_workflow_run_block_uri(artifact_id, workflow_run_block, artifact_type)
+        return await self._create_artifact(
+            aio_task_primary_key=workflow_run_block.workflow_run_block_id,
+            artifact_id=artifact_id,
+            artifact_type=artifact_type,
+            uri=uri,
+            workflow_run_block_id=workflow_run_block.workflow_run_block_id,
+            workflow_run_id=workflow_run_block.workflow_run_id,
+            organization_id=workflow_run_block.organization_id,
             data=data,
             path=path,
         )

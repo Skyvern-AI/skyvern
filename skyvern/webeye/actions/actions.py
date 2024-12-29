@@ -23,6 +23,7 @@ class ActionType(StrEnum):
     WAIT = "wait"
     NULL_ACTION = "null_action"
     SOLVE_CAPTCHA = "solve_captcha"
+    GOTO_PAGE = "goto_page"
     TERMINATE = "terminate"
     COMPLETE = "complete"
 
@@ -146,6 +147,8 @@ class Action(BaseModel):
                 return WaitAction.model_validate(value)
             elif action_type is ActionType.SOLVE_CAPTCHA:
                 return SolveCaptchaAction.model_validate(value)
+            elif action_type is ActionType.GOTO_PAGE:
+                return GotoPageAction.model_validate(value)
             else:
                 raise ValueError(f"Unsupported action type: {action_type}")
         else:
@@ -201,6 +204,13 @@ class NullAction(Action):
 
 class SolveCaptchaAction(Action):
     action_type: ActionType = ActionType.SOLVE_CAPTCHA
+
+class GotoPageAction(Action):
+    action_type: ActionType = ActionType.GOTO_PAGE
+    url: str
+
+    def __repr__(self) -> str:
+        return f"GotoPageAction(url={self.url})"
 
 
 class SelectOptionAction(WebAction):

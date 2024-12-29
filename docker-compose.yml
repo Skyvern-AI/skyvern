@@ -1,53 +1,61 @@
 services:
-  postgres:
-    image: postgres:14-alpine
-    restart: always
-    # comment out if you want to externally connect DB
-    # ports:
-    #   - 5432:5432
-    volumes:
-      - ./postgres-data:/var/lib/postgresql/data
-    environment:
-      - PGDATA=/var/lib/postgresql/data/pgdata
-      - POSTGRES_USER=skyvern
-      - POSTGRES_PASSWORD=skyvern
-      - POSTGRES_POSTGRES_DB=skyvern
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U skyvern"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+  # uncomment if you want to use postgres
+  # postgres:
+  #   image: postgres:14-alpine
+  #   restart: always
+  #   # comment out if you want to externally connect DB
+  #   # ports:
+  #   #   - 5432:5432
+  #   volumes:
+  #     - ./postgres-data:/var/lib/postgresql/data
+  #   environment:
+  #     - PGDATA=/var/lib/postgresql/data/pgdata
+  #     - POSTGRES_USER=skyvern
+  #     - POSTGRES_PASSWORD=skyvern
+  #     - POSTGRES_POSTGRES_DB=skyvern
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U skyvern"]
+  #     interval: 5s
+  #     timeout: 5s
+  #     retries: 5
 
   skyvern:
-    image: public.ecr.aws/skyvern/skyvern:latest
+    build:
+      dockerfile: Dockerfile
     restart: on-failure
     # comment out if you want to externally call skyvern API
     ports:
       - 8000:8000
     volumes:
+      - ./:/app
       - ./artifacts:/data/artifacts
       - ./videos:/data/videos
       - ./har:/data/har
       - ./log:/data/log
       - ./.streamlit:/app/.streamlit
     environment:
-      - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
+      - DATABASE_STRING=${SKYVERN_DATABASE_STRING}
       - BROWSER_TYPE=chromium-headful
       - ENABLE_OPENAI=true
-      - OPENAI_API_KEY=<your_openai_key>
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LLM_KEY=OPENAI_GPT4O
+      # - AWS_DEFAULT_REGION=us-east-1
+      # - AWS_ACCESS_KEY_ID=<your_aws_access_key_id>
+      # - AWS_SECRET_ACCESS_KEY=<your_aws_secret_access_key>
+      # - SKYVERN_STORAGE_TYPE=s3
       # If you want to use other LLM provider, like azure and anthropic:
       # - ENABLE_ANTHROPIC=true
-      # - LLM_KEY=ANTHROPIC_CLAUDE3_OPUS
-      # - ANTHROPIC_API_KEY=<your_anthropic_key>
+      # - LLM_KEY=ANTHROPIC_CLAUDE3
+      # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       # - ENABLE_AZURE=true
       # - LLM_KEY=AZURE_OPENAI
       # - AZURE_DEPLOYMENT=<your_azure_deployment>
       # - AZURE_API_KEY=<your_azure_api_key>
       # - AZURE_API_BASE=<your_azure_api_base>
       # - AZURE_API_VERSION=<your_azure_api_version>
-    depends_on:
-      postgres:
-        condition: service_healthy
+    # depends_on:
+    #   postgres:
+    #     condition: service_healthy
     healthcheck:
       test: ["CMD", "test", "-f", "/app/.streamlit/secrets.toml"]
       interval: 5s
@@ -68,7 +76,7 @@ services:
     environment:
     # if you want to run skyvern on a remote server,
     # you need to change the host in VITE_WSS_BASE_URL and VITE_API_BASE_URL to match your server ip
-      - VITE_WSS_BASE_URL=ws://localhost:8000/api/v1
+      - VITE_WSS_BASE_URL=ws://host.docker.internal:8000/api/v1
     #   - VITE_API_BASE_URL=http://localhost:8000/api/v1
     #   - VITE_SKYVERN_API_KEY=
     depends_on:

@@ -14,7 +14,8 @@ RUN playwright install-deps
 RUN playwright install
 RUN apt-get install -y xauth x11-apps netpbm && apt-get clean
 
-COPY . /app
+# Commented out for local development
+# COPY . /app
 
 ENV PYTHONPATH="/app:$PYTHONPATH"
 ENV VIDEO_PATH=/data/videos

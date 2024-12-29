@@ -23,6 +23,7 @@ import { DotFilledIcon } from "@radix-ui/react-icons";
 import { WorkflowRunTimelineItemInfoSection } from "./WorkflowRunTimelineItemInfoSection";
 import { ObserverThoughtScreenshot } from "./ObserverThoughtScreenshot";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
+import { WorkflowRunBlockScreenshot } from "./WorkflowRunBlockScreenshot";
 
 export type ActionItem = {
   block: WorkflowRunBlock;
@@ -103,9 +104,9 @@ function WorkflowRunOverview() {
             />
           )}
           {isWorkflowRunBlock(selection) && (
-            <div className="flex h-full w-full items-center justify-center bg-slate-elevation1">
-              No screenshot found for this block
-            </div>
+            <WorkflowRunBlockScreenshot
+              workflowRunBlockId={selection.workflow_run_block_id}
+            />
           )}
           {isObserverThought(selection) && (
             <ObserverThoughtScreenshot

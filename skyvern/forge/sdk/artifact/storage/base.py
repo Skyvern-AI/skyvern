@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverThought
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
 # TODO: This should be a part of the ArtifactType model
 FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
@@ -49,6 +50,12 @@ class BaseStorage(ABC):
     @abstractmethod
     def build_observer_cruise_uri(
         self, artifact_id: str, observer_cruise: ObserverCruise, artifact_type: ArtifactType
+    ) -> str:
+        pass
+
+    @abstractmethod
+    def build_workflow_run_block_uri(
+        self, artifact_id: str, workflow_run_block: WorkflowRunBlock, artifact_type: ArtifactType
     ) -> str:
         pass
 

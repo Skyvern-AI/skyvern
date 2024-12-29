@@ -1,26 +1,24 @@
 import { getClient } from "@/api/AxiosClient";
-import { ArtifactApiResponse, ArtifactType, Status } from "@/api/types";
+import { ArtifactApiResponse, ArtifactType } from "@/api/types";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 import { ReloadIcon } from "@radix-ui/react-icons";
-import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { getImageURL } from "@/routes/tasks/detail/artifactUtils";
 
 type Props = {
-  observerThoughtId: string;
-  taskStatus?: Status; // to give a hint that screenshot may not be available if task is not finalized
+  workflowRunBlockId: string;
 };
 
-function ObserverThoughtScreenshot({ observerThoughtId, taskStatus }: Props) {
+function WorkflowRunBlockScreenshot({ workflowRunBlockId }: Props) {
   const credentialGetter = useCredentialGetter();
 
   const { data: artifacts, isLoading } = useQuery<Array<ArtifactApiResponse>>({
-    queryKey: ["observerThought", observerThoughtId, "artifacts"],
+    queryKey: ["workflowRunBlock", workflowRunBlockId, "artifacts"],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client
-        .get(`/observer_thought/${observerThoughtId}/artifacts`)
+        .get(`/workflow_run_block/${workflowRunBlockId}/artifacts`)
         .then((response) => response.data);
     },
     refetchInterval: (query) => {
@@ -50,18 +48,10 @@ function ObserverThoughtScreenshot({ observerThoughtId, taskStatus }: Props) {
     );
   }
 
-  if (
-    !screenshot &&
-    taskStatus &&
-    statusIsNotFinalized({ status: taskStatus })
-  ) {
-    return <div>The screenshot for this action is not available yet.</div>;
-  }
-
   if (!screenshot) {
     return (
       <div className="flex h-full items-center justify-center bg-slate-elevation1">
-        No screenshot found for this thought.
+        No screenshot found for this workflow run block.
       </div>
     );
   }
@@ -73,4 +63,4 @@ function ObserverThoughtScreenshot({ observerThoughtId, taskStatus }: Props) {
   );
 }
 
-export { ObserverThoughtScreenshot };
+export { WorkflowRunBlockScreenshot };
