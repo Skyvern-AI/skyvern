@@ -1097,3 +1097,15 @@ async def observer_cruise(
         max_iterations_override=x_max_iterations_override,
     )
     return observer_cruise
+
+
+@base_router.get("/cruise/{observer_cruise_id}")
+@base_router.get("/cruise/{observer_cruise_id}/", include_in_schema=False)
+async def get_observer_cruise(
+    observer_cruise_id: str,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> ObserverCruise:
+    observer_cruise = await observer_service.get_observer_cruise(observer_cruise_id, organization.organization_id)
+    if not observer_cruise:
+        raise HTTPException(status_code=404, detail=f"Observer cruise {observer_cruise_id} not found")
+    return observer_cruise

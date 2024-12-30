@@ -919,3 +919,7 @@ async def _record_thought_screenshot(observer_thought: ObserverThought, workflow
         artifact_type=ArtifactType.SCREENSHOT_LLM,
         data=screenshot,
     )
+
+
+async def get_observer_cruise(observer_cruise_id: str, organization_id: str | None = None) -> ObserverCruise | None:
+    return await app.DATABASE.get_observer_cruise(observer_cruise_id, organization_id=organization_id)
