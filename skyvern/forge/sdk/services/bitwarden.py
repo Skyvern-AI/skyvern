@@ -60,7 +60,9 @@ class BitwardenQueryResult(BaseModel):
 
 class BitwardenService:
     @staticmethod
-    def run_command(command: list[str], additional_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    def run_command(
+        command: list[str], additional_env: dict[str, str] | None = None, timeout: int = 60
+    ) -> subprocess.CompletedProcess:
         """
         Run a CLI command with the specified additional environment variables and return the result.
         """
@@ -71,9 +73,9 @@ class BitwardenService:
             env.update(additional_env)  # Update with any additional environment variables
 
         try:
-            return subprocess.run(command, capture_output=True, text=True, env=env, timeout=60)
+            return subprocess.run(command, capture_output=True, text=True, env=env, timeout=timeout)
         except subprocess.TimeoutExpired as e:
-            LOG.error("Bitwarden command timed out after 60 seconds", stdout=e.stdout, stderr=e.stderr)
+            LOG.error(f"Bitwarden command timed out after {timeout} seconds", stdout=e.stdout, stderr=e.stderr)
             raise e
 
     @staticmethod
@@ -100,48 +102,39 @@ class BitwardenService:
         bw_collection_ids: list[str] | None,
         url: str,
         collection_id: str | None = None,
-        remaining_retries: int = settings.BITWARDEN_MAX_RETRIES,
+        max_retries: int = settings.BITWARDEN_MAX_RETRIES,
         timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
-        fail_reasons: list[str] = [],
     ) -> dict[str, str]:
         """
         Get the secret value from the Bitwarden CLI.
         """
+        fail_reasons: list[str] = []
         if not bw_organization_id and bw_collection_ids and collection_id not in bw_collection_ids:
             raise BitwardenAccessDeniedError()
-        try:
-            async with asyncio.timeout(timeout):
-                return await BitwardenService._get_secret_value_from_url(
-                    client_id=client_id,
-                    client_secret=client_secret,
-                    master_password=master_password,
-                    bw_organization_id=bw_organization_id,
-                    bw_collection_ids=bw_collection_ids,
-                    url=url,
-                    collection_id=collection_id,
-                )
-        except BitwardenAccessDeniedError as e:
-            raise e
-        except Exception as e:
-            if remaining_retries <= 0:
-                raise BitwardenListItemsError(
-                    f"Bitwarden CLI failed after all retry attempts. Fail reasons: {fail_reasons}"
-                )
 
-            remaining_retries -= 1
-            LOG.info("Retrying to get secret value from Bitwarden", remaining_retries=remaining_retries)
-            return await BitwardenService.get_secret_value_from_url(
-                client_id=client_id,
-                client_secret=client_secret,
-                master_password=master_password,
-                bw_organization_id=bw_organization_id,
-                bw_collection_ids=bw_collection_ids,
-                url=url,
-                collection_id=collection_id,
-                remaining_retries=remaining_retries,
-                # Double the timeout for the next retry
-                timeout=timeout * 2,
-                fail_reasons=fail_reasons + [f"{type(e).__name__}: {str(e)}"],
+        for i in range(max_retries):
+            # FIXME: just simply double the timeout for the second try. maybe a better backoff policy when needed
+            timeout = (i + 1) * timeout
+            try:
+                async with asyncio.timeout(timeout):
+                    return await BitwardenService._get_secret_value_from_url(
+                        client_id=client_id,
+                        client_secret=client_secret,
+                        master_password=master_password,
+                        bw_organization_id=bw_organization_id,
+                        bw_collection_ids=bw_collection_ids,
+                        url=url,
+                        collection_id=collection_id,
+                        timeout=timeout,
+                    )
+            except BitwardenAccessDeniedError as e:
+                raise e
+            except Exception as e:
+                LOG.info("Failed to get secret value from Bitwarden", tried_times=i + 1, exc_info=True)
+                fail_reasons.append(f"{type(e).__name__}: {str(e)}")
+        else:
+            raise BitwardenListItemsError(
+                f"Bitwarden CLI failed after all retry attempts. Fail reasons: {fail_reasons}"
             )
 
     @staticmethod
@@ -153,6 +146,7 @@ class BitwardenService:
         bw_collection_ids: list[str] | None,
         url: str,
         collection_id: str | None = None,
+        timeout: int = 60,
     ) -> dict[str, str]:
         """
         Get the secret value from the Bitwarden CLI.
@@ -186,7 +180,7 @@ class BitwardenService:
             else:
                 LOG.error("No collection ID or organization ID provided -- this is required")
                 raise BitwardenListItemsError("No collection ID or organization ID provided -- this is required")
-            items_result = BitwardenService.run_command(list_command)
+            items_result = BitwardenService.run_command(list_command, timeout=timeout)
 
             if items_result.stderr and "Event post failed" not in items_result.stderr:
                 raise BitwardenListItemsError(items_result.stderr)
