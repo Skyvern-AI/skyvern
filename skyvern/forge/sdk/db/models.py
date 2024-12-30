@@ -165,6 +165,8 @@ class ArtifactModel(Base):
         Index("org_task_step_index", "organization_id", "task_id", "step_id"),
         Index("org_workflow_run_index", "organization_id", "workflow_run_id"),
         Index("org_observer_cruise_index", "organization_id", "observer_cruise_id"),
+        Index("org_observer_thought_index", "organization_id", "observer_thought_id"),
+        Index("org_observer_wfrb_index", "organization_id", "workflow_run_block_id"),
     )
 
     artifact_id = Column(String, primary_key=True, index=True, default=generate_artifact_id)
