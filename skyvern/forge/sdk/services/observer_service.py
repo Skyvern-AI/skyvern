@@ -6,6 +6,7 @@ from typing import Any
 
 import structlog
 from pydantic import BaseModel
+from sqlalchemy.exc import OperationalError
 
 from skyvern.exceptions import UrlGenerationFailure
 from skyvern.forge import app
@@ -170,10 +171,57 @@ async def run_observer_cruise(
     max_iterations_override: str | int | None = None,
 ) -> None:
     organization_id = organization.organization_id
-    observer_cruise = await app.DATABASE.get_observer_cruise(observer_cruise_id, organization_id=organization_id)
+    try:
+        observer_cruise = await app.DATABASE.get_observer_cruise(observer_cruise_id, organization_id=organization_id)
+    except Exception:
+        LOG.error(
+            "Failed to get observer cruise",
+            observer_cruise_id=observer_cruise_id,
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        await mark_observer_cruise_as_failed(observer_cruise_id, organization_id=organization_id)
+        return None
     if not observer_cruise:
         LOG.error("Observer cruise not found", observer_cruise_id=observer_cruise_id, organization_id=organization_id)
         return None
+
+    try:
+        await run_observer_cruise_helper(
+            organization=organization,
+            observer_cruise=observer_cruise,
+            request_id=request_id,
+            max_iterations_override=max_iterations_override,
+        )
+    except OperationalError:
+        LOG.error("Database error when running observer cruise", exc_info=True)
+        await mark_observer_cruise_as_failed(
+            observer_cruise_id,
+            workflow_run_id=observer_cruise.workflow_run_id,
+            failure_reason="Database error when running cruise",
+            organization_id=organization_id,
+        )
+        return
+    except Exception:
+        LOG.error("Failed to run observer cruise", exc_info=True)
+        await mark_observer_cruise_as_failed(
+            observer_cruise_id,
+            workflow_run_id=observer_cruise.workflow_run_id,
+            # TODO: add better failure reason
+            failure_reason="Failed to run observer cruise",
+            organization_id=organization_id,
+        )
+        return
+
+
+async def run_observer_cruise_helper(
+    organization: Organization,
+    observer_cruise: ObserverCruise,
+    request_id: str | None = None,
+    max_iterations_override: str | int | None = None,
+) -> None:
+    organization_id = organization.organization_id
+    observer_cruise_id = observer_cruise.observer_cruise_id
     if observer_cruise.status != ObserverCruiseStatus.queued:
         LOG.error(
             "Observer cruise is not queued. Duplicate observer cruise",
@@ -946,3 +994,18 @@ async def _record_thought_screenshot(observer_thought: ObserverThought, workflow
 
 async def get_observer_cruise(observer_cruise_id: str, organization_id: str | None = None) -> ObserverCruise | None:
     return await app.DATABASE.get_observer_cruise(observer_cruise_id, organization_id=organization_id)
+
+
+async def mark_observer_cruise_as_failed(
+    observer_cruise_id: str,
+    workflow_run_id: str | None = None,
+    failure_reason: str | None = None,
+    organization_id: str | None = None,
+) -> None:
+    await app.DATABASE.update_observer_cruise(
+        observer_cruise_id, organization_id=organization_id, status=ObserverCruiseStatus.failed
+    )
+    if workflow_run_id:
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
+            workflow_run_id, failure_reason=failure_reason or "Observer cruise failed"
+        )
