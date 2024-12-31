@@ -134,3 +134,5 @@ class WorkflowRunStatusResponse(BaseModel):
     recording_url: str | None = None
     downloaded_file_urls: list[str] | None = None
     outputs: dict[str, Any] | None = None
+    total_steps: int | None = None
+    total_cost: float | None = None
