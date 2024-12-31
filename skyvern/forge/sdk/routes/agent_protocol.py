@@ -1084,11 +1084,17 @@ async def observer_cruise(
     if x_max_iterations_override:
         LOG.info("Overriding max iterations for observer", max_iterations_override=x_max_iterations_override)
 
-    observer_cruise = await observer_service.initialize_observer_cruise(
-        organization=organization,
-        user_prompt=data.user_prompt,
-        user_url=str(data.url) if data.url else None,
-    )
+    try:
+        observer_cruise = await observer_service.initialize_observer_cruise(
+            organization=organization,
+            user_prompt=data.user_prompt,
+            user_url=str(data.url) if data.url else None,
+        )
+    except LLMProviderError:
+        LOG.error("LLM failure to initialize observer cruise", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail="Skyvern LLM failure to initialize observer cruise. Please try again later."
+        )
     analytics.capture("skyvern-oss-agent-observer-cruise", data={"url": observer_cruise.url})
     await AsyncExecutorFactory.get_executor().execute_cruise(
         request=request,
