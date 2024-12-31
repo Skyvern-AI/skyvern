@@ -187,7 +187,7 @@ async def run_observer_cruise(
         return None
 
     try:
-        await run_observer_cruise_helper(
+        workflow, workflow_run = await run_observer_cruise_helper(
             organization=organization,
             observer_cruise=observer_cruise,
             request_id=request_id,
@@ -213,13 +213,21 @@ async def run_observer_cruise(
         )
         return
 
+    await app.DATABASE.update_observer_cruise(
+        observer_cruise_id=observer_cruise_id,
+        organization_id=organization_id,
+        status=ObserverCruiseStatus.completed,
+    )
+    if workflow and workflow_run:
+        await app.WORKFLOW_SERVICE.clean_up_workflow(workflow=workflow, workflow_run=workflow_run)
+
 
 async def run_observer_cruise_helper(
     organization: Organization,
     observer_cruise: ObserverCruise,
     request_id: str | None = None,
     max_iterations_override: str | int | None = None,
-) -> None:
+) -> tuple[Workflow, WorkflowRun] | tuple[None, None]:
     organization_id = organization.organization_id
     observer_cruise_id = observer_cruise.observer_cruise_id
     if observer_cruise.status != ObserverCruiseStatus.queued:
@@ -229,21 +237,21 @@ async def run_observer_cruise_helper(
             status=observer_cruise.status,
             organization_id=organization_id,
         )
-        return None
+        return None, None
     if not observer_cruise.url or not observer_cruise.prompt:
         LOG.error(
             "Observer cruise url or prompt not found",
             observer_cruise_id=observer_cruise_id,
             organization_id=organization_id,
         )
-        return None
+        return None, None
     if not observer_cruise.workflow_run_id:
         LOG.error(
             "Workflow run id not found in observer cruise",
             observer_cruise_id=observer_cruise_id,
             organization_id=organization_id,
         )
-        return None
+        return None, None
 
     int_max_iterations_override = None
     if max_iterations_override:
@@ -261,19 +269,19 @@ async def run_observer_cruise_helper(
     workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(workflow_run_id, organization_id=organization_id)
     if not workflow_run:
         LOG.error("Workflow run not found", workflow_run_id=workflow_run_id)
-        return None
+        return None, None
     else:
         LOG.info("Workflow run found", workflow_run_id=workflow_run_id)
 
     if workflow_run.status != WorkflowRunStatus.queued:
         LOG.warning("Duplicate workflow run execution", workflow_run_id=workflow_run_id, status=workflow_run.status)
-        return None
+        return None, None
 
     workflow_id = workflow_run.workflow_id
     workflow = await app.WORKFLOW_SERVICE.get_workflow(workflow_id, organization_id=organization_id)
     if not workflow:
         LOG.error("Workflow not found", workflow_id=workflow_id)
-        return None
+        return None, None
     else:
         LOG.info("Workflow found", workflow_id=workflow_id)
 
@@ -520,13 +528,7 @@ async def run_observer_cruise_helper(
                 )
                 await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(workflow_run_id=workflow_run_id)
                 break
-
-    await app.DATABASE.update_observer_cruise(
-        observer_cruise_id=observer_cruise_id,
-        organization_id=organization_id,
-        status=ObserverCruiseStatus.completed,
-    )
-    await app.WORKFLOW_SERVICE.clean_up_workflow(workflow=workflow, workflow_run=workflow_run)
+    return workflow, workflow_run
 
 
 async def handle_block_result(
