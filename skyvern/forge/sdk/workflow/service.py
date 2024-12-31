@@ -741,7 +741,7 @@ class WorkflowService:
         self,
         workflow_run_id: str,
         organization_id: str,
-        includ_cost: bool = False,
+        include_cost: bool = False,
     ) -> WorkflowRunStatusResponse:
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         if workflow_run is None:
@@ -752,7 +752,7 @@ class WorkflowService:
             workflow_permanent_id=workflow_permanent_id,
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
-            includ_cost=includ_cost,
+            include_cost=include_cost,
         )
 
     async def build_workflow_run_status_response(
@@ -760,7 +760,7 @@ class WorkflowService:
         workflow_permanent_id: str,
         workflow_run_id: str,
         organization_id: str,
-        includ_cost: bool = False,
+        include_cost: bool = False,
     ) -> WorkflowRunStatusResponse:
         workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id, organization_id=organization_id)
         if workflow is None:
@@ -829,7 +829,7 @@ class WorkflowService:
 
         total_steps = None
         total_cost = None
-        if includ_cost:
+        if include_cost:
             workflow_run_steps = await app.DATABASE.get_steps_by_task_ids(
                 task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
             )
