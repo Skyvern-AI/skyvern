@@ -835,8 +835,8 @@ class WorkflowService:
             )
             total_steps = len(workflow_run_steps)
             # TODO: This is a temporary cost calculation. We need to implement a more accurate cost calculation.
-            # successful steps are the ones that have a status of success and the total count of unique step.order
-            successful_steps = set(step.order for step in workflow_run_steps if step.status == StepStatus.success)
+            # successful steps are the ones that have a status of completed and the total count of unique step.order
+            successful_steps = set(step.order for step in workflow_run_steps if step.status == StepStatus.completed)
             total_cost = 0.1 * len(successful_steps)
         return WorkflowRunStatusResponse(
             workflow_id=workflow.workflow_permanent_id,
