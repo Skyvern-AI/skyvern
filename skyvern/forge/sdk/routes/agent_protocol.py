@@ -724,6 +724,7 @@ async def get_workflow_run(
         workflow_permanent_id=workflow_id,
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
+        include_cost=True,
     )
 
 

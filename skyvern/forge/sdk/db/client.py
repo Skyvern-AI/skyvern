@@ -318,6 +318,21 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_steps_by_task_ids(self, task_ids: list[str], organization_id: str | None = None) -> list[Step]:
+        try:
+            async with self.Session() as session:
+                steps = (
+                    await session.scalars(
+                        select(StepModel)
+                        .filter(StepModel.task_id.in_(task_ids))
+                        .filter_by(organization_id=organization_id)
+                    )
+                ).all()
+                return [convert_to_step(step, debug_enabled=self.debug_enabled) for step in steps]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
     async def get_task_step_models(self, task_id: str, organization_id: str | None = None) -> Sequence[StepModel]:
         try:
             async with self.Session() as session:
