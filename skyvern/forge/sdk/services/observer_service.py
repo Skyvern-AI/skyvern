@@ -109,34 +109,57 @@ async def initialize_observer_cruise(
 
     # create workflow and workflow run
     max_steps_override = 10
-    new_workflow = await app.WORKFLOW_SERVICE.create_empty_workflow(organization, metadata.workflow_title)
-    workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
-        request_id=None,
-        workflow_request=WorkflowRequestBody(),
-        workflow_permanent_id=new_workflow.workflow_permanent_id,
-        organization_id=organization.organization_id,
-        version=None,
-        max_steps_override=max_steps_override,
-    )
-    await app.DATABASE.update_observer_thought(
-        observer_thought_id=observer_thought.observer_thought_id,
-        organization_id=organization.organization_id,
-        workflow_run_id=workflow_run.workflow_run_id,
-        workflow_id=new_workflow.workflow_id,
-        workflow_permanent_id=new_workflow.workflow_permanent_id,
-        thought=metadata_response.get("thoughts", ""),
-        output=metadata.model_dump(),
-    )
+    try:
+        new_workflow = await app.WORKFLOW_SERVICE.create_empty_workflow(organization, metadata.workflow_title)
+        workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
+            request_id=None,
+            workflow_request=WorkflowRequestBody(),
+            workflow_permanent_id=new_workflow.workflow_permanent_id,
+            organization_id=organization.organization_id,
+            version=None,
+            max_steps_override=max_steps_override,
+        )
+    except Exception:
+        LOG.error("Failed to setup cruise workflow run", exc_info=True)
+        # fail the workflow run
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
+            workflow_run_id=workflow_run.workflow_run_id,
+            failure_reason="Skyvern failed to setup the workflow run",
+        )
+        raise
+
+    try:
+        await app.DATABASE.update_observer_thought(
+            observer_thought_id=observer_thought.observer_thought_id,
+            organization_id=organization.organization_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_id=new_workflow.workflow_id,
+            workflow_permanent_id=new_workflow.workflow_permanent_id,
+            thought=metadata_response.get("thoughts", ""),
+            output=metadata.model_dump(),
+        )
+    except Exception:
+        LOG.warning("Failed to update observer thought", exc_info=True)
 
     # update oserver cruise
-    observer_cruise = await app.DATABASE.update_observer_cruise(
-        observer_cruise_id=observer_cruise.observer_cruise_id,
-        workflow_run_id=workflow_run.workflow_run_id,
-        workflow_id=new_workflow.workflow_id,
-        workflow_permanent_id=new_workflow.workflow_permanent_id,
-        url=url,
-        organization_id=organization.organization_id,
-    )
+    try:
+        observer_cruise = await app.DATABASE.update_observer_cruise(
+            observer_cruise_id=observer_cruise.observer_cruise_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_id=new_workflow.workflow_id,
+            workflow_permanent_id=new_workflow.workflow_permanent_id,
+            url=url,
+            organization_id=organization.organization_id,
+        )
+    except Exception:
+        LOG.warning("Failed to update observer cruise", exc_info=True)
+        # fail the workflow run
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
+            workflow_run_id=workflow_run.workflow_run_id,
+            failure_reason="Skyvern failed to update the observer cruise after initializing the workflow run",
+        )
+        raise
+
     return observer_cruise
 
 
