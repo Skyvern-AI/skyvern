@@ -95,7 +95,7 @@ async def initialize_observer_cruise(
     metadata_response = await app.SECONDARY_LLM_API_HANDLER(prompt=metadata_prompt, observer_thought=observer_thought)
     # validate
     LOG.info(f"Initialized observer initial response: {metadata_response}")
-    url: str = metadata_response.get("url", "")
+    url: str = user_url or metadata_response.get("url", "")
     if not url:
         raise UrlGenerationFailure()
     title: str = metadata_response.get("title", DEFAULT_WORKFLOW_TITLE)
