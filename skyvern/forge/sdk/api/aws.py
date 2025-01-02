@@ -71,7 +71,7 @@ class AsyncAWSClient:
         try:
             parsed_uri = S3Uri(uri)
             await client.upload_file(file_path, parsed_uri.bucket, parsed_uri.key)
-            LOG.info("Upload file from path success", uri=uri)
+            LOG.debug("Upload file from path success", uri=uri)
         except Exception:
             LOG.exception("S3 upload failed.", uri=uri)
 
