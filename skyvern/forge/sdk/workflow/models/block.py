@@ -83,6 +83,7 @@ class BlockType(StrEnum):
     LOGIN = "login"
     WAIT = "wait"
     FILE_DOWNLOAD = "file_download"
+    GOTO_URL = "goto_url"
 
 
 class BlockStatus(StrEnum):
@@ -1801,6 +1802,11 @@ class FileDownloadBlock(BaseTaskBlock):
     block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD
 
 
+class UrlBlock(BaseTaskBlock):
+    block_type: Literal[BlockType.GOTO_URL] = BlockType.GOTO_URL
+    url: str
+
+
 BlockSubclasses = Union[
     ForLoopBlock,
     TaskBlock,
@@ -1817,5 +1823,6 @@ BlockSubclasses = Union[
     LoginBlock,
     WaitBlock,
     FileDownloadBlock,
+    UrlBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
