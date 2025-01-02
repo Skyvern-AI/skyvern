@@ -1,10 +1,8 @@
-import { ExternalLinkIcon } from "@radix-ui/react-icons";
+import { CubeIcon } from "@radix-ui/react-icons";
 import { WorkflowRunBlock } from "../types/workflowRunTypes";
 import { cn } from "@/util/utils";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
 import { workflowBlockTitle } from "../editor/nodes/types";
-import { Button } from "@/components/ui/button";
-import { Link } from "react-router-dom";
 
 type Props = {
   active: boolean;
@@ -23,7 +21,7 @@ function BlockCard({ block, onClick, active }: Props) {
       )}
       onClick={onClick}
     >
-      <div className="flex items-center justify-between">
+      <div className="flex justify-between">
         <div className="flex gap-3">
           <WorkflowBlockIcon
             workflowBlockType={block.block_type}
@@ -31,18 +29,10 @@ function BlockCard({ block, onClick, active }: Props) {
           />
           <span>{workflowBlockTitle[block.block_type]}</span>
         </div>
-        {block.task_id && (
-          <Button
-            title="Go to task diagnostics"
-            asChild
-            size="icon"
-            className="size-8 bg-slate-800 text-primary hover:bg-slate-700"
-          >
-            <Link to={`/tasks/${block.task_id}/diagnostics`}>
-              <ExternalLinkIcon />
-            </Link>
-          </Button>
-        )}
+        <div className="flex items-center gap-1 rounded bg-slate-elevation5 px-2 py-1">
+          <CubeIcon className="size-4" />
+          <span className="text-xs">Block</span>
+        </div>
       </div>
     </div>
   );
