@@ -10,6 +10,7 @@ class SkyvernContext:
     task_id: str | None = None
     workflow_id: str | None = None
     workflow_run_id: str | None = None
+    observer_cruise_id: str | None = None
     max_steps_override: int | None = None
     tz_info: ZoneInfo | None = None
     totp_codes: dict[str, str | None] = field(default_factory=dict)

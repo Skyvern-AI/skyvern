@@ -84,6 +84,10 @@ async def initialize_observer_cruise(
         prompt=user_prompt,
         organization_id=organization.organization_id,
     )
+    # set observer cruise id in context
+    context = skyvern_context.current()
+    if context:
+        context.observer_cruise_id = observer_cruise.observer_cruise_id
 
     observer_thought = await app.DATABASE.create_observer_thought(
         observer_cruise_id=observer_cruise.observer_cruise_id,
