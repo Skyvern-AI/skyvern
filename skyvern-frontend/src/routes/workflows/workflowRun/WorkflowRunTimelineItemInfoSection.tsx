@@ -13,6 +13,8 @@ import { WorkflowBlockTypes } from "../types/workflowTypes";
 import { statusIsAFailureType } from "@/routes/tasks/types";
 import { SendEmailBlockInfo } from "./blockInfo/SendEmailBlockInfo";
 import { WorkflowRunOverviewActiveElement } from "./WorkflowRunOverview";
+import { ExternalLinkIcon } from "@radix-ui/react-icons";
+import { Link } from "react-router-dom";
 
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
@@ -84,6 +86,17 @@ function WorkflowRunTimelineItemInfoSection({ activeItem }: Props) {
               )}
               <TabsTrigger value="navigation_goal">Navigation Goal</TabsTrigger>
               <TabsTrigger value="parameters">Parameters</TabsTrigger>
+              {item.task_id && (
+                <Link
+                  to={`/tasks/${item.task_id}/diagnostics`}
+                  title="Go to diagnostics"
+                >
+                  <div className="flex items-center gap-2 px-3 py-1 text-sm font-medium">
+                    <ExternalLinkIcon />
+                    <span>Diagnostics</span>
+                  </div>
+                </Link>
+              )}
             </TabsList>
             {item.status === Status.Completed && (
               <TabsContent value="extracted_information">
