@@ -12,6 +12,7 @@ import {
   isActionItem,
   isBlockItem,
   isObserverThought,
+  isTaskVariantBlockItem,
   isThoughtItem,
   isWorkflowRunBlock,
   ObserverThought,
@@ -24,6 +25,11 @@ import { WorkflowRunTimelineItemInfoSection } from "./WorkflowRunTimelineItemInf
 import { ObserverThoughtScreenshot } from "./ObserverThoughtScreenshot";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { WorkflowRunBlockScreenshot } from "./WorkflowRunBlockScreenshot";
+
+const formatter = Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+});
 
 export type ActionItem = {
   block: WorkflowRunBlock;
@@ -92,6 +98,13 @@ function WorkflowRunOverview() {
 
   const selection = getActiveSelection();
 
+  const numberOfActions = workflowRunTimeline.reduce((total, current) => {
+    if (isTaskVariantBlockItem(current)) {
+      return total + current.block!.actions!.length;
+    }
+    return total + 0;
+  }, 0);
+
   return (
     <div className="flex h-[42rem] gap-6">
       <div className="w-2/3 space-y-4">
@@ -117,11 +130,21 @@ function WorkflowRunOverview() {
 
         <WorkflowRunTimelineItemInfoSection activeItem={selection} />
       </div>
-      <div className="w-1/3 min-w-0 rounded bg-slate-elevation1 p-4">
+      <div className="w-1/3 min-w-0 space-y-4 rounded bg-slate-elevation1 p-4">
+        <div className="grid grid-cols-3 gap-2">
+          <div className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs">
+            Actions: {numberOfActions}
+          </div>
+          <div className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs">
+            Steps: {workflowRun.total_steps ?? 0}
+          </div>
+          <div className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs">
+            Cost: {formatter.format(workflowRun.total_cost ?? 0)}
+          </div>
+        </div>
         <ScrollArea>
-          <ScrollAreaViewport className="max-h-[40rem]">
+          <ScrollAreaViewport className="max-h-[37rem]">
             <div className="space-y-4">
-              <div className="gap-2"></div>
               {workflowRunIsNotFinalized && (
                 <div
                   key="stream"
