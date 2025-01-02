@@ -282,8 +282,6 @@ async def run_observer_cruise_helper(
     if not workflow:
         LOG.error("Workflow not found", workflow_id=workflow_id)
         return None, None
-    else:
-        LOG.info("Workflow found", workflow_id=workflow_id)
 
     ###################### run observer ######################
 
@@ -748,27 +746,31 @@ async def _generate_loop_task(
     task_parameters: list[PARAMETER_TYPE] = []
     if output_value_obj.is_loop_value_link:
         LOG.info("Loop values are links", loop_values=output_value_obj.loop_values)
-        # create ContextParameter for the value
-        url_value_context_parameter = ContextParameter(
-            key="task_in_loop_url",
-            source=loop_for_context_parameter,
-        )
-        task_parameters.append(url_value_context_parameter)
-        for_loop_parameter_yaml_list.append(
-            ContextParameterYAML(
-                key=url_value_context_parameter.key,
-                description=url_value_context_parameter.description,
-                source_parameter_key=loop_for_context_parameter.key,
-            )
-        )
-        app.WORKFLOW_CONTEXT_MANAGER.add_context_parameter(workflow_run_id, url_value_context_parameter)
         url = "task_in_loop_url"
+        context_parameter_key = "task_in_loop_url"
     else:
         LOG.info("Loop values are not links", loop_values=output_value_obj.loop_values)
         page = await browser_state.get_working_page()
         url = str(
             await SkyvernFrame.evaluate(frame=page, expression="() => document.location.href") if page else original_url
         )
+        context_parameter_key = "target"
+
+    # create ContextParameter for the value
+    url_value_context_parameter = ContextParameter(
+        key=context_parameter_key,
+        source=loop_for_context_parameter,
+    )
+    task_parameters.append(url_value_context_parameter)
+    for_loop_parameter_yaml_list.append(
+        ContextParameterYAML(
+            key=url_value_context_parameter.key,
+            description=url_value_context_parameter.description,
+            source_parameter_key=loop_for_context_parameter.key,
+        )
+    )
+    app.WORKFLOW_CONTEXT_MANAGER.add_context_parameter(workflow_run_id, url_value_context_parameter)
+
     task_in_loop_label = f"task_in_loop_{_generate_random_string()}"
     context = skyvern_context.ensure_context()
     task_in_loop_metadata_prompt = prompt_engine.load_prompt(
