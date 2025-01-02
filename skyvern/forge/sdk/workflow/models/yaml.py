@@ -308,6 +308,11 @@ class FileDownloadBlockYAML(BlockYAML):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    
+
+class UrlBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.GOTO_URL] = BlockType.GOTO_URL  # type: ignore
+    url: str
 
 
 PARAMETER_YAML_SUBCLASSES = (
@@ -337,6 +342,7 @@ BLOCK_YAML_SUBCLASSES = (
     | LoginBlockYAML
     | WaitBlockYAML
     | FileDownloadBlockYAML
+    | UrlBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 

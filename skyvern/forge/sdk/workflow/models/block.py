@@ -26,6 +26,7 @@ from skyvern.config import settings
 from skyvern.exceptions import (
     ContextParameterValueNotFound,
     DisabledBlockExecutionError,
+    FailedToNavigateToUrl,
     MissingBrowserState,
     MissingBrowserStatePage,
     SkyvernException,
@@ -83,6 +84,7 @@ class BlockType(StrEnum):
     LOGIN = "login"
     WAIT = "wait"
     FILE_DOWNLOAD = "file_download"
+    GOTO_URL = "goto_url"
 
 
 class BlockStatus(StrEnum):
@@ -1799,6 +1801,84 @@ class LoginBlock(BaseTaskBlock):
 
 class FileDownloadBlock(BaseTaskBlock):
     block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD
+    
+
+class UrlBlock(Block):
+    block_type: Literal[BlockType.GOTO_URL] = BlockType.GOTO_URL
+    url: str
+
+    async def execute(
+        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+    ) -> BlockResult:
+        workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
+        if not workflow_run:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="Workflow run not found",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        # create a new browser state
+        browser_state: BrowserState | None = None
+        # the first task block will create the browser state and do the navigation
+        try:
+            browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                workflow_run=workflow_run, url=self.url,
+            )
+        except Exception as e:
+            LOG.exception(
+                "Failed to get browser state for url block",
+                workflow_run_id=workflow_run_id,
+            )
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Skyvern browser has failed to navigate to url {self.url}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        
+        # navigate to the url
+        working_page = await browser_state.get_working_page()
+        if not working_page:
+            LOG.error("Failed to get working page for url block", url=self.url, workflow_run_id=workflow_run_id)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Skyvern browser has failed to navigate to url {self.url}. The page might have been closed.",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        
+        try:
+            await browser_state.navigate_to_url(page=working_page, url=self.url)
+        except Exception as e:
+            LOG.exception(
+                "Failed to navigate to url",
+                url=self.url,
+                workflow_run_id=workflow_run_id,
+            )
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Skyvern browser has failed to navigate to url {self.url}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        return await self.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value=None,
+            status=BlockStatus.completed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
 
 
 BlockSubclasses = Union[
@@ -1817,5 +1897,6 @@ BlockSubclasses = Union[
     LoginBlock,
     WaitBlock,
     FileDownloadBlock,
+    UrlBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
