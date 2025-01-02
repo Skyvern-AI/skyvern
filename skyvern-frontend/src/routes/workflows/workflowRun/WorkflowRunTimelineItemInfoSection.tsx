@@ -72,7 +72,7 @@ function WorkflowRunTimelineItemInfoSection({ activeItem }: Props) {
     ) {
       return (
         <div className="rounded bg-slate-elevation1 p-4">
-          <Tabs key={item.block_type} defaultValue={defaultTab}>
+          <Tabs key={item.task_id ?? item.block_type} defaultValue={defaultTab}>
             <TabsList>
               {item.status === Status.Completed && (
                 <TabsTrigger value="extracted_information">

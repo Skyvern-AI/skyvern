@@ -44,7 +44,8 @@ function ActionScreenshot({ stepId, index, taskStatus }: Props) {
     (artifact) => artifact.artifact_type === ArtifactType.ActionScreenshot,
   );
 
-  const screenshot = actionScreenshots?.[index];
+  // action screenshots are reverse ordered w.r.t action order
+  const screenshot = actionScreenshots?.[actionScreenshots.length - index - 1];
 
   if (isLoading) {
     return (
