@@ -1,6 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
 import { ObserverCruise, TaskGenerationApiResponse } from "@/api/types";
 import img from "@/assets/promptBoxBg.png";
+import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { CartIcon } from "@/components/icons/CartIcon";
 import { GraphIcon } from "@/components/icons/GraphIcon";
 import { InboxIcon } from "@/components/icons/InboxIcon";
@@ -16,7 +17,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Textarea } from "@/components/ui/textarea";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import {
@@ -225,12 +225,11 @@ function PromptBox() {
             What task would you like to accomplish?
           </span>
           <div className="flex w-full max-w-xl items-center rounded-xl bg-slate-700 py-2 pr-4 lg:w-3/4">
-            <Textarea
+            <AutoResizingTextarea
               className="min-h-0 resize-none rounded-xl border-transparent px-4 hover:border-transparent focus-visible:ring-0"
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
               placeholder="Enter your prompt..."
-              rows={1}
             />
             <Select value={selectValue} onValueChange={setSelectValue}>
               <SelectTrigger className="w-48 focus:ring-0">
