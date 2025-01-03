@@ -1,6 +1,8 @@
-import { PersonIcon } from "@radix-ui/react-icons";
+import { QuestionMarkIcon } from "@radix-ui/react-icons";
 import { ObserverThought } from "../types/workflowRunTypes";
 import { cn } from "@/util/utils";
+import { BrainIcon } from "@/components/icons/BrainIcon";
+import { useCallback } from "react";
 
 type Props = {
   active: boolean;
@@ -9,6 +11,17 @@ type Props = {
 };
 
 function ThoughtCard({ thought, onClick, active }: Props) {
+  const refCallback = useCallback((element: HTMLDivElement | null) => {
+    if (element && active) {
+      element.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+    }
+    // this should only run once at mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
     <div
       className={cn(
@@ -20,11 +33,15 @@ function ThoughtCard({ thought, onClick, active }: Props) {
       onClick={() => {
         onClick(thought);
       }}
+      ref={refCallback}
     >
       <div className="flex justify-between">
-        <span>Thought</span>
-        <div className="flex items-center gap-1 bg-slate-elevation5">
-          <PersonIcon className="size-4" />
+        <div className="flex gap-3">
+          <BrainIcon className="size-6" />
+          <span>Thinking</span>
+        </div>
+        <div className="flex items-center gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
+          <QuestionMarkIcon className="size-4" />
           <span className="text-xs">Decision</span>
         </div>
       </div>

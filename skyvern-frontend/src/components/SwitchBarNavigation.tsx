@@ -1,5 +1,5 @@
 import { cn } from "@/util/utils";
-import { NavLink } from "react-router-dom";
+import { NavLink, useSearchParams } from "react-router-dom";
 
 type Option = {
   label: string;
@@ -11,12 +11,14 @@ type Props = {
 };
 
 function SwitchBarNavigation({ options }: Props) {
+  const [searchParams] = useSearchParams();
+
   return (
     <div className="flex w-fit gap-2 rounded-sm border border-slate-700 p-2">
       {options.map((option) => {
         return (
           <NavLink
-            to={option.to}
+            to={`${option.to}?${searchParams.toString()}`}
             replace
             key={option.to}
             className={({ isActive }) => {

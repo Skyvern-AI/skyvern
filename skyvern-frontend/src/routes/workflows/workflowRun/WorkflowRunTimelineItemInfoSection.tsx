@@ -11,10 +11,10 @@ import { CodeEditor } from "../components/CodeEditor";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { WorkflowBlockTypes } from "../types/workflowTypes";
 import { statusIsAFailureType } from "@/routes/tasks/types";
-import { SendEmailBlockInfo } from "./blockInfo/SendEmailBlockInfo";
 import { WorkflowRunOverviewActiveElement } from "./WorkflowRunOverview";
 import { ExternalLinkIcon } from "@radix-ui/react-icons";
 import { Link } from "react-router-dom";
+import { SendEmailBlockParameters } from "./blockInfo/SendEmailBlockInfo";
 
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
@@ -151,10 +151,16 @@ function WorkflowRunTimelineItemInfoSection({ activeItem }: Props) {
         item.body !== null &&
         typeof item.body !== "undefined" &&
         item.recipients !== null &&
-        typeof item.recipients !== "undefined"
+        typeof item.recipients !== "undefined" &&
+        item.subject !== null &&
+        typeof item.subject !== "undefined"
       ) {
         return (
-          <SendEmailBlockInfo body={item.body} recipients={item.recipients} />
+          <SendEmailBlockParameters
+            body={item.body}
+            recipients={item.recipients}
+            subject={item.subject}
+          />
         );
       }
       return null;
