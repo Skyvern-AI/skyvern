@@ -295,6 +295,7 @@ async def run_observer_cruise_helper(
             workflow_id=workflow_id,
             workflow_run_id=workflow_run_id,
             request_id=request_id,
+            observer_cruise_id=observer_cruise_id,
         )
     )
 
