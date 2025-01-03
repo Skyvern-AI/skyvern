@@ -204,3 +204,8 @@ def _get_worker_hash() -> int:
 def _generate_worker_hash() -> int:
     worker_identity = f"{platform.node()}:{os.getpid()}"
     return int(hashlib.md5(worker_identity.encode()).hexdigest()[-15:], 16)
+
+
+def generate_persistent_browser_session_id() -> str:
+    int_id = generate_id()
+    return f"{PERSISTENT_BROWSER_SESSION_ID}_{int_id}"
