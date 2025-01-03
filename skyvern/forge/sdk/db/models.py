@@ -549,6 +549,7 @@ class PersistentBrowserSessionModel(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
     runnable_type = Column(String, nullable=True)
     runnable_id = Column(String, nullable=True)
+    browser_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
