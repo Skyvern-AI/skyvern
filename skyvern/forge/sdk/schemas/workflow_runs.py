@@ -41,6 +41,12 @@ class WorkflowRunBlock(BaseModel):
     current_value: str | None = None
     current_index: int | None = None
 
+    # email block
+    recipients: list[str] | None = None
+    attachments: list[str] | None = None
+    subject: str | None = None
+    body: str | None = None
+
 
 class WorkflowRunTimelineType(StrEnum):
     thought = "thought"
