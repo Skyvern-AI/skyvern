@@ -30,6 +30,7 @@ from skyvern.forge.sdk.db.id import (
     generate_org_id,
     generate_organization_auth_token_id,
     generate_output_parameter_id,
+    generate_persistent_browser_session_id,
     generate_step_id,
     generate_task_generation_id,
     generate_task_id,
@@ -41,6 +42,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_run_id,
     generate_persistent_browser_session_id,
 )
+from skyvern.forge.sdk.schemas.observers import ObserverThoughtType
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 
 
@@ -160,18 +162,14 @@ class OrganizationAuthTokenModel(Base):
 
 class ArtifactModel(Base):
     __tablename__ = "artifacts"
-    __table_args__ = (
-        Index("org_task_step_index", "organization_id", "task_id", "step_id"),
-        Index("org_workflow_run_index", "organization_id", "workflow_run_id"),
-        Index("org_observer_cruise_index", "organization_id", "observer_cruise_id"),
-    )
+    __table_args__ = (Index("org_task_step_index", "organization_id", "task_id", "step_id"),)
 
     artifact_id = Column(String, primary_key=True, index=True, default=generate_artifact_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
-    workflow_run_id = Column(String)
-    workflow_run_block_id = Column(String)
-    observer_cruise_id = Column(String)
-    observer_thought_id = Column(String)
+    workflow_run_id = Column(String, index=True)
+    workflow_run_block_id = Column(String, index=True)
+    observer_cruise_id = Column(String, index=True)
+    observer_thought_id = Column(String, index=True)
     task_id = Column(String, ForeignKey("tasks.task_id"))
     step_id = Column(String, ForeignKey("steps.step_id"), index=True)
     artifact_type = Column(String)
@@ -503,6 +501,24 @@ class WorkflowRunBlockModel(Base):
     status = Column(String, nullable=False)
     output = Column(JSON, nullable=True)
     continue_on_failure = Column(Boolean, nullable=False, default=False)
+    failure_reason = Column(String, nullable=True)
+
+    # for loop block
+    loop_values = Column(JSON, nullable=True)
+    current_value = Column(String, nullable=True)
+    current_index = Column(Integer, nullable=True)
+
+    # email block
+    recipients = Column(JSON, nullable=True)
+    attachments = Column(JSON, nullable=True)
+    subject = Column(String, nullable=True)
+    body = Column(String, nullable=True)
+
+    # prompt block
+    prompt = Column(String, nullable=True)
+
+    # wait block
+    wait_sec = Column(Integer, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -510,6 +526,7 @@ class WorkflowRunBlockModel(Base):
 
 class ObserverCruiseModel(Base):
     __tablename__ = "observer_cruises"
+    __table_args__ = (Index("oc_org_wfr_index", "organization_id", "workflow_run_id"),)
 
     observer_cruise_id = Column(String, primary_key=True, default=generate_observer_cruise_id)
     status = Column(String, nullable=False, default="created")
@@ -526,6 +543,7 @@ class ObserverCruiseModel(Base):
 
 class ObserverThoughtModel(Base):
     __tablename__ = "observer_thoughts"
+    __table_args__ = (Index("observer_cruise_index", "organization_id", "observer_cruise_id"),)
 
     observer_thought_id = Column(String, primary_key=True, default=generate_observer_thought_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
@@ -539,8 +557,13 @@ class ObserverThoughtModel(Base):
     thought = Column(String, nullable=True)
     answer = Column(String, nullable=True)
 
+    observer_thought_type = Column(String, nullable=True, default=ObserverThoughtType.plan)
+    observer_thought_scenario = Column(String, nullable=True)
+    output = Column(JSON, nullable=True)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
 
 class PersistentBrowserSessionModel(Base):
     __tablename__ = "persistent_browser_sessions"

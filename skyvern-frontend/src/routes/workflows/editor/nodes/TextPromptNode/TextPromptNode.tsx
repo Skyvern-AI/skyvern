@@ -6,7 +6,7 @@ import { Separator } from "@/components/ui/separator";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
-import { CursorTextIcon } from "@radix-ui/react-icons";
+import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 import {
   Handle,
   NodeProps,
@@ -22,6 +22,7 @@ import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
+import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { type TextPromptNode } from "./types";
 
 function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
@@ -60,7 +61,10 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
         <div className="flex h-[2.75rem] justify-between">
           <div className="flex gap-2">
             <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <CursorTextIcon className="h-6 w-6" />
+              <WorkflowBlockIcon
+                workflowBlockType={WorkflowBlockTypes.TextPrompt}
+                className="size-6"
+              />
             </div>
             <div className="flex flex-col gap-1">
               <EditableNodeTitle

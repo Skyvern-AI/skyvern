@@ -48,8 +48,8 @@ from skyvern.forge.sdk.api.files import get_path_for_workflow_download_directory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
-from skyvern.forge.sdk.core.validators import prepend_scheme_and_validate_url
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
@@ -64,11 +64,11 @@ from skyvern.webeye.actions.actions import (
     DecisiveAction,
     UserDefinedError,
     WebAction,
-    parse_actions,
 )
 from skyvern.webeye.actions.caching import retrieve_action_plan
 from skyvern.webeye.actions.handler import ActionHandler, poll_verification_code
 from skyvern.webeye.actions.models import AgentStepOutput, DetailedAgentStepOutput
+from skyvern.webeye.actions.parse_actions import parse_actions
 from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
@@ -140,11 +140,6 @@ class ForgeAgent:
 
             task_url = working_page.url
 
-        task_url = prepend_scheme_and_validate_url(task_url)
-        totp_verification_url = task_block.totp_verification_url
-        if totp_verification_url:
-            totp_verification_url = prepend_scheme_and_validate_url(totp_verification_url)
-
         task = await app.DATABASE.create_task(
             url=task_url,
             task_type=task_block.task_type,
@@ -152,7 +147,7 @@ class ForgeAgent:
             terminate_criterion=task_block.terminate_criterion,
             title=task_block.title or task_block.label,
             webhook_callback_url=None,
-            totp_verification_url=totp_verification_url,
+            totp_verification_url=task_block.totp_verification_url,
             totp_identifier=task_block.totp_identifier,
             navigation_goal=task_block.navigation_goal,
             data_extraction_goal=task_block.data_extraction_goal,
@@ -247,7 +242,10 @@ class ForgeAgent:
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
         workflow_run: WorkflowRun | None = None
         if task.workflow_run_id:
-            workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=task.workflow_run_id)
+            workflow_run = await app.DATABASE.get_workflow_run(
+                workflow_run_id=task.workflow_run_id,
+                organization_id=organization.organization_id,
+            )
             if workflow_run and workflow_run.status == WorkflowRunStatus.canceled:
                 LOG.info(
                     "Workflow run is canceled, stopping execution inside task",
@@ -1783,6 +1781,9 @@ class ForgeAgent:
             step_id=step.step_id,
             diff=update_comparison,
         )
+
+        await save_step_logs(step.step_id)
+
         return await app.DATABASE.update_step(
             task_id=step.task_id,
             step_id=step.step_id,
@@ -1815,6 +1816,7 @@ class ForgeAgent:
             for key, value in updates.items()
             if getattr(task, key) != value
         }
+        await save_task_logs(task.task_id)
         LOG.info("Updating task in db", task_id=task.task_id, diff=update_comparison)
         return await app.DATABASE.update_task(
             task.task_id,

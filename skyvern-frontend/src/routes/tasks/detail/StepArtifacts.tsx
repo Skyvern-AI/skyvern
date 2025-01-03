@@ -7,7 +7,7 @@ import {
 import { StatusBadge } from "@/components/StatusBadge";
 import { Label } from "@/components/ui/label";
 import { useQuery } from "@tanstack/react-query";
-import { useParams, useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router-dom";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -17,6 +17,9 @@ import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { Artifact } from "./Artifact";
 
+const enable_log_artifacts =
+  import.meta.env.VITE_ENABLE_LOG_ARTIFACTS === "true";
+
 type Props = {
   id: string;
   stepProps: StepApiResponse;
@@ -25,7 +28,6 @@ type Props = {
 function StepArtifacts({ id, stepProps }: Props) {
   const [searchParams, setSearchParams] = useSearchParams();
   const artifact = searchParams.get("artifact") ?? "info";
-  const { taskId } = useParams();
   const credentialGetter = useCredentialGetter();
   const {
     data: artifacts,
@@ -33,11 +35,11 @@ function StepArtifacts({ id, stepProps }: Props) {
     isError,
     error,
   } = useQuery<Array<ArtifactApiResponse>>({
-    queryKey: ["task", taskId, "steps", id, "artifacts"],
+    queryKey: ["step", id, "artifacts"],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client
-        .get(`/tasks/${taskId}/steps/${id}/artifacts`)
+        .get(`/step/${id}/artifacts`)
         .then((response) => response.data);
     },
   });
@@ -79,6 +81,10 @@ function StepArtifacts({ id, stepProps }: Props) {
     (artifact) => artifact.artifact_type === ArtifactType.HTMLScrape,
   );
 
+  const skyvernLog = artifacts?.filter(
+    (artifact) => artifact.artifact_type === ArtifactType.SkyvernLog,
+  );
+
   return (
     <Tabs
       value={artifact}
@@ -108,6 +114,9 @@ function StepArtifacts({ id, stepProps }: Props) {
         <TabsTrigger value="llm_response_parsed">Action List</TabsTrigger>
         <TabsTrigger value="html_raw">HTML (Raw)</TabsTrigger>
         <TabsTrigger value="llm_request">LLM Request (Raw)</TabsTrigger>
+        {enable_log_artifacts && (
+          <TabsTrigger value="skyvern_log">Skyvern Log</TabsTrigger>
+        )}
       </TabsList>
       <TabsContent value="info">
         <div className="flex flex-col gap-6 p-4">
@@ -209,6 +218,11 @@ function StepArtifacts({ id, stepProps }: Props) {
       <TabsContent value="llm_request">
         {llmRequest ? <Artifact type="json" artifacts={llmRequest} /> : null}
       </TabsContent>
+      {enable_log_artifacts && (
+        <TabsContent value="skyvern_log">
+          {skyvernLog ? <Artifact type="text" artifacts={skyvernLog} /> : null}
+        </TabsContent>
+      )}
     </Tabs>
   );
 }

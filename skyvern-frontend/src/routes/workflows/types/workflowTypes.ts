@@ -120,7 +120,7 @@ export type WorkflowBlock =
   | WaitBlock
   | FileDownloadBlock;
 
-export const WorkflowBlockType = {
+export const WorkflowBlockTypes = {
   Task: "task",
   ForLoop: "for_loop",
   Code: "code",
@@ -138,8 +138,22 @@ export const WorkflowBlockType = {
   FileDownload: "file_download",
 } as const;
 
+export function isTaskVariantBlock(item: {
+  block_type: WorkflowBlockType;
+}): boolean {
+  return (
+    item.block_type === "task" ||
+    item.block_type === "navigation" ||
+    item.block_type === "action" ||
+    item.block_type === "extraction" ||
+    item.block_type === "validation" ||
+    item.block_type === "login" ||
+    item.block_type === "file_download"
+  );
+}
+
 export type WorkflowBlockType =
-  (typeof WorkflowBlockType)[keyof typeof WorkflowBlockType];
+  (typeof WorkflowBlockTypes)[keyof typeof WorkflowBlockTypes];
 
 export type WorkflowBlockBase = {
   label: string;

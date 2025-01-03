@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 import commentjson
+import json_repair
 import litellm
 import structlog
 
@@ -51,24 +52,33 @@ def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bo
         # Since we prefilled Anthropic response with "{" we need to add it back to the response to have a valid json object:
         if add_assistant_prefix:
             content = "{" + content
-        content = try_to_extract_json_from_markdown_format(content)
-        if not content:
-            raise EmptyLLMResponseError(str(response))
-        return commentjson.loads(content)
-    except Exception as e:
-        if content:
-            LOG.warning(
-                "Failed to parse LLM response. Will retry auto-fixing the response for unescaped quotes.",
-                exc_info=True,
-                content=content,
-            )
-            try:
-                return fix_and_parse_json_string(content)
-            except Exception as e2:
-                LOG.exception("Failed to auto-fix LLM response.", error=str(e2))
-                raise InvalidLLMResponseFormat(str(response)) from e2
 
-        raise InvalidLLMResponseFormat(str(response)) from e
+        return json_repair.loads(content)
+
+    except Exception:
+        LOG.warning(
+            "Failed to parse LLM response using json_repair. Will retry auto-fixing the response for unescaped quotes.",
+            exc_info=True,
+        )
+        try:
+            if not content:
+                raise EmptyLLMResponseError(str(response))
+            content = try_to_extract_json_from_markdown_format(content)
+            return commentjson.loads(content)
+        except Exception as e:
+            if content:
+                LOG.warning(
+                    "Failed to parse LLM response. Will retry auto-fixing the response for unescaped quotes.",
+                    exc_info=True,
+                    content=content,
+                )
+                try:
+                    return fix_and_parse_json_string(content)
+                except Exception as e2:
+                    LOG.exception("Failed to auto-fix LLM response.", error=str(e2))
+                    raise InvalidLLMResponseFormat(str(response)) from e2
+
+            raise InvalidLLMResponseFormat(str(response)) from e
 
 
 def fix_cutoff_json(json_string: str, error_position: int) -> dict[str, Any]:

@@ -1,8 +1,9 @@
 from abc import ABC, abstractmethod
 
-from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverThought
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
 # TODO: This should be a part of the ArtifactType model
 FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
@@ -11,6 +12,8 @@ FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
     ArtifactType.SCREENSHOT_LLM: "png",
     ArtifactType.SCREENSHOT_ACTION: "png",
     ArtifactType.SCREENSHOT_FINAL: "png",
+    ArtifactType.SKYVERN_LOG: "log",
+    ArtifactType.SKYVERN_LOG_RAW: "json",
     ArtifactType.LLM_PROMPT: "txt",
     ArtifactType.LLM_REQUEST: "json",
     ArtifactType.LLM_RESPONSE: "json",
@@ -35,6 +38,10 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
+    def build_log_uri(self, log_entity_type: LogEntityType, log_entity_id: str, artifact_type: ArtifactType) -> str:
+        pass
+
+    @abstractmethod
     def build_observer_thought_uri(
         self, artifact_id: str, observer_thought: ObserverThought, artifact_type: ArtifactType
     ) -> str:
@@ -43,6 +50,12 @@ class BaseStorage(ABC):
     @abstractmethod
     def build_observer_cruise_uri(
         self, artifact_id: str, observer_cruise: ObserverCruise, artifact_type: ArtifactType
+    ) -> str:
+        pass
+
+    @abstractmethod
+    def build_workflow_run_block_uri(
+        self, artifact_id: str, workflow_run_block: WorkflowRunBlock, artifact_type: ArtifactType
     ) -> str:
         pass
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, Field, field_serializer
 
@@ -9,6 +10,9 @@ from pydantic import BaseModel, Field, field_serializer
 class ArtifactType(StrEnum):
     RECORDING = "recording"
     BROWSER_CONSOLE_LOG = "browser_console_log"
+
+    SKYVERN_LOG = "skyvern_log"
+    SKYVERN_LOG_RAW = "skyvern_log_raw"
 
     # DEPRECATED. pls use SCREENSHOT_LLM, SCREENSHOT_ACTION or SCREENSHOT_FINAL
     SCREENSHOT = "screenshot"
@@ -70,3 +74,14 @@ class Artifact(BaseModel):
     observer_thought_id: str | None = None
     signed_url: str | None = None
     organization_id: str | None = None
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+
+class LogEntityType(StrEnum):
+    STEP = "step"
+    TASK = "task"
+    WORKFLOW_RUN = "workflow_run"
+    WORKFLOW_RUN_BLOCK = "workflow_run_block"
+    OBSERVER = "observer"

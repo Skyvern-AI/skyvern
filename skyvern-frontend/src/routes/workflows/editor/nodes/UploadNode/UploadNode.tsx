@@ -3,11 +3,12 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
-import { UploadIcon } from "@radix-ui/react-icons";
+import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 import { Handle, NodeProps, Position } from "@xyflow/react";
 import { helpTooltips } from "../../helpContent";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
+import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { type UploadNode } from "./types";
 
 function UploadNode({ id, data }: NodeProps<UploadNode>) {
@@ -35,7 +36,10 @@ function UploadNode({ id, data }: NodeProps<UploadNode>) {
         <div className="flex h-[2.75rem] justify-between">
           <div className="flex gap-2">
             <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <UploadIcon className="h-6 w-6" />
+              <WorkflowBlockIcon
+                workflowBlockType={WorkflowBlockTypes.UploadToS3}
+                className="size-6"
+              />
             </div>
             <div className="flex flex-col gap-1">
               <EditableNodeTitle

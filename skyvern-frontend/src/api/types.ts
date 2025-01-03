@@ -10,6 +10,8 @@ export const ArtifactType = {
   LLMPrompt: "llm_prompt",
   LLMRequest: "llm_request",
   HTMLScrape: "html_scrape",
+  SkyvernLog: "skyvern_log",
+  SkyvernLogRaw: "skyvern_log_raw",
 } as const;
 
 export type ArtifactType = (typeof ArtifactType)[keyof typeof ArtifactType];
@@ -209,6 +211,8 @@ export type WorkflowRunStatusApiResponse = {
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
+  total_steps: number | null;
+  total_cost: number | null;
 };
 
 export type TaskGenerationApiResponse = {
@@ -221,6 +225,7 @@ export type TaskGenerationApiResponse = {
 };
 
 export type ActionsApiResponse = {
+  action_id: string;
   action_type: ActionType;
   status: Status;
   task_id: string | null;
@@ -232,4 +237,16 @@ export type ActionsApiResponse = {
   reasoning: string | null;
   intention: string | null;
   response: string | null;
+};
+
+export type ObserverCruise = {
+  observer_cruise_id: string;
+  status: Status;
+  workflow_run_id: string | null;
+  workflow_id: string | null;
+  workflow_permanent_id: string | null;
+  prompt: string | null;
+  url: string | null;
+  created_at: string;
+  modified_at: string;
 };

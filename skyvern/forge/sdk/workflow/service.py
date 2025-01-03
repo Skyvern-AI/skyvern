@@ -22,9 +22,10 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
-from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
     InvalidWaitBlockTime,
@@ -191,7 +192,7 @@ class WorkflowService:
     ) -> WorkflowRun:
         """Execute a workflow."""
         organization_id = organization.organization_id
-        workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id)
+        workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         workflow = await self.get_workflow(workflow_id=workflow_run.workflow_id, organization_id=organization_id)
 
         # Set workflow run status to running, create workflow run parameters
@@ -219,7 +220,8 @@ class WorkflowService:
         for block_idx, block in enumerate(blocks):
             try:
                 refreshed_workflow_run = await app.DATABASE.get_workflow_run(
-                    workflow_run_id=workflow_run.workflow_run_id
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    organization_id=organization_id,
                 )
                 if refreshed_workflow_run and refreshed_workflow_run.status == WorkflowRunStatus.canceled:
                     LOG.info(
@@ -248,7 +250,10 @@ class WorkflowService:
                     block_type_var=block.block_type,
                     block_label=block.label,
                 )
-                block_result = await block.execute_safe(workflow_run_id=workflow_run_id)
+                block_result = await block.execute_safe(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                )
                 if block_result.status == BlockStatus.canceled:
                     LOG.info(
                         f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} was canceled for workflow run {workflow_run_id}, cancelling workflow run",
@@ -355,7 +360,10 @@ class WorkflowService:
                 await self.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, api_key=api_key)
                 return workflow_run
 
-        refreshed_workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=workflow_run.workflow_run_id)
+        refreshed_workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=organization_id,
+        )
         if refreshed_workflow_run and refreshed_workflow_run.status not in (
             WorkflowRunStatus.canceled,
             WorkflowRunStatus.failed,
@@ -567,8 +575,11 @@ class WorkflowService:
             status=WorkflowRunStatus.canceled,
         )
 
-    async def get_workflow_run(self, workflow_run_id: str) -> WorkflowRun:
-        workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=workflow_run_id)
+    async def get_workflow_run(self, workflow_run_id: str, organization_id: str | None = None) -> WorkflowRun:
+        workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
         if not workflow_run:
             raise WorkflowRunNotFound(workflow_run_id)
         return workflow_run
@@ -715,8 +726,8 @@ class WorkflowService:
 
         return [
             (output_parameter, workflow_run_output_parameter)
-            for output_parameter in output_parameters
             for workflow_run_output_parameter in workflow_run_output_parameters
+            for output_parameter in output_parameters
             if output_parameter.output_parameter_id == workflow_run_output_parameter.output_parameter_id
         ]
 
@@ -730,8 +741,9 @@ class WorkflowService:
         self,
         workflow_run_id: str,
         organization_id: str,
+        include_cost: bool = False,
     ) -> WorkflowRunStatusResponse:
-        workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id)
+        workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         if workflow_run is None:
             LOG.error(f"Workflow run {workflow_run_id} not found")
             raise WorkflowRunNotFound(workflow_run_id=workflow_run_id)
@@ -740,6 +752,7 @@ class WorkflowService:
             workflow_permanent_id=workflow_permanent_id,
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
+            include_cost=include_cost,
         )
 
     async def build_workflow_run_status_response(
@@ -747,13 +760,14 @@ class WorkflowService:
         workflow_permanent_id: str,
         workflow_run_id: str,
         organization_id: str,
+        include_cost: bool = False,
     ) -> WorkflowRunStatusResponse:
         workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id, organization_id=organization_id)
         if workflow is None:
             LOG.error(f"Workflow {workflow_permanent_id} not found")
             raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id)
 
-        workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id)
+        workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         workflow_run_tasks = await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
         screenshot_artifacts = []
         screenshot_urls: list[str] | None = None
@@ -813,6 +827,17 @@ class WorkflowService:
         if output_parameter_tuples:
             outputs = {output_parameter.key: output.value for output_parameter, output in output_parameter_tuples}
 
+        total_steps = None
+        total_cost = None
+        if include_cost:
+            workflow_run_steps = await app.DATABASE.get_steps_by_task_ids(
+                task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
+            )
+            total_steps = len(workflow_run_steps)
+            # TODO: This is a temporary cost calculation. We need to implement a more accurate cost calculation.
+            # successful steps are the ones that have a status of completed and the total count of unique step.order
+            successful_steps = [step for step in workflow_run_steps if step.status == StepStatus.completed]
+            total_cost = 0.1 * len(successful_steps)
         return WorkflowRunStatusResponse(
             workflow_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run_id,
@@ -829,6 +854,8 @@ class WorkflowService:
             recording_url=recording_url,
             downloaded_file_urls=downloaded_file_urls,
             outputs=outputs,
+            total_steps=total_steps,
+            total_cost=total_cost,
         )
 
     async def clean_up_workflow(
@@ -1592,3 +1619,55 @@ class WorkflowService:
             organization=organization,
             request=workflow_create_request,
         )
+
+    async def get_workflow_run_timeline(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+    ) -> list[WorkflowRunTimeline]:
+        """
+        build the tree structure of the workflow run timeline
+        """
+        workflow_run_blocks = await app.DATABASE.get_workflow_run_blocks(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        # get all the actions for all workflow run blocks
+        task_ids = [block.task_id for block in workflow_run_blocks if block.task_id]
+        task_id_to_block: dict[str, WorkflowRunBlock] = {
+            block.task_id: block for block in workflow_run_blocks if block.task_id
+        }
+        actions = await app.DATABASE.get_tasks_actions(task_ids=task_ids, organization_id=organization_id)
+        for action in actions:
+            if not action.task_id:
+                continue
+            task_block = task_id_to_block[action.task_id]
+            task_block.actions.append(action)
+
+        result = []
+        block_map: dict[str, WorkflowRunTimeline] = {}
+        counter = 0
+        while workflow_run_blocks:
+            counter += 1
+            block = workflow_run_blocks.pop(0)
+            workflow_run_timeline = WorkflowRunTimeline(
+                type=WorkflowRunTimelineType.block,
+                block=block,
+                created_at=block.created_at,
+                modified_at=block.modified_at,
+            )
+            if block.parent_workflow_run_block_id:
+                if block.parent_workflow_run_block_id in block_map:
+                    block_map[block.parent_workflow_run_block_id].children.append(workflow_run_timeline)
+                else:
+                    # put the block back to the queue
+                    workflow_run_blocks.append(block)
+            else:
+                result.append(workflow_run_timeline)
+                block_map[block.workflow_run_block_id] = workflow_run_timeline
+
+            if counter > 1000:
+                LOG.error("Too many blocks in the workflow run", workflow_run_id=workflow_run_id)
+                break
+
+        return result

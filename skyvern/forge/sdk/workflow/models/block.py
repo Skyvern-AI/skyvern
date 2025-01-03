@@ -43,6 +43,8 @@ from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.core.validators import prepend_scheme_and_validate_url
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
@@ -81,9 +83,11 @@ class BlockType(StrEnum):
     LOGIN = "login"
     WAIT = "wait"
     FILE_DOWNLOAD = "file_download"
+    GOTO_URL = "goto_url"
 
 
 class BlockStatus(StrEnum):
+    running = "running"
     completed = "completed"
     failed = "failed"
     terminated = "terminated"
@@ -97,6 +101,7 @@ class BlockResult:
     output_parameter_value: dict[str, Any] | list | str | None = None
     status: BlockStatus | None = None
     failure_reason: str | None = None
+    workflow_run_block_id: str | None = None
 
 
 class Block(BaseModel, abc.ABC):
@@ -127,19 +132,34 @@ class Block(BaseModel, abc.ABC):
             workflow_run_id=workflow_run_id,
         )
 
-    def build_block_result(
+    async def build_block_result(
         self,
         success: bool,
         failure_reason: str | None,
         output_parameter_value: dict[str, Any] | list | str | None = None,
         status: BlockStatus | None = None,
+        workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
     ) -> BlockResult:
+        # TODO: update workflow run block status and failure reason
+        if isinstance(output_parameter_value, str):
+            output_parameter_value = {"value": output_parameter_value}
+
+        if workflow_run_block_id:
+            await app.DATABASE.update_workflow_run_block(
+                workflow_run_block_id=workflow_run_block_id,
+                output=output_parameter_value,
+                status=status,
+                failure_reason=failure_reason,
+                organization_id=organization_id,
+            )
         return BlockResult(
             success=success,
             failure_reason=failure_reason,
             output_parameter=self.output_parameter,
             output_parameter_value=output_parameter_value,
             status=status,
+            workflow_run_block_id=workflow_run_block_id,
         )
 
     def format_block_parameter_template_from_workflow_run_context(
@@ -166,12 +186,42 @@ class Block(BaseModel, abc.ABC):
         return app.WORKFLOW_CONTEXT_MANAGER.aws_client
 
     @abc.abstractmethod
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+    ) -> BlockResult:
         pass
 
-    async def execute_safe(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute_safe(
+        self,
+        workflow_run_id: str,
+        parent_workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        workflow_run_block_id = None
         try:
-            return await self.execute(workflow_run_id, **kwargs)
+            workflow_run_block = await app.DATABASE.create_workflow_run_block(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                parent_workflow_run_block_id=parent_workflow_run_block_id,
+                label=self.label,
+                block_type=self.block_type,
+                continue_on_failure=self.continue_on_failure,
+            )
+            # create a screenshot
+            browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+            if not browser_state:
+                LOG.warning("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
+            else:
+                screenshot = await browser_state.take_screenshot(full_page=True)
+                if screenshot:
+                    await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
+                        workflow_run_block=workflow_run_block,
+                        artifact_type=ArtifactType.SCREENSHOT_LLM,
+                        data=screenshot,
+                    )
+            workflow_run_block_id = workflow_run_block.workflow_run_block_id
+            return await self.execute(workflow_run_id, workflow_run_block_id, organization_id=organization_id, **kwargs)
         except Exception as e:
             LOG.exception(
                 "Block execution failed",
@@ -187,7 +237,14 @@ class Block(BaseModel, abc.ABC):
             failure_reason = "unexpected exception"
             if isinstance(e, SkyvernException):
                 failure_reason = f"unexpected SkyvernException({e.__class__.__name__})"
-            return self.build_block_result(success=False, failure_reason=failure_reason, status=BlockStatus.failed)
+
+            return await self.build_block_result(
+                success=False,
+                failure_reason=failure_reason,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
 
     @abc.abstractmethod
     def get_all_parameters(
@@ -235,6 +292,7 @@ class BaseTaskBlock(Block):
 
         if self.url:
             self.url = self.format_block_parameter_template_from_workflow_run_context(self.url, workflow_run_context)
+            self.url = prepend_scheme_and_validate_url(self.url)
 
         if self.totp_identifier:
             self.totp_identifier = self.format_block_parameter_template_from_workflow_run_context(
@@ -245,6 +303,7 @@ class BaseTaskBlock(Block):
             self.totp_verification_url = self.format_block_parameter_template_from_workflow_run_context(
                 self.totp_verification_url, workflow_run_context
             )
+            self.totp_verification_url = prepend_scheme_and_validate_url(self.totp_verification_url)
 
         if self.download_suffix:
             self.download_suffix = self.format_block_parameter_template_from_workflow_run_context(
@@ -303,14 +362,22 @@ class BaseTaskBlock(Block):
 
         return order, retry + 1
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+    ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         current_retry = 0
         # initial value for will_retry is True, so that the loop runs at least once
         will_retry = True
         current_running_task: Task | None = None
-        workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(workflow_run_id=workflow_run_id)
-        workflow = await app.WORKFLOW_SERVICE.get_workflow(workflow_id=workflow_run.workflow_id)
+        workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        workflow = await app.WORKFLOW_SERVICE.get_workflow(
+            workflow_id=workflow_run.workflow_id,
+            organization_id=organization_id,
+        )
         # if the task url is parameterized, we need to get the value from the workflow run context
         if self.url and workflow_run_context.has_parameter(self.url) and workflow_run_context.has_value(self.url):
             task_url_parameter_value = workflow_run_context.get_value(self.url)
@@ -349,11 +416,13 @@ class BaseTaskBlock(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context=workflow_run_context)
         except Exception as e:
-            return self.build_block_result(
+            return await self.build_block_result(
                 success=False,
                 failure_reason=f"Failed to format jinja template: {str(e)}",
                 output_parameter_value=None,
                 status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
 
         # TODO (kerem) we should always retry on terminated. We should make a distinction between retriable and
@@ -369,6 +438,11 @@ class BaseTaskBlock(Block):
                 task_order=task_order,
                 task_retry=task_retry,
             )
+            workflow_run_block = await app.DATABASE.update_workflow_run_block(
+                workflow_run_block_id=workflow_run_block_id,
+                task_id=task.task_id,
+                organization_id=workflow.organization_id,
+            )
             current_running_task = task
             organization = await app.DATABASE.get_organization(organization_id=workflow.organization_id)
             if not organization:
@@ -381,6 +455,14 @@ class BaseTaskBlock(Block):
                     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                         workflow_run=workflow_run, url=self.url
                     )
+                    # add screenshot artifact for the first task
+                    screenshot = await browser_state.take_screenshot(full_page=True)
+                    if screenshot:
+                        await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
+                            workflow_run_block=workflow_run_block,
+                            artifact_type=ArtifactType.SCREENSHOT_LLM,
+                            data=screenshot,
+                        )
                 except Exception as e:
                     LOG.exception(
                         "Failed to get browser state for first task",
@@ -474,11 +556,13 @@ class BaseTaskBlock(Block):
                 task_output = TaskOutput.from_task(updated_task)
                 output_parameter_value = task_output.model_dump()
                 await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_parameter_value)
-                return self.build_block_result(
+                return await self.build_block_result(
                     success=success,
                     failure_reason=updated_task.failure_reason,
                     output_parameter_value=output_parameter_value,
                     status=block_status_mapping[updated_task.status],
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
                 )
             elif updated_task.status == TaskStatus.canceled:
                 LOG.info(
@@ -489,11 +573,13 @@ class BaseTaskBlock(Block):
                     workflow_id=workflow.workflow_id,
                     organization_id=workflow.organization_id,
                 )
-                return self.build_block_result(
+                return await self.build_block_result(
                     success=False,
                     failure_reason=updated_task.failure_reason,
                     output_parameter_value=None,
                     status=block_status_mapping[updated_task.status],
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
                 )
             else:
                 current_retry += 1
@@ -516,18 +602,22 @@ class BaseTaskBlock(Block):
                     await self.record_output_parameter_value(
                         workflow_run_context, workflow_run_id, output_parameter_value
                     )
-                    return self.build_block_result(
+                    return await self.build_block_result(
                         success=False,
                         failure_reason=updated_task.failure_reason,
                         output_parameter_value=output_parameter_value,
                         status=block_status_mapping[updated_task.status],
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
                     )
 
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id)
-        return self.build_block_result(
+        return await self.build_block_result(
             success=False,
             status=BlockStatus.failed,
             failure_reason=current_running_task.failure_reason if current_running_task else None,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
         )
 
 
@@ -674,7 +764,12 @@ class ForLoopBlock(Block):
             return [parameter_value]
 
     async def execute_loop_helper(
-        self, workflow_run_id: str, workflow_run_context: WorkflowRunContext, loop_over_values: list[Any]
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        workflow_run_context: WorkflowRunContext,
+        loop_over_values: list[Any],
+        organization_id: str | None = None,
     ) -> LoopBlockExecutedResult:
         outputs_with_loop_values: list[list[dict[str, Any]]] = []
         block_outputs: list[BlockResult] = []
@@ -697,7 +792,11 @@ class ForLoopBlock(Block):
                 loop_block = loop_block.copy()
                 current_block = loop_block
 
-                block_output = await loop_block.execute_safe(workflow_run_id=workflow_run_id)
+                block_output = await loop_block.execute_safe(
+                    workflow_run_id=workflow_run_id,
+                    parent_workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
                 each_loop_output_values.append(
                     {
                         "loop_value": loop_over_value,
@@ -705,6 +804,21 @@ class ForLoopBlock(Block):
                         "output_value": workflow_run_context.get_value(block_output.output_parameter.key),
                     }
                 )
+                try:
+                    if block_output.workflow_run_block_id:
+                        await app.DATABASE.update_workflow_run_block(
+                            workflow_run_block_id=block_output.workflow_run_block_id,
+                            organization_id=organization_id,
+                            current_value=str(loop_over_value),
+                            current_index=loop_idx,
+                        )
+                except Exception:
+                    LOG.warning(
+                        "Failed to update workflow run block",
+                        workflow_run_block_id=block_output.workflow_run_block_id,
+                        loop_over_value=loop_over_value,
+                        loop_idx=loop_idx,
+                    )
                 loop_block = original_loop_block
                 block_outputs.append(block_output)
                 if block_output.status == BlockStatus.canceled:
@@ -746,16 +860,26 @@ class ForLoopBlock(Block):
             last_block=current_block,
         )
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+    ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         try:
             loop_over_values = self.get_loop_over_parameter_values(workflow_run_context)
         except Exception as e:
-            return self.build_block_result(
+            return await self.build_block_result(
                 success=False,
                 failure_reason=f"failed to get loop values: {str(e)}",
                 status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
+
+        await app.DATABASE.update_workflow_run_block(
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            loop_values=loop_over_values,
+        )
 
         LOG.info(
             f"Number of loop_over values: {len(loop_over_values)}",
@@ -771,10 +895,12 @@ class ForLoopBlock(Block):
                 num_loop_over_values=len(loop_over_values),
             )
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, [])
-            return self.build_block_result(
+            return await self.build_block_result(
                 success=False,
                 failure_reason="No iterable value found for the loop block",
                 status=BlockStatus.terminated,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
 
         if not self.loop_blocks or len(self.loop_blocks) == 0:
@@ -785,14 +911,20 @@ class ForLoopBlock(Block):
                 num_loop_blocks=len(self.loop_blocks),
             )
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, [])
-            return self.build_block_result(
-                success=False, failure_reason="No defined blocks to loop", status=BlockStatus.terminated
+            return await self.build_block_result(
+                success=False,
+                failure_reason="No defined blocks to loop",
+                status=BlockStatus.terminated,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
 
         loop_executed_result = await self.execute_loop_helper(
             workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
             workflow_run_context=workflow_run_context,
             loop_over_values=loop_over_values,
+            organization_id=organization_id,
         )
         await self.record_output_parameter_value(
             workflow_run_context, workflow_run_id, loop_executed_result.outputs_with_loop_values
@@ -810,11 +942,13 @@ class ForLoopBlock(Block):
         else:
             block_status = BlockStatus.failed
 
-        return self.build_block_result(
+        return await self.build_block_result(
             success=success,
             failure_reason=loop_executed_result.get_failure_reason(),
             output_parameter_value=loop_executed_result.outputs_with_loop_values,
             status=block_status,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
         )
 
 
@@ -833,18 +967,22 @@ class CodeBlock(Block):
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         self.code = self.format_block_parameter_template_from_workflow_run_context(self.code, workflow_run_context)
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+    ) -> BlockResult:
         raise DisabledBlockExecutionError("CodeBlock is disabled")
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            return self.build_block_result(
+            return await self.build_block_result(
                 success=False,
                 failure_reason=f"Failed to format jinja template: {str(e)}",
                 output_parameter_value=None,
                 status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
 
         # get all parameters into a dictionary
@@ -886,7 +1024,13 @@ async def user_code():
 
         result = {"result": result_container.get("result")}
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result)
-        return self.build_block_result(success=True, output_parameter_value=result, status=BlockStatus.completed)
+        return await self.build_block_result(
+            success=True,
+            output_parameter_value=result,
+            status=BlockStatus.completed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
 
 
 DEFAULT_TEXT_PROMPT_LLM_KEY = settings.SECONDARY_LLM_KEY or settings.LLM_KEY
@@ -943,17 +1087,26 @@ class TextPromptBlock(Block):
         LOG.info("TextPromptBlock: Received response from LLM", response=response)
         return response
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+    ) -> BlockResult:
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        await app.DATABASE.update_workflow_run_block(
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            prompt=self.prompt,
+        )
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            return self.build_block_result(
+            return await self.build_block_result(
                 success=False,
                 failure_reason=f"Failed to format jinja template: {str(e)}",
                 output_parameter_value=None,
                 status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
         # get all parameters into a dictionary
         parameter_values = {}
@@ -967,8 +1120,13 @@ class TextPromptBlock(Block):
 
         response = await self.send_prompt(self.prompt, parameter_values)
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response)
-        return self.build_block_result(
-            success=True, failure_reason=None, output_parameter_value=response, status=BlockStatus.completed
+        return await self.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value=response,
+            status=BlockStatus.completed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
         )
 
 
@@ -999,7 +1157,9 @@ class DownloadToS3Block(Block):
             # Clean up the temporary file since it's created with delete=False
             os.unlink(file_path)
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+    ) -> BlockResult:
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         # get all parameters into a dictionary
@@ -1016,11 +1176,13 @@ class DownloadToS3Block(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            return self.build_block_result(
+            return await self.build_block_result(
                 success=False,
                 failure_reason=f"Failed to format jinja template: {str(e)}",
                 output_parameter_value=None,
                 status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
 
         try:
@@ -1039,8 +1201,13 @@ class DownloadToS3Block(Block):
 
         LOG.info("DownloadToS3Block: File downloaded and uploaded to S3", uri=uri)
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, uri)
-        return self.build_block_result(
-            success=True, failure_reason=None, output_parameter_value=uri, status=BlockStatus.completed
+        return await self.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value=uri,
+            status=BlockStatus.completed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
         )
 
 
@@ -1071,7 +1238,9 @@ class UploadToS3Block(Block):
         s3_key = f"{settings.ENV}/{workflow_run_id}/{uuid.uuid4()}_{Path(path).name}"
         return f"s3://{s3_bucket}/{s3_key}"
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+    ) -> BlockResult:
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         # get all parameters into a dictionary
@@ -1091,11 +1260,13 @@ class UploadToS3Block(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            return self.build_block_result(
+            return await self.build_block_result(
                 success=False,
                 failure_reason=f"Failed to format jinja template: {str(e)}",
                 output_parameter_value=None,
                 status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
 
         if not self.path or not os.path.exists(self.path):
@@ -1129,8 +1300,13 @@ class UploadToS3Block(Block):
 
         LOG.info("UploadToS3Block: File(s) uploaded to S3", file_path=self.path)
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, s3_uris)
-        return self.build_block_result(
-            success=True, failure_reason=None, output_parameter_value=s3_uris, status=BlockStatus.completed
+        return await self.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value=s3_uris,
+            status=BlockStatus.completed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
         )
 
 
@@ -1385,16 +1561,28 @@ class SendEmailBlock(Block):
 
         return msg
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+    ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        await app.DATABASE.update_workflow_run_block(
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            recipients=self.recipients,
+            attachments=self.file_attachments,
+            subject=self.subject,
+            body=self.body,
+        )
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            return self.build_block_result(
+            return await self.build_block_result(
                 success=False,
                 failure_reason=f"Failed to format jinja template: {str(e)}",
                 output_parameter_value=None,
                 status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
         smtp_host_value, smtp_port_value, smtp_username_value, smtp_password_value = self._decrypt_smtp_parameters(
             workflow_run_context
@@ -1414,8 +1602,13 @@ class SendEmailBlock(Block):
             LOG.error("SendEmailBlock: Failed to send email", exc_info=True)
             result_dict = {"success": False, "error": str(e)}
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
-            return self.build_block_result(
-                success=False, failure_reason=str(e), output_parameter_value=result_dict, status=BlockStatus.failed
+            return await self.build_block_result(
+                success=False,
+                failure_reason=str(e),
+                output_parameter_value=result_dict,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
         finally:
             if smtp_host:
@@ -1423,8 +1616,13 @@ class SendEmailBlock(Block):
 
         result_dict = {"success": True}
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
-        return self.build_block_result(
-            success=True, failure_reason=None, output_parameter_value=result_dict, status=BlockStatus.completed
+        return await self.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value=result_dict,
+            status=BlockStatus.completed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
         )
 
 
@@ -1460,7 +1658,9 @@ class FileParserBlock(Block):
             except csv.Error as e:
                 raise InvalidFileType(file_url=file_url_used, file_type=self.file_type, error=str(e))
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+    ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         if (
             self.file_url
@@ -1479,11 +1679,13 @@ class FileParserBlock(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            return self.build_block_result(
+            return await self.build_block_result(
                 success=False,
                 failure_reason=f"Failed to format jinja template: {str(e)}",
                 output_parameter_value=None,
                 status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
 
         # Download the file
@@ -1502,8 +1704,13 @@ class FileParserBlock(Block):
                     parsed_data.append(row)
         # Record the parsed data
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, parsed_data)
-        return self.build_block_result(
-            success=True, failure_reason=None, output_parameter_value=parsed_data, status=BlockStatus.completed
+        return await self.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value=parsed_data,
+            status=BlockStatus.completed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
         )
 
 
@@ -1519,8 +1726,15 @@ class WaitBlock(Block):
     ) -> list[PARAMETER_TYPE]:
         return self.parameters
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+    ) -> BlockResult:
         # TODO: we need to support to interrupt the sleep when the workflow run failed/cancelled/terminated
+        await app.DATABASE.update_workflow_run_block(
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            wait_sec=self.wait_sec,
+        )
         LOG.info(
             "Going to pause the workflow for a while",
             second=self.wait_sec,
@@ -1530,8 +1744,13 @@ class WaitBlock(Block):
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         result_dict = {"success": True}
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
-        return self.build_block_result(
-            success=True, failure_reason=None, output_parameter_value=result_dict, status=BlockStatus.completed
+        return await self.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value=result_dict,
+            status=BlockStatus.completed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
         )
 
 
@@ -1544,18 +1763,27 @@ class ValidationBlock(BaseTaskBlock):
     ) -> list[PARAMETER_TYPE]:
         return self.parameters
 
-    async def execute(self, workflow_run_id: str, **kwargs: dict) -> BlockResult:
+    async def execute(
+        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+    ) -> BlockResult:
         task_order, _ = await self.get_task_order(workflow_run_id, 0)
         is_first_task = task_order == 0
         if is_first_task:
-            return self.build_block_result(
+            return await self.build_block_result(
                 success=False,
                 failure_reason="Validation block should not be the first block",
                 output_parameter_value=None,
                 status=BlockStatus.terminated,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
             )
 
-        return await super().execute(workflow_run_id=workflow_run_id, kwargs=kwargs)
+        return await super().execute(
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            kwargs=kwargs,
+        )
 
 
 class ActionBlock(BaseTaskBlock):
@@ -1582,6 +1810,11 @@ class FileDownloadBlock(BaseTaskBlock):
     block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD
 
 
+class UrlBlock(BaseTaskBlock):
+    block_type: Literal[BlockType.GOTO_URL] = BlockType.GOTO_URL
+    url: str
+
+
 BlockSubclasses = Union[
     ForLoopBlock,
     TaskBlock,
@@ -1598,5 +1831,6 @@ BlockSubclasses = Union[
     LoginBlock,
     WaitBlock,
     FileDownloadBlock,
+    UrlBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]

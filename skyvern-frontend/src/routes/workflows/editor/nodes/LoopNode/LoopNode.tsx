@@ -1,3 +1,4 @@
+import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -8,7 +9,7 @@ import {
 } from "@/components/ui/select";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
-import { UpdateIcon } from "@radix-ui/react-icons";
+import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 import type { Node } from "@xyflow/react";
 import {
   Handle,
@@ -19,13 +20,13 @@ import {
   useReactFlow,
 } from "@xyflow/react";
 import { AppNode } from "..";
+import { helpTooltips } from "../../helpContent";
 import { useWorkflowParametersState } from "../../useWorkflowParametersState";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
+import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import type { LoopNode } from "./types";
-import { HelpTooltip } from "@/components/HelpTooltip";
-import { helpTooltips } from "../../helpContent";
 
 function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const { updateNodeData } = useReactFlow();
@@ -88,7 +89,10 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
             <div className="flex h-[2.75rem] justify-between">
               <div className="flex gap-2">
                 <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-                  <UpdateIcon className="h-6 w-6" />
+                  <WorkflowBlockIcon
+                    workflowBlockType={WorkflowBlockTypes.ForLoop}
+                    className="size-6"
+                  />
                 </div>
                 <div className="flex flex-col gap-1">
                   <EditableNodeTitle

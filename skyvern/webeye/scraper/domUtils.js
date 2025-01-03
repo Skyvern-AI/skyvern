@@ -619,6 +619,9 @@ function isInteractable(element) {
     if (hasAngularClickBinding(element)) {
       return true;
     }
+    if (element.className.toString().includes("blinking-cursor")) {
+      return true;
+    }
     // https://www.oxygenxml.com/dita/1.3/specs/langRef/technicalContent/svg-container.html
     // svg-container is usually used for clickable elements that wrap SVGs
     if (element.className.toString().includes("svg-container")) {
@@ -1548,7 +1551,8 @@ function buildElementTree(starter = document.body, frame, full_tree = false) {
         if (
           labelElement &&
           labelElement.childElementCount === 0 &&
-          !labelElement.getAttribute("for")
+          !labelElement.getAttribute("for") &&
+          !element.text
         ) {
           continue;
         }

@@ -1,5 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
+import { ProxyLocation } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
+import { SwitchBarNavigation } from "@/components/SwitchBarNavigation";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -25,12 +27,10 @@ import {
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import fetchToCurl from "fetch-to-curl";
-import { Link, NavLink, Outlet, useParams } from "react-router-dom";
+import { Link, Outlet, useParams } from "react-router-dom";
 import { statusIsFinalized, statusIsRunningOrQueued } from "../tasks/types";
 import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "./hooks/useWorkflowRunQuery";
-import { cn } from "@/util/utils";
-import { ProxyLocation } from "@/api/types";
 
 function WorkflowRun() {
   const { workflowRunId, workflowPermanentId } = useParams();
@@ -86,7 +86,14 @@ function WorkflowRun() {
   const title = workflowIsLoading ? (
     <Skeleton className="h-9 w-48" />
   ) : (
-    <h1 className="text-3xl">{workflow?.title}</h1>
+    <h1 className="text-3xl">
+      <Link
+        className="hover:underline hover:underline-offset-2"
+        to={`/workflows/${workflowPermanentId}/runs`}
+      >
+        {workflow?.title}
+      </Link>
+    </h1>
   );
 
   const workflowFailureReason = workflowRun?.failure_reason ? (
@@ -203,64 +210,26 @@ function WorkflowRun() {
         </div>
       </header>
       {workflowFailureReason}
-      <div className="flex w-fit gap-2 rounded-sm border border-slate-700 p-2">
-        <NavLink
-          to="blocks"
-          replace
-          className={({ isActive }) => {
-            return cn(
-              "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
-              {
-                "bg-slate-700": isActive,
-              },
-            );
-          }}
-        >
-          Blocks
-        </NavLink>
-        <NavLink
-          to="output"
-          replace
-          className={({ isActive }) => {
-            return cn(
-              "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
-              {
-                "bg-slate-700": isActive,
-              },
-            );
-          }}
-        >
-          Output
-        </NavLink>
-        <NavLink
-          to="parameters"
-          replace
-          className={({ isActive }) => {
-            return cn(
-              "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
-              {
-                "bg-slate-700": isActive,
-              },
-            );
-          }}
-        >
-          Parameters
-        </NavLink>
-        <NavLink
-          to="recording"
-          replace
-          className={({ isActive }) => {
-            return cn(
-              "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
-              {
-                "bg-slate-700": isActive,
-              },
-            );
-          }}
-        >
-          Recording
-        </NavLink>
-      </div>
+      <SwitchBarNavigation
+        options={[
+          {
+            label: "Overview",
+            to: "overview",
+          },
+          {
+            label: "Output",
+            to: "output",
+          },
+          {
+            label: "Parameters",
+            to: "parameters",
+          },
+          {
+            label: "Recording",
+            to: "recording",
+          },
+        ]}
+      />
       <Outlet />
     </div>
   );

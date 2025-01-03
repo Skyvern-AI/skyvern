@@ -30,6 +30,7 @@ from skyvern.forge.sdk.db.models import (
     TOTPCodeModel,
     WorkflowModel,
     WorkflowParameterModel,
+    WorkflowRunBlockModel,
     WorkflowRunModel,
     WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
@@ -48,15 +49,24 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_workflow,
     convert_to_workflow_parameter,
     convert_to_workflow_run,
+    convert_to_workflow_run_block,
     convert_to_workflow_run_output_parameter,
     convert_to_workflow_run_parameter,
 )
+from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
-from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverCruiseStatus, ObserverThought
+from skyvern.forge.sdk.schemas.observers import (
+    ObserverCruise,
+    ObserverCruiseStatus,
+    ObserverThought,
+    ObserverThoughtType,
+)
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.tasks import OrderBy, ProxyLocation, SortDirection, Task, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.models.block import BlockStatus, BlockType
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     BitwardenCreditCardDataParameter,
@@ -245,6 +255,28 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_tasks_by_ids(
+        self,
+        task_ids: list[str],
+        organization_id: str | None = None,
+    ) -> list[Task]:
+        try:
+            async with self.Session() as session:
+                tasks = (
+                    await session.scalars(
+                        select(TaskModel)
+                        .filter(TaskModel.task_id.in_(task_ids))
+                        .filter_by(organization_id=organization_id)
+                    )
+                ).all()
+                return [convert_to_task(task, debug_enabled=self.debug_enabled) for task in tasks]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def get_step(self, task_id: str, step_id: str, organization_id: str | None = None) -> Step | None:
         try:
             async with self.Session() as session:
@@ -286,6 +318,21 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_steps_by_task_ids(self, task_ids: list[str], organization_id: str | None = None) -> list[Step]:
+        try:
+            async with self.Session() as session:
+                steps = (
+                    await session.scalars(
+                        select(StepModel)
+                        .filter(StepModel.task_id.in_(task_ids))
+                        .filter_by(organization_id=organization_id)
+                    )
+                ).all()
+                return [convert_to_step(step, debug_enabled=self.debug_enabled) for step in steps]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
     async def get_task_step_models(self, task_id: str, organization_id: str | None = None) -> Sequence[StepModel]:
         try:
             async with self.Session() as session:
@@ -315,6 +362,25 @@ class AgentDB:
                     .order_by(ActionModel.created_at)
                 )
 
+                actions = (await session.scalars(query)).all()
+                return [Action.model_validate(action) for action in actions]
+
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_tasks_actions(self, task_ids: list[str], organization_id: str | None = None) -> list[Action]:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(ActionModel)
+                    .filter(ActionModel.organization_id == organization_id)
+                    .filter(ActionModel.task_id.in_(task_ids))
+                    .order_by(ActionModel.created_at)
+                )
                 actions = (await session.scalars(query)).all()
                 return [Action.model_validate(action) for action in actions]
 
@@ -360,6 +426,7 @@ class AgentDB:
                         .filter_by(task_id=task_id)
                         .filter_by(organization_id=organization_id)
                         .order_by(StepModel.order.desc())
+                        .order_by(StepModel.retry_index.desc())
                     )
                 ).first():
                     return convert_to_step(step, debug_enabled=self.debug_enabled)
@@ -808,6 +875,73 @@ class AgentDB:
             LOG.exception("UnexpectedError")
             raise
 
+    async def get_artifacts_by_entity_id(
+        self,
+        artifact_type: ArtifactType | None = None,
+        task_id: str | None = None,
+        step_id: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_run_block_id: str | None = None,
+        observer_thought_id: str | None = None,
+        observer_cruise_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> list[Artifact]:
+        try:
+            async with self.Session() as session:
+                query = select(ArtifactModel)
+
+                if artifact_type is not None:
+                    query = query.filter_by(artifact_type=artifact_type)
+                if task_id is not None:
+                    query = query.filter_by(task_id=task_id)
+                if step_id is not None:
+                    query = query.filter_by(step_id=step_id)
+                if workflow_run_id is not None:
+                    query = query.filter_by(workflow_run_id=workflow_run_id)
+                if workflow_run_block_id is not None:
+                    query = query.filter_by(workflow_run_block_id=workflow_run_block_id)
+                if observer_thought_id is not None:
+                    query = query.filter_by(observer_thought_id=observer_thought_id)
+                if observer_cruise_id is not None:
+                    query = query.filter_by(observer_cruise_id=observer_cruise_id)
+                if organization_id is not None:
+                    query = query.filter_by(organization_id=organization_id)
+
+                query = query.order_by(ArtifactModel.created_at.desc())
+                if artifacts := (await session.scalars(query)).all():
+                    return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifacts]
+                else:
+                    return []
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_artifact_by_entity_id(
+        self,
+        artifact_type: ArtifactType,
+        task_id: str | None = None,
+        step_id: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_run_block_id: str | None = None,
+        observer_thought_id: str | None = None,
+        observer_cruise_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> Artifact | None:
+        artifacts = await self.get_artifacts_by_entity_id(
+            artifact_type=artifact_type,
+            task_id=task_id,
+            step_id=step_id,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            observer_thought_id=observer_thought_id,
+            observer_cruise_id=observer_cruise_id,
+            organization_id=organization_id,
+        )
+        return artifacts[0] if artifacts else None
+
     async def get_artifact(
         self,
         task_id: str,
@@ -1183,6 +1317,7 @@ class AgentDB:
                 workflow_run.failure_reason = failure_reason
                 await session.commit()
                 await session.refresh(workflow_run)
+                await save_workflow_run_logs(workflow_run_id)
                 return convert_to_workflow_run(workflow_run)
             LOG.error(
                 "WorkflowRun not found, nothing to update",
@@ -1190,12 +1325,13 @@ class AgentDB:
             )
             return None
 
-    async def get_workflow_run(self, workflow_run_id: str) -> WorkflowRun | None:
+    async def get_workflow_run(self, workflow_run_id: str, organization_id: str | None = None) -> WorkflowRun | None:
         try:
             async with self.Session() as session:
-                if workflow_run := (
-                    await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
-                ).first():
+                get_workflow_run_query = select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id)
+                if organization_id:
+                    get_workflow_run_query = get_workflow_run_query.filter_by(organization_id=organization_id)
+                if workflow_run := (await session.scalars(get_workflow_run_query)).first():
                     return convert_to_workflow_run(workflow_run)
                 return None
         except SQLAlchemyError:
@@ -1775,6 +1911,22 @@ class AgentDB:
                 return ObserverCruise.model_validate(observer_cruise)
             return None
 
+    async def get_observer_cruise_by_workflow_run_id(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+    ) -> ObserverCruise | None:
+        async with self.Session() as session:
+            if observer_cruise := (
+                await session.scalars(
+                    select(ObserverCruiseModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_run_id=workflow_run_id)
+                )
+            ).first():
+                return ObserverCruise.model_validate(observer_cruise)
+            return None
+
     async def get_observer_thought(
         self, observer_thought_id: str, organization_id: str | None = None
     ) -> ObserverThought | None:
@@ -1788,6 +1940,24 @@ class AgentDB:
             ).first():
                 return ObserverThought.model_validate(observer_thought)
             return None
+
+    async def get_observer_thoughts(
+        self,
+        observer_cruise_id: str,
+        observer_thought_types: list[ObserverThoughtType] | None = None,
+        organization_id: str | None = None,
+    ) -> list[ObserverThought]:
+        async with self.Session() as session:
+            query = (
+                select(ObserverThoughtModel)
+                .filter_by(observer_cruise_id=observer_cruise_id)
+                .filter_by(organization_id=organization_id)
+                .order_by(ObserverThoughtModel.created_at)
+            )
+            if observer_thought_types:
+                query = query.filter(ObserverThoughtModel.observer_thought_type.in_(observer_thought_types))
+            observer_thoughts = (await session.scalars(query)).all()
+            return [ObserverThought.model_validate(thought) for thought in observer_thoughts]
 
     async def create_observer_cruise(
         self,
@@ -1823,6 +1993,9 @@ class AgentDB:
         observation: str | None = None,
         thought: str | None = None,
         answer: str | None = None,
+        observer_thought_scenario: str | None = None,
+        observer_thought_type: str = ObserverThoughtType.plan,
+        output: dict[str, Any] | None = None,
         organization_id: str | None = None,
     ) -> ObserverThought:
         async with self.Session() as session:
@@ -1836,12 +2009,58 @@ class AgentDB:
                 observation=observation,
                 thought=thought,
                 answer=answer,
+                observer_thought_scenario=observer_thought_scenario,
+                observer_thought_type=observer_thought_type,
+                output=output,
                 organization_id=organization_id,
             )
             session.add(new_observer_thought)
             await session.commit()
             await session.refresh(new_observer_thought)
             return ObserverThought.model_validate(new_observer_thought)
+
+    async def update_observer_thought(
+        self,
+        observer_thought_id: str,
+        workflow_run_block_id: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_id: str | None = None,
+        workflow_permanent_id: str | None = None,
+        observation: str | None = None,
+        thought: str | None = None,
+        answer: str | None = None,
+        output: dict[str, Any] | None = None,
+        organization_id: str | None = None,
+    ) -> ObserverThought:
+        async with self.Session() as session:
+            observer_thought = (
+                await session.scalars(
+                    select(ObserverThoughtModel)
+                    .filter_by(observer_thought_id=observer_thought_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if observer_thought:
+                if workflow_run_block_id:
+                    observer_thought.workflow_run_block_id = workflow_run_block_id
+                if workflow_run_id:
+                    observer_thought.workflow_run_id = workflow_run_id
+                if workflow_id:
+                    observer_thought.workflow_id = workflow_id
+                if workflow_permanent_id:
+                    observer_thought.workflow_permanent_id = workflow_permanent_id
+                if observation:
+                    observer_thought.observation = observation
+                if thought:
+                    observer_thought.thought = thought
+                if answer:
+                    observer_thought.answer = answer
+                if output:
+                    observer_thought.output = output
+                await session.commit()
+                await session.refresh(observer_thought)
+                return ObserverThought.model_validate(observer_thought)
+            raise NotFoundError(f"ObserverThought {observer_thought_id}")
 
     async def update_observer_cruise(
         self,
@@ -1879,3 +2098,141 @@ class AgentDB:
                 await session.refresh(observer_cruise)
                 return ObserverCruise.model_validate(observer_cruise)
             raise NotFoundError(f"ObserverCruise {observer_cruise_id} not found")
+
+    async def create_workflow_run_block(
+        self,
+        workflow_run_id: str,
+        parent_workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
+        task_id: str | None = None,
+        label: str | None = None,
+        block_type: BlockType | None = None,
+        status: BlockStatus = BlockStatus.running,
+        output: dict | list | str | None = None,
+        continue_on_failure: bool = False,
+    ) -> WorkflowRunBlock:
+        async with self.Session() as session:
+            new_workflow_run_block = WorkflowRunBlockModel(
+                workflow_run_id=workflow_run_id,
+                parent_workflow_run_block_id=parent_workflow_run_block_id,
+                organization_id=organization_id,
+                task_id=task_id,
+                label=label,
+                block_type=block_type,
+                status=status,
+                output=output,
+                continue_on_failure=continue_on_failure,
+            )
+            session.add(new_workflow_run_block)
+            await session.commit()
+            await session.refresh(new_workflow_run_block)
+
+        task = None
+        if task_id:
+            task = await self.get_task(task_id, organization_id=organization_id)
+        return convert_to_workflow_run_block(new_workflow_run_block, task=task)
+
+    async def update_workflow_run_block(
+        self,
+        workflow_run_block_id: str,
+        status: BlockStatus | None = None,
+        output: dict | list | str | None = None,
+        failure_reason: str | None = None,
+        task_id: str | None = None,
+        organization_id: str | None = None,
+        loop_values: list | None = None,
+        current_value: str | None = None,
+        current_index: int | None = None,
+        recipients: list[str] | None = None,
+        attachments: list[str] | None = None,
+        subject: str | None = None,
+        body: str | None = None,
+        prompt: str | None = None,
+        wait_sec: int | None = None,
+    ) -> WorkflowRunBlock:
+        async with self.Session() as session:
+            workflow_run_block = (
+                await session.scalars(
+                    select(WorkflowRunBlockModel)
+                    .filter_by(workflow_run_block_id=workflow_run_block_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if workflow_run_block:
+                if status:
+                    workflow_run_block.status = status
+                if output:
+                    workflow_run_block.output = output
+                if task_id:
+                    workflow_run_block.task_id = task_id
+                if failure_reason:
+                    workflow_run_block.failure_reason = failure_reason
+                if loop_values:
+                    workflow_run_block.loop_values = loop_values
+                if current_value:
+                    workflow_run_block.current_value = current_value
+                if current_index:
+                    workflow_run_block.current_index = current_index
+                if recipients:
+                    workflow_run_block.recipients = recipients
+                if attachments:
+                    workflow_run_block.attachments = attachments
+                if subject:
+                    workflow_run_block.subject = subject
+                if body:
+                    workflow_run_block.body = body
+                if prompt:
+                    workflow_run_block.prompt = prompt
+                if wait_sec:
+                    workflow_run_block.wait_sec = wait_sec
+                await session.commit()
+                await session.refresh(workflow_run_block)
+            else:
+                raise NotFoundError(f"WorkflowRunBlock {workflow_run_block_id} not found")
+        task = None
+        task_id = workflow_run_block.task_id
+        if task_id:
+            task = await self.get_task(task_id, organization_id=workflow_run_block.organization_id)
+        return convert_to_workflow_run_block(workflow_run_block, task=task)
+
+    async def get_workflow_run_block(
+        self,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+    ) -> WorkflowRunBlock:
+        async with self.Session() as session:
+            workflow_run_block = (
+                await session.scalars(
+                    select(WorkflowRunBlockModel)
+                    .filter_by(workflow_run_block_id=workflow_run_block_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if workflow_run_block:
+                task = None
+                task_id = workflow_run_block.task_id
+                if task_id:
+                    task = await self.get_task(task_id, organization_id=organization_id)
+                return convert_to_workflow_run_block(workflow_run_block, task=task)
+            raise NotFoundError(f"WorkflowRunBlock {workflow_run_block_id} not found")
+
+    async def get_workflow_run_blocks(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+    ) -> list[WorkflowRunBlock]:
+        async with self.Session() as session:
+            workflow_run_blocks = (
+                await session.scalars(
+                    select(WorkflowRunBlockModel)
+                    .filter_by(workflow_run_id=workflow_run_id)
+                    .filter_by(organization_id=organization_id)
+                    .order_by(WorkflowRunBlockModel.created_at)
+                )
+            ).all()
+            tasks = await self.get_tasks_by_workflow_run_id(workflow_run_id)
+            tasks_dict = {task.task_id: task for task in tasks}
+            return [
+                convert_to_workflow_run_block(workflow_run_block, task=tasks_dict.get(workflow_run_block.task_id))
+                for workflow_run_block in workflow_run_blocks
+            ]

@@ -27,7 +27,7 @@ export const baseHelpTooltipContent = {
 } as const;
 
 export const basePlaceholderContent = {
-  url: "https://",
+  url: "(optional) Navigate to this URL: https://...",
   navigationGoal: "Tell Skyvern what to do.",
   dataExtractionGoal: "What data do you need to extract?",
   maxRetries: "Default: 3",

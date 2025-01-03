@@ -664,7 +664,13 @@ async def handle_input_text_action(
             return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
         except Exception:
             LOG.warning("Failed to clear the input field", action=action, exc_info=True)
-            return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
+
+            # some <span> is supported to use `locator.press_sequentially()` to fill in the data
+            if skyvern_element.get_tag_name() != "span":
+                return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
+
+            await skyvern_element.press_fill(text=text)
+            return [ActionSuccess()]
 
     try:
         # TODO: not sure if this case will trigger auto-completion

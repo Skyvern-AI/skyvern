@@ -1,6 +1,7 @@
 import datetime
 import hashlib
 import uuid
+from enum import Enum
 from typing import Annotated, Any
 
 import structlog
@@ -35,6 +36,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.schemas.observers import CruiseRequest, ObserverCruise
 from skyvern.forge.sdk.schemas.organizations import (
     GetOrganizationAPIKeysResponse,
     GetOrganizationsResponse,
@@ -51,7 +53,8 @@ from skyvern.forge.sdk.schemas.tasks import (
     TaskResponse,
     TaskStatus,
 )
-from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline
+from skyvern.forge.sdk.services import observer_service, org_auth_service
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
@@ -307,7 +310,10 @@ async def cancel_workflow_run(
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> None:
-    workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=workflow_run_id)
+    workflow_run = await app.DATABASE.get_workflow_run(
+        workflow_run_id=workflow_run_id,
+        organization_id=current_org.organization_id,
+    )
     if not workflow_run:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -465,6 +471,84 @@ async def get_agent_task_steps(
     analytics.capture("skyvern-oss-agent-task-steps-get")
     steps = await app.DATABASE.get_task_steps(task_id, organization_id=current_org.organization_id)
     return ORJSONResponse([step.model_dump(exclude_none=True) for step in steps])
+
+
+class EntityType(str, Enum):
+    STEP = "step"
+    TASK = "task"
+    WORKFLOW_RUN = "workflow_run"
+    WORKFLOW_RUN_BLOCK = "workflow_run_block"
+    OBSERVER_THOUGHT = "observer_thought"
+
+
+entity_type_to_param = {
+    EntityType.STEP: "step_id",
+    EntityType.TASK: "task_id",
+    EntityType.WORKFLOW_RUN: "workflow_run_id",
+    EntityType.WORKFLOW_RUN_BLOCK: "workflow_run_block_id",
+    EntityType.OBSERVER_THOUGHT: "observer_thought_id",
+}
+
+
+@base_router.get(
+    "/{entity_type}/{entity_id}/artifacts",
+    tags=["agent"],
+    response_model=list[Artifact],
+)
+@base_router.get(
+    "/{entity_type}/{entity_id}/artifacts/",
+    tags=["agent"],
+    response_model=list[Artifact],
+    include_in_schema=False,
+)
+async def get_agent_entity_artifacts(
+    entity_type: EntityType,
+    entity_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Response:
+    """
+    Get all artifacts for an entity (step, task, workflow_run).
+
+    Args:
+        entity_type: Type of entity to fetch artifacts for
+        entity_id: ID of the entity
+        current_org: Current organization from auth
+
+    Returns:
+        List of artifacts for the entity
+
+    Raises:
+        HTTPException: If entity is not supported
+    """
+
+    if entity_type not in entity_type_to_param:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid entity_type: {entity_type}",
+        )
+
+    analytics.capture("skyvern-oss-agent-entity-artifacts-get")
+
+    params = {
+        "organization_id": current_org.organization_id,
+        entity_type_to_param[entity_type]: entity_id,
+    }
+
+    artifacts = await app.DATABASE.get_artifacts_by_entity_id(**params)  # type: ignore
+
+    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
+        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
+        if signed_urls:
+            for i, artifact in enumerate(artifacts):
+                artifact.signed_url = signed_urls[i]
+        else:
+            LOG.warning(
+                "Failed to get signed urls for artifacts",
+                entity_type=entity_type,
+                entity_id=entity_id,
+            )
+
+    return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
 
 @base_router.get(
@@ -636,11 +720,51 @@ async def get_workflow_run(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> WorkflowRunStatusResponse:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
-    return await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
+    workflow_run_status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
         workflow_permanent_id=workflow_id,
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
+        include_cost=True,
     )
+    observer_cruise = await app.DATABASE.get_observer_cruise_by_workflow_run_id(
+        workflow_run_id=workflow_run_id,
+        organization_id=current_org.organization_id,
+    )
+    if observer_cruise:
+        workflow_run_status_response.observer_cruise = observer_cruise
+    return workflow_run_status_response
+
+
+@base_router.get(
+    "/workflows/{workflow_id}/runs/{workflow_run_id}/timeline",
+)
+@base_router.get(
+    "/workflows/{workflow_id}/runs/{workflow_run_id}/timeline/",
+)
+async def get_workflow_run_timeline(
+    workflow_run_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> list[WorkflowRunTimeline]:
+    # get observer cruise by workflow run id
+    observer_cruise_obj = await app.DATABASE.get_observer_cruise_by_workflow_run_id(
+        workflow_run_id=workflow_run_id,
+        organization_id=current_org.organization_id,
+    )
+    # get all the workflow run blocks
+    workflow_run_block_timeline = await app.WORKFLOW_SERVICE.get_workflow_run_timeline(
+        workflow_run_id=workflow_run_id,
+        organization_id=current_org.organization_id,
+    )
+    if observer_cruise_obj and observer_cruise_obj.observer_cruise_id:
+        observer_thought_timeline = await observer_service.get_observer_thought_timelines(
+            observer_cruise_id=observer_cruise_obj.observer_cruise_id,
+            organization_id=current_org.organization_id,
+        )
+        workflow_run_block_timeline.extend(observer_thought_timeline)
+    workflow_run_block_timeline.sort(key=lambda x: x.created_at)
+    return workflow_run_block_timeline
 
 
 @base_router.get(
@@ -953,3 +1077,49 @@ async def upload_file(
         status_code=200,
         media_type="application/json",
     )
+
+
+@base_router.post("/cruise")
+@base_router.post("/cruise/", include_in_schema=False)
+async def observer_cruise(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    data: CruiseRequest,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+    x_max_iterations_override: Annotated[int | None, Header()] = None,
+) -> ObserverCruise:
+    if x_max_iterations_override:
+        LOG.info("Overriding max iterations for observer", max_iterations_override=x_max_iterations_override)
+
+    try:
+        observer_cruise = await observer_service.initialize_observer_cruise(
+            organization=organization,
+            user_prompt=data.user_prompt,
+            user_url=str(data.url) if data.url else None,
+        )
+    except LLMProviderError:
+        LOG.error("LLM failure to initialize observer cruise", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail="Skyvern LLM failure to initialize observer cruise. Please try again later."
+        )
+    analytics.capture("skyvern-oss-agent-observer-cruise", data={"url": observer_cruise.url})
+    await AsyncExecutorFactory.get_executor().execute_cruise(
+        request=request,
+        background_tasks=background_tasks,
+        organization_id=organization.organization_id,
+        observer_cruise_id=observer_cruise.observer_cruise_id,
+        max_iterations_override=x_max_iterations_override,
+    )
+    return observer_cruise
+
+
+@base_router.get("/cruise/{observer_cruise_id}")
+@base_router.get("/cruise/{observer_cruise_id}/", include_in_schema=False)
+async def get_observer_cruise(
+    observer_cruise_id: str,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> ObserverCruise:
+    observer_cruise = await observer_service.get_observer_cruise(observer_cruise_id, organization.organization_id)
+    if not observer_cruise:
+        raise HTTPException(status_code=404, detail=f"Observer cruise {observer_cruise_id} not found")
+    return observer_cruise

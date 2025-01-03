@@ -10,9 +10,11 @@ class SkyvernContext:
     task_id: str | None = None
     workflow_id: str | None = None
     workflow_run_id: str | None = None
+    observer_cruise_id: str | None = None
     max_steps_override: int | None = None
     tz_info: ZoneInfo | None = None
     totp_codes: dict[str, str | None] = field(default_factory=dict)
+    log: list[dict] = field(default_factory=list)
 
     def __repr__(self) -> str:
         return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, max_steps_override={self.max_steps_override})"
