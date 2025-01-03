@@ -392,6 +392,10 @@ def convert_to_workflow_run_block(
         loop_values=workflow_run_block_model.loop_values,
         current_value=workflow_run_block_model.current_value,
         current_index=workflow_run_block_model.current_index,
+        recipients=workflow_run_block_model.recipients,
+        attachments=workflow_run_block_model.attachments,
+        subject=workflow_run_block_model.subject,
+        body=workflow_run_block_model.body,
         created_at=workflow_run_block_model.created_at,
         modified_at=workflow_run_block_model.modified_at,
     )
