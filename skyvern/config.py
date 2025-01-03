@@ -83,7 +83,7 @@ class Settings(BaseSettings):
     # Bitwarden Configs #
     #####################
     BITWARDEN_TIMEOUT_SECONDS: int = 60
-    BITWARDEN_MAX_RETRIES: int = 1
+    BITWARDEN_MAX_RETRIES: int = 2
 
     # task generation settings
     PROMPT_CACHE_WINDOW_HOURS: int = 24
