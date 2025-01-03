@@ -382,6 +382,7 @@ def convert_to_workflow_run_block(
         workflow_run_id=workflow_run_block_model.workflow_run_id,
         organization_id=workflow_run_block_model.organization_id,
         parent_workflow_run_block_id=workflow_run_block_model.parent_workflow_run_block_id,
+        description=workflow_run_block_model.description,
         block_type=BlockType(workflow_run_block_model.block_type),
         label=workflow_run_block_model.label,
         status=BlockStatus(workflow_run_block_model.status),
