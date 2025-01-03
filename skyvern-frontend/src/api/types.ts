@@ -213,6 +213,7 @@ export type WorkflowRunStatusApiResponse = {
   downloaded_file_urls: Array<string> | null;
   total_steps: number | null;
   total_cost: number | null;
+  observer_cruise: ObserverCruise | null;
 };
 
 export type TaskGenerationApiResponse = {

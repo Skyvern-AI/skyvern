@@ -27,12 +27,17 @@ import {
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import fetchToCurl from "fetch-to-curl";
-import { Link, Outlet, useParams } from "react-router-dom";
+import { Link, Outlet, useParams, useSearchParams } from "react-router-dom";
 import { statusIsFinalized, statusIsRunningOrQueued } from "../tasks/types";
 import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "./hooks/useWorkflowRunQuery";
+import { WorkflowRunTimeline } from "./workflowRun/WorkflowRunTimeline";
+import { useWorkflowRunTimelineQuery } from "./hooks/useWorkflowRunTimelineQuery";
+import { findActiveItem } from "./workflowRun/workflowTimelineUtils";
 
 function WorkflowRun() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const active = searchParams.get("active");
   const { workflowRunId, workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
   const apiCredential = useApiCredential();
@@ -44,6 +49,8 @@ function WorkflowRun() {
 
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
     useWorkflowRunQuery();
+
+  const { data: workflowRunTimeline } = useWorkflowRunTimelineQuery();
 
   const cancelWorkflowMutation = useMutation({
     mutationFn: async () => {
@@ -78,7 +85,11 @@ function WorkflowRun() {
     workflowRun && statusIsRunningOrQueued(workflowRun);
 
   const workflowRunIsFinalized = workflowRun && statusIsFinalized(workflowRun);
-
+  const selection = findActiveItem(
+    workflowRunTimeline ?? [],
+    active,
+    !!workflowRunIsFinalized,
+  );
   const parameters = workflowRun?.parameters ?? {};
   const proxyLocation =
     workflowRun?.proxy_location ?? ProxyLocation.Residential;
@@ -107,6 +118,13 @@ function WorkflowRun() {
       <div className="text-sm">{workflowRun.failure_reason}</div>
     </div>
   ) : null;
+
+  function handleSetActiveItem(id: string) {
+    searchParams.set("active", id);
+    setSearchParams(searchParams, {
+      replace: true,
+    });
+  }
 
   return (
     <div className="space-y-8">
@@ -230,7 +248,28 @@ function WorkflowRun() {
           },
         ]}
       />
-      <Outlet />
+      <div className="flex h-[42rem] gap-6">
+        <div className="w-2/3">
+          <Outlet />
+        </div>
+        <div className="w-1/3">
+          <WorkflowRunTimeline
+            activeItem={selection}
+            onActionItemSelected={(item) => {
+              handleSetActiveItem(item.action.action_id);
+            }}
+            onBlockItemSelected={(item) => {
+              handleSetActiveItem(item.workflow_run_block_id);
+            }}
+            onLiveStreamSelected={() => {
+              handleSetActiveItem("stream");
+            }}
+            onObserverThoughtCardSelected={(item) => {
+              handleSetActiveItem(item.observer_thought_id);
+            }}
+          />
+        </div>
+      </div>
     </div>
   );
 }

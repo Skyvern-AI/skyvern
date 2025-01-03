@@ -1,14 +1,20 @@
+import { CubeIcon, ExternalLinkIcon } from "@radix-ui/react-icons";
+import { workflowBlockTitle } from "../editor/nodes/types";
+import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
 import {
-  isActionItem,
+  isAction,
   isWorkflowRunBlock,
   WorkflowRunBlock,
 } from "../types/workflowRunTypes";
 import { ActionCard } from "./ActionCard";
-import { BlockCard } from "./BlockCard";
 import {
   ActionItem,
   WorkflowRunOverviewActiveElement,
 } from "./WorkflowRunOverview";
+import { cn } from "@/util/utils";
+import { isTaskVariantBlock } from "../types/workflowTypes";
+import { Link } from "react-router-dom";
+import { useCallback } from "react";
 
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
@@ -27,19 +33,86 @@ function WorkflowRunTimelineBlockItem({
 }: Props) {
   const actions = block.actions ? [...block.actions].reverse() : [];
 
+  const hasActiveAction =
+    isAction(activeItem) &&
+    Boolean(
+      block.actions?.find(
+        (action) => action.action_id === activeItem.action_id,
+      ),
+    );
+  const isActiveBlock =
+    isWorkflowRunBlock(activeItem) &&
+    activeItem.workflow_run_block_id === block.workflow_run_block_id;
+
+  const showDiagnosticLink =
+    isTaskVariantBlock(block) && (hasActiveAction || isActiveBlock);
+
+  const refCallback = useCallback((element: HTMLDivElement | null) => {
+    if (
+      element &&
+      isWorkflowRunBlock(activeItem) &&
+      activeItem.workflow_run_block_id === block.workflow_run_block_id
+    ) {
+      element.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+    }
+    // this should only run once at mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
-    <div className="space-y-4 rounded border border-slate-600 p-4">
+    <div
+      className={cn(
+        "cursor-pointer space-y-4 rounded border border-slate-600 p-4",
+        {
+          "border-slate-50":
+            isWorkflowRunBlock(activeItem) &&
+            activeItem.workflow_run_block_id === block.workflow_run_block_id,
+        },
+      )}
+      onClick={(event) => {
+        event.stopPropagation();
+        onBlockItemClick(block);
+      }}
+      ref={refCallback}
+    >
+      <div className="flex justify-between">
+        <div className="flex gap-3">
+          <WorkflowBlockIcon
+            workflowBlockType={block.block_type}
+            className="size-6"
+          />
+          <span>{workflowBlockTitle[block.block_type]}</span>
+        </div>
+        <div className="flex items-center gap-1 rounded bg-slate-elevation5 px-2 py-1">
+          {showDiagnosticLink ? (
+            <Link to={`/tasks/${block.task_id}/diagnostics`}>
+              <div className="flex gap-1">
+                <ExternalLinkIcon className="size-4" />
+                <span className="text-xs">Diagnostics</span>
+              </div>
+            </Link>
+          ) : (
+            <>
+              <CubeIcon className="size-4" />
+              <span className="text-xs">Block</span>
+            </>
+          )}
+        </div>
+      </div>
       {actions.map((action, index) => {
         return (
           <ActionCard
             key={action.action_id}
             action={action}
             active={
-              isActionItem(activeItem) &&
-              activeItem.action.action_id === action.action_id
+              isAction(activeItem) && activeItem.action_id === action.action_id
             }
             index={actions.length - index}
-            onClick={() => {
+            onClick={(event) => {
+              event.stopPropagation();
               const actionItem: ActionItem = {
                 block,
                 action,
@@ -61,16 +134,6 @@ function WorkflowRunTimelineBlockItem({
           />
         );
       })}
-      <BlockCard
-        active={
-          isWorkflowRunBlock(activeItem) &&
-          activeItem.workflow_run_block_id === block.workflow_run_block_id
-        }
-        block={block}
-        onClick={() => {
-          onBlockItemClick(block);
-        }}
-      />
     </div>
   );
 }

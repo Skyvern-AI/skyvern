@@ -3,21 +3,33 @@ import { Separator } from "@/components/ui/separator";
 import { ActionTypePill } from "@/routes/tasks/detail/ActionTypePill";
 import { cn } from "@/util/utils";
 import { CheckCircledIcon, CrossCircledIcon } from "@radix-ui/react-icons";
+import { useCallback } from "react";
 
 type Props = {
   action: ActionsApiResponse;
   index: number;
   active: boolean;
-  onClick: () => void;
+  onClick: React.DOMAttributes<HTMLDivElement>["onClick"];
 };
 
 function ActionCard({ action, onClick, active, index }: Props) {
   const success = action.status === Status.Completed;
 
+  const refCallback = useCallback((element: HTMLDivElement | null) => {
+    if (element && active) {
+      element.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+    }
+    // this should only run once at mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
     <div
       className={cn(
-        "flex cursor-pointer rounded-lg border-2 bg-slate-elevation3 hover:border-slate-50",
+        "flex cursor-pointer rounded-lg border-2 border-transparent bg-slate-elevation3 hover:border-slate-50",
         {
           "border-l-destructive": !success,
           "border-l-success": success,
@@ -25,6 +37,7 @@ function ActionCard({ action, onClick, active, index }: Props) {
         },
       )}
       onClick={onClick}
+      ref={refCallback}
     >
       <div className="flex-1 space-y-2 p-4 pl-5">
         <div className="flex justify-between">

@@ -48,6 +48,13 @@ export type WorkflowRunBlock = {
   wait_sec?: number | null;
   created_at: string;
   modified_at: string;
+
+  // for loop block itself
+  loop_values: Array<unknown> | null;
+
+  // for blocks in loop
+  current_value: string | null;
+  current_index: number | null;
 };
 
 export type WorkflowRunTimelineBlockItem = {
