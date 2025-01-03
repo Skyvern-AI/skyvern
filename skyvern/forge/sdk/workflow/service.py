@@ -726,8 +726,8 @@ class WorkflowService:
 
         return [
             (output_parameter, workflow_run_output_parameter)
-            for output_parameter in output_parameters
             for workflow_run_output_parameter in workflow_run_output_parameters
+            for output_parameter in output_parameters
             if output_parameter.output_parameter_id == workflow_run_output_parameter.output_parameter_id
         ]
 
