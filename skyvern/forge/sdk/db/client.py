@@ -2132,6 +2132,17 @@ class AgentDB:
             task = await self.get_task(task_id, organization_id=organization_id)
         return convert_to_workflow_run_block(new_workflow_run_block, task=task)
 
+    async def delete_workflow_run_blocks(self, workflow_run_id: str, organization_id: str | None = None) -> None:
+        async with self.Session() as session:
+            stmt = delete(WorkflowRunBlockModel).where(
+                and_(
+                    WorkflowRunBlockModel.workflow_run_id == workflow_run_id,
+                    WorkflowRunBlockModel.organization_id == organization_id,
+                )
+            )
+            await session.execute(stmt)
+            await session.commit()
+
     async def update_workflow_run_block(
         self,
         workflow_run_block_id: str,
