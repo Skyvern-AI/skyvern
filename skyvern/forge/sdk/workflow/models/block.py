@@ -438,7 +438,7 @@ class BaseTaskBlock(Block):
                 task_order=task_order,
                 task_retry=task_retry,
             )
-            await app.DATABASE.update_workflow_run_block(
+            workflow_run_block = await app.DATABASE.update_workflow_run_block(
                 workflow_run_block_id=workflow_run_block_id,
                 task_id=task.task_id,
                 organization_id=workflow.organization_id,
@@ -455,6 +455,14 @@ class BaseTaskBlock(Block):
                     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                         workflow_run=workflow_run, url=self.url
                     )
+                    # add screenshot artifact for the first task
+                    screenshot = await browser_state.take_screenshot(full_page=True)
+                    if screenshot:
+                        await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
+                            workflow_run_block=workflow_run_block,
+                            artifact_type=ArtifactType.SCREENSHOT_LLM,
+                            data=screenshot,
+                        )
                 except Exception as e:
                     LOG.exception(
                         "Failed to get browser state for first task",
