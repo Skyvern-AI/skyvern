@@ -1688,7 +1688,7 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   );
   if (emptyLoopNodes.length > 0) {
     emptyLoopNodes.forEach((node) => {
-      errors.push(`${node.data.label}: Loop value parameter must be selected.`);
+      errors.push(`${node.data.label}: Loop value parameter is required.`);
     });
   }
 
