@@ -1691,11 +1691,11 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   // check loop node parameters
   const loopNodes: Array<LoopNode> = nodes.filter(isLoopNode);
   const emptyLoopNodes = loopNodes.filter(
-    (node: LoopNode) => node.data.loopValue === "",
+    (node: LoopNode) => node.data.loopVariableReference === "",
   );
   if (emptyLoopNodes.length > 0) {
     emptyLoopNodes.forEach((node) => {
-      errors.push(`${node.data.label}: Loop value parameter is required.`);
+      errors.push(`${node.data.label}: Loop value is required.`);
     });
   }
 
