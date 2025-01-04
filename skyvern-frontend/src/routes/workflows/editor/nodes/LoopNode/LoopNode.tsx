@@ -28,7 +28,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
     initialValue: data.label,
   });
   const [inputs, setInputs] = useState({
-    loopValue: data.loopValue,
+    loopVariableReference: data.loopVariableReference,
   });
   const deleteNodeCallback = useDeleteNodeCallback();
 
@@ -105,13 +105,13 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
               </div>
               <WorkflowBlockInput
                 nodeId={id}
-                value={inputs.loopValue}
+                value={inputs.loopVariableReference}
                 onChange={(value) => {
                   setInputs({
                     ...inputs,
-                    loopValue: value,
+                    loopVariableReference: value,
                   });
-                  updateNodeData(id, { loopValue: value });
+                  updateNodeData(id, { loopVariableReference: value });
                 }}
               />
             </div>

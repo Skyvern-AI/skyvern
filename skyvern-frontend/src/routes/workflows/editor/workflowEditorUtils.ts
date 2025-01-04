@@ -365,6 +365,10 @@ function convertToNode(
       };
     }
     case "for_loop": {
+      const loopVariableReference =
+        block.loop_variable_reference !== null
+          ? block.loop_variable_reference
+          : block.loop_over.key;
       return {
         ...identifiers,
         ...common,
@@ -372,6 +376,7 @@ function convertToNode(
         data: {
           ...commonData,
           loopValue: block.loop_over.key,
+          loopVariableReference: loopVariableReference,
         },
       };
     }
@@ -1073,6 +1078,7 @@ function getWorkflowBlocksUtil(
           continue_on_failure: node.data.continueOnFailure,
           loop_over_parameter_key: node.data.loopValue,
           loop_blocks: getOrderedChildrenBlocks(nodes, edges, node.id),
+          loop_variable_reference: node.data.loopVariableReference,
         },
       ];
     }
@@ -1570,6 +1576,7 @@ function convertBlocksToBlockYAML(
           block_type: "for_loop",
           loop_over_parameter_key: block.loop_over.key,
           loop_blocks: convertBlocksToBlockYAML(block.loop_blocks),
+          loop_variable_reference: block.loop_variable_reference,
         };
         return blockYaml;
       }

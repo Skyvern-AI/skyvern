@@ -250,4 +250,5 @@ export type ForLoopBlockYAML = BlockYAMLBase & {
   block_type: "for_loop";
   loop_over_parameter_key: string;
   loop_blocks: Array<BlockYAML>;
+  loop_variable_reference: string | null;
 };
