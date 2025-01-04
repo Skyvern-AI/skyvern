@@ -18,6 +18,7 @@ import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import type { LoopNode } from "./types";
+import { useState } from "react";
 
 function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const { updateNodeData } = useReactFlow();
@@ -25,6 +26,9 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const [label, setLabel] = useNodeLabelChangeHandler({
     id,
     initialValue: data.label,
+  });
+  const [inputs, setInputs] = useState({
+    loopValue: data.loopValue,
   });
   const deleteNodeCallback = useDeleteNodeCallback();
 
@@ -101,8 +105,12 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
               </div>
               <WorkflowBlockInput
                 nodeId={id}
-                value={data.loopValue}
+                value={inputs.loopValue}
                 onChange={(value) => {
+                  setInputs({
+                    ...inputs,
+                    loopValue: value,
+                  });
                   updateNodeData(id, { loopValue: value });
                 }}
               />
