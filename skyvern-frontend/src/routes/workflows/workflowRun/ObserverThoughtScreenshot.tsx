@@ -39,7 +39,8 @@ function ObserverThoughtScreenshot({ observerThoughtId, taskStatus }: Props) {
     (artifact) => artifact.artifact_type === ArtifactType.LLMScreenshot,
   );
 
-  const screenshot = llmScreenshots?.[0];
+  // use the last screenshot as the llmScreenshots are in reverse order
+  const screenshot = llmScreenshots?.[llmScreenshots.length - 1];
 
   if (isLoading) {
     return (
