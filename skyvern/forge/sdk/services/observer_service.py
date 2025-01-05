@@ -394,6 +394,7 @@ async def run_observer_cruise_helper(
             break
 
         block: BlockTypeVar | None = None
+        task_history_record: dict[str, Any] = {}
         if task_type == "extract":
             block, block_yaml_list, parameter_yaml_list = await _generate_extraction_task(
                 observer_cruise=observer_cruise,
@@ -405,7 +406,7 @@ async def run_observer_cruise_helper(
                 data_extraction_goal=plan,
                 task_history=task_history,
             )
-            task_history.append({"type": task_type, "task": plan})
+            task_history_record = {"type": task_type, "task": plan}
         elif task_type == "navigate":
             original_url = url if i == 0 else None
             block, block_yaml_list, parameter_yaml_list = await _generate_navigation_task(
@@ -415,7 +416,7 @@ async def run_observer_cruise_helper(
                 original_url=original_url,
                 navigation_goal=plan,
             )
-            task_history.append({"type": task_type, "task": plan})
+            task_history_record = {"type": task_type, "task": plan}
         elif task_type == "loop":
             try:
                 block, block_yaml_list, parameter_yaml_list, extraction_obj, inner_task = await _generate_loop_task(
@@ -428,14 +429,12 @@ async def run_observer_cruise_helper(
                     original_url=url,
                     scraped_page=scraped_page,
                 )
-                task_history.append(
-                    {
-                        "type": task_type,
-                        "task": plan,
-                        "loop_over_values": extraction_obj.loop_values,
-                        "task_inside_the_loop": inner_task,
-                    }
-                )
+                task_history_record = {
+                    "type": task_type,
+                    "task": plan,
+                    "loop_over_values": extraction_obj.loop_values,
+                    "task_inside_the_loop": inner_task,
+                }
             except Exception:
                 LOG.exception("Failed to generate loop task")
                 await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
@@ -453,6 +452,26 @@ async def run_observer_cruise_helper(
         # generate the extraction task
         block_result = await block.execute_safe(workflow_run_id=workflow_run_id, organization_id=organization_id)
 
+        if task_type == "extract":
+            if (
+                "extracted_information" in block_result.output_parameter_value
+                and block_result.output_parameter_value["extracted_information"]
+            ):
+                task_history_record["extracted_data"] = block_result.output_parameter_value["extracted_information"]
+        elif task_type == "loop":
+            # if loop task has data extraction, add it to the task history
+            if block_result.output_parameter_value:
+                loop_output_overall = []
+                for inner_loop_output in block_result.output_parameter_value:
+                    inner_loop_output_overall = []
+                    for inner_output in inner_loop_output:
+                        output_value = inner_output.get("output_value", {})
+                        if "extracted_information" in output_value and output_value["extracted_information"]:
+                            inner_loop_output_overall.append(output_value["extracted_information"])
+                    loop_output_overall.append(inner_loop_output_overall)
+                task_history_record["extracted_data"] = loop_output_overall
+
+        task_history.append(task_history_record)
         # refresh workflow
         yaml_blocks.extend(block_yaml_list)
         yaml_parameters.extend(parameter_yaml_list)
