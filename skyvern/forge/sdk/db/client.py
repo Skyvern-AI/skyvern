@@ -379,7 +379,7 @@ class AgentDB:
                     select(ActionModel)
                     .filter(ActionModel.organization_id == organization_id)
                     .filter(ActionModel.task_id.in_(task_ids))
-                    .order_by(ActionModel.created_at)
+                    .order_by(ActionModel.created_at.desc())
                 )
                 actions = (await session.scalars(query)).all()
                 return [Action.model_validate(action) for action in actions]
@@ -2241,7 +2241,7 @@ class AgentDB:
                     select(WorkflowRunBlockModel)
                     .filter_by(workflow_run_id=workflow_run_id)
                     .filter_by(organization_id=organization_id)
-                    .order_by(WorkflowRunBlockModel.created_at)
+                    .order_by(WorkflowRunBlockModel.created_at.desc())
                 )
             ).all()
             tasks = await self.get_tasks_by_workflow_run_id(workflow_run_id)
