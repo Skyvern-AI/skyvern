@@ -454,17 +454,38 @@ async def run_observer_cruise_helper(
 
         if task_type == "extract":
             if (
-                "extracted_information" in block_result.output_parameter_value
+                isinstance(block_result.output_parameter_value, dict)
+                and "extracted_information" in block_result.output_parameter_value
                 and block_result.output_parameter_value["extracted_information"]
             ):
                 task_history_record["extracted_data"] = block_result.output_parameter_value["extracted_information"]
         elif task_type == "loop":
             # if loop task has data extraction, add it to the task history
-            if block_result.output_parameter_value:
+            # WARNING: the assumption here is that the output_paremeter_value is a list of list of dicts
+            #          output_parameter_value data structure is not consistent across all the blocks
+            if block_result.output_parameter_value and isinstance(block_result.output_parameter_value, list):
                 loop_output_overall = []
                 for inner_loop_output in block_result.output_parameter_value:
                     inner_loop_output_overall = []
+                    if not isinstance(inner_loop_output, list):
+                        LOG.warning(
+                            "Inner loop output is not a list",
+                            inner_loop_output=inner_loop_output,
+                            observer_cruise_id=observer_cruise_id,
+                            workflow_run_id=workflow_run_id,
+                            workflow_run_block_id=block_result.workflow_run_block_id,
+                        )
+                        continue
                     for inner_output in inner_loop_output:
+                        if not isinstance(inner_output, dict):
+                            LOG.warning(
+                                "inner output is not a dict",
+                                inner_output=inner_output,
+                                observer_cruise_id=observer_cruise_id,
+                                workflow_run_id=workflow_run_id,
+                                workflow_run_block_id=block_result.workflow_run_block_id,
+                            )
+                            continue
                         output_value = inner_output.get("output_value", {})
                         if "extracted_information" in output_value and output_value["extracted_information"]:
                             inner_loop_output_overall.append(output_value["extracted_information"])
