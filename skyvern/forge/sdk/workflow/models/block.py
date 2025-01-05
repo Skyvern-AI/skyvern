@@ -458,9 +458,13 @@ class BaseTaskBlock(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context=workflow_run_context)
         except Exception as e:
+            failure_reason = f"Failed to format jinja template: {str(e)}"
+            await self.record_output_parameter_value(
+                workflow_run_context, workflow_run_id, {"failure_reason": failure_reason}
+            )
             return await self.build_block_result(
                 success=False,
-                failure_reason=f"Failed to format jinja template: {str(e)}",
+                failure_reason=failure_reason,
                 output_parameter_value=None,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
@@ -843,7 +847,9 @@ class ForLoopBlock(Block):
                     {
                         "loop_value": loop_over_value,
                         "output_parameter": block_output.output_parameter,
-                        "output_value": workflow_run_context.get_value(block_output.output_parameter.key),
+                        "output_value": workflow_run_context.get_value(block_output.output_parameter.key)
+                        if workflow_run_context.has_value(block_output.output_parameter.key)
+                        else None,
                     }
                 )
                 try:
