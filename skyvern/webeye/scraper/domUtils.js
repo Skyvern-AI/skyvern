@@ -555,7 +555,16 @@ function isInteractableInput(element) {
   return !isReadonlyElement(element) && type !== "hidden";
 }
 
-function isInteractable(element) {
+function isValidCSSSelector(selector) {
+  try {
+    document.querySelector(selector);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function isInteractable(element, hoverStylesMap) {
   if (element.shadowRoot) {
     return false;
   }
@@ -689,6 +698,17 @@ function isInteractable(element) {
     if (elementCursor === "pointer") {
       return true;
     }
+
+    // Check if element has hover styles that change cursor to pointer
+    // This is to handle the case where an element's cursor is "auto", but resolves to "pointer" on hover
+    if (elementCursor === "auto") {
+      for (const [selector, styles] of hoverStylesMap) {
+        if (element.matches(selector) && styles.cursor === "pointer") {
+          return true;
+        }
+      }
+    }
+
     // FIXME: hardcode to fix the bug about hover style now
     if (element.className.toString().includes("hover:cursor-pointer")) {
       return true;
@@ -1202,6 +1222,9 @@ function buildTreeFromBody(frame = "main.frame") {
 }
 
 function buildElementTree(starter = document.body, frame, full_tree = false) {
+  // Generate hover styles map at the start
+  const hoverStylesMap = getHoverStylesMap();
+
   var elements = [];
   var resultArray = [];
 
@@ -1232,7 +1255,7 @@ function buildElementTree(starter = document.body, frame, full_tree = false) {
     }
 
     // Check if the element is interactable
-    if (isInteractable(element)) {
+    if (isInteractable(element, hoverStylesMap)) {
       var elementObj = buildElementObject(frame, element, true);
       elements.push(elementObj);
       // If the element is interactable but has no interactable parent,
@@ -1884,6 +1907,90 @@ function scrollToElementTop(element) {
   });
 }
 
+/**
+ * Get all styles associated with :hover selectors
+ *
+ * Chrome doesn't allow you to compute these in run-time because hover is a protected attribute (from JS code)
+ *
+ * Instead of checking the hover state, we can look at the stylesheet and find all the :hover selectors
+ * and try to infer styles associated with them
+ *
+ * It's not 100% accurate, but it's a good start
+ *
+ * References:
+ * https://stackoverflow.com/questions/23040926/how-can-i-get-elementhover-style
+ * https://stackoverflow.com/questions/7013559/is-there-a-way-to-get-element-hover-style-while-the-element-not-in-hover-state
+ * https://stackoverflow.com/questions/17226676/how-to-simulate-a-mouseover-in-pure-javascript-that-activates-the-css-hover
+ */
+function getHoverStylesMap() {
+  const hoverMap = new Map();
+  const sheets = document.styleSheets;
+
+  try {
+    for (const sheet of sheets) {
+      try {
+        const rules = sheet.cssRules || sheet.rules;
+        for (const rule of rules) {
+          if (rule.type === 1 && rule.selectorText) {
+            // Split multiple selectors (e.g., "a:hover, button:hover")
+            const selectors = rule.selectorText.split(",").map((s) => s.trim());
+
+            for (const selector of selectors) {
+              // Check if this is a hover rule
+              if (selector.includes(":hover")) {
+                // Get all parts of the selector
+                const parts = selector.split(/\s*[>+~]\s*/);
+
+                // Get the main hoverable element (the one with :hover)
+                const hoverPart = parts.find((part) => part.includes(":hover"));
+                if (!hoverPart) continue;
+
+                // Get base selector without :hover
+                const baseSelector = hoverPart.replace(/:hover/g, "").trim();
+
+                // Skip invalid selectors
+                if (!isValidCSSSelector(baseSelector)) {
+                  continue;
+                }
+
+                // Get or create styles object for this selector
+                let styles = hoverMap.get(baseSelector) || {};
+
+                // Add all style properties
+                for (const prop of rule.style) {
+                  styles[prop] = rule.style[prop];
+                }
+
+                // If this is a nested selector (like :hover > .something)
+                // store it in a special format
+                if (parts.length > 1) {
+                  const fullSelector = selector;
+                  styles["__nested__"] = styles["__nested__"] || [];
+                  styles["__nested__"].push({
+                    selector: fullSelector,
+                    styles: Object.fromEntries(
+                      [...rule.style].map((prop) => [prop, rule.style[prop]]),
+                    ),
+                  });
+                }
+
+                hoverMap.set(baseSelector, styles);
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.warn("Could not access stylesheet:", e);
+        continue;
+      }
+    }
+  } catch (e) {
+    console.error("Error processing stylesheets:", e);
+  }
+
+  return hoverMap;
+}
+
 // Helper method for debugging
 function findNodeById(arr, targetId, path = []) {
   for (let i = 0; i < arr.length; i++) {
@@ -2109,3 +2216,24 @@ function getIncrementElements() {
 
   return [Array.from(idToElement.values()), cleanedTreeList];
 }
+
+/**
+
+// How to run the code:
+
+// Get all interactable elements and draw boxes
+buildElementsAndDrawBoundingBoxes();
+
+// Remove the boxes
+removeBoundingBoxes();
+
+// Get the element tree
+const [elements, tree] = buildTreeFromBody();
+console.log(elements); // All elements
+console.log(tree);     // Tree structure
+
+// Test if a specific element is interactable
+const element = document.querySelector('button');
+const hoverMap = getHoverStylesMap();
+console.log(isInteractable(element, hoverMap));
+ */
