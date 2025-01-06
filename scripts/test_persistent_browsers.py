@@ -27,7 +27,7 @@ def make_request(method: str, endpoint: str, data: Optional[dict[str, Any]] = No
         try:
             error_detail = e.response.json() if hasattr(e, "response") else str(e)
             print(f"Error details: {json.dumps(error_detail, indent=2)}")
-        except:
+        except json.JSONDecodeError:
             print(f"Raw error response: {e.response.text if hasattr(e, 'response') else str(e)}")
         raise
 

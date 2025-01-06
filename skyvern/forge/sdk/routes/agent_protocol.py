@@ -1198,6 +1198,7 @@ async def close_browser_sessions(
         media_type="application/json",
     )
 
+
 @base_router.post(
     "/browser_sessions/{session_id}/close",
 )
