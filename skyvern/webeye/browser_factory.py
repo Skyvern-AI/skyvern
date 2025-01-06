@@ -166,15 +166,21 @@ class BrowserContextFactory:
         har_dir = (
             f"{settings.HAR_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{BrowserContextFactory.get_subdir()}.har"
         )
+
+        browser_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disk-cache-size=1",
+            "--start-maximized",
+            "--kiosk-printing",
+        ]
+
+        if kwargs.get("cdp_port"):
+            browser_args.append(f"--remote-debugging-port={kwargs.get('cdp_port')}")
+
         args = {
             "locale": settings.BROWSER_LOCALE,
             "color_scheme": "no-preference",
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--disk-cache-size=1",
-                "--start-maximized",
-                "--kiosk-printing",
-            ],
+            "args": browser_args,
             "ignore_default_args": [
                 "--enable-automation",
             ],
@@ -185,9 +191,6 @@ class BrowserContextFactory:
                 "height": settings.BROWSER_HEIGHT,
             },
         }
-
-        if kwargs.get("cdp_port"):
-            args["args"].append(f"--remote-debugging-port={kwargs.get('cdp_port')}")
 
         if proxy_location:
             if tz_info := get_tzinfo_from_proxy(proxy_location=proxy_location):
@@ -299,8 +302,14 @@ async def _create_headless_chromium(
         user_data_dir=user_data_dir,
         download_dir=download_dir,
     )
+    optional_args = {}
     cdp_port = kwargs.get("cdp_port")
-    browser_args = BrowserContextFactory.build_browser_args(proxy_location=proxy_location, cdp_port=cdp_port)
+    if cdp_port:
+        optional_args["cdp_port"] = cdp_port
+    browser_args = BrowserContextFactory.build_browser_args(
+        proxy_location=proxy_location,
+        **optional_args,
+    )
     browser_args.update(
         {
             "user_data_dir": user_data_dir,
@@ -322,8 +331,11 @@ async def _create_headful_chromium(
         user_data_dir=user_data_dir,
         download_dir=download_dir,
     )
+    optional_args = {}
     cdp_port = kwargs.get("cdp_port")
-    browser_args = BrowserContextFactory.build_browser_args(proxy_location=proxy_location, cdp_port=cdp_port)
+    if cdp_port:
+        optional_args["cdp_port"] = cdp_port
+    browser_args = BrowserContextFactory.build_browser_args(proxy_location=proxy_location, **optional_args)
     browser_args.update(
         {
             "user_data_dir": user_data_dir,
