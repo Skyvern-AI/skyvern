@@ -30,9 +30,13 @@ def make_request(
         response.raise_for_status()
         return response
     except requests.exceptions.RequestException as e:
-        print(f"Error making request: {str(e)}")
-        if hasattr(e.response, 'text'):
-            print(f"Response text: {e.response.text}")
+        print(f"\nRequest failed: {method} {url}")
+        print(f"Status code: {e.response.status_code if hasattr(e, 'response') else 'N/A'}")
+        try:
+            error_detail = e.response.json() if hasattr(e, 'response') else str(e)
+            print(f"Error details: {json.dumps(error_detail, indent=2)}")
+        except:
+            print(f"Raw error response: {e.response.text if hasattr(e, 'response') else str(e)}")
         raise
 
 def list_sessions():
@@ -41,11 +45,17 @@ def list_sessions():
         response = make_request("GET", "/browser_sessions")
         sessions = response.json()
         print("\nActive browser sessions:")
+        if not sessions:
+            print("  No active sessions found")
+            return
         for session in sessions:
-            print(f"  ID: {session['browser_session_id']}")
-            print(f"  Status: {session['status']}")
-            print(f"  Created at: {session['created_at']}")
-            print("  ---")
+            try:
+                # print all fields
+                print(json.dumps(session, indent=2))
+                print("  ---")
+            except Exception as e:
+                print(f"  Error parsing session data: {session}")
+                print(f"  Error: {str(e)}")
     except Exception as e:
         print(f"Error listing sessions: {str(e)}")
 
@@ -55,9 +65,14 @@ def create_session():
         response = make_request("POST", "/browser_sessions")
         session = response.json()
         print("\nCreated new browser session:")
-        print(f"  ID: {session['browser_session_id']}")
-        print(f"  Status: {session['status']}")
-        return session['browser_session_id']
+        try:
+            print(f"  ID: {session.get('browser_session_id', 'N/A')}")
+            print(f"  Status: {session.get('status', 'N/A')}")
+            print(f"Full response: {json.dumps(session, indent=2)}")
+            return session.get('browser_session_id')
+        except Exception as e:
+            print(f"Error parsing response: {session}")
+            print(f"Error: {str(e)}")
     except Exception as e:
         print(f"Error creating session: {str(e)}")
 
