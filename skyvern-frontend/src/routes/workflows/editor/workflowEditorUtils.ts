@@ -1574,7 +1574,7 @@ function convertBlocksToBlockYAML(
         const blockYaml: ForLoopBlockYAML = {
           ...base,
           block_type: "for_loop",
-          loop_over_parameter_key: block.loop_over.key,
+          loop_over_parameter_key: block.loop_over?.key ?? "",
           loop_blocks: convertBlocksToBlockYAML(block.loop_blocks),
           loop_variable_reference: block.loop_variable_reference,
         };
