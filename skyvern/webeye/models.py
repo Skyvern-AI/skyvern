@@ -15,7 +15,7 @@ class BrowserSessionResponse(BaseModel):
     deleted_at: datetime | None
 
     @classmethod
-    def from_browser_session(cls, browser_session: PersistentBrowserSession):
+    def from_browser_session(cls, browser_session: PersistentBrowserSession) -> "BrowserSessionResponse":
         return cls(
             session_id=browser_session.persistent_browser_session_id,
             organization_id=browser_session.organization_id,
