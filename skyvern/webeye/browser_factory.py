@@ -215,7 +215,7 @@ class BrowserContextFactory:
     async def create_browser_context(
         cls, playwright: Playwright, **kwargs: Any
     ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
-        browser_type = settings.BROWSER_TYPE
+        browser_type = kwargs.get("browser_type", settings.BROWSER_TYPE)
         browser_context: BrowserContext | None = None
         try:
             creator = cls._creators.get(browser_type)
