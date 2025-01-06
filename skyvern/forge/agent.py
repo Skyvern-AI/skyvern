@@ -572,7 +572,7 @@ class ForgeAgent:
 
             failure_reason = "unexpected exception"
             if isinstance(e, SkyvernException):
-                failure_reason = f"unexpected SkyvernException({e.__class__.__name__})"
+                failure_reason = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
 
             is_task_marked_as_failed = await self.fail_task(task, step, failure_reason)
             if is_task_marked_as_failed:
