@@ -368,14 +368,14 @@ function convertToNode(
       const loopVariableReference =
         block.loop_variable_reference !== null
           ? block.loop_variable_reference
-          : block.loop_over.key;
+          : block.loop_over?.key ?? "";
       return {
         ...identifiers,
         ...common,
         type: "loop",
         data: {
           ...commonData,
-          loopValue: block.loop_over.key,
+          loopValue: block.loop_over?.key ?? "",
           loopVariableReference: loopVariableReference,
         },
       };
