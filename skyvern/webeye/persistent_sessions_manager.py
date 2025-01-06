@@ -86,7 +86,7 @@ class PersistentSessionsManager:
             cdp_port=cdp_port,
         )
 
-        async def on_context_close():
+        async def on_context_close() -> None:
             await self.close_session(organization_id, session_id)
 
         browser_context.on("close", lambda: asyncio.create_task(on_context_close()))

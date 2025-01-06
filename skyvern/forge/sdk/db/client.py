@@ -2281,8 +2281,8 @@ class AgentDB:
     async def create_persistent_browser_session(
         self,
         organization_id: str,
-        runnable_type: str,
-        runnable_id: str,
+        runnable_type: str | None = None,
+        runnable_id: str | None = None,
     ) -> PersistentBrowserSessionModel:
         """Create a new persistent browser session."""
         async with self.Session() as session:

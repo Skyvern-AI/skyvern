@@ -1144,6 +1144,8 @@ async def get_browser_session_by_id(
         browser_session_id,
         current_org.organization_id,
     )
+    if not browser_session:
+        raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
     return BrowserSessionResponse.from_browser_session(browser_session)
 
 
