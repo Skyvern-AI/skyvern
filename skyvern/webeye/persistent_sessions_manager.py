@@ -11,6 +11,7 @@ from playwright.async_api import async_playwright
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.webeye.browser_factory import BrowserContextFactory, BrowserState
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 
 LOG = structlog.get_logger()
 
@@ -35,8 +36,8 @@ class PersistentSessionsManager:
             cls.instance.database = database
         return cls.instance
 
-    async def get_active_sessions(self, organization_id: str) -> List[str]:
-        """Get all active session IDs for an organization."""
+    async def get_active_sessions(self, organization_id: str) -> List[PersistentBrowserSession]:
+        """Get all active sessions for an organization."""
         return await self.database.get_active_persistent_browser_sessions(organization_id)
 
     def get_browser_state(self, session_id: str) -> Optional[BrowserState]:
@@ -44,7 +45,7 @@ class PersistentSessionsManager:
         browser_session = self._browser_sessions.get(session_id)
         return browser_session.browser_state if browser_session else None
 
-    async def get_session(self, session_id: str, organization_id: str) -> Optional[BrowserState]:
+    async def get_session(self, session_id: str, organization_id: str) -> Optional[PersistentBrowserSession]:
         """Get a specific browser session by session ID."""
         return await self.database.get_persistent_browser_session(session_id, organization_id)
 
@@ -55,7 +56,7 @@ class PersistentSessionsManager:
         url: str | None = None,
         runnable_id: str | None = None,
         runnable_type: str | None = None,
-    ) -> Tuple[str, BrowserState]:
+    ) -> Tuple[PersistentBrowserSession, BrowserState]:
         """Create a new browser session for an organization and return its ID with the browser state."""
         
         LOG.info(
