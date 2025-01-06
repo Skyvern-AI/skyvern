@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import datetime
 from typing import Dict, List, Optional, Tuple
 import asyncio
+import socket
 
 import structlog
 from playwright.async_api import async_playwright
@@ -60,6 +60,13 @@ class PersistentSessionsManager:
             runnable_id=runnable_id,
         )
         print("---", browser_session)
+
+        cdp_port = None
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('', 0))
+            cdp_port = s.getsockname()[1]
+
         session_id = browser_session.persistent_browser_session_id
 
         pw = await async_playwright().start()
@@ -68,6 +75,7 @@ class PersistentSessionsManager:
             proxy_location=proxy_location,
             url=url,
             organization_id=organization_id,
+            cdp_port=cdp_port,
         )
 
         async def on_context_close():

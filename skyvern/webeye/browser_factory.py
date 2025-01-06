@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
 import aiofiles
+import json
 import structlog
 from playwright.async_api import BrowserContext, ConsoleMessage, Download, Error, Page, Playwright
 from pydantic import BaseModel, PrivateAttr
@@ -161,7 +162,7 @@ class BrowserContextFactory:
             f.write(preference_file_content)
 
     @staticmethod
-    def build_browser_args(proxy_location: ProxyLocation | None = None) -> dict[str, Any]:
+    def build_browser_args(proxy_location: ProxyLocation | None = None, **kwargs: dict) -> dict[str, Any]:
         video_dir = f"{settings.VIDEO_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}"
         har_dir = (
             f"{settings.HAR_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{BrowserContextFactory.get_subdir()}.har"
@@ -185,6 +186,12 @@ class BrowserContextFactory:
                 "height": settings.BROWSER_HEIGHT,
             },
         }
+
+        if kwargs.get("cdp_port"):
+            args["args"].append(f"--remote-debugging-port={kwargs.get('cdp_port')}")
+
+        # pretty print args
+        print(json.dumps(args, indent=2))
 
         if proxy_location:
             if tz_info := get_tzinfo_from_proxy(proxy_location=proxy_location):
@@ -215,7 +222,7 @@ class BrowserContextFactory:
     async def create_browser_context(
         cls, playwright: Playwright, **kwargs: Any
     ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
-        browser_type = kwargs.get("browser_type", settings.BROWSER_TYPE)
+        browser_type = settings.BROWSER_TYPE
         browser_context: BrowserContext | None = None
         try:
             creator = cls._creators.get(browser_type)
@@ -296,7 +303,8 @@ async def _create_headless_chromium(
         user_data_dir=user_data_dir,
         download_dir=download_dir,
     )
-    browser_args = BrowserContextFactory.build_browser_args(proxy_location=proxy_location)
+    cdp_port = kwargs.get("cdp_port")
+    browser_args = BrowserContextFactory.build_browser_args(proxy_location=proxy_location, cdp_port=cdp_port)
     browser_args.update(
         {
             "user_data_dir": user_data_dir,
@@ -318,7 +326,8 @@ async def _create_headful_chromium(
         user_data_dir=user_data_dir,
         download_dir=download_dir,
     )
-    browser_args = BrowserContextFactory.build_browser_args(proxy_location=proxy_location)
+    cdp_port = kwargs.get("cdp_port")
+    browser_args = BrowserContextFactory.build_browser_args(proxy_location=proxy_location, cdp_port=cdp_port)
     browser_args.update(
         {
             "user_data_dir": user_data_dir,
@@ -333,7 +342,6 @@ async def _create_headful_chromium(
 
 BrowserContextFactory.register_type("chromium-headless", _create_headless_chromium)
 BrowserContextFactory.register_type("chromium-headful", _create_headful_chromium)
-
 
 class BrowserState:
     instance = None
