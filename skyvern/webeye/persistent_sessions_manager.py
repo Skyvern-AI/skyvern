@@ -152,8 +152,8 @@ class PersistentSessionsManager:
                 organization_id=organization_id,
                 session_id=session_id,
             )
-            await browser_session.browser_state.close()
             self._browser_sessions.pop(session_id, None)
+            await browser_session.browser_state.close()
         else:
             LOG.info(
                 "Browser session not found in memory, marking as deleted in database",

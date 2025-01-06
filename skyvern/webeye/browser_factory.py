@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import time
 import uuid
@@ -189,9 +188,6 @@ class BrowserContextFactory:
 
         if kwargs.get("cdp_port"):
             args["args"].append(f"--remote-debugging-port={kwargs.get('cdp_port')}")
-
-        # pretty print args
-        print(json.dumps(args, indent=2))
 
         if proxy_location:
             if tz_info := get_tzinfo_from_proxy(proxy_location=proxy_location):
