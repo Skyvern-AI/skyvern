@@ -153,9 +153,14 @@ class PersistentSessionsManager:
                 session_id=session_id,
             )
             await browser_session.browser_state.close()
-            del self._browser_sessions[session_id]
+            self._browser_sessions.pop(session_id, None)
+        else:
+            LOG.info(
+                "Browser session not found in memory, marking as deleted in database",
+                organization_id=organization_id,
+                session_id=session_id,
+            )
 
-        # Mark as deleted in database
         await self.database.mark_persistent_browser_session_deleted(session_id, organization_id)
 
     async def close_all_sessions(self, organization_id: str) -> None:
