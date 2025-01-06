@@ -1194,10 +1194,11 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
         ...node,
         data: {
           ...node.data,
-          loopValue:
-            node.data.loopValue === getOutputParameterKey(oldLabel)
+          label: node.id === id ? newLabel : node.data.label,
+          loopVariableReference:
+            node.data.loopVariableReference === getOutputParameterKey(oldLabel)
               ? getOutputParameterKey(newLabel)
-              : node.data.loopValue,
+              : node.data.loopVariableReference,
         },
       };
     }
