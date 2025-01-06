@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 import asyncio
 import socket
+from dataclasses import dataclass
 
 import structlog
 from playwright.async_api import async_playwright
@@ -14,9 +15,16 @@ from skyvern.webeye.browser_factory import BrowserContextFactory, BrowserState
 LOG = structlog.get_logger()
 
 
+@dataclass
+class BrowserSession:
+    browser_state: BrowserState
+    cdp_port: int
+    cdp_host: str = "localhost"
+
+
 class PersistentSessionsManager:
     instance = None
-    _browser_states: Dict[str, BrowserState] = dict()
+    _browser_sessions: Dict[str, BrowserSession] = dict()
 
     def __init__(self, database: AgentDB):
         self.database = database
@@ -32,8 +40,9 @@ class PersistentSessionsManager:
         return await self.database.get_active_persistent_browser_sessions(organization_id)
 
     def get_browser_state(self, session_id: str) -> Optional[BrowserState]:
-        """Get a specific browser session by session ID."""
-        return self._browser_states.get(session_id)
+        """Get a specific browser session's state by session ID."""
+        browser_session = self._browser_sessions.get(session_id)
+        return browser_session.browser_state if browser_session else None
 
     async def get_session(self, session_id: str, organization_id: str) -> Optional[BrowserState]:
         """Get a specific browser session by session ID."""
@@ -54,20 +63,18 @@ class PersistentSessionsManager:
             organization_id=organization_id,
         )
         
-        browser_session = await self.database.create_persistent_browser_session(
+        browser_session_db = await self.database.create_persistent_browser_session(
             organization_id=organization_id,
             runnable_type=runnable_type,
             runnable_id=runnable_id,
         )
-        print("---", browser_session)
 
         cdp_port = None
-
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(('', 0))
             cdp_port = s.getsockname()[1]
 
-        session_id = browser_session.persistent_browser_session_id
+        session_id = browser_session_db.persistent_browser_session_id
 
         pw = await async_playwright().start()
         browser_context, browser_artifacts, browser_cleanup = await BrowserContextFactory.create_browser_context(
@@ -91,7 +98,17 @@ class PersistentSessionsManager:
             browser_cleanup=browser_cleanup,
         )
 
-        self._browser_states[session_id] = browser_state
+        browser_session = BrowserSession(
+            browser_state=browser_state,
+            cdp_port=cdp_port,
+        )
+        LOG.info(
+            "Created new browser session",
+            session_id=session_id,
+            cdp_port=cdp_port,
+            cdp_host="localhost",
+        )
+        self._browser_sessions[session_id] = browser_session
 
         if url:
             await browser_state.get_or_create_page(
@@ -100,7 +117,7 @@ class PersistentSessionsManager:
                 organization_id=organization_id,
             )
 
-        return browser_session, browser_state
+        return browser_session_db, browser_state
 
     async def occupy_browser_session(
         self,
@@ -112,11 +129,14 @@ class PersistentSessionsManager:
         await self.database.occupy_persistent_browser_session(session_id, runnable_type, runnable_id)
 
 
-    async def get_network_info(self, session_id: str) -> None:
+    async def get_network_info(self, session_id: str) -> Tuple[Optional[int], Optional[str]]:
         """Returns cdp port and ip address of the browser session"""
-        browser_state = self.get_browser_state(session_id)
-        if browser_state:
-            return browser_state.browser_artifacts.cdp_port, browser_state.browser_artifacts.ip_address
+        browser_session = self._browser_sessions.get(session_id)
+        if browser_session:
+            return (
+                browser_session.cdp_port,
+                browser_session.cdp_host,
+            )
         return None, None
 
 
@@ -127,16 +147,17 @@ class PersistentSessionsManager:
 
     async def close_session(self, organization_id: str, session_id: str) -> None:
         """Close a specific browser session."""
-        browser_state = self.get_browser_state(session_id)
-        if browser_state:
+        browser_session = self._browser_sessions.get(session_id)
+        if browser_session:
             LOG.info(
                 "Closing browser session",
                 organization_id=organization_id,
                 session_id=session_id,
             )
-            await browser_state.close()
+            await browser_session.browser_state.close()
+            del self._browser_sessions[session_id]
 
-            # Mark as deleted in database
+        # Mark as deleted in database
         await self.database.mark_persistent_browser_session_deleted(session_id, organization_id)
 
     async def close_all_sessions(self, organization_id: str) -> None:
