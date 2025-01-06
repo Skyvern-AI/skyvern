@@ -147,12 +147,23 @@ async def handle_direct_command(cmd: str, args: list[str]):
         print("Type 'help_direct' for available direct commands")
 
 
+def close_session(session_id: str):
+    """Close a specific browser session"""
+    try:
+        response = make_request("POST", f"/browser_sessions/{session_id}/close")
+        print("\nClosed browser session:")
+        print(f"Response: {response.json()}")
+    except Exception as e:
+        print(f"Error closing session: {str(e)}")
+
+
 def print_help():
     """Print available commands"""
     print("\nHTTP API Commands:")
     print("  list - List all active browser sessions")
     print("  create - Create a new browser session")
     print("  get <session_id> - Get details of a specific session")
+    print("  close <session_id> - Close a specific session")
     print("  close_all - Close all active browser sessions")
     print("  help - Show this help message")
     print("\nDirect Method Commands:")
@@ -193,6 +204,11 @@ async def main():
                     print("Error: session_id required")
                     continue
                 get_session(args[0])
+            elif cmd == "close":
+                if not args:
+                    print("Error: session_id required")
+                    continue
+                close_session(args[0])
             elif cmd == "close_all":
                 close_all_sessions()
             else:

@@ -1197,3 +1197,21 @@ async def close_browser_sessions(
         status_code=200,
         media_type="application/json",
     )
+
+@base_router.post(
+    "/browser_sessions/{session_id}/close",
+)
+@base_router.post(
+    "/browser_sessions/{session_id}/close/",
+    include_in_schema=False,
+)
+async def close_browser_session(
+    session_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ORJSONResponse:
+    await app.PERSISTENT_SESSIONS_MANAGER.close_session(current_org.organization_id, session_id)
+    return ORJSONResponse(
+        content={"message": "Browser session closed"},
+        status_code=200,
+        media_type="application/json",
+    )
