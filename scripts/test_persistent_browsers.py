@@ -23,16 +23,20 @@ def make_request(method: str, endpoint: str, data: Optional[dict[str, Any]] = No
         return response
     except requests.exceptions.RequestException as e:
         print(f"\nRequest failed: {method} {url}")
-        print(f"Status code: {e.response.status_code if hasattr(e, 'response') else 'N/A'}")
-        try:
-            error_detail = e.response.json() if hasattr(e, "response") else str(e)
-            print(f"Error details: {json.dumps(error_detail, indent=2)}")
-        except json.JSONDecodeError:
-            print(f"Raw error response: {e.response.text if hasattr(e, 'response') else str(e)}")
+        if hasattr(e, "response") and e.response is not None:
+            print(f"Status code: {e.response.status_code}")
+            try:
+                error_detail = e.response.json() if e.response is not None else str(e)
+                print(f"Error details: {json.dumps(error_detail, indent=2)}")
+            except json.JSONDecodeError:
+                print(f"Raw error response: {e.response.text}")
+        else:
+            print("Status code: N/A")
+            print(f"Error details: {str(e)}")
         raise
 
 
-def list_sessions():
+def list_sessions() -> None:
     """List all active browser sessions"""
     try:
         response = make_request("GET", "/browser_sessions")
@@ -43,7 +47,6 @@ def list_sessions():
             return
         for session in sessions:
             try:
-                # print all fields
                 print(json.dumps(session, indent=2))
                 print("  ---")
             except Exception as e:
@@ -53,7 +56,7 @@ def list_sessions():
         print(f"Error listing sessions: {str(e)}")
 
 
-def create_session():
+def create_session() -> Optional[str]:
     """Create a new browser session"""
     try:
         response = make_request("POST", "/browser_sessions")
@@ -67,11 +70,13 @@ def create_session():
         except Exception as e:
             print(f"Error parsing response: {session}")
             print(f"Error: {str(e)}")
+            return None
     except Exception as e:
         print(f"Error creating session: {str(e)}")
+        return None
 
 
-def get_session(session_id: str):
+def get_session(session_id: str) -> None:
     """Get details of a specific browser session"""
     try:
         response = make_request("GET", f"/browser_sessions/{session_id}")
@@ -82,7 +87,7 @@ def get_session(session_id: str):
         print(f"Error getting session: {str(e)}")
 
 
-def close_all_sessions():
+def close_all_sessions() -> None:
     """Close all active browser sessions"""
     try:
         response = make_request("POST", "/browser_sessions/close")
@@ -92,7 +97,7 @@ def close_all_sessions():
         print(f"Error closing sessions: {str(e)}")
 
 
-async def direct_get_network_info(session_id: str):
+async def direct_get_network_info(session_id: str) -> None:
     """Get network info directly from PersistentSessionsManager"""
     try:
         manager = app.PERSISTENT_SESSIONS_MANAGER
@@ -104,7 +109,7 @@ async def direct_get_network_info(session_id: str):
         print(f"Error getting network info: {str(e)}")
 
 
-async def direct_list_sessions(organization_id: str):
+async def direct_list_sessions(organization_id: str) -> None:
     """List sessions directly from PersistentSessionsManager"""
     try:
         manager = app.PERSISTENT_SESSIONS_MANAGER
@@ -120,7 +125,7 @@ async def direct_list_sessions(organization_id: str):
         print(f"Error listing sessions directly: {str(e)}")
 
 
-def print_direct_help():
+def print_direct_help() -> None:
     """Print available direct commands"""
     print("\nAvailable direct commands:")
     print("  direct_list <org_id> - List all active browser sessions directly")
@@ -128,7 +133,7 @@ def print_direct_help():
     print("  help_direct - Show this help message")
 
 
-async def handle_direct_command(cmd: str, args: list[str]):
+async def handle_direct_command(cmd: str, args: list[str]) -> None:
     """Handle direct method calls"""
     if cmd == "help_direct":
         print_direct_help()
@@ -147,7 +152,7 @@ async def handle_direct_command(cmd: str, args: list[str]):
         print("Type 'help_direct' for available direct commands")
 
 
-def close_session(session_id: str):
+def close_session(session_id: str) -> None:
     """Close a specific browser session"""
     try:
         response = make_request("POST", f"/browser_sessions/{session_id}/close")
@@ -157,7 +162,7 @@ def close_session(session_id: str):
         print(f"Error closing session: {str(e)}")
 
 
-def print_help():
+def print_help() -> None:
     """Print available commands"""
     print("\nHTTP API Commands:")
     print("  list - List all active browser sessions")
@@ -174,7 +179,7 @@ def print_help():
     print("  exit - Exit the program")
 
 
-async def main():
+async def main() -> None:
     print("Browser Sessions Testing CLI")
     print("Type 'help' for available commands")
 
