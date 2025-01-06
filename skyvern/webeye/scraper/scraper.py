@@ -13,6 +13,7 @@ from skyvern.config import settings
 from skyvern.constants import BUILDING_ELEMENT_TREE_TIMEOUT_MS, SKYVERN_DIR, SKYVERN_ID_ATTR
 from skyvern.exceptions import FailedToTakeScreenshot, UnknownElementTreeFormat
 from skyvern.forge.sdk.api.crypto import calculate_sha256
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -96,7 +97,20 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
     if element.get("isDropped", False):
         return ""
 
+    tag = element["tagName"]
     attributes: dict[str, Any] = copy.deepcopy(element.get("attributes", {}))
+
+    context = skyvern_context.ensure_context()
+
+    # FIXME: Theoretically, all href links with over 69(64+1+4) length could be hashed
+    # but currently, just hash length>300 links to confirm the solution goes well
+    if "href" in attributes and len(attributes.get("href", "")) > 300:
+        href = attributes.get("href", "")
+        # jinja style can't accept the variable name starts with number
+        # adding "_" to make sure the variable name is valid.
+        hashed_href = "_" + calculate_sha256(href)
+        context.hashed_href_map[hashed_href] = href
+        attributes["href"] = "{{" + hashed_href + "}}"
 
     if need_skyvern_attrs:
         # adding the node attribute to attributes
@@ -108,13 +122,14 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
 
     attributes_html = " ".join(build_attribute(key, value) for key, value in attributes.items())
 
-    tag = element["tagName"]
     if element.get("isSelectable", False):
         tag = "select"
 
     text = element.get("text", "")
     # build children HTML
-    children_html = "".join(json_to_html(child) for child in element.get("children", []))
+    children_html = "".join(
+        json_to_html(child, need_skyvern_attrs=need_skyvern_attrs) for child in element.get("children", [])
+    )
     # build option HTML
     option_html = "".join(
         f'<option index="{option.get("optionIndex")}">{option.get("text")}</option>'
@@ -183,7 +198,7 @@ def build_element_dict(
 
 
 class ElementTreeFormat(StrEnum):
-    JSON = "json"
+    JSON = "json"  # deprecate JSON format soon. please use HTML format
     HTML = "html"
 
 
@@ -232,7 +247,7 @@ class ScrapedPage(BaseModel):
         self._clean_up_func = clean_up_func
         self._scrape_exclude = scrape_exclude
 
-    def build_element_tree(self, fmt: ElementTreeFormat = ElementTreeFormat.JSON) -> str:
+    def build_element_tree(self, fmt: ElementTreeFormat = ElementTreeFormat.HTML) -> str:
         if fmt == ElementTreeFormat.JSON:
             return json.dumps(self.element_tree_trimmed)
 
