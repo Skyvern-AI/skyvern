@@ -71,6 +71,10 @@ DATA_EXTRACTION_SCHEMA_FOR_LOOP = {
     },
 }
 
+MINI_GOAL_TEMPLATE = """Achieve the following mini goal and once it's achieved, complete: {mini_goal}
+
+This mini goal is part of the big goal the user wants to achieve and use the big goal as context to achieve the mini goal: {main_goal}"""
+
 
 class LoopExtractionOutput(BaseModel):
     loop_values: list[str]
@@ -409,12 +413,13 @@ async def run_observer_cruise_helper(
             task_history_record = {"type": task_type, "task": plan}
         elif task_type == "navigate":
             original_url = url if i == 0 else None
+            navigation_goal = MINI_GOAL_TEMPLATE.format(main_goal=user_prompt, mini_goal=plan)
             block, block_yaml_list, parameter_yaml_list = await _generate_navigation_task(
                 workflow_id=workflow_id,
                 workflow_permanent_id=workflow.workflow_permanent_id,
                 workflow_run_id=workflow_run_id,
                 original_url=original_url,
-                navigation_goal=plan,
+                navigation_goal=navigation_goal,
             )
             task_history_record = {"type": task_type, "task": plan}
         elif task_type == "loop":
