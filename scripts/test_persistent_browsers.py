@@ -4,10 +4,12 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 import json
 
+from skyvern.forge import app
+
 load_dotenv("./skyvern-frontend/.env")
 API_KEY = os.getenv("VITE_SKYVERN_API_KEY")
 
-API_BASE_URL = "http://localhost:8000/api/v1"  # Adjust if needed
+API_BASE_URL = "http://localhost:8000/api/v1" 
 HEADERS = {
     "x-api-key": API_KEY,
     "Content-Type": "application/json"
@@ -95,17 +97,73 @@ def close_all_sessions():
     except Exception as e:
         print(f"Error closing sessions: {str(e)}")
 
+async def direct_get_network_info(session_id: str):
+    """Get network info directly from PersistentSessionsManager"""
+    try:
+        manager = app.PERSISTENT_SESSIONS_MANAGER
+        cdp_port, ip_address = await manager.get_network_info(session_id)
+        print("\nNetwork info:")
+        print(f"  CDP Port: {cdp_port}")
+        print(f"  IP Address: {ip_address}")
+    except Exception as e:
+        print(f"Error getting network info: {str(e)}")
+
+async def direct_list_sessions(organization_id: str):
+    """List sessions directly from PersistentSessionsManager"""
+    try:
+        manager = app.PERSISTENT_SESSIONS_MANAGER
+        sessions = await manager.get_active_sessions(organization_id)
+        print("\nActive browser sessions (direct):")
+        if not sessions:
+            print("  No active sessions found")
+            return
+        for session in sessions:
+            print(json.dumps(session.model_dump(), indent=2))
+            print("  ---")
+    except Exception as e:
+        print(f"Error listing sessions directly: {str(e)}")
+
+def print_direct_help():
+    """Print available direct commands"""
+    print("\nAvailable direct commands:")
+    print("  direct_list <org_id> - List all active browser sessions directly")
+    print("  direct_network <session_id> - Get network info directly")
+    print("  help_direct - Show this help message")
+
+async def handle_direct_command(cmd: str, args: list[str]):
+    """Handle direct method calls"""
+    if cmd == "help_direct":
+        print_direct_help()
+    elif cmd == "direct_network":
+        if not args:
+            print("Error: session_id required")
+            return
+        await direct_get_network_info(args[0])
+    elif cmd == "direct_list":
+        if not args:
+            print("Error: organization_id required")
+            return
+        await direct_list_sessions(args[0])
+    else:
+        print(f"Unknown direct command: {cmd}")
+        print("Type 'help_direct' for available direct commands")
+
 def print_help():
     """Print available commands"""
-    print("\nAvailable commands:")
+    print("\nHTTP API Commands:")
     print("  list - List all active browser sessions")
     print("  create - Create a new browser session")
     print("  get <session_id> - Get details of a specific session")
     print("  close_all - Close all active browser sessions")
     print("  help - Show this help message")
+    print("\nDirect Method Commands:")
+    print("  direct_list <org_id> - List sessions directly")
+    print("  direct_network <session_id> - Get network info directly") 
+    print("  help_direct - Show direct command help")
+    print("\nOther Commands:")
     print("  exit - Exit the program")
 
-def main():
+async def main():
     print("Browser Sessions Testing CLI")
     print("Type 'help' for available commands")
 
@@ -122,6 +180,8 @@ def main():
 
             if cmd == "exit":
                 break
+            elif cmd.startswith("direct_") or cmd == "help_direct":
+                await handle_direct_command(cmd, args)
             elif cmd == "help":
                 print_help()
             elif cmd == "list":
@@ -145,4 +205,5 @@ def main():
             print(f"Error: {str(e)}")
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())

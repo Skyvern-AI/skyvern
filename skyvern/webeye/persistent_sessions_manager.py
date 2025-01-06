@@ -104,6 +104,14 @@ class PersistentSessionsManager:
         await self.database.occupy_persistent_browser_session(session_id, runnable_type, runnable_id)
 
 
+    async def get_network_info(self, session_id: str) -> None:
+        """Returns cdp port and ip address of the browser session"""
+        browser_state = self.get_browser_state(session_id)
+        if browser_state:
+            return browser_state.browser_artifacts.cdp_port, browser_state.browser_artifacts.ip_address
+        return None, None
+
+
     async def release_browser_session(self, session_id: str) -> None:
         """Release a specific browser session."""
         await self.database.release_persistent_browser_session(session_id)
