@@ -1,45 +1,36 @@
-import os
-import requests
-from typing import Any, Optional
-from dotenv import load_dotenv
 import json
+import os
+from typing import Any, Optional
+
+import requests
+from dotenv import load_dotenv
 
 from skyvern.forge import app
 
 load_dotenv("./skyvern-frontend/.env")
 API_KEY = os.getenv("VITE_SKYVERN_API_KEY")
 
-API_BASE_URL = "http://localhost:8000/api/v1" 
-HEADERS = {
-    "x-api-key": API_KEY,
-    "Content-Type": "application/json"
-}
+API_BASE_URL = "http://localhost:8000/api/v1"
+HEADERS = {"x-api-key": API_KEY, "Content-Type": "application/json"}
 
-def make_request(
-    method: str,
-    endpoint: str,
-    data: Optional[dict[str, Any]] = None
-) -> requests.Response:
+
+def make_request(method: str, endpoint: str, data: Optional[dict[str, Any]] = None) -> requests.Response:
     """Helper function to make API requests"""
     url = f"{API_BASE_URL}{endpoint}"
     try:
-        response = requests.request(
-            method=method,
-            url=url,
-            headers=HEADERS,
-            json=data
-        )
+        response = requests.request(method=method, url=url, headers=HEADERS, json=data)
         response.raise_for_status()
         return response
     except requests.exceptions.RequestException as e:
         print(f"\nRequest failed: {method} {url}")
         print(f"Status code: {e.response.status_code if hasattr(e, 'response') else 'N/A'}")
         try:
-            error_detail = e.response.json() if hasattr(e, 'response') else str(e)
+            error_detail = e.response.json() if hasattr(e, "response") else str(e)
             print(f"Error details: {json.dumps(error_detail, indent=2)}")
         except:
             print(f"Raw error response: {e.response.text if hasattr(e, 'response') else str(e)}")
         raise
+
 
 def list_sessions():
     """List all active browser sessions"""
@@ -61,6 +52,7 @@ def list_sessions():
     except Exception as e:
         print(f"Error listing sessions: {str(e)}")
 
+
 def create_session():
     """Create a new browser session"""
     try:
@@ -71,12 +63,13 @@ def create_session():
             print(f"  ID: {session.get('browser_session_id', 'N/A')}")
             print(f"  Status: {session.get('status', 'N/A')}")
             print(f"Full response: {json.dumps(session, indent=2)}")
-            return session.get('browser_session_id')
+            return session.get("browser_session_id")
         except Exception as e:
             print(f"Error parsing response: {session}")
             print(f"Error: {str(e)}")
     except Exception as e:
         print(f"Error creating session: {str(e)}")
+
 
 def get_session(session_id: str):
     """Get details of a specific browser session"""
@@ -88,6 +81,7 @@ def get_session(session_id: str):
     except Exception as e:
         print(f"Error getting session: {str(e)}")
 
+
 def close_all_sessions():
     """Close all active browser sessions"""
     try:
@@ -96,6 +90,7 @@ def close_all_sessions():
         print(f"Response: {response.json()}")
     except Exception as e:
         print(f"Error closing sessions: {str(e)}")
+
 
 async def direct_get_network_info(session_id: str):
     """Get network info directly from PersistentSessionsManager"""
@@ -107,6 +102,7 @@ async def direct_get_network_info(session_id: str):
         print(f"  IP Address: {ip_address}")
     except Exception as e:
         print(f"Error getting network info: {str(e)}")
+
 
 async def direct_list_sessions(organization_id: str):
     """List sessions directly from PersistentSessionsManager"""
@@ -123,12 +119,14 @@ async def direct_list_sessions(organization_id: str):
     except Exception as e:
         print(f"Error listing sessions directly: {str(e)}")
 
+
 def print_direct_help():
     """Print available direct commands"""
     print("\nAvailable direct commands:")
     print("  direct_list <org_id> - List all active browser sessions directly")
     print("  direct_network <session_id> - Get network info directly")
     print("  help_direct - Show this help message")
+
 
 async def handle_direct_command(cmd: str, args: list[str]):
     """Handle direct method calls"""
@@ -148,6 +146,7 @@ async def handle_direct_command(cmd: str, args: list[str]):
         print(f"Unknown direct command: {cmd}")
         print("Type 'help_direct' for available direct commands")
 
+
 def print_help():
     """Print available commands"""
     print("\nHTTP API Commands:")
@@ -158,10 +157,11 @@ def print_help():
     print("  help - Show this help message")
     print("\nDirect Method Commands:")
     print("  direct_list <org_id> - List sessions directly")
-    print("  direct_network <session_id> - Get network info directly") 
+    print("  direct_network <session_id> - Get network info directly")
     print("  help_direct - Show direct command help")
     print("\nOther Commands:")
     print("  exit - Exit the program")
+
 
 async def main():
     print("Browser Sessions Testing CLI")
@@ -204,6 +204,8 @@ async def main():
         except Exception as e:
             print(f"Error: {str(e)}")
 
+
 if __name__ == "__main__":
     import asyncio
+
     asyncio.run(main())

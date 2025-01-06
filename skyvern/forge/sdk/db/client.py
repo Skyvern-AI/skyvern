@@ -1,7 +1,6 @@
 import json
 from datetime import datetime, timedelta
-from typing import Any, List, Sequence, Optional
-
+from typing import Any, List, Optional, Sequence
 
 import structlog
 from sqlalchemy import and_, delete, func, select, update
@@ -10,7 +9,6 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from skyvern.config import settings
 from skyvern.exceptions import WorkflowParameterNotFound
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -65,6 +63,7 @@ from skyvern.forge.sdk.schemas.observers import (
     ObserverThoughtType,
 )
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.tasks import OrderBy, ProxyLocation, SortDirection, Task, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
@@ -2266,7 +2265,9 @@ class AgentDB:
             sessions = result.scalars().all()
             return [PersistentBrowserSession.model_validate(session) for session in sessions]
 
-    async def get_persistent_browser_session(self, session_id: str, organization_id: str) -> Optional[PersistentBrowserSessionModel]:
+    async def get_persistent_browser_session(
+        self, session_id: str, organization_id: str
+    ) -> Optional[PersistentBrowserSessionModel]:
         """Get a specific persistent browser session."""
         async with self.Session() as session:
             result = await session.execute(
@@ -2298,26 +2299,30 @@ class AgentDB:
 
     async def mark_persistent_browser_session_deleted(self, session_id: str, organization_id: str) -> None:
         """Mark a persistent browser session as deleted."""
-        LOG.info("Marking persistent browser session as deleted", session_id=session_id, organization_id=organization_id)
+        LOG.info(
+            "Marking persistent browser session as deleted", session_id=session_id, organization_id=organization_id
+        )
         async with self.Session() as session:
             await session.execute(
-                update(PersistentBrowserSessionModel).where(
+                update(PersistentBrowserSessionModel)
+                .where(
                     PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
                     PersistentBrowserSessionModel.organization_id == organization_id,
-                ).values(deleted_at=datetime.utcnow())
+                )
+                .values(deleted_at=datetime.utcnow())
             )
             await session.commit()
 
-    async def occupy_persistent_browser_session(
-        self, session_id: str, runnable_type: str, runnable_id: str
-    ) -> None:
+    async def occupy_persistent_browser_session(self, session_id: str, runnable_type: str, runnable_id: str) -> None:
         """Occupy a specific persistent browser session."""
         async with self.Session() as session:
             await session.execute(
-                update(PersistentBrowserSessionModel).where(
+                update(PersistentBrowserSessionModel)
+                .where(
                     PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
                     PersistentBrowserSessionModel.deleted_at.is_(None),
-                ).values(runnable_type=runnable_type, runnable_id=runnable_id)
+                )
+                .values(runnable_type=runnable_type, runnable_id=runnable_id)
             )
             await session.commit()
 
@@ -2325,9 +2330,11 @@ class AgentDB:
         """Release a specific persistent browser session."""
         async with self.Session() as session:
             await session.execute(
-                update(PersistentBrowserSessionModel).where(
+                update(PersistentBrowserSessionModel)
+                .where(
                     PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
-                ).values(runnable_type=None, runnable_id=None)
+                )
+                .values(runnable_type=None, runnable_id=None)
             )
             await session.commit()
 
@@ -2335,8 +2342,6 @@ class AgentDB:
         """Get all active persistent browser sessions across all organizations."""
         async with self.Session() as session:
             result = await session.execute(
-                select(PersistentBrowserSessionModel).where(
-                    PersistentBrowserSessionModel.deleted_at.is_(None)
-                )
+                select(PersistentBrowserSessionModel).where(PersistentBrowserSessionModel.deleted_at.is_(None))
             )
             return result.scalars().all()

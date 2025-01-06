@@ -1125,6 +1125,7 @@ async def get_observer_cruise(
         raise HTTPException(status_code=404, detail=f"Observer cruise {observer_cruise_id} not found")
     return observer_cruise
 
+
 @base_router.get(
     "/browser_sessions/{browser_session_id}",
     response_model=BrowserSessionResponse,
@@ -1161,10 +1162,8 @@ async def get_browser_sessions(
     """Get all active browser sessions for the organization"""
     analytics.capture("skyvern-oss-agent-browser-sessions-get")
     browser_sessions = await app.PERSISTENT_SESSIONS_MANAGER.get_active_sessions(current_org.organization_id)
-    return [
-        BrowserSessionResponse.from_browser_session(browser_session)
-        for browser_session in browser_sessions
-    ]
+    return [BrowserSessionResponse.from_browser_session(browser_session) for browser_session in browser_sessions]
+
 
 @base_router.post(
     "/browser_sessions",
@@ -1174,12 +1173,13 @@ async def get_browser_sessions(
     "/browser_sessions/",
     response_model=BrowserSessionResponse,
     include_in_schema=False,
-) 
+)
 async def create_browser_session(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> BrowserSessionResponse:
     browser_session, _ = await app.PERSISTENT_SESSIONS_MANAGER.create_session(current_org.organization_id)
     return BrowserSessionResponse.from_browser_session(browser_session)
+
 
 @base_router.post(
     "/browser_sessions/close",
@@ -1187,7 +1187,7 @@ async def create_browser_session(
 @base_router.post(
     "/browser_sessions/close/",
     include_in_schema=False,
-) 
+)
 async def close_browser_sessions(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> ORJSONResponse:

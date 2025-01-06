@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 import uuid
@@ -9,7 +10,6 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
 import aiofiles
-import json
 import structlog
 from playwright.async_api import BrowserContext, ConsoleMessage, Download, Error, Page, Playwright
 from pydantic import BaseModel, PrivateAttr
@@ -342,6 +342,7 @@ async def _create_headful_chromium(
 
 BrowserContextFactory.register_type("chromium-headless", _create_headless_chromium)
 BrowserContextFactory.register_type("chromium-headful", _create_headful_chromium)
+
 
 class BrowserState:
     instance = None

@@ -4,6 +4,7 @@ from pydantic import BaseModel
 
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 
+
 class BrowserSessionResponse(BaseModel):
     session_id: str
     organization_id: str
@@ -13,7 +14,7 @@ class BrowserSessionResponse(BaseModel):
     modified_at: datetime
     deleted_at: datetime | None
 
-    @classmethod        
+    @classmethod
     def from_browser_session(cls, browser_session: PersistentBrowserSession):
         return cls(
             session_id=browser_session.persistent_browser_session_id,
