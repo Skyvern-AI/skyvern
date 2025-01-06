@@ -31,7 +31,7 @@ function WorkflowRunTimelineBlockItem({
   onBlockItemClick,
   onActionClick,
 }: Props) {
-  const actions = block.actions ? [...block.actions].reverse() : [];
+  const actions = block.actions ?? [];
 
   const hasActiveAction =
     isAction(activeItem) &&
