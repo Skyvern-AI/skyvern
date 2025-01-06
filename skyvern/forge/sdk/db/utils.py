@@ -382,6 +382,7 @@ def convert_to_workflow_run_block(
         workflow_run_id=workflow_run_block_model.workflow_run_id,
         organization_id=workflow_run_block_model.organization_id,
         parent_workflow_run_block_id=workflow_run_block_model.parent_workflow_run_block_id,
+        description=workflow_run_block_model.description,
         block_type=BlockType(workflow_run_block_model.block_type),
         label=workflow_run_block_model.label,
         status=BlockStatus(workflow_run_block_model.status),
@@ -392,6 +393,10 @@ def convert_to_workflow_run_block(
         loop_values=workflow_run_block_model.loop_values,
         current_value=workflow_run_block_model.current_value,
         current_index=workflow_run_block_model.current_index,
+        recipients=workflow_run_block_model.recipients,
+        attachments=workflow_run_block_model.attachments,
+        subject=workflow_run_block_model.subject,
+        body=workflow_run_block_model.body,
         created_at=workflow_run_block_model.created_at,
         modified_at=workflow_run_block_model.modified_at,
     )

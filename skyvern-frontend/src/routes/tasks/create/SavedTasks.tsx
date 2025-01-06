@@ -102,7 +102,7 @@ function SavedTasks() {
       queryClient.invalidateQueries({
         queryKey: ["savedTasks"],
       });
-      navigate(`/create/${response.workflow_permanent_id}`);
+      navigate(`/tasks/create/${response.workflow_permanent_id}`);
     },
   });
 

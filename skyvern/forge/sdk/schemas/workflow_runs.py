@@ -15,6 +15,7 @@ class WorkflowRunBlock(BaseModel):
     workflow_run_block_id: str
     workflow_run_id: str
     organization_id: str | None = None
+    description: str | None = None
     parent_workflow_run_block_id: str | None = None
     block_type: BlockType
     label: str | None = None
@@ -40,6 +41,12 @@ class WorkflowRunBlock(BaseModel):
     # block inside a loop block
     current_value: str | None = None
     current_index: int | None = None
+
+    # email block
+    recipients: list[str] | None = None
+    attachments: list[str] | None = None
+    subject: str | None = None
+    body: str | None = None
 
 
 class WorkflowRunTimelineType(StrEnum):

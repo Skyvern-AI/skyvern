@@ -208,6 +208,49 @@ class Block(BaseModel, abc.ABC):
                 block_type=self.block_type,
                 continue_on_failure=self.continue_on_failure,
             )
+            workflow_run_block_id = workflow_run_block.workflow_run_block_id
+
+            description = None
+            try:
+                block_data = self.model_dump(
+                    exclude={
+                        "workflow_run_block_id",
+                        "organization_id",
+                        "task_id",
+                        "workflow_run_id",
+                        "parent_workflow_run_block_id",
+                        "label",
+                        "status",
+                        "output",
+                        "continue_on_failure",
+                        "failure_reason",
+                        "actions",
+                        "created_at",
+                        "modified_at",
+                    },
+                    exclude_none=True,
+                )
+                description_generation_prompt = prompt_engine.load_prompt(
+                    "generate_workflow_run_block_description",
+                    block=block_data,
+                )
+                json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=description_generation_prompt)
+                description = json_response.get("summary")
+                LOG.info(
+                    "Generated description for the workflow run block",
+                    description=description,
+                    workflow_run_block_id=workflow_run_block.workflow_run_block_id,
+                )
+            except Exception as e:
+                LOG.exception("Failed to generate description for the workflow run block", error=e)
+
+            if description:
+                workflow_run_block = await app.DATABASE.update_workflow_run_block(
+                    workflow_run_block_id=workflow_run_block.workflow_run_block_id,
+                    description=description,
+                    organization_id=organization_id,
+                )
+
             # create a screenshot
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
             if not browser_state:
@@ -220,7 +263,10 @@ class Block(BaseModel, abc.ABC):
                         artifact_type=ArtifactType.SCREENSHOT_LLM,
                         data=screenshot,
                     )
-            workflow_run_block_id = workflow_run_block.workflow_run_block_id
+
+            LOG.info(
+                "Executing block", workflow_run_id=workflow_run_id, block_label=self.label, block_type=self.block_type
+            )
             return await self.execute(workflow_run_id, workflow_run_block_id, organization_id=organization_id, **kwargs)
         except Exception as e:
             LOG.exception(
@@ -236,7 +282,7 @@ class Block(BaseModel, abc.ABC):
 
             failure_reason = "unexpected exception"
             if isinstance(e, SkyvernException):
-                failure_reason = f"unexpected SkyvernException({e.__class__.__name__})"
+                failure_reason = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
 
             return await self.build_block_result(
                 success=False,
@@ -416,9 +462,13 @@ class BaseTaskBlock(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context=workflow_run_context)
         except Exception as e:
+            failure_reason = f"Failed to format jinja template: {str(e)}"
+            await self.record_output_parameter_value(
+                workflow_run_context, workflow_run_id, {"failure_reason": failure_reason}
+            )
             return await self.build_block_result(
                 success=False,
-                failure_reason=f"Failed to format jinja template: {str(e)}",
+                failure_reason=failure_reason,
                 output_parameter_value=None,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
@@ -797,11 +847,17 @@ class ForLoopBlock(Block):
                     parent_workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                 )
+
+                output_value = (
+                    workflow_run_context.get_value(block_output.output_parameter.key)
+                    if workflow_run_context.has_value(block_output.output_parameter.key)
+                    else None
+                )
                 each_loop_output_values.append(
                     {
                         "loop_value": loop_over_value,
                         "output_parameter": block_output.output_parameter,
-                        "output_value": workflow_run_context.get_value(block_output.output_parameter.key),
+                        "output_value": output_value,
                     }
                 )
                 try:
@@ -838,12 +894,13 @@ class ForLoopBlock(Block):
 
                 if not block_output.success and not loop_block.continue_on_failure:
                     LOG.info(
-                        f"ForLoopBlock: Encountered an failure processing block {block_idx} during loop {loop_idx}, terminating early",
+                        f"ForLoopBlock: Encountered a failure processing block {block_idx} during loop {loop_idx}, terminating early",
                         block_outputs=block_outputs,
                         loop_idx=loop_idx,
                         block_idx=block_idx,
                         loop_over_value=loop_over_value,
                         loop_block_continue_on_failure=loop_block.continue_on_failure,
+                        failure_reason=block_output.failure_reason,
                     )
                     outputs_with_loop_values.append(each_loop_output_values)
                     return LoopBlockExecutedResult(

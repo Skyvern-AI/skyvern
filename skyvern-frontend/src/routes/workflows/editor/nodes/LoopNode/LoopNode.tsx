@@ -1,12 +1,6 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
@@ -15,35 +9,28 @@ import {
   Handle,
   NodeProps,
   Position,
-  useEdges,
   useNodes,
   useReactFlow,
 } from "@xyflow/react";
 import { AppNode } from "..";
 import { helpTooltips } from "../../helpContent";
-import { useWorkflowParametersState } from "../../useWorkflowParametersState";
-import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import type { LoopNode } from "./types";
+import { useState } from "react";
 
 function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const { updateNodeData } = useReactFlow();
   const nodes = useNodes<AppNode>();
-  const edges = useEdges();
   const [label, setLabel] = useNodeLabelChangeHandler({
     id,
     initialValue: data.label,
   });
+  const [inputs, setInputs] = useState({
+    loopVariableReference: data.loopVariableReference,
+  });
   const deleteNodeCallback = useDeleteNodeCallback();
-
-  const [workflowParameters] = useWorkflowParametersState();
-  const parameters = workflowParameters.filter(
-    (parameter) => parameter.parameterType !== "credential",
-  );
-  const parameterKeys = parameters.map((parameter) => parameter.key);
-  const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
 
   const children = nodes.filter((node) => node.parentId === id);
   const furthestDownChild: Node | null = children.reduce(
@@ -113,30 +100,20 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
             </div>
             <div className="space-y-2">
               <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">
-                  Loop Value Parameter
-                </Label>
+                <Label className="text-xs text-slate-300">Loop Value</Label>
                 <HelpTooltip content={helpTooltips["loop"]["loopValue"]} />
               </div>
-              <Select
-                value={data.loopValue}
-                onValueChange={(value) => {
-                  updateNodeData(id, { loopValue: value });
+              <WorkflowBlockInput
+                nodeId={id}
+                value={inputs.loopVariableReference}
+                onChange={(value) => {
+                  setInputs({
+                    ...inputs,
+                    loopVariableReference: value,
+                  });
+                  updateNodeData(id, { loopVariableReference: value });
                 }}
-              >
-                <SelectTrigger>
-                  <SelectValue placeholder="Select the parameter to iterate over" />
-                </SelectTrigger>
-                <SelectContent>
-                  {[...parameterKeys, ...outputParameterKeys].map(
-                    (parameterKey) => (
-                      <SelectItem key={parameterKey} value={parameterKey}>
-                        {parameterKey}
-                      </SelectItem>
-                    ),
-                  )}
-                </SelectContent>
-              </Select>
+              />
             </div>
           </div>
         </div>

@@ -1,29 +1,35 @@
+import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
+import { Input } from "@/components/ui/input";
+
 type Props = {
   recipients: Array<string>;
   body: string;
+  subject: string;
 };
 
-function SendEmailBlockInfo({ recipients, body }: Props) {
+function SendEmailBlockParameters({ recipients, body, subject }: Props) {
   return (
-    <div className="flex gap-2">
-      <div className="w-1/2 space-y-4 p-4">
-        <div className="flex justify-between">
-          <span className="text-sm text-slate-400">From</span>
-          <span className="text-sm">hello@skyvern.com</span>
+    <div className="space-y-4">
+      <div className="flex gap-16">
+        <div className="w-80">
+          <h1 className="text-lg">To</h1>
         </div>
-        <div className="flex justify-between">
-          <span className="text-sm text-slate-400">To</span>
-          {recipients.map((recipient) => {
-            return <span className="text-sm">{recipient}</span>;
-          })}
-        </div>
+        <Input value={recipients.join(", ")} readOnly />
       </div>
-      <div className="w-1/2 space-y-4 p-4">
-        <span className="text-sm text-slate-400">Body</span>
-        <p className="text-sm">{body}</p>
+      <div className="flex gap-16">
+        <div className="w-80">
+          <h1 className="text-lg">Subject</h1>
+        </div>
+        <Input value={subject} readOnly />
+      </div>
+      <div className="flex gap-16">
+        <div className="w-80">
+          <h1 className="text-lg">Body</h1>
+        </div>
+        <AutoResizingTextarea value={body} readOnly />
       </div>
     </div>
   );
 }
 
-export { SendEmailBlockInfo };
+export { SendEmailBlockParameters };

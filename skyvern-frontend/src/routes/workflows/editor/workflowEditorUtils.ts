@@ -365,13 +365,18 @@ function convertToNode(
       };
     }
     case "for_loop": {
+      const loopVariableReference =
+        block.loop_variable_reference !== null
+          ? block.loop_variable_reference
+          : block.loop_over?.key ?? "";
       return {
         ...identifiers,
         ...common,
         type: "loop",
         data: {
           ...commonData,
-          loopValue: block.loop_over.key,
+          loopValue: block.loop_over?.key ?? "",
+          loopVariableReference: loopVariableReference,
         },
       };
     }
@@ -1073,6 +1078,7 @@ function getWorkflowBlocksUtil(
           continue_on_failure: node.data.continueOnFailure,
           loop_over_parameter_key: node.data.loopValue,
           loop_blocks: getOrderedChildrenBlocks(nodes, edges, node.id),
+          loop_variable_reference: node.data.loopVariableReference,
         },
       ];
     }
@@ -1568,8 +1574,9 @@ function convertBlocksToBlockYAML(
         const blockYaml: ForLoopBlockYAML = {
           ...base,
           block_type: "for_loop",
-          loop_over_parameter_key: block.loop_over.key,
+          loop_over_parameter_key: block.loop_over?.key ?? "",
           loop_blocks: convertBlocksToBlockYAML(block.loop_blocks),
+          loop_variable_reference: block.loop_variable_reference,
         };
         return blockYaml;
       }
@@ -1684,11 +1691,11 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   // check loop node parameters
   const loopNodes: Array<LoopNode> = nodes.filter(isLoopNode);
   const emptyLoopNodes = loopNodes.filter(
-    (node: LoopNode) => node.data.loopValue === "",
+    (node: LoopNode) => node.data.loopVariableReference === "",
   );
   if (emptyLoopNodes.length > 0) {
     emptyLoopNodes.forEach((node) => {
-      errors.push(`${node.data.label}: Loop value parameter must be selected.`);
+      errors.push(`${node.data.label}: Loop value is required.`);
     });
   }
 

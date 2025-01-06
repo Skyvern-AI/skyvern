@@ -495,6 +495,7 @@ class WorkflowRunBlockModel(Base):
         String, ForeignKey("workflow_run_blocks.workflow_run_block_id"), nullable=True
     )
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
+    description = Column(String, nullable=True)
     task_id = Column(String, ForeignKey("tasks.task_id"), nullable=True)
     label = Column(String, nullable=True)
     block_type = Column(String, nullable=False)
