@@ -18,6 +18,7 @@ FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
     ArtifactType.LLM_REQUEST: "json",
     ArtifactType.LLM_RESPONSE: "json",
     ArtifactType.LLM_RESPONSE_PARSED: "json",
+    ArtifactType.LLM_RESPONSE_RENDERED: "json",
     ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP: "json",
     ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP: "json",
     ArtifactType.VISIBLE_ELEMENTS_TREE: "json",
@@ -27,6 +28,7 @@ FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
     ArtifactType.HTML_ACTION: "html",
     ArtifactType.TRACE: "zip",
     ArtifactType.HAR: "har",
+    ArtifactType.HASHED_HREF_MAP: "json",
     # DEPRECATED: we're using CSS selector map now
     ArtifactType.VISIBLE_ELEMENTS_ID_XPATH_MAP: "json",
 }
