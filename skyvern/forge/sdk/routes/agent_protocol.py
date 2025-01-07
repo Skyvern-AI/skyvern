@@ -1112,6 +1112,7 @@ async def observer_cruise(
         organization_id=organization.organization_id,
         observer_cruise_id=observer_cruise.observer_cruise_id,
         max_iterations_override=x_max_iterations_override,
+        browser_session_id=observer_cruise.browser_session_id,
     )
     return observer_cruise
 

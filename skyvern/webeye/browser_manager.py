@@ -147,7 +147,8 @@ class BrowserManager:
                 )
                 page = await browser_state.get_working_page()
                 if page:
-                    await browser_state.navigate_to_url(page=page, url=url)
+                    if url:
+                        await browser_state.navigate_to_url(page=page, url=url)
                 else:
                     LOG.warning("Browser state has no page", workflow_run_id=workflow_run.workflow_run_id)
 
