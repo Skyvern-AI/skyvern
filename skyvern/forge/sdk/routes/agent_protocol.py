@@ -653,6 +653,7 @@ async def execute_workflow(
         workflow_id=workflow_run.workflow_id,
         workflow_run_id=workflow_run.workflow_run_id,
         max_steps_override=x_max_steps_override,
+        browser_session_id=workflow_request.browser_session_id,
         api_key=x_api_key,
     )
     return RunWorkflowResponse(

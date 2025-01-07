@@ -18,6 +18,7 @@ class WorkflowRequestBody(BaseModel):
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
+    browser_session_id: str | None = None
 
     @field_validator("webhook_callback_url", "totp_verification_url")
     @classmethod
