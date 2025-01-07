@@ -124,6 +124,10 @@ class Settings(BaseSettings):
     # GEMINI
     GEMINI_API_KEY: str | None = None
 
+    # NOVITA AI
+    ENABLE_NOVITA: bool = False
+    NOVITA_API_KEY: str | None = None
+
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40

@@ -115,6 +115,33 @@ setup_llm_providers() {
         update_or_add_env_var "ENABLE_GEMINI" "false"
     fi
 
+    # Novita AI Configuration
+    echo "To enable Novita AI, you must have an Novita AI API key."
+    read -p "Do you want to enable Novita AI (y/n)? " enable_novita
+    if [[ "$enable_novita" == "y" ]]; then
+        read -p "Enter your Novita AI API key: " novita_api_key
+        if [ -z "$novita_api_key" ]; then
+            echo "Error: Novita AI API key is required."
+            echo "Novita AI will not be enabled."
+        else
+            update_or_add_env_var "NOVITA_API_KEY" "$novita_api_key"
+            update_or_add_env_var "ENABLE_NOVITA" "true"
+            model_options+=(
+                "NOVITA_LLAMA_3_3_70B"
+                "NOVITA_LLAMA_3_2_1B"
+                "NOVITA_LLAMA_3_2_3B"
+                "NOVITA_LLAMA_3_2_11B_VISION"
+                "NOVITA_LLAMA_3_1_8B"
+                "NOVITA_LLAMA_3_1_70B"
+                "NOVITA_LLAMA_3_1_405B"
+                "NOVITA_LLAMA_3_8B"
+                "NOVITA_LLAMA_3_70B"
+            )
+        fi
+    else
+        update_or_add_env_var "ENABLE_NOVITA" "false"
+    fi
+
     # Model Selection
     if [ ${#model_options[@]} -eq 0 ]; then
         echo "No LLM providers enabled. You won't be able to run Skyvern unless you enable at least one provider. You can re-run this script to enable providers or manually update the .env file."
