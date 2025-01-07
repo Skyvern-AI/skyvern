@@ -1,11 +1,12 @@
 import json
 import os
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import requests
 from dotenv import load_dotenv
 
 from skyvern.forge import app
+from skyvern.forge.sdk.schemas.tasks import TaskRequest, TaskResponse
 
 load_dotenv("./skyvern-frontend/.env")
 API_KEY = os.getenv("VITE_SKYVERN_API_KEY")
@@ -162,6 +163,29 @@ def close_session(session_id: str) -> None:
         print(f"Error closing session: {str(e)}")
 
 
+def create_task() -> Optional[str]:
+    """Create a new task"""
+    try:
+        data = TaskRequest(
+            url="news.ycombinator.com",
+            goal="Navigate to the Hacker News homepage and identify the top post. COMPLETE when the title and URL of the top post are extracted. Ensure that the top post is the first post listed on the page."
+        )
+        response = make_request("POST", "/tasks", data=data.model_dump())
+        task = cast(dict[str, Any], response.json())
+        print("\nCreated new task:")
+        try:
+            print(f"  ID: {task.get('task_id', 'N/A')}")
+            print(f"Full response: {json.dumps(task, indent=2)}")
+            return task.get("task_id")
+        except Exception as e:
+            print(f"Error parsing response: {task}")
+            print(f"Error: {str(e)}")
+            return None
+    except Exception as e:
+        print(f"Error creating task: {str(e)}")
+        return None
+
+
 def print_help() -> None:
     """Print available commands"""
     print("\nHTTP API Commands:")
@@ -170,6 +194,7 @@ def print_help() -> None:
     print("  get <session_id> - Get details of a specific session")
     print("  close <session_id> - Close a specific session")
     print("  close_all - Close all active browser sessions")
+    print("  task - Create a new Hacker News task")
     print("  help - Show this help message")
     print("\nDirect Method Commands:")
     print("  direct_list <org_id> - List sessions directly")
@@ -204,6 +229,8 @@ async def main() -> None:
                 list_sessions()
             elif cmd == "create":
                 create_session()
+            elif cmd == "task":
+                create_task()
             elif cmd == "get":
                 if not args:
                     print("Error: session_id required")
