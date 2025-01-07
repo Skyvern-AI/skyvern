@@ -6,7 +6,7 @@ import requests
 from dotenv import load_dotenv
 
 from skyvern.forge import app
-from skyvern.forge.sdk.schemas.tasks import TaskRequest, TaskResponse
+from skyvern.forge.sdk.schemas.tasks import TaskRequest
 
 load_dotenv("./skyvern-frontend/.env")
 API_KEY = os.getenv("VITE_SKYVERN_API_KEY")
@@ -169,7 +169,7 @@ def create_task(
     browser_session_id: str | None = None,
 ) -> Optional[str]:
     """Create a new task
-    
+
     Args:
         url: URL to navigate to (default: https://news.ycombinator.com)
         goal: Task goal/instructions (default: Extract top HN post)
@@ -210,7 +210,7 @@ def print_help() -> None:
     print("  create_task [args] - Create a new task")
     print("    Optional args:")
     print("      --url <url> - URL to navigate to")
-    print("      --goal <goal> - Task goal/instructions") 
+    print("      --goal <goal> - Task goal/instructions")
     print("      --browser_session_id <id> - Browser session ID to use")
     print("  help - Show this help message")
     print("\nDirect Method Commands:")

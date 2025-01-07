@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import structlog
-from playwright.async_api import async_playwright
 from playwright._impl._errors import TargetClosedError
+from playwright.async_api import async_playwright
 
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -154,7 +154,7 @@ class PersistentSessionsManager:
                 session_id=session_id,
             )
             self._browser_sessions.pop(session_id, None)
-            
+
             try:
                 await browser_session.browser_state.close()
             except TargetClosedError:

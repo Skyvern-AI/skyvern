@@ -6,11 +6,10 @@ import structlog
 from playwright.async_api import async_playwright
 
 from skyvern.exceptions import MissingBrowserState
+from skyvern.forge import app
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.webeye.browser_factory import BrowserContextFactory, BrowserState, VideoArtifact
-
-from skyvern.forge import app
 
 LOG = structlog.get_logger()
 
@@ -137,7 +136,9 @@ class BrowserManager:
             )
             browser_state = app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id)
             if browser_state is None:
-                LOG.warning("Browser state not found in persistent sessions manager", browser_session_id=browser_session_id)
+                LOG.warning(
+                    "Browser state not found in persistent sessions manager", browser_session_id=browser_session_id
+                )
             else:
                 await app.PERSISTENT_SESSIONS_MANAGER.occupy_browser_session(
                     browser_session_id,
