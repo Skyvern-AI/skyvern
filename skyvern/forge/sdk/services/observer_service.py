@@ -71,6 +71,10 @@ DATA_EXTRACTION_SCHEMA_FOR_LOOP = {
     },
 }
 
+MINI_GOAL_TEMPLATE = """Achieve the following mini goal and once it's achieved, complete: {mini_goal}
+
+This mini goal is part of the big goal the user wants to achieve and use the big goal as context to achieve the mini goal: {main_goal}"""
+
 
 class LoopExtractionOutput(BaseModel):
     loop_values: list[str]
@@ -190,6 +194,7 @@ async def run_observer_cruise(
         LOG.error("Observer cruise not found", observer_cruise_id=observer_cruise_id, organization_id=organization_id)
         return None
 
+    workflow, workflow_run = None, None
     try:
         workflow, workflow_run = await run_observer_cruise_helper(
             organization=organization,
@@ -216,14 +221,13 @@ async def run_observer_cruise(
             organization_id=organization_id,
         )
         return
+    finally:
+        if workflow and workflow_run:
+            await app.WORKFLOW_SERVICE.clean_up_workflow(workflow=workflow, workflow_run=workflow_run)
+        else:
+            LOG.warning("Workflow or workflow run not found")
 
-    await app.DATABASE.update_observer_cruise(
-        observer_cruise_id=observer_cruise_id,
-        organization_id=organization_id,
-        status=ObserverCruiseStatus.completed,
-    )
-    if workflow and workflow_run:
-        await app.WORKFLOW_SERVICE.clean_up_workflow(workflow=workflow, workflow_run=workflow_run)
+        skyvern_context.reset()
 
 
 async def run_observer_cruise_helper(
@@ -311,7 +315,8 @@ async def run_observer_cruise_helper(
     yaml_blocks: list[BLOCK_YAML_TYPES] = []
     yaml_parameters: list[PARAMETER_YAML_TYPES] = []
 
-    for i in range(int_max_iterations_override or DEFAULT_MAX_ITERATIONS):
+    max_iterations = int_max_iterations_override or DEFAULT_MAX_ITERATIONS
+    for i in range(max_iterations):
         LOG.info(f"Observer iteration i={i}", workflow_run_id=workflow_run_id, url=url)
         browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
             workflow_run=workflow_run,
@@ -409,12 +414,13 @@ async def run_observer_cruise_helper(
             task_history_record = {"type": task_type, "task": plan}
         elif task_type == "navigate":
             original_url = url if i == 0 else None
+            navigation_goal = MINI_GOAL_TEMPLATE.format(main_goal=user_prompt, mini_goal=plan)
             block, block_yaml_list, parameter_yaml_list = await _generate_navigation_task(
                 workflow_id=workflow_id,
                 workflow_permanent_id=workflow.workflow_permanent_id,
                 workflow_run_id=workflow_run_id,
                 original_url=original_url,
-                navigation_goal=plan,
+                navigation_goal=navigation_goal,
             )
             task_history_record = {"type": task_type, "task": plan}
         elif task_type == "loop":
@@ -537,8 +543,26 @@ async def run_observer_cruise_helper(
                     workflow_run_id=workflow_run_id,
                     completion_resp=completion_resp,
                 )
-                await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(workflow_run_id=workflow_run_id)
+                await mark_observer_cruise_as_completed(
+                    observer_cruise_id=observer_cruise_id,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                )
                 break
+    else:
+        LOG.info(
+            "Observer cruise failed - run out of iterations",
+            max_iterations=max_iterations,
+            workflow_run_id=workflow_run_id,
+        )
+        await mark_observer_cruise_as_failed(
+            observer_cruise_id=observer_cruise_id,
+            workflow_run_id=workflow_run_id,
+            # TODO: add a better failure reason with LLM
+            failure_reason="Observer max iterations reached",
+            organization_id=organization_id,
+        )
+
     return workflow, workflow_run
 
 
@@ -1026,6 +1050,20 @@ async def mark_observer_cruise_as_failed(
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
             workflow_run_id, failure_reason=failure_reason or "Observer cruise failed"
         )
+
+
+async def mark_observer_cruise_as_completed(
+    observer_cruise_id: str,
+    workflow_run_id: str | None = None,
+    organization_id: str | None = None,
+) -> None:
+    await app.DATABASE.update_observer_cruise(
+        observer_cruise_id,
+        organization_id=organization_id,
+        status=ObserverCruiseStatus.completed,
+    )
+    if workflow_run_id:
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(workflow_run_id)
 
 
 def _get_extracted_data_from_block_result(

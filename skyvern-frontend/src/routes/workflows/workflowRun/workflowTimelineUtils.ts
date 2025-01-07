@@ -37,15 +37,13 @@ function findActiveItem(
       return "stream";
     }
     if (timeline?.length > 0) {
-      const last = timeline.length - 1;
-      const timelineItem = timeline![last];
+      const timelineItem = timeline![0];
       if (isBlockItem(timelineItem)) {
         if (
           timelineItem.block.actions &&
           timelineItem.block.actions.length > 0
         ) {
-          const last = timelineItem.block.actions.length - 1;
-          return timelineItem.block.actions[last]!;
+          return timelineItem.block.actions[0]!;
         }
         return timelineItem.block;
       }

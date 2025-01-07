@@ -583,16 +583,14 @@ function getElements(
       ),
     );
     const children = data.filter((b) => b.parentId === block.id);
+    const adderNodeId = nanoid();
     if (children.length === 0) {
-      const adderNodeId = nanoid();
-      nodes.push(nodeAdderNode(adderNodeId, block.id));
       edges.push(defaultEdge(startNodeId, adderNodeId));
     } else {
       const firstChild = children.find((c) => c.previous === null)!;
       edges.push(edgeWithAddButton(startNodeId, firstChild.id));
     }
     const lastChild = children.find((c) => c.next === null);
-    const adderNodeId = nanoid();
     nodes.push(nodeAdderNode(adderNodeId, block.id));
     if (lastChild) {
       edges.push(defaultEdge(lastChild.id, adderNodeId));
@@ -1194,10 +1192,11 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
         ...node,
         data: {
           ...node.data,
-          loopValue:
-            node.data.loopValue === getOutputParameterKey(oldLabel)
+          label: node.id === id ? newLabel : node.data.label,
+          loopVariableReference:
+            node.data.loopVariableReference === getOutputParameterKey(oldLabel)
               ? getOutputParameterKey(newLabel)
-              : node.data.loopValue,
+              : node.data.loopVariableReference,
         },
       };
     }

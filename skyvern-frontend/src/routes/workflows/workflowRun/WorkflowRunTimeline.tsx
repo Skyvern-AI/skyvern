@@ -56,8 +56,6 @@ function WorkflowRunTimeline({
 
   const workflowRunIsNotFinalized = statusIsNotFinalized(workflowRun);
 
-  const timeline = workflowRunTimeline.slice().reverse();
-
   const numberOfActions = workflowRunTimeline.reduce((total, current) => {
     if (isTaskVariantBlockItem(current)) {
       return total + current.block!.actions!.length;
@@ -98,8 +96,10 @@ function WorkflowRunTimeline({
                 </div>
               </div>
             )}
-            {timeline.length === 0 && <div>Workflow timeline is empty</div>}
-            {timeline?.map((timelineItem) => {
+            {workflowRunTimeline.length === 0 && (
+              <div>Workflow timeline is empty</div>
+            )}
+            {workflowRunTimeline?.map((timelineItem) => {
               if (isBlockItem(timelineItem)) {
                 return (
                   <WorkflowRunTimelineBlockItem

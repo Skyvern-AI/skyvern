@@ -9,6 +9,8 @@ Do not ever include anything other than the JSON object in your output, and do n
 
 If you are unable to extract the requested information for a specific field in the json schema, please output a null value for that field.
 
+If you are trying to extract the href links which are using the jinja style like "{% raw %}{{}}{% endraw %}", please keep the orignal string.
+
 User Data Extraction Goal: {{ data_extraction_goal }}
 
 {% if error_code_mapping_str %}

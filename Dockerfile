@@ -2,6 +2,7 @@ FROM python:3.11 as requirements-stage
 
 WORKDIR /tmp
 RUN pip install poetry
+RUN poetry self add poetry-plugin-export
 COPY ./pyproject.toml /tmp/pyproject.toml
 COPY ./poetry.lock /tmp/poetry.lock
 RUN poetry export -f requirements.txt --output requirements.txt --without-hashes

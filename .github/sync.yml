@@ -1,8 +1,7 @@
 Skyvern-AI/skyvern-cloud:
   - source: skyvern/
     dest: skyvern/
-  - source: streamlit_app/
-    dest: streamlit_app/
+    deleteOrphaned: true
   - source: pyproject.toml
     dest: pyproject.toml
   - source: poetry.lock
@@ -19,3 +18,4 @@ Skyvern-AI/skyvern-cloud:
     dest: run_alembic_check.sh
   - source: skyvern-frontend/src/
     dest: skyvern-frontend/src/
+    deleteOrphaned: true

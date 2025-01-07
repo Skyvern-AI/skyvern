@@ -151,7 +151,7 @@ function WorkflowPostRunParameters() {
                   The original prompt for the observer
                 </h2>
               </div>
-              <Input
+              <AutoResizingTextarea
                 value={workflowRun.observer_cruise.prompt ?? ""}
                 readOnly
               />
