@@ -53,7 +53,6 @@ class AsyncExecutor(abc.ABC):
         organization_id: str,
         observer_cruise_id: str,
         max_iterations_override: int | None,
-        browser_session_id: str | None,
         **kwargs: dict,
     ) -> None:
         pass
@@ -145,7 +144,6 @@ class BackgroundTaskExecutor(AsyncExecutor):
         organization_id: str,
         observer_cruise_id: str,
         max_iterations_override: int | None,
-        browser_session_id: str | None,
         **kwargs: dict,
     ) -> None:
         LOG.info(
@@ -180,5 +178,4 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 organization=organization,
                 observer_cruise_id=observer_cruise_id,
                 max_iterations_override=max_iterations_override,
-                browser_session_id=browser_session_id,
             )
