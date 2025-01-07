@@ -79,7 +79,7 @@ class BrowserManager:
 
         if browser_session_id:
             LOG.info(
-                "Getting browser state for workflow run from persistent sessions manager",
+                "Getting browser state for task from persistent sessions manager",
                 browser_session_id=browser_session_id,
             )
             browser_state = app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id)
@@ -100,13 +100,15 @@ class BrowserManager:
                 else:
                     LOG.warning("Browser state has no page", workflow_run_id=task.workflow_run_id)
 
-        LOG.info("Creating browser state for task", task_id=task.task_id)
-        browser_state = await self._create_browser_state(
-            proxy_location=task.proxy_location,
-            url=task.url,
-            task_id=task.task_id,
-            organization_id=task.organization_id,
-        )
+        if browser_state is None:
+            LOG.info("Creating browser state for task", task_id=task.task_id)
+            browser_state = await self._create_browser_state(
+                proxy_location=task.proxy_location,
+                url=task.url,
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+            )
+
         self.pages[task.task_id] = browser_state
         if task.workflow_run_id:
             self.pages[task.workflow_run_id] = browser_state
