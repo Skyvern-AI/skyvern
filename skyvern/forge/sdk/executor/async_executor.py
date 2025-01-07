@@ -25,6 +25,7 @@ class AsyncExecutor(abc.ABC):
         organization_id: str,
         max_steps_override: int | None,
         api_key: str | None,
+        browser_session_id: str | None,
         **kwargs: dict,
     ) -> None:
         pass
@@ -39,6 +40,7 @@ class AsyncExecutor(abc.ABC):
         workflow_run_id: str,
         max_steps_override: int | None,
         api_key: str | None,
+        browser_session_id: str | None,
         **kwargs: dict,
     ) -> None:
         pass
@@ -51,6 +53,7 @@ class AsyncExecutor(abc.ABC):
         organization_id: str,
         observer_cruise_id: str,
         max_iterations_override: int | None,
+        browser_session_id: str | None,
         **kwargs: dict,
     ) -> None:
         pass
@@ -65,6 +68,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         organization_id: str,
         max_steps_override: int | None,
         api_key: str | None,
+        browser_session_id: str | None,
         **kwargs: dict,
     ) -> None:
         LOG.info("Executing task using background task executor", task_id=task_id)
@@ -98,6 +102,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 task,
                 step,
                 api_key,
+                browser_session_id=browser_session_id,
             )
 
     async def execute_workflow(
@@ -109,6 +114,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         workflow_run_id: str,
         max_steps_override: int | None,
         api_key: str | None,
+        browser_session_id: str | None,
         **kwargs: dict,
     ) -> None:
         LOG.info(
@@ -126,6 +132,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 workflow_run_id=workflow_run_id,
                 api_key=api_key,
                 organization=organization,
+                browser_session_id=browser_session_id,
             )
 
     async def execute_cruise(
@@ -135,6 +142,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         organization_id: str,
         observer_cruise_id: str,
         max_iterations_override: int | None,
+        browser_session_id: str | None,
         **kwargs: dict,
     ) -> None:
         LOG.info(
@@ -169,4 +177,5 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 organization=organization,
                 observer_cruise_id=observer_cruise_id,
                 max_iterations_override=max_iterations_override,
+                browser_session_id=browser_session_id,
             )
