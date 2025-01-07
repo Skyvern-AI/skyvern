@@ -368,6 +368,7 @@ class ForgeAgent:
                         last_step=last_step,
                         api_key=api_key,
                         close_browser_on_completion=close_browser_on_completion,
+                        browser_session_id=browser_session_id,
                     )
                     return last_step, detailed_output, None
 
@@ -384,6 +385,7 @@ class ForgeAgent:
                         last_step=step,
                         api_key=api_key,
                         close_browser_on_completion=close_browser_on_completion,
+                        browser_session_id=browser_session_id,
                     )
                     return step, detailed_output, None
             elif step.status == StepStatus.completed:
@@ -406,6 +408,7 @@ class ForgeAgent:
                         last_step=last_step,
                         api_key=api_key,
                         close_browser_on_completion=close_browser_on_completion,
+                        browser_session_id=browser_session_id,
                     )
                     return last_step, detailed_output, None
                 elif maybe_next_step:
@@ -479,6 +482,7 @@ class ForgeAgent:
                     last_step=step,
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
+                    browser_session_id=browser_session_id,
                 )
             else:
                 LOG.warning(
@@ -514,6 +518,7 @@ class ForgeAgent:
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
                     need_final_screenshot=False,
+                    browser_session_id=browser_session_id,
                 )
             else:
                 LOG.warning(
@@ -532,6 +537,7 @@ class ForgeAgent:
                 last_step=step,
                 api_key=api_key,
                 need_call_webhook=False,
+                browser_session_id=browser_session_id,
             )
             return step, detailed_output, None
         except InvalidTaskStatusTransition:
@@ -546,6 +552,7 @@ class ForgeAgent:
                 last_step=step,
                 api_key=api_key,
                 need_call_webhook=False,
+                browser_session_id=browser_session_id,
             )
             return step, detailed_output, None
         except (UnsupportedActionType, UnsupportedTaskType, FailedToParseActionInstruction) as e:
@@ -562,6 +569,7 @@ class ForgeAgent:
                 last_step=step,
                 api_key=api_key,
                 need_call_webhook=False,
+                browser_session_id=browser_session_id,
             )
             return step, detailed_output, None
 
@@ -583,6 +591,7 @@ class ForgeAgent:
                     last_step=step,
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
+                    browser_session_id=browser_session_id,
                 )
             else:
                 LOG.warning(
@@ -1463,6 +1472,7 @@ class ForgeAgent:
         need_call_webhook: bool = True,
         close_browser_on_completion: bool = True,
         need_final_screenshot: bool = True,
+        browser_session_id: str | None = None,
     ) -> None:
         """
         send the task response to the webhook callback url
@@ -1542,7 +1552,9 @@ class ForgeAgent:
                 )
 
         await self.async_operation_pool.remove_task(task.task_id)
-        await self.cleanup_browser_and_create_artifacts(close_browser_on_completion, last_step, task)
+        await self.cleanup_browser_and_create_artifacts(
+            close_browser_on_completion, last_step, task, browser_session_id=browser_session_id
+        )
 
         # Wait for all tasks to complete before generating the links for the artifacts
         await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([task.task_id])
@@ -1711,7 +1723,11 @@ class ForgeAgent:
         )
 
     async def cleanup_browser_and_create_artifacts(
-        self, close_browser_on_completion: bool, last_step: Step, task: Task
+        self,
+        close_browser_on_completion: bool,
+        last_step: Step,
+        task: Task,
+        browser_session_id: str | None = None,
     ) -> None:
         """
         Developer notes: we should not expect any exception to be raised here.
@@ -1719,7 +1735,9 @@ class ForgeAgent:
         If errors are raised and not caught inside this function, please catch and handle them.
         """
         # We need to close the browser even if there is no webhook callback url or api key
-        browser_state = await app.BROWSER_MANAGER.cleanup_for_task(task.task_id, close_browser_on_completion)
+        browser_state = await app.BROWSER_MANAGER.cleanup_for_task(
+            task.task_id, close_browser_on_completion, browser_session_id
+        )
         if browser_state:
             # Update recording artifact after closing the browser, so we can get an accurate recording
             video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(

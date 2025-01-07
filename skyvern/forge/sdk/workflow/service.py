@@ -865,6 +865,7 @@ class WorkflowService:
         api_key: str | None = None,
         close_browser_on_completion: bool = True,
         need_call_webhook: bool = True,
+        browser_session_id: str | None = None,
     ) -> None:
         analytics.capture("skyvern-oss-agent-workflow-status", {"status": workflow_run.status})
         tasks = await self.get_tasks_by_workflow_run_id(workflow_run.workflow_run_id)
@@ -873,6 +874,7 @@ class WorkflowService:
             workflow_run.workflow_run_id,
             all_workflow_task_ids,
             close_browser_on_completion,
+            browser_session_id,
         )
         if browser_state:
             await self.persist_video_data(browser_state, workflow, workflow_run)

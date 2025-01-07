@@ -259,7 +259,12 @@ class BrowserManager:
         cls.pages = dict()
         LOG.info("BrowserManger is closed")
 
-    async def cleanup_for_task(self, task_id: str, close_browser_on_completion: bool = True) -> BrowserState | None:
+    async def cleanup_for_task(
+        self,
+        task_id: str,
+        close_browser_on_completion: bool = True,
+        browser_session_id: str | None = None,
+    ) -> BrowserState | None:
         """
         Developer notes: handle errors here. Do not raise error from this function.
         If error occurs, log it and address the cleanup error.
@@ -275,6 +280,10 @@ class BrowserManager:
             await browser_state_to_close.close(close_browser_on_completion=close_browser_on_completion)
         LOG.info("Task is cleaned up")
 
+        if browser_session_id:
+            await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(browser_session_id)
+            LOG.info("Released browser session", browser_session_id=browser_session_id)
+
         return browser_state_to_close
 
     async def cleanup_for_workflow_run(
@@ -282,6 +291,7 @@ class BrowserManager:
         workflow_run_id: str,
         task_ids: list[str],
         close_browser_on_completion: bool = True,
+        browser_session_id: str | None = None,
     ) -> BrowserState | None:
         LOG.info("Cleaning up for workflow run")
         browser_state_to_close = self.pages.pop(workflow_run_id, None)
@@ -307,5 +317,9 @@ class BrowserManager:
                     workflow_run_id=workflow_run_id,
                 )
         LOG.info("Workflow run is cleaned up")
+
+        if browser_session_id:
+            await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(browser_session_id)
+            LOG.info("Released browser session", browser_session_id=browser_session_id)
 
         return browser_state_to_close

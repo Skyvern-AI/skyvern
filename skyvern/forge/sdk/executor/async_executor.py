@@ -73,6 +73,8 @@ class BackgroundTaskExecutor(AsyncExecutor):
     ) -> None:
         LOG.info("Executing task using background task executor", task_id=task_id)
 
+        close_browser_on_completion = browser_session_id is None
+
         organization = await app.DATABASE.get_organization(organization_id)
         if organization is None:
             raise OrganizationNotFound(organization_id)
@@ -102,6 +104,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 task,
                 step,
                 api_key,
+                close_browser_on_completion=close_browser_on_completion,
                 browser_session_id=browser_session_id,
             )
 
