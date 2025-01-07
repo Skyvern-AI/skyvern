@@ -15,6 +15,7 @@ class SkyvernContext:
     tz_info: ZoneInfo | None = None
     totp_codes: dict[str, str | None] = field(default_factory=dict)
     log: list[dict] = field(default_factory=list)
+    hashed_href_map: dict[str, str] = field(default_factory=dict)
 
     def __repr__(self) -> str:
         return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, max_steps_override={self.max_steps_override})"

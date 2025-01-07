@@ -764,7 +764,7 @@ async def get_workflow_run_timeline(
             organization_id=current_org.organization_id,
         )
         workflow_run_block_timeline.extend(observer_thought_timeline)
-    workflow_run_block_timeline.sort(key=lambda x: x.created_at)
+    workflow_run_block_timeline.sort(key=lambda x: x.created_at, reverse=True)
     return workflow_run_block_timeline
 
 

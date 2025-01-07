@@ -6,6 +6,7 @@ from typing import Any
 
 import litellm
 import structlog
+from jinja2 import Template
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -19,6 +20,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 from skyvern.forge.sdk.api.llm.models import LLMAPIHandler, LLMConfig, LLMRouterConfig
 from skyvern.forge.sdk.api.llm.utils import llm_messages_builder, parse_api_response
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverThought
 
@@ -78,6 +80,16 @@ class LLMAPIHandlerFactory:
             """
             if parameters is None:
                 parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
+
+            context = skyvern_context.current()
+            if context and len(context.hashed_href_map) > 0:
+                await app.ARTIFACT_MANAGER.create_llm_artifact(
+                    data=json.dumps(context.hashed_href_map, indent=2).encode("utf-8"),
+                    artifact_type=ArtifactType.HASHED_HREF_MAP,
+                    step=step,
+                    observer_cruise=observer_cruise,
+                    observer_thought=observer_thought,
+                )
 
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=prompt.encode("utf-8"),
@@ -149,6 +161,19 @@ class LLMAPIHandlerFactory:
                 observer_cruise=observer_cruise,
                 observer_thought=observer_thought,
             )
+
+            if context and len(context.hashed_href_map) > 0:
+                llm_content = json.dumps(parsed_response)
+                rendered_content = Template(llm_content).render(context.hashed_href_map)
+                parsed_response = json.loads(rendered_content)
+                await app.ARTIFACT_MANAGER.create_llm_artifact(
+                    data=json.dumps(parsed_response, indent=2).encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
+                    step=step,
+                    observer_cruise=observer_cruise,
+                    observer_thought=observer_thought,
+                )
+
             return parsed_response
 
         return llm_api_handler_with_router_and_fallback
@@ -177,6 +202,16 @@ class LLMAPIHandlerFactory:
             active_parameters.update(parameters)
             if llm_config.litellm_params:  # type: ignore
                 active_parameters.update(llm_config.litellm_params)  # type: ignore
+
+            context = skyvern_context.current()
+            if context and len(context.hashed_href_map) > 0:
+                await app.ARTIFACT_MANAGER.create_llm_artifact(
+                    data=json.dumps(context.hashed_href_map, indent=2).encode("utf-8"),
+                    artifact_type=ArtifactType.HASHED_HREF_MAP,
+                    step=step,
+                    observer_cruise=observer_cruise,
+                    observer_thought=observer_thought,
+                )
 
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=prompt.encode("utf-8"),
@@ -261,6 +296,19 @@ class LLMAPIHandlerFactory:
                 observer_cruise=observer_cruise,
                 observer_thought=observer_thought,
             )
+
+            if context and len(context.hashed_href_map) > 0:
+                llm_content = json.dumps(parsed_response)
+                rendered_content = Template(llm_content).render(context.hashed_href_map)
+                parsed_response = json.loads(rendered_content)
+                await app.ARTIFACT_MANAGER.create_llm_artifact(
+                    data=json.dumps(parsed_response, indent=2).encode("utf-8"),
+                    artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
+                    step=step,
+                    observer_cruise=observer_cruise,
+                    observer_thought=observer_thought,
+                )
+
             return parsed_response
 
         return llm_api_handler

@@ -26,6 +26,7 @@ export type WorkflowRunBlock = {
   parent_workflow_run_block_id: string | null;
   block_type: WorkflowBlockType;
   label: string | null;
+  description: string | null;
   title: string | null;
   status: Status | null;
   failure_reason: string | null;

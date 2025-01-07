@@ -31,7 +31,7 @@ function WorkflowRunTimelineBlockItem({
   onBlockItemClick,
   onActionClick,
 }: Props) {
-  const actions = block.actions ? [...block.actions].reverse() : [];
+  const actions = block.actions ?? [];
 
   const hasActiveAction =
     isAction(activeItem) &&
@@ -78,30 +78,36 @@ function WorkflowRunTimelineBlockItem({
       }}
       ref={refCallback}
     >
-      <div className="flex justify-between">
-        <div className="flex gap-3">
-          <WorkflowBlockIcon
-            workflowBlockType={block.block_type}
-            className="size-6"
-          />
-          <span>{workflowBlockTitle[block.block_type]}</span>
+      <div className="space-y-2">
+        <div className="flex justify-between">
+          <div className="flex gap-3">
+            <WorkflowBlockIcon
+              workflowBlockType={block.block_type}
+              className="size-6"
+            />
+            <span>{workflowBlockTitle[block.block_type]}</span>
+          </div>
+          <div className="flex items-center gap-1 rounded bg-slate-elevation5 px-2 py-1">
+            {showDiagnosticLink ? (
+              <Link to={`/tasks/${block.task_id}/diagnostics`}>
+                <div className="flex gap-1">
+                  <ExternalLinkIcon className="size-4" />
+                  <span className="text-xs">Diagnostics</span>
+                </div>
+              </Link>
+            ) : (
+              <>
+                <CubeIcon className="size-4" />
+                <span className="text-xs">Block</span>
+              </>
+            )}
+          </div>
         </div>
-        <div className="flex items-center gap-1 rounded bg-slate-elevation5 px-2 py-1">
-          {showDiagnosticLink ? (
-            <Link to={`/tasks/${block.task_id}/diagnostics`}>
-              <div className="flex gap-1">
-                <ExternalLinkIcon className="size-4" />
-                <span className="text-xs">Diagnostics</span>
-              </div>
-            </Link>
-          ) : (
-            <>
-              <CubeIcon className="size-4" />
-              <span className="text-xs">Block</span>
-            </>
-          )}
-        </div>
+        {block.description ? (
+          <div className="text-xs text-slate-400">{block.description}</div>
+        ) : null}
       </div>
+
       {actions.map((action, index) => {
         return (
           <ActionCard
