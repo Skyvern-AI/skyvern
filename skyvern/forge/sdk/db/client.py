@@ -2257,10 +2257,9 @@ class AgentDB:
         """Get all active persistent browser sessions for an organization."""
         async with self.Session() as session:
             result = await session.execute(
-                select(PersistentBrowserSessionModel).where(
-                    PersistentBrowserSessionModel.organization_id == organization_id,
-                    PersistentBrowserSessionModel.deleted_at.is_(None),
-                )
+                select(PersistentBrowserSessionModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(deleted_at=None)
             )
             sessions = result.scalars().all()
             return [PersistentBrowserSession.model_validate(session) for session in sessions]
@@ -2271,10 +2270,10 @@ class AgentDB:
         """Get a specific persistent browser session."""
         async with self.Session() as session:
             result = await session.execute(
-                select(PersistentBrowserSessionModel).where(
-                    PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
-                    PersistentBrowserSessionModel.organization_id == organization_id,
-                )
+                select(PersistentBrowserSessionModel)
+                .filter_by(persistent_browser_session_id=session_id)
+                .filter_by(organization_id=organization_id)
+                .filter_by(deleted_at=None)
             )
             return result.scalar_one_or_none()
 
@@ -2305,10 +2304,8 @@ class AgentDB:
         async with self.Session() as session:
             await session.execute(
                 update(PersistentBrowserSessionModel)
-                .where(
-                    PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
-                    PersistentBrowserSessionModel.organization_id == organization_id,
-                )
+                .filter_by(persistent_browser_session_id=session_id)
+                .filter_by(organization_id=organization_id)
                 .values(deleted_at=datetime.utcnow())
             )
             await session.commit()
@@ -2318,10 +2315,8 @@ class AgentDB:
         async with self.Session() as session:
             await session.execute(
                 update(PersistentBrowserSessionModel)
-                .where(
-                    PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
-                    PersistentBrowserSessionModel.deleted_at.is_(None),
-                )
+                .filter_by(persistent_browser_session_id=session_id)
+                .filter_by(deleted_at=None)
                 .values(runnable_type=runnable_type, runnable_id=runnable_id)
             )
             await session.commit()
@@ -2331,9 +2326,7 @@ class AgentDB:
         async with self.Session() as session:
             await session.execute(
                 update(PersistentBrowserSessionModel)
-                .where(
-                    PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
-                )
+                .filter_by(persistent_browser_session_id=session_id)
                 .values(runnable_type=None, runnable_id=None)
             )
             await session.commit()
@@ -2342,6 +2335,6 @@ class AgentDB:
         """Get all active persistent browser sessions across all organizations."""
         async with self.Session() as session:
             result = await session.execute(
-                select(PersistentBrowserSessionModel).where(PersistentBrowserSessionModel.deleted_at.is_(None))
+                select(PersistentBrowserSessionModel).filter_by(deleted_at=None)
             )
             return result.scalars().all()
