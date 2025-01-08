@@ -69,7 +69,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
 from skyvern.webeye.actions.actions import Action
-from skyvern.webeye.models import BrowserSessionResponse
+from skyvern.webeye.schemas import BrowserSessionResponse
 
 base_router = APIRouter()
 
