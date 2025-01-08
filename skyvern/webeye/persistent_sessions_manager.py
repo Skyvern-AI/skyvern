@@ -31,11 +31,8 @@ class PersistentSessionsManager:
     def __new__(cls, database: AgentDB) -> PersistentSessionsManager:
         if cls.instance is None:
             cls.instance = super().__new__(cls)
-            cls.instance.database = database
+        cls.instance.database = database
         return cls.instance
-
-    def __init__(self, database: AgentDB) -> None:
-        self.database = database
 
     async def get_active_sessions(self, organization_id: str) -> List[PersistentBrowserSession]:
         """Get all active sessions for an organization."""
@@ -88,7 +85,7 @@ class PersistentSessionsManager:
         )
 
         async def on_context_close() -> None:
-            await self.close_session(organization_id, session_id)
+            await self._clean_up_on_session_close(session_id, organization_id)
 
         browser_context.on("close", lambda: asyncio.create_task(on_context_close()))
 
@@ -149,6 +146,13 @@ class PersistentSessionsManager:
     async def release_browser_session(self, session_id: str, organization_id: str) -> None:
         """Release a specific browser session."""
         await self.database.release_persistent_browser_session(session_id, organization_id)
+
+    async def _clean_up_on_session_close(self, session_id: str, organization_id: str) -> None:
+        """Clean up session data when browser session is closed"""
+        browser_session = self._browser_sessions.get(session_id)
+        if browser_session:
+            await self.database.mark_persistent_browser_session_deleted(session_id, organization_id)
+            self._browser_sessions.pop(session_id, None)
 
     async def close_session(self, organization_id: str, session_id: str) -> None:
         """Close a specific browser session."""

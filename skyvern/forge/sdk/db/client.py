@@ -2327,7 +2327,13 @@ class AgentDB:
         """Mark a persistent browser session as deleted."""
         try:
             async with self.Session() as session:
-                persistent_browser_session = await self.get_persistent_browser_session(session_id, organization_id)
+                persistent_browser_session = (
+                    await session.scalars(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(persistent_browser_session_id=session_id)
+                        .filter_by(organization_id=organization_id)
+                    )
+                ).first()
                 if persistent_browser_session:
                     persistent_browser_session.deleted_at = datetime.utcnow()
                     await session.commit()
@@ -2350,7 +2356,14 @@ class AgentDB:
         """Occupy a specific persistent browser session."""
         try:
             async with self.Session() as session:
-                persistent_browser_session = await self.get_persistent_browser_session(session_id, organization_id)
+                persistent_browser_session = (
+                    await session.scalars(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(persistent_browser_session_id=session_id)
+                        .filter_by(organization_id=organization_id)
+                        .filter_by(deleted_at=None)
+                    )
+                ).first()
                 if persistent_browser_session:
                     persistent_browser_session.runnable_type = runnable_type
                     persistent_browser_session.runnable_id = runnable_id
@@ -2372,7 +2385,14 @@ class AgentDB:
         """Release a specific persistent browser session."""
         try:
             async with self.Session() as session:
-                persistent_browser_session = await self.get_persistent_browser_session(session_id, organization_id)
+                persistent_browser_session = (
+                    await session.scalars(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(persistent_browser_session_id=session_id)
+                        .filter_by(organization_id=organization_id)
+                        .filter_by(deleted_at=None)
+                    )
+                ).first()
                 if persistent_browser_session:
                     persistent_browser_session.runnable_type = None
                     persistent_browser_session.runnable_id = None
