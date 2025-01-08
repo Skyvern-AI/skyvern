@@ -1,3 +1,4 @@
+from __future__ import annotations
 from datetime import datetime
 
 from pydantic import BaseModel
@@ -15,7 +16,7 @@ class BrowserSessionResponse(BaseModel):
     deleted_at: datetime | None = None
 
     @classmethod
-    def from_browser_session(cls, browser_session: PersistentBrowserSession) -> "BrowserSessionResponse":
+    def from_browser_session(cls, browser_session: PersistentBrowserSession) -> BrowserSessionResponse:
         return cls(
             session_id=browser_session.persistent_browser_session_id,
             organization_id=browser_session.organization_id,
