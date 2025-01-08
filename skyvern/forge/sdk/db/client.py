@@ -2285,15 +2285,15 @@ class AgentDB:
     ) -> PersistentBrowserSessionModel:
         """Create a new persistent browser session."""
         async with self.Session() as session:
-            db_session = PersistentBrowserSessionModel(
+            browser_session = PersistentBrowserSessionModel(
                 organization_id=organization_id,
                 runnable_type=runnable_type,
                 runnable_id=runnable_id,
             )
-            session.add(db_session)
+            session.add(browser_session)
             await session.commit()
-            await session.refresh(db_session)
-            return PersistentBrowserSession.model_validate(db_session)
+            await session.refresh(browser_session)
+            return PersistentBrowserSession.model_validate(browser_session)
 
     async def mark_persistent_browser_session_deleted(self, session_id: str, organization_id: str) -> None:
         """Mark a persistent browser session as deleted."""
