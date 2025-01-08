@@ -26,12 +26,16 @@ class BrowserSession:
 class PersistentSessionsManager:
     instance = None
     _browser_sessions: Dict[str, BrowserSession] = dict()
+    database: AgentDB
 
     def __new__(cls, database: AgentDB) -> PersistentSessionsManager:
         if cls.instance is None:
             cls.instance = super().__new__(cls)
             cls.instance.database = database
         return cls.instance
+
+    def __init__(self, database: AgentDB) -> None:
+        self.database = database
 
     async def get_active_sessions(self, organization_id: str) -> List[PersistentBrowserSession]:
         """Get all active sessions for an organization."""

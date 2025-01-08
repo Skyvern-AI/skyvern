@@ -293,6 +293,15 @@ class BrowserArtifacts(BaseModel):
                 return await f.read()
 
 
+def _get_cdp_port(kwargs: dict) -> int | None:
+    raw_cdp_port = kwargs.get("cdp_port")
+    if isinstance(raw_cdp_port, (int, str)):
+        try:
+            return int(raw_cdp_port)
+        except (ValueError, TypeError):
+            return None
+
+
 async def _create_headless_chromium(
     playwright: Playwright, proxy_location: ProxyLocation | None = None, **kwargs: dict
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
@@ -302,11 +311,8 @@ async def _create_headless_chromium(
         user_data_dir=user_data_dir,
         download_dir=download_dir,
     )
-    cdp_port = kwargs.get("cdp_port")
-    browser_args = BrowserContextFactory.build_browser_args(
-        proxy_location=proxy_location,
-        cdp_port=cdp_port
-    )
+    cdp_port: int | None = _get_cdp_port(kwargs)
+    browser_args = BrowserContextFactory.build_browser_args(proxy_location=proxy_location, cdp_port=cdp_port)
     browser_args.update(
         {
             "user_data_dir": user_data_dir,
@@ -328,11 +334,8 @@ async def _create_headful_chromium(
         user_data_dir=user_data_dir,
         download_dir=download_dir,
     )
-    cdp_port = kwargs.get("cdp_port")
-    browser_args = BrowserContextFactory.build_browser_args(
-        proxy_location=proxy_location,
-        cdp_port=cdp_port
-    )
+    cdp_port: int | None = _get_cdp_port(kwargs)
+    browser_args = BrowserContextFactory.build_browser_args(proxy_location=proxy_location, cdp_port=cdp_port)
     browser_args.update(
         {
             "user_data_dir": user_data_dir,
