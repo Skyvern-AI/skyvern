@@ -27,9 +27,6 @@ class PersistentSessionsManager:
     instance = None
     _browser_sessions: Dict[str, BrowserSession] = dict()
 
-    def __init__(self, database: AgentDB):
-        self.database = database
-
     def __new__(cls, database: AgentDB) -> PersistentSessionsManager:
         if cls.instance is None:
             cls.instance = super().__new__(cls)
