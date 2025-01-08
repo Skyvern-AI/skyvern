@@ -126,9 +126,15 @@ class PersistentSessionsManager:
         session_id: str,
         runnable_type: str,
         runnable_id: str,
+        organization_id: str,
     ) -> None:
         """Occupy a specific browser session."""
-        await self.database.occupy_persistent_browser_session(session_id, runnable_type, runnable_id)
+        await self.database.occupy_persistent_browser_session(
+            session_id=session_id,
+            runnable_type=runnable_type,
+            runnable_id=runnable_id,
+            organization_id=organization_id,
+        )
 
     async def get_network_info(self, session_id: str) -> Tuple[Optional[int], Optional[str]]:
         """Returns cdp port and ip address of the browser session"""
@@ -140,9 +146,9 @@ class PersistentSessionsManager:
             )
         return None, None
 
-    async def release_browser_session(self, session_id: str) -> None:
+    async def release_browser_session(self, session_id: str, organization_id: str) -> None:
         """Release a specific browser session."""
-        await self.database.release_persistent_browser_session(session_id)
+        await self.database.release_persistent_browser_session(session_id, organization_id)
 
     async def close_session(self, organization_id: str, session_id: str) -> None:
         """Close a specific browser session."""

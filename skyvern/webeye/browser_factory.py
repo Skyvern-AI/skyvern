@@ -300,6 +300,7 @@ def _get_cdp_port(kwargs: dict) -> int | None:
             return int(raw_cdp_port)
         except (ValueError, TypeError):
             return None
+    return None
 
 
 async def _create_headless_chromium(
