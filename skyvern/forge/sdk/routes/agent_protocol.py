@@ -36,6 +36,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
 from skyvern.forge.sdk.schemas.observers import CruiseRequest, ObserverCruise
 from skyvern.forge.sdk.schemas.organizations import (
     GetOrganizationAPIKeysResponse,
@@ -936,6 +937,38 @@ async def get_workflow(
         organization_id=current_org.organization_id,
         version=version,
     )
+
+
+class AISuggestionType(str, Enum):
+    DATA_SCHEMA = "data_schema"
+
+
+@base_router.post("/suggest/{ai_suggestion_type}", include_in_schema=False)
+@base_router.post("/suggest/{ai_suggestion_type}/")
+async def make_ai_suggestion(
+    ai_suggestion_type: AISuggestionType,
+    data: AISuggestionRequest,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> AISuggestionBase:
+    llm_prompt = ""
+
+    if ai_suggestion_type == AISuggestionType.DATA_SCHEMA:
+        llm_prompt = prompt_engine.load_prompt("suggest-data-schema", input=data.input)
+
+    try:
+        new_ai_suggestion = await app.DATABASE.create_ai_suggestion(
+            organization_id=current_org.organization_id,
+            ai_suggestion_type=ai_suggestion_type,
+        )
+
+        llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt, ai_suggestion=new_ai_suggestion)
+        parsed_ai_suggestion = AISuggestionBase.model_validate(llm_response)
+
+        return parsed_ai_suggestion
+
+    except LLMProviderError:
+        LOG.error("Failed to suggest data schema", exc_info=True)
+        raise HTTPException(status_code=400, detail="Failed to suggest data schema. Please try again later.")
 
 
 @base_router.post("/generate/task", include_in_schema=False)

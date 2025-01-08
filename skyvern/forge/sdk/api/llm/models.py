@@ -4,6 +4,7 @@ from typing import Any, Awaitable, Literal, Optional, Protocol, TypedDict
 from litellm import AllowedFailsPolicy
 
 from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverThought
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
@@ -81,6 +82,7 @@ class LLMAPIHandler(Protocol):
         step: Step | None = None,
         observer_cruise: ObserverCruise | None = None,
         observer_thought: ObserverThought | None = None,
+        ai_suggestion: AISuggestion | None = None,
         screenshots: list[bytes] | None = None,
         parameters: dict[str, Any] | None = None,
     ) -> Awaitable[dict[str, Any]]: ...

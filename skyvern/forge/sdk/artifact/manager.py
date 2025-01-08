@@ -8,6 +8,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverThought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
@@ -30,6 +31,7 @@ class ArtifactManager:
         workflow_run_block_id: str | None = None,
         observer_thought_id: str | None = None,
         observer_cruise_id: str | None = None,
+        ai_suggestion_id: str | None = None,
         organization_id: str | None = None,
         data: bytes | None = None,
         path: str | None = None,
@@ -49,6 +51,7 @@ class ArtifactManager:
             observer_thought_id=observer_thought_id,
             observer_cruise_id=observer_cruise_id,
             organization_id=organization_id,
+            ai_suggestion_id=ai_suggestion_id,
         )
         if data:
             # Fire and forget
@@ -173,6 +176,26 @@ class ArtifactManager:
             path=path,
         )
 
+    async def create_ai_suggestion_artifact(
+        self,
+        ai_suggestion: AISuggestion,
+        artifact_type: ArtifactType,
+        data: bytes | None = None,
+        path: str | None = None,
+    ) -> str:
+        artifact_id = generate_artifact_id()
+        uri = app.STORAGE.build_ai_suggestion_uri(artifact_id, ai_suggestion, artifact_type)
+        return await self._create_artifact(
+            aio_task_primary_key=ai_suggestion.ai_suggestion_id,
+            artifact_id=artifact_id,
+            artifact_type=artifact_type,
+            uri=uri,
+            ai_suggestion_id=ai_suggestion.ai_suggestion_id,
+            organization_id=ai_suggestion.organization_id,
+            data=data,
+            path=path,
+        )
+
     async def create_llm_artifact(
         self,
         data: bytes,
@@ -181,6 +204,7 @@ class ArtifactManager:
         step: Step | None = None,
         observer_thought: ObserverThought | None = None,
         observer_cruise: ObserverCruise | None = None,
+        ai_suggestion: AISuggestion | None = None,
     ) -> None:
         if step:
             await self.create_artifact(
@@ -215,6 +239,18 @@ class ArtifactManager:
             for screenshot in screenshots or []:
                 await self.create_observer_thought_artifact(
                     observer_thought=observer_thought,
+                    artifact_type=ArtifactType.SCREENSHOT_LLM,
+                    data=screenshot,
+                )
+        elif ai_suggestion:
+            await self.create_ai_suggestion_artifact(
+                ai_suggestion=ai_suggestion,
+                artifact_type=artifact_type,
+                data=data,
+            )
+            for screenshot in screenshots or []:
+                await self.create_ai_suggestion_artifact(
+                    ai_suggestion=ai_suggestion,
                     artifact_type=ArtifactType.SCREENSHOT_LLM,
                     data=screenshot,
                 )
