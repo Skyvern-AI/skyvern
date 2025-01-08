@@ -1,6 +1,6 @@
 import json
 from datetime import datetime, timedelta
-from typing import Any, Sequence
+from typing import Any, List, Optional, Sequence
 
 import structlog
 from sqlalchemy import and_, delete, func, select, update
@@ -24,6 +24,7 @@ from skyvern.forge.sdk.db.models import (
     OrganizationAuthTokenModel,
     OrganizationModel,
     OutputParameterModel,
+    PersistentBrowserSessionModel,
     StepModel,
     TaskGenerationModel,
     TaskModel,
@@ -62,6 +63,7 @@ from skyvern.forge.sdk.schemas.observers import (
     ObserverThoughtType,
 )
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.tasks import OrderBy, ProxyLocation, SortDirection, Task, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
@@ -2251,3 +2253,173 @@ class AgentDB:
                 convert_to_workflow_run_block(workflow_run_block, task=tasks_dict.get(workflow_run_block.task_id))
                 for workflow_run_block in workflow_run_blocks
             ]
+
+    async def get_active_persistent_browser_sessions(self, organization_id: str) -> List[PersistentBrowserSession]:
+        """Get all active persistent browser sessions for an organization."""
+        try:
+            async with self.Session() as session:
+                result = await session.execute(
+                    select(PersistentBrowserSessionModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(deleted_at=None)
+                )
+                sessions = result.scalars().all()
+                return [PersistentBrowserSession.model_validate(session) for session in sessions]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_persistent_browser_session(
+        self, session_id: str, organization_id: str
+    ) -> Optional[PersistentBrowserSessionModel]:
+        """Get a specific persistent browser session."""
+        try:
+            async with self.Session() as session:
+                persistent_browser_session = (
+                    await session.scalars(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(persistent_browser_session_id=session_id)
+                        .filter_by(organization_id=organization_id)
+                        .filter_by(deleted_at=None)
+                    )
+                ).first()
+                if persistent_browser_session:
+                    return PersistentBrowserSession.model_validate(persistent_browser_session)
+                raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
+        except NotFoundError:
+            LOG.error("NotFoundError", exc_info=True)
+            raise
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def create_persistent_browser_session(
+        self,
+        organization_id: str,
+        runnable_type: str | None = None,
+        runnable_id: str | None = None,
+    ) -> PersistentBrowserSessionModel:
+        """Create a new persistent browser session."""
+        try:
+            async with self.Session() as session:
+                browser_session = PersistentBrowserSessionModel(
+                    organization_id=organization_id,
+                    runnable_type=runnable_type,
+                    runnable_id=runnable_id,
+                )
+                session.add(browser_session)
+                await session.commit()
+                await session.refresh(browser_session)
+                return PersistentBrowserSession.model_validate(browser_session)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def mark_persistent_browser_session_deleted(self, session_id: str, organization_id: str) -> None:
+        """Mark a persistent browser session as deleted."""
+        try:
+            async with self.Session() as session:
+                persistent_browser_session = (
+                    await session.scalars(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(persistent_browser_session_id=session_id)
+                        .filter_by(organization_id=organization_id)
+                    )
+                ).first()
+                if persistent_browser_session:
+                    persistent_browser_session.deleted_at = datetime.utcnow()
+                    await session.commit()
+                    await session.refresh(persistent_browser_session)
+                else:
+                    raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
+        except NotFoundError:
+            LOG.error("NotFoundError", exc_info=True)
+            raise
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def occupy_persistent_browser_session(
+        self, session_id: str, runnable_type: str, runnable_id: str, organization_id: str
+    ) -> None:
+        """Occupy a specific persistent browser session."""
+        try:
+            async with self.Session() as session:
+                persistent_browser_session = (
+                    await session.scalars(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(persistent_browser_session_id=session_id)
+                        .filter_by(organization_id=organization_id)
+                        .filter_by(deleted_at=None)
+                    )
+                ).first()
+                if persistent_browser_session:
+                    persistent_browser_session.runnable_type = runnable_type
+                    persistent_browser_session.runnable_id = runnable_id
+                    await session.commit()
+                    await session.refresh(persistent_browser_session)
+                else:
+                    raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
+        except NotFoundError:
+            LOG.error("NotFoundError", exc_info=True)
+            raise
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def release_persistent_browser_session(self, session_id: str, organization_id: str) -> None:
+        """Release a specific persistent browser session."""
+        try:
+            async with self.Session() as session:
+                persistent_browser_session = (
+                    await session.scalars(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(persistent_browser_session_id=session_id)
+                        .filter_by(organization_id=organization_id)
+                        .filter_by(deleted_at=None)
+                    )
+                ).first()
+                if persistent_browser_session:
+                    persistent_browser_session.runnable_type = None
+                    persistent_browser_session.runnable_id = None
+                    await session.commit()
+                    await session.refresh(persistent_browser_session)
+                else:
+                    raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except NotFoundError:
+            LOG.error("NotFoundError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_all_active_persistent_browser_sessions(self) -> List[PersistentBrowserSessionModel]:
+        """Get all active persistent browser sessions across all organizations."""
+        try:
+            async with self.Session() as session:
+                result = await session.execute(select(PersistentBrowserSessionModel).filter_by(deleted_at=None))
+                return result.scalars().all()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise

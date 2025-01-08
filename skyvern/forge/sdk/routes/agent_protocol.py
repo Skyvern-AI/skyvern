@@ -69,6 +69,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
 from skyvern.webeye.actions.actions import Action
+from skyvern.webeye.schemas import BrowserSessionResponse
 
 base_router = APIRouter()
 
@@ -1123,3 +1124,97 @@ async def get_observer_cruise(
     if not observer_cruise:
         raise HTTPException(status_code=404, detail=f"Observer cruise {observer_cruise_id} not found")
     return observer_cruise
+
+
+@base_router.get(
+    "/browser_sessions/{browser_session_id}",
+    response_model=BrowserSessionResponse,
+)
+@base_router.get(
+    "/browser_sessions/{browser_session_id}/",
+    response_model=BrowserSessionResponse,
+    include_in_schema=False,
+)
+async def get_browser_session_by_id(
+    browser_session_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BrowserSessionResponse:
+    analytics.capture("skyvern-oss-agent-workflow-run-get")
+    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+        browser_session_id,
+        current_org.organization_id,
+    )
+    if not browser_session:
+        raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
+    return BrowserSessionResponse.from_browser_session(browser_session)
+
+
+@base_router.get(
+    "/browser_sessions",
+    response_model=list[BrowserSessionResponse],
+)
+@base_router.get(
+    "/browser_sessions/",
+    response_model=list[BrowserSessionResponse],
+    include_in_schema=False,
+)
+async def get_browser_sessions(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> list[BrowserSessionResponse]:
+    """Get all active browser sessions for the organization"""
+    analytics.capture("skyvern-oss-agent-browser-sessions-get")
+    browser_sessions = await app.PERSISTENT_SESSIONS_MANAGER.get_active_sessions(current_org.organization_id)
+    return [BrowserSessionResponse.from_browser_session(browser_session) for browser_session in browser_sessions]
+
+
+@base_router.post(
+    "/browser_sessions",
+    response_model=BrowserSessionResponse,
+)
+@base_router.post(
+    "/browser_sessions/",
+    response_model=BrowserSessionResponse,
+    include_in_schema=False,
+)
+async def create_browser_session(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BrowserSessionResponse:
+    browser_session, _ = await app.PERSISTENT_SESSIONS_MANAGER.create_session(current_org.organization_id)
+    return BrowserSessionResponse.from_browser_session(browser_session)
+
+
+@base_router.post(
+    "/browser_sessions/close",
+)
+@base_router.post(
+    "/browser_sessions/close/",
+    include_in_schema=False,
+)
+async def close_browser_sessions(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ORJSONResponse:
+    await app.PERSISTENT_SESSIONS_MANAGER.close_all_sessions(current_org.organization_id)
+    return ORJSONResponse(
+        content={"message": "All browser sessions closed"},
+        status_code=200,
+        media_type="application/json",
+    )
+
+
+@base_router.post(
+    "/browser_sessions/{session_id}/close",
+)
+@base_router.post(
+    "/browser_sessions/{session_id}/close/",
+    include_in_schema=False,
+)
+async def close_browser_session(
+    session_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ORJSONResponse:
+    await app.PERSISTENT_SESSIONS_MANAGER.close_session(current_org.organization_id, session_id)
+    return ORJSONResponse(
+        content={"message": "Browser session closed"},
+        status_code=200,
+        media_type="application/json",
+    )
