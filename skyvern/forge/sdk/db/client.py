@@ -2290,7 +2290,6 @@ class AgentDB:
                 runnable_type=runnable_type,
                 runnable_id=runnable_id,
             )
-            print(db_session)
             session.add(db_session)
             await session.commit()
             await session.refresh(db_session)
