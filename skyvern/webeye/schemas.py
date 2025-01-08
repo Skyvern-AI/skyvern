@@ -12,7 +12,7 @@ class BrowserSessionResponse(BaseModel):
     runnable_id: str | None = None
     created_at: datetime
     modified_at: datetime
-    deleted_at: datetime | None
+    deleted_at: datetime | None = None
 
     @classmethod
     def from_browser_session(cls, browser_session: PersistentBrowserSession) -> "BrowserSessionResponse":
