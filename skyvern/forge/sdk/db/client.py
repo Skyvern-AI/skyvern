@@ -2392,9 +2392,7 @@ class AgentDB:
         """Get all active persistent browser sessions across all organizations."""
         try:
             async with self.Session() as session:
-                result = await session.execute(
-                    select(PersistentBrowserSessionModel).filter_by(deleted_at=None)
-                )
+                result = await session.execute(select(PersistentBrowserSessionModel).filter_by(deleted_at=None))
                 return result.scalars().all()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
