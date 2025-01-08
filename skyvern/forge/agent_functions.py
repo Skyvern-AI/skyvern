@@ -267,6 +267,16 @@ async def _convert_css_shape_to_string(
 
         try:
             LOG.debug("call LLM to convert css shape to string shape", element_id=element_id)
+            if not await locater.is_visible(timeout=settings.BROWSER_ACTION_TIMEOUT_MS):
+                LOG.info(
+                    "element is not visible on the page, going to abort conversion",
+                    task_id=task_id,
+                    step_id=step_id,
+                    element_id=element_id,
+                    key=shape_key,
+                )
+                return None
+
             screenshot = await locater.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
             prompt = prompt_engine.load_prompt("css-shape-convert")
 

@@ -770,6 +770,21 @@ const isComboboxDropdown = (element) => {
   return role && haspopup && controls && readonly;
 };
 
+const isDivComboboxDropdown = (element) => {
+  const tagName = element.tagName.toLowerCase();
+  if (tagName !== "div") {
+    return false;
+  }
+  const role = element.getAttribute("role")
+    ? element.getAttribute("role").toLowerCase()
+    : "";
+  const haspopup = element.getAttribute("aria-haspopup")
+    ? element.getAttribute("aria-haspopup").toLowerCase()
+    : "";
+  const controls = element.hasAttribute("aria-controls");
+  return role === "combobox" && controls && haspopup;
+};
+
 const isDropdownButton = (element) => {
   const tagName = element.tagName.toLowerCase();
   const type = element.getAttribute("type")
@@ -1182,6 +1197,7 @@ function buildElementObject(frame, element, interactable, purgeable = false) {
       elementTagNameLower === "svg" || element.closest("svg") !== null,
     isSelectable:
       elementTagNameLower === "select" ||
+      isDivComboboxDropdown(element) ||
       isDropdownButton(element) ||
       isAngularDropdown(element) ||
       isSelect2Dropdown(element) ||
@@ -2083,9 +2099,12 @@ if (window.globalObserverForDOMIncrement === undefined) {
         }
         if (mutation.attributeName === "class") {
           const node = mutation.target;
+          if (node.nodeType === Node.TEXT_NODE) continue;
+          if (node.tagName.toLowerCase() === "body") continue;
+          if (!mutation.oldValue) continue;
           if (
-            !mutation.oldValue ||
-            !isClassNameIncludesHidden(mutation.oldValue)
+            !isClassNameIncludesHidden(mutation.oldValue) &&
+            !node.hasAttribute("data-menu-uid") // google framework use this to trace dropdown menu
           )
             continue;
           const newStyle = getElementComputedStyle(node);

@@ -318,12 +318,21 @@ class SkyvernElement:
         assert handler is not None
         return handler
 
-    async def find_blocking_element(self, dom: DomUtil) -> tuple[SkyvernElement | None, bool]:
+    async def find_blocking_element(
+        self, dom: DomUtil, incremental_page: IncrementalScrapePage | None = None
+    ) -> tuple[SkyvernElement | None, bool]:
         skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
         blocking_element_id, blocked = await skyvern_frame.get_blocking_element_id(await self.get_element_handler())
         if not blocking_element_id:
             return None, blocked
-        return await dom.get_skyvern_element_by_id(blocking_element_id), blocked
+
+        if dom.check_id_in_dom(blocking_element_id):
+            return await dom.get_skyvern_element_by_id(blocking_element_id), blocked
+
+        if incremental_page and incremental_page.check_id_in_page(blocking_element_id):
+            return await SkyvernElement.create_from_incremental(incremental_page, blocking_element_id), blocked
+
+        return None, blocked
 
     async def find_element_in_label_children(
         self, dom: DomUtil, element_type: InteractiveElement
@@ -590,10 +599,9 @@ class SkyvernElement:
             await self.focus(timeout=timeout)
         await asyncio.sleep(2)  # wait for scrolling into the target
 
-    async def calculate_vertical_distance_to(
+    async def calculate_min_y_distance_to(
         self,
         target_locator: Locator,
-        mode: typing.Literal["inner", "outer"],
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> float:
         self_rect = await self.get_locator().bounding_box(timeout=timeout)
@@ -604,10 +612,57 @@ class SkyvernElement:
         if self_rect is None or target_rect is None:
             raise Exception("Can't get the target element rect")
 
-        if mode == "inner":
-            return abs(self_rect["y"] + self_rect["height"] - target_rect["y"])
-        else:
-            return abs(self_rect["y"] - (target_rect["y"] + target_rect["height"]))
+        y_1 = self_rect["y"] + self_rect["height"] - target_rect["y"]
+        y_2 = self_rect["y"] - (target_rect["y"] + target_rect["height"])
+
+        # if y1 * y2 <= 0, it means the two elements are overlapping
+        if y_1 * y_2 <= 0:
+            return 0
+
+        return min(
+            abs(y_1),
+            abs(y_2),
+        )
+
+    async def calculate_min_x_distance_to(
+        self,
+        target_locator: Locator,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> float:
+        self_rect = await self.get_locator().bounding_box(timeout=timeout)
+        if self_rect is None:
+            raise Exception("Can't Skyvern element rect")
+
+        target_rect = await target_locator.bounding_box(timeout=timeout)
+        if self_rect is None or target_rect is None:
+            raise Exception("Can't get the target element rect")
+
+        x_1 = self_rect["x"] + self_rect["width"] - target_rect["x"]
+        x_2 = self_rect["x"] - (target_rect["x"] + target_rect["width"])
+
+        # if x1 * x2 <= 0, it means the two elements are overlapping
+        if x_1 * x_2 <= 0:
+            return 0
+
+        return min(
+            abs(x_1),
+            abs(x_2),
+        )
+
+    async def is_next_to_element(
+        self,
+        target_locator: Locator,
+        max_x_distance: float = 0,
+        max_y_distance: float = 0,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> bool:
+        if max_x_distance > 0 and await self.calculate_min_x_distance_to(target_locator, timeout) > max_x_distance:
+            return False
+
+        if max_y_distance > 0 and await self.calculate_min_y_distance_to(target_locator, timeout) > max_y_distance:
+            return False
+
+        return True
 
 
 class DomUtil:
