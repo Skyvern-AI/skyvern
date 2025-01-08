@@ -161,7 +161,7 @@ class BrowserContextFactory:
             f.write(preference_file_content)
 
     @staticmethod
-    def build_browser_args(proxy_location: ProxyLocation | None = None, **kwargs: dict) -> dict[str, Any]:
+    def build_browser_args(proxy_location: ProxyLocation | None = None, cdp_port: int | None = None) -> dict[str, Any]:
         video_dir = f"{settings.VIDEO_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}"
         har_dir = (
             f"{settings.HAR_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{BrowserContextFactory.get_subdir()}.har"
@@ -174,8 +174,8 @@ class BrowserContextFactory:
             "--kiosk-printing",
         ]
 
-        if kwargs.get("cdp_port"):
-            browser_args.append(f"--remote-debugging-port={kwargs.get('cdp_port')}")
+        if cdp_port:
+            browser_args.append(f"--remote-debugging-port={cdp_port}")
 
         args = {
             "locale": settings.BROWSER_LOCALE,
@@ -302,13 +302,10 @@ async def _create_headless_chromium(
         user_data_dir=user_data_dir,
         download_dir=download_dir,
     )
-    optional_args = {}
     cdp_port = kwargs.get("cdp_port")
-    if cdp_port:
-        optional_args["cdp_port"] = cdp_port
     browser_args = BrowserContextFactory.build_browser_args(
         proxy_location=proxy_location,
-        **optional_args,
+        cdp_port=cdp_port
     )
     browser_args.update(
         {
@@ -331,11 +328,11 @@ async def _create_headful_chromium(
         user_data_dir=user_data_dir,
         download_dir=download_dir,
     )
-    optional_args = {}
     cdp_port = kwargs.get("cdp_port")
-    if cdp_port:
-        optional_args["cdp_port"] = cdp_port
-    browser_args = BrowserContextFactory.build_browser_args(proxy_location=proxy_location, **optional_args)
+    browser_args = BrowserContextFactory.build_browser_args(
+        proxy_location=proxy_location,
+        cdp_port=cdp_port
+    )
     browser_args.update(
         {
             "user_data_dir": user_data_dir,
