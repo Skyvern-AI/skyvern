@@ -40,7 +40,7 @@ class PersistentSessionsManager:
         """Get all active sessions for an organization."""
         return await self.database.get_active_persistent_browser_sessions(organization_id)
 
-    def get_browser_state(self, session_id: str) -> Optional[BrowserState]:
+    def get_browser_state(self, session_id: str) -> BrowserState | None:
         """Get a specific browser session's state by session ID."""
         browser_session = self._browser_sessions.get(session_id)
         return browser_session.browser_state if browser_session else None
