@@ -2344,7 +2344,9 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def occupy_persistent_browser_session(self, session_id: str, runnable_type: str, runnable_id: str) -> None:
+    async def occupy_persistent_browser_session(
+        self, session_id: str, runnable_type: str, runnable_id: str, organization_id: str
+    ) -> None:
         """Occupy a specific persistent browser session."""
         try:
             async with self.Session() as session:
@@ -2366,7 +2368,7 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def release_persistent_browser_session(self, session_id: str) -> None:
+    async def release_persistent_browser_session(self, session_id: str, organization_id: str) -> None:
         """Release a specific persistent browser session."""
         try:
             async with self.Session() as session:
