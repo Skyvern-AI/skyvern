@@ -16,7 +16,7 @@ function CreateNewTaskFormPage() {
   const location = useLocation();
 
   const { data, isFetching } = useQuery({
-    queryKey: ["savedTask", template],
+    queryKey: ["savedTasks", template],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client
