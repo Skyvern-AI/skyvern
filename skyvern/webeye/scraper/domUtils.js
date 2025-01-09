@@ -753,6 +753,17 @@ function isScrollableOverflow(element) {
   );
 }
 
+function isDatePickerSelector(element) {
+  const tagName = element.tagName.toLowerCase();
+  if (
+    tagName === "button" &&
+    element.getAttribute("data-testid")?.includes("date")
+  ) {
+    return true;
+  }
+  return false;
+}
+
 const isComboboxDropdown = (element) => {
   if (element.tagName.toLowerCase() !== "input") {
     return false;
@@ -1197,6 +1208,7 @@ function buildElementObject(frame, element, interactable, purgeable = false) {
       elementTagNameLower === "svg" || element.closest("svg") !== null,
     isSelectable:
       elementTagNameLower === "select" ||
+      isDatePickerSelector(element) ||
       isDivComboboxDropdown(element) ||
       isDropdownButton(element) ||
       isAngularDropdown(element) ||
