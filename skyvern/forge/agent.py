@@ -570,7 +570,7 @@ class ForgeAgent:
                 step_id=step.step_id,
             )
 
-            failure_reason = "unexpected exception"
+            failure_reason = f"Unexpected error: {str(e)}"
             if isinstance(e, SkyvernException):
                 failure_reason = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
 

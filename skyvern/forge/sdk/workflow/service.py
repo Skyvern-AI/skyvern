@@ -349,7 +349,7 @@ class WorkflowService:
                     block_label=block.label,
                 )
 
-                exception_message = "unexpected exception"
+                exception_message = f"Unexpected error: {str(e)}"
                 if isinstance(e, SkyvernException):
                     exception_message = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
 
