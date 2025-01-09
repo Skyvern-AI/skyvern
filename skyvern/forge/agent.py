@@ -846,6 +846,19 @@ class ForgeAgent:
                         action=action,
                         action_result=results,
                     )
+                    if results[-1].skip_remaining_actions:
+                        LOG.warning(
+                            "Going to stop executing the remaining actions",
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            step_order=step.order,
+                            step_retry=step.retry_index,
+                            action_idx=action_idx,
+                            action=action,
+                            action_result=results,
+                        )
+                        break
+
                 elif results and isinstance(action, DecisiveAction):
                     LOG.warning(
                         "DecisiveAction failed, but not stopping execution and not retrying the step",

@@ -676,7 +676,7 @@ class DomUtil:
         self.scraped_page = scraped_page
         self.page = page
 
-    def check_id_in_dom(self, element_id: str) -> bool:
+    async def check_id_in_dom(self, element_id: str) -> bool:
         css_selector = self.scraped_page.id_to_css_dict.get(element_id, "")
         if css_selector:
             return True
