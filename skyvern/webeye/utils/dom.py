@@ -326,7 +326,7 @@ class SkyvernElement:
         if not blocking_element_id:
             return None, blocked
 
-        if dom.check_id_in_dom(blocking_element_id):
+        if await dom.check_id_in_dom(blocking_element_id):
             return await dom.get_skyvern_element_by_id(blocking_element_id), blocked
 
         if incremental_page and incremental_page.check_id_in_page(blocking_element_id):
