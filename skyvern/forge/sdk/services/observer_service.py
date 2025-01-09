@@ -226,7 +226,10 @@ async def run_observer_cruise(
     finally:
         if workflow and workflow_run:
             await app.WORKFLOW_SERVICE.clean_up_workflow(
-                workflow=workflow, workflow_run=workflow_run, browser_session_id=browser_session_id
+                workflow=workflow,
+                workflow_run=workflow_run,
+                browser_session_id=browser_session_id,
+                close_browser_on_completion=browser_session_id is None,
             )
         else:
             LOG.warning("Workflow or workflow run not found")
@@ -497,7 +500,13 @@ async def run_observer_cruise_helper(
         LOG.info("Workflow created", workflow_id=workflow.workflow_id)
 
         # execute the extraction task
-        workflow_run = await handle_block_result(block, block_result, workflow, workflow_run)
+        workflow_run = await handle_block_result(
+            block,
+            block_result,
+            workflow,
+            workflow_run,
+            browser_session_id=browser_session_id,
+        )
         if workflow_run.status != WorkflowRunStatus.running:
             LOG.info(
                 "Workflow run is not running anymore, stopping the observer",
@@ -578,6 +587,7 @@ async def handle_block_result(
     workflow: Workflow,
     workflow_run: WorkflowRun,
     is_last_block: bool = True,
+    browser_session_id: str | None = None,
 ) -> WorkflowRun:
     workflow_run_id = workflow_run.workflow_run_id
     if block_result.status == BlockStatus.canceled:
@@ -596,6 +606,8 @@ async def handle_block_result(
             workflow=workflow,
             workflow_run=workflow_run,
             need_call_webhook=False,
+            close_browser_on_completion=browser_session_id is None,
+            browser_session_id=browser_session_id,
         )
     elif block_result.status == BlockStatus.failed:
         LOG.error(
@@ -626,6 +638,8 @@ async def handle_block_result(
             await app.WORKFLOW_SERVICE.clean_up_workflow(
                 workflow=workflow,
                 workflow_run=workflow_run,
+                close_browser_on_completion=browser_session_id is None,
+                browser_session_id=browser_session_id,
             )
     elif block_result.status == BlockStatus.terminated:
         LOG.info(
@@ -654,6 +668,8 @@ async def handle_block_result(
             await app.WORKFLOW_SERVICE.clean_up_workflow(
                 workflow=workflow,
                 workflow_run=workflow_run,
+                browser_session_id=browser_session_id,
+                close_browser_on_completion=browser_session_id is None,
             )
     # refresh workflow run model
     return await app.WORKFLOW_SERVICE.get_workflow_run(
