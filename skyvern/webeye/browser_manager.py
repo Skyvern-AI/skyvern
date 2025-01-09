@@ -88,11 +88,15 @@ class BrowserManager:
                     browser_session_id=browser_session_id,
                 )
             else:
-                await app.PERSISTENT_SESSIONS_MANAGER.occupy_browser_session(
-                    browser_session_id,
-                    runnable_type="task",
-                    runnable_id=task.task_id,
-                )
+                if task.organization_id:
+                    await app.PERSISTENT_SESSIONS_MANAGER.occupy_browser_session(
+                        browser_session_id,
+                        organization_id=task.organization_id,
+                        runnable_type="task",
+                        runnable_id=task.task_id,
+                    )
+                else:
+                    LOG.warning("Organization ID is not set for task", task_id=task.task_id)
                 page = await browser_state.get_working_page()
                 if page:
                     await browser_state.navigate_to_url(page=page, url=task.url)
@@ -144,6 +148,7 @@ class BrowserManager:
                     browser_session_id,
                     runnable_type="workflow_run",
                     runnable_id=workflow_run.workflow_run_id,
+                    organization_id=workflow_run.organization_id,
                 )
                 page = await browser_state.get_working_page()
                 if page:
@@ -266,6 +271,7 @@ class BrowserManager:
         task_id: str,
         close_browser_on_completion: bool = True,
         browser_session_id: str | None = None,
+        organization_id: str | None = None,
     ) -> BrowserState | None:
         """
         Developer notes: handle errors here. Do not raise error from this function.
@@ -283,7 +289,12 @@ class BrowserManager:
         LOG.info("Task is cleaned up")
 
         if browser_session_id:
-            await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(browser_session_id)
+            if organization_id:
+                await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
+                    browser_session_id, organization_id=organization_id
+                )
+            else:
+                LOG.warning("Organization ID not specified, cannot release browser session", task_id=task_id)
             LOG.info("Released browser session", browser_session_id=browser_session_id)
 
         return browser_state_to_close
@@ -294,6 +305,7 @@ class BrowserManager:
         task_ids: list[str],
         close_browser_on_completion: bool = True,
         browser_session_id: str | None = None,
+        organization_id: str | None = None,
     ) -> BrowserState | None:
         LOG.info("Cleaning up for workflow run")
         browser_state_to_close = self.pages.pop(workflow_run_id, None)
@@ -321,7 +333,14 @@ class BrowserManager:
         LOG.info("Workflow run is cleaned up")
 
         if browser_session_id:
-            await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(browser_session_id)
+            if organization_id:
+                await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
+                    browser_session_id, organization_id=organization_id
+                )
+            else:
+                LOG.warning(
+                    "Organization ID not specified, cannot release browser session", workflow_run_id=workflow_run_id
+                )
             LOG.info("Released browser session", browser_session_id=browser_session_id)
 
         return browser_state_to_close

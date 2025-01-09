@@ -199,6 +199,38 @@ def create_task(
         return None
 
 
+def create_workflow_run(
+    workflow_permanent_id: str = "wpid_346464432851787586",
+    browser_session_id: str | None = None,
+) -> Optional[str]:
+    """Create a new workflow run
+
+    Args:
+        workflow_permanent_id: Workflow permanent ID (default: wpid_346464432851787586)
+        browser_session_id: Optional browser session ID to use
+    """
+    try:
+        data: dict[str, Any] = {
+            "parameters": {},  # Add parameters if needed
+            "browser_session_id": browser_session_id,
+        }
+        response = make_request("POST", f"/workflows/{workflow_permanent_id}/run", data=data)
+        workflow_run = response.json()
+        print("\nCreated new workflow run:")
+        try:
+            print(f"  Workflow Run ID: {workflow_run.get('workflow_run_id', 'N/A')}")
+            print(f"  Workflow ID: {workflow_run.get('workflow_id', 'N/A')}")
+            print(f"Full response: {json.dumps(workflow_run, indent=2)}")
+            return workflow_run.get("workflow_run_id")
+        except Exception as e:
+            print(f"Error parsing response: {workflow_run}")
+            print(f"Error: {str(e)}")
+            return None
+    except Exception as e:
+        print(f"Error creating workflow run: {str(e)}")
+        return None
+
+
 def print_help() -> None:
     """Print available commands"""
     print("\nHTTP API Commands:")
@@ -211,6 +243,10 @@ def print_help() -> None:
     print("    Optional args:")
     print("      --url <url> - URL to navigate to")
     print("      --goal <goal> - Task goal/instructions")
+    print("      --browser_session_id <id> - Browser session ID to use")
+    print("  create_workflow_run [args] - Create a new workflow run")
+    print("    Optional args:")
+    print("      --workflow_id <id> - Workflow permanent ID")
     print("      --browser_session_id <id> - Browser session ID to use")
     print("  help - Show this help message")
     print("\nDirect Method Commands:")
@@ -277,6 +313,21 @@ async def main() -> None:
                 close_session(args[0])
             elif cmd == "close_all_sessions":
                 close_all_sessions()
+            elif cmd == "create_workflow_run":
+                # Parse optional args
+                workflow_id = "wpid_346464432851787586"  # Default workflow ID
+                browser_session_id = None
+                i = 0
+                while i < len(args):
+                    if args[i] == "--workflow_id" and i + 1 < len(args):
+                        workflow_id = args[i + 1]
+                        i += 2
+                    elif args[i] == "--browser_session_id" and i + 1 < len(args):
+                        browser_session_id = args[i + 1]
+                        i += 2
+                    else:
+                        i += 1
+                create_workflow_run(workflow_permanent_id=workflow_id, browser_session_id=browser_session_id)
             else:
                 print(f"Unknown command: {cmd}")
                 print("Type 'help' for available commands")

@@ -177,6 +177,7 @@ async def run_observer_cruise(
     observer_cruise_id: str,
     request_id: str | None = None,
     max_iterations_override: str | int | None = None,
+    browser_session_id: str | None = None,
 ) -> None:
     organization_id = organization.organization_id
     try:
@@ -201,6 +202,7 @@ async def run_observer_cruise(
             observer_cruise=observer_cruise,
             request_id=request_id,
             max_iterations_override=max_iterations_override,
+            browser_session_id=browser_session_id,
         )
     except OperationalError:
         LOG.error("Database error when running observer cruise", exc_info=True)
@@ -223,7 +225,9 @@ async def run_observer_cruise(
         return
     finally:
         if workflow and workflow_run:
-            await app.WORKFLOW_SERVICE.clean_up_workflow(workflow=workflow, workflow_run=workflow_run)
+            await app.WORKFLOW_SERVICE.clean_up_workflow(
+                workflow=workflow, workflow_run=workflow_run, browser_session_id=browser_session_id
+            )
         else:
             LOG.warning("Workflow or workflow run not found")
 
@@ -235,6 +239,7 @@ async def run_observer_cruise_helper(
     observer_cruise: ObserverCruise,
     request_id: str | None = None,
     max_iterations_override: str | int | None = None,
+    browser_session_id: str | None = None,
 ) -> tuple[Workflow, WorkflowRun] | tuple[None, None]:
     organization_id = organization.organization_id
     observer_cruise_id = observer_cruise.observer_cruise_id
@@ -321,6 +326,7 @@ async def run_observer_cruise_helper(
         browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
             workflow_run=workflow_run,
             url=url,
+            browser_session_id=browser_session_id,
         )
         scraped_page = await scrape_website(
             browser_state,

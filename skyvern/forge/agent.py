@@ -1736,7 +1736,7 @@ class ForgeAgent:
         """
         # We need to close the browser even if there is no webhook callback url or api key
         browser_state = await app.BROWSER_MANAGER.cleanup_for_task(
-            task.task_id, close_browser_on_completion, browser_session_id
+            task.task_id, close_browser_on_completion, browser_session_id, task.organization_id
         )
         if browser_state:
             # Update recording artifact after closing the browser, so we can get an accurate recording

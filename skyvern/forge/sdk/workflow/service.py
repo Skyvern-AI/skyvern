@@ -189,9 +189,16 @@ class WorkflowService:
         workflow_run_id: str,
         api_key: str,
         organization: Organization,
+        browser_session_id: str | None = None,
     ) -> WorkflowRun:
         """Execute a workflow."""
         organization_id = organization.organization_id
+        LOG.info(
+            "Executing workflow",
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+        )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         workflow = await self.get_workflow(workflow_id=workflow_run.workflow_id, organization_id=organization_id)
 
@@ -253,6 +260,7 @@ class WorkflowService:
                 block_result = await block.execute_safe(
                     workflow_run_id=workflow_run_id,
                     organization_id=organization_id,
+                    browser_session_id=browser_session_id,
                 )
                 if block_result.status == BlockStatus.canceled:
                     LOG.info(
@@ -875,6 +883,7 @@ class WorkflowService:
             all_workflow_task_ids,
             close_browser_on_completion,
             browser_session_id,
+            organization_id=workflow_run.organization_id,
         )
         if browser_state:
             await self.persist_video_data(browser_state, workflow, workflow_run)

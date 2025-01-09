@@ -89,3 +89,4 @@ class ObserverMetadata(BaseModel):
 class CruiseRequest(BaseModel):
     user_prompt: str
     url: HttpUrl | None = None
+    browser_session_id: str | None = None
