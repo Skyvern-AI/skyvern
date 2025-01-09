@@ -140,9 +140,9 @@ class WorkflowNotFound(SkyvernHTTPException):
         )
 
 
-class WorkflowRunNotFound(SkyvernException):
+class WorkflowRunNotFound(SkyvernHTTPException):
     def __init__(self, workflow_run_id: str) -> None:
-        super().__init__(f"WorkflowRun {workflow_run_id} not found")
+        super().__init__(f"WorkflowRun {workflow_run_id} not found", status_code=status.HTTP_404_NOT_FOUND)
 
 
 class MissingValueForParameter(SkyvernHTTPException):
