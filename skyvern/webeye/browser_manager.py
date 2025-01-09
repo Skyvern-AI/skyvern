@@ -295,9 +295,9 @@ class BrowserManager:
                 await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
                     browser_session_id, organization_id=organization_id
                 )
+                LOG.info("Released browser session", browser_session_id=browser_session_id)
             else:
                 LOG.warning("Organization ID not specified, cannot release browser session", task_id=task_id)
-            LOG.info("Released browser session", browser_session_id=browser_session_id)
 
         return browser_state_to_close
 
@@ -339,10 +339,10 @@ class BrowserManager:
                 await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
                     browser_session_id, organization_id=organization_id
                 )
+                LOG.info("Released browser session", browser_session_id=browser_session_id)
             else:
                 LOG.warning(
                     "Organization ID not specified, cannot release browser session", workflow_run_id=workflow_run_id
                 )
-            LOG.info("Released browser session", browser_session_id=browser_session_id)
 
         return browser_state_to_close
