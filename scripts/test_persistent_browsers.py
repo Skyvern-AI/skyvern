@@ -231,6 +231,42 @@ def create_workflow_run(
         return None
 
 
+def create_cruise(
+    prompt: str | None = None,
+    url: str | None = None,
+    browser_session_id: str | None = None,
+) -> Optional[str]:
+    """Create a new observer cruise
+    
+    Args:
+        prompt: Task prompt/instructions (default: Extract top HN post)
+        url: URL to navigate to (default: None)
+        browser_session_id: Optional browser session ID to use
+    """
+    try:
+        default_prompt = "Navigate to the Hacker News homepage and identify the top post. COMPLETE when the title and URL of the top post are extracted. Ensure that the top post is the first post listed on the page."
+        data = {
+            "user_prompt": prompt or default_prompt,
+            "url": url,
+            "browser_session_id": browser_session_id
+        }
+        response = make_request("POST", "/cruise", data=data)
+        cruise = response.json()
+        print("\nCreated new observer cruise:")
+        try:
+            print(f"  Cruise ID: {cruise.get('observer_cruise_id', 'N/A')}")
+            print(f"  URL: {cruise.get('url', 'N/A')}")
+            print(f"Full response: {json.dumps(cruise, indent=2)}")
+            return cruise.get("observer_cruise_id")
+        except Exception as e:
+            print(f"Error parsing response: {cruise}")
+            print(f"Error: {str(e)}")
+            return None
+    except Exception as e:
+        print(f"Error creating cruise: {str(e)}")
+        return None
+
+
 def print_help() -> None:
     """Print available commands"""
     print("\nHTTP API Commands:")
@@ -247,6 +283,11 @@ def print_help() -> None:
     print("  create_workflow_run [args] - Create a new workflow run")
     print("    Optional args:")
     print("      --workflow_id <id> - Workflow permanent ID")
+    print("      --browser_session_id <id> - Browser session ID to use")
+    print("  create_cruise [args] - Create a new observer cruise")
+    print("    Optional args:")
+    print("      --prompt <prompt> - Task prompt/instructions")
+    print("      --url <url> - URL to navigate to")
     print("      --browser_session_id <id> - Browser session ID to use")
     print("  help - Show this help message")
     print("\nDirect Method Commands:")
@@ -328,6 +369,25 @@ async def main() -> None:
                     else:
                         i += 1
                 create_workflow_run(workflow_permanent_id=workflow_id, browser_session_id=browser_session_id)
+            elif cmd == "create_cruise":
+                # Parse optional args
+                prompt = None
+                url = None
+                browser_session_id = None
+                i = 0
+                while i < len(args):
+                    if args[i] == "--prompt" and i + 1 < len(args):
+                        prompt = args[i + 1]
+                        i += 2
+                    elif args[i] == "--url" and i + 1 < len(args):
+                        url = args[i + 1]
+                        i += 2
+                    elif args[i] == "--browser_session_id" and i + 1 < len(args):
+                        browser_session_id = args[i + 1]
+                        i += 2
+                    else:
+                        i += 1
+                create_cruise(prompt=prompt, url=url, browser_session_id=browser_session_id)
             else:
                 print(f"Unknown command: {cmd}")
                 print("Type 'help' for available commands")
