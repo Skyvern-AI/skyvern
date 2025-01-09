@@ -585,6 +585,8 @@ class BaseTaskBlock(Block):
                     task=task,
                     step=step,
                     task_block=self,
+                    browser_session_id=browser_session_id,
+                    close_browser_on_completion=browser_session_id is None,
                 )
             except Exception as e:
                 # Make sure the task is marked as failed in the database before raising the exception

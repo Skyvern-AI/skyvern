@@ -286,6 +286,7 @@ class ForgeAgent:
                 api_key=api_key,
                 need_call_webhook=True,
                 browser_session_id=browser_session_id,
+                close_browser_on_completion=close_browser_on_completion,
             )
             return step, None, None
 
@@ -438,6 +439,7 @@ class ForgeAgent:
                     next_step,
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
+                    browser_session_id=browser_session_id,
                     task_block=task_block,
                 )
             elif settings.execute_all_steps() and next_step:
@@ -447,6 +449,7 @@ class ForgeAgent:
                     next_step,
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
+                    browser_session_id=browser_session_id,
                     task_block=task_block,
                 )
             else:
@@ -553,6 +556,7 @@ class ForgeAgent:
                 api_key=api_key,
                 need_call_webhook=False,
                 browser_session_id=browser_session_id,
+                close_browser_on_completion=close_browser_on_completion,
             )
             return step, detailed_output, None
         except (UnsupportedActionType, UnsupportedTaskType, FailedToParseActionInstruction) as e:
@@ -570,6 +574,7 @@ class ForgeAgent:
                 api_key=api_key,
                 need_call_webhook=False,
                 browser_session_id=browser_session_id,
+                close_browser_on_completion=close_browser_on_completion,
             )
             return step, detailed_output, None
 
@@ -1749,7 +1754,10 @@ class ForgeAgent:
         """
         # We need to close the browser even if there is no webhook callback url or api key
         browser_state = await app.BROWSER_MANAGER.cleanup_for_task(
-            task.task_id, close_browser_on_completion, browser_session_id, task.organization_id
+            task.task_id,
+            close_browser_on_completion,
+            browser_session_id,
+            task.organization_id,
         )
         if browser_state:
             # Update recording artifact after closing the browser, so we can get an accurate recording
