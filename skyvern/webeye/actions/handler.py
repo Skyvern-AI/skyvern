@@ -984,7 +984,8 @@ async def handle_select_option_action(
                 element_id=selectable_child.get_id(),
                 option=action.option,
             )
-            return await handle_select_option_action(select_action, page, scraped_page, task, step)
+            action = select_action
+            skyvern_element = selectable_child
 
     # dynamically validate the attr, since it could change into enabled after the previous actions
     if await skyvern_element.is_disabled(dynamic=True):
@@ -997,14 +998,40 @@ async def handle_select_option_action(
         )
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
-    if tag_name == InteractiveElement.SELECT:
+    if skyvern_element.get_tag_name() == InteractiveElement.SELECT:
         LOG.info(
             "SelectOptionAction is on <select>",
             action=action,
             task_id=task.task_id,
             step_id=step.step_id,
         )
-        return await normal_select(action=action, skyvern_element=skyvern_element, dom=dom, task=task, step=step)
+
+        try:
+            blocking_element, exist = await skyvern_element.find_blocking_element(dom=dom)
+        except Exception:
+            LOG.warning(
+                "Failed to find the blocking element, continue to select on the orignal <select>",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                exc_info=True,
+            )
+            return await normal_select(action=action, skyvern_element=skyvern_element, dom=dom, task=task, step=step)
+
+        if not exist or blocking_element is None:
+            return await normal_select(action=action, skyvern_element=skyvern_element, dom=dom, task=task, step=step)
+        LOG.info(
+            "<select> is blocked by another element, going to select on the blocking element",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            blocking_element=blocking_element.get_id(),
+        )
+        select_action = SelectOptionAction(
+            reasoning=action.reasoning,
+            element_id=blocking_element.get_id(),
+            option=action.option,
+        )
+        action = select_action
+        skyvern_element = blocking_element
 
     if await skyvern_element.is_checkbox():
         LOG.info(
@@ -1040,6 +1067,7 @@ async def handle_select_option_action(
     LOG.info(
         "Trigger custom select",
         action=action,
+        element_id=skyvern_element.get_id(),
     )
 
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
@@ -1089,7 +1117,7 @@ async def handle_select_option_action(
             )
 
         if len(incremental_element) == 0:
-            raise NoIncrementalElementFoundForCustomSelection(element_id=action.element_id)
+            raise NoIncrementalElementFoundForCustomSelection(element_id=skyvern_element.get_id())
 
         # TODO: support sequetially select from dropdown by value, just support single select now
         result, suggested_value = await sequentially_select_from_dropdown(
