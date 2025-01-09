@@ -2,8 +2,12 @@ You're to assist the user to achieve the user goal in the web, given the user go
 
 Reply in JSON format with the following keys:
 {
+  "page_info": str, // Think step by step. Describe all the useful information in the page related to the user goal.
+  "extraction_thought": str, // Think step by step. Should any information be extracted given the user goal? If yes, has all the information been extracted? If the user is searching for something, looking for information or specifically trying to extract information along side the goal, consider it an intention to extract information. Phrases like "find something", "show me something", "search something" and so on indicate the intention to extract information.
+  "require_extraction": bool, // True if the user goal requires information extraction. False otherwise.
+  "information_extracted": optional[bool], // True if the needed information has been extracted. False if the needed information has not been extracted. Null if the user goal does not require information extraction.
   "thoughts": str, // Think step by step. Would completing the tasks in the task history be good enough to achieve the user goal? If more tasks need to be completed to achieve the goal, what would be the next task?
-  "user_goal_achieved": bool, // True if the user goal has been completed, false otherwise. If the user wants to extract information along side the goal, make sure the extract task has happened before claiming that the goal is achieved.
+  "user_goal_achieved": bool, // True if the user goal has been completed, false otherwise. If the user wants to extract information and it has not been done, the user goal is not achieved.
 }
 
 User goal:
