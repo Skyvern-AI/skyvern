@@ -44,6 +44,7 @@ BITWARDEN_LOGIN_CREDENTIAL_PARAMETER_PREFIX = "blc"
 BITWARDEN_SENSITIVE_INFORMATION_PARAMETER_PREFIX = "bsi"
 BITWARDEN_CREDIT_CARD_DATA_PARAMETER_PREFIX = "bccd"
 TASK_GENERATION_PREFIX = "tg"
+AI_SUGGESTION_PREFIX = "as"
 OBSERVER_CRUISE_ID = "oc"
 OBSERVER_THOUGHT_ID = "ot"
 PERSISTENT_BROWSER_SESSION_ID = "pbs"
@@ -132,6 +133,11 @@ def generate_user_id() -> str:
 def generate_task_generation_id() -> str:
     int_id = generate_id()
     return f"{TASK_GENERATION_PREFIX}_{int_id}"
+
+
+def generate_ai_suggestion_id() -> str:
+    int_id = generate_id()
+    return f"{AI_SUGGESTION_PREFIX}_{int_id}"
 
 
 def generate_totp_code_id() -> str:

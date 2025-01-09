@@ -17,6 +17,7 @@ class ActionResult(BaseModel):
     # None is used for old data so that we can differentiate between old and new data which only has boolean
     interacted_with_sibling: bool | None = None
     interacted_with_parent: bool | None = None
+    skip_remaining_actions: bool | None = None
 
     def __str__(self) -> str:
         results = [f"ActionResult(success={self.success}"]
@@ -35,6 +36,8 @@ class ActionResult(BaseModel):
             results.append(f"interacted_with_sibling={self.interacted_with_sibling}")
         if self.interacted_with_parent is not None:
             results.append(f"interacted_with_parent={self.interacted_with_parent}")
+        if self.skip_remaining_actions is not None:
+            results.append(f"skip_remaining_actions={self.skip_remaining_actions}")
 
         return ", ".join(results) + ")"
 

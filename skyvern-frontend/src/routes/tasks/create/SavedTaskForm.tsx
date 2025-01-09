@@ -245,7 +245,7 @@ function SavedTaskForm({ initialValues }: Props) {
         description: "Changes saved successfully",
       });
       queryClient.invalidateQueries({
-        queryKey: ["savedTasks", template],
+        queryKey: ["savedTasks"],
       });
     },
   });

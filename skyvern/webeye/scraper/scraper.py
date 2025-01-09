@@ -541,6 +541,12 @@ class IncrementalScrapePage:
         self.element_tree_trimmed: list[dict] = list()
         self.skyvern_frame = skyvern_frame
 
+    def check_id_in_page(self, element_id: str) -> bool:
+        css_selector = self.id_to_css_dict.get(element_id, "")
+        if css_selector:
+            return True
+        return False
+
     async def get_incremental_element_tree(
         self,
         cleanup_element_tree: CleanupElementTreeFunc,

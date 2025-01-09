@@ -17,6 +17,7 @@ from skyvern.config import settings
 from skyvern.constants import (
     AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
     BROWSER_DOWNLOAD_TIMEOUT,
+    DROPDOWN_MENU_MAX_DISTANCE,
     REPO_ROOT_DIR,
     SKYVERN_ID_ATTR,
 )
@@ -141,25 +142,43 @@ def is_ul_or_listbox_element_factory(
     return wrapper
 
 
-CheckExistIDFunc = Callable[[str], bool]
+CheckFilterOutElementIDFunc = Callable[[str], Awaitable[bool]]
 
 
-def check_id_in_dict_factory(id_dict: dict[str, Any]) -> CheckExistIDFunc:
-    def helper(element_id: str) -> bool:
-        if id_dict.get(element_id, ""):
+def check_disappeared_element_id_in_incremental_factory(
+    incremental_scraped: IncrementalScrapePage,
+) -> CheckFilterOutElementIDFunc:
+    current_element_to_dict = copy.deepcopy(incremental_scraped.id_to_css_dict)
+
+    async def helper(element_id: str) -> bool:
+        if not current_element_to_dict.get(element_id, ""):
+            return False
+
+        try:
+            skyvern_element = await SkyvernElement.create_from_incremental(
+                incre_page=incremental_scraped, element_id=element_id
+            )
+        except Exception:
+            LOG.info(
+                "Failed to create skyvern element, going to drop the element from incremental tree",
+                exc_info=True,
+                element_id=element_id,
+            )
             return True
-        return False
+
+        skyvern_frame = incremental_scraped.skyvern_frame
+        return not await skyvern_frame.get_element_visible(await skyvern_element.get_element_handler())
 
     return helper
 
 
-def remove_exist_elements(element_tree: list[dict], check_exist: CheckExistIDFunc) -> list[dict]:
+async def filter_out_elements(element_tree: list[dict], check_filter: CheckFilterOutElementIDFunc) -> list[dict]:
     new_element_tree = []
     for element in element_tree:
         children_elements = element.get("children", [])
         if len(children_elements) > 0:
-            children_elements = remove_exist_elements(element_tree=children_elements, check_exist=check_exist)
-        if check_exist(element.get("id", "")):
+            children_elements = await filter_out_elements(element_tree=children_elements, check_filter=check_filter)
+        if await check_filter(element.get("id", "")):
             new_element_tree.extend(children_elements)
         else:
             element["children"] = children_elements
@@ -168,14 +187,14 @@ def remove_exist_elements(element_tree: list[dict], check_exist: CheckExistIDFun
 
 
 def clean_and_remove_element_tree_factory(
-    task: Task, step: Step, check_exist_funcs: list[CheckExistIDFunc]
+    task: Task, step: Step, check_filter_funcs: list[CheckFilterOutElementIDFunc]
 ) -> CleanupElementTreeFunc:
     async def helper_func(frame: Page | Frame, url: str, element_tree: list[dict]) -> list[dict]:
         element_tree = await app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step)(
             frame, url, element_tree
         )
-        for check_exist in check_exist_funcs:
-            element_tree = remove_exist_elements(element_tree=element_tree, check_exist=check_exist)
+        for check_filter in check_filter_funcs:
+            element_tree = await filter_out_elements(element_tree=element_tree, check_filter=check_filter)
 
         return element_tree
 
@@ -556,29 +575,38 @@ async def handle_input_text_action(
         )
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
+    select_action = SelectOptionAction(
+        reasoning=action.reasoning,
+        element_id=skyvern_element.get_id(),
+        option=SelectOption(label=text),
+    )
+    if skyvern_element.get_selectable():
+        LOG.info(
+            "Input element is selectable, doing select actions",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            element_id=skyvern_element.get_id(),
+            action=action,
+        )
+        return await handle_select_option_action(select_action, page, scraped_page, task, step)
+
     incremental_element: list[dict] = []
     auto_complete_hacky_flag: bool = False
     # check if it's selectable
     if skyvern_element.get_tag_name() == InteractiveElement.INPUT and not await skyvern_element.is_raw_input():
-        select_action = SelectOptionAction(
-            reasoning=action.reasoning,
-            element_id=skyvern_element.get_id(),
-            option=SelectOption(label=text),
-        )
-
         await skyvern_element.scroll_into_view()
-        if skyvern_element.get_selectable():
+        # press arrowdown to watch if there's any options popping up
+        await incremental_scraped.start_listen_dom_increment()
+        try:
+            await skyvern_element.input_clear()
+        except Exception:
             LOG.info(
-                "Input element is selectable, doing select actions",
+                "Failed to clear up the input, but continue to input",
                 task_id=task.task_id,
                 step_id=step.step_id,
                 element_id=skyvern_element.get_id(),
-                action=action,
             )
-            return await handle_select_option_action(select_action, page, scraped_page, task, step)
 
-        # press arrowdown to watch if there's any options popping up
-        await incremental_scraped.start_listen_dom_increment()
         try:
             await skyvern_element.press_key("ArrowDown")
         except TimeoutError:
@@ -594,7 +622,7 @@ async def handle_input_text_action(
         await asyncio.sleep(5)
 
         incremental_element = await incremental_scraped.get_incremental_element_tree(
-            clean_and_remove_element_tree_factory(task=task, step=step, check_exist_funcs=[dom.check_id_in_dom]),
+            clean_and_remove_element_tree_factory(task=task, step=step, check_filter_funcs=[dom.check_id_in_dom]),
         )
         if len(incremental_element) == 0:
             LOG.info(
@@ -613,6 +641,7 @@ async def handle_input_text_action(
                     action=select_action,
                     page=page,
                     dom=dom,
+                    skyvern_element=skyvern_element,
                     skyvern_frame=skyvern_frame,
                     incremental_scraped=incremental_scraped,
                     step=step,
@@ -641,14 +670,29 @@ async def handle_input_text_action(
                     )
 
             except Exception:
-                await skyvern_element.scroll_into_view()
                 LOG.warning(
                     "Failed to do custom selection transformed from input action, continue to input text",
                     exc_info=True,
                     task_id=task.task_id,
                     step_id=step.step_id,
                 )
+                await skyvern_element.scroll_into_view()
             finally:
+                blocking_element, exist = await skyvern_element.find_blocking_element(
+                    dom=dom, incremental_page=incremental_scraped
+                )
+                if blocking_element and exist:
+                    LOG.info(
+                        "Find a blocking element to the current element, going to blur the blocking element first",
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        blocking_element=blocking_element.get_locator(),
+                    )
+                    if await blocking_element.get_locator().count():
+                        await blocking_element.press_key("Escape")
+                    if await blocking_element.get_locator().count():
+                        await blocking_element.blur()
+
                 await skyvern_element.press_key("Escape")
                 await skyvern_element.blur()
                 await incremental_scraped.stop_listen_dom_increment()
@@ -671,6 +715,25 @@ async def handle_input_text_action(
 
             await skyvern_element.press_fill(text=text)
             return [ActionSuccess()]
+
+    # wait 2s for blocking element to show up
+    await asyncio.sleep(2)
+    try:
+        blocking_element, exist = await skyvern_element.find_blocking_element(
+            dom=dom, incremental_page=incremental_scraped
+        )
+        if blocking_element and exist:
+            LOG.warning(
+                "Find a blocking element to the current element, going to input on the blocking element",
+            )
+            skyvern_element = blocking_element
+    except Exception:
+        LOG.info(
+            "Failed to find the blocking element, continue with the orignal element",
+            exc_info=True,
+            task_id=task.task_id,
+            step_id=step.step_id,
+        )
 
     try:
         # TODO: not sure if this case will trigger auto-completion
@@ -709,6 +772,7 @@ async def handle_input_text_action(
                     step=step,
                     task=task,
                 ):
+                    auto_complete_hacky_flag = False
                     return [result]
 
         await incremental_scraped.start_listen_dom_increment()
@@ -717,7 +781,7 @@ async def handle_input_text_action(
             await skyvern_element.input_sequentially(text=text)
         finally:
             incremental_element = await incremental_scraped.get_incremental_element_tree(
-                clean_and_remove_element_tree_factory(task=task, step=step, check_exist_funcs=[dom.check_id_in_dom]),
+                clean_and_remove_element_tree_factory(task=task, step=step, check_filter_funcs=[dom.check_id_in_dom]),
             )
             if len(incremental_element) > 0:
                 auto_complete_hacky_flag = True
@@ -1006,7 +1070,7 @@ async def handle_select_option_action(
         is_open = True
 
         incremental_element = await incremental_scraped.get_incremental_element_tree(
-            clean_and_remove_element_tree_factory(task=task, step=step, check_exist_funcs=[dom.check_id_in_dom]),
+            clean_and_remove_element_tree_factory(task=task, step=step, check_filter_funcs=[dom.check_id_in_dom]),
         )
 
         if len(incremental_element) == 0 and skyvern_element.get_tag_name() == InteractiveElement.INPUT:
@@ -1021,7 +1085,7 @@ async def handle_select_option_action(
             # wait 5s for options to load
             await asyncio.sleep(5)
             incremental_element = await incremental_scraped.get_incremental_element_tree(
-                clean_and_remove_element_tree_factory(task=task, step=step, check_exist_funcs=[dom.check_id_in_dom]),
+                clean_and_remove_element_tree_factory(task=task, step=step, check_filter_funcs=[dom.check_id_in_dom]),
             )
 
         if len(incremental_element) == 0:
@@ -1032,6 +1096,7 @@ async def handle_select_option_action(
             action=action,
             page=page,
             dom=dom,
+            skyvern_element=skyvern_element,
             skyvern_frame=skyvern_frame,
             incremental_scraped=incremental_scraped,
             step=step,
@@ -1087,6 +1152,7 @@ async def handle_select_option_action(
             value=suggested_value,
             page=page,
             dom=dom,
+            skyvern_element=skyvern_element,
             skyvern_frame=skyvern_frame,
             incremental_scraped=incremental_scraped,
             task=task,
@@ -1491,7 +1557,7 @@ async def choose_auto_completion_dropdown(
         # wait for new elemnts to load
         await asyncio.sleep(5)
         incremental_element = await incremental_scraped.get_incremental_element_tree(
-            clean_and_remove_element_tree_factory(task=task, step=step, check_exist_funcs=[dom.check_id_in_dom]),
+            clean_and_remove_element_tree_factory(task=task, step=step, check_filter_funcs=[dom.check_id_in_dom]),
         )
 
         # check if elements in preserve list are still on the page
@@ -1765,6 +1831,7 @@ async def sequentially_select_from_dropdown(
     action: SelectOptionAction,
     page: Page,
     dom: DomUtil,
+    skyvern_element: SkyvernElement,
     skyvern_frame: SkyvernFrame,
     incremental_scraped: IncrementalScrapePage,
     step: Step,
@@ -1807,14 +1874,15 @@ async def sequentially_select_from_dropdown(
     values: list[str | None] = []
     select_history: list[CustomSingleSelectResult] = []
 
-    check_exist_funcs: list[CheckExistIDFunc] = [dom.check_id_in_dom]
+    check_filter_funcs: list[CheckFilterOutElementIDFunc] = [dom.check_id_in_dom]
     for i in range(MAX_SELECT_DEPTH):
         single_select_result = await select_from_dropdown(
             context=input_or_select_context,
             page=page,
+            skyvern_element=skyvern_element,
             skyvern_frame=skyvern_frame,
             incremental_scraped=incremental_scraped,
-            check_exist_funcs=check_exist_funcs,
+            check_filter_funcs=check_filter_funcs,
             step=step,
             task=task,
             dropdown_menu_element=dropdown_menu_element,
@@ -1826,6 +1894,18 @@ async def sequentially_select_from_dropdown(
         values.append(single_select_result.value)
         # wait 1s until DOM finished updating
         await asyncio.sleep(1)
+
+        # HACK: if agent took mini actions 2 times, stop executing the rest actions
+        # this is a hack to fix some date picker issues.
+        if input_or_select_context.is_date_related and i >= 1 and single_select_result.action_result:
+            LOG.warning(
+                "It's a date picker, going to skip reamaining actions",
+                depth=i,
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            single_select_result.action_result.skip_remaining_actions = True
+            break
 
         if await single_select_result.is_done():
             return single_select_result.action_result, values[-1] if len(values) > 0 else None
@@ -1848,14 +1928,15 @@ async def sequentially_select_from_dropdown(
         # wait for 3s to load new options
         await asyncio.sleep(3)
 
-        current_element_to_dict = copy.deepcopy(incremental_scraped.id_to_css_dict)
-        check_exist_funcs.append(check_id_in_dict_factory(current_element_to_dict))
+        check_filter_funcs.append(
+            check_disappeared_element_id_in_incremental_factory(incremental_scraped=incremental_scraped)
+        )
 
         secondary_increment_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
                 task=task,
                 step=step,
-                check_exist_funcs=check_exist_funcs,
+                check_filter_funcs=check_filter_funcs,
             )
         )
         if len(secondary_increment_element) == 0:
@@ -1887,9 +1968,10 @@ def build_sequential_select_history(history_list: list[CustomSingleSelectResult]
 async def select_from_dropdown(
     context: InputOrSelectContext,
     page: Page,
+    skyvern_element: SkyvernElement,
     skyvern_frame: SkyvernFrame,
     incremental_scraped: IncrementalScrapePage,
-    check_exist_funcs: list[CheckExistIDFunc],
+    check_filter_funcs: list[CheckFilterOutElementIDFunc],
     step: Step,
     task: Task,
     dropdown_menu_element: SkyvernElement | None = None,
@@ -1911,6 +1993,7 @@ async def select_from_dropdown(
 
     if dropdown_menu_element is None:
         dropdown_menu_element = await locate_dropdown_menu(
+            current_anchor_element=skyvern_element,
             incremental_scraped=incremental_scraped,
             step=step,
             task=task,
@@ -1939,7 +2022,7 @@ async def select_from_dropdown(
             )
 
     trimmed_element_tree = await incremental_scraped.get_incremental_element_tree(
-        clean_and_remove_element_tree_factory(task=task, step=step, check_exist_funcs=check_exist_funcs),
+        clean_and_remove_element_tree_factory(task=task, step=step, check_filter_funcs=check_filter_funcs),
     )
 
     html = incremental_scraped.build_html_tree(element_tree=trimmed_element_tree)
@@ -1947,6 +2030,7 @@ async def select_from_dropdown(
     skyvern_context = ensure_context()
     prompt = prompt_engine.load_prompt(
         "custom-select",
+        is_date_related=context.is_date_related,
         field_information=context.field,
         required_field=context.is_required,
         target_value="" if force_select else target_value,
@@ -1962,7 +2046,12 @@ async def select_from_dropdown(
         step_id=step.step_id,
         task_id=task.task_id,
     )
-    json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+    if context.is_date_related:
+        # HACK: according to the test, secondary LLM is not doing well on the date picker
+        # using the main LLM to handle the case
+        json_response = await app.LLM_API_HANDLER(prompt=prompt, step=step)
+    else:
+        json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
     value: str | None = json_response.get("value", None)
     single_select_result.value = value
     select_reason: str | None = json_response.get("reasoning", None)
@@ -2059,6 +2148,7 @@ async def select_from_dropdown(
 async def select_from_dropdown_by_value(
     value: str,
     page: Page,
+    skyvern_element: SkyvernElement,
     skyvern_frame: SkyvernFrame,
     dom: DomUtil,
     incremental_scraped: IncrementalScrapePage,
@@ -2068,7 +2158,7 @@ async def select_from_dropdown_by_value(
 ) -> ActionResult:
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
     await incremental_scraped.get_incremental_element_tree(
-        clean_and_remove_element_tree_factory(task=task, step=step, check_exist_funcs=[dom.check_id_in_dom]),
+        clean_and_remove_element_tree_factory(task=task, step=step, check_filter_funcs=[dom.check_id_in_dom]),
     )
 
     element_locator = await incremental_scraped.select_one_element_by_value(value=value)
@@ -2078,6 +2168,7 @@ async def select_from_dropdown_by_value(
 
     if dropdown_menu_element is None:
         dropdown_menu_element = await locate_dropdown_menu(
+            current_anchor_element=skyvern_element,
             incremental_scraped=incremental_scraped,
             step=step,
             task=task,
@@ -2101,7 +2192,7 @@ async def select_from_dropdown_by_value(
 
     async def continue_callback(incre_scraped: IncrementalScrapePage) -> bool:
         await incre_scraped.get_incremental_element_tree(
-            clean_and_remove_element_tree_factory(task=task, step=step, check_exist_funcs=[dom.check_id_in_dom]),
+            clean_and_remove_element_tree_factory(task=task, step=step, check_filter_funcs=[dom.check_id_in_dom]),
         )
 
         element_locator = await incre_scraped.select_one_element_by_value(value=value)
@@ -2131,6 +2222,7 @@ async def select_from_dropdown_by_value(
 
 
 async def locate_dropdown_menu(
+    current_anchor_element: SkyvernElement,
     incremental_scraped: IncrementalScrapePage,
     step: Step,
     task: Task,
@@ -2157,6 +2249,30 @@ async def locate_dropdown_menu(
         except Exception:
             LOG.debug(
                 "Failed to get head element in the incremental page",
+                element_id=element_id,
+                step_id=step.step_id,
+                task_id=task.task_id,
+                exc_info=True,
+            )
+            continue
+
+        try:
+            if not await head_element.is_next_to_element(
+                target_locator=current_anchor_element.get_locator(),
+                max_x_distance=DROPDOWN_MENU_MAX_DISTANCE,
+                max_y_distance=DROPDOWN_MENU_MAX_DISTANCE,
+            ):
+                LOG.debug(
+                    "Skip the element since it's too far away from the anchor element",
+                    step_id=step.step_id,
+                    task_id=task.task_id,
+                    element_id=element_id,
+                )
+                continue
+
+        except Exception:
+            LOG.info(
+                "Failed to calculate the distance between the elements",
                 element_id=element_id,
                 step_id=step.step_id,
                 task_id=task.task_id,

@@ -11,6 +11,7 @@ from skyvern.forge.sdk.api.files import get_download_dir, get_skyvern_temp_dir
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP, BaseStorage
 from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverThought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
@@ -46,6 +47,12 @@ class LocalStorage(BaseStorage):
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
         return f"file://{self.artifact_path}/{settings.ENV}/workflow_runs/{workflow_run_block.workflow_run_id}/{workflow_run_block.workflow_run_block_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+
+    def build_ai_suggestion_uri(
+        self, artifact_id: str, ai_suggestion: AISuggestion, artifact_type: ArtifactType
+    ) -> str:
+        file_ext = FILE_EXTENTSION_MAP[artifact_type]
+        return f"file://{self.artifact_path}/{settings.ENV}/ai_suggestions/{ai_suggestion.ai_suggestion_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         file_path = None

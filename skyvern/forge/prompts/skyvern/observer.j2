@@ -12,8 +12,11 @@ MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing comma
 Reply in JSON format with the following keys:
 {
   "page_info": str, // Think step by step. Describe all the useful information in the page related to the user goal.
+  "extraction_thought": str, // Think step by step. Should any information be extracted given the user goal? If yes, has all the information been extracted? If the user is searching for something, looking for information or specifically trying to extract information along side the goal, consider it an intention to extract information. Phrases like "find something", "show me something", "search something" and so on indicate the intention to extract information.
+  "require_extraction": bool, // True if the user goal requires information extraction. False otherwise.
+  "information_extracted": optional[bool], // True if the needed information has been extracted. False if the needed information has not been extracted. If task history has no "extract" type, that means no data extraction has happened, return false. Null if the user goal does not require information extraction.
   "thoughts": str, // Think step by step. What has been done so far and what is the next reasonable mini goal a human can do foreseeably move towards the overall goal.
-  "user_goal_achieved": bool, // True if the user goal has been completed, false otherwise. If the user is searching for something, looking for information or specifically trying to extract information along side the goal, make sure at least an extract task has happened in the task history before claiming that the goal is achieved.
+  "user_goal_achieved": bool, // True if the user goal has been completed, false otherwise. If the user wants to extract information and it has not been done, the user goal is not achieved.
   "plan": str, // The mini goal to achieve to move towards the user goal. DO NOT come up or hallucinate any data that's not provided in the user goal. Be accurate and precise. Return null if the user goal has been achieved.
   "task_type": str, // One of the available task types: navigate, extract, loop
   "loop_values": list[str], // a list of string values to iterate through for loop task. null if it's not a loop task
@@ -36,6 +39,10 @@ Task history (the earliest task is the first in the list and the latest is the l
 ```
 {{ task_history }}
 ```
+
+Task history explanation:
+- completed status means the mini goal has been completed
+- terminated and failed mean the mini goal was not fully achieved or couldn't be achieved so you might want to try something else. The reason is given to explain why.
 
 Current datetime, ISO format:
 ```

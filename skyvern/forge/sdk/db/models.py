@@ -20,6 +20,7 @@ from sqlalchemy.orm import DeclarativeBase
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
 from skyvern.forge.sdk.db.id import (
     generate_action_id,
+    generate_ai_suggestion_id,
     generate_artifact_id,
     generate_aws_secret_parameter_id,
     generate_bitwarden_credit_card_data_parameter_id,
@@ -169,6 +170,7 @@ class ArtifactModel(Base):
     workflow_run_block_id = Column(String, index=True)
     observer_cruise_id = Column(String, index=True)
     observer_thought_id = Column(String, index=True)
+    ai_suggestion_id = Column(String, index=True)
     task_id = Column(String, ForeignKey("tasks.task_id"))
     step_id = Column(String, ForeignKey("steps.step_id"), index=True)
     artifact_type = Column(String)
@@ -437,6 +439,16 @@ class TaskGenerationModel(Base):
 
     source_task_generation_id = Column(String, index=True)
 
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
+
+class AISuggestionModel(Base):
+    __tablename__ = "ai_suggestions"
+
+    ai_suggestion_id = Column(String, primary_key=True, default=generate_ai_suggestion_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"))
+    ai_suggestion_type = Column(String)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 

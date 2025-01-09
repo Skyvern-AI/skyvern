@@ -25,8 +25,8 @@ class BrowserSession:
 
 
 class PersistentSessionsManager:
-    _browser_sessions: Dict[str, BrowserSession] = dict()
     instance: PersistentSessionsManager | None = None
+    _browser_sessions: Dict[str, BrowserSession] = dict()
     database: AgentDB
 
     def __new__(cls, database: AgentDB) -> PersistentSessionsManager:

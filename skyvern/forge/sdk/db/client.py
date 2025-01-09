@@ -14,6 +14,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import (
     ActionModel,
+    AISuggestionModel,
     ArtifactModel,
     AWSSecretParameterModel,
     BitwardenCreditCardDataParameterModel,
@@ -56,6 +57,7 @@ from skyvern.forge.sdk.db.utils import (
 )
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.observers import (
     ObserverCruise,
     ObserverCruiseStatus,
@@ -206,6 +208,7 @@ class AgentDB:
         workflow_run_block_id: str | None = None,
         observer_cruise_id: str | None = None,
         observer_thought_id: str | None = None,
+        ai_suggestion_id: str | None = None,
         organization_id: str | None = None,
     ) -> Artifact:
         try:
@@ -220,6 +223,7 @@ class AgentDB:
                     workflow_run_block_id=workflow_run_block_id,
                     observer_cruise_id=observer_cruise_id,
                     observer_thought_id=observer_thought_id,
+                    ai_suggestion_id=ai_suggestion_id,
                     organization_id=organization_id,
                 )
                 session.add(new_artifact)
@@ -402,6 +406,7 @@ class AgentDB:
                         .filter_by(task_id=task_id)
                         .filter_by(organization_id=organization_id)
                         .order_by(StepModel.order.asc())
+                        .order_by(StepModel.retry_index.asc())
                     )
                 ).first():
                     return convert_to_step(step, debug_enabled=self.debug_enabled)
@@ -1787,6 +1792,21 @@ class AgentDB:
             await session.commit()
             await session.refresh(new_task_generation)
             return TaskGeneration.model_validate(new_task_generation)
+
+    async def create_ai_suggestion(
+        self,
+        organization_id: str,
+        ai_suggestion_type: str,
+    ) -> AISuggestion:
+        async with self.Session() as session:
+            new_ai_suggestion = AISuggestionModel(
+                organization_id=organization_id,
+                ai_suggestion_type=ai_suggestion_type,
+            )
+            session.add(new_ai_suggestion)
+            await session.commit()
+            await session.refresh(new_ai_suggestion)
+            return AISuggestion.model_validate(new_ai_suggestion)
 
     async def get_task_generation_by_prompt_hash(
         self,

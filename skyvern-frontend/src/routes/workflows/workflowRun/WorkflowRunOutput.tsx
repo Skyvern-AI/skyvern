@@ -11,6 +11,7 @@ import { findBlockSurroundingAction } from "./workflowTimelineUtils";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import { Status } from "@/api/types";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
+import { isTaskVariantBlock } from "../types/workflowTypes";
 
 function WorkflowRunOutput() {
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
@@ -44,47 +45,65 @@ function WorkflowRunOutput() {
   const activeBlock = getActiveBlock();
 
   const showExtractedInformation =
-    activeBlock && activeBlock.status === Status.Completed;
+    activeBlock &&
+    isTaskVariantBlock(activeBlock) &&
+    activeBlock.status === Status.Completed;
 
   const outputs = workflowRun?.outputs;
   const fileUrls = workflowRun?.downloaded_file_urls ?? [];
+
   return (
     <div className="space-y-5">
       {activeBlock ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
             <h1 className="text-lg font-bold">Block Outputs</h1>
-            <div className="space-y-2">
-              <h2>
-                {showExtractedInformation
-                  ? "Extracted Information"
-                  : "Failure Reason"}
-              </h2>
-              {showExtractedInformation ? (
+            {activeBlock.output === null ? (
+              <div>This block has no outputs</div>
+            ) : isTaskVariantBlock(activeBlock) ? (
+              <div className="space-y-2">
+                <h2>
+                  {showExtractedInformation
+                    ? "Extracted Information"
+                    : "Failure Reason"}
+                </h2>
+                {showExtractedInformation ? (
+                  <CodeEditor
+                    language="json"
+                    value={JSON.stringify(
+                      (hasExtractedInformation(activeBlock.output) &&
+                        activeBlock.output.extracted_information) ??
+                        null,
+                      null,
+                      2,
+                    )}
+                    minHeight="96px"
+                    maxHeight="200px"
+                    readOnly
+                  />
+                ) : (
+                  <AutoResizingTextarea
+                    value={
+                      activeBlock.status === "canceled"
+                        ? "This block was cancelled"
+                        : activeBlock.failure_reason ?? ""
+                    }
+                    readOnly
+                  />
+                )}
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <h2>Output</h2>
                 <CodeEditor
                   language="json"
-                  value={JSON.stringify(
-                    (hasExtractedInformation(activeBlock.output) &&
-                      activeBlock.output.extracted_information) ??
-                      null,
-                    null,
-                    2,
-                  )}
+                  value={JSON.stringify(activeBlock.output, null, 2)}
                   minHeight="96px"
                   maxHeight="200px"
                   readOnly
                 />
-              ) : (
-                <AutoResizingTextarea
-                  value={
-                    activeBlock.status === "canceled"
-                      ? "This block was cancelled"
-                      : activeBlock.failure_reason ?? ""
-                  }
-                  readOnly
-                />
-              )}
-            </div>
+              </div>
+            )}
           </div>
         </div>
       ) : null}
