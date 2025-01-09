@@ -187,7 +187,12 @@ class Block(BaseModel, abc.ABC):
 
     @abc.abstractmethod
     async def execute(
-        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
     ) -> BlockResult:
         pass
 
@@ -196,6 +201,7 @@ class Block(BaseModel, abc.ABC):
         workflow_run_id: str,
         parent_workflow_run_block_id: str | None = None,
         organization_id: str | None = None,
+        browser_session_id: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_block_id = None
@@ -267,7 +273,13 @@ class Block(BaseModel, abc.ABC):
             LOG.info(
                 "Executing block", workflow_run_id=workflow_run_id, block_label=self.label, block_type=self.block_type
             )
-            return await self.execute(workflow_run_id, workflow_run_block_id, organization_id=organization_id, **kwargs)
+            return await self.execute(
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                **kwargs,
+            )
         except Exception as e:
             LOG.exception(
                 "Block execution failed",
@@ -409,7 +421,12 @@ class BaseTaskBlock(Block):
         return order, retry + 1
 
     async def execute(
-        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         current_retry = 0
@@ -503,7 +520,7 @@ class BaseTaskBlock(Block):
                 # the first task block will create the browser state and do the navigation
                 try:
                     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                        workflow_run=workflow_run, url=self.url
+                        workflow_run=workflow_run, url=self.url, browser_session_id=browser_session_id
                     )
                     # add screenshot artifact for the first task
                     screenshot = await browser_state.take_screenshot(full_page=True)
@@ -568,6 +585,8 @@ class BaseTaskBlock(Block):
                     task=task,
                     step=step,
                     task_block=self,
+                    browser_session_id=browser_session_id,
+                    close_browser_on_completion=browser_session_id is None,
                 )
             except Exception as e:
                 # Make sure the task is marked as failed in the database before raising the exception
@@ -918,7 +937,12 @@ class ForLoopBlock(Block):
         )
 
     async def execute(
-        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         try:
@@ -1025,7 +1049,12 @@ class CodeBlock(Block):
         self.code = self.format_block_parameter_template_from_workflow_run_context(self.code, workflow_run_context)
 
     async def execute(
-        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
     ) -> BlockResult:
         raise DisabledBlockExecutionError("CodeBlock is disabled")
         # get workflow run context
@@ -1145,7 +1174,12 @@ class TextPromptBlock(Block):
         return response
 
     async def execute(
-        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
     ) -> BlockResult:
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -1215,7 +1249,12 @@ class DownloadToS3Block(Block):
             os.unlink(file_path)
 
     async def execute(
-        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
     ) -> BlockResult:
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -1296,7 +1335,12 @@ class UploadToS3Block(Block):
         return f"s3://{s3_bucket}/{s3_key}"
 
     async def execute(
-        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
     ) -> BlockResult:
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -1619,7 +1663,12 @@ class SendEmailBlock(Block):
         return msg
 
     async def execute(
-        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         await app.DATABASE.update_workflow_run_block(
@@ -1716,7 +1765,12 @@ class FileParserBlock(Block):
                 raise InvalidFileType(file_url=file_url_used, file_type=self.file_type, error=str(e))
 
     async def execute(
-        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         if (
@@ -1784,7 +1838,12 @@ class WaitBlock(Block):
         return self.parameters
 
     async def execute(
-        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
     ) -> BlockResult:
         # TODO: we need to support to interrupt the sleep when the workflow run failed/cancelled/terminated
         await app.DATABASE.update_workflow_run_block(
@@ -1821,7 +1880,12 @@ class ValidationBlock(BaseTaskBlock):
         return self.parameters
 
     async def execute(
-        self, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None, **kwargs: dict
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
     ) -> BlockResult:
         task_order, _ = await self.get_task_order(workflow_run_id, 0)
         is_first_task = task_order == 0

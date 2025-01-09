@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import structlog
+from playwright._impl._errors import TargetClosedError
 from playwright.async_api import async_playwright
 
 from skyvern.forge.sdk.db.client import AgentDB
@@ -24,7 +25,7 @@ class BrowserSession:
 
 
 class PersistentSessionsManager:
-    instance = None
+    instance: PersistentSessionsManager | None = None
     _browser_sessions: Dict[str, BrowserSession] = dict()
     database: AgentDB
 
@@ -164,7 +165,22 @@ class PersistentSessionsManager:
                 session_id=session_id,
             )
             self._browser_sessions.pop(session_id, None)
-            await browser_session.browser_state.close()
+
+            try:
+                await browser_session.browser_state.close()
+            except TargetClosedError:
+                LOG.info(
+                    "Browser context already closed",
+                    organization_id=organization_id,
+                    session_id=session_id,
+                )
+            except Exception:
+                LOG.warning(
+                    "Error while closing browser session",
+                    organization_id=organization_id,
+                    session_id=session_id,
+                    exc_info=True,
+                )
         else:
             LOG.info(
                 "Browser session not found in memory, marking as deleted in database",

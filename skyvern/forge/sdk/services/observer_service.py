@@ -173,6 +173,7 @@ async def run_observer_cruise(
     observer_cruise_id: str,
     request_id: str | None = None,
     max_iterations_override: str | int | None = None,
+    browser_session_id: str | None = None,
 ) -> None:
     organization_id = organization.organization_id
     try:
@@ -197,6 +198,7 @@ async def run_observer_cruise(
             observer_cruise=observer_cruise,
             request_id=request_id,
             max_iterations_override=max_iterations_override,
+            browser_session_id=browser_session_id,
         )
     except OperationalError:
         LOG.error("Database error when running observer cruise", exc_info=True)
@@ -219,7 +221,12 @@ async def run_observer_cruise(
         return
     finally:
         if workflow and workflow_run:
-            await app.WORKFLOW_SERVICE.clean_up_workflow(workflow=workflow, workflow_run=workflow_run)
+            await app.WORKFLOW_SERVICE.clean_up_workflow(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                browser_session_id=browser_session_id,
+                close_browser_on_completion=browser_session_id is None,
+            )
         else:
             LOG.warning("Workflow or workflow run not found")
 
@@ -231,6 +238,7 @@ async def run_observer_cruise_helper(
     observer_cruise: ObserverCruise,
     request_id: str | None = None,
     max_iterations_override: str | int | None = None,
+    browser_session_id: str | None = None,
 ) -> tuple[Workflow, WorkflowRun] | tuple[None, None]:
     organization_id = organization.organization_id
     observer_cruise_id = observer_cruise.observer_cruise_id
@@ -318,6 +326,7 @@ async def run_observer_cruise_helper(
             browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                 workflow_run=workflow_run,
                 url=url,
+                browser_session_id=browser_session_id,
             )
             scraped_page = await scrape_website(
                 browser_state,
@@ -494,7 +503,13 @@ async def run_observer_cruise_helper(
         LOG.info("Workflow created", workflow_id=workflow.workflow_id)
 
         # execute the extraction task
-        workflow_run = await handle_block_result(block, block_result, workflow, workflow_run)
+        workflow_run = await handle_block_result(
+            block,
+            block_result,
+            workflow,
+            workflow_run,
+            browser_session_id=browser_session_id,
+        )
         if workflow_run.status != WorkflowRunStatus.running:
             LOG.info(
                 "Workflow run is not running anymore, stopping the observer",
@@ -575,6 +590,7 @@ async def handle_block_result(
     workflow: Workflow,
     workflow_run: WorkflowRun,
     is_last_block: bool = True,
+    browser_session_id: str | None = None,
 ) -> WorkflowRun:
     workflow_run_id = workflow_run.workflow_run_id
     if block_result.status == BlockStatus.canceled:
@@ -593,6 +609,8 @@ async def handle_block_result(
             workflow=workflow,
             workflow_run=workflow_run,
             need_call_webhook=False,
+            close_browser_on_completion=browser_session_id is None,
+            browser_session_id=browser_session_id,
         )
     elif block_result.status == BlockStatus.failed:
         LOG.error(

@@ -6,6 +6,7 @@ import structlog
 from playwright.async_api import async_playwright
 
 from skyvern.exceptions import MissingBrowserState
+from skyvern.forge import app
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.webeye.browser_factory import BrowserContextFactory, BrowserState, VideoArtifact
@@ -66,18 +67,52 @@ class BrowserManager:
 
         return None
 
-    async def get_or_create_for_task(self, task: Task) -> BrowserState:
+    async def get_or_create_for_task(
+        self,
+        task: Task,
+        browser_session_id: str | None = None,
+    ) -> BrowserState:
         browser_state = self.get_for_task(task_id=task.task_id, workflow_run_id=task.workflow_run_id)
         if browser_state is not None:
             return browser_state
 
-        LOG.info("Creating browser state for task", task_id=task.task_id)
-        browser_state = await self._create_browser_state(
-            proxy_location=task.proxy_location,
-            url=task.url,
-            task_id=task.task_id,
-            organization_id=task.organization_id,
-        )
+        if browser_session_id:
+            LOG.info(
+                "Getting browser state for task from persistent sessions manager",
+                browser_session_id=browser_session_id,
+            )
+            browser_state = app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id)
+            if browser_state is None:
+                LOG.warning(
+                    "Browser state not found in persistent sessions manager",
+                    browser_session_id=browser_session_id,
+                )
+                raise MissingBrowserState(task_id=task.task_id)
+            else:
+                if task.organization_id:
+                    await app.PERSISTENT_SESSIONS_MANAGER.occupy_browser_session(
+                        browser_session_id,
+                        organization_id=task.organization_id,
+                        runnable_type="task",
+                        runnable_id=task.task_id,
+                    )
+                else:
+                    LOG.warning("Organization ID is not set for task", task_id=task.task_id)
+                page = await browser_state.get_working_page()
+                if page:
+                    await browser_state.navigate_to_url(page=page, url=task.url)
+                else:
+                    LOG.warning("Browser state has no page", workflow_run_id=task.workflow_run_id)
+
+        if browser_state is None:
+            LOG.info("Creating browser state for task", task_id=task.task_id)
+            browser_state = await self._create_browser_state(
+                proxy_location=task.proxy_location,
+                url=task.url,
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+            )
+
         self.pages[task.task_id] = browser_state
         if task.workflow_run_id:
             self.pages[task.workflow_run_id] = browser_state
@@ -89,21 +124,53 @@ class BrowserManager:
         )
         return browser_state
 
-    async def get_or_create_for_workflow_run(self, workflow_run: WorkflowRun, url: str | None = None) -> BrowserState:
+    async def get_or_create_for_workflow_run(
+        self,
+        workflow_run: WorkflowRun,
+        url: str | None = None,
+        browser_session_id: str | None = None,
+    ) -> BrowserState:
         browser_state = self.get_for_workflow_run(workflow_run_id=workflow_run.workflow_run_id)
         if browser_state is not None:
             return browser_state
 
-        LOG.info(
-            "Creating browser state for workflow run",
-            workflow_run_id=workflow_run.workflow_run_id,
-        )
-        browser_state = await self._create_browser_state(
-            workflow_run.proxy_location,
-            url=url,
-            workflow_run_id=workflow_run.workflow_run_id,
-            organization_id=workflow_run.organization_id,
-        )
+        if browser_session_id:
+            LOG.info(
+                "Getting browser state for workflow run from persistent sessions manager",
+                browser_session_id=browser_session_id,
+            )
+            browser_state = app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id)
+            if browser_state is None:
+                LOG.warning(
+                    "Browser state not found in persistent sessions manager", browser_session_id=browser_session_id
+                )
+                raise MissingBrowserState(workflow_run_id=workflow_run.workflow_run_id)
+            else:
+                await app.PERSISTENT_SESSIONS_MANAGER.occupy_browser_session(
+                    browser_session_id,
+                    runnable_type="workflow_run",
+                    runnable_id=workflow_run.workflow_run_id,
+                    organization_id=workflow_run.organization_id,
+                )
+                page = await browser_state.get_working_page()
+                if page:
+                    if url:
+                        await browser_state.navigate_to_url(page=page, url=url)
+                else:
+                    LOG.warning("Browser state has no page", workflow_run_id=workflow_run.workflow_run_id)
+
+        if browser_state is None:
+            LOG.info(
+                "Creating browser state for workflow run",
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
+            browser_state = await self._create_browser_state(
+                proxy_location=workflow_run.proxy_location,
+                url=url,
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=workflow_run.organization_id,
+            )
+
         self.pages[workflow_run.workflow_run_id] = browser_state
 
         # The URL here is only used when creating a new page, and not when using an existing page.
@@ -201,7 +268,13 @@ class BrowserManager:
         cls.pages = dict()
         LOG.info("BrowserManger is closed")
 
-    async def cleanup_for_task(self, task_id: str, close_browser_on_completion: bool = True) -> BrowserState | None:
+    async def cleanup_for_task(
+        self,
+        task_id: str,
+        close_browser_on_completion: bool = True,
+        browser_session_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> BrowserState | None:
         """
         Developer notes: handle errors here. Do not raise error from this function.
         If error occurs, log it and address the cleanup error.
@@ -217,6 +290,15 @@ class BrowserManager:
             await browser_state_to_close.close(close_browser_on_completion=close_browser_on_completion)
         LOG.info("Task is cleaned up")
 
+        if browser_session_id:
+            if organization_id:
+                await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
+                    browser_session_id, organization_id=organization_id
+                )
+                LOG.info("Released browser session", browser_session_id=browser_session_id)
+            else:
+                LOG.warning("Organization ID not specified, cannot release browser session", task_id=task_id)
+
         return browser_state_to_close
 
     async def cleanup_for_workflow_run(
@@ -224,6 +306,8 @@ class BrowserManager:
         workflow_run_id: str,
         task_ids: list[str],
         close_browser_on_completion: bool = True,
+        browser_session_id: str | None = None,
+        organization_id: str | None = None,
     ) -> BrowserState | None:
         LOG.info("Cleaning up for workflow run")
         browser_state_to_close = self.pages.pop(workflow_run_id, None)
@@ -249,5 +333,16 @@ class BrowserManager:
                     workflow_run_id=workflow_run_id,
                 )
         LOG.info("Workflow run is cleaned up")
+
+        if browser_session_id:
+            if organization_id:
+                await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
+                    browser_session_id, organization_id=organization_id
+                )
+                LOG.info("Released browser session", browser_session_id=browser_session_id)
+            else:
+                LOG.warning(
+                    "Organization ID not specified, cannot release browser session", workflow_run_id=workflow_run_id
+                )
 
         return browser_state_to_close
