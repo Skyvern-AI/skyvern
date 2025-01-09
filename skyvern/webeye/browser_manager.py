@@ -87,6 +87,7 @@ class BrowserManager:
                     "Browser state not found in persistent sessions manager",
                     browser_session_id=browser_session_id,
                 )
+                raise MissingBrowserState(task_id=task.task_id)
             else:
                 if task.organization_id:
                     await app.PERSISTENT_SESSIONS_MANAGER.occupy_browser_session(
@@ -143,6 +144,7 @@ class BrowserManager:
                 LOG.warning(
                     "Browser state not found in persistent sessions manager", browser_session_id=browser_session_id
                 )
+                raise MissingBrowserState(workflow_run_id=workflow_run.workflow_run_id)
             else:
                 await app.PERSISTENT_SESSIONS_MANAGER.occupy_browser_session(
                     browser_session_id,
