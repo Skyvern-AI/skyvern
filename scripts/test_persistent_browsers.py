@@ -237,7 +237,7 @@ def create_cruise(
     browser_session_id: str | None = None,
 ) -> Optional[str]:
     """Create a new observer cruise
-    
+
     Args:
         prompt: Task prompt/instructions (default: Extract top HN post)
         url: URL to navigate to (default: None)
@@ -245,11 +245,7 @@ def create_cruise(
     """
     try:
         default_prompt = "Navigate to the Hacker News homepage and identify the top post. COMPLETE when the title and URL of the top post are extracted. Ensure that the top post is the first post listed on the page."
-        data = {
-            "user_prompt": prompt or default_prompt,
-            "url": url,
-            "browser_session_id": browser_session_id
-        }
+        data = {"user_prompt": prompt or default_prompt, "url": url, "browser_session_id": browser_session_id}
         response = make_request("POST", "/cruise", data=data)
         cruise = response.json()
         print("\nCreated new observer cruise:")
