@@ -318,18 +318,22 @@ async def run_observer_cruise_helper(
     max_iterations = int_max_iterations_override or DEFAULT_MAX_ITERATIONS
     for i in range(max_iterations):
         LOG.info(f"Observer iteration i={i}", workflow_run_id=workflow_run_id, url=url)
-        browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-            workflow_run=workflow_run,
-            url=url,
-        )
-        scraped_page = await scrape_website(
-            browser_state,
-            url,
-            app.AGENT_FUNCTION.cleanup_element_tree_factory(),
-            scrape_exclude=app.scrape_exclude,
-        )
-        element_tree_in_prompt: str = scraped_page.build_element_tree(ElementTreeFormat.HTML)
-        page = await browser_state.get_working_page()
+        try:
+            browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                workflow_run=workflow_run,
+                url=url,
+            )
+            scraped_page = await scrape_website(
+                browser_state,
+                url,
+                app.AGENT_FUNCTION.cleanup_element_tree_factory(),
+                scrape_exclude=app.scrape_exclude,
+            )
+            element_tree_in_prompt: str = scraped_page.build_element_tree(ElementTreeFormat.HTML)
+            page = await browser_state.get_working_page()
+        except Exception:
+            LOG.exception("Failed to get browser state or scrape website in observer iteration", iteration=i, url=url)
+            continue
         current_url = str(
             await SkyvernFrame.evaluate(frame=page, expression="() => document.location.href") if page else url
         )
@@ -748,7 +752,7 @@ async def _generate_loop_task(
 
     # create ContextParameter for the loop over pointer that ForLoopBlock needs.
     loop_for_context_parameter = ContextParameter(
-        key="loop_values",
+        key=f"loop_values_{_generate_random_string()}",
         source=loop_value_extraction_output_parameter,
     )
     for_loop_parameter_yaml_list.append(
@@ -767,8 +771,7 @@ async def _generate_loop_task(
     task_parameters: list[PARAMETER_TYPE] = []
     if output_value_obj.is_loop_value_link:
         LOG.info("Loop values are links", loop_values=output_value_obj.loop_values)
-        url = "task_in_loop_url"
-        context_parameter_key = "task_in_loop_url"
+        context_parameter_key = url = f"task_in_loop_url_{_generate_random_string()}"
     else:
         LOG.info("Loop values are not links", loop_values=output_value_obj.loop_values)
         page = await browser_state.get_working_page()
@@ -1009,12 +1012,15 @@ async def _record_thought_screenshot(observer_thought: ObserverThought, workflow
         LOG.warning("No browser state found for the workflow run", workflow_run_id=workflow_run_id)
         return
     # get the screenshot for the workflow run
-    screenshot = await browser_state.take_screenshot(full_page=True)
-    await app.ARTIFACT_MANAGER.create_observer_thought_artifact(
-        observer_thought=observer_thought,
-        artifact_type=ArtifactType.SCREENSHOT_LLM,
-        data=screenshot,
-    )
+    try:
+        screenshot = await browser_state.take_screenshot(full_page=True)
+        await app.ARTIFACT_MANAGER.create_observer_thought_artifact(
+            observer_thought=observer_thought,
+            artifact_type=ArtifactType.SCREENSHOT_LLM,
+            data=screenshot,
+        )
+    except Exception:
+        LOG.warning("Failed to take screenshot for the observer thought", observer_thought=observer_thought)
 
 
 async def get_observer_cruise(observer_cruise_id: str, organization_id: str | None = None) -> ObserverCruise | None:
