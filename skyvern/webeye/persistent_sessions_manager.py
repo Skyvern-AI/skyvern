@@ -179,7 +179,7 @@ class PersistentSessionsManager:
                     "Error while closing browser session",
                     organization_id=organization_id,
                     session_id=session_id,
-                    error=str(e),
+                    exc_info=True,
                 )
         else:
             LOG.info(
