@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from skyvern.exceptions import BitwardenBaseError, WorkflowRunContextNotInitialized
+from skyvern.exceptions import BitwardenBaseError, SkyvernException, WorkflowRunContextNotInitialized
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
@@ -168,9 +168,12 @@ class WorkflowRunContext:
 
             if self.has_parameter(parameter.url_parameter_key) and self.has_value(parameter.url_parameter_key):
                 url = self.values[parameter.url_parameter_key]
+            elif parameter.url_parameter_key:
+                # If a key can't be found within the parameter values dict, assume it's a URL (and not a URL Parameter)
+                url = parameter.url_parameter_key
             else:
                 LOG.error(f"URL parameter {parameter.url_parameter_key} not found or has no value")
-                raise ValueError("URL parameter for Bitwarden login credentials not found or has no value")
+                raise SkyvernException("URL parameter for Bitwarden login credentials not found or has no value")
 
             collection_id = None
             if parameter.bitwarden_collection_id:

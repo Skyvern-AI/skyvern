@@ -280,7 +280,7 @@ class Block(BaseModel, abc.ABC):
             if not workflow_run_context.has_value(self.output_parameter.key):
                 await self.record_output_parameter_value(workflow_run_context, workflow_run_id)
 
-            failure_reason = "unexpected exception"
+            failure_reason = f"Unexpected error: {str(e)}"
             if isinstance(e, SkyvernException):
                 failure_reason = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
 
