@@ -174,7 +174,7 @@ class PersistentSessionsManager:
                     organization_id=organization_id,
                     session_id=session_id,
                 )
-            except Exception as e:
+            except Exception:
                 LOG.warning(
                     "Error while closing browser session",
                     organization_id=organization_id,
