@@ -300,6 +300,8 @@ if settings.ENABLE_NOVITA:
             litellm_params=LiteLLMParams(
                 api_base="https://api.novita.ai/v3/openai",
                 api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/meta-llama/llama-3.3-70b-instruct"},
             ),
         ),
     )
@@ -313,6 +315,8 @@ if settings.ENABLE_NOVITA:
             litellm_params=LiteLLMParams(
                 api_base="https://api.novita.ai/v3/openai",
                 api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/meta-llama/llama-3.2-1b-instruct"},
             ),
         ),
     )
@@ -326,6 +330,8 @@ if settings.ENABLE_NOVITA:
             litellm_params=LiteLLMParams(
                 api_base="https://api.novita.ai/v3/openai",
                 api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/meta-llama/llama-3.2-3b-instruct"},
             ),
         ),
     )
@@ -339,6 +345,8 @@ if settings.ENABLE_NOVITA:
             litellm_params=LiteLLMParams(
                 api_base="https://api.novita.ai/v3/openai",
                 api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/meta-llama/llama-3.2-11b-vision-instruct"},
             ),
         ),
     )
@@ -352,6 +360,8 @@ if settings.ENABLE_NOVITA:
             litellm_params=LiteLLMParams(
                 api_base="https://api.novita.ai/v3/openai",
                 api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/meta-llama/llama-3.1-8b-instruct"},
             ),
         ),
     )
@@ -365,6 +375,8 @@ if settings.ENABLE_NOVITA:
             litellm_params=LiteLLMParams(
                 api_base="https://api.novita.ai/v3/openai",
                 api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/meta-llama/llama-3.1-70b-instruct"},
             ),
         ),
     )
@@ -378,6 +390,8 @@ if settings.ENABLE_NOVITA:
             litellm_params=LiteLLMParams(
                 api_base="https://api.novita.ai/v3/openai",
                 api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/meta-llama/llama-3.1-405b-instruct"},
             ),
         ),
     )
@@ -391,6 +405,8 @@ if settings.ENABLE_NOVITA:
             litellm_params=LiteLLMParams(
                 api_base="https://api.novita.ai/v3/openai",
                 api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/meta-llama/llama-3-8b-instruct"},
             ),
         ),
     )
@@ -404,6 +420,8 @@ if settings.ENABLE_NOVITA:
             litellm_params=LiteLLMParams(
                 api_base="https://api.novita.ai/v3/openai",
                 api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/meta-llama/llama-3-70b-instruct"},
             ),
         ),
     )

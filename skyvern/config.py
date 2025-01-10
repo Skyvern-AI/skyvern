@@ -127,6 +127,7 @@ class Settings(BaseSettings):
     # NOVITA AI
     ENABLE_NOVITA: bool = False
     NOVITA_API_KEY: str | None = None
+    NOVITA_API_VERSION: str = "v3"
 
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
