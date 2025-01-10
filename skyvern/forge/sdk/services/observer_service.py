@@ -208,13 +208,13 @@ async def run_observer_cruise(
             organization_id=organization_id,
         )
         return
-    except Exception:
+    except Exception as e:
         LOG.error("Failed to run observer cruise", exc_info=True)
+        failure_reason = f"Failed to run observer cruise: {str(e)}"
         await mark_observer_cruise_as_failed(
             observer_cruise_id,
             workflow_run_id=observer_cruise.workflow_run_id,
-            # TODO: add better failure reason
-            failure_reason="Failed to run observer cruise",
+            failure_reason=failure_reason,
             organization_id=organization_id,
         )
         return
