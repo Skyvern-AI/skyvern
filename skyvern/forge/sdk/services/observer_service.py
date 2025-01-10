@@ -518,7 +518,7 @@ async def run_observer_cruise_helper(
             )
             break
         if block_result.success is True:
-            screenshots = []
+            completion_screenshots = []
             try:
                 scraped_page = await scrape_website(
                     browser_state,
@@ -526,7 +526,7 @@ async def run_observer_cruise_helper(
                     app.AGENT_FUNCTION.cleanup_element_tree_factory(),
                     scrape_exclude=app.scrape_exclude,
                 )
-                screenshots = scraped_page.screenshots
+                completion_screenshots = scraped_page.screenshots
             except Exception:
                 LOG.warning("Failed to scrape the website for observer completion check")
 
@@ -548,8 +548,8 @@ async def run_observer_cruise_helper(
             )
             completion_resp = await app.LLM_API_HANDLER(
                 prompt=observer_completion_prompt,
-                screenshots=screenshots,
-                observer_cruise=observer_thought,
+                screenshots=completion_screenshots,
+                observer_thought=observer_thought,
             )
             LOG.info(
                 "Observer completion check response",
