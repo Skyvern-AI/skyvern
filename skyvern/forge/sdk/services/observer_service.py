@@ -517,7 +517,19 @@ async def run_observer_cruise_helper(
                 status=workflow_run.status,
             )
             break
-        if block_result.success is True and i == max_iterations - 1:
+        if block_result.success is True:
+            screenshots = []
+            try:
+                scraped_page = await scrape_website(
+                    browser_state,
+                    url,
+                    app.AGENT_FUNCTION.cleanup_element_tree_factory(),
+                    scrape_exclude=app.scrape_exclude,
+                )
+                screenshots = scraped_page.screenshots
+            except Exception:
+                LOG.warning("Failed to scrape the website for observer completion check")
+
             # validate completion only happens at the last iteration
             observer_completion_prompt = prompt_engine.load_prompt(
                 "observer_check_completion",
@@ -536,9 +548,9 @@ async def run_observer_cruise_helper(
             )
             completion_resp = await app.LLM_API_HANDLER(
                 prompt=observer_completion_prompt,
+                screenshots=screenshots,
                 observer_cruise=observer_thought,
             )
-            await _record_thought_screenshot(observer_thought=observer_thought, workflow_run_id=workflow_run_id)
             LOG.info(
                 "Observer completion check response",
                 completion_resp=completion_resp,
