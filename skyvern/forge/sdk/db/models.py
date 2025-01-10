@@ -548,6 +548,8 @@ class ObserverCruiseModel(Base):
     workflow_permanent_id = Column(String, nullable=True)
     prompt = Column(UnicodeText, nullable=True)
     url = Column(String, nullable=True)
+    summary = Column(String, nullable=True)
+    output = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
