@@ -1168,7 +1168,7 @@ async def _summarize_observer_cruise(
     # summarize the observer cruise and format the output
     observer_summary_prompt = prompt_engine.load_prompt(
         "observer_summary",
-        user_goal=observer_cruise.user_prompt,
+        user_goal=observer_cruise.prompt,
         task_history=task_history,
         local_datetime=datetime.now(context.tz_info).isoformat(),
     )
