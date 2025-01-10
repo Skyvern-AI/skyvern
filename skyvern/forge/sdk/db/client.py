@@ -2093,6 +2093,8 @@ class AgentDB:
         workflow_permanent_id: str | None = None,
         url: str | None = None,
         prompt: str | None = None,
+        summary: str | None = None,
+        output: dict[str, Any] | None = None,
         organization_id: str | None = None,
     ) -> ObserverCruise:
         async with self.Session() as session:
@@ -2116,6 +2118,10 @@ class AgentDB:
                     observer_cruise.url = url
                 if prompt:
                     observer_cruise.prompt = prompt
+                if summary:
+                    observer_cruise.summary = summary
+                if output:
+                    observer_cruise.output = output
                 await session.commit()
                 await session.refresh(observer_cruise)
                 return ObserverCruise.model_validate(observer_cruise)

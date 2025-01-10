@@ -1,0 +1,24 @@
+The AI assistant has helped the user achieve the user goal in the web.
+Given the user goal, the latest screenshot of the page and the mini tasks that have been completed by the user along the way, summarize what has been achieved and output structured data related to the user goal in json format.
+You want to present the response in a clear way so that user can clearly understand what has been achieved.
+
+Reply in JSON format with the following keys:
+{
+    "description": str, // Summarize what has been achieved and describe the information extracted related to the user goal if any. Be precise and concise.
+    "output": json, // Structured data related to the user goal if any.
+}
+
+User goal:
+```
+{{ user_goal }}
+```
+
+Task history (the earliest task is the first in the list and the latest is the last in the list):
+```
+{{ task_history }}
+```
+
+Current datetime, ISO format:
+```
+{{ local_datetime }}
+```

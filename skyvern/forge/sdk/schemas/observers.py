@@ -31,6 +31,8 @@ class ObserverCruise(BaseModel):
     workflow_permanent_id: str | None = None
     prompt: str | None = None
     url: HttpUrl | None = None
+    summary: str | None = None
+    output: dict[str, Any] | list | str | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -46,6 +48,7 @@ class ObserverThoughtType(StrEnum):
 class ObserverThoughtScenario(StrEnum):
     generate_plan = "generate_plan"
     user_goal_check = "user_goal_check"
+    summarization = "summarization"
     generate_metadata = "generate_metadata"
     extract_loop_values = "extract_loop_values"
     generate_task_in_loop = "generate_task_in_loop"
