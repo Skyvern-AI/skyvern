@@ -52,6 +52,7 @@ if not any(
         settings.ENABLE_AZURE_GPT4O_MINI,
         settings.ENABLE_BEDROCK,
         settings.ENABLE_GEMINI,
+        settings.ENABLE_NOVITA,
     ]
 ):
     raise NoProviderEnabledError()
@@ -285,5 +286,142 @@ if settings.ENABLE_GEMINI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_output_tokens=8192,
+        ),
+    )
+
+if settings.ENABLE_NOVITA:
+    LLMConfigRegistry.register_config(
+        "NOVITA_LLAMA_3_3_70B",
+        LLMConfig(
+            "openai/meta-llama/llama-3.3-70b-instruct",
+            ["NOVITA_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            litellm_params=LiteLLMParams(
+                api_base="https://api.novita.ai/v3/openai",
+                api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/meta-llama/llama-3.3-70b-instruct"},
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "NOVITA_LLAMA_3_2_1B",
+        LLMConfig(
+            "openai/meta-llama/llama-3.2-1b-instruct",
+            ["NOVITA_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            litellm_params=LiteLLMParams(
+                api_base="https://api.novita.ai/v3/openai",
+                api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/meta-llama/llama-3.2-1b-instruct"},
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "NOVITA_LLAMA_3_2_3B",
+        LLMConfig(
+            "openai/meta-llama/llama-3.2-3b-instruct",
+            ["NOVITA_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            litellm_params=LiteLLMParams(
+                api_base="https://api.novita.ai/v3/openai",
+                api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/meta-llama/llama-3.2-3b-instruct"},
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "NOVITA_LLAMA_3_2_11B_VISION",
+        LLMConfig(
+            "openai/meta-llama/llama-3.2-11b-vision-instruct",
+            ["NOVITA_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            litellm_params=LiteLLMParams(
+                api_base="https://api.novita.ai/v3/openai",
+                api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/meta-llama/llama-3.2-11b-vision-instruct"},
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "NOVITA_LLAMA_3_1_8B",
+        LLMConfig(
+            "openai/meta-llama/llama-3.1-8b-instruct",
+            ["NOVITA_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            litellm_params=LiteLLMParams(
+                api_base="https://api.novita.ai/v3/openai",
+                api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/meta-llama/llama-3.1-8b-instruct"},
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "NOVITA_LLAMA_3_1_70B",
+        LLMConfig(
+            "openai/meta-llama/llama-3.1-70b-instruct",
+            ["NOVITA_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            litellm_params=LiteLLMParams(
+                api_base="https://api.novita.ai/v3/openai",
+                api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/meta-llama/llama-3.1-70b-instruct"},
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "NOVITA_LLAMA_3_1_405B",
+        LLMConfig(
+            "openai/meta-llama/llama-3.1-405b-instruct",
+            ["NOVITA_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            litellm_params=LiteLLMParams(
+                api_base="https://api.novita.ai/v3/openai",
+                api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/meta-llama/llama-3.1-405b-instruct"},
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "NOVITA_LLAMA_3_8B",
+        LLMConfig(
+            "openai/meta-llama/llama-3-8b-instruct",
+            ["NOVITA_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            litellm_params=LiteLLMParams(
+                api_base="https://api.novita.ai/v3/openai",
+                api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/meta-llama/llama-3-8b-instruct"},
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "NOVITA_LLAMA_3_70B",
+        LLMConfig(
+            "openai/meta-llama/llama-3-70b-instruct",
+            ["NOVITA_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            litellm_params=LiteLLMParams(
+                api_base="https://api.novita.ai/v3/openai",
+                api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/meta-llama/llama-3-70b-instruct"},
+            ),
         ),
     )

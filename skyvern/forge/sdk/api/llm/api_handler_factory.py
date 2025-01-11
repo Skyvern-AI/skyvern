@@ -147,7 +147,11 @@ class LLMAPIHandlerFactory:
                 ai_suggestion=ai_suggestion,
             )
             if step:
-                llm_cost = litellm.completion_cost(completion_response=response)
+                try:
+                    llm_cost = litellm.completion_cost(completion_response=response)
+                except Exception as e:
+                    LOG.exception("Failed to calculate LLM cost", error=str(e))
+                    llm_cost = 0
                 prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
                 completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
                 await app.DATABASE.update_step(
@@ -289,7 +293,11 @@ class LLMAPIHandlerFactory:
             )
 
             if step:
-                llm_cost = litellm.completion_cost(completion_response=response)
+                try:
+                    llm_cost = litellm.completion_cost(completion_response=response)
+                except Exception as e:
+                    LOG.exception("Failed to calculate LLM cost", error=str(e))
+                    llm_cost = 0
                 prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
                 completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
                 await app.DATABASE.update_step(
