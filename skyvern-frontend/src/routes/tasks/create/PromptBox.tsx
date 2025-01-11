@@ -122,7 +122,7 @@ const exampleCases = [
 function PromptBox() {
   const navigate = useNavigate();
   const [prompt, setPrompt] = useState<string>("");
-  const [selectValue, setSelectValue] = useState("v1");
+  const [selectValue, setSelectValue] = useState("v2"); // Observer is the default
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
 
@@ -242,7 +242,7 @@ function PromptBox() {
                       <SelectItemText>Skyvern 1.0 (Tasks)</SelectItemText>
                     </div>
                     <div className="text-xs text-slate-400">
-                      best for simple tasks
+                      Best for simple tasks
                     </div>
                   </div>
                 </CustomSelectItem>
@@ -252,7 +252,7 @@ function PromptBox() {
                       <SelectItemText>Skyvern 2.0 (Observer)</SelectItemText>
                     </div>
                     <div className="text-xs text-slate-400">
-                      best for complex tasks
+                      Best for complex tasks
                     </div>
                   </div>
                 </CustomSelectItem>
