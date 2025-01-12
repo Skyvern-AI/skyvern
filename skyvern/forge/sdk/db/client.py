@@ -1744,6 +1744,19 @@ class AgentDB:
             await session.execute(stmt)
             await session.commit()
 
+    async def delete_observer_cruise_artifacts(
+        self, observer_cruise_id: str, organization_id: str | None = None
+    ) -> None:
+        async with self.Session() as session:
+            stmt = delete(ArtifactModel).where(
+                and_(
+                    ArtifactModel.observer_cruise_id == observer_cruise_id,
+                    ArtifactModel.organization_id == organization_id,
+                )
+            )
+            await session.execute(stmt)
+            await session.commit()
+
     async def delete_task_steps(self, organization_id: str, task_id: str) -> None:
         async with self.Session() as session:
             # delete artifacts by filtering organization_id and task_id
@@ -1932,6 +1945,19 @@ class AgentDB:
             ).first():
                 return ObserverCruise.model_validate(observer_cruise)
             return None
+
+    async def delete_observer_thoughts_for_cruise(
+        self, observer_cruise_id: str, organization_id: str | None = None
+    ) -> None:
+        async with self.Session() as session:
+            stmt = delete(ObserverThoughtModel).where(
+                and_(
+                    ObserverThoughtModel.observer_cruise_id == observer_cruise_id,
+                    ObserverThoughtModel.organization_id == organization_id,
+                )
+            )
+            await session.execute(stmt)
+            await session.commit()
 
     async def get_observer_cruise_by_workflow_run_id(
         self,
