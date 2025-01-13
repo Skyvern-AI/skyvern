@@ -27,27 +27,29 @@ SEQUENCE_COUNTER = itertools.count()
 _worker_hash = None
 
 # prefix
-ORGANIZATION_AUTH_TOKEN_PREFIX = "oat"
-ORG_PREFIX = "o"
-TASK_PREFIX = "tsk"
-USER_PREFIX = "u"
-STEP_PREFIX = "stp"
+ACTION_PREFIX = "act"
+AI_SUGGESTION_PREFIX = "as"
 ARTIFACT_PREFIX = "a"
-WORKFLOW_PREFIX = "w"
-WORKFLOW_PERMANENT_ID_PREFIX = "wpid"
-WORKFLOW_RUN_PREFIX = "wr"
-WORKFLOW_RUN_BLOCK_PREFIX = "wrb"
-WORKFLOW_PARAMETER_PREFIX = "wp"
 AWS_SECRET_PARAMETER_PREFIX = "asp"
-OUTPUT_PARAMETER_PREFIX = "op"
+BITWARDEN_CREDIT_CARD_DATA_PARAMETER_PREFIX = "bccd"
 BITWARDEN_LOGIN_CREDENTIAL_PARAMETER_PREFIX = "blc"
 BITWARDEN_SENSITIVE_INFORMATION_PARAMETER_PREFIX = "bsi"
-BITWARDEN_CREDIT_CARD_DATA_PARAMETER_PREFIX = "bccd"
-TASK_GENERATION_PREFIX = "tg"
-AI_SUGGESTION_PREFIX = "as"
 OBSERVER_CRUISE_ID = "oc"
 OBSERVER_THOUGHT_ID = "ot"
+ORGANIZATION_AUTH_TOKEN_PREFIX = "oat"
+ORG_PREFIX = "o"
+OUTPUT_PARAMETER_PREFIX = "op"
 PERSISTENT_BROWSER_SESSION_ID = "pbs"
+STEP_PREFIX = "stp"
+TASK_GENERATION_PREFIX = "tg"
+TASK_PREFIX = "tsk"
+TOTP_CODE_PREFIX = "totp"
+USER_PREFIX = "u"
+WORKFLOW_PARAMETER_PREFIX = "wp"
+WORKFLOW_PERMANENT_ID_PREFIX = "wpid"
+WORKFLOW_PREFIX = "w"
+WORKFLOW_RUN_BLOCK_PREFIX = "wrb"
+WORKFLOW_RUN_PREFIX = "wr"
 
 
 def generate_workflow_id() -> str:
@@ -142,12 +144,12 @@ def generate_ai_suggestion_id() -> str:
 
 def generate_totp_code_id() -> str:
     int_id = generate_id()
-    return f"totp_{int_id}"
+    return f"{TOTP_CODE_PREFIX}_{int_id}"
 
 
 def generate_action_id() -> str:
     int_id = generate_id()
-    return f"a_{int_id}"
+    return f"{ACTION_PREFIX}_{int_id}"
 
 
 def generate_observer_cruise_id() -> str:
