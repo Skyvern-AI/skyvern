@@ -150,9 +150,9 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
         and not before_pseudo_text
         and not after_pseudo_text
     ):
-        return f'<{tag}{attributes_html if not attributes_html else " "+attributes_html}>'
+        return f"<{tag}{attributes_html if not attributes_html else ' ' + attributes_html}>"
     else:
-        return f'<{tag}{attributes_html if not attributes_html else " "+attributes_html}>{before_pseudo_text}{text}{children_html+option_html}{after_pseudo_text}</{tag}>'
+        return f"<{tag}{attributes_html if not attributes_html else ' ' + attributes_html}>{before_pseudo_text}{text}{children_html + option_html}{after_pseudo_text}</{tag}>"
 
 
 def clean_element_before_hashing(element: dict) -> dict:
