@@ -550,6 +550,9 @@ class ObserverCruiseModel(Base):
     url = Column(String, nullable=True)
     summary = Column(String, nullable=True)
     output = Column(JSON, nullable=True)
+    webhook_callback_url = Column(String, nullable=True)
+    totp_verification_url = Column(String, nullable=True)
+    totp_identifier = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

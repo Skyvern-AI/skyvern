@@ -2762,6 +2762,8 @@ async def poll_verification_code(
     task_id: str,
     organization_id: str,
     workflow_id: str | None = None,
+    workflow_run_id: str | None = None,
+    workflow_permanent_id: str | None = None,
     totp_verification_url: str | None = None,
     totp_identifier: str | None = None,
 ) -> str | None:
@@ -2793,10 +2795,18 @@ async def poll_verification_code(
         await asyncio.sleep(10)
 
 
-async def _get_verification_code_from_url(task_id: str, url: str, api_key: str) -> str | None:
-    request_data = {
-        "task_id": task_id,
-    }
+async def _get_verification_code_from_url(
+    task_id: str,
+    url: str,
+    api_key: str,
+    workflow_run_id: str | None = None,
+    workflow_permanent_id: str | None = None,
+) -> str | None:
+    request_data = {"task_id": task_id}
+    if workflow_run_id:
+        request_data["workflow_run_id"] = workflow_run_id
+    if workflow_permanent_id:
+        request_data["workflow_permanent_id"] = workflow_permanent_id
     payload = json.dumps(request_data)
     signature = generate_skyvern_signature(
         payload=payload,

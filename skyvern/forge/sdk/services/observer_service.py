@@ -4,15 +4,18 @@ import string
 from datetime import datetime
 from typing import Any
 
+import httpx
 import structlog
 from sqlalchemy.exc import OperationalError
 
-from skyvern.exceptions import UrlGenerationFailure
+from skyvern.exceptions import FailedToSendWebhook, UrlGenerationFailure
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.observers import (
     ObserverCruise,
     ObserverCruiseStatus,
@@ -1061,6 +1064,9 @@ async def mark_observer_cruise_as_failed(
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
             workflow_run_id, failure_reason=failure_reason or "Observer cruise failed"
         )
+    observer_cruise = await get_observer_cruise(observer_cruise_id, organization_id=organization_id)
+    if observer_cruise:
+        await send_observer_cruise_webhook(observer_cruise)
 
 
 async def mark_observer_cruise_as_completed(
@@ -1079,6 +1085,10 @@ async def mark_observer_cruise_as_completed(
     )
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(workflow_run_id)
+
+    observer_cruise = await get_observer_cruise(observer_cruise_id, organization_id=organization_id)
+    if observer_cruise:
+        await send_observer_cruise_webhook(observer_cruise)
 
 
 def _get_extracted_data_from_block_result(
@@ -1195,3 +1205,52 @@ async def _summarize_observer_cruise(
         summary=thought,
         output=summarized_output,
     )
+
+
+async def send_observer_cruise_webhook(observer_cruise: ObserverCruise) -> None:
+    if not observer_cruise.webhook_callback_url:
+        return
+    organization_id = observer_cruise.organization_id
+    if not organization_id:
+        return
+    api_key = await app.DATABASE.get_valid_org_auth_token(
+        organization_id,
+        OrganizationAuthTokenType.api,
+    )
+    if not api_key:
+        LOG.warning(
+            "No valid API key found for the organization of observer cruise",
+            observer_cruise_id=observer_cruise.observer_cruise_id,
+        )
+        return
+    # build the observer cruise response
+    payload = observer_cruise.model_dump_json()
+    headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key.token)
+    LOG.info(
+        "Sending observer cruise response to webhook callback url",
+        observer_cruise_id=observer_cruise.observer_cruise_id,
+        webhook_callback_url=observer_cruise.webhook_callback_url,
+        payload=payload,
+        headers=headers,
+    )
+    try:
+        resp = await httpx.AsyncClient().post(
+            observer_cruise.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
+        )
+        if resp.status_code == 200:
+            LOG.info(
+                "Observer cruise webhook sent successfully",
+                observer_cruise_id=observer_cruise.observer_cruise_id,
+                resp_code=resp.status_code,
+                resp_text=resp.text,
+            )
+        else:
+            LOG.info(
+                "Observer cruise webhook failed",
+                observer_cruise_id=observer_cruise.observer_cruise_id,
+                resp=resp,
+                resp_code=resp.status_code,
+                resp_text=resp.text,
+            )
+    except Exception as e:
+        raise FailedToSendWebhook(observer_cruise_id=observer_cruise.observer_cruise_id) from e
