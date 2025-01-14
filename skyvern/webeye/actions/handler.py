@@ -788,12 +788,21 @@ async def handle_input_text_action(
             await incremental_scraped.stop_listen_dom_increment()
 
         return [ActionSuccess()]
+    except Exception as e:
+        LOG.exception(
+            "Failed to input the value or finish the auto completion",
+            task_id=task.task_id,
+            step_id=step.step_id,
+        )
+        raise e
     finally:
         # HACK: force to finish missing auto completion input
-        if auto_complete_hacky_flag and not await skyvern_element.is_raw_input():
+        if auto_complete_hacky_flag and await skyvern_element.is_visible() and not await skyvern_element.is_raw_input():
             LOG.debug(
                 "Trigger input-selection hack, pressing Tab to choose one",
                 action=action,
+                task_id=task.task_id,
+                step_id=step.step_id,
             )
             await skyvern_element.press_key("Tab")
 
@@ -1624,6 +1633,7 @@ async def choose_auto_completion_dropdown(
         html = incremental_scraped.build_html_tree(cleaned_incremental_element)
         auto_completion_confirm_prompt = prompt_engine.load_prompt(
             "auto-completion-choose-option",
+            is_search=context.is_search_bar,
             field_information=context.field,
             filled_value=text,
             navigation_goal=task.navigation_goal,
@@ -1638,6 +1648,16 @@ async def choose_auto_completion_dropdown(
         json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=auto_completion_confirm_prompt, step=step)
         element_id = json_response.get("id", "")
         relevance_float = json_response.get("relevance_float", 0)
+        if json_response.get("direct_searching", False):
+            LOG.info(
+                "Decided to directly search with the current value",
+                value=text,
+                step_id=step.step_id,
+                task_id=task.task_id,
+            )
+            await skyvern_element.press_key("Enter")
+            return result
+
         if not element_id:
             reasoning = json_response.get("reasoning")
             raise NoSuitableAutoCompleteOption(reasoning=reasoning, target_value=text)
@@ -1682,7 +1702,7 @@ async def choose_auto_completion_dropdown(
         return result
     finally:
         await incremental_scraped.stop_listen_dom_increment()
-        if clear_input:
+        if clear_input and await skyvern_element.is_visible():
             await skyvern_element.input_clear()
 
 

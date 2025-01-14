@@ -267,6 +267,8 @@ class SkyvernElement:
         return self.get_selectable() or self.get_tag_name() in SELECTABLE_ELEMENT
 
     async def is_visible(self) -> bool:
+        if not await self.get_locator().count():
+            return False
         skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
         return await skyvern_frame.get_element_visible(await self.get_element_handler())
 
