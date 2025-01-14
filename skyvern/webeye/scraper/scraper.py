@@ -575,6 +575,10 @@ class IncrementalScrapePage:
         await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script)
 
     async def stop_listen_dom_increment(self) -> None:
+        # check if the DOM has navigated away or refreshed
+        js_script = "() => window.globalObserverForDOMIncrement === undefined"
+        if await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script):
+            return
         js_script = "() => stopGlobalIncrementalObserver()"
         await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script)
 
