@@ -29,11 +29,13 @@ class FailedToSendWebhook(SkyvernException):
         task_id: str | None = None,
         workflow_run_id: str | None = None,
         workflow_id: str | None = None,
+        observer_cruise_id: str | None = None,
     ):
         workflow_run_str = f"workflow_run_id={workflow_run_id}" if workflow_run_id else ""
         workflow_str = f"workflow_id={workflow_id}" if workflow_id else ""
         task_str = f"task_id={task_id}" if task_id else ""
-        super().__init__(f"Failed to send webhook. {workflow_run_str} {workflow_str} {task_str}")
+        observer_cruise_str = f"observer_cruise_id={observer_cruise_id}" if observer_cruise_id else ""
+        super().__init__(f"Failed to send webhook. {workflow_run_str} {workflow_str} {task_str} {observer_cruise_str}")
 
 
 class ProxyLocationNotSupportedError(SkyvernException):

@@ -987,9 +987,10 @@ class WorkflowService:
             headers=headers,
         )
         try:
-            resp = await httpx.AsyncClient().post(
-                url=workflow_run.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
-            )
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    url=workflow_run.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
+                )
             if resp.status_code == 200:
                 LOG.info(
                     "Webhook sent successfully",
