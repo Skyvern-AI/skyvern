@@ -553,6 +553,7 @@ class ObserverCruiseModel(Base):
     webhook_callback_url = Column(String, nullable=True)
     totp_verification_url = Column(String, nullable=True)
     totp_identifier = Column(String, nullable=True)
+    proxy_location = Column(Enum(ProxyLocation), nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
