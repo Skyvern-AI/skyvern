@@ -57,8 +57,8 @@ Skyvern uses a swarm of agents to comprehend a website, and plan and execute its
 6. **Dynamic Auto-complete Agent**: This agent is responsible for filling out dynamic auto-complete forms on a website. It's capable of reading the options presented to it, selecting the appropriate option based on the user's input, and adjusting its inputs based on the feedback from inside the form. Popular examples include: Address forms, university dropdowns, and more.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/skyvern-system-diagram-dark.png" />
-  <img src="docs/images/skyvern-system-diagram-light.png" />
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/skyvern_2_0_system_diagram.png" />
+  <img src="docs/images/skyvern_2_0_system_diagram.png" />
 </picture>
 
 # Demo
@@ -142,6 +142,14 @@ pre-commit install
 ```
 
 # Supported Functionality
+
+## Skyvern 2.0
+Skyvern 2.0 is a major overhaul of Skyvern that includes a multi-agent architecture with a planner + validator agent, allowing Skyvern to complete more complex tasks with a zero-shot prompt.
+
+<p align="center">
+  <img src="docs/images/skyvern_2_0_screenshot.png"/>
+</p>
+
 ## Skyvern Tasks
 Tasks are the fundamental building block inside Skyvern. Each task is a single request to Skyvern, instructing it to navigate through a website and accomplish a specific goal. 
 
@@ -160,12 +168,15 @@ For example, if you wanted to download all invoices newer than January 1st, you 
 Another example is if you wanted to automate purchasing products from an e-commerce store, you could create a workflow that first navigated to the desired product, then added it to a cart. Second, it would navigate to the cart and validate the cart state. Finally, it would go through the checkout process to purchase the items.
 
 Supported workflow features include:
-1. Tasks (+ chained tasks)
+1. Navigation
+1. Action
+1. Data Extraction
 1. Loops
 1. File parsing
 1. Uploading files to block storage
 1. Sending emails
 1. Text Prompts
+1. Tasks (general)
 1. (Coming soon) Conditionals
 1. (Coming soon) Custom Code Block
 
@@ -177,18 +188,18 @@ Supported workflow features include:
 Skyvern allows you to livestream the viewport of the browser to your local machine so that you can see exactly what Skyvern is doing on the web. This is useful for debugging and understanding how Skyvern is interacting with a website, and intervening when necessary
 
 ## Form Filling
-Skyvern is natively capable of filling out form inputs on websites. Passing in information via the `navigation_goal` or `navigation_payload` will allow Skyvern to comprehend the information and fill out the form accordingly.
+Skyvern is natively capable of filling out form inputs on websites. Passing in information via the `navigation_goal` will allow Skyvern to comprehend the information and fill out the form accordingly.
 
 ## Data Extraction
-Skyvern is also capable of extracting data from a website. Specifying a `data_extraction_goal` will allow Skyvern to extract the data and return it to you in the response.
+Skyvern is also capable of extracting data from a website.
 
-You can also specify a `data_extraction_schema` to tell Skyvern exactly what data you'd like to extract from the website, in jsonc format. Skyvern's output will be structured in accordance to the supplied schema.
+You can also specify a `data_extraction_schema` directly within the main prompt to tell Skyvern exactly what data you'd like to extract from the website, in jsonc format. Skyvern's output will be structured in accordance to the supplied schema.
 
 ## File Downloading
-Skyvern is also capable of downloading files from a website. Specifying a `file_download_goal` will allow Skyvern to download the file and return a link to the file in the response.
+Skyvern is also capable of downloading files from a website. All downloaded files are automatically uploaded to block storage (if configured), and you can access them via the UI.
 
-## Authentication
-Skyvern supports a number of different authentication methods to make it easier to automate tasks behind a login. 
+## Authentication (Beta)
+Skyvern supports a number of different authentication methods to make it easier to automate tasks behind a login. If you'd like to try it out, please reach out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
 
 ### Password Manager Integrations
 Skyvern currently supports the following password manager integrations:
@@ -212,11 +223,6 @@ Examples include:
 # Real-world examples of Skyvern
 We love to see how Skyvern is being used in the wild. Here are some examples of how Skyvern is being used to automate workflows in the real world. Please open PRs to add your own examples!
 
-You'll need to have Skyvern running locally if you want to try these examples out. Please run the following command after going through the quickstart guide:
-```
-./run_skyvern.sh
-```
-
 ## Invoice Downloading on many different websites
 [Book a demo to see it live](https://meetings.hubspot.com/skyvern/demo)
 
@@ -225,38 +231,38 @@ You'll need to have Skyvern running locally if you want to try these examples ou
 </p>
 
 ## Automate the job application process
-[💡 See it in action](https://app.skyvern.com/create/job_application)
+[💡 See it in action](https://app.skyvern.com/tasks/create/job_application)
 <p align="center">
   <img src="docs/images/job_application_demo.gif"/>
 </p>
 
 ## Automate materials procurement for a manufacturing company
-[💡 See it in action](https://app.skyvern.com/create/finditparts)
+[💡 See it in action](https://app.skyvern.com/tasks/create/finditparts)
 <p align="center">
   <img src="docs/images/finditparts_recording_crop.gif"/>
 </p>
 
 ## Navigating to government websites to register accounts or fill out forms 
-[💡 See it in action](https://app.skyvern.com/create/california_edd)
+[💡 See it in action](https://app.skyvern.com/tasks/create/california_edd)
 <p align="center">
   <img src="docs/images/edd_services.gif"/>
 </p>
 <!-- Add example of delaware entity lookups x2 -->
 
 ## Filling out random contact us forms
-[💡 See it in action](https://app.skyvern.com/create/contact_us_forms)
+[💡 See it in action](https://app.skyvern.com/tasks/create/contact_us_forms)
 <p align="center">
   <img src="docs/images/contact_forms.gif"/>
 </p>
 
 
 ## Retrieving insurance quotes from insurance providers in any language
-[💡 See it in action](https://app.skyvern.com/create/bci_seguros)
+[💡 See it in action](https://app.skyvern.com/tasks/create/bci_seguros)
 <p align="center">
   <img src="docs/images/bci_seguros_recording.gif"/>
 </p>
 
-[💡 See it in action](https://app.skyvern.com/create/geico)
+[💡 See it in action](https://app.skyvern.com/tasks/create/geico)
 
 <p align="center">
   <img src="docs/images/geico_shu_recording_cropped.gif"/>
@@ -310,10 +316,10 @@ This is our planned roadmap for the next few months. If you have any suggestions
 - [x] **Workflow UI Builder** - Introduce a UI to allow users to build and analyze workflows visually
 - [x] **Chrome Viewport streaming** - Introduce a way to live-stream the Chrome viewport to the user's browser (as a part of the self-serve UI)
 - [x] **Past Runs UI** - Deprecate the Streamlit UI in favour of a React-based UI that allows you to visualize past runs and their results
+- [X] **Auto workflow builder ("Observer") mode** - Allow Skyvern to auto-generate workflows as it's navigating the web to make it easier to build new workflows
 - [ ] **Prompt Caching** - Introduce a caching layer to the LLM calls to dramatically reduce the cost of running Skyvern (memorize past actions and repeat them!)
 - [ ] **Web Evaluation Dataset** - Integrate Skyvern with public benchmark tests to track the quality of our models over time
 - [ ] **Improved Debug mode** - Allow Skyvern to plan its actions and get "approval" before running them, allowing you to debug what it's doing and more easily iterate on the prompt
-- [ ] **Auto workflow builder ("Observer") mode** - Allow Skyvern to auto-generate workflows as it's navigating the web to make it easier to build new workflows
 - [ ] **Chrome Extension** - Allow users to interact with Skyvern through a Chrome extension (incl voice mode, saving tasks, etc.)
 - [ ] **Skyvern Action Recorder** - Allow Skyvern to watch a user complete a task and then automatically generate a workflow for it
 - [ ] **Interactable Livestream** - Allow users to interact with the livestream in real-time to intervene when necessary (such as manually submitting sensitive forms)
