@@ -358,6 +358,9 @@ class BitwardenService:
             BitwardenService.sync()
             session_key = BitwardenService.unlock(master_password)
 
+            if not bw_organization_id and not collection_id:
+                raise BitwardenAccessDeniedError()
+
             # Step 3: Retrieve the items
             list_command = [
                 "bw",
@@ -513,6 +516,12 @@ class BitwardenService:
                 "--session",
                 session_key,
             ]
+
+            # Bitwarden CLI doesn't support filtering by organization ID or collection ID for credit card data so we just raise an error if no collection ID or organization ID is provided
+            if not bw_organization_id and not collection_id:
+                LOG.error("No collection ID or organization ID provided -- this is required")
+                raise BitwardenAccessDeniedError()
+
             item_result = BitwardenService.run_command(get_command)
 
             # Parse the item and extract credit card data
@@ -571,8 +580,6 @@ class BitwardenService:
         """
         Get the credit card data from the Bitwarden CLI.
         """
-        if not bw_organization_id and not bw_collection_ids:
-            raise BitwardenAccessDeniedError()
         try:
             async with asyncio.timeout(settings.BITWARDEN_TIMEOUT_SECONDS):
                 return await BitwardenService._get_credit_card_data(

@@ -1218,10 +1218,6 @@ class WorkflowService:
                         description=parameter.description,
                     )
                 elif parameter.parameter_type == ParameterType.BITWARDEN_CREDIT_CARD_DATA:
-                    if not organization.bw_organization_id and not organization.bw_collection_ids:
-                        raise InvalidWorkflowDefinition(
-                            message="To use credit card data parameters, please contact us at support@skyvern.com"
-                        )
                     parameters[parameter.key] = await self.create_bitwarden_credit_card_data_parameter(
                         workflow_id=workflow.workflow_id,
                         bitwarden_client_id_aws_secret_key=parameter.bitwarden_client_id_aws_secret_key,
