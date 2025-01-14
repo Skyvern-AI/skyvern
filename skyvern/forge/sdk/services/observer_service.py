@@ -437,6 +437,8 @@ async def run_observer_cruise_helper(
                 workflow_run_id=workflow_run_id,
                 original_url=original_url,
                 navigation_goal=navigation_goal,
+                totp_verification_url=observer_cruise.totp_verification_url,
+                totp_identifier=observer_cruise.totp_identifier,
             )
             task_history_record = {"type": task_type, "task": plan}
         elif task_type == "loop":
@@ -498,7 +500,7 @@ async def run_observer_cruise_helper(
         workflow_create_request = WorkflowCreateYAMLRequest(
             title=workflow.title,
             description=workflow.description,
-            proxy_location=ProxyLocation.RESIDENTIAL,
+            proxy_location=observer_cruise.proxy_location or ProxyLocation.RESIDENTIAL,
             workflow_definition=workflow_definition_yaml,
         )
         LOG.info("Creating workflow from request", workflow_create_request=workflow_create_request)
@@ -994,6 +996,8 @@ async def _generate_navigation_task(
     workflow_run_id: str,
     navigation_goal: str,
     original_url: str | None = None,
+    totp_verification_url: str | None = None,
+    totp_identifier: str | None = None,
 ) -> tuple[NavigationBlock, list[BLOCK_YAML_TYPES], list[PARAMETER_YAML_TYPES]]:
     LOG.info("Generating navigation task", navigation_goal=navigation_goal, original_url=original_url)
     label = f"navigation_{_generate_random_string()}"
@@ -1001,6 +1005,8 @@ async def _generate_navigation_task(
         label=label,
         url=original_url,
         navigation_goal=navigation_goal,
+        totp_verification_url=totp_verification_url,
+        totp_identifier=totp_identifier,
     )
     output_parameter = await app.WORKFLOW_SERVICE.create_output_parameter_for_block(
         workflow_id=workflow_id,
@@ -1011,6 +1017,8 @@ async def _generate_navigation_task(
             label=label,
             url=original_url,
             navigation_goal=navigation_goal,
+            totp_verification_url=totp_verification_url,
+            totp_identifier=totp_identifier,
             output_parameter=output_parameter,
         ),
         [navigation_block_yaml],
