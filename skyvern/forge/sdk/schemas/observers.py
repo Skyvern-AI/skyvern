@@ -2,9 +2,10 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, HttpUrl, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from skyvern.forge.sdk.core.validators import validate_url
+from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
 
@@ -30,12 +31,24 @@ class ObserverCruise(BaseModel):
     workflow_id: str | None = None
     workflow_permanent_id: str | None = None
     prompt: str | None = None
-    url: HttpUrl | None = None
+    url: str | None = None
     summary: str | None = None
     output: dict[str, Any] | list | str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    proxy_location: ProxyLocation | None = None
+    webhook_callback_url: str | None = None
 
     created_at: datetime
     modified_at: datetime
+
+    @field_validator("url", "webhook_callback_url", "totp_verification_url")
+    @classmethod
+    def validate_urls(cls, url: str | None) -> str | None:
+        if url is None:
+            return None
+
+        return validate_url(url)
 
 
 class ObserverThoughtType(StrEnum):
