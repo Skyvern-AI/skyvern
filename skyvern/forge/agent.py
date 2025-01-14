@@ -47,7 +47,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import get_path_for_workflow_download_directory, list_files_in_directory, rename_file
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.security import generate_skyvern_signature
+from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -1603,17 +1603,8 @@ class ForgeAgent:
         task_response = await self.build_task_response(task=task, last_step=last_step)
 
         # send task_response to the webhook callback url
-        timestamp = str(int(datetime.utcnow().timestamp()))
         payload = task_response.model_dump_json(exclude={"request"})
-        signature = generate_skyvern_signature(
-            payload=payload,
-            api_key=api_key,
-        )
-        headers = {
-            "x-skyvern-timestamp": timestamp,
-            "x-skyvern-signature": signature,
-            "Content-Type": "application/json",
-        }
+        headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key)
         LOG.info(
             "Sending task response to webhook callback url",
             task_id=task.task_id,

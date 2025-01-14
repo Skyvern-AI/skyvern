@@ -41,3 +41,13 @@ def generate_skyvern_signature(
     """
     hash_obj = hmac.new(api_key.encode("utf-8"), msg=payload.encode("utf-8"), digestmod=hashlib.sha256)
     return hash_obj.hexdigest()
+
+
+def generate_skyvern_webhook_headers(payload: str, api_key: str) -> dict[str, str]:
+    signature = generate_skyvern_signature(payload=payload, api_key=api_key)
+    timestamp = str(int(datetime.utcnow().timestamp()))
+    return {
+        "x-skyvern-timestamp": timestamp,
+        "x-skyvern-signature": signature,
+        "Content-Type": "application/json",
+    }
