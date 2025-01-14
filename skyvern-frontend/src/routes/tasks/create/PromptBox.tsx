@@ -239,7 +239,7 @@ function PromptBox() {
                 <CustomSelectItem value="v1">
                   <div className="space-y-2">
                     <div>
-                      <SelectItemText>Skyvern 1.0</SelectItemText>
+                      <SelectItemText>Skyvern 1.0 (Tasks)</SelectItemText>
                     </div>
                     <div className="text-xs text-slate-400">
                       Best for simple tasks
@@ -249,7 +249,7 @@ function PromptBox() {
                 <CustomSelectItem value="v2" className="hover:bg-slate-800">
                   <div className="space-y-2">
                     <div>
-                      <SelectItemText>Skyvern 2.0</SelectItemText>
+                      <SelectItemText>Skyvern 2.0 (Observer)</SelectItemText>
                     </div>
                     <div className="text-xs text-slate-400">
                       Best for complex tasks
