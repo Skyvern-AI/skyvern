@@ -1,6 +1,5 @@
 import asyncio
 import json
-from datetime import datetime
 from typing import Any
 
 import httpx
@@ -19,7 +18,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.security import generate_skyvern_signature
+from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -974,17 +973,11 @@ class WorkflowService:
             return
 
         # send webhook to the webhook callback url
-        timestamp = str(int(datetime.utcnow().timestamp()))
         payload = workflow_run_status_response.model_dump_json()
-        signature = generate_skyvern_signature(
+        headers = generate_skyvern_webhook_headers(
             payload=payload,
             api_key=api_key,
         )
-        headers = {
-            "x-skyvern-timestamp": timestamp,
-            "x-skyvern-signature": signature,
-            "Content-Type": "application/json",
-        }
         LOG.info(
             "Sending webhook run status to webhook callback url",
             workflow_id=workflow_id,
