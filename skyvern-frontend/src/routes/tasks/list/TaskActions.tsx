@@ -160,7 +160,7 @@ function TaskActions({ task }: Props) {
             </DialogTrigger>
             <DropdownMenuItem
               onSelect={() => {
-                navigate(`/create/retry/${task.task_id}`);
+                navigate(`/tasks/create/retry/${task.task_id}`);
               }}
             >
               Rerun Task
