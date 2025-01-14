@@ -251,7 +251,7 @@ class WorkflowService:
                     workflow_run_id, parameters, organization
                 )
                 LOG.info(
-                    f"Executing root block {block.block_type} at index {block_idx}/{blocks_cnt -1} for workflow run {workflow_run_id}",
+                    f"Executing root block {block.block_type} at index {block_idx}/{blocks_cnt - 1} for workflow run {workflow_run_id}",
                     block_type=block.block_type,
                     workflow_run_id=workflow_run.workflow_run_id,
                     block_idx=block_idx,
@@ -265,7 +265,7 @@ class WorkflowService:
                 )
                 if block_result.status == BlockStatus.canceled:
                     LOG.info(
-                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} was canceled for workflow run {workflow_run_id}, cancelling workflow run",
+                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} was canceled for workflow run {workflow_run_id}, cancelling workflow run",
                         block_type=block.block_type,
                         workflow_run_id=workflow_run.workflow_run_id,
                         block_idx=block_idx,
@@ -286,7 +286,7 @@ class WorkflowService:
                     return workflow_run
                 elif block_result.status == BlockStatus.failed:
                     LOG.error(
-                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} failed for workflow run {workflow_run_id}",
+                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed for workflow run {workflow_run_id}",
                         block_type=block.block_type,
                         workflow_run_id=workflow_run.workflow_run_id,
                         block_idx=block_idx,
@@ -295,7 +295,7 @@ class WorkflowService:
                         block_label=block.label,
                     )
                     if not block.continue_on_failure:
-                        failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} failed. failure reason: {block_result.failure_reason}"
+                        failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed. failure reason: {block_result.failure_reason}"
                         await self.mark_workflow_run_as_failed(
                             workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                         )
@@ -309,7 +309,7 @@ class WorkflowService:
                         return workflow_run
 
                     LOG.warning(
-                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} failed but will continue executing the workflow run {workflow_run_id}",
+                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed but will continue executing the workflow run {workflow_run_id}",
                         block_type=block.block_type,
                         workflow_run_id=workflow_run.workflow_run_id,
                         block_idx=block_idx,
@@ -321,7 +321,7 @@ class WorkflowService:
 
                 elif block_result.status == BlockStatus.terminated:
                     LOG.info(
-                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} was terminated for workflow run {workflow_run_id}, marking workflow run as terminated",
+                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} was terminated for workflow run {workflow_run_id}, marking workflow run as terminated",
                         block_type=block.block_type,
                         workflow_run_id=workflow_run.workflow_run_id,
                         block_idx=block_idx,
@@ -331,7 +331,7 @@ class WorkflowService:
                     )
 
                     if not block.continue_on_failure:
-                        failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} terminated. Reason: {block_result.failure_reason}"
+                        failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} terminated. Reason: {block_result.failure_reason}"
                         await self.mark_workflow_run_as_terminated(
                             workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                         )
@@ -345,7 +345,7 @@ class WorkflowService:
                         return workflow_run
 
                     LOG.warning(
-                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} was terminated for workflow run {workflow_run_id}, but will continue executing the workflow run",
+                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} was terminated for workflow run {workflow_run_id}, but will continue executing the workflow run",
                         block_type=block.block_type,
                         workflow_run_id=workflow_run.workflow_run_id,
                         block_idx=block_idx,
@@ -368,7 +368,7 @@ class WorkflowService:
                 if isinstance(e, SkyvernException):
                     exception_message = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
 
-                failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt -1} failed. failure reason: {exception_message}"
+                failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed. failure reason: {exception_message}"
                 await self.mark_workflow_run_as_failed(
                     workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                 )

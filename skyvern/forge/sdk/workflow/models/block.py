@@ -789,7 +789,7 @@ class ForLoopBlock(Block):
     def get_loop_over_parameter_values(self, workflow_run_context: WorkflowRunContext) -> list[Any]:
         # parse the value from self.loop_variable_reference and then from self.loop_over
         if self.loop_variable_reference:
-            value_template = f'{{{{ {self.loop_variable_reference.strip(" {}")} | tojson }}}}'
+            value_template = f"{{{{ {self.loop_variable_reference.strip(' {}')} | tojson }}}}"
             try:
                 value_json = self.format_block_parameter_template_from_workflow_run_context(
                     value_template, workflow_run_context
