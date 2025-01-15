@@ -7,7 +7,7 @@ from skyvern.exceptions import OrganizationNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.schemas.observers import ObserverCruiseStatus
+from skyvern.forge.sdk.schemas.observers import ObserverTaskStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services import observer_service
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -166,7 +166,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         # mark observer cruise as queued
         await app.DATABASE.update_observer_cruise(
             observer_cruise_id,
-            status=ObserverCruiseStatus.queued,
+            status=ObserverTaskStatus.queued,
             organization_id=organization_id,
         )
         await app.DATABASE.update_workflow_run(

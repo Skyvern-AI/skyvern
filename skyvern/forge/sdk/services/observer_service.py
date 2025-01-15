@@ -17,9 +17,9 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.observers import (
-    ObserverCruise,
-    ObserverCruiseStatus,
     ObserverMetadata,
+    ObserverTask,
+    ObserverTaskStatus,
     ObserverThoughtScenario,
     ObserverThoughtType,
 )
@@ -81,7 +81,7 @@ def _generate_data_extraction_schema_for_loop(loop_values_key: str) -> dict:
 
 async def initialize_observer_cruise(
     organization: Organization, user_prompt: str, user_url: str | None = None
-) -> ObserverCruise:
+) -> ObserverTask:
     observer_cruise = await app.DATABASE.create_observer_cruise(
         prompt=user_prompt,
         organization_id=organization.organization_id,
@@ -237,14 +237,14 @@ async def run_observer_cruise(
 
 async def run_observer_cruise_helper(
     organization: Organization,
-    observer_cruise: ObserverCruise,
+    observer_cruise: ObserverTask,
     request_id: str | None = None,
     max_iterations_override: str | int | None = None,
     browser_session_id: str | None = None,
 ) -> tuple[Workflow, WorkflowRun] | tuple[None, None]:
     organization_id = organization.organization_id
     observer_cruise_id = observer_cruise.observer_cruise_id
-    if observer_cruise.status != ObserverCruiseStatus.queued:
+    if observer_cruise.status != ObserverTaskStatus.queued:
         LOG.error(
             "Observer cruise is not queued. Duplicate observer cruise",
             observer_cruise_id=observer_cruise_id,
@@ -310,7 +310,7 @@ async def run_observer_cruise_helper(
     )
 
     await app.DATABASE.update_observer_cruise(
-        observer_cruise_id=observer_cruise_id, organization_id=organization_id, status=ObserverCruiseStatus.running
+        observer_cruise_id=observer_cruise_id, organization_id=organization_id, status=ObserverTaskStatus.running
     )
     await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
     await _set_up_workflow_context(workflow_id, workflow_run_id)
@@ -700,7 +700,7 @@ async def _set_up_workflow_context(workflow_id: str, workflow_run_id: str) -> No
 
 
 async def _generate_loop_task(
-    observer_cruise: ObserverCruise,
+    observer_cruise: ObserverTask,
     workflow_id: str,
     workflow_permanent_id: str,
     workflow_run_id: str,
@@ -938,7 +938,7 @@ async def _generate_loop_task(
 
 
 async def _generate_extraction_task(
-    observer_cruise: ObserverCruise,
+    observer_cruise: ObserverTask,
     workflow_id: str,
     workflow_permanent_id: str,
     workflow_run_id: str,
@@ -1059,7 +1059,7 @@ async def get_observer_thought_timelines(
     ]
 
 
-async def get_observer_cruise(observer_cruise_id: str, organization_id: str | None = None) -> ObserverCruise | None:
+async def get_observer_cruise(observer_cruise_id: str, organization_id: str | None = None) -> ObserverTask | None:
     return await app.DATABASE.get_observer_cruise(observer_cruise_id, organization_id=organization_id)
 
 
@@ -1070,7 +1070,7 @@ async def mark_observer_cruise_as_failed(
     organization_id: str | None = None,
 ) -> None:
     await app.DATABASE.update_observer_cruise(
-        observer_cruise_id, organization_id=organization_id, status=ObserverCruiseStatus.failed
+        observer_cruise_id, organization_id=organization_id, status=ObserverTaskStatus.failed
     )
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
@@ -1091,7 +1091,7 @@ async def mark_observer_cruise_as_completed(
     await app.DATABASE.update_observer_cruise(
         observer_cruise_id,
         organization_id=organization_id,
-        status=ObserverCruiseStatus.completed,
+        status=ObserverTaskStatus.completed,
         summary=summary,
         output=output,
     )
@@ -1173,7 +1173,7 @@ def _get_extracted_data_from_block_result(
 
 
 async def _summarize_observer_cruise(
-    observer_cruise: ObserverCruise,
+    observer_cruise: ObserverTask,
     task_history: list[dict],
     context: SkyvernContext,
     screenshots: list[bytes] | None = None,
@@ -1219,7 +1219,7 @@ async def _summarize_observer_cruise(
     )
 
 
-async def send_observer_cruise_webhook(observer_cruise: ObserverCruise) -> None:
+async def send_observer_cruise_webhook(observer_cruise: ObserverTask) -> None:
     if not observer_cruise.webhook_callback_url:
         return
     organization_id = observer_cruise.organization_id
