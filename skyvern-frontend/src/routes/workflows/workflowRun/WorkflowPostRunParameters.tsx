@@ -140,7 +140,7 @@ function WorkflowPostRunParameters() {
           </div>
         </div>
       </div>
-      {workflowRun.observer_cruise ? (
+      {workflowRun.observer_task ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
             <h1 className="text-lg font-bold">Observer Parameters</h1>
@@ -152,7 +152,7 @@ function WorkflowPostRunParameters() {
                 </h2>
               </div>
               <AutoResizingTextarea
-                value={workflowRun.observer_cruise.prompt ?? ""}
+                value={workflowRun.observer_task.prompt ?? ""}
                 readOnly
               />
             </div>

@@ -215,7 +215,7 @@ export type WorkflowRunStatusApiResponse = {
   downloaded_file_urls: Array<string> | null;
   total_steps: number | null;
   total_cost: number | null;
-  observer_cruise: ObserverCruise | null;
+  observer_task: ObserverTask | null;
 };
 
 export type TaskGenerationApiResponse = {
@@ -242,8 +242,8 @@ export type ActionsApiResponse = {
   response: string | null;
 };
 
-export type ObserverCruise = {
-  observer_cruise_id: string;
+export type ObserverTask = {
+  task_id: string;
   status: Status;
   workflow_run_id: string | null;
   workflow_id: string | null;

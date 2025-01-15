@@ -1,5 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import { ObserverCruise, TaskGenerationApiResponse } from "@/api/types";
+import { ObserverTask, TaskGenerationApiResponse } from "@/api/types";
 import img from "@/assets/promptBoxBg.png";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { CartIcon } from "@/components/icons/CartIcon";
@@ -128,9 +128,9 @@ function PromptBox() {
 
   const startObserverCruiseMutation = useMutation({
     mutationFn: async (prompt: string) => {
-      const client = await getClient(credentialGetter);
-      return client.post<{ user_prompt: string }, { data: ObserverCruise }>(
-        "/cruise",
+      const client = await getClient(credentialGetter, "v2");
+      return client.post<{ user_prompt: string }, { data: ObserverTask }>(
+        "/tasks",
         { user_prompt: prompt },
       );
     },
