@@ -23,7 +23,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverThought
+from skyvern.forge.sdk.schemas.observers import ObserverTask, ObserverThought
 
 LOG = structlog.get_logger()
 
@@ -62,7 +62,7 @@ class LLMAPIHandlerFactory:
         async def llm_api_handler_with_router_and_fallback(
             prompt: str,
             step: Step | None = None,
-            observer_cruise: ObserverCruise | None = None,
+            observer_cruise: ObserverTask | None = None,
             observer_thought: ObserverThought | None = None,
             ai_suggestion: AISuggestion | None = None,
             screenshots: list[bytes] | None = None,
@@ -201,7 +201,7 @@ class LLMAPIHandlerFactory:
         async def llm_api_handler(
             prompt: str,
             step: Step | None = None,
-            observer_cruise: ObserverCruise | None = None,
+            observer_cruise: ObserverTask | None = None,
             observer_thought: ObserverThought | None = None,
             ai_suggestion: AISuggestion | None = None,
             screenshots: list[bytes] | None = None,

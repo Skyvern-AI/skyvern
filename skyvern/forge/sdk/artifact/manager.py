@@ -9,7 +9,7 @@ from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityT
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.observers import ObserverCruise, ObserverThought
+from skyvern.forge.sdk.schemas.observers import ObserverTask, ObserverThought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
 LOG = structlog.get_logger(__name__)
@@ -137,7 +137,7 @@ class ArtifactManager:
 
     async def create_observer_cruise_artifact(
         self,
-        observer_cruise: ObserverCruise,
+        observer_cruise: ObserverTask,
         artifact_type: ArtifactType,
         data: bytes | None = None,
         path: str | None = None,
@@ -203,7 +203,7 @@ class ArtifactManager:
         screenshots: list[bytes] | None = None,
         step: Step | None = None,
         observer_thought: ObserverThought | None = None,
-        observer_cruise: ObserverCruise | None = None,
+        observer_cruise: ObserverTask | None = None,
         ai_suggestion: AISuggestion | None = None,
     ) -> None:
         if step:

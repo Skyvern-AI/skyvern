@@ -58,12 +58,7 @@ from skyvern.forge.sdk.db.utils import (
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.observers import (
-    ObserverCruise,
-    ObserverCruiseStatus,
-    ObserverThought,
-    ObserverThoughtType,
-)
+from skyvern.forge.sdk.schemas.observers import ObserverTask, ObserverTaskStatus, ObserverThought, ObserverThoughtType
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
@@ -1934,7 +1929,7 @@ class AgentDB:
 
     async def get_observer_cruise(
         self, observer_cruise_id: str, organization_id: str | None = None
-    ) -> ObserverCruise | None:
+    ) -> ObserverTask | None:
         async with self.Session() as session:
             if observer_cruise := (
                 await session.scalars(
@@ -1943,7 +1938,7 @@ class AgentDB:
                     .filter_by(organization_id=organization_id)
                 )
             ).first():
-                return ObserverCruise.model_validate(observer_cruise)
+                return ObserverTask.model_validate(observer_cruise)
             return None
 
     async def delete_observer_thoughts_for_cruise(
@@ -1963,7 +1958,7 @@ class AgentDB:
         self,
         workflow_run_id: str,
         organization_id: str | None = None,
-    ) -> ObserverCruise | None:
+    ) -> ObserverTask | None:
         async with self.Session() as session:
             if observer_cruise := (
                 await session.scalars(
@@ -1972,7 +1967,7 @@ class AgentDB:
                     .filter_by(workflow_run_id=workflow_run_id)
                 )
             ).first():
-                return ObserverCruise.model_validate(observer_cruise)
+                return ObserverTask.model_validate(observer_cruise)
             return None
 
     async def get_observer_thought(
@@ -2015,7 +2010,7 @@ class AgentDB:
         prompt: str | None = None,
         url: str | None = None,
         organization_id: str | None = None,
-    ) -> ObserverCruise:
+    ) -> ObserverTask:
         async with self.Session() as session:
             new_observer_cruise = ObserverCruiseModel(
                 workflow_run_id=workflow_run_id,
@@ -2028,7 +2023,7 @@ class AgentDB:
             session.add(new_observer_cruise)
             await session.commit()
             await session.refresh(new_observer_cruise)
-            return ObserverCruise.model_validate(new_observer_cruise)
+            return ObserverTask.model_validate(new_observer_cruise)
 
     async def create_observer_thought(
         self,
@@ -2113,7 +2108,7 @@ class AgentDB:
     async def update_observer_cruise(
         self,
         observer_cruise_id: str,
-        status: ObserverCruiseStatus | None = None,
+        status: ObserverTaskStatus | None = None,
         workflow_run_id: str | None = None,
         workflow_id: str | None = None,
         workflow_permanent_id: str | None = None,
@@ -2122,7 +2117,7 @@ class AgentDB:
         summary: str | None = None,
         output: dict[str, Any] | None = None,
         organization_id: str | None = None,
-    ) -> ObserverCruise:
+    ) -> ObserverTask:
         async with self.Session() as session:
             observer_cruise = (
                 await session.scalars(
@@ -2150,8 +2145,8 @@ class AgentDB:
                     observer_cruise.output = output
                 await session.commit()
                 await session.refresh(observer_cruise)
-                return ObserverCruise.model_validate(observer_cruise)
-            raise NotFoundError(f"ObserverCruise {observer_cruise_id} not found")
+                return ObserverTask.model_validate(observer_cruise)
+            raise NotFoundError(f"ObserverTask {observer_cruise_id} not found")
 
     async def create_workflow_run_block(
         self,
