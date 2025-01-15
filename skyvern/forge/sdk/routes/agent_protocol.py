@@ -736,7 +736,7 @@ async def get_workflow_run(
     )
     if observer_cruise:
         return_dict["observer_task"] = observer_cruise.model_dump(by_alias=True)
-    return workflow_run_status_response
+    return return_dict
 
 
 @base_router.get(
