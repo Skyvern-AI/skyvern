@@ -6,6 +6,7 @@ import { useParams, useSearchParams } from "react-router-dom";
 import { PAGE_SIZE } from "../constants";
 import { CheckboxIcon, CrossCircledIcon } from "@radix-ui/react-icons";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { apiPathPrefix } from "@/util/env";
 
 type Props = {
   activeIndex: number;
@@ -27,7 +28,7 @@ function StepNavigation({ activeIndex, onActiveIndexChange }: Props) {
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client
-        .get(`/tasks/${taskId}/steps`, {
+        .get(`${apiPathPrefix}/tasks/${taskId}/steps`, {
           params: {
             page,
             page_size: PAGE_SIZE,

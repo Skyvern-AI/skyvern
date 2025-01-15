@@ -16,6 +16,7 @@ import { Input } from "@/components/ui/input";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { Artifact } from "./Artifact";
+import { apiPathPrefix } from "@/util/env";
 
 const enable_log_artifacts =
   import.meta.env.VITE_ENABLE_LOG_ARTIFACTS === "true";
@@ -39,7 +40,7 @@ function StepArtifacts({ id, stepProps }: Props) {
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client
-        .get(`/step/${id}/artifacts`)
+        .get(`${apiPathPrefix}/step/${id}/artifacts`)
         .then((response) => response.data);
     },
   });
