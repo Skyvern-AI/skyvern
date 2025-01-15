@@ -19,3 +19,6 @@ Skyvern-AI/skyvern-cloud:
   - source: skyvern-frontend/src/
     dest: skyvern-frontend/src/
     deleteOrphaned: true
+  - source: evaluation/
+    dest: evaluation/
+    deleteOrphaned: true
