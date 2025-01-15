@@ -19,4 +19,12 @@ if (!artifactApiBaseUrl) {
   console.warn("artifactApiBaseUrl environment variable was not set");
 }
 
-export { apiBaseUrl, environment, envCredential, artifactApiBaseUrl };
+const apiPathPrefix = import.meta.env.VITE_API_PATH_PREFIX ?? "";
+
+export {
+  apiBaseUrl,
+  environment,
+  envCredential,
+  artifactApiBaseUrl,
+  apiPathPrefix,
+};
