@@ -5,6 +5,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { getImageURL } from "@/routes/tasks/detail/artifactUtils";
+import { apiPathPrefix } from "@/util/env";
 
 type Props = {
   workflowRunBlockId: string;
@@ -18,7 +19,9 @@ function WorkflowRunBlockScreenshot({ workflowRunBlockId }: Props) {
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client
-        .get(`/workflow_run_block/${workflowRunBlockId}/artifacts`)
+        .get(
+          `${apiPathPrefix}/workflow_run_block/${workflowRunBlockId}/artifacts`,
+        )
         .then((response) => response.data);
     },
     refetchInterval: (query) => {

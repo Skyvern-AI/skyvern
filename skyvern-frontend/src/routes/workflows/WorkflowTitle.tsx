@@ -3,6 +3,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 import { WorkflowApiResponse } from "./types/workflowTypes";
+import { apiPathPrefix } from "@/util/env";
 
 type Props = {
   workflowPermanentId: string;
@@ -20,7 +21,7 @@ function WorkflowTitle({ workflowPermanentId }: Props) {
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client
-        .get(`/workflows/${workflowPermanentId}`)
+        .get(`${apiPathPrefix}/workflows/${workflowPermanentId}`)
         .then((response) => response.data);
     },
   });
