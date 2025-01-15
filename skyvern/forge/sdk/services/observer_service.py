@@ -391,10 +391,6 @@ async def run_observer_cruise_helper(
             output={"task_type": task_type, "user_goal_achieved": user_goal_achieved},
         )
 
-        if not plan:
-            LOG.warning("No plan found in observer response", observer_response=observer_response)
-            continue
-
         if user_goal_achieved is True:
             LOG.info(
                 "User goal achieved. Workflow run will complete. Observer is stopping",
@@ -408,6 +404,10 @@ async def run_observer_cruise_helper(
                 screenshots=scraped_page.screenshots,
             )
             break
+
+        if not plan:
+            LOG.warning("No plan found in observer response", observer_response=observer_response)
+            continue
 
         # parse observer repsonse and run the next task
         if not task_type:
