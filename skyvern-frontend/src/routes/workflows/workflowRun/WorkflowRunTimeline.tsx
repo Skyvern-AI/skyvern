@@ -14,7 +14,7 @@ import {
   WorkflowRunOverviewActiveElement,
 } from "./WorkflowRunOverview";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
-import { statusIsNotFinalized } from "@/routes/tasks/types";
+import { statusIsFinalized, statusIsNotFinalized } from "@/routes/tasks/types";
 import { cn } from "@/util/utils";
 import { ThoughtCard } from "./ThoughtCard";
 import { WorkflowRunTimelineBlockItem } from "./WorkflowRunTimelineBlockItem";
@@ -54,7 +54,9 @@ function WorkflowRunTimeline({
     return null;
   }
 
+  // bit redundant but better read
   const workflowRunIsNotFinalized = statusIsNotFinalized(workflowRun);
+  const workflowRunIsFinalized = statusIsFinalized(workflowRun);
 
   const numberOfActions = workflowRunTimeline.reduce((total, current) => {
     if (isTaskVariantBlockItem(current)) {
@@ -96,7 +98,7 @@ function WorkflowRunTimeline({
                 </div>
               </div>
             )}
-            {workflowRunTimeline.length === 0 && (
+            {workflowRunIsFinalized && workflowRunTimeline.length === 0 && (
               <div>Workflow timeline is empty</div>
             )}
             {workflowRunTimeline?.map((timelineItem) => {
