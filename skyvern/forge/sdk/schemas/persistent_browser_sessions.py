@@ -1,7 +1,7 @@
 from datetime import datetime
-from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
+
 
 class PersistentBrowserSession(BaseModel):
     model_config = ConfigDict(from_attributes=True)
