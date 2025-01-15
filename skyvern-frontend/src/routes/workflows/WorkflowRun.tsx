@@ -265,7 +265,7 @@ function WorkflowRun() {
               handleSetActiveItem("stream");
             }}
             onObserverThoughtCardSelected={(item) => {
-              handleSetActiveItem(item.observer_thought_id);
+              handleSetActiveItem(item.thought_id);
             }}
           />
         </div>

@@ -11,7 +11,7 @@ export type WorkflowRunTimelineItemType =
   (typeof WorkflowRunTimelineItemTypes)[keyof typeof WorkflowRunTimelineItemTypes];
 
 export type ObserverThought = {
-  observer_thought_id: string;
+  thought_id: string;
   user_input: string | null;
   observation: string | null;
   thought: string | null;
@@ -123,7 +123,7 @@ export function isObserverThought(item: unknown): item is ObserverThought {
   return (
     typeof item === "object" &&
     item !== null &&
-    "observer_thought_id" in item &&
+    "thought_id" in item &&
     "thought" in item
   );
 }

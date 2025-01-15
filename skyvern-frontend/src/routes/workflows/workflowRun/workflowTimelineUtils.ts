@@ -64,10 +64,7 @@ function findActiveItem(
     ) {
       return current.block;
     }
-    if (
-      current.type === "thought" &&
-      current.thought.observer_thought_id === target
-    ) {
+    if (current.type === "thought" && current.thought.thought_id === target) {
       return current.thought;
     }
     if (current.type === "block") {
