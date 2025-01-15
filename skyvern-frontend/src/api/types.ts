@@ -252,4 +252,6 @@ export type ObserverCruise = {
   url: string | null;
   created_at: string;
   modified_at: string;
+  output: Record<string, unknown> | null;
+  summary: string | null;
 };

@@ -13,6 +13,29 @@ import { Status } from "@/api/types";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { isTaskVariantBlock } from "../types/workflowTypes";
 
+function getAggregatedExtractedInformation(outputs: Record<string, unknown>) {
+  const extractedInformation: Record<string, unknown> = {};
+  Object.entries(outputs).forEach(([id, output]) => {
+    if (
+      typeof output === "object" &&
+      output !== null &&
+      "extracted_information" in output
+    ) {
+      extractedInformation[id] = output.extracted_information;
+    }
+  });
+  return extractedInformation;
+}
+
+function formatExtractedInformation(outputs: Record<string, unknown>) {
+  const aggregateExtractedInformation =
+    getAggregatedExtractedInformation(outputs);
+  return {
+    extracted_information: aggregateExtractedInformation,
+    ...outputs,
+  };
+}
+
 function WorkflowRunOutput() {
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
@@ -50,7 +73,11 @@ function WorkflowRunOutput() {
     activeBlock.status === Status.Completed;
 
   const outputs = workflowRun?.outputs;
+  const formattedOutputs = outputs
+    ? formatExtractedInformation(outputs)
+    : outputs;
   const fileUrls = workflowRun?.downloaded_file_urls ?? [];
+  const observerOutput = workflowRun?.observer_cruise?.output;
 
   return (
     <div className="space-y-5">
@@ -107,15 +134,27 @@ function WorkflowRunOutput() {
           </div>
         </div>
       ) : null}
+      {observerOutput ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-lg font-bold">Observer Output</h1>
+            <CodeEditor
+              language="json"
+              value={JSON.stringify(observerOutput, null, 2)}
+              readOnly
+              minHeight="96px"
+              maxHeight="200px"
+            />
+          </div>
+        </div>
+      ) : null}
       <div className="rounded bg-slate-elevation2 p-6">
         <div className="space-y-4">
           <h1 className="text-lg font-bold">Workflow Run Outputs</h1>
           <CodeEditor
             language="json"
             value={
-              outputs
-                ? JSON.stringify(outputs, null, 2)
-                : "Waiting for outputs.."
+              formattedOutputs ? JSON.stringify(formattedOutputs, null, 2) : ""
             }
             readOnly
             minHeight="96px"
