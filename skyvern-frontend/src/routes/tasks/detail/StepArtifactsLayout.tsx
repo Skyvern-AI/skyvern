@@ -5,6 +5,7 @@ import { StepApiResponse } from "@/api/types";
 import { useParams, useSearchParams } from "react-router-dom";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { apiPathPrefix } from "@/util/env";
 
 function StepArtifactsLayout() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -21,7 +22,7 @@ function StepArtifactsLayout() {
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client
-        .get(`/tasks/${taskId}/steps`)
+        .get(`${apiPathPrefix}/tasks/${taskId}/steps`)
         .then((response) => response.data);
     },
   });

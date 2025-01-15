@@ -119,11 +119,10 @@ function WorkflowRunTimeline({
               if (isThoughtItem(timelineItem)) {
                 return (
                   <ThoughtCard
-                    key={timelineItem.thought.observer_thought_id}
+                    key={timelineItem.thought.thought_id}
                     active={
                       isObserverThought(activeItem) &&
-                      activeItem.observer_thought_id ===
-                        timelineItem.thought.observer_thought_id
+                      activeItem.thought_id === timelineItem.thought.thought_id
                     }
                     onClick={onObserverThoughtCardSelected}
                     thought={timelineItem.thought}

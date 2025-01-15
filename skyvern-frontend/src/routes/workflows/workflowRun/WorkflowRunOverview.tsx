@@ -77,9 +77,7 @@ function WorkflowRunOverview() {
         />
       )}
       {isObserverThought(selection) && (
-        <ObserverThoughtScreenshot
-          observerThoughtId={selection.observer_thought_id}
-        />
+        <ObserverThoughtScreenshot observerThoughtId={selection.thought_id} />
       )}
     </AspectRatio>
   );
