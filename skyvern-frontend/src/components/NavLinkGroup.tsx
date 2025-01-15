@@ -48,7 +48,7 @@ function NavLinkGroup({ title, links }: Props) {
               key={link.to}
               to={link.to}
               target={link.newTab ? "_blank" : undefined}
-              rel={link.newTab ? "noreferrer,noopener" : undefined}
+              rel={link.newTab ? "noopener noreferrer" : undefined}
               className={({ isActive }) => {
                 return cn(
                   "block rounded-lg py-2 pl-3 text-slate-400 hover:bg-muted hover:text-primary",
