@@ -1359,8 +1359,8 @@ class ForgeAgent:
             error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
             local_datetime=datetime.now(context.tz_info).isoformat(),
             verification_code_check=verification_code_check,
-            complete_criterion=task.complete_criterion,
-            terminate_criterion=task.terminate_criterion,
+            complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
+            terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
         )
 
     def _build_navigation_payload(
