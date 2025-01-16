@@ -35,7 +35,7 @@
       {
         "id": 6,
         "type": "possible",
-        "ans": "'Spinach Lasagna', 4.7-star, 501 reviews"
+        "ans": "'<recipe name>', 4.0+ star, 500+ reviews"
       },
       {
         "id": 7,
@@ -90,12 +90,12 @@
       {
         "id": 17,
         "type": "golden",
-        "ans": "Easy to make and very delicious"
+        "ans": "<review content>"
       },
       {
         "id": 18,
         "type": "possible",
-        "ans": "'Eggplant Lasagna', 4.7-star, 305 reviews"
+        "ans": "'<recipe name>', 4.5+ star, 300+ reviews"
       },
       {
         "id": 19,
@@ -285,7 +285,7 @@
       {
         "id": 10,
         "type": "possible",
-        "ans": "Sony Playstation PS4 1TB Black Console; 2-Year Protection for $30.99"
+        "ans": "Sony Playstation PS4; 2-Year Protection for $20 to $40"
       },
       {
         "id": 11,
@@ -295,7 +295,7 @@
       {
         "id": 12,
         "type": "possible",
-        "ans": "Worth every penny"
+        "ans": "<review content>"
       },
       {
         "id": 13,
@@ -455,7 +455,7 @@
       {
         "id": 2,
         "type": "possible",
-        "ans": "14 Pro: Available at authorized resellers, A16 Bionic chip, 6-core CPU, 5-core GPU, 16-core Neural Engine; 15 Pro: Starting at $999, A17 Pro chip, 6-core CPU, 6-core GPU, 16-core Neural Engine"
+        "ans": "16 Pro:<price>, <chip information>; 16: <price>, <chip information>"
       },
       {
         "id": 3,
@@ -470,7 +470,7 @@
       {
         "id": 5,
         "type": "possible",
-        "ans": "iPhone 15 ($799) or pro ($999) or pro Max ($1199); September 22, 2023"
+        "ans": "<iPhone model>, <price>"
       },
       {
         "id": 6,
@@ -500,7 +500,7 @@
       {
         "id": 11,
         "type": "possible",
-        "ans": "sixth-generation iPad Pro 11\u2011inch, iPad Pro 12.9\u2011inch; release date: October 26, 2022; base storage capacity 128 GB, starting price $799"
+        "ans": "<iPad model>, <starting price>, <base storage capacity>"
       },
       {
         "id": 12,
@@ -525,7 +525,7 @@
       {
         "id": 16,
         "type": "possible",
-        "ans": "2 types, price difference $10"
+        "ans": "2 types, price difference $50"
       },
       {
         "id": 17,
@@ -540,7 +540,7 @@
       {
         "id": 19,
         "type": "golden",
-        "ans": "If you can dream it, Mac can do it; Mind-blowing. Head-turning"
+        "ans": "<Mac slogan>; <Macbook pro slogan>"
       },
       {
         "id": 20,
@@ -550,17 +550,17 @@
       {
         "id": 21,
         "type": "possible",
-        "ans": "128GB, 256GB, 512GB, 1TB, and 2TB"
+        "ans": "256GB, 512GB, 1TB, and 2TB"
       },
       {
         "id": 22,
         "type": "possible",
-        "ans": "iPhone 13 Pro Max, Up to $500"
+        "ans": "iPhone 13 Pro Max, $3000 to $500"
       },
       {
         "id": 23,
         "type": "possible",
-        "ans": "Apple Watch SE From $249, Apple Watch Series 9 From $399"
+        "ans": "Apple Watch SE From $249, Apple Watch Series 10 From $399"
       },
       {
         "id": 24,
@@ -575,12 +575,12 @@
       {
         "id": 26,
         "type": "possible",
-        "ans": "4K video recording at 24 fps, 25 fps, 30 fps, or 60 fps"
+        "ans": "4K video recording at 60 fps"
       },
       {
         "id": 27,
         "type": "possible",
-        "ans": "Available in multiple colors: Space Gray, Blue, Yellow, White, and Orange."
+        "ans": "Available in multiple colors: Midnight, Blue, Yellow, White, and Orange."
       },
       {
         "id": 28,
@@ -595,7 +595,7 @@
       {
         "id": 30,
         "type": "possible",
-        "ans": "11-inch, 128GB from $799, 256GB from $899, 512GB from $1099, 1TB from $1499, and 2TB from $1899."
+        "ans": "11-inch, 256GB from <price>, 512GB from <price>, 1TB from <price>, and 2TB from <price>"
       },
       {
         "id": 31,
@@ -605,7 +605,7 @@
       {
         "id": 32,
         "type": "possible",
-        "ans": "iPhone 11 Pro Max\tUp to $270"
+        "ans": "iPhone 11 Pro Max, $100 to $300."
       },
       {
         "id": 33,
@@ -725,7 +725,7 @@
       {
         "id": 12,
         "type": "golden",
-        "ans": "3"
+        "ans": "3 to 5"
       },
       {
         "id": 13,
@@ -735,7 +735,7 @@
       {
         "id": 14,
         "type": "golden",
-        "ans": "3"
+        "ans": "4"
       },
       {
         "id": 15,
@@ -810,7 +810,7 @@
       {
         "id": 29,
         "type": "possible",
-        "ans": "240+ (search by title)"
+        "ans": "212 (search by title)"
       },
       {
         "id": 30,
@@ -820,7 +820,7 @@
       {
         "id": 31,
         "type": "golden",
-        "ans": "7 papers"
+        "ans": "2 papers"
       },
       {
         "id": 32,
@@ -895,7 +895,7 @@
       {
         "id": 2,
         "type": "possible",
-        "ans": "<article> (within the last 2 days)"
+        "ans": "<article> (within the last 2 months)"
       },
       {
         "id": 3,
@@ -945,7 +945,7 @@
       {
         "id": 12,
         "type": "possible",
-        "ans": "ramen, Tokyo"
+        "ans": "<food>, <region>"
       },
       {
         "id": 13,
@@ -1310,7 +1310,7 @@
       {
         "id": 42,
         "type": "possible",
-        "ans": "Heiseikan Shiosaitei Hanatsuki, 9.0 ratings, high: Staff 9.3, Facilities 9.0, Cleanliness 9.4, Comfort 9.3. low: Value for money 8.2, Location 8.7, Free WiFi 8.1"
+        "ans": "<Hotel>(with over 9+ rating), <each category rating>"
       },
       {
         "id": 43,
@@ -1570,7 +1570,7 @@
       {
         "id": 5,
         "type": "possible",
-        "ans": "Coding for Everyone: C and C++, Specialization; Outcomes: Learn in-demand skills from university and industry experts; Master a subject or tool with hands-on projects; Develop a deep understanding of key concepts; Earn a career certificate from University of California, Santa Cruz"
+        "ans": "<Course>(C++ course for beginners)"
       },
       {
         "id": 6,
@@ -1630,7 +1630,7 @@
       {
         "id": 17,
         "type": "possible",
-        "ans": "23"
+        "ans": "30 to 50"
       },
       {
         "id": 18,
@@ -1690,7 +1690,7 @@
       {
         "id": 29,
         "type": "possible",
-        "ans": "$399/year, discount: 59 / month * 12 - 399 = 309; Google, IBM, and Imperial College London ..."
+        "ans": "<price>; Google, Microsoft, and IBM..."
       },
       {
         "id": 30,
@@ -1700,7 +1700,7 @@
       {
         "id": 31,
         "type": "possible",
-        "ans": "52.6%"
+        "ans": "56.81%"
       },
       {
         "id": 32,
@@ -1805,7 +1805,7 @@
       {
         "id": 9,
         "type": "golden",
-        "ans": "10 teams have Los Angeles in their name; 2 teams are NBA"
+        "ans": "9 teams have Los Angeles in their name; 1 teams are NBA"
       },
       {
         "id": 10,
@@ -1845,7 +1845,7 @@
       {
         "id": 17,
         "type": "golden",
-        "ans": "Boston Celtics; San Antonio Spurs"
+        "ans": "<team 1>; <team 2>"
       },
       {
         "id": 18,
@@ -1855,12 +1855,12 @@
       {
         "id": 19,
         "type": "golden",
-        "ans": "Jrue Holiday"
+        "ans": "Jaylen Brown"
       },
       {
         "id": 20,
         "type": "possible",
-        "ans": "For Western, rebounds: Domantas Sabonis; assists: Luka Doncic"
+        "ans": "For Western, rebounds: <player name>; assists: <player name>"
       },
       {
         "id": 21,
@@ -1895,7 +1895,7 @@
       {
         "id": 27,
         "type": "golden",
-        "ans": "30 teams in search results, 1 team Vegas Golden Knights (NHL)"
+        "ans": "31 teams in search results, 1 team Vegas Golden Knights (NHL)"
       },
       {
         "id": 28,
@@ -1915,7 +1915,7 @@
       {
         "id": 31,
         "type": "golden",
-        "ans": "Carlos Rodon, 255 lbs"
+        "ans": "Paul Goldschmidt, 225 lbs"
       },
       {
         "id": 32,
@@ -1945,7 +1945,7 @@
       {
         "id": 37,
         "type": "possible",
-        "ans": "1471"
+        "ans": "1471 or more"
       },
       {
         "id": 38,
@@ -1975,7 +1975,7 @@
       {
         "id": 43,
         "type": "possible",
-        "ans": "espnW Rankings Class of 2023, Judea Watkins from USC, Mikaylah Williams from LSU, Jadyn Donovan from Duke"
+        "ans": "espnW Rankings Class of 2025, Aaliyah Chavez, Sienna Betts from UCLA, Jasmine Davidson from USC"
       }
     ]
   },
@@ -2055,7 +2055,7 @@
       {
         "id": 14,
         "type": "possible",
-        "ans": "bpasero; jrieken; mjbvz"
+        "ans": "bpasero; jrieken; Tyriar"
       },
       {
         "id": 15,
@@ -2150,7 +2150,7 @@
       {
         "id": 33,
         "type": "possible",
-        "ans": "Philips builds and deploys digital health technology faster with innersource on GitHub. Shopify keeps pushing eCommerce forward with help from GitHub tools."
+        "ans": "Duolingo boosts developer speed by 25% with GitHub Copilot. "
       },
       {
         "id": 34,
@@ -2175,7 +2175,7 @@
       {
         "id": 38,
         "type": "golden",
-        "ans": "WerWolv/ImHex"
+        "ans": "sherlock-project/sherlock"
       },
       {
         "id": 39,
@@ -2685,7 +2685,7 @@
       {
         "id": 13,
         "type": "possible",
-        "ans": "Strange Planet, 2023"
+        "ans": "iCarly Reboot"
       },
       {
         "id": 14,
@@ -2750,7 +2750,7 @@
       {
         "id": 26,
         "type": "possible",
-        "ans": "RAM 8 GB; Processor: Multicore Intel\u00ae or Apple Silicon processor (2 GHz or faster processor with SSE 4.2 or later) with 64-bit support; Operating system, macOS Big Sur (version 11.0) or later; Graphics card, GPU with Metal support, 1.5 GB of GPU memory ..."
+        "ans": "<hardware information> (Mac) ..."
       },
       {
         "id": 27,
@@ -2780,7 +2780,7 @@
       {
         "id": 32,
         "type": "possible",
-        "ans": "Manchester City Football Club; June 10, 2023; Atat\u00fcrk Olympic Stadium, Istanbul, Turkey"
+        "ans": "The final was held in London on June 1, 2024, and the winner was Real Madrid."
       },
       {
         "id": 33,
@@ -2810,7 +2810,7 @@
       {
         "id": 38,
         "type": "possible",
-        "ans": "next: April 8, 2024. The one after that will take place on August 23, 2044."
+        "ans": "next: August 23, 2044. The one after that will take place on August 12, 2045."
       },
       {
         "id": 39,
@@ -2970,7 +2970,7 @@
       {
         "id": 26,
         "type": "possible",
-        "ans": "PhilipTheGreat/DiabloGPT-small-Traveller, GPT2LMHeadModel, 510 MB"
+        "ans": "<model> (generating travel chats), <model name>, <model size>, <model trainning framework>"
       },
       {
         "id": 27,
