@@ -744,6 +744,7 @@ async def get_workflow_run(
 )
 @base_router.get(
     "/workflows/{workflow_id}/runs/{workflow_run_id}/timeline/",
+    include_in_schema=False,
 )
 async def get_workflow_run_timeline(
     workflow_run_id: str,
