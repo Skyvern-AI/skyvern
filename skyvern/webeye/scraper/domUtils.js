@@ -804,7 +804,12 @@ const isDropdownButton = (element) => {
   const haspopup = element.getAttribute("aria-haspopup")
     ? element.getAttribute("aria-haspopup").toLowerCase()
     : "";
-  return tagName === "button" && type === "button" && haspopup === "listbox";
+  const hasExpanded = element.hasAttribute("aria-expanded");
+  return (
+    tagName === "button" &&
+    type === "button" &&
+    (hasExpanded || haspopup === "listbox")
+  );
 };
 
 const isSelect2Dropdown = (element) => {
