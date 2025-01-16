@@ -138,4 +138,4 @@ class WorkflowRunStatusResponse(BaseModel):
     outputs: dict[str, Any] | None = None
     total_steps: int | None = None
     total_cost: float | None = None
-    observer_task: ObserverTask | None = None
+    observer_cruise: ObserverTask | None = None
