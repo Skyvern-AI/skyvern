@@ -1653,6 +1653,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     proxy_location: workflow.proxy_location,
     webhook_callback_url: workflow.webhook_callback_url,
     totp_verification_url: workflow.totp_verification_url,
+    persist_browser_session: workflow.persist_browser_session,
     workflow_definition: {
       parameters: convertParametersToParameterYAML(userParameters),
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
