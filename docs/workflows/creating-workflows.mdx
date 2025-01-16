@@ -241,3 +241,10 @@ workflow_definition:
         - SKYVERN_DOWNLOAD_DIRECTORY
 
 ```
+
+## Update Workflows (YAML)
+`PUT api.skyvern.com/api/v1/workflows/{workflow_permanent_id}`
+
+Workflows are versioned. Each time you create a new workflow or update the workflow, you will get a new workflow_id and but the workflow_permanent_id will remain the same.
+
+The update workflow API payload should be exactly the same as the create workflow API payload, a YAML.
