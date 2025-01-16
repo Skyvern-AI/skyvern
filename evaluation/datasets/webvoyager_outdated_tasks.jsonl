@@ -1,0 +1,8 @@
+{"web_name": "Apple", "id": "Apple--7", "ques": "When and where the Apple Vision Pro will be released.", "web": "https://www.apple.com/"}
+{"web_name": "ArXiv", "id": "ArXiv--24", "ques": "Identify the most recent paper related to 'graph neural networks' on ArXiv and determine the affiliation of the first author.", "web": "https://arxiv.org/"}
+{"web_name": "BBC News", "id": "BBC News--28", "ques": "Find the Market Data section on BBC News and tell me which company the data comes from.", "web": "https://www.bbc.com/news/"}
+{"web_name": "GitHub", "id": "GitHub--20", "ques": "Open GitHub Copilot's FAQs to find the official answer to when Copilot chat can be used on mobile.", "web": "https://github.com/"}
+{"web_name": "Huggingface", "id": "Huggingface--10", "ques": "Open space: argilla/notux-chat-ui and interact with it by asking it 'which team trained you'. What is its answer.", "web": "https://huggingface.co/"}
+{"web_name": "Huggingface", "id": "Huggingface--20", "ques": "Locate a pre-trained natural language processing model on Hugging Face that specializes in named entity recognition (NER), confirm that the model was last updated in 2022 and has 1M+ downloads.", "web": "https://huggingface.co/"}
+{"web_name": "Huggingface", "id": "Huggingface--34", "ques": "List the benefits of hugging face classroom mentioned on Hugging face website.", "web": "https://huggingface.co/"}
+{"web_name": "Wolfram Alpha", "id": "Wolfram Alpha--45", "ques": "A 175cm tall, 85kg, 40yo man climbs 2500 steps at about 18cm per step and 40 steps per minute. summarise the Metabolic properties.", "web": "https://www.wolframalpha.com/"}
