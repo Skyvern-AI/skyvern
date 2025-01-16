@@ -605,7 +605,7 @@
       {
         "id": 32,
         "type": "possible",
-        "ans": "iPhone 11 Pro Max\tUp to $270"
+        "ans": "iPhone 11 Pro Max, $100 to $300."
       },
       {
         "id": 33,
@@ -1310,7 +1310,7 @@
       {
         "id": 42,
         "type": "possible",
-        "ans": "Heiseikan Shiosaitei Hanatsuki, 9.0 ratings, high: Staff 9.3, Facilities 9.0, Cleanliness 9.4, Comfort 9.3. low: Value for money 8.2, Location 8.7, Free WiFi 8.1"
+        "ans": "<Hotel>(with over 9+ rating), <each category rating>"
       },
       {
         "id": 43,
@@ -1570,7 +1570,7 @@
       {
         "id": 5,
         "type": "possible",
-        "ans": "Coding for Everyone: C and C++, Specialization; Outcomes: Learn in-demand skills from university and industry experts; Master a subject or tool with hands-on projects; Develop a deep understanding of key concepts; Earn a career certificate from University of California, Santa Cruz"
+        "ans": "<Course>(C++ course for beginners)"
       },
       {
         "id": 6,
@@ -1860,7 +1860,7 @@
       {
         "id": 20,
         "type": "possible",
-        "ans": "For Western, rebounds: Domantas Sabonis; assists: Luka Doncic"
+        "ans": "For Western, rebounds: <player name>; assists: <player name>"
       },
       {
         "id": 21,
