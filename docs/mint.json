@@ -69,6 +69,7 @@
       "pages": [
         "running-tasks/introduction",
         "running-tasks/api-spec",
+        "running-tasks/api-v2-spec",
         "running-tasks/webhooks-faq",
         "running-tasks/visualizing-results",
         "running-tasks/advanced-features"

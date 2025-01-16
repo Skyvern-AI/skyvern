@@ -1236,7 +1236,7 @@ async def send_observer_cruise_webhook(observer_cruise: ObserverTask) -> None:
         )
         return
     # build the observer cruise response
-    payload = observer_cruise.model_dump_json()
+    payload = observer_cruise.model_dump_json(by_alias=True)
     headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key.token)
     LOG.info(
         "Sending observer cruise response to webhook callback url",
