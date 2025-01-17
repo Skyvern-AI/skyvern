@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from skyvern.config import settings
 from skyvern.exceptions import BitwardenBaseError, SkyvernException, WorkflowRunContextNotInitialized
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -23,7 +24,6 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunParameter
 
 LOG = structlog.get_logger()
-
 
 BlockMetadata = dict[str, str | int | float | bool | dict | list]
 
@@ -159,9 +159,15 @@ class WorkflowRunContext:
         elif parameter.parameter_type == ParameterType.BITWARDEN_LOGIN_CREDENTIAL:
             try:
                 # Get the Bitwarden login credentials from AWS secrets
-                client_id = await aws_client.get_secret(parameter.bitwarden_client_id_aws_secret_key)
-                client_secret = await aws_client.get_secret(parameter.bitwarden_client_secret_aws_secret_key)
-                master_password = await aws_client.get_secret(parameter.bitwarden_master_password_aws_secret_key)
+                client_id = settings.BITWARDEN_CLIENT_ID or await aws_client.get_secret(
+                    parameter.bitwarden_client_id_aws_secret_key
+                )
+                client_secret = settings.BITWARDEN_CLIENT_SECRET or await aws_client.get_secret(
+                    parameter.bitwarden_client_secret_aws_secret_key
+                )
+                master_password = settings.BITWARDEN_MASTER_PASSWORD or await aws_client.get_secret(
+                    parameter.bitwarden_master_password_aws_secret_key
+                )
             except Exception as e:
                 LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
                 raise e
@@ -228,9 +234,15 @@ class WorkflowRunContext:
         elif parameter.parameter_type == ParameterType.BITWARDEN_SENSITIVE_INFORMATION:
             try:
                 # Get the Bitwarden login credentials from AWS secrets
-                client_id = await aws_client.get_secret(parameter.bitwarden_client_id_aws_secret_key)
-                client_secret = await aws_client.get_secret(parameter.bitwarden_client_secret_aws_secret_key)
-                master_password = await aws_client.get_secret(parameter.bitwarden_master_password_aws_secret_key)
+                client_id = settings.BITWARDEN_CLIENT_ID or await aws_client.get_secret(
+                    parameter.bitwarden_client_id_aws_secret_key
+                )
+                client_secret = settings.BITWARDEN_CLIENT_SECRET or await aws_client.get_secret(
+                    parameter.bitwarden_client_secret_aws_secret_key
+                )
+                master_password = settings.BITWARDEN_MASTER_PASSWORD or await aws_client.get_secret(
+                    parameter.bitwarden_master_password_aws_secret_key
+                )
             except Exception as e:
                 LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
                 raise e
@@ -280,9 +292,15 @@ class WorkflowRunContext:
         elif parameter.parameter_type == ParameterType.BITWARDEN_CREDIT_CARD_DATA:
             try:
                 # Get the Bitwarden login credentials from AWS secrets
-                client_id = await aws_client.get_secret(parameter.bitwarden_client_id_aws_secret_key)
-                client_secret = await aws_client.get_secret(parameter.bitwarden_client_secret_aws_secret_key)
-                master_password = await aws_client.get_secret(parameter.bitwarden_master_password_aws_secret_key)
+                client_id = settings.BITWARDEN_CLIENT_ID or await aws_client.get_secret(
+                    parameter.bitwarden_client_id_aws_secret_key
+                )
+                client_secret = settings.BITWARDEN_CLIENT_SECRET or await aws_client.get_secret(
+                    parameter.bitwarden_client_secret_aws_secret_key
+                )
+                master_password = settings.BITWARDEN_MASTER_PASSWORD or await aws_client.get_secret(
+                    parameter.bitwarden_master_password_aws_secret_key
+                )
             except Exception as e:
                 LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
                 raise e

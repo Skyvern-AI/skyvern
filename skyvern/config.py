@@ -134,6 +134,11 @@ class Settings(BaseSettings):
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
     VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 5
 
+    # Bitwarden Settings
+    BITWARDEN_CLIENT_ID: str | None = None
+    BITWARDEN_CLIENT_SECRET: str | None = None
+    BITWARDEN_MASTER_PASSWORD: str | None = None
+
     SVG_MAX_LENGTH: int = 100000
 
     ENABLE_LOG_ARTIFACTS: bool = False
