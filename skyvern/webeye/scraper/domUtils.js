@@ -713,11 +713,6 @@ function isInteractable(element, hoverStylesMap) {
     if (element.className.toString().includes("hover:cursor-pointer")) {
       return true;
     }
-
-    // auto for <a> is equal to pointer for <a>
-    if (tagName == "a" && elementCursor === "auto") {
-      return true;
-    }
   }
 
   if (hasASPClientControl() && tagName === "tr") {
