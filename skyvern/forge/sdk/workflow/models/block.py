@@ -1181,6 +1181,13 @@ class TextPromptBlock(Block):
         browser_session_id: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
+        # Validate block execution
+        await app.AGENT_FUNCTION.validate_block_execution(
+            block=self,
+            workflow_run_block_id=workflow_run_block_id,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         await app.DATABASE.update_workflow_run_block(
