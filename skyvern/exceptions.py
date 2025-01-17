@@ -311,6 +311,13 @@ class StepTerminationError(SkyvernException):
         super().__init__(f"Step {step_id} cannot be executed and task is failed. Reason: {reason}")
 
 
+class BlockTerminationError(SkyvernException):
+    def __init__(self, workflow_run_block_id: str, workflow_run_id: str, reason: str) -> None:
+        super().__init__(
+            f"Block {workflow_run_block_id} cannot be executed and workflow run {workflow_run_id} is failed. Reason: {reason}"
+        )
+
+
 class StepUnableToExecuteError(SkyvernException):
     def __init__(self, step_id: str, reason: str) -> None:
         super().__init__(f"Step {step_id} cannot be executed and task execution is stopped. Reason: {reason}")

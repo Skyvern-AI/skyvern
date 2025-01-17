@@ -860,11 +860,15 @@ class WorkflowService:
             workflow_run_steps = await app.DATABASE.get_steps_by_task_ids(
                 task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
             )
+            workflow_run_blocks = await app.DATABASE.get_workflow_run_blocks(
+                workflow_run_id=workflow_run_id, organization_id=organization_id
+            )
+            text_prompt_blocks = [block for block in workflow_run_blocks if block.block_type == BlockType.TEXT_PROMPT]
             total_steps = len(workflow_run_steps)
             # TODO: This is a temporary cost calculation. We need to implement a more accurate cost calculation.
             # successful steps are the ones that have a status of completed and the total count of unique step.order
             successful_steps = [step for step in workflow_run_steps if step.status == StepStatus.completed]
-            total_cost = 0.1 * len(successful_steps)
+            total_cost = 0.1 * (len(successful_steps) + len(text_prompt_blocks))
         return WorkflowRunStatusResponse(
             workflow_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run_id,
