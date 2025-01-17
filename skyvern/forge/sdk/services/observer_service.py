@@ -603,7 +603,7 @@ async def run_observer_cruise_helper(
             observer_cruise_id=observer_cruise_id,
             workflow_run_id=workflow_run_id,
             # TODO: add a better failure reason with LLM
-            failure_reason="Observer max iterations reached",
+            failure_reason="Max iterations reached",
             organization_id=organization_id,
         )
 
