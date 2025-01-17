@@ -591,6 +591,8 @@ class PersistentBrowserSessionModel(Base):
     runnable_type = Column(String, nullable=True)
     runnable_id = Column(String, nullable=True)
     browser_id = Column(String, nullable=True)
+    browser_address = Column(String, nullable=True)
+    status = Column(String, nullable=True, default="created")
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
