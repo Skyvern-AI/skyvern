@@ -1,6 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
+import { WorkflowRunApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
   Pagination,
@@ -25,40 +25,20 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { downloadBlob } from "@/util/downloadBlob";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
-import {
-  DownloadIcon,
-  ExclamationTriangleIcon,
-  Pencil2Icon,
-  PlayIcon,
-  PlusIcon,
-  ReloadIcon,
-} from "@radix-ui/react-icons";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { DownloadIcon, Pencil2Icon, PlayIcon } from "@radix-ui/react-icons";
+import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { stringify as convertToYAML } from "yaml";
-import { ImportWorkflowButton } from "./ImportWorkflowButton";
-import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
-import { WorkflowActions } from "./WorkflowActions";
-import { WorkflowTitle } from "./WorkflowTitle";
 import { WorkflowApiResponse } from "./types/workflowTypes";
-import { WorkflowRunApiResponse } from "@/api/types";
-import { downloadBlob } from "@/util/downloadBlob";
-
-const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
-  title: "New Workflow",
-  description: "",
-  workflow_definition: {
-    blocks: [],
-    parameters: [],
-  },
-};
+import { WorkflowActions } from "./WorkflowActions";
+import { WorkflowsPageBanner } from "./WorkflowsPageBanner";
+import { WorkflowTitle } from "./WorkflowTitle";
 
 function Workflows() {
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
-  const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const workflowsPage = searchParams.get("workflowsPage")
     ? Number(searchParams.get("workflowsPage"))
@@ -97,27 +77,6 @@ function Workflows() {
         .then((response) => response.data);
     },
     refetchOnMount: "always",
-  });
-
-  const createNewWorkflowMutation = useMutation({
-    mutationFn: async () => {
-      const client = await getClient(credentialGetter);
-      const yaml = convertToYAML(emptyWorkflowRequest);
-      return client.post<
-        typeof emptyWorkflowRequest,
-        { data: WorkflowApiResponse }
-      >("/workflows", yaml, {
-        headers: {
-          "Content-Type": "text/plain",
-        },
-      });
-    },
-    onSuccess: (response) => {
-      queryClient.invalidateQueries({
-        queryKey: ["workflows"],
-      });
-      navigate(`/workflows/${response.data.workflow_permanent_id}/edit`);
-    },
   });
 
   function handleExport() {
@@ -176,55 +135,12 @@ function Workflows() {
     navigate(path);
   }
 
-  const showExperimentalMessage =
-    workflows?.length === 0 && workflowsPage === 1;
-
   return (
     <div className="space-y-8">
-      {showExperimentalMessage && (
-        <Alert variant="default" className="bg-slate-elevation2">
-          <AlertTitle>
-            <div className="flex items-center gap-2">
-              <ExclamationTriangleIcon className="h-6 w-6" />
-              <span className="text-xl">Experimental Feature</span>
-            </div>
-          </AlertTitle>
-          <AlertDescription className="text-base text-slate-300">
-            Workflows are still in experimental mode. Please{" "}
-            {
-              <a
-                href="https://meetings.hubspot.com/skyvern/demo"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="ml-auto underline underline-offset-2"
-              >
-                book a demo
-              </a>
-            }{" "}
-            if you'd like to learn more. If you're feeling adventurous, create
-            your first workflow!
-          </AlertDescription>
-        </Alert>
-      )}
+      <WorkflowsPageBanner />
       <div className="space-y-4">
-        <header className="flex items-center justify-between">
+        <header>
           <h1 className="text-2xl font-semibold">Workflows</h1>
-          <div className="flex gap-2">
-            <ImportWorkflowButton />
-            <Button
-              disabled={createNewWorkflowMutation.isPending}
-              onClick={() => {
-                createNewWorkflowMutation.mutate();
-              }}
-            >
-              {createNewWorkflowMutation.isPending ? (
-                <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-              ) : (
-                <PlusIcon className="mr-2 h-4 w-4" />
-              )}
-              Create Workflow
-            </Button>
-          </div>
         </header>
         <div className="rounded-md border">
           <Table>
