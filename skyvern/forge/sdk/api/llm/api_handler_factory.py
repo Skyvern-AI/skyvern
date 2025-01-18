@@ -146,7 +146,7 @@ class LLMAPIHandlerFactory:
                 observer_thought=observer_thought,
                 ai_suggestion=ai_suggestion,
             )
-            if step:
+            if step or observer_thought:
                 try:
                     llm_cost = litellm.completion_cost(completion_response=response)
                 except Exception as e:
@@ -154,14 +154,24 @@ class LLMAPIHandlerFactory:
                     llm_cost = 0
                 prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
                 completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
-                await app.DATABASE.update_step(
-                    task_id=step.task_id,
-                    step_id=step.step_id,
-                    organization_id=step.organization_id,
-                    incremental_cost=llm_cost,
-                    incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
-                    incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
-                )
+
+                if step:
+                    await app.DATABASE.update_step(
+                        task_id=step.task_id,
+                        step_id=step.step_id,
+                        organization_id=step.organization_id,
+                        incremental_cost=llm_cost,
+                        incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
+                        incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
+                    )
+                if observer_thought:
+                    await app.DATABASE.update_observer_thought(
+                        observer_thought_id=observer_thought.observer_thought_id,
+                        organization_id=observer_thought.organization_id,
+                        input_token_count=prompt_tokens if prompt_tokens > 0 else None,
+                        output_token_count=completion_tokens if completion_tokens > 0 else None,
+                        thought_cost=llm_cost,
+                    )
             parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=json.dumps(parsed_response, indent=2).encode("utf-8"),
@@ -292,7 +302,7 @@ class LLMAPIHandlerFactory:
                 ai_suggestion=ai_suggestion,
             )
 
-            if step:
+            if step or observer_thought:
                 try:
                     llm_cost = litellm.completion_cost(completion_response=response)
                 except Exception as e:
@@ -300,14 +310,23 @@ class LLMAPIHandlerFactory:
                     llm_cost = 0
                 prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
                 completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
-                await app.DATABASE.update_step(
-                    task_id=step.task_id,
-                    step_id=step.step_id,
-                    organization_id=step.organization_id,
-                    incremental_cost=llm_cost,
-                    incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
-                    incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
-                )
+                if step:
+                    await app.DATABASE.update_step(
+                        task_id=step.task_id,
+                        step_id=step.step_id,
+                        organization_id=step.organization_id,
+                        incremental_cost=llm_cost,
+                        incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
+                        incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
+                    )
+                if observer_thought:
+                    await app.DATABASE.update_observer_thought(
+                        observer_thought_id=observer_thought.observer_thought_id,
+                        organization_id=observer_thought.organization_id,
+                        input_token_count=prompt_tokens if prompt_tokens > 0 else None,
+                        output_token_count=completion_tokens if completion_tokens > 0 else None,
+                        thought_cost=llm_cost,
+                    )
             parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=json.dumps(parsed_response, indent=2).encode("utf-8"),

@@ -2039,6 +2039,9 @@ class AgentDB:
         observer_thought_scenario: str | None = None,
         observer_thought_type: str = ObserverThoughtType.plan,
         output: dict[str, Any] | None = None,
+        input_token_count: int | None = None,
+        output_token_count: int | None = None,
+        thought_cost: float | None = None,
         organization_id: str | None = None,
     ) -> ObserverThought:
         async with self.Session() as session:
@@ -2055,6 +2058,9 @@ class AgentDB:
                 observer_thought_scenario=observer_thought_scenario,
                 observer_thought_type=observer_thought_type,
                 output=output,
+                input_token_count=input_token_count,
+                output_token_count=output_token_count,
+                thought_cost=thought_cost,
                 organization_id=organization_id,
             )
             session.add(new_observer_thought)
@@ -2073,6 +2079,9 @@ class AgentDB:
         thought: str | None = None,
         answer: str | None = None,
         output: dict[str, Any] | None = None,
+        input_token_count: int | None = None,
+        output_token_count: int | None = None,
+        thought_cost: float | None = None,
         organization_id: str | None = None,
     ) -> ObserverThought:
         async with self.Session() as session:
@@ -2100,6 +2109,12 @@ class AgentDB:
                     observer_thought.answer = answer
                 if output:
                     observer_thought.output = output
+                if input_token_count:
+                    observer_thought.input_token_count = input_token_count
+                if output_token_count:
+                    observer_thought.output_token_count = output_token_count
+                if thought_cost:
+                    observer_thought.thought_cost = thought_cost
                 await session.commit()
                 await session.refresh(observer_thought)
                 return ObserverThought.model_validate(observer_thought)
