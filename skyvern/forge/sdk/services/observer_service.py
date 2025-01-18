@@ -159,11 +159,11 @@ async def initialize_observer_cruise(
             organization_id=organization.organization_id,
         )
     except Exception:
-        LOG.warning("Failed to update observer cruise", exc_info=True)
+        LOG.warning("Failed to update task 2.0", exc_info=True)
         # fail the workflow run
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
             workflow_run_id=workflow_run.workflow_run_id,
-            failure_reason="Skyvern failed to update the observer cruise after initializing the workflow run",
+            failure_reason="Skyvern failed to update the task 2.0 after initializing the workflow run",
         )
         raise
 
@@ -207,13 +207,13 @@ async def run_observer_cruise(
         await mark_observer_cruise_as_failed(
             observer_cruise_id,
             workflow_run_id=observer_cruise.workflow_run_id,
-            failure_reason="Database error when running cruise",
+            failure_reason="Database error when running task 2.0",
             organization_id=organization_id,
         )
         return
     except Exception as e:
         LOG.error("Failed to run observer cruise", exc_info=True)
-        failure_reason = f"Failed to run observer cruise: {str(e)}"
+        failure_reason = f"Failed to run task 2.0: {str(e)}"
         await mark_observer_cruise_as_failed(
             observer_cruise_id,
             workflow_run_id=observer_cruise.workflow_run_id,
@@ -467,13 +467,14 @@ async def run_observer_cruise_helper(
                 LOG.exception("Failed to generate loop task")
                 await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
                     workflow_run_id=workflow_run_id,
-                    failure_reason="Failed to generate loop task.",
+                    failure_reason="Failed to generate the loop.",
                 )
                 break
         else:
             LOG.info("Unsupported task type", task_type=task_type)
             await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
-                workflow_run_id=workflow_run_id, failure_reason=f"Unsupported task type gets generated: {task_type}"
+                workflow_run_id=workflow_run_id,
+                failure_reason=f"Unsupported task block type gets generated: {task_type}",
             )
             break
 
@@ -766,7 +767,7 @@ async def _generate_loop_task(
         # TODO: fail the workflow run
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
             workflow_run_id=workflow_run_id,
-            failure_reason="Failed to extract loop values for the loop task. Please try again later.",
+            failure_reason="Failed to extract loop values for the loop. Please try again later.",
         )
         raise Exception("extraction_block failed")
     # validate output parameter
@@ -787,7 +788,7 @@ async def _generate_loop_task(
         )
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
             workflow_run_id=workflow_run_id,
-            failure_reason="Invalid output parameter of the extraction block for the loop task. Please try again later.",
+            failure_reason="Invalid output parameter of the extraction block for the loop. Please try again later.",
         )
         raise
 
@@ -1074,7 +1075,7 @@ async def mark_observer_cruise_as_failed(
     )
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
-            workflow_run_id, failure_reason=failure_reason or "Observer cruise failed"
+            workflow_run_id, failure_reason=failure_reason or "Skyvern task 2.0 failed"
         )
     observer_cruise = await get_observer_cruise(observer_cruise_id, organization_id=organization_id)
     if observer_cruise:
