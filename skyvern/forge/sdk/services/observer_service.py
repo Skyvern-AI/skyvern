@@ -99,7 +99,7 @@ async def initialize_observer_cruise(
     )
 
     metadata_prompt = prompt_engine.load_prompt("observer_generate_metadata", user_goal=user_prompt, user_url=user_url)
-    metadata_response = await app.SECONDARY_LLM_API_HANDLER(prompt=metadata_prompt, observer_thought=observer_thought)
+    metadata_response = await app.LLM_API_HANDLER(prompt=metadata_prompt, observer_thought=observer_thought)
     # validate
     LOG.info(f"Initialized observer initial response: {metadata_response}")
     url: str = user_url or metadata_response.get("url", "")
