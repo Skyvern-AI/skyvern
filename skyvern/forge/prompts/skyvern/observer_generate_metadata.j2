@@ -4,8 +4,8 @@ MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing comma
 
 Reply in JSON format with the following keys:
 {
-  "thoughts": str, // Think step by step. If the user specifically mentioned which website it is to use, let's use that url. If the user doesn't specifify a specific website, to achieve what the user wants to do, what is most likely website url for achieving the goal? 
-  "url": str, // The url to type into the browser. DO NOT change the url if user specified one.
+  "thoughts": str, // Think step by step. Has the user specify a url to go? If yes, what is the complete url user specified? If not, to achieve what the user wants to do, what is most likely website url for achieving the goal?
+  "url": str, // The initial url to type into the browser. If the user specified one, use exactly that url.
   "title": str, // A descriptive and informative title for the goal. Use no more than 5 words
 }
 
