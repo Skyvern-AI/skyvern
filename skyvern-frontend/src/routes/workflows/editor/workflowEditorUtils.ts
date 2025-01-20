@@ -2,14 +2,16 @@ import Dagre from "@dagrejs/dagre";
 import type { Node } from "@xyflow/react";
 import { Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
-import type {
-  AWSSecretParameter,
-  OutputParameter,
-  Parameter,
-  WorkflowApiResponse,
-  WorkflowBlock,
-  WorkflowParameterValueType,
-  WorkflowSettings,
+import {
+  WorkflowBlockTypes,
+  WorkflowParameterTypes,
+  type AWSSecretParameter,
+  type OutputParameter,
+  type Parameter,
+  type WorkflowApiResponse,
+  type WorkflowBlock,
+  type WorkflowParameterValueType,
+  type WorkflowSettings,
 } from "../types/workflowTypes";
 import {
   ActionBlockYAML,
@@ -1241,22 +1243,22 @@ const sendEmailExpectedParameters = [
   {
     key: SMTP_HOST_PARAMETER_KEY,
     aws_key: SMTP_HOST_AWS_KEY,
-    parameter_type: "aws_secret",
+    parameter_type: WorkflowParameterTypes.AWS_Secret,
   },
   {
     key: SMTP_PORT_PARAMETER_KEY,
     aws_key: SMTP_PORT_AWS_KEY,
-    parameter_type: "aws_secret",
+    parameter_type: WorkflowParameterTypes.AWS_Secret,
   },
   {
     key: SMTP_USERNAME_PARAMETER_KEY,
     aws_key: SMTP_USERNAME_AWS_KEY,
-    parameter_type: "aws_secret",
+    parameter_type: WorkflowParameterTypes.AWS_Secret,
   },
   {
     key: SMTP_PASSWORD_PARAMETER_KEY,
     aws_key: SMTP_PASSWORD_AWS_KEY,
-    parameter_type: "aws_secret",
+    parameter_type: WorkflowParameterTypes.AWS_Secret,
   },
 ] as const;
 
@@ -1265,7 +1267,7 @@ function getAdditionalParametersForEmailBlock(
   parameters: Array<ParameterYAML>,
 ): Array<ParameterYAML> {
   const emailBlocks = blocks.filter(
-    (block) => block.block_type === "send_email",
+    (block) => block.block_type === WorkflowBlockTypes.SendEmail,
   );
   if (emailBlocks.length === 0) {
     return [];
@@ -1371,32 +1373,35 @@ function convertParametersToParameterYAML(
     const base = {
       key: parameter.key,
       description: parameter.description,
+      parameter_type: parameter.parameter_type,
     };
     switch (parameter.parameter_type) {
-      case "aws_secret": {
+      case WorkflowParameterTypes.AWS_Secret: {
         return {
           ...base,
-          parameter_type: "aws_secret",
+          parameter_type: WorkflowParameterTypes.AWS_Secret,
           aws_key: parameter.aws_key,
         };
       }
-      case "bitwarden_login_credential": {
+      case WorkflowParameterTypes.Bitwarden_Login_Credential: {
         return {
           ...base,
-          parameter_type: "bitwarden_login_credential",
+          parameter_type: WorkflowParameterTypes.Bitwarden_Login_Credential,
           bitwarden_collection_id: parameter.bitwarden_collection_id,
           url_parameter_key: parameter.url_parameter_key,
-          bitwarden_client_id_aws_secret_key: "SKYVERN_BITWARDEN_CLIENT_ID",
+          bitwarden_client_id_aws_secret_key:
+            parameter.bitwarden_client_id_aws_secret_key,
           bitwarden_client_secret_aws_secret_key:
-            "SKYVERN_BITWARDEN_CLIENT_SECRET",
+            parameter.bitwarden_client_secret_aws_secret_key,
           bitwarden_master_password_aws_secret_key:
-            "SKYVERN_BITWARDEN_MASTER_PASSWORD",
+            parameter.bitwarden_master_password_aws_secret_key,
         };
       }
-      case "bitwarden_sensitive_information": {
+      case WorkflowParameterTypes.Bitwarden_Sensitive_Information: {
         return {
           ...base,
-          parameter_type: "bitwarden_sensitive_information",
+          parameter_type:
+            WorkflowParameterTypes.Bitwarden_Sensitive_Information,
           bitwarden_collection_id: parameter.bitwarden_collection_id,
           bitwarden_identity_key: parameter.bitwarden_identity_key,
           bitwarden_identity_fields: parameter.bitwarden_identity_fields,
@@ -1408,17 +1413,31 @@ function convertParametersToParameterYAML(
             parameter.bitwarden_master_password_aws_secret_key,
         };
       }
-      case "context": {
+      case WorkflowParameterTypes.Bitwarden_Credit_Card_Data: {
         return {
           ...base,
-          parameter_type: "context",
+          parameter_type: WorkflowParameterTypes.Bitwarden_Credit_Card_Data,
+          bitwarden_collection_id: parameter.bitwarden_collection_id,
+          bitwarden_item_id: parameter.bitwarden_item_id,
+          bitwarden_client_id_aws_secret_key:
+            parameter.bitwarden_client_id_aws_secret_key,
+          bitwarden_client_secret_aws_secret_key:
+            parameter.bitwarden_client_secret_aws_secret_key,
+          bitwarden_master_password_aws_secret_key:
+            parameter.bitwarden_master_password_aws_secret_key,
+        };
+      }
+      case WorkflowParameterTypes.Context: {
+        return {
+          ...base,
+          parameter_type: WorkflowParameterTypes.Context,
           source_parameter_key: parameter.source.key,
         };
       }
-      case "workflow": {
+      case WorkflowParameterTypes.Workflow: {
         return {
           ...base,
-          parameter_type: "workflow",
+          parameter_type: WorkflowParameterTypes.Workflow,
           workflow_parameter_type: parameter.workflow_parameter_type,
           default_value: parameter.default_value,
         };
@@ -1645,7 +1664,7 @@ function convertBlocksToBlockYAML(
 
 function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
   const userParameters = workflow.workflow_definition.parameters.filter(
-    (parameter) => parameter.parameter_type !== "output",
+    (parameter) => parameter.parameter_type !== WorkflowParameterTypes.Output,
   );
   return {
     title: workflow.title,

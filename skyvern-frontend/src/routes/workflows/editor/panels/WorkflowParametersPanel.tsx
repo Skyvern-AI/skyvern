@@ -27,6 +27,10 @@ import {
 import { useReactFlow } from "@xyflow/react";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
+import {
+  WorkflowEditorParameterType,
+  WorkflowEditorParameterTypes,
+} from "../../types/workflowTypes";
 
 const WORKFLOW_EDIT_PANEL_WIDTH = 20 * 16;
 const WORKFLOW_EDIT_PANEL_GAP = 1 * 16;
@@ -41,7 +45,7 @@ function WorkflowParametersPanel() {
     active: boolean;
     operation: "add" | "edit";
     parameter?: ParametersState[number] | null;
-    type: "workflow" | "credential" | "context" | "secret";
+    type: WorkflowEditorParameterType;
   }>({
     active: false,
     operation: "add",
@@ -113,6 +117,17 @@ function WorkflowParametersPanel() {
               }}
             >
               Secret Parameter
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              onClick={() => {
+                setOperationPanelState({
+                  active: true,
+                  operation: "add",
+                  type: WorkflowEditorParameterTypes.CreditCardData,
+                });
+              }}
+            >
+              Credit Card Data Parameter
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>

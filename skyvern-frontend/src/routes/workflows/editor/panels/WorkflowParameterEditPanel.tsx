@@ -2,7 +2,10 @@ import { Cross2Icon } from "@radix-ui/react-icons";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { useState } from "react";
-import { WorkflowParameterValueType } from "../../types/workflowTypes";
+import {
+  WorkflowEditorParameterType,
+  WorkflowParameterValueType,
+} from "../../types/workflowTypes";
 import {
   Select,
   SelectContent,
@@ -21,7 +24,7 @@ import { SourceParameterKeySelector } from "../../components/SourceParameterKeyS
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 
 type Props = {
-  type: "workflow" | "credential" | "context" | "secret";
+  type: WorkflowEditorParameterType;
   onClose: () => void;
   onSave: (value: ParametersState[number]) => void;
   initialValues: ParametersState[number];
@@ -36,7 +39,7 @@ const workflowParameterTypeOptions = [
   { label: "JSON", value: WorkflowParameterValueType.JSON },
 ];
 
-function header(type: "workflow" | "credential" | "context" | "secret") {
+function header(type: WorkflowEditorParameterType) {
   if (type === "workflow") {
     return "Edit Input Parameter";
   }
@@ -45,6 +48,9 @@ function header(type: "workflow" | "credential" | "context" | "secret") {
   }
   if (type === "secret") {
     return "Edit Secret Parameter";
+  }
+  if (type === "creditCardData") {
+    return "Edit Credit Card Data Parameter";
   }
   return "Edit Context Parameter";
 }
@@ -66,7 +72,8 @@ function WorkflowParameterEditPanel({
   );
   const [collectionId, setCollectionId] = useState(
     initialValues.parameterType === "credential" ||
-      initialValues.parameterType === "secret"
+      initialValues.parameterType === "secret" ||
+      initialValues.parameterType === "creditCardData"
       ? initialValues.collectionId
       : "",
   );
@@ -107,6 +114,12 @@ function WorkflowParameterEditPanel({
   const [identityFields, setIdentityFields] = useState(
     initialValues.parameterType === "secret"
       ? initialValues.identityFields.join(", ")
+      : "",
+  );
+
+  const [itemId, setItemId] = useState(
+    initialValues.parameterType === "creditCardData"
+      ? initialValues.itemId
       : "",
   );
 
@@ -271,6 +284,24 @@ function WorkflowParameterEditPanel({
               </div>
             </>
           )}
+          {type === "creditCardData" && (
+            <>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Item ID</Label>
+                <Input
+                  value={itemId}
+                  onChange={(e) => setItemId(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Collection ID</Label>
+                <Input
+                  value={collectionId}
+                  onChange={(e) => setCollectionId(e.target.value)}
+                />
+              </div>
+            </>
+          )}
           <div className="flex justify-end">
             <Button
               onClick={() => {
@@ -305,7 +336,11 @@ function WorkflowParameterEditPanel({
                       : null,
                   });
                 }
-                if (type === "credential") {
+                if (
+                  type === "credential" ||
+                  type === "secret" ||
+                  type === "creditCardData"
+                ) {
                   if (!collectionId) {
                     toast({
                       variant: "destructive",
@@ -314,6 +349,8 @@ function WorkflowParameterEditPanel({
                     });
                     return;
                   }
+                }
+                if (type === "credential") {
                   onSave({
                     key,
                     parameterType: "credential",
@@ -323,14 +360,6 @@ function WorkflowParameterEditPanel({
                   });
                 }
                 if (type === "secret") {
-                  if (!collectionId) {
-                    toast({
-                      variant: "destructive",
-                      title: "Failed to add parameter",
-                      description: "Collection ID is required",
-                    });
-                    return;
-                  }
                   onSave({
                     key,
                     parameterType: "secret",
@@ -340,6 +369,15 @@ function WorkflowParameterEditPanel({
                       .filter((s) => s.length > 0)
                       .map((field) => field.trim()),
                     identityKey,
+                    description,
+                  });
+                }
+                if (type === "creditCardData") {
+                  onSave({
+                    key,
+                    parameterType: "creditCardData",
+                    collectionId,
+                    itemId,
                     description,
                   });
                 }
