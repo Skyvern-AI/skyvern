@@ -25,6 +25,7 @@ class ActionType(StrEnum):
     SOLVE_CAPTCHA = "solve_captcha"
     TERMINATE = "terminate"
     COMPLETE = "complete"
+    RELOAD_PAGE = "reload_page"
 
     def is_web_action(self) -> bool:
         return self in [
@@ -159,6 +160,11 @@ class WebAction(Action):
 
 class DecisiveAction(Action):
     errors: list[UserDefinedError] = []
+
+
+# TODO: consider to implement this as a WebAction in the future
+class ReloadPageAction(Action):
+    action_type: ActionType = ActionType.RELOAD_PAGE
 
 
 class ClickAction(WebAction):

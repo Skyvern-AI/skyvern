@@ -58,10 +58,12 @@ from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, 
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.webeye.actions.actions import (
     Action,
+    ActionStatus,
     ActionType,
     CompleteAction,
     CompleteVerifyResult,
     DecisiveAction,
+    ReloadPageAction,
     UserDefinedError,
     WebAction,
 )
@@ -69,7 +71,7 @@ from skyvern.webeye.actions.caching import retrieve_action_plan
 from skyvern.webeye.actions.handler import ActionHandler, poll_verification_code
 from skyvern.webeye.actions.models import AgentStepOutput, DetailedAgentStepOutput
 from skyvern.webeye.actions.parse_actions import parse_actions
-from skyvern.webeye.actions.responses import ActionResult
+from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -800,6 +802,35 @@ class ForgeAgent:
 
             element_id_to_last_action: dict[str, int] = dict()
             for action_idx, action_node in enumerate(action_linked_list):
+                context = skyvern_context.ensure_context()
+                if context.refresh_working_page:
+                    LOG.warning(
+                        "Detected the signal to reload the page, going to reload and skip the rest of the actions",
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        step_order=step.order,
+                    )
+                    await browser_state.reload_page()
+                    context.refresh_working_page = False
+                    action_result = ActionSuccess()
+                    action_result.step_order = step.order
+                    action_result.step_retry_number = step.retry_index
+                    detailed_agent_step_output.actions_and_results[action_idx] = (
+                        ReloadPageAction(
+                            reasoning="Something wrong with the current page, reload to continue",
+                            status=ActionStatus.completed,
+                            organization_id=task.organization_id,
+                            workflow_run_id=task.workflow_run_id,
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            step_order=step.order,
+                            action_order=action_idx,
+                        ),
+                        [action_result],
+                    )
+                    await self.record_artifacts_after_action(task, step, browser_state)
+                    break
+
                 action = action_node.action
                 if isinstance(action, WebAction):
                     previous_action_idx = element_id_to_last_action.get(action.element_id)
