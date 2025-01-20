@@ -21,6 +21,8 @@ import structlog
 from email_validator import EmailNotValidError, validate_email
 from jinja2 import Template
 from pydantic import BaseModel, Field
+from pypdf import PdfReader
+from pypdf.errors import PdfReadError
 
 from skyvern.config import settings
 from skyvern.exceptions import (
@@ -84,6 +86,7 @@ class BlockType(StrEnum):
     WAIT = "wait"
     FILE_DOWNLOAD = "file_download"
     GOTO_URL = "goto_url"
+    PDF_PARSER = "pdf_parser"
 
 
 class BlockStatus(StrEnum):
@@ -1832,6 +1835,112 @@ class FileParserBlock(Block):
         )
 
 
+class PDFParserBlock(Block):
+    block_type: Literal[BlockType.PDF_PARSER] = BlockType.PDF_PARSER
+
+    file_url: str
+    json_schema: dict[str, Any] | None = None
+
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,
+    ) -> list[PARAMETER_TYPE]:
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        if self.file_url and workflow_run_context.has_parameter(self.file_url):
+            return [workflow_run_context.get_parameter(self.file_url)]
+        return []
+
+    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+        self.file_url = self.format_block_parameter_template_from_workflow_run_context(
+            self.file_url, workflow_run_context
+        )
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        if (
+            self.file_url
+            and workflow_run_context.has_parameter(self.file_url)
+            and workflow_run_context.has_value(self.file_url)
+        ):
+            file_url_parameter_value = workflow_run_context.get_value(self.file_url)
+            if file_url_parameter_value:
+                LOG.info(
+                    "PDFParserBlock: File URL is parameterized, using parameter value",
+                    file_url_parameter_value=file_url_parameter_value,
+                    file_url_parameter_key=self.file_url,
+                )
+                self.file_url = file_url_parameter_value
+
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception as e:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to format jinja template: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        # Download the file
+        file_path = None
+        if self.file_url.startswith("s3://"):
+            file_path = await download_from_s3(self.get_async_aws_client(), self.file_url)
+        else:
+            file_path = await download_file(self.file_url)
+
+        extracted_text = ""
+        try:
+            reader = PdfReader(file_path)
+            page_count = len(reader.pages)
+            for i in range(page_count):
+                extracted_text += reader.pages[i].extract_text() + "\n"
+
+        except PdfReadError:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="Failed to parse PDF file",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        if not self.json_schema:
+            self.json_schema = {
+                "type": "object",
+                "properties": {
+                    "extracted_information": {
+                        "type": "object",
+                        "description": "Information extracted from the text",
+                    }
+                },
+            }
+
+        llm_prompt = prompt_engine.load_prompt(
+            "extract-information-from-file-text", extracted_text_content=extracted_text, json_schema=self.json_schema
+        )
+        llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt)
+        # Record the parsed data
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, llm_response)
+        return await self.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value=llm_response,
+            status=BlockStatus.completed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
+
 class WaitBlock(Block):
     block_type: Literal[BlockType.WAIT] = BlockType.WAIT
 
@@ -1952,6 +2061,7 @@ BlockSubclasses = Union[
     UploadToS3Block,
     SendEmailBlock,
     FileParserBlock,
+    PDFParserBlock,
     ValidationBlock,
     ActionBlock,
     NavigationBlock,

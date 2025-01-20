@@ -215,6 +215,13 @@ class FileParserBlockYAML(BlockYAML):
     file_type: FileType
 
 
+class PDFParserBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.PDF_PARSER] = BlockType.PDF_PARSER  # type: ignore
+
+    file_url: str
+    json_schema: dict[str, Any] | None = None
+
+
 class ValidationBlockYAML(BlockYAML):
     block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION  # type: ignore
 
@@ -343,6 +350,7 @@ BLOCK_YAML_SUBCLASSES = (
     | WaitBlockYAML
     | FileDownloadBlockYAML
     | UrlBlockYAML
+    | PDFParserBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 

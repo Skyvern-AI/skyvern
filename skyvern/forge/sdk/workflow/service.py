@@ -46,6 +46,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ForLoopBlock,
     LoginBlock,
     NavigationBlock,
+    PDFParserBlock,
     SendEmailBlock,
     TaskBlock,
     TextPromptBlock,
@@ -1467,6 +1468,14 @@ class WorkflowService:
                 output_parameter=output_parameter,
                 file_url=block_yaml.file_url,
                 file_type=block_yaml.file_type,
+                continue_on_failure=block_yaml.continue_on_failure,
+            )
+        elif block_yaml.block_type == BlockType.PDF_PARSER:
+            return PDFParserBlock(
+                label=block_yaml.label,
+                output_parameter=output_parameter,
+                file_url=block_yaml.file_url,
+                json_schema=block_yaml.json_schema,
                 continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.VALIDATION:
