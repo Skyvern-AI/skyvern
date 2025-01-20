@@ -692,7 +692,8 @@ function isInteractable(element, hoverStylesMap) {
     tagName === "a" ||
     tagName === "i" ||
     tagName === "li" ||
-    tagName === "p"
+    tagName === "p" ||
+    tagName === "td"
   ) {
     const elementCursor = getElementComputedStyle(element)?.cursor;
     if (elementCursor === "pointer") {
