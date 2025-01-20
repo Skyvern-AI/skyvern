@@ -148,6 +148,8 @@ class Action(BaseModel):
                 return WaitAction.model_validate(value)
             elif action_type is ActionType.SOLVE_CAPTCHA:
                 return SolveCaptchaAction.model_validate(value)
+            elif action_type is ActionType.RELOAD_PAGE:
+                return ReloadPageAction.model_validate(value)
             else:
                 raise ValueError(f"Unsupported action type: {action_type}")
         else:
