@@ -7,7 +7,12 @@ import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { FlowRenderer } from "./FlowRenderer";
 import { getElements } from "./workflowEditorUtils";
 import { LogoMinimized } from "@/components/LogoMinimized";
-import { WorkflowSettings } from "../types/workflowTypes";
+import {
+  isDisplayedInWorkflowEditor,
+  WorkflowEditorParameterTypes,
+  WorkflowParameterTypes,
+  WorkflowSettings,
+} from "../types/workflowTypes";
 
 function WorkflowEditor() {
   const { workflowPermanentId } = useParams();
@@ -27,7 +32,6 @@ function WorkflowEditor() {
     setHasChanges(false);
   });
 
-  // TODO
   if (isLoading) {
     return (
       <div className="flex h-screen w-full items-center justify-center">
@@ -56,13 +60,7 @@ function WorkflowEditor() {
           initialNodes={elements.nodes}
           initialEdges={elements.edges}
           initialParameters={workflow.workflow_definition.parameters
-            .filter(
-              (parameter) =>
-                parameter.parameter_type === "workflow" ||
-                parameter.parameter_type === "bitwarden_login_credential" ||
-                parameter.parameter_type === "context" ||
-                parameter.parameter_type === "bitwarden_sensitive_information",
-            )
+            .filter((parameter) => isDisplayedInWorkflowEditor(parameter))
             .map((parameter) => {
               if (parameter.parameter_type === "workflow") {
                 return {
@@ -88,6 +86,17 @@ function WorkflowEditor() {
                   collectionId: parameter.bitwarden_collection_id,
                   identityKey: parameter.bitwarden_identity_key,
                   identityFields: parameter.bitwarden_identity_fields,
+                  description: parameter.description,
+                };
+              } else if (
+                parameter.parameter_type ===
+                WorkflowParameterTypes.Bitwarden_Credit_Card_Data
+              ) {
+                return {
+                  key: parameter.key,
+                  parameterType: WorkflowEditorParameterTypes.CreditCardData,
+                  collectionId: parameter.bitwarden_collection_id,
+                  itemId: parameter.bitwarden_item_id,
                   description: parameter.description,
                 };
               } else {

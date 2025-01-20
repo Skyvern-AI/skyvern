@@ -36,10 +36,13 @@ import { stringify as convertToYAML } from "yaml";
 import {
   AWSSecretParameter,
   WorkflowApiResponse,
+  WorkflowEditorParameterTypes,
+  WorkflowParameterTypes,
   WorkflowParameterValueType,
   WorkflowSettings,
 } from "../types/workflowTypes";
 import {
+  BitwardenCreditCardDataParameterYAML,
   BitwardenLoginCredentialParameterYAML,
   BitwardenSensitiveInformationParameterYAML,
   BlockYAML,
@@ -50,6 +53,11 @@ import {
 } from "../types/workflowYamlTypes";
 import { WorkflowHeader } from "./WorkflowHeader";
 import { WorkflowParametersStateContext } from "./WorkflowParametersStateContext";
+import {
+  BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
+  BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
+  BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
+} from "./constants";
 import { edgeTypes } from "./edges";
 import {
   AppNode,
@@ -82,11 +90,12 @@ function convertToParametersYAML(
   | BitwardenLoginCredentialParameterYAML
   | ContextParameterYAML
   | BitwardenSensitiveInformationParameterYAML
+  | BitwardenCreditCardDataParameterYAML
 > {
   return parameters.map((parameter) => {
-    if (parameter.parameterType === "workflow") {
+    if (parameter.parameterType === WorkflowEditorParameterTypes.Workflow) {
       return {
-        parameter_type: "workflow",
+        parameter_type: WorkflowParameterTypes.Workflow,
         key: parameter.key,
         description: parameter.description || null,
         workflow_parameter_type: parameter.dataType,
@@ -94,39 +103,58 @@ function convertToParametersYAML(
           ? {}
           : { default_value: parameter.defaultValue }),
       };
-    } else if (parameter.parameterType === "context") {
+    } else if (
+      parameter.parameterType === WorkflowEditorParameterTypes.Context
+    ) {
       return {
-        parameter_type: "context",
+        parameter_type: WorkflowParameterTypes.Context,
         key: parameter.key,
         description: parameter.description || null,
         source_parameter_key: parameter.sourceParameterKey,
       };
-    } else if (parameter.parameterType === "secret") {
+    } else if (
+      parameter.parameterType === WorkflowEditorParameterTypes.Secret
+    ) {
       return {
-        parameter_type: "bitwarden_sensitive_information",
+        parameter_type: WorkflowParameterTypes.Bitwarden_Sensitive_Information,
         key: parameter.key,
         bitwarden_identity_key: parameter.identityKey,
         bitwarden_identity_fields: parameter.identityFields,
         description: parameter.description || null,
         bitwarden_collection_id: parameter.collectionId,
-        bitwarden_client_id_aws_secret_key: "SKYVERN_BITWARDEN_CLIENT_ID",
+        bitwarden_client_id_aws_secret_key: BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
         bitwarden_client_secret_aws_secret_key:
-          "SKYVERN_BITWARDEN_CLIENT_SECRET",
+          BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
         bitwarden_master_password_aws_secret_key:
-          "SKYVERN_BITWARDEN_MASTER_PASSWORD",
+          BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
+      };
+    } else if (
+      parameter.parameterType === WorkflowEditorParameterTypes.CreditCardData
+    ) {
+      return {
+        parameter_type: WorkflowParameterTypes.Bitwarden_Credit_Card_Data,
+        key: parameter.key,
+        description: parameter.description || null,
+        bitwarden_item_id: parameter.itemId,
+        bitwarden_collection_id: parameter.collectionId,
+        bitwarden_client_id_aws_secret_key: BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
+        bitwarden_client_secret_aws_secret_key:
+          BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
+        bitwarden_master_password_aws_secret_key:
+          BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
       };
     } else {
       return {
-        parameter_type: "bitwarden_login_credential",
+        parameter_type: WorkflowParameterTypes.Bitwarden_Login_Credential,
         key: parameter.key,
         description: parameter.description || null,
         bitwarden_collection_id: parameter.collectionId,
         url_parameter_key: parameter.urlParameterKey,
-        bitwarden_client_id_aws_secret_key: "SKYVERN_BITWARDEN_CLIENT_ID",
+        bitwarden_client_id_aws_secret_key: BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
         bitwarden_client_secret_aws_secret_key:
-          "SKYVERN_BITWARDEN_CLIENT_SECRET",
+          BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
         bitwarden_master_password_aws_secret_key:
-          "SKYVERN_BITWARDEN_MASTER_PASSWORD",
+          BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
       };
     }
   });
@@ -158,6 +186,13 @@ export type ParametersState = Array<
       parameterType: "secret";
       identityKey: string;
       identityFields: Array<string>;
+      collectionId: string;
+      description?: string | null;
+    }
+  | {
+      key: string;
+      parameterType: "creditCardData";
+      itemId: string;
       collectionId: string;
       description?: string | null;
     }

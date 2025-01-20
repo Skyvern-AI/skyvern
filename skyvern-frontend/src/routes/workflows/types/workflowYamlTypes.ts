@@ -22,7 +22,8 @@ export type ParameterYAML =
   | AWSSecretParameterYAML
   | ContextParameterYAML
   | OutputParameterYAML
-  | BitwardenSensitiveInformationParameterYAML;
+  | BitwardenSensitiveInformationParameterYAML
+  | BitwardenCreditCardDataParameterYAML;
 
 export type ParameterYAMLBase = {
   parameter_type: string;
@@ -40,9 +41,9 @@ export type BitwardenLoginCredentialParameterYAML = ParameterYAMLBase & {
   parameter_type: "bitwarden_login_credential";
   bitwarden_collection_id: string;
   url_parameter_key: string;
-  bitwarden_client_id_aws_secret_key: "SKYVERN_BITWARDEN_CLIENT_ID";
-  bitwarden_client_secret_aws_secret_key: "SKYVERN_BITWARDEN_CLIENT_SECRET";
-  bitwarden_master_password_aws_secret_key: "SKYVERN_BITWARDEN_MASTER_PASSWORD";
+  bitwarden_client_id_aws_secret_key: string;
+  bitwarden_client_secret_aws_secret_key: string;
+  bitwarden_master_password_aws_secret_key: string;
 };
 
 export type AWSSecretParameterYAML = ParameterYAMLBase & {
@@ -55,6 +56,18 @@ export type BitwardenSensitiveInformationParameterYAML = ParameterYAMLBase & {
   bitwarden_collection_id: string;
   bitwarden_identity_key: string;
   bitwarden_identity_fields: Array<string>;
+  bitwarden_client_id_aws_secret_key: string;
+  bitwarden_client_secret_aws_secret_key: string;
+  bitwarden_master_password_aws_secret_key: string;
+};
+
+export type BitwardenCreditCardDataParameterYAML = ParameterYAMLBase & {
+  parameter_type: "bitwarden_credit_card_data";
+
+  // bitwarden ids for the credit card item
+  bitwarden_collection_id: string;
+  bitwarden_item_id: string;
+
   bitwarden_client_id_aws_secret_key: string;
   bitwarden_client_secret_aws_secret_key: string;
   bitwarden_master_password_aws_secret_key: string;
