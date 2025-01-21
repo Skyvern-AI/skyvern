@@ -1918,7 +1918,7 @@ class PDFParserBlock(Block):
             self.json_schema = {
                 "type": "object",
                 "properties": {
-                    "extracted_information": {
+                    "output": {
                         "type": "object",
                         "description": "Information extracted from the text",
                     }
