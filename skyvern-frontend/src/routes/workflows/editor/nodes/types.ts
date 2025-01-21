@@ -20,7 +20,7 @@ export const dataSchemaExampleValue = {
 export const dataSchemaExampleForFileExtraction = {
   type: "object",
   properties: {
-    extracted_information: {
+    output: {
       type: "object",
       description: "All of the information extracted from the file",
     },
