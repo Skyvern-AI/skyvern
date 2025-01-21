@@ -32,6 +32,7 @@ import {
   LoginBlockYAML,
   WaitBlockYAML,
   FileDownloadBlockYAML,
+  PDFParserBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -84,6 +85,7 @@ import { loginNodeDefaultData } from "./nodes/LoginNode/types";
 import { waitNodeDefaultData } from "./nodes/WaitNode/types";
 import { fileDownloadNodeDefaultData } from "./nodes/FileDownloadNode/types";
 import { ProxyLocation } from "@/api/types";
+import { pdfParserNodeDefaultData } from "./nodes/PDFParserNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -390,6 +392,19 @@ function convertToNode(
         data: {
           ...commonData,
           fileUrl: block.file_url,
+        },
+      };
+    }
+
+    case "pdf_parser": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "pdfParser",
+        data: {
+          ...commonData,
+          fileUrl: block.file_url,
+          jsonSchema: JSON.stringify(block.json_schema, null, 2),
         },
       };
     }
@@ -788,6 +803,17 @@ function createNode(
         },
       };
     }
+    case "pdfParser": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "pdfParser",
+        data: {
+          ...pdfParserNodeDefaultData,
+          label,
+        },
+      };
+    }
   }
 }
 
@@ -1018,6 +1044,14 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         prompt: node.data.prompt,
         json_schema: JSONParseSafe(node.data.jsonSchema),
         parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "pdfParser": {
+      return {
+        ...base,
+        block_type: "pdf_parser",
+        file_url: node.data.fileUrl,
+        json_schema: JSONParseSafe(node.data.jsonSchema),
       };
     }
     default: {
@@ -1639,6 +1673,15 @@ function convertBlocksToBlockYAML(
           block_type: "file_url_parser",
           file_url: block.file_url,
           file_type: block.file_type,
+        };
+        return blockYaml;
+      }
+      case "pdf_parser": {
+        const blockYaml: PDFParserBlockYAML = {
+          ...base,
+          block_type: "pdf_parser",
+          file_url: block.file_url,
+          json_schema: block.json_schema,
         };
         return blockYaml;
       }
