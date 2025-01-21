@@ -20,7 +20,7 @@ function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
   const deleteNodeCallback = useDeleteNodeCallback();
   const [inputs, setInputs] = useState({
     fileUrl: data.fileUrl,
-    dataSchema: data.jsonSchema,
+    jsonSchema: data.jsonSchema,
   });
   const [label, setLabel] = useNodeLabelChangeHandler({
     id,
@@ -79,7 +79,7 @@ function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
           <div className="space-y-2">
             <div className="flex gap-2">
               <Label className="text-xs text-slate-300">File URL</Label>
-              <HelpTooltip content={helpTooltips["fileParser"]["fileUrl"]} />
+              <HelpTooltip content={helpTooltips["pdfParser"]["fileUrl"]} />
             </div>
             <Input
               value={inputs.fileUrl}
@@ -97,13 +97,15 @@ function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
             <div className="flex gap-4">
               <div className="flex gap-2">
                 <Label className="text-xs text-slate-300">Data Schema</Label>
-                <HelpTooltip content={helpTooltips["task"]["dataSchema"]} />
+                <HelpTooltip
+                  content={helpTooltips["pdfParser"]["jsonSchema"]}
+                />
               </div>
               <Checkbox
-                checked={inputs.dataSchema !== "null"}
+                checked={inputs.jsonSchema !== "null"}
                 onCheckedChange={(checked) => {
                   handleChange(
-                    "dataSchema",
+                    "jsonSchema",
                     checked
                       ? JSON.stringify(
                           dataSchemaExampleForFileExtraction,
@@ -115,13 +117,13 @@ function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
                 }}
               />
             </div>
-            {inputs.dataSchema !== "null" && (
+            {inputs.jsonSchema !== "null" && (
               <div>
                 <CodeEditor
                   language="json"
-                  value={inputs.dataSchema}
+                  value={inputs.jsonSchema}
                   onChange={(value) => {
-                    handleChange("dataSchema", value);
+                    handleChange("jsonSchema", value);
                   }}
                   className="nowheel nopan"
                   fontSize={8}

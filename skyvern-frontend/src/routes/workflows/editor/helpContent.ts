@@ -91,6 +91,11 @@ export const helpTooltips = {
     waitInSeconds:
       "Specify a number for how many seconds to wait. Value must be between 0 and 300 seconds.",
   },
+  pdfParser: {
+    ...baseHelpTooltipContent,
+    fileUrl: "The URL from which the file will be downloaded",
+    jsonSchema: "Specify a format for the extracted information from the file",
+  },
 };
 
 export const placeholders = {
@@ -125,4 +130,5 @@ export const placeholders = {
   codeBlock: basePlaceholderContent,
   fileUrl: basePlaceholderContent,
   wait: basePlaceholderContent,
+  pdfParser: basePlaceholderContent,
 };
