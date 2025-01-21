@@ -85,6 +85,9 @@ class ObserverThought(BaseModel):
     observer_thought_type: ObserverThoughtType | None = Field(alias="thought_type", default=ObserverThoughtType.plan)
     observer_thought_scenario: ObserverThoughtScenario | None = Field(alias="thought_scenario", default=None)
     output: dict[str, Any] | None = None
+    input_token_count: int | None = None
+    output_token_count: int | None = None
+    thought_cost: float | None = None
 
     created_at: datetime
     modified_at: datetime

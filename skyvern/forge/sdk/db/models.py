@@ -574,6 +574,9 @@ class ObserverThoughtModel(Base):
     observation = Column(String, nullable=True)
     thought = Column(String, nullable=True)
     answer = Column(String, nullable=True)
+    input_token_count = Column(Integer, nullable=True)
+    output_token_count = Column(Integer, nullable=True)
+    thought_cost = Column(Numeric, nullable=True)
 
     observer_thought_type = Column(String, nullable=True, default=ObserverThoughtType.plan)
     observer_thought_scenario = Column(String, nullable=True)
