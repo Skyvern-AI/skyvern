@@ -97,7 +97,8 @@ export type BlockYAML =
   | ExtractionBlockYAML
   | LoginBlockYAML
   | WaitBlockYAML
-  | FileDownloadBlockYAML;
+  | FileDownloadBlockYAML
+  | PDFParserBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
@@ -264,4 +265,10 @@ export type ForLoopBlockYAML = BlockYAMLBase & {
   loop_over_parameter_key: string;
   loop_blocks: Array<BlockYAML>;
   loop_variable_reference: string | null;
+};
+
+export type PDFParserBlockYAML = BlockYAMLBase & {
+  block_type: "pdf_parser";
+  file_url: string;
+  json_schema: Record<string, unknown> | null;
 };

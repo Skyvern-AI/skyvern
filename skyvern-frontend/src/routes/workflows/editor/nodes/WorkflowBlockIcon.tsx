@@ -67,6 +67,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     case "wait": {
       return <StopwatchIcon className={className} />;
     }
+    case "pdf_parser": {
+      return <CursorTextIcon className={className} />;
+    }
   }
 }
 

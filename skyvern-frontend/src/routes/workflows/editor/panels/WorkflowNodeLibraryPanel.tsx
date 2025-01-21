@@ -121,6 +121,17 @@ const nodeLibraryItems: Array<{
     title: "File Parser Block",
     description: "Downloads and parses a file",
   },
+  {
+    nodeType: "pdfParser",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.PDFParser}
+        className="size-6"
+      />
+    ),
+    title: "PDF Parser Block",
+    description: "Downloads and parses a PDF file with an optional data schema",
+  },
   // disabled
   // {
   //   nodeType: "download",

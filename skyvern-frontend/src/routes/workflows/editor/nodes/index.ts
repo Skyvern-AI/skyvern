@@ -33,6 +33,8 @@ import { WaitNode } from "./WaitNode/types";
 import { WaitNode as WaitNodeComponent } from "./WaitNode/WaitNode";
 import { FileDownloadNode } from "./FileDownloadNode/types";
 import { FileDownloadNode as FileDownloadNodeComponent } from "./FileDownloadNode/FileDownloadNode";
+import { PDFParserNode } from "./PDFParserNode/types";
+import { PDFParserNode as PDFParserNodeComponent } from "./PDFParserNode/PDFParserNode";
 
 export type UtilityNode = StartNode | NodeAdderNode;
 
@@ -51,7 +53,8 @@ export type WorkflowBlockNode =
   | ExtractionNode
   | LoginNode
   | WaitNode
-  | FileDownloadNode;
+  | FileDownloadNode
+  | PDFParserNode;
 
 export function isUtilityNode(node: AppNode): node is UtilityNode {
   return node.type === "nodeAdder" || node.type === "start";
@@ -81,4 +84,5 @@ export const nodeTypes = {
   login: memo(LoginNodeComponent),
   wait: memo(WaitNodeComponent),
   fileDownload: memo(FileDownloadNodeComponent),
+  pdfParser: memo(PDFParserNodeComponent),
 } as const;
