@@ -147,7 +147,7 @@ function FileUpload({ value, onChange }: Props) {
               id={inputId}
               type="file"
               onChange={handleFileChange}
-              accept=".csv,.pdf"
+              accept=".csv"
               className="hidden"
             />
             <div className="flex max-w-full gap-2 px-2">
