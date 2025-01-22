@@ -1,5 +1,6 @@
 import datetime
 import hashlib
+import os
 import uuid
 from enum import Enum
 from typing import Annotated, Any
@@ -1094,12 +1095,25 @@ async def upload_file(
 ) -> Response:
     bucket = app.SETTINGS_MANAGER.AWS_S3_BUCKET_UPLOADS
     todays_date = datetime.datetime.now().strftime("%Y-%m-%d")
-    uuid_prefixed_filename = f"{str(uuid.uuid4())}_{file.filename}"
-    s3_uri = (
-        f"s3://{bucket}/{app.SETTINGS_MANAGER.ENV}/{current_org.organization_id}/{todays_date}/{uuid_prefixed_filename}"
-    )
-    # Stream the file to S3
-    uploaded_s3_uri = await aws_client.upload_file_stream(s3_uri, file.file)
+
+    # First try uploading with original filename
+    try:
+        sanitized_filename = os.path.basename(file.filename)  # Remove any path components
+        s3_uri = (
+            f"s3://{bucket}/{app.SETTINGS_MANAGER.ENV}/{current_org.organization_id}/{todays_date}/{sanitized_filename}"
+        )
+        uploaded_s3_uri = await aws_client.upload_file_stream(s3_uri, file.file)
+    except Exception:
+        LOG.error("Failed to upload file to S3", exc_info=True)
+        uploaded_s3_uri = None
+
+    # If upload fails, try again with UUID prefix
+    if not uploaded_s3_uri:
+        uuid_prefixed_filename = f"{str(uuid.uuid4())}_{file.filename}"
+        s3_uri = f"s3://{bucket}/{app.SETTINGS_MANAGER.ENV}/{current_org.organization_id}/{todays_date}/{uuid_prefixed_filename}"
+        file.file.seek(0)  # Reset file pointer
+        uploaded_s3_uri = await aws_client.upload_file_stream(s3_uri, file.file)
+
     if not uploaded_s3_uri:
         raise HTTPException(status_code=500, detail="Failed to upload file to S3.")
 
