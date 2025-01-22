@@ -9,7 +9,7 @@ from playwright.async_api import Frame, Page
 
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR
-from skyvern.exceptions import StepUnableToExecuteError
+from skyvern.exceptions import StepUnableToExecuteError, TaskAlreadyTimeout
 from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.prompts import prompt_engine
@@ -362,6 +362,9 @@ class AgentFunction:
         :return: A tuple of whether the step can be executed and a list of reasons why it can't be executed.
         """
         reasons = []
+        if task.status == TaskStatus.timed_out:
+            raise TaskAlreadyTimeout(task_id=task.task_id)
+
         # can't execute if task status is not running
         has_valid_task_status = task.status == TaskStatus.running
         if not has_valid_task_status:
