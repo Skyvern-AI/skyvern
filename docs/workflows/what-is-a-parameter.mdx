@@ -87,9 +87,11 @@ Create this value when you have details that vary from run-to-run:
 <img src="/images/what_is_a_parameter/u.2.png"/>
     
 
-## Future Plans for Parameters
+## Referencing Parameters Using JINJA2 Templating Syntax
 
-Our main goal is to make every field a parameterized field and remove block parameters
+You can reference any parameter in your workflows by using the `{{ parameter_key }}` syntax in any input field.
 
-* We know it’s confusing, but it’s only temporary! In the future we’re headed toward loading parameters directly into each input field. 
-* One day, your prompt may look like “Find the invoices page using **/how_to_find_invoices_page**, filter the invoices using **/start_date** and **/end_date** provided.” Or perhaps brackets as are traditionally used in code.
+For example, if you have a parameter with the key `website_url`, you can reference it in a task block by using `{{ website_url }}` in the URL field.
+
+### Referencing Block Output
+A block can have output. To reference the output of a block, you can use the `{{ block_label.output }}` syntax.
