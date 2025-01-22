@@ -247,12 +247,17 @@ class ScrapedPage(BaseModel):
         self._clean_up_func = clean_up_func
         self._scrape_exclude = scrape_exclude
 
-    def build_element_tree(self, fmt: ElementTreeFormat = ElementTreeFormat.HTML) -> str:
+    def build_element_tree(
+        self, fmt: ElementTreeFormat = ElementTreeFormat.HTML, html_need_skyvern_attrs: bool = True
+    ) -> str:
         if fmt == ElementTreeFormat.JSON:
             return json.dumps(self.element_tree_trimmed)
 
         if fmt == ElementTreeFormat.HTML:
-            return "".join(json_to_html(element) for element in self.element_tree_trimmed)
+            return "".join(
+                json_to_html(element, need_skyvern_attrs=html_need_skyvern_attrs)
+                for element in self.element_tree_trimmed
+            )
 
         raise UnknownElementTreeFormat(fmt=fmt)
 
