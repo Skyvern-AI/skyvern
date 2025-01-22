@@ -409,6 +409,11 @@ class TaskAlreadyCanceled(SkyvernHTTPException):
         )
 
 
+class TaskAlreadyTimeout(SkyvernException):
+    def __init__(self, task_id: str):
+        super().__init__(f"Task {task_id} is timed out")
+
+
 class InvalidTaskStatusTransition(SkyvernHTTPException):
     def __init__(self, old_status: str, new_status: str, task_id: str):
         super().__init__(f"Invalid task status transition from {old_status} to {new_status} for {task_id}")

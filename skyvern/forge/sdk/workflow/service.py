@@ -247,6 +247,25 @@ class WorkflowService:
                         browser_session_id=browser_session_id,
                     )
                     return workflow_run
+
+                if refreshed_workflow_run and refreshed_workflow_run.status == WorkflowRunStatus.timed_out:
+                    LOG.info(
+                        "Workflow run is timed out, stopping execution inside workflow execution loop",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        block_idx=block_idx,
+                        block_type=block.block_type,
+                        block_label=block.label,
+                    )
+                    await self.clean_up_workflow(
+                        workflow=workflow,
+                        workflow_run=workflow_run,
+                        api_key=api_key,
+                        need_call_webhook=True,
+                        close_browser_on_completion=browser_session_id is None,
+                        browser_session_id=browser_session_id,
+                    )
+                    return workflow_run
+
                 parameters = block.get_all_parameters(workflow_run_id)
                 await app.WORKFLOW_CONTEXT_MANAGER.register_block_parameters_for_workflow_run(
                     workflow_run_id, parameters, organization
@@ -356,6 +375,42 @@ class WorkflowService:
                         block_label=block.label,
                     )
 
+                elif block_result.status == BlockStatus.timed_out:
+                    LOG.info(
+                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} timed out for workflow run {workflow_run_id}, marking workflow run as failed",
+                        block_type=block.block_type,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        block_idx=block_idx,
+                        block_result=block_result,
+                        block_type_var=block.block_type,
+                        block_label=block.label,
+                    )
+
+                    if not block.continue_on_failure:
+                        failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} timed out. Reason: {block_result.failure_reason}"
+                        await self.mark_workflow_run_as_failed(
+                            workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
+                        )
+                        await self.clean_up_workflow(
+                            workflow=workflow,
+                            workflow_run=workflow_run,
+                            api_key=api_key,
+                            close_browser_on_completion=browser_session_id is None,
+                            browser_session_id=browser_session_id,
+                        )
+                        return workflow_run
+
+                    LOG.warning(
+                        f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} timed out for workflow run {workflow_run_id}, but will continue executing the workflow run",
+                        block_type=block.block_type,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        block_idx=block_idx,
+                        block_result=block_result,
+                        continue_on_failure=block.continue_on_failure,
+                        block_type_var=block.block_type,
+                        block_label=block.label,
+                    )
+
             except Exception as e:
                 LOG.exception(
                     f"Error while executing workflow run {workflow_run.workflow_run_id}",
@@ -390,11 +445,12 @@ class WorkflowService:
             WorkflowRunStatus.canceled,
             WorkflowRunStatus.failed,
             WorkflowRunStatus.terminated,
+            WorkflowRunStatus.timed_out,
         ):
             await self.mark_workflow_run_as_completed(workflow_run_id=workflow_run.workflow_run_id)
         else:
             LOG.info(
-                "Workflow run is already canceled, failed, or terminated, not marking as completed",
+                "Workflow run is already timed_out, canceled, failed, or terminated, not marking as completed",
                 workflow_run_id=workflow_run.workflow_run_id,
                 workflow_run_status=refreshed_workflow_run.status if refreshed_workflow_run else None,
             )
