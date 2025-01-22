@@ -10,6 +10,7 @@ packages = [{ include = "skyvern" }]
 python = "^3.11,<3.12"
 python-dotenv = "^1.0.0"
 openai = "<2.0"
+google-auth = "^2.37.0" 
 sqlalchemy = {extras = ["mypy"], version = "^2.0.29"}
 aiohttp = "^3.8.5"
 python-multipart = "^0.0.6"
