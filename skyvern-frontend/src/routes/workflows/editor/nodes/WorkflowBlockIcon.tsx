@@ -6,6 +6,7 @@ import {
   CursorTextIcon,
   DownloadIcon,
   EnvelopeClosedIcon,
+  FileTextIcon,
   ListBulletIcon,
   LockOpen1Icon,
   StopwatchIcon,
@@ -68,7 +69,7 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
       return <StopwatchIcon className={className} />;
     }
     case "pdf_parser": {
-      return <CursorTextIcon className={className} />;
+      return <FileTextIcon className={className} />;
     }
   }
 }

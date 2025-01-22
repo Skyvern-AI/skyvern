@@ -220,7 +220,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
           </div>
           <span className="text-sm text-slate-400">
             {first
-              ? "Click on the node type to add your first node"
+              ? "Click on the node type to add your first block"
               : "Click on the node type you want to add"}
           </span>
         </header>
@@ -252,7 +252,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
                     }}
                   >
                     <div className="flex gap-2">
-                      <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
+                      <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-slate-600">
                         {item.icon}
                       </div>
                       <div className="flex flex-col gap-1">
@@ -264,7 +264,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
                         </span>
                       </div>
                     </div>
-                    <PlusIcon className="size-6" />
+                    <PlusIcon className="size-6 shrink-0" />
                   </div>
                 );
               })}
