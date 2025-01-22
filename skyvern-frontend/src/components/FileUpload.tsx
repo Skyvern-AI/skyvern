@@ -126,6 +126,9 @@ function FileUpload({ value, onChange }: Props) {
             className={cn(
               "flex w-full cursor-pointer items-center justify-center border border-dashed py-8 hover:border-slate-500",
             )}
+            onDragOver={(event) => {
+              event.preventDefault();
+            }}
             onDrop={(event) => {
               event.preventDefault();
               event.stopPropagation();
