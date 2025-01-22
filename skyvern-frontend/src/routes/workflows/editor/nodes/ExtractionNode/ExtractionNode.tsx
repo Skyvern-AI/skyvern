@@ -14,7 +14,14 @@ import { Switch } from "@/components/ui/switch";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
+import {
+  Handle,
+  NodeProps,
+  Position,
+  useEdges,
+  useNodes,
+  useReactFlow,
+} from "@xyflow/react";
 import { useState } from "react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
@@ -23,6 +30,9 @@ import type { ExtractionNode } from "./types";
 
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { helpTooltips, placeholders } from "../../helpContent";
+import { AppNode } from "..";
+import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
+import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 
 function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
   const { updateNodeData } = useReactFlow();
@@ -41,6 +51,9 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
     cacheActions: data.cacheActions,
   });
   const deleteNodeCallback = useDeleteNodeCallback();
+  const nodes = useNodes<AppNode>();
+  const edges = useEdges();
+  const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
 
   function handleChange(key: string, value: unknown) {
     if (!editable) {
@@ -156,6 +169,15 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
             </AccordionTrigger>
             <AccordionContent className="pl-6 pr-1 pt-1">
               <div className="space-y-4">
+                <div className="space-y-2">
+                  <ParametersMultiSelect
+                    availableOutputParameters={outputParameterKeys}
+                    parameters={data.parameterKeys}
+                    onParametersChange={(parameterKeys) => {
+                      updateNodeData(id, { parameterKeys });
+                    }}
+                  />
+                </div>
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
                     <Label className="text-xs font-normal text-slate-300">
