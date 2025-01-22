@@ -95,6 +95,7 @@ class BlockStatus(StrEnum):
     failed = "failed"
     terminated = "terminated"
     canceled = "canceled"
+    timed_out = "timed_out"
 
 
 @dataclass(frozen=True)
@@ -614,6 +615,7 @@ class BaseTaskBlock(Block):
                 TaskStatus.terminated: BlockStatus.terminated,
                 TaskStatus.failed: BlockStatus.failed,
                 TaskStatus.canceled: BlockStatus.canceled,
+                TaskStatus.timed_out: BlockStatus.timed_out,
             }
             if updated_task.status == TaskStatus.completed or updated_task.status == TaskStatus.terminated:
                 LOG.info(
@@ -639,6 +641,23 @@ class BaseTaskBlock(Block):
             elif updated_task.status == TaskStatus.canceled:
                 LOG.info(
                     "Task canceled, cancelling block",
+                    task_id=updated_task.task_id,
+                    task_status=updated_task.status,
+                    workflow_run_id=workflow_run_id,
+                    workflow_id=workflow.workflow_id,
+                    organization_id=workflow.organization_id,
+                )
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=updated_task.failure_reason,
+                    output_parameter_value=None,
+                    status=block_status_mapping[updated_task.status],
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            elif updated_task.status == TaskStatus.timed_out:
+                LOG.info(
+                    "Task timed out, making the block time out",
                     task_id=updated_task.task_id,
                     task_status=updated_task.status,
                     workflow_run_id=workflow_run_id,

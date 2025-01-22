@@ -37,6 +37,7 @@ from skyvern.exceptions import (
     StepTerminationError,
     StepUnableToExecuteError,
     TaskAlreadyCanceled,
+    TaskAlreadyTimeout,
     TaskNotFound,
     UnsupportedActionType,
     UnsupportedTaskType,
@@ -266,6 +267,23 @@ class ForgeAgent:
                 )
                 return step, None, None
 
+            if workflow_run and workflow_run.status == WorkflowRunStatus.timed_out:
+                LOG.info(
+                    "Workflow run is timed out, stopping execution inside task",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    step_id=step.step_id,
+                )
+                step = await self.update_step(
+                    step,
+                    status=StepStatus.canceled,
+                    is_last=True,
+                )
+                task = await self.update_task(
+                    task,
+                    status=TaskStatus.timed_out,
+                )
+                return step, None, None
+
         refreshed_task = await app.DATABASE.get_task(task_id=task.task_id, organization_id=organization.organization_id)
         if refreshed_task:
             task = refreshed_task
@@ -473,6 +491,20 @@ class ForgeAgent:
                 step_id=step.step_id,
             )
             raise
+        except TaskAlreadyTimeout:
+            LOG.warning(
+                "Task is timed out, stopping execution",
+                task_id=task.task_id,
+                step=step.step_id,
+            )
+            await self.clean_up_task(
+                task=task,
+                last_step=step,
+                api_key=api_key,
+                close_browser_on_completion=close_browser_on_completion,
+                browser_session_id=browser_session_id,
+            )
+            return step, detailed_output, None
         except StepTerminationError as e:
             LOG.warning(
                 "Step cannot be executed, marking task as failed",
