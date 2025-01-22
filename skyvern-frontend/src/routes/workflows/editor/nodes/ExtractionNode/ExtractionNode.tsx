@@ -97,6 +97,7 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
             />
           </div>
           <WorkflowBlockInputTextarea
+            isFirstInputInNode
             nodeId={id}
             onChange={(value) => {
               if (!editable) {

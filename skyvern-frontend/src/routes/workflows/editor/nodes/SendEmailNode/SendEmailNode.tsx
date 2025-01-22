@@ -79,6 +79,7 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
         <div className="space-y-2">
           <Label className="text-xs text-slate-300">Recipients</Label>
           <WorkflowBlockInput
+            isFirstInputInNode
             nodeId={id}
             onChange={(value) => {
               handleChange("recipients", value);

@@ -105,6 +105,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
               <HelpTooltip content={urlTooltip} />
             </div>
             <WorkflowBlockInputTextarea
+              isFirstInputInNode
               nodeId={id}
               onChange={(value) => {
                 handleChange("url", value);

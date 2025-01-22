@@ -125,6 +125,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     <HelpTooltip content={helpTooltips["task"]["url"]} />
                   </div>
                   <WorkflowBlockInputTextarea
+                    isFirstInputInNode
                     nodeId={id}
                     onChange={(value) => {
                       handleChange("url", value);
