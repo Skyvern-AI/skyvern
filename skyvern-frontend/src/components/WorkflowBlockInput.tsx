@@ -3,14 +3,43 @@ import { cn } from "@/util/utils";
 import { Input } from "./ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { WorkflowBlockParameterSelect } from "@/routes/workflows/editor/nodes/WorkflowBlockParameterSelect";
+import { useEdges, useNodes } from "@xyflow/react";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "./ui/tooltip";
 
 type Props = Omit<React.ComponentProps<typeof Input>, "onChange"> & {
   onChange: (value: string) => void;
   nodeId: string;
+  isFirstInputInNode?: boolean;
 };
 
 function WorkflowBlockInput(props: Props) {
   const { nodeId, onChange, ...inputProps } = props;
+  const edges = useEdges();
+  const nodes = useNodes();
+
+  function isInsideFirstNode() {
+    const node = nodes.find((node) => node.id === nodeId);
+    if (!node) {
+      return;
+    }
+    const incomingEdge = edges.find((edge) => edge.target === node.id);
+    if (!incomingEdge) {
+      return;
+    }
+    const source = incomingEdge.source;
+    const sourceNode = nodes.find((node) => node.id === source);
+    if (!sourceNode) {
+      return;
+    }
+    return !node.parentId && sourceNode.type === "start";
+  }
+
+  const showInputTooltip = isInsideFirstNode() && props.isFirstInputInNode;
 
   return (
     <div className="relative">
@@ -23,11 +52,19 @@ function WorkflowBlockInput(props: Props) {
       />
       <div className="absolute right-0 top-0 flex size-9 cursor-pointer items-center justify-center">
         <Popover>
-          <PopoverTrigger asChild>
-            <div className="rounded p-1 hover:bg-muted" title="Add a parameter">
-              <PlusIcon className="size-4" />
-            </div>
-          </PopoverTrigger>
+          <TooltipProvider>
+            <Tooltip open={showInputTooltip}>
+              <TooltipTrigger asChild>
+                <PopoverTrigger asChild>
+                  <div className="rounded p-1 hover:bg-muted">
+                    <PlusIcon className="size-4" />
+                  </div>
+                </PopoverTrigger>
+              </TooltipTrigger>
+              <TooltipContent>Add parameters using the + button</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+
           <PopoverContent>
             <WorkflowBlockParameterSelect
               nodeId={nodeId}

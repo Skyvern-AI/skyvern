@@ -88,6 +88,7 @@ function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
         <div className="space-y-2">
           <Label className="text-xs text-slate-300">Complete if...</Label>
           <WorkflowBlockInputTextarea
+            isFirstInputInNode
             nodeId={id}
             onChange={(value) => {
               handleChange("completeCriterion", value);

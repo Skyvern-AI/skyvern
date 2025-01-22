@@ -1,5 +1,4 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
@@ -11,6 +10,7 @@ import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import type { WaitNode } from "./types";
+import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 
 function WaitNode({ id, data }: NodeProps<WaitNode>) {
   const { updateNodeData } = useReactFlow();
@@ -79,16 +79,18 @@ function WaitNode({ id, data }: NodeProps<WaitNode>) {
             </Label>
             <HelpTooltip content={helpTooltips["wait"]["waitInSeconds"]} />
           </div>
-          <Input
+          <WorkflowBlockInput
+            nodeId={id}
+            isFirstInputInNode
             type="number"
             min="1"
             max="300"
             value={inputs.waitInSeconds}
-            onChange={(event) => {
+            onChange={(value) => {
               if (!editable) {
                 return;
               }
-              handleChange("waitInSeconds", Number(event.target.value));
+              handleChange("waitInSeconds", Number(value));
             }}
             className="nopan text-xs"
           />

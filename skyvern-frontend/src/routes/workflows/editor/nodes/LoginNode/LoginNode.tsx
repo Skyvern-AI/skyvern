@@ -102,6 +102,7 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
               <HelpTooltip content={helpTooltips["login"]["url"]} />
             </div>
             <WorkflowBlockInputTextarea
+              isFirstInputInNode
               nodeId={id}
               onChange={(value) => {
                 handleChange("url", value);

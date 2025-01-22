@@ -104,6 +104,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                 <HelpTooltip content={helpTooltips["loop"]["loopValue"]} />
               </div>
               <WorkflowBlockInput
+                isFirstInputInNode
                 nodeId={id}
                 value={inputs.loopVariableReference}
                 onChange={(value) => {

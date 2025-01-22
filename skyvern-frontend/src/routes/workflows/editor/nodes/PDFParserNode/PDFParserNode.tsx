@@ -82,6 +82,7 @@ function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
               <HelpTooltip content={helpTooltips["pdfParser"]["fileUrl"]} />
             </div>
             <WorkflowBlockInput
+              isFirstInputInNode
               nodeId={id}
               value={inputs.fileUrl}
               onChange={(value) => {

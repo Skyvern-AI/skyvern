@@ -108,6 +108,7 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
               <HelpTooltip content={urlTooltip} />
             </div>
             <WorkflowBlockInputTextarea
+              isFirstInputInNode
               nodeId={id}
               onChange={(value) => {
                 handleChange("url", value);

@@ -104,6 +104,7 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
               <HelpTooltip content={helpTooltips["navigation"]["url"]} />
             </div>
             <WorkflowBlockInputTextarea
+              isFirstInputInNode
               nodeId={id}
               onChange={(value) => {
                 handleChange("url", value);

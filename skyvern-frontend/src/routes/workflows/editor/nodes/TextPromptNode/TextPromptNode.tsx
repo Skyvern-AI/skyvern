@@ -1,4 +1,3 @@
-import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
@@ -24,6 +23,7 @@ import { NodeActionMenu } from "../NodeActionMenu";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { type TextPromptNode } from "./types";
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 
 function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
   const { updateNodeData } = useReactFlow();
@@ -88,13 +88,15 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
             <Label className="text-xs text-slate-300">Prompt</Label>
             <HelpTooltip content={helpTooltips["textPrompt"]["prompt"]} />
           </div>
-          <AutoResizingTextarea
-            onChange={(event) => {
+          <WorkflowBlockInputTextarea
+            isFirstInputInNode
+            nodeId={id}
+            onChange={(value) => {
               if (!editable) {
                 return;
               }
-              setInputs({ ...inputs, prompt: event.target.value });
-              updateNodeData(id, { prompt: event.target.value });
+              setInputs({ ...inputs, prompt: value });
+              updateNodeData(id, { prompt: value });
             }}
             value={inputs.prompt}
             placeholder="What do you want to generate?"
