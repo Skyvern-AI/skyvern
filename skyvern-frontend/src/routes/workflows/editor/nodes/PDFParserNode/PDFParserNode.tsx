@@ -1,6 +1,8 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
-import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
+import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
+import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
@@ -9,11 +11,9 @@ import { useState } from "react";
 import { helpTooltips } from "../../helpContent";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
+import { dataSchemaExampleForFileExtraction } from "../types";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { type PDFParserNode } from "./types";
-import { Checkbox } from "@/components/ui/checkbox";
-import { dataSchemaExampleForFileExtraction } from "../types";
-import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 
 function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
   const { updateNodeData } = useReactFlow();
@@ -81,14 +81,11 @@ function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
               <Label className="text-xs text-slate-300">File URL</Label>
               <HelpTooltip content={helpTooltips["pdfParser"]["fileUrl"]} />
             </div>
-            <Input
+            <WorkflowBlockInput
+              nodeId={id}
               value={inputs.fileUrl}
-              onChange={(event) => {
-                if (!data.editable) {
-                  return;
-                }
-                setInputs({ ...inputs, fileUrl: event.target.value });
-                updateNodeData(id, { fileUrl: event.target.value });
+              onChange={(value) => {
+                handleChange("fileUrl", value);
               }}
               className="nopan text-xs"
             />
