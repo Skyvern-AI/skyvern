@@ -956,7 +956,7 @@ async def make_ai_suggestion(
     llm_prompt = ""
 
     if ai_suggestion_type == AISuggestionType.DATA_SCHEMA:
-        llm_prompt = prompt_engine.load_prompt("suggest-data-schema", input=data.input)
+        llm_prompt = prompt_engine.load_prompt("suggest-data-schema", input=data.input, additional_context=data.context)
 
     try:
         new_ai_suggestion = await app.DATABASE.create_ai_suggestion(

@@ -20,3 +20,4 @@ class AISuggestion(AISuggestionBase):
 
 class AISuggestionRequest(BaseModel):
     input: str = Field(..., min_length=1)
+    context: dict[str, Any] | None = None
