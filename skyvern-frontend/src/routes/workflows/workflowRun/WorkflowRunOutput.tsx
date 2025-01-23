@@ -137,7 +137,7 @@ function WorkflowRunOutput() {
       {observerOutput ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
-            <h1 className="text-lg font-bold">Observer Output</h1>
+            <h1 className="text-lg font-bold">Task 2.0 Output</h1>
             <CodeEditor
               language="json"
               value={JSON.stringify(observerOutput, null, 2)}
