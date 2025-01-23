@@ -6,7 +6,6 @@ import { CartIcon } from "@/components/icons/CartIcon";
 import { GraphIcon } from "@/components/icons/GraphIcon";
 import { InboxIcon } from "@/components/icons/InboxIcon";
 import { MessageIcon } from "@/components/icons/MessageIcon";
-import { TranslateIcon } from "@/components/icons/TranslateIcon";
 import { TrophyIcon } from "@/components/icons/TrophyIcon";
 import { Button } from "@/components/ui/button";
 import {
@@ -33,6 +32,11 @@ import { AxiosError } from "axios";
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { stringify as convertToYAML } from "yaml";
+import {
+  generatePhoneNumber,
+  generateUniqueEmail,
+} from "../data/sampleTaskData";
+import { ExampleCasePill } from "./ExampleCasePill";
 
 function createTemplateTaskFromTaskGenerationParameters(
   values: TaskGenerationApiResponse,
@@ -70,51 +74,59 @@ const exampleCases = [
   {
     key: "finditparts",
     label: "Add a product to cart",
+    prompt:
+      'Go to https://www.finditparts.com first. Search for the product "W01-377-8537", add it to cart and then navigate to the cart page. Your goal is COMPLETE when you\'re on the cart page and the specified product is in the cart. Extract all product quantity information from the cart page. Do not attempt to checkout.',
     icon: <CartIcon className="size-6" />,
-  },
-  {
-    key: "geico",
-    label: "Get an insurance quote",
-    icon: <FileTextIcon className="size-6" />,
   },
   {
     key: "job_application",
     label: "Apply for a job",
+    prompt: `Go to https://jobs.lever.co/leverdemo-8/45d39614-464a-4b62-a5cd-8683ce4fb80a/apply, fill out the job application form and apply to the job. Fill out any public burden questions if they appear in the form. Your goal is complete when the page says you've successfully applied to the job. Terminate if you are unable to apply successfully. Here's the user information: {"name":"John Doe","email":"${generateUniqueEmail()}","phone":"${generatePhoneNumber()}","resume_url":"https://writing.colostate.edu/guides/documents/resume/functionalSample.pdf","cover_letter":"Generate a compelling cover letter for me"}`,
     icon: <InboxIcon className="size-6" />,
+  },
+  {
+    key: "geico",
+    label: "Get an insurance quote",
+    prompt: `Go to https://www.geico.com first. Navigate through the website until you generate an auto insurance quote. Do not generate a home insurance quote. If you're on a page showing an auto insurance quote (with premium amounts), your goal is COMPLETE. Extract all quote information in JSON format including the premium amount, the timeframe for the quote. {"nameform":"work_data","login_admin":"noteadm","login":"user","passw":"password","mode":"flat","mode_data":[{"flat_data":{"unique_start":"1516966548.648839","flat_on_stage_id":33,"flat_status_id":4,"retry_count":3,"time_start":"2017-01-26 15:51:18","duration":70,"gps_start":"GPS","gps_end":"GPS","audio_info":"35","photo_flat":"ph_1516966548_fl_hRd8dpz"},"quizer_data":{"argessive":0,"registration":1,"take_apm":0,"request":1,"live_in_flat":3,"first_vote":1,"will_vote":1,"home_vote":0,"rf":1}}]}`,
+    icon: <FileTextIcon className="size-6" />,
   },
   {
     key: "california_edd",
     label: "Fill out CA's online EDD",
+    prompt: `Go to https://eddservices.edd.ca.gov/acctservices/AccountManagement/AccountServlet?Command=NEW_SIGN_UP. Navigate through the employer services online enrollment form. Terminate when the form is completed. Here's the needed information: {"username":"isthisreal1","password":"Password123!","first_name":"John","last_name":"Doe","pin":"1234","email":"${generateUniqueEmail()}","phone_number":"${generatePhoneNumber()}"}`,
     icon: <Pencil1Icon className="size-6" />,
   },
   {
     key: "contact_us_forms",
     label: "Fill a contact us form",
+    prompt: `Go to https://canadahvac.com/contact-hvac-canada. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. Here's the user information: {"name":"John Doe","email":"john.doe@gmail.com","phone":"123-456-7890","message":"Hello, I have a question about your services."}`,
     icon: <FileTextIcon className="size-6" />,
-  },
-  {
-    key: "bci_seguros",
-    label: "Get an auto insurance quote in spanish",
-    icon: <TranslateIcon className="size-6" />,
   },
   {
     key: "hackernews",
     label: "What's the top post on hackernews",
+    prompt: "Navigate to the Hacker News homepage and get the top 3 posts.",
     icon: <MessageIcon className="size-6" />,
   },
   {
     key: "AAPLStockPrice",
     label: "Search for AAPL on Google Finance",
+    prompt:
+      'Go to google finance and find the "AAPL" stock price. COMPLETE when the search results for "AAPL" are displayed and the stock price is extracted.',
     icon: <GraphIcon className="size-6" />,
   },
   {
     key: "topRankedFootballTeam",
     label: "Get the top ranked football team",
+    prompt:
+      "Navigate to the FIFA World Ranking page and identify the top ranked football team. Extract the name of the top ranked football team from the FIFA World Ranking page.",
     icon: <TrophyIcon className="size-6" />,
   },
   {
     key: "extractIntegrationsFromGong",
     label: "Extract Integrations from Gong.io",
+    prompt:
+      "Go to https://www.gong.io first. Navigate to the 'Integrations' page on the Gong website. Extract the names and descriptions of all integrations listed on the Gong integrations page. Ensure not to click on any external links or advertisements.",
     icon: <GearIcon className="size-6" />,
   },
 ];
@@ -122,7 +134,7 @@ const exampleCases = [
 function PromptBox() {
   const navigate = useNavigate();
   const [prompt, setPrompt] = useState<string>("");
-  const [selectValue, setSelectValue] = useState("v2"); // Observer is the default
+  const [selectValue, setSelectValue] = useState<"v1" | "v2">("v2"); // Observer is the default
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
 
@@ -231,7 +243,12 @@ function PromptBox() {
               onChange={(e) => setPrompt(e.target.value)}
               placeholder="Enter your prompt..."
             />
-            <Select value={selectValue} onValueChange={setSelectValue}>
+            <Select
+              value={selectValue}
+              onValueChange={(value: "v1" | "v2") => {
+                setSelectValue(value);
+              }}
+            >
               <SelectTrigger className="w-48 focus:ring-0">
                 <SelectValue />
               </SelectTrigger>
@@ -298,16 +315,14 @@ function PromptBox() {
         </div>
         {exampleCases.map((example) => {
           return (
-            <div
+            <ExampleCasePill
               key={example.key}
-              className="flex cursor-pointer gap-2 whitespace-normal rounded-sm bg-slate-elevation3 px-4 py-3 hover:bg-slate-elevation5 lg:whitespace-nowrap"
-              onClick={() => {
-                navigate(`/tasks/create/${example.key}`);
-              }}
-            >
-              <div>{example.icon}</div>
-              <div>{example.label}</div>
-            </div>
+              exampleId={example.key}
+              icon={example.icon}
+              label={example.label}
+              prompt={example.prompt}
+              version={selectValue}
+            />
           );
         })}
       </div>

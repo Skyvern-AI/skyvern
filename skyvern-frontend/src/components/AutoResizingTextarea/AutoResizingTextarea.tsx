@@ -1,4 +1,4 @@
-import { ChangeEventHandler, useLayoutEffect, useRef } from "react";
+import { ChangeEventHandler, useEffect, useLayoutEffect, useRef } from "react";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/util/utils";
 
@@ -27,13 +27,13 @@ function AutoResizingTextarea({
     ref.current.style.height = `${ref.current.scrollHeight + 2}px`;
   }, []);
 
-  function setSize() {
+  useEffect(() => {
     if (!ref.current) {
       return;
     }
     ref.current.style.height = "auto";
     ref.current.style.height = `${ref.current.scrollHeight + 2}px`;
-  }
+  }, [value]);
 
   return (
     <Textarea
@@ -42,8 +42,6 @@ function AutoResizingTextarea({
       readOnly={readOnly}
       placeholder={placeholder}
       ref={ref}
-      onKeyDown={setSize}
-      onInput={setSize}
       rows={1}
       className={cn("min-h-0 resize-none overflow-y-hidden", className)}
     />
