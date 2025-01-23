@@ -19,6 +19,7 @@ import { NodeActionMenu } from "../NodeActionMenu";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import type { LoopNode } from "./types";
 import { useState } from "react";
+import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 
 function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const { updateNodeData } = useReactFlow();
@@ -31,6 +32,8 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
     loopVariableReference: data.loopVariableReference,
   });
   const deleteNodeCallback = useDeleteNodeCallback();
+
+  const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
   const children = nodes.filter((node) => node.parentId === id);
   const furthestDownChild: Node | null = children.reduce(
@@ -99,12 +102,18 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
               />
             </div>
             <div className="space-y-2">
-              <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">Loop Value</Label>
-                <HelpTooltip content={helpTooltips["loop"]["loopValue"]} />
+              <div className="flex justify-between">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">Loop Value</Label>
+                  <HelpTooltip content={helpTooltips["loop"]["loopValue"]} />
+                </div>
+                {isFirstWorkflowBlock ? (
+                  <div className="flex justify-end text-xs text-slate-400">
+                    Tip: Use the {"+"} button to add parameters!
+                  </div>
+                ) : null}
               </div>
               <WorkflowBlockInput
-                isFirstInputInNode
                 nodeId={id}
                 value={inputs.loopVariableReference}
                 onChange={(value) => {

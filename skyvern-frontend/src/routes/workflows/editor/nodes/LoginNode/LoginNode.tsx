@@ -34,6 +34,7 @@ import type { LoginNode } from "./types";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { AppNode } from "..";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
+import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 
 function LoginNode({ id, data }: NodeProps<LoginNode>) {
   const { updateNodeData } = useReactFlow();
@@ -60,6 +61,7 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
+  const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
   function handleChange(key: string, value: unknown) {
     if (!editable) {
@@ -111,12 +113,19 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
         </header>
         <div className="space-y-4">
           <div className="space-y-2">
-            <div className="flex gap-2">
-              <Label className="text-xs text-slate-300">URL</Label>
-              <HelpTooltip content={helpTooltips["login"]["url"]} />
+            <div className="flex justify-between">
+              <div className="flex gap-2">
+                <Label className="text-xs text-slate-300">URL</Label>
+                <HelpTooltip content={helpTooltips["login"]["url"]} />
+              </div>
+              {isFirstWorkflowBlock ? (
+                <div className="flex justify-end text-xs text-slate-400">
+                  Tip: Use the {"+"} button to add parameters!
+                </div>
+              ) : null}
             </div>
+
             <WorkflowBlockInputTextarea
-              isFirstInputInNode
               nodeId={id}
               onChange={(value) => {
                 handleChange("url", value);

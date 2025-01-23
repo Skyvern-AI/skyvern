@@ -32,6 +32,7 @@ import { AppNode } from "..";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
+import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 
 function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
   const { updateNodeData } = useReactFlow();
@@ -53,6 +54,8 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
+
+  const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
   function handleChange(key: string, value: unknown) {
     if (!editable) {
@@ -100,16 +103,23 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
           />
         </header>
         <div className="space-y-2">
-          <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">
-              Data Extraction Goal
-            </Label>
-            <HelpTooltip
-              content={helpTooltips["extraction"]["dataExtractionGoal"]}
-            />
+          <div className="flex justify-between">
+            <div className="flex gap-2">
+              <Label className="text-xs text-slate-300">
+                Data Extraction Goal
+              </Label>
+              <HelpTooltip
+                content={helpTooltips["extraction"]["dataExtractionGoal"]}
+              />
+            </div>
+            {isFirstWorkflowBlock ? (
+              <div className="flex justify-end text-xs text-slate-400">
+                Tip: Use the {"+"} button to add parameters!
+              </div>
+            ) : null}
           </div>
+
           <WorkflowBlockInputTextarea
-            isFirstInputInNode
             nodeId={id}
             onChange={(value) => {
               if (!editable) {

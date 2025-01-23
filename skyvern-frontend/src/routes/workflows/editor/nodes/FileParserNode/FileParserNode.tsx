@@ -1,5 +1,4 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
@@ -11,6 +10,8 @@ import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { type FileParserNode } from "./types";
+import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
+import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 
 function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
   const { updateNodeData } = useReactFlow();
@@ -22,6 +23,8 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
     id,
     initialValue: data.label,
   });
+
+  const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
   return (
     <div>
@@ -65,18 +68,27 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
         </div>
         <div className="space-y-4">
           <div className="space-y-2">
-            <div className="flex gap-2">
-              <Label className="text-xs text-slate-300">File URL</Label>
-              <HelpTooltip content={helpTooltips["fileParser"]["fileUrl"]} />
+            <div className="flex justify-between">
+              <div className="flex gap-2">
+                <Label className="text-xs text-slate-300">File URL</Label>
+                <HelpTooltip content={helpTooltips["fileParser"]["fileUrl"]} />
+              </div>
+              {isFirstWorkflowBlock ? (
+                <div className="flex justify-end text-xs text-slate-400">
+                  Tip: Use the {"+"} button to add parameters!
+                </div>
+              ) : null}
             </div>
-            <Input
+
+            <WorkflowBlockInput
+              nodeId={id}
               value={inputs.fileUrl}
-              onChange={(event) => {
+              onChange={(value) => {
                 if (!data.editable) {
                   return;
                 }
-                setInputs({ ...inputs, fileUrl: event.target.value });
-                updateNodeData(id, { fileUrl: event.target.value });
+                setInputs({ ...inputs, fileUrl: value });
+                updateNodeData(id, { fileUrl: value });
               }}
               className="nopan text-xs"
             />
