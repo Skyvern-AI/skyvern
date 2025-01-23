@@ -20,6 +20,8 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
+from skyvern.webeye.utils.dom import SkyvernElement
+from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
@@ -103,6 +105,7 @@ def _remove_skyvern_attributes(element: Dict) -> Dict:
 
 
 async def _convert_svg_to_string(
+    skyvern_frame: SkyvernFrame,
     element: Dict,
     task: Task | None = None,
     step: Step | None = None,
@@ -116,6 +119,24 @@ async def _convert_svg_to_string(
     task_id = task.task_id if task else None
     step_id = step.step_id if step else None
     element_id = element.get("id", "")
+
+    try:
+        locater = skyvern_frame.get_frame().locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
+        skyvern_element = SkyvernElement(locator=locater, frame=skyvern_frame.get_frame(), static_element=element)
+
+        _, blocked = await skyvern_frame.get_blocking_element_id(await skyvern_element.get_element_handler())
+        if blocked:
+            del element["children"]
+            element["isDropped"] = True
+            return
+    except Exception:
+        LOG.warning(
+            "Failed to get the blocking element for the svg, going to continue parsing the svg",
+            exc_info=True,
+            task_id=task_id,
+            step_id=step_id,
+        )
+
     svg_element = _remove_skyvern_attributes(element)
     svg_html = json_to_html(svg_element)
     hash_object = hashlib.sha256()
@@ -422,13 +443,14 @@ class AgentFunction:
             :param elements: List of elements to remove xpaths from.
             :return: List of elements without xpaths.
             """
+            skyvern_frame = await SkyvernFrame.create_instance(frame=frame)
             queue = []
             for element in element_tree:
                 queue.append(element)
             while queue:
                 queue_ele = queue.pop(0)
                 _remove_rect(queue_ele)
-                await _convert_svg_to_string(queue_ele, task, step)
+                await _convert_svg_to_string(skyvern_frame, queue_ele, task, step)
 
                 if _should_css_shape_convert(element=queue_ele):
                     await _convert_css_shape_to_string(
