@@ -430,7 +430,7 @@ export function getSample(sample: SampleCase) {
   }
 }
 
-function generateUniqueEmail() {
+export function generateUniqueEmail() {
   // Define the characters to use for the random part
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
   let randomString = "";
@@ -446,7 +446,7 @@ function generateUniqueEmail() {
   return email;
 }
 
-function generatePhoneNumber() {
+export function generatePhoneNumber() {
   let phoneNumber = "";
 
   // The first digit should be between 1 and 9 (it can't be 0)
