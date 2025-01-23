@@ -11,6 +11,7 @@ import { NodeActionMenu } from "../NodeActionMenu";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import type { WaitNode } from "./types";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
+import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 
 function WaitNode({ id, data }: NodeProps<WaitNode>) {
   const { updateNodeData } = useReactFlow();
@@ -31,6 +32,8 @@ function WaitNode({ id, data }: NodeProps<WaitNode>) {
     setInputs({ ...inputs, [key]: value });
     updateNodeData(id, { [key]: value });
   }
+
+  const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
   return (
     <div>
@@ -73,15 +76,22 @@ function WaitNode({ id, data }: NodeProps<WaitNode>) {
           />
         </header>
         <div className="space-y-2">
-          <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">
-              Wait Time (in seconds)
-            </Label>
-            <HelpTooltip content={helpTooltips["wait"]["waitInSeconds"]} />
+          <div className="flex justify-between">
+            <div className="flex gap-2">
+              <Label className="text-xs text-slate-300">
+                Wait Time (in seconds)
+              </Label>
+              <HelpTooltip content={helpTooltips["wait"]["waitInSeconds"]} />
+            </div>
+            {isFirstWorkflowBlock ? (
+              <div className="flex justify-end text-xs text-slate-400">
+                Tip: Use the {"+"} button to add parameters!
+              </div>
+            ) : null}
           </div>
+
           <WorkflowBlockInput
             nodeId={id}
-            isFirstInputInNode
             type="number"
             min="1"
             max="300"

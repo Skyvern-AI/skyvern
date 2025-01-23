@@ -13,6 +13,7 @@ import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { type SendEmailNode } from "./types";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 
 function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
   const { updateNodeData } = useReactFlow();
@@ -35,6 +36,8 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
     setInputs({ ...inputs, [key]: value });
     updateNodeData(id, { [key]: value });
   }
+
+  const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
   return (
     <div>
@@ -77,9 +80,15 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
           />
         </div>
         <div className="space-y-2">
-          <Label className="text-xs text-slate-300">Recipients</Label>
+          <div className="flex justify-between">
+            <Label className="text-xs text-slate-300">Recipients</Label>
+            {isFirstWorkflowBlock ? (
+              <div className="flex justify-end text-xs text-slate-400">
+                Tip: Use the {"+"} button to add parameters!
+              </div>
+            ) : null}
+          </div>
           <WorkflowBlockInput
-            isFirstInputInNode
             nodeId={id}
             onChange={(value) => {
               handleChange("recipients", value);

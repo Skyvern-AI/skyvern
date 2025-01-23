@@ -24,6 +24,7 @@ import { type TextPromptNode } from "./types";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 import { dataSchemaExampleValue } from "../types";
+import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 
 function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
   const { updateNodeData } = useReactFlow();
@@ -50,6 +51,8 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
     setInputs({ ...inputs, [key]: value });
     updateNodeData(id, { [key]: value });
   }
+
+  const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
   return (
     <div>
@@ -92,12 +95,19 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
           />
         </div>
         <div className="space-y-2">
-          <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">Prompt</Label>
-            <HelpTooltip content={helpTooltips["textPrompt"]["prompt"]} />
+          <div className="flex justify-between">
+            <div className="flex gap-2">
+              <Label className="text-xs text-slate-300">Prompt</Label>
+              <HelpTooltip content={helpTooltips["textPrompt"]["prompt"]} />
+            </div>
+            {isFirstWorkflowBlock ? (
+              <div className="flex justify-end text-xs text-slate-400">
+                Tip: Use the {"+"} button to add parameters!
+              </div>
+            ) : null}
           </div>
+
           <WorkflowBlockInputTextarea
-            isFirstInputInNode
             nodeId={id}
             onChange={(value) => {
               handleChange("prompt", value);

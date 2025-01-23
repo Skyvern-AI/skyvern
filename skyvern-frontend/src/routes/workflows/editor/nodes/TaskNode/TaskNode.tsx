@@ -35,6 +35,7 @@ import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { ParametersMultiSelect } from "./ParametersMultiSelect";
 import type { TaskNode } from "./types";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
+import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 
 function TaskNode({ id, data }: NodeProps<TaskNode>) {
   const { updateNodeData } = useReactFlow();
@@ -43,6 +44,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
+  const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
   const [label, setLabel] = useNodeLabelChangeHandler({
     id,
@@ -121,12 +123,18 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
             <AccordionContent className="pl-[1.5rem] pr-1">
               <div className="space-y-4">
                 <div className="space-y-2">
-                  <div className="flex gap-2">
-                    <Label className="text-xs text-slate-300">URL</Label>
-                    <HelpTooltip content={helpTooltips["task"]["url"]} />
+                  <div className="flex justify-between">
+                    <div className="flex gap-2">
+                      <Label className="text-xs text-slate-300">URL</Label>
+                      <HelpTooltip content={helpTooltips["task"]["url"]} />
+                    </div>
+                    {isFirstWorkflowBlock ? (
+                      <div className="flex justify-end text-xs text-slate-400">
+                        Tip: Use the {"+"} button to add parameters!
+                      </div>
+                    ) : null}
                   </div>
                   <WorkflowBlockInputTextarea
-                    isFirstInputInNode
                     nodeId={id}
                     onChange={(value) => {
                       handleChange("url", value);

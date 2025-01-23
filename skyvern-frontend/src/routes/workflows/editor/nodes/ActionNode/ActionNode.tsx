@@ -34,6 +34,7 @@ import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 import { AppNode } from "..";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
+import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -74,6 +75,8 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
     setInputs({ ...inputs, [key]: value });
     updateNodeData(id, { [key]: value });
   }
+
+  const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
   return (
     <div>
@@ -117,12 +120,19 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
         </header>
         <div className="space-y-4">
           <div className="space-y-2">
-            <div className="flex gap-2">
-              <Label className="text-xs text-slate-300">URL</Label>
-              <HelpTooltip content={urlTooltip} />
+            <div className="flex justify-between">
+              <div className="flex gap-2">
+                <Label className="text-xs text-slate-300">URL</Label>
+                <HelpTooltip content={urlTooltip} />
+              </div>
+              {isFirstWorkflowBlock ? (
+                <div className="flex justify-end text-xs text-slate-400">
+                  Tip: Use the {"+"} button to add parameters!
+                </div>
+              ) : null}
             </div>
+
             <WorkflowBlockInputTextarea
-              isFirstInputInNode
               nodeId={id}
               onChange={(value) => {
                 handleChange("url", value);

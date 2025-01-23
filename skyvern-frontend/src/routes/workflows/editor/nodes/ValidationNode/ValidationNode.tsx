@@ -32,6 +32,7 @@ import type { ValidationNode } from "./types";
 import { AppNode } from "..";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
+import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 
 function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
   const { updateNodeData } = useReactFlow();
@@ -57,6 +58,8 @@ function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
     setInputs({ ...inputs, [key]: value });
     updateNodeData(id, { [key]: value });
   }
+
+  const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
   return (
     <div>
@@ -99,9 +102,15 @@ function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
           />
         </header>
         <div className="space-y-2">
-          <Label className="text-xs text-slate-300">Complete if...</Label>
+          <div className="flex justify-between">
+            <Label className="text-xs text-slate-300">Complete if...</Label>
+            {isFirstWorkflowBlock ? (
+              <div className="flex justify-end text-xs text-slate-400">
+                Tip: Use the {"+"} button to add parameters!
+              </div>
+            ) : null}
+          </div>
           <WorkflowBlockInputTextarea
-            isFirstInputInNode
             nodeId={id}
             onChange={(value) => {
               handleChange("completeCriterion", value);

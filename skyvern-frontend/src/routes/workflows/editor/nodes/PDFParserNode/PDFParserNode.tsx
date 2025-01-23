@@ -13,6 +13,7 @@ import { dataSchemaExampleForFileExtraction } from "../types";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { type PDFParserNode } from "./types";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
+import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 
 function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
   const { updateNodeData } = useReactFlow();
@@ -33,6 +34,8 @@ function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
     setInputs({ ...inputs, [key]: value });
     updateNodeData(id, { [key]: value });
   }
+
+  const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
   return (
     <div>
@@ -76,12 +79,18 @@ function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
         </div>
         <div className="space-y-4">
           <div className="space-y-2">
-            <div className="flex gap-2">
-              <Label className="text-xs text-slate-300">File URL</Label>
-              <HelpTooltip content={helpTooltips["pdfParser"]["fileUrl"]} />
+            <div className="flex justify-between">
+              <div className="flex gap-2">
+                <Label className="text-xs text-slate-300">File URL</Label>
+                <HelpTooltip content={helpTooltips["pdfParser"]["fileUrl"]} />
+              </div>
+              {isFirstWorkflowBlock ? (
+                <div className="flex justify-end text-xs text-slate-400">
+                  Tip: Use the {"+"} button to add parameters!
+                </div>
+              ) : null}
             </div>
             <WorkflowBlockInput
-              isFirstInputInNode
               nodeId={id}
               value={inputs.fileUrl}
               onChange={(value) => {
