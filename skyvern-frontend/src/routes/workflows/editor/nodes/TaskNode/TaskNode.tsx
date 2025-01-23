@@ -34,6 +34,7 @@ import { dataSchemaExampleValue, errorMappingExampleValue } from "../types";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { ParametersMultiSelect } from "./ParametersMultiSelect";
 import type { TaskNode } from "./types";
+import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 
 function TaskNode({ id, data }: NodeProps<TaskNode>) {
   const { updateNodeData } = useReactFlow();
@@ -187,42 +188,18 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                     className="nopan text-xs"
                   />
                 </div>
-                <div className="space-y-2">
-                  <div className="flex gap-4">
-                    <div className="flex gap-2">
-                      <Label className="text-xs text-slate-300">
-                        Data Schema
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["task"]["dataSchema"]}
-                      />
-                    </div>
-                    <Checkbox
-                      checked={inputs.dataSchema !== "null"}
-                      onCheckedChange={(checked) => {
-                        handleChange(
-                          "dataSchema",
-                          checked
-                            ? JSON.stringify(dataSchemaExampleValue, null, 2)
-                            : "null",
-                        );
-                      }}
-                    />
-                  </div>
-                  {inputs.dataSchema !== "null" && (
-                    <div>
-                      <CodeEditor
-                        language="json"
-                        value={inputs.dataSchema}
-                        onChange={(value) => {
-                          handleChange("dataSchema", value);
-                        }}
-                        className="nowheel nopan"
-                        fontSize={8}
-                      />
-                    </div>
-                  )}
-                </div>
+                <WorkflowDataSchemaInputGroup
+                  exampleValue={dataSchemaExampleValue}
+                  onChange={(value) => {
+                    handleChange("dataSchema", value);
+                  }}
+                  value={inputs.dataSchema}
+                  suggestionContext={{
+                    data_extraction_goal: inputs.dataExtractionGoal,
+                    current_schema: inputs.dataSchema,
+                    navigation_goal: inputs.navigationGoal,
+                  }}
+                />
               </div>
             </AccordionContent>
           </AccordionItem>

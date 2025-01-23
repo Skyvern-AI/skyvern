@@ -1,8 +1,6 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
-import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
-import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
@@ -14,6 +12,7 @@ import { NodeActionMenu } from "../NodeActionMenu";
 import { dataSchemaExampleForFileExtraction } from "../types";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { type PDFParserNode } from "./types";
+import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 
 function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
   const { updateNodeData } = useReactFlow();
@@ -91,44 +90,14 @@ function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
               className="nopan text-xs"
             />
           </div>
-          <div className="space-y-2">
-            <div className="flex gap-4">
-              <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">Data Schema</Label>
-                <HelpTooltip
-                  content={helpTooltips["pdfParser"]["jsonSchema"]}
-                />
-              </div>
-              <Checkbox
-                checked={inputs.jsonSchema !== "null"}
-                onCheckedChange={(checked) => {
-                  handleChange(
-                    "jsonSchema",
-                    checked
-                      ? JSON.stringify(
-                          dataSchemaExampleForFileExtraction,
-                          null,
-                          2,
-                        )
-                      : "null",
-                  );
-                }}
-              />
-            </div>
-            {inputs.jsonSchema !== "null" && (
-              <div>
-                <CodeEditor
-                  language="json"
-                  value={inputs.jsonSchema}
-                  onChange={(value) => {
-                    handleChange("jsonSchema", value);
-                  }}
-                  className="nowheel nopan"
-                  fontSize={8}
-                />
-              </div>
-            )}
-          </div>
+          <WorkflowDataSchemaInputGroup
+            exampleValue={dataSchemaExampleForFileExtraction}
+            value={inputs.jsonSchema}
+            onChange={(value) => {
+              handleChange("jsonSchema", value);
+            }}
+            suggestionContext={{}}
+          />
         </div>
       </div>
     </div>
