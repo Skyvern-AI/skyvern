@@ -143,12 +143,12 @@ function WorkflowPostRunParameters() {
       {workflowRun.observer_task ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
-            <h1 className="text-lg font-bold">Observer Parameters</h1>
+            <h1 className="text-lg font-bold">Task 2.0 Parameters</h1>
             <div className="flex gap-16">
               <div className="w-80">
-                <h1 className="text-lg">Observer Prompt</h1>
+                <h1 className="text-lg">Task 2.0 Prompt</h1>
                 <h2 className="text-base text-slate-400">
-                  The original prompt for the observer
+                  The original prompt for the task
                 </h2>
               </div>
               <AutoResizingTextarea
