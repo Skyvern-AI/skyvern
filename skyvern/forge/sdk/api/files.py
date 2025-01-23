@@ -46,8 +46,25 @@ def get_file_extension_from_headers(headers: CIMultiDictProxy[str]) -> str:
     return ""
 
 
+def extract_google_drive_file_id(url: str) -> str | None:
+    """Extract file ID from Google Drive URL."""
+    # Handle format: https://drive.google.com/file/d/{file_id}/view
+    match = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
+    if match:
+        return match.group(1)
+    return None
+
+
 async def download_file(url: str, max_size_mb: int | None = None) -> str:
     try:
+        # Check if URL is a Google Drive link
+        if "drive.google.com" in url:
+            file_id = extract_google_drive_file_id(url)
+            if file_id:
+                # Convert to direct download URL
+                url = f"https://drive.google.com/uc?export=download&id={file_id}"
+                LOG.info("Converting Google Drive link to direct download", url=url)
+
         # Check if URL is an S3 URI
         if url.startswith(f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/o_"):
             LOG.info("Downloading Skyvern file from S3", url=url)
