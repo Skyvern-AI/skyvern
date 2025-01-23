@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from skyvern.config import settings
 from skyvern.constants import (
     AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
+    BROWSER_DOWNLOAD_MAX_WAIT_TIME,
     BROWSER_DOWNLOAD_TIMEOUT,
     DROPDOWN_MENU_MAX_DISTANCE,
     REPO_ROOT_DIR,
@@ -474,25 +475,23 @@ async def handle_click_to_download_file_action(
         )
         return [ActionFailure(e, download_triggered=False)]
 
-    # wait 5s to start downloading
-    LOG.info(
-        "Sleep for 5s to let download finish",
-        task_id=task.task_id,
-        step_id=step.step_id,
-        workflow_run_id=task.workflow_run_id,
-    )
-    await asyncio.sleep(5)
-    list_files_after = list_files_in_directory(download_dir)
-    LOG.info(
-        "Number of files in download directory after click",
-        num_downloaded_files_after=len(list_files_after),
-        download_dir=download_dir,
-        task_id=task.task_id,
-        step_id=step.step_id,
-        workflow_run_id=task.workflow_run_id,
-    )
+    try:
+        async with asyncio.timeout(BROWSER_DOWNLOAD_MAX_WAIT_TIME):
+            while True:
+                list_files_after = list_files_in_directory(download_dir)
+                LOG.info(
+                    "Number of files in download directory after click",
+                    num_downloaded_files_after=len(list_files_after),
+                    download_dir=download_dir,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    workflow_run_id=task.workflow_run_id,
+                )
+                if len(list_files_after) > len(list_files_before):
+                    break
+                await asyncio.sleep(1)
 
-    if len(list_files_after) <= len(list_files_before):
+    except asyncio.TimeoutError:
         LOG.warning(
             "No file to download after click",
             task_id=task.task_id,
