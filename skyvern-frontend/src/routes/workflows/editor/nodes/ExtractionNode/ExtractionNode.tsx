@@ -6,12 +6,10 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
-import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
-import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import {
@@ -33,6 +31,7 @@ import { helpTooltips, placeholders } from "../../helpContent";
 import { AppNode } from "..";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
+import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 
 function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
   const { updateNodeData } = useReactFlow();
@@ -123,44 +122,17 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
             className="nopan text-xs"
           />
         </div>
-        <div className="space-y-2">
-          <div className="flex gap-4">
-            <div className="flex gap-2">
-              <Label className="text-xs text-slate-300">Data Schema</Label>
-              <HelpTooltip content={helpTooltips["extraction"]["dataSchema"]} />
-            </div>
-            <Checkbox
-              checked={inputs.dataSchema !== "null"}
-              onCheckedChange={(checked) => {
-                if (!editable) {
-                  return;
-                }
-                handleChange(
-                  "dataSchema",
-                  checked
-                    ? JSON.stringify(dataSchemaExampleValue, null, 2)
-                    : "null",
-                );
-              }}
-            />
-          </div>
-          {inputs.dataSchema !== "null" && (
-            <div>
-              <CodeEditor
-                language="json"
-                value={inputs.dataSchema}
-                onChange={(value) => {
-                  if (!editable) {
-                    return;
-                  }
-                  handleChange("dataSchema", value);
-                }}
-                className="nowheel nopan"
-                fontSize={8}
-              />
-            </div>
-          )}
-        </div>
+        <WorkflowDataSchemaInputGroup
+          value={inputs.dataSchema}
+          onChange={(value) => {
+            handleChange("dataSchema", value);
+          }}
+          exampleValue={dataSchemaExampleValue}
+          suggestionContext={{
+            data_extraction_goal: inputs.dataExtractionGoal,
+            current_schema: inputs.dataSchema,
+          }}
+        />
         <Separator />
         <Accordion type="single" collapsible>
           <AccordionItem value="advanced" className="border-b-0">
