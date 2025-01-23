@@ -145,6 +145,7 @@ export const ActionTypes = {
   wait: "wait",
   terminate: "terminate",
   SolveCaptcha: "solve_captcha",
+  extract: "extract",
 } as const;
 
 export type ActionType = (typeof ActionTypes)[keyof typeof ActionTypes];
@@ -160,6 +161,7 @@ export const ReadableActionTypes: {
   wait: "Wait",
   terminate: "Terminate",
   solve_captcha: "Solve Captcha",
+  extract: "Extract Data",
 };
 
 export type Option = {
