@@ -575,17 +575,27 @@ class WorkflowService:
             organization_id=organization_id,
         )
 
-    async def get_workflow_runs(self, organization_id: str, page: int = 1, page_size: int = 10) -> list[WorkflowRun]:
-        return await app.DATABASE.get_workflow_runs(organization_id=organization_id, page=page, page_size=page_size)
+    async def get_workflow_runs(
+        self, organization_id: str, page: int = 1, page_size: int = 10, status: list[WorkflowRunStatus] | None = None
+    ) -> list[WorkflowRun]:
+        return await app.DATABASE.get_workflow_runs(
+            organization_id=organization_id, page=page, page_size=page_size, status=status
+        )
 
     async def get_workflow_runs_for_workflow_permanent_id(
-        self, workflow_permanent_id: str, organization_id: str, page: int = 1, page_size: int = 10
+        self,
+        workflow_permanent_id: str,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+        status: list[WorkflowRunStatus] | None = None,
     ) -> list[WorkflowRun]:
         return await app.DATABASE.get_workflow_runs_for_workflow_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
             organization_id=organization_id,
             page=page,
             page_size=page_size,
+            status=status,
         )
 
     async def create_workflow_run(
