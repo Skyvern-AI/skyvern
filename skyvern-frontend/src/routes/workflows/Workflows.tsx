@@ -1,5 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import { WorkflowRunApiResponse } from "@/api/types";
+import { Status, WorkflowRunApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Button } from "@/components/ui/button";
 import {
@@ -35,11 +35,14 @@ import { WorkflowApiResponse } from "./types/workflowTypes";
 import { WorkflowActions } from "./WorkflowActions";
 import { WorkflowsPageBanner } from "./WorkflowsPageBanner";
 import { WorkflowTitle } from "./WorkflowTitle";
+import { useState } from "react";
+import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
 
 function Workflows() {
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
+  const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
   const workflowsPage = searchParams.get("workflowsPage")
     ? Number(searchParams.get("workflowsPage"))
     : 1;
@@ -65,11 +68,14 @@ function Workflows() {
   const { data: workflowRuns, isLoading: workflowRunsIsLoading } = useQuery<
     Array<WorkflowRunApiResponse>
   >({
-    queryKey: ["workflowRuns", workflowRunsPage],
+    queryKey: ["workflowRuns", { statusFilters }, workflowRunsPage],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
       params.append("page", String(workflowRunsPage));
+      statusFilters.forEach((status) => {
+        params.append("status", status);
+      });
       return client
         .get("/workflows/runs", {
           params,
@@ -277,10 +283,16 @@ function Workflows() {
         <header>
           <div className="flex justify-between">
             <h1 className="text-2xl font-semibold">Workflow Runs</h1>
-            <Button variant="secondary" onClick={handleExport}>
-              <DownloadIcon className="mr-2" />
-              Export CSV
-            </Button>
+            <div className="flex gap-2">
+              <StatusFilterDropdown
+                values={statusFilters}
+                onChange={setStatusFilters}
+              />
+              <Button variant="secondary" onClick={handleExport}>
+                <DownloadIcon className="mr-2" />
+                Export CSV
+              </Button>
+            </div>
           </div>
         </header>
         <div className="rounded-md border">
