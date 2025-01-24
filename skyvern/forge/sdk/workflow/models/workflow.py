@@ -50,6 +50,12 @@ class WorkflowDefinition(BaseModel):
             raise WorkflowDefinitionHasDuplicateBlockLabels(duplicate_labels)
 
 
+class WorkflowStatus(StrEnum):
+    published = "published"
+    draft = "draft"
+    auto_generated = "auto_generated"
+
+
 class Workflow(BaseModel):
     workflow_id: str
     organization_id: str
@@ -64,6 +70,7 @@ class Workflow(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     persist_browser_session: bool = False
+    status: WorkflowStatus = WorkflowStatus.published
 
     created_at: datetime
     modified_at: datetime

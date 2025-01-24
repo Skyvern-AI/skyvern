@@ -73,6 +73,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunParameter,
     WorkflowRunStatus,
     WorkflowRunStatusResponse,
+    WorkflowStatus,
 )
 from skyvern.forge.sdk.workflow.models.yaml import (
     BLOCK_YAML_TYPES,
@@ -478,6 +479,7 @@ class WorkflowService:
         workflow_permanent_id: str | None = None,
         version: int | None = None,
         is_saved_task: bool = False,
+        status: WorkflowStatus = WorkflowStatus.published,
     ) -> Workflow:
         return await app.DATABASE.create_workflow(
             title=title,
@@ -492,6 +494,7 @@ class WorkflowService:
             workflow_permanent_id=workflow_permanent_id,
             version=version,
             is_saved_task=is_saved_task,
+            status=status,
         )
 
     async def get_workflow(self, workflow_id: str, organization_id: str | None = None) -> Workflow:
@@ -525,6 +528,7 @@ class WorkflowService:
         only_saved_tasks: bool = False,
         only_workflows: bool = False,
         title: str = "",
+        statuses: list[WorkflowStatus] | None = None,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
@@ -536,6 +540,7 @@ class WorkflowService:
             only_saved_tasks=only_saved_tasks,
             only_workflows=only_workflows,
             title=title,
+            statuses=statuses,
         )
 
     async def update_workflow(
@@ -1203,6 +1208,7 @@ class WorkflowService:
                     workflow_permanent_id=workflow_permanent_id,
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
+                    status=request.status,
                 )
             else:
                 workflow = await self.create_workflow(
@@ -1216,6 +1222,7 @@ class WorkflowService:
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
                     is_saved_task=request.is_saved_task,
+                    status=request.status,
                 )
             # Keeping track of the new workflow id to delete it if an error occurs during the creation process
             new_workflow_id = workflow.workflow_id
@@ -1707,7 +1714,11 @@ class WorkflowService:
         raise ValueError(f"Invalid block type {block_yaml.block_type}")
 
     async def create_empty_workflow(
-        self, organization: Organization, title: str, proxy_location: ProxyLocation | None = None
+        self,
+        organization: Organization,
+        title: str,
+        proxy_location: ProxyLocation | None = None,
+        status: WorkflowStatus = WorkflowStatus.published,
     ) -> Workflow:
         """
         Create a blank workflow with no blocks
@@ -1720,6 +1731,7 @@ class WorkflowService:
                 blocks=[],
             ),
             proxy_location=proxy_location,
+            status=status,
         )
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=organization,
