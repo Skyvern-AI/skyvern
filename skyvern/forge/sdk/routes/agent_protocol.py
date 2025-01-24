@@ -67,6 +67,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     Workflow,
     WorkflowRequestBody,
     WorkflowRun,
+    WorkflowRunStatus,
     WorkflowRunStatusResponse,
 )
 from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
@@ -677,6 +678,7 @@ async def execute_workflow(
 async def get_workflow_runs(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
+    status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
@@ -684,6 +686,7 @@ async def get_workflow_runs(
         organization_id=current_org.organization_id,
         page=page,
         page_size=page_size,
+        status=status,
     )
 
 
@@ -700,6 +703,7 @@ async def get_workflow_runs_for_workflow_permanent_id(
     workflow_permanent_id: str,
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
+    status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
@@ -708,6 +712,7 @@ async def get_workflow_runs_for_workflow_permanent_id(
         organization_id=current_org.organization_id,
         page=page,
         page_size=page_size,
+        status=status,
     )
 
 
