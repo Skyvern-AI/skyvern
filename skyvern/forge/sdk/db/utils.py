@@ -43,7 +43,6 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunOutputParameter,
     WorkflowRunParameter,
     WorkflowRunStatus,
-    WorkflowStatus,
 )
 
 LOG = structlog.get_logger()
@@ -188,7 +187,6 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         created_at=workflow_model.created_at,
         modified_at=workflow_model.modified_at,
         deleted_at=workflow_model.deleted_at,
-        status=WorkflowStatus(workflow_model.status),
     )
 
 

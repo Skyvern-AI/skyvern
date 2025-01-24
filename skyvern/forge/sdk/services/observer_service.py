@@ -36,13 +36,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     TaskBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, ContextParameter
-from skyvern.forge.sdk.workflow.models.workflow import (
-    Workflow,
-    WorkflowRequestBody,
-    WorkflowRun,
-    WorkflowRunStatus,
-    WorkflowStatus,
-)
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.models.yaml import (
     BLOCK_YAML_TYPES,
     PARAMETER_YAML_TYPES,
@@ -93,7 +87,6 @@ async def initialize_observer_cruise(
     totp_identifier: str | None = None,
     totp_verification_url: str | None = None,
     webhook_callback_url: str | None = None,
-    publish_workflow: bool = False,
 ) -> ObserverTask:
     observer_cruise = await app.DATABASE.create_observer_cruise(
         prompt=user_prompt,
@@ -134,12 +127,8 @@ async def initialize_observer_cruise(
     # create workflow and workflow run
     max_steps_override = 10
     try:
-        workflow_status = WorkflowStatus.published if publish_workflow else WorkflowStatus.auto_generated
         new_workflow = await app.WORKFLOW_SERVICE.create_empty_workflow(
-            organization,
-            metadata.workflow_title,
-            proxy_location=proxy_location,
-            status=workflow_status,
+            organization, metadata.workflow_title, proxy_location=proxy_location
         )
         workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
             request_id=None,
@@ -530,7 +519,6 @@ async def run_observer_cruise_helper(
             description=workflow.description,
             proxy_location=observer_cruise.proxy_location or ProxyLocation.RESIDENTIAL,
             workflow_definition=workflow_definition_yaml,
-            status=workflow.status,
         )
         LOG.info("Creating workflow from request", workflow_create_request=workflow_create_request)
         workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(

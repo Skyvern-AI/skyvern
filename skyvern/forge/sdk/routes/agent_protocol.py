@@ -69,7 +69,6 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowRunStatusResponse,
-    WorkflowStatus,
 )
 from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
 from skyvern.webeye.actions.actions import Action
@@ -933,7 +932,6 @@ async def get_workflows(
         only_saved_tasks=only_saved_tasks,
         only_workflows=only_workflows,
         title=title,
-        statuses=[WorkflowStatus.published, WorkflowStatus.draft],
     )
 
 
@@ -1160,7 +1158,6 @@ async def observer_task(
             totp_verification_url=data.totp_verification_url,
             webhook_callback_url=data.webhook_callback_url,
             proxy_location=data.proxy_location,
-            publish_workflow=data.publish_workflow,
         )
     except LLMProviderError:
         LOG.error("LLM failure to initialize observer cruise", exc_info=True)

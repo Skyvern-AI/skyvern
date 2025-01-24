@@ -7,7 +7,6 @@ from skyvern.config import settings
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileType
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowStatus
 
 
 class ParameterYAML(BaseModel, abc.ABC):
@@ -371,4 +370,3 @@ class WorkflowCreateYAMLRequest(BaseModel):
     persist_browser_session: bool = False
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False
-    status: WorkflowStatus = WorkflowStatus.published
