@@ -524,6 +524,7 @@ class WorkflowService:
         page_size: int = 10,
         only_saved_tasks: bool = False,
         only_workflows: bool = False,
+        title: str = "",
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
@@ -534,6 +535,7 @@ class WorkflowService:
             page_size=page_size,
             only_saved_tasks=only_saved_tasks,
             only_workflows=only_workflows,
+            title=title,
         )
 
     async def update_workflow(

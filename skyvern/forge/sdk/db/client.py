@@ -1176,6 +1176,7 @@ class AgentDB:
         page_size: int = 10,
         only_saved_tasks: bool = False,
         only_workflows: bool = False,
+        title: str = "",
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
@@ -1209,6 +1210,8 @@ class AgentDB:
                     main_query = main_query.where(WorkflowModel.is_saved_task.is_(True))
                 elif only_workflows:
                     main_query = main_query.where(WorkflowModel.is_saved_task.is_(False))
+                if title:
+                    main_query = main_query.where(WorkflowModel.title.ilike(f"%{title}%"))
                 main_query = (
                     main_query.order_by(WorkflowModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
                 )
