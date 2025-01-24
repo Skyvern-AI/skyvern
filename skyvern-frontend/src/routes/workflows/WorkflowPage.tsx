@@ -1,5 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import { WorkflowRunApiResponse } from "@/api/types";
+import { Status, WorkflowRunApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Button } from "@/components/ui/button";
 import {
@@ -32,18 +32,21 @@ import {
 } from "react-router-dom";
 import { WorkflowApiResponse } from "./types/workflowTypes";
 import { WorkflowActions } from "./WorkflowActions";
+import { useState } from "react";
+import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
 
 function WorkflowPage() {
   const credentialGetter = useCredentialGetter();
   const { workflowPermanentId } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
+  const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
   const navigate = useNavigate();
 
   const { data: workflowRuns, isLoading } = useQuery<
     Array<WorkflowRunApiResponse>
   >({
-    queryKey: ["workflowRuns", workflowPermanentId, page],
+    queryKey: ["workflowRuns", workflowPermanentId, { statusFilters }, page],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
@@ -110,8 +113,12 @@ function WorkflowPage() {
         </div>
       </header>
       <div className="space-y-4">
-        <header>
-          <h1 className="text-lg font-semibold">Past Runs</h1>
+        <header className="flex justify-between">
+          <h1 className="text-2xl">Past Runs</h1>
+          <StatusFilterDropdown
+            values={statusFilters}
+            onChange={setStatusFilters}
+          />
         </header>
         <div className="rounded-md border">
           <Table>

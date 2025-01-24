@@ -8,18 +8,60 @@ import {
 import { Checkbox } from "./ui/checkbox";
 import { Status } from "@/api/types";
 
+type StatusDropdownItem = {
+  label: string;
+  value: Status;
+};
+
+const statusDropdownItems: Array<StatusDropdownItem> = [
+  {
+    label: "Completed",
+    value: Status.Completed,
+  },
+  {
+    label: "Failed",
+    value: Status.Failed,
+  },
+  {
+    label: "Running",
+    value: Status.Running,
+  },
+  {
+    label: "Queued",
+    value: Status.Queued,
+  },
+  {
+    label: "Terminated",
+    value: Status.Terminated,
+  },
+  {
+    label: "Canceled",
+    value: Status.Canceled,
+  },
+  {
+    label: "Timed Out",
+    value: Status.TimedOut,
+  },
+  {
+    label: "Created",
+    value: Status.Created,
+  },
+];
+
 type Item = {
   label: string;
   value: Status;
 };
 
 type Props = {
-  options: Array<Item>;
   values: Array<Status>;
   onChange: (values: Array<Status>) => void;
+  options?: Array<Item>;
 };
 
 function StatusFilterDropdown({ options, values, onChange }: Props) {
+  const dropdownOptions = options ?? statusDropdownItems; // allow options to be overridden by the user of this component
+
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -28,7 +70,7 @@ function StatusFilterDropdown({ options, values, onChange }: Props) {
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end">
-        {options.map((item) => {
+        {dropdownOptions.map((item) => {
           return (
             <div
               key={item.value}

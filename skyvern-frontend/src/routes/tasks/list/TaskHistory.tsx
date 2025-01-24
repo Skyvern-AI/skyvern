@@ -30,46 +30,6 @@ import { Button } from "@/components/ui/button";
 import { DownloadIcon } from "@radix-ui/react-icons";
 import { downloadBlob } from "@/util/downloadBlob";
 
-type StatusDropdownItem = {
-  label: string;
-  value: Status;
-};
-
-const statusDropdownItems: Array<StatusDropdownItem> = [
-  {
-    label: "Completed",
-    value: Status.Completed,
-  },
-  {
-    label: "Failed",
-    value: Status.Failed,
-  },
-  {
-    label: "Running",
-    value: Status.Running,
-  },
-  {
-    label: "Queued",
-    value: Status.Queued,
-  },
-  {
-    label: "Terminated",
-    value: Status.Terminated,
-  },
-  {
-    label: "Canceled",
-    value: Status.Canceled,
-  },
-  {
-    label: "Timed Out",
-    value: Status.TimedOut,
-  },
-  {
-    label: "Created",
-    value: Status.Created,
-  },
-];
-
 function TaskHistory() {
   const credentialGetter = useCredentialGetter();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -152,7 +112,6 @@ function TaskHistory() {
           <StatusFilterDropdown
             values={statusFilters}
             onChange={setStatusFilters}
-            options={statusDropdownItems}
           />
           <Button variant="secondary" onClick={handleExport}>
             <DownloadIcon className="mr-2" />
