@@ -131,6 +131,7 @@ class WorkflowService:
             request_id=request_id,
             workflow_run_id=workflow_run.workflow_run_id,
             workflow_id=workflow.workflow_id,
+            organization_id=workflow.organization_id,
             proxy_location=workflow_request.proxy_location,
             webhook_callback_url=workflow_request.webhook_callback_url,
         )
