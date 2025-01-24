@@ -194,6 +194,7 @@ class WorkflowModel(Base):
             name="uc_org_permanent_id_version",
         ),
         Index("permanent_id_version_idx", "workflow_permanent_id", "version"),
+        Index("organization_id_title_idx", "organization_id", "title"),
     )
 
     workflow_id = Column(String, primary_key=True, index=True, default=generate_workflow_id)

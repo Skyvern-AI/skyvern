@@ -911,6 +911,7 @@ async def get_workflows(
     page_size: int = Query(10, ge=1),
     only_saved_tasks: bool = Query(False),
     only_workflows: bool = Query(False),
+    title: str = Query(""),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[Workflow]:
     """
@@ -930,6 +931,7 @@ async def get_workflows(
         page_size=page_size,
         only_saved_tasks=only_saved_tasks,
         only_workflows=only_workflows,
+        title=title,
     )
 
 
