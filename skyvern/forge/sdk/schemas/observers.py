@@ -112,6 +112,7 @@ class ObserverTaskRequest(BaseModel):
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
+    proxy_location: ProxyLocation | None = None
 
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
     @classmethod
