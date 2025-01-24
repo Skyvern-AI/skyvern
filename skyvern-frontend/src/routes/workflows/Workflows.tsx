@@ -157,15 +157,17 @@ function Workflows() {
       <div className="space-y-4">
         <header className="flex justify-between">
           <h1 className="text-2xl font-semibold">Workflows</h1>
-          <div className="flex w-48 items-center rounded-md border pl-4 lg:w-72">
-            <MagnifyingGlassIcon className="size-6" />
+          <div className="relative">
+            <div className="absolute left-0 top-0 flex size-9 items-center justify-center">
+              <MagnifyingGlassIcon className="size-6" />
+            </div>
             <Input
               value={search}
               onChange={(event) => {
                 setSearch(event.target.value);
               }}
               placeholder="Search by title..."
-              className="border-transparent hover:border-transparent focus-visible:ring-0"
+              className="w-48 pl-9 lg:w-72"
             />
           </div>
         </header>
