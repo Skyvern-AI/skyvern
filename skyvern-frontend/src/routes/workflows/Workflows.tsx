@@ -28,7 +28,12 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { downloadBlob } from "@/util/downloadBlob";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
-import { DownloadIcon, Pencil2Icon, PlayIcon } from "@radix-ui/react-icons";
+import {
+  DownloadIcon,
+  MagnifyingGlassIcon,
+  Pencil2Icon,
+  PlayIcon,
+} from "@radix-ui/react-icons";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { WorkflowApiResponse } from "./types/workflowTypes";
@@ -37,12 +42,16 @@ import { WorkflowsPageBanner } from "./WorkflowsPageBanner";
 import { WorkflowTitle } from "./WorkflowTitle";
 import { useState } from "react";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
+import { useDebounce } from "use-debounce";
+import { Input } from "@/components/ui/input";
 
 function Workflows() {
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
+  const [search, setSearch] = useState("");
+  const [debouncedSearch] = useDebounce(search, 500);
   const workflowsPage = searchParams.get("workflowsPage")
     ? Number(searchParams.get("workflowsPage"))
     : 1;
@@ -51,12 +60,13 @@ function Workflows() {
     : 1;
 
   const { data: workflows, isLoading } = useQuery<Array<WorkflowApiResponse>>({
-    queryKey: ["workflows", workflowsPage],
+    queryKey: ["workflows", debouncedSearch, workflowsPage],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
       params.append("page", String(workflowsPage));
       params.append("only_workflows", "true");
+      params.append("title", debouncedSearch);
       return client
         .get(`/workflows`, {
           params,
@@ -145,8 +155,19 @@ function Workflows() {
     <div className="space-y-8">
       <WorkflowsPageBanner />
       <div className="space-y-4">
-        <header>
+        <header className="flex justify-between">
           <h1 className="text-2xl font-semibold">Workflows</h1>
+          <div className="flex w-48 items-center rounded-md border pl-4 lg:w-72">
+            <MagnifyingGlassIcon className="size-6" />
+            <Input
+              value={search}
+              onChange={(event) => {
+                setSearch(event.target.value);
+              }}
+              placeholder="Search by title..."
+              className="border-transparent hover:border-transparent focus-visible:ring-0"
+            />
+          </div>
         </header>
         <div className="rounded-md border">
           <Table>
