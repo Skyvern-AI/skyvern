@@ -2016,7 +2016,13 @@ function getHoverStylesMap() {
                   });
                 }
 
-                hoverMap.set(baseSelector, styles);
+                // only need the style which includes the cursor attribute.
+                for (const prop in styles) {
+                  if (prop.includes("cursor")) {
+                    hoverMap.set(baseSelector, styles);
+                    break;
+                  }
+                }
               }
             }
           }
