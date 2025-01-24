@@ -2017,12 +2017,10 @@ function getHoverStylesMap() {
                 }
 
                 // only need the style which includes the cursor attribute.
-                for (const prop in styles) {
-                  if (prop.includes("cursor")) {
-                    hoverMap.set(baseSelector, styles);
-                    break;
-                  }
+                if (!("cursor" in styles)) {
+                  continue;
                 }
+                hoverMap.set(baseSelector, styles);
               }
             }
           }
