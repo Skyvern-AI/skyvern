@@ -594,6 +594,10 @@ function isInteractable(element, hoverStylesMap) {
     return false;
   }
 
+  if (tagName === "frameset") {
+    return false;
+  }
+
   if (tagName === "a" && element.href) {
     return true;
   }
@@ -1289,8 +1293,9 @@ function buildElementTree(starter = document.body, frame, full_tree = false) {
     }
 
     // Check if the element is interactable
-    if (isInteractable(element, hoverStylesMap)) {
-      var elementObj = buildElementObject(frame, element, true);
+    var interactable = isInteractable(element, hoverStylesMap);
+    if (interactable || element.tagName.toLowerCase() === "frameset") {
+      var elementObj = buildElementObject(frame, element, interactable);
       elements.push(elementObj);
       // If the element is interactable but has no interactable parent,
       // then it starts a new tree, so add it to the result array
@@ -1314,7 +1319,10 @@ function buildElementTree(starter = document.body, frame, full_tree = false) {
         processElement(childElement, elementObj.id);
       }
       return elementObj;
-    } else if (element.tagName.toLowerCase() === "iframe") {
+    } else if (
+      element.tagName.toLowerCase() === "iframe" ||
+      element.tagName.toLowerCase() === "frame"
+    ) {
       let iframeElementObject = buildElementObject(frame, element, false);
 
       elements.push(iframeElementObject);
