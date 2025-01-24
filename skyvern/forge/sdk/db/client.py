@@ -81,6 +81,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunOutputParameter,
     WorkflowRunParameter,
     WorkflowRunStatus,
+    WorkflowStatus,
 )
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.actions.models import AgentStepOutput
@@ -1090,6 +1091,7 @@ class AgentDB:
         workflow_permanent_id: str | None = None,
         version: int | None = None,
         is_saved_task: bool = False,
+        status: WorkflowStatus = WorkflowStatus.published,
     ) -> Workflow:
         async with self.Session() as session:
             workflow = WorkflowModel(
@@ -1103,6 +1105,7 @@ class AgentDB:
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
                 is_saved_task=is_saved_task,
+                status=status,
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
@@ -1177,6 +1180,7 @@ class AgentDB:
         only_saved_tasks: bool = False,
         only_workflows: bool = False,
         title: str = "",
+        statuses: list[WorkflowStatus] | None = None,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
@@ -1212,6 +1216,8 @@ class AgentDB:
                     main_query = main_query.where(WorkflowModel.is_saved_task.is_(False))
                 if title:
                     main_query = main_query.where(WorkflowModel.title.ilike(f"%{title}%"))
+                if statuses:
+                    main_query = main_query.where(WorkflowModel.status.in_(statuses))
                 main_query = (
                     main_query.order_by(WorkflowModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
                 )
