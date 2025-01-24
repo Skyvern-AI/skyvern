@@ -195,6 +195,7 @@ class WorkflowModel(Base):
         ),
         Index("permanent_id_version_idx", "workflow_permanent_id", "version"),
         Index("organization_id_title_idx", "organization_id", "title"),
+        Index("workflow_oid_status_idx", "organization_id", "status"),
     )
 
     workflow_id = Column(String, primary_key=True, index=True, default=generate_workflow_id)
