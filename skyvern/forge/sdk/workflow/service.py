@@ -1693,7 +1693,9 @@ class WorkflowService:
 
         raise ValueError(f"Invalid block type {block_yaml.block_type}")
 
-    async def create_empty_workflow(self, organization: Organization, title: str) -> Workflow:
+    async def create_empty_workflow(
+        self, organization: Organization, title: str, proxy_location: ProxyLocation | None = None
+    ) -> Workflow:
         """
         Create a blank workflow with no blocks
         """
@@ -1704,6 +1706,7 @@ class WorkflowService:
                 parameters=[],
                 blocks=[],
             ),
+            proxy_location=proxy_location,
         )
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=organization,

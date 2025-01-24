@@ -80,11 +80,21 @@ def _generate_data_extraction_schema_for_loop(loop_values_key: str) -> dict:
 
 
 async def initialize_observer_cruise(
-    organization: Organization, user_prompt: str, user_url: str | None = None
+    organization: Organization,
+    user_prompt: str,
+    user_url: str | None = None,
+    proxy_location: ProxyLocation | None = None,
+    totp_identifier: str | None = None,
+    totp_verification_url: str | None = None,
+    webhook_callback_url: str | None = None,
 ) -> ObserverTask:
     observer_cruise = await app.DATABASE.create_observer_cruise(
         prompt=user_prompt,
         organization_id=organization.organization_id,
+        totp_verification_url=totp_verification_url,
+        totp_identifier=totp_identifier,
+        webhook_callback_url=webhook_callback_url,
+        proxy_location=proxy_location,
     )
     # set observer cruise id in context
     context = skyvern_context.current()
@@ -117,7 +127,9 @@ async def initialize_observer_cruise(
     # create workflow and workflow run
     max_steps_override = 10
     try:
-        new_workflow = await app.WORKFLOW_SERVICE.create_empty_workflow(organization, metadata.workflow_title)
+        new_workflow = await app.WORKFLOW_SERVICE.create_empty_workflow(
+            organization, metadata.workflow_title, proxy_location=proxy_location
+        )
         workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
             request_id=None,
             workflow_request=WorkflowRequestBody(),

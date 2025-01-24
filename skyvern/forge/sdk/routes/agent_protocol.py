@@ -1147,6 +1147,10 @@ async def observer_task(
             organization=organization,
             user_prompt=data.user_prompt,
             user_url=str(data.url) if data.url else None,
+            totp_identifier=data.totp_identifier,
+            totp_verification_url=data.totp_verification_url,
+            webhook_callback_url=data.webhook_callback_url,
+            proxy_location=data.proxy_location,
         )
     except LLMProviderError:
         LOG.error("LLM failure to initialize observer cruise", exc_info=True)

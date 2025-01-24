@@ -2010,6 +2010,10 @@ class AgentDB:
         prompt: str | None = None,
         url: str | None = None,
         organization_id: str | None = None,
+        proxy_location: ProxyLocation | None = None,
+        totp_identifier: str | None = None,
+        totp_verification_url: str | None = None,
+        webhook_callback_url: str | None = None,
     ) -> ObserverTask:
         async with self.Session() as session:
             new_observer_cruise = ObserverCruiseModel(
@@ -2018,6 +2022,10 @@ class AgentDB:
                 workflow_permanent_id=workflow_permanent_id,
                 prompt=prompt,
                 url=url,
+                proxy_location=proxy_location,
+                totp_identifier=totp_identifier,
+                totp_verification_url=totp_verification_url,
+                webhook_callback_url=webhook_callback_url,
                 organization_id=organization_id,
             )
             session.add(new_observer_cruise)

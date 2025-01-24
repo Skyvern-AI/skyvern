@@ -64,6 +64,7 @@ from skyvern.webeye.actions.actions import (
     CompleteAction,
     CompleteVerifyResult,
     DecisiveAction,
+    ExtractAction,
     ReloadPageAction,
     UserDefinedError,
     WebAction,
@@ -721,19 +722,7 @@ class ForgeAgent:
 
             using_cached_action_plan = False
             if not task.navigation_goal and not isinstance(task_block, ValidationBlock):
-                actions = [
-                    CompleteAction(
-                        reasoning="Task has no navigation goal.",
-                        data_extraction_goal=task.data_extraction_goal,
-                        organization_id=task.organization_id,
-                        task_id=task.task_id,
-                        workflow_run_id=task.workflow_run_id,
-                        step_id=step.step_id,
-                        step_order=step.order,
-                        action_order=0,
-                        confidence_float=1.0,
-                    )
-                ]
+                actions = [await self.create_extract_action(task, step, scraped_page)]
             elif (
                 task_block
                 and task_block.cache_actions
@@ -1039,6 +1028,21 @@ class ForgeAgent:
                         )
                         detailed_agent_step_output.actions_and_results.append((complete_action, complete_results))
                         await self.record_artifacts_after_action(task, step, browser_state)
+
+            # if the last action is complete and is successful, check if there's a data extraction goal
+            # if task has navigation goal and extraction goal at the same time, handle ExtractAction before marking step as completed
+            if (
+                task.navigation_goal
+                and task.data_extraction_goal
+                and self.step_has_completed_goal(detailed_agent_step_output)
+            ):
+                working_page = await browser_state.must_get_working_page()
+                extract_action = await self.create_extract_action(task, step, scraped_page)
+                extract_results = await ActionHandler.handle_action(
+                    scraped_page, task, step, working_page, extract_action
+                )
+                detailed_agent_step_output.actions_and_results.append((extract_action, extract_results))
+
             # If no action errors return the agent state and output
             completed_step = await self.update_step(
                 step=step,
@@ -1490,6 +1494,7 @@ class ForgeAgent:
         """
         Find the last successful ScrapeAction for the task and return the extracted information.
         """
+        # TODO: make sure we can get extracted information with the ExtractAction change
         steps = await app.DATABASE.get_task_steps(
             task_id=task.task_id,
             organization_id=task.organization_id,
@@ -1500,7 +1505,7 @@ class ForgeAgent:
             if not step.output or not step.output.actions_and_results:
                 continue
             for action, action_results in step.output.actions_and_results:
-                if action.action_type != ActionType.COMPLETE:
+                if action.action_type != ActionType.EXTRACT:
                     continue
 
                 for action_result in action_results:
@@ -2197,3 +2202,43 @@ class ForgeAgent:
             organization_id=task.organization_id,
             errors=task_errors,
         )
+
+    @staticmethod
+    async def create_extract_action(task: Task, step: Step, scraped_page: ScrapedPage) -> ExtractAction:
+        context = skyvern_context.ensure_context()
+        # generate reasoning by prompt llm to think briefly what data to extract
+        prompt = prompt_engine.load_prompt(
+            "data-extraction-summary",
+            data_extraction_goal=task.data_extraction_goal,
+            data_extraction_schema=task.extracted_information_schema,
+            current_url=scraped_page.url,
+            local_datetime=datetime.now(context.tz_info).isoformat(),
+        )
+
+        data_extraction_summary_resp = await app.SECONDARY_LLM_API_HANDLER(
+            prompt=prompt,
+            step=step,
+            screenshots=scraped_page.screenshots,
+        )
+        return ExtractAction(
+            reasoning=data_extraction_summary_resp.get("summary", "Extracting information from the page"),
+            data_extraction_goal=task.data_extraction_goal,
+            organization_id=task.organization_id,
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            step_id=step.step_id,
+            step_order=step.order,
+            action_order=0,
+            confidence_float=1.0,
+        )
+
+    @staticmethod
+    def step_has_completed_goal(detailed_agent_step_output: DetailedAgentStepOutput) -> bool:
+        if not detailed_agent_step_output.actions_and_results:
+            return False
+
+        last_action, last_action_results = detailed_agent_step_output.actions_and_results[-1]
+        if last_action.action_type not in [ActionType.COMPLETE, ActionType.EXTRACT]:
+            return False
+
+        return any(action_result.success for action_result in last_action_results)

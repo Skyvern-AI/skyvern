@@ -87,6 +87,9 @@ class Step(BaseModel):
             raise ValueError(f"cant_set_is_last_to_false({self.step_id})")
 
     def is_goal_achieved(self) -> bool:
+        # TODO: now we also consider a step has achieved the goal if the task doesn't have a navigation goal
+        # and the data extraction is successful
+
         if self.status != StepStatus.completed:
             return False
         # TODO (kerem): Remove this check once we have backfilled all the steps
@@ -94,14 +97,14 @@ class Step(BaseModel):
             return False
 
         # Check if there is a successful complete action
-        for action, action_results in self.output.actions_and_results:
-            if action.action_type != ActionType.COMPLETE:
-                continue
+        if not self.output.actions_and_results:
+            return False
 
-            if any(action_result.success for action_result in action_results):
-                return True
+        last_action, last_action_results = self.output.actions_and_results[-1]
+        if last_action.action_type not in [ActionType.COMPLETE, ActionType.EXTRACT]:
+            return False
 
-        return False
+        return any(action_result.success for action_result in last_action_results)
 
     def is_success(self) -> bool:
         if self.status != StepStatus.completed:

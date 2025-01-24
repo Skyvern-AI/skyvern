@@ -53,6 +53,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import download_file, get_download_dir, list_files_in_directory
+from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_post
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.skyvern_context import ensure_context
@@ -308,6 +309,9 @@ class ActionHandler:
                 "Cannot handle multiple elements with the same selector in one action.",
                 action=action,
             )
+            actions_result.append(ActionFailure(e))
+        except LLMProviderError as e:
+            LOG.exception("LLM error in action handler", action=action, exc_info=True)
             actions_result.append(ActionFailure(e))
         except Exception as e:
             LOG.exception("Unhandled exception in action handler", action=action)
@@ -1318,15 +1322,28 @@ async def handle_complete_action(
         )
         action.verified = True
 
+    return [ActionSuccess()]
+
+
+async def handle_extract_action(
+    action: actions.ExtractAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
     extracted_data = None
-    if action.data_extraction_goal:
+    if task.data_extraction_goal:
         scrape_action_result = await extract_information_for_navigation_goal(
             scraped_page=scraped_page,
             task=task,
             step=step,
         )
         extracted_data = scrape_action_result.scraped_data
-    return [ActionSuccess(data=extracted_data)]
+        return [ActionSuccess(data=extracted_data)]
+    else:
+        LOG.warning("No data extraction goal, skipping extract action", step_id=step.step_id)
+        return [ActionFailure(exception=Exception("No data extraction goal"))]
 
 
 ActionHandler.register_action_type(ActionType.SOLVE_CAPTCHA, handle_solve_captcha_action)
@@ -1339,6 +1356,7 @@ ActionHandler.register_action_type(ActionType.SELECT_OPTION, handle_select_optio
 ActionHandler.register_action_type(ActionType.WAIT, handle_wait_action)
 ActionHandler.register_action_type(ActionType.TERMINATE, handle_terminate_action)
 ActionHandler.register_action_type(ActionType.COMPLETE, handle_complete_action)
+ActionHandler.register_action_type(ActionType.EXTRACT, handle_extract_action)
 
 
 async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) -> Any:

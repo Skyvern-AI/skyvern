@@ -27,6 +27,8 @@ class ActionType(StrEnum):
     COMPLETE = "complete"
     RELOAD_PAGE = "reload_page"
 
+    EXTRACT = "extract"
+
     def is_web_action(self) -> bool:
         return self in [
             ActionType.CLICK,
@@ -246,6 +248,12 @@ class CompleteAction(DecisiveAction):
     action_type: ActionType = ActionType.COMPLETE
     verified: bool = False
     data_extraction_goal: str | None = None
+
+
+class ExtractAction(Action):
+    action_type: ActionType = ActionType.EXTRACT
+    data_extraction_goal: str | None = None
+    data_extraction_schema: dict[str, Any] | None = None
 
 
 class ScrapeResult(BaseModel):
