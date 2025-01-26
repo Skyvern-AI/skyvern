@@ -218,11 +218,11 @@ class SkyvernFrame:
         :param page: Page instance to remove the bounding boxes from.
         """
         js_script = "() => removeBoundingBoxes()"
-        await self.evaluate(frame=self.frame, expression=js_script)
+        await self.evaluate(frame=self.frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS)
 
     async def build_elements_and_draw_bounding_boxes(self) -> None:
         js_script = "() => buildElementsAndDrawBoundingBoxes()"
-        await self.evaluate(frame=self.frame, expression=js_script)
+        await self.evaluate(frame=self.frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS)
 
     async def is_window_scrollable(self) -> bool:
         js_script = "() => isWindowScrollable()"
