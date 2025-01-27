@@ -291,6 +291,21 @@ if settings.ENABLE_GEMINI:
 
 if settings.ENABLE_NOVITA:
     LLMConfigRegistry.register_config(
+        "NOVITA_DEEPSEEK_R1",
+        LLMConfig(
+            "openai/deepseek/deepseek-r1",
+            ["NOVITA_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            litellm_params=LiteLLMParams(
+                api_base="https://api.novita.ai/v3/openai",
+                api_key=settings.NOVITA_API_KEY,
+                api_version=settings.NOVITA_API_VERSION,
+                model_info={"model_name": "openai/deepseek/deepseek-r1"},
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "NOVITA_DEEPSEEK_V3",
         LLMConfig(
             "openai/deepseek/deepseek_v3",

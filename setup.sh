@@ -127,6 +127,7 @@ setup_llm_providers() {
             update_or_add_env_var "NOVITA_API_KEY" "$novita_api_key"
             update_or_add_env_var "ENABLE_NOVITA" "true"
             model_options+=(
+                "NOVITA_DEEPSEEK_R1"
                 "NOVITA_DEEPSEEK_V3"
                 "NOVITA_LLAMA_3_3_70B"
                 "NOVITA_LLAMA_3_2_1B"
