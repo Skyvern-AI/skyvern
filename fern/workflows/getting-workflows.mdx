@@ -1,0 +1,156 @@
+---
+title: Getting Existing Workflows
+subtitle: ''
+slug: workflows/getting-workflows
+---
+
+
+# Workflows API Specification
+
+## Endpoint
+
+### `GET /api/v1/workflows`
+
+This endpoint retrieves a list of workflows.
+
+### Request
+*  **URL:** `https://api.skyvern.com/api/v1/workflows`
+*  **Method:** `GET`
+*  **Query Parameters:**
+  * `page`: The page number to retrieve (default: `1`).
+  * `only_workflows`: Set to `true` to only retrieve workflows.
+
+### Headers
+
+
+* **x-api-key:** `String` `yes` `[your-api-key-here]`  
+
+### Example Curl Request
+
+```bash
+curl 'https://api.skyvern.com/api/v1/workflows?page=1&only_workflows=true' \
+  -H 'x-api-key: [your-api-key-here]' \
+```
+
+## API Response Structure
+
+The API returns a JSON array where each element represents a workflow object. Below is the structure and documentation for each field.
+
+```json
+[
+  {
+    "workflow_id": "string",
+    "organization_id": "string",
+    "title": "string",
+    "workflow_permanent_id": "string",
+    "version": "integer",
+    "is_saved_task": "boolean",
+    "description": "string",
+    "proxy_location": "string | null",
+    "webhook_callback_url": "string | null",
+    "totp_verification_url": "string | null",
+    "workflow_definition": {
+      "parameters": [
+        {
+          "parameter_type": "string",
+          "key": "string",
+          "description": "string | null"
+        }
+      ],
+      "blocks": [
+        {
+          "label": "string",
+          "block_type": "string"
+        }
+      ]
+    }
+  }
+]
+```
+
+### Fields
+
+* **workflow_id** (`string`): 
+  * A unique identifier for the workflow. This ID is used to reference the workflow in various operations and tasks.
+
+* **organization_id** (`string`): 
+  * The unique identifier of the organization to which the workflow belongs. This is useful for segregating workflows by different organizations.
+
+* **title** (`string`): 
+  * The human-readable title of the workflow. It typically describes the primary task or purpose of the workflow.
+
+* **workflow_permanent_id** (`string`): 
+  * A permanent and unique identifier for the workflow. Unlike `workflow_id`, this ID remains consistent across different versions of the workflow.
+
+* **version** (`integer`): 
+  * Indicates the version number of the workflow. This is incremented with each update or modification to the workflow.
+
+* **is_saved_task** (`boolean`): 
+  * A flag indicating whether the workflow is saved as a task for future use (`true`) or not (`false`).
+
+* **description** (`string`): 
+  * A brief description of what the workflow does. This may include the primary goal or steps involved in the workflow.
+
+* **proxy_location** (`string | null`): 
+  * The location setting for the proxy, if applicable. It could be `RESIDENTIAL`, `DATACENTER`, or `null` if no proxy is used.
+
+* **webhook_callback_url** (`string | null`): 
+  * The URL to which callbacks will be sent once the workflow completes or if specific events occur during its execution. This field may be `null` if no webhook is configured.
+
+* **totp_verification_url** (`string | null`): 
+  * The URL for TOTP (Time-based One-Time Password) verification, if required. This field is `null` if TOTP verification is not necessary for the workflow.
+
+* **workflow_definition** (`object`): 
+  * Contains the detailed definition of the workflow, including the parameters and blocks that make up the workflow.
+
+  * **parameters** (`array`): 
+    * A list of parameters used by the workflow. Each parameter defines a key-value pair that may include the type of parameter, its key, and an optional description. Parameters help in customizing and controlling the workflow's behavior.
+
+  * **blocks** (`array`): 
+    * A series of blocks that represent individual tasks or actions within the workflow. Each block includes a label and type, which define the nature and purpose of the task within the workflow. Blocks can range from simple tasks, like logging in, to more complex sequences of actions.
+
+
+
+Example Response
+Here’s an example of what the API might return:
+```
+[
+  {
+    "workflow_id": "w_297763518988864302",
+    "organization_id": "o_197675547813248794",
+    "title": "Test Workday Application",
+    "workflow_permanent_id": "wpid_297751296240552836",
+    "version": 4,
+    "is_saved_task": false,
+    "description": "Login Workday and submit the application",
+    "proxy_location": "RESIDENTIAL",
+    "webhook_callback_url": null,
+    "totp_verification_url": null,
+    "workflow_definition": {
+      "parameters": [
+        {
+          "parameter_type": "output",
+          "key": "login_output",
+          "description": "Output parameter for block login"
+        },
+        {
+          "parameter_type": "workflow",
+          "key": "website_url",
+          "description": null
+        }
+      ],
+      "blocks": [
+        {
+          "label": "login",
+          "block_type": "task"
+        },
+        {
+          "label": "submit",
+          "block_type": "task"
+        }
+      ]
+    }
+  }
+]
+
+```

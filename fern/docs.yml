@@ -1,0 +1,60 @@
+instances:
+  - url: https://skyvern.docs.buildwithfern.com
+title: Skyvern
+favicon: images/skyvern_favicon.png
+logo:
+  light: images/skyvern_logo_blackbg.png
+  dark: images/skyvern_logo.png
+  height: 28
+colors:
+  accentPrimary:
+    dark: '#0D9373'
+    light: '#07C983'
+  background:
+    dark: '#000000'
+    light: '#FFFFFF'
+navigation:
+  - section: Getting Started
+    contents:
+      - page: Introduction
+        path: introduction.mdx
+      - page: Skyvern In Action
+        path: getting-started/skyvern-in-action.mdx
+      - page: Task Prompting Guide
+        path: getting-started/prompting-guide.mdx
+  - section: Tasks
+    contents:
+      - page: Introduction
+        path: running-tasks/introduction.mdx
+      - page: Tasks API
+        path: running-tasks/api-spec.mdx
+      - page: Webhooks FAQ
+        path: running-tasks/webhooks-faq.mdx
+      - page: Visualizing Results
+        path: running-tasks/visualizing-results.mdx
+      - page: Advanced Settings for tasks
+        path: running-tasks/advanced-features.mdx
+  - section: Workflows (Beta)
+    contents:
+      - page: Introduction
+        path: workflows/introduction.mdx
+      - page: Creating Workflows
+        path: workflows/creating-workflows.mdx
+      - page: Getting Existing Workflows
+        path: workflows/getting-workflows.mdx
+      - page: Running Workflows
+        path: workflows/running-workflows.mdx
+      - page: Workflow Blocks
+        path: workflows/workflow-blocks.mdx
+      - page: What the heck is a parameter?
+        path: workflows/what-is-a-parameter.mdx
+  - section: Integrations
+    contents:
+      - page: API Integrations
+        path: integrations/api.mdx
+      - page: Zapier
+        path: integrations/zapier.mdx
+      - page: ''
+        path: integrations/make.com.mdx
+      - page: Workato
+        path: integrations/workato.mdx

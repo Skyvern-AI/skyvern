@@ -1,0 +1,211 @@
+---
+title: Running Workflows
+subtitle: Executing complex multi-step workflows
+slug: workflows/running-workflows
+---
+
+
+## Running workflows
+
+### `POST /workflows/{workflow_permanent_id}/run`
+
+You can see the generic endpoint definition below. We’ll go into the specifics of the invoice retrieval workflow in the next section.
+
+### Body
+
+| Parameter | Type | Required? | Sample Value | Description |
+| --- | --- | --- | --- | --- |
+| data | JSON | no | \{ <br/>"website_url": "YOUR_URL",<br/>"invoice_retrieval_start_date": "2024-04-15"<br/> \}, | The data field is used to pass in required and optional parameters that a workflow accepts. For the invoice retrieval workflow, required fields are website_url and invoice_retrieval_start_date |
+| webhook_callback_url | String | no | …  | Our system will send the webhook once it is finished executing the workflow run. |
+| proxy_location  | String | no | RESIDENTIAL | Proxy location for the web browser. Please pass RESIDENTIAL. <br /> If we use residential proxies, Skyvern’s requests to the websites will be less suspicious. |
+
+### Response
+
+| Parameter | Type | Always returned? | Sample Value | Description |
+| --- | --- | --- | --- | --- |
+| workflow_permanent_id | String | yes | wpid_123456 | The workflow id |
+| workflow_run_id | String | yes | wr_123456 | The workflow run id that represents this specific workflow run. <br/> You can use this id to match the webhook response to the initial request. |
+
+### Sample Request & Response - Invoice retrieval
+
+```bash
+-- Sample Request
+curl --location 'https://api.skyvern.com/api/v1/workflows/wpid_123456/run' \
+--header 'x-api-key: <USE_YOUR_API_KEY>' \
+--header 'Content-Type: application/json' \
+--data '{
+    "data": {
+        "website_url": "your_website",
+        "invoice_retrieval_start_date": "2024-04-15"
+    },
+    "proxy_location": "RESIDENTIAL",
+    "webhook_callback_url": "<your-endpoint>"
+}'
+
+-- Sample Response
+{
+    "workflow_id": "wpid_123456",
+    "workflow_run_id": "wr_123456"
+}
+```
+
+## Retrieving workflow runs
+
+### `GET /workflows/runs/{workflow_run_id}`
+
+### Response
+
+| Parameter | Type | Sample value | Description |
+| --- | --- | --- | --- |
+| workflow_id  | String | wpid_123456 |  |
+| workflow_run_id | String | wr_123456 |  |
+| status | String | completed | Status of the workflow run. Possible values: created, running, failed, terminated, completed |
+| proxy_location | JSON | RESIDENTIAL |  |
+| webhook_callback_url  | String | 127.0.0.1:8000/api/v1/webhook |  |
+| created_at | Timestamp | 2024-05-16T08:35:24.920793 | Timestamp for when the workflow run is created |
+| modified_at | Timestamp | 2024-05-16T08:42:32.568908 | Last modified timestamp for the workflow run |
+| parameters | JSON | see sample response below | The parameters that the workflow run was triggered with. For the invoice retrieval workflow, this field will have the website_url and invoice_retrieval_start_date values you sent. |
+| screenshot_urls | list[String] | see sample response below | Final screenshots for the last 3 tasks in the workflow. |
+| recording_url | String | see sample response below | The full browser recording.  |
+| outputs | JSON | see sample response below | See the explaining outputs section |
+
+### Sample response
+
+```json
+{
+    "workflow_id": "wpid_123456",
+    "workflow_run_id": "wr_123456",
+    "status": "completed",
+    "proxy_location": "RESIDENTIAL",
+    "webhook_callback_url": "127.0.0.1:8000/api/v1/webhook",
+    "created_at": "2024-05-16T08:35:24.920793",
+    "modified_at": "2024-05-16T08:42:32.568908",
+    "parameters": {
+        "website_url": "YOUR_WEBSITE_URL",
+        "invoice_retrieval_start_date": "2024-04-15"
+    },
+    "screenshot_urls": [
+        "https://skyvern-artifacts.s3.amazonaws.com/...",
+        "https://skyvern-artifacts.s3.amazonaws.com/...",
+        "https://skyvern-artifacts.s3.amazonaws.com/..."
+    ],
+    "recording_url": "https://skyvern-artifacts.s3.amazonaws.com/...",
+    "outputs": {
+        "login_output": {
+            "task_id": "tsk_1234",
+            "status": "completed",
+            "extracted_information": null,
+            "failure_reason": null,
+            "errors": []
+        },
+        "get_order_history_page_url_and_qualifying_order_ids_output": {
+            "task_id": "tsk_258409009008559418",
+            "status": "completed",
+            "extracted_information": {
+              ...
+            },
+            "failure_reason": null,
+            "errors": []
+        },
+        "iterate_over_order_ids_output": [
+            [
+                {
+                    ...
+                }
+            ]
+        ],
+        "download_invoice_for_order_output": {
+            "task_id": "tsk_258409361195877732",
+            "status": "completed",
+            "extracted_information": null,
+            "failure_reason": null,
+            "errors": []
+        },
+        "upload_downloaded_files_to_s3_output": [
+            "s3://skyvern-uploads/..."
+        ],
+        "send_email_output": {
+            "success": true
+        }
+    }
+}
+```
+
+## Webhooks
+
+Skyvern always sends webhooks when a workflow run is executed. The status for an executed workflow run can be: `completed, failed, terminated`. 
+
+The webhook body is the same as the get workflow run endpoint.
+
+### Webhook Headers
+
+| Parameter | Type | Required? | Sample Value | Description |
+| --- | --- | --- | --- | --- |
+| x-skyvern-signature | String | yes | v0=a2114d57b48eac39b9ad189dd8316235a7b4a8d21a10bd27519666489c69b503 | Authentication token that allows our service to communicate with your backend service via callback / webhook <br/> <br/> We’ll be using the same strategy slack uses, as defined here: https://api.slack.com/authentication/verifying-requests-from-slack#making__validating-a-request |
+| x-skyvern-timestamp | String | yes | 1531420618 | Timestamp used to decode and validate the incoming webhook call
+
+We’ll be using the same strategy slack uses, as defined here: https://api.slack.com/authentication/verifying-requests-from-slack#making__validating-a-request |
+
+## Explaining `outputs`
+
+If you checked out the sample response, you probably thought “What the heck is this field right here?”.
+
+We previously went over that workflows are essentially a list of building blocks. `outputs` field has the output for every single block that a workflow has. Before we start analyzing the `outputs` from the sample above, let’s go over the building blocks for the invoice retrieval workflow. 
+
+### Building blocks of invoice retrieval workflow:
+
+| # | Block type | Block label | Purpose |
+| --- | --- | --- | --- |
+| 1 | TaskBlock | login | Find login page, login to the website |
+| 2 | TaskBlock | get_order_history_page_url_and_qualifying_order_ids | Find the order history page, extract order history page url, contact emails, and order details for orders after the start date |
+| 3 | ForLoopBlock | iterate_over_order_ids | The contents of the ForLoop is executed for each order id that’s extracted from the previous step. |
+| 4 | TaskBlock [within ForLoopBlock] | download_invoice_for_order | For a given order id, find a way to download the invoice, download it. |
+| 5 | UploadToS3Block | upload_downloaded_files_to_s3 | Upload all downloaded invoices to S3 |
+| 6 | SendEmailBlock | send_email | Send an email attaching all the downloaded invoices |
+
+### ⚠️ Still in development, not a blocker
+
+1. The blocks within the ForLoop show up twice: within the ForLoop output and as a root block.
+2. UploadToS3Block output is S3 URIs at the moment. They’ll be updated with signed urls instead.
+3. Add block type to each object in `outputs`, define the output structure for each block for easier integration.
+
+
+```json
+...
+"outputs": {
+    "login_output": {
+        "task_id": "tsk_1234",
+        "status": "completed",
+        "extracted_information": null,
+        "failure_reason": null,
+        "errors": []
+    },
+    "get_order_history_page_url_and_qualifying_order_ids_output": {
+        "task_id": "tsk_1234",
+        "status": "completed",
+        "extracted_information": {
+            ...
+        },
+        "failure_reason": null,
+        "errors": []
+    },
+    "iterate_over_order_ids_output": [
+        ...
+    ],
+    "download_invoice_for_order_output": {
+        "task_id": "tsk_1234",
+        "status": "completed",
+        "extracted_information": null,
+        "failure_reason": null,
+        "errors": []
+    },
+    "upload_downloaded_files_to_s3_output": [
+        "s3://skyvern-uploads/...",
+        "s3://skyvern-uploads/..."
+    ],
+    "send_email_output": {
+        "success": true
+    }
+}
+...
+```

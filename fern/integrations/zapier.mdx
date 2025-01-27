@@ -1,0 +1,110 @@
+---
+title: Zapier
+slug: integrations/zapier
+---
+
+
+## Running a Skyvern Task in Zapier
+
+### Setup
+
+1. Get a Skyvern account, navigate to settings and copy your API Key, you will need to link this in your Skyvern block in Zapier
+
+2. Add a Skyvern Block, and select the “Run a Task” Action Event
+
+3. A required “Account” section should populate, here is where you paste your [API Key](https://docs.skyvern.com/running-tasks/introduction#getting-your-api-key)
+
+4. Once you’ve connected your account, you can press next and proceed to the second step “Configure”
+   ![image](../images/zapier/z.1.png)
+   ![image](../images/zapier/z.2.png)
+
+### Configure
+
+1. *(required) URL:* Skyvern’s starting point
+
+2. *(often required) Navigation Goal:* details where Skyvern is going and what Skyvern is doing. Clear Navigation Goals will be a single goal, broken down into steps. You need to specify when the goal is complete, using “COMPLETE”, or when to abandon that goal, using “TERMINATE”
+
+   * The navigation goal is not used to load the URL. Asking Skyvern to “go to website A” in this field will not have the intended effect
+
+   * Terminations result in Skyvern explaining why it stopped navigating
+
+   * This field can be omitted if you only want Skyvern to extract data
+
+3. *(optional) Data Extraction Goal:* aside from where Skyvern is going and what Skyvern is doing, is there anything that Skyvern is extracting and returning back? A good data extraction goal is specific about what Skyvern is returning to the user
+
+   * Note that data extractions only happen AFTER Skyvern is finished navigating
+
+4. *(optional) Navigation Payload:* if you need any content inputted during your task flow, that content goes here in JSON format
+
+   * If you want to run the same task for different users (i.e. filling out the same form multiple times), you should keep everything else the same and update the Navigation Payload
+
+5. *(optional) Extracted Information Schema:* if you have a data extraction goal, some users need it formatted in a certain way for internal purposes. Navigation payload accepts JSON formatted specifications for how the data should be returned
+
+6. *(optional) Webhook Callback URL:* This URL can be specified if you would like Skyvern to notify you when it’s finished executing
+
+7. *(optional) Max Steps:* some users want to cap cost through the number of steps the task can take
+   ![image](../images/zapier/z.3.png)
+   ![image](../images/zapier/z.4.png)
+
+### Test
+
+1. This page will tell you what information “Data In” will be going to Skyvern, and what is empty. Make sure to check this before you “test step,” which we would highly recommend
+
+2. Upon pressing “test step,” go to your Skyvern account where you can see it run. If everything worked as expected, fabulous! If not, feel free to refine your prompt in Skyvern before heading back to Zapier and sending another test
+   ![image](../images/zapier/z.5.png)
+
+## Running a Skyvern Workflow in Zapier
+
+### Setup
+
+1. First, create your workflow in Skyvern. The purpose of this block is to run a pre-configured workflow inside of Zapier. Every workflow tool has limitations, allowing you to run a Skyvern workflow in another workflow builder extends the possibilities of their tool
+
+2. Like with the task block, you will need to link your Skyvern account using your API key found in settings
+   ![image](../images/zapier/z.6w.png)
+
+### Configure
+
+1. Select what workflow you would like to run
+
+   1. If there are no selections, make sure to check your Skyvern account and see if you have any saved workflows you can run
+
+2. Once you’ve selected the workflow you’d like to run, the only thing you need to configure are whatever parameters you have linked in your workflow.
+
+   1. If you don’t have parameters, and instead have fixed values, don’t worry!
+
+3. If your workflow has parameters, they should populate. Add or amend the values to customize the workflow run
+   ![image](../images/zapier/z.7w.png)
+   ![image](../images/zapier/z.8w.png)
+
+### Test
+
+1. Upon pressing “test step,” go to your Skyvern account where you can see the workflow run. If everything worked as expected, fabulous! If not, try debugging in Skyvern before you retest in Zapier
+   ![image](../images/zapier/z.9w.png)
+
+## Adding a Previously Ran Task or Workflow in Zapier
+
+### Setup
+
+1. This block “gets,” or pulls the output of a previous run into your Zapier workflow. The Get a Workflow does so for a workflow run, the Get a Task does so for a task run.
+
+2. Like with the task block, you will need to link your Skyvern account using your API key found in settings
+   ![image](../images/zapier/z.10ag.png)
+   ![image](../images/zapier/z.10bg.png)
+
+### Configure
+
+1. Since this action is pulling a previously ran task or workflow, the run you want to use needs to have already run/finished running to be able to pull it into your zap
+
+2. Depending on whether you selected a “Get a Task” or “Get a Workflow” action, find the appropriate ID
+
+   1. The Workflow Run ID starts with a WR and the Task ID starts with a TSK
+
+3. Once you’ve selected the Workflow Run ID or Task ID for the run you would like to add to your action, paste it into the input field
+   ![image](../images/zapier/z.11ag.png)
+   ![image](../images/zapier/z.11bg.png)
+
+### Test
+
+1. Upon pressing “test step,” the task or workflow details should populate. If everything worked as expected, fabulous! If not, it might be that you linked the incorrect account or the ID is incorrect
+   ![image](../images/zapier/z.12ag.png)
+   ![image](../images/zapier/z.12bg.png)
