@@ -500,11 +500,7 @@ async def get_interactable_element_tree_in_frame(
 
         for element in elements:
             if element["id"] == unique_id:
-                element["children"] = frame_elements
-
-        for element_tree_item in element_tree:
-            if element_tree_item["id"] == unique_id:
-                element_tree_item["children"] = frame_element_tree
+                element["children"] = frame_element_tree
 
         elements = elements + frame_elements
 
