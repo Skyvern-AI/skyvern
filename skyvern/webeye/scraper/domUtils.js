@@ -598,6 +598,10 @@ function isInteractable(element, hoverStylesMap) {
     return false;
   }
 
+  if (tagName === "frame") {
+    return false;
+  }
+
   if (tagName === "a" && element.href) {
     return true;
   }
@@ -996,7 +1000,7 @@ function getElementContext(element, stopped_element) {
     let childContext = "";
     if (child.nodeType === Node.TEXT_NODE && isElementVisible(element)) {
       if (!element.hasAttribute("unique_id")) {
-        childContext = getVisibleText(child).trim();
+        childContext = getElementText(child).trim();
       }
     } else if (child.nodeType === Node.ELEMENT_NODE) {
       if (!child.hasAttribute("unique_id") && isElementVisible(child)) {
@@ -1033,13 +1037,30 @@ function getVisibleText(element) {
   return visibleText.join(" ");
 }
 
+// only get text from element itself
+function getElementText(element) {
+  if (element.nodeType === Node.TEXT_NODE) {
+    return element.data.trim();
+  }
+
+  let visibleText = [];
+  for (let i = 0; i < element.childNodes.length; i++) {
+    var node = element.childNodes[i];
+    let nodeText = "";
+    if (node.nodeType === Node.TEXT_NODE && (nodeText = node.data.trim())) {
+      visibleText.push(nodeText);
+    }
+  }
+  return visibleText.join(";");
+}
+
 function getElementContent(element, skipped_element = null) {
   // DFS to get all the text content from all the nodes under the element
   if (skipped_element && element === skipped_element) {
     return "";
   }
 
-  let textContent = getVisibleText(element);
+  let textContent = getElementText(element);
   let nodeContent = "";
   // if element has children, then build a list of text and join with a semicolon
   if (element.childNodes.length > 0) {
@@ -1048,7 +1069,7 @@ function getElementContent(element, skipped_element = null) {
     for (var child of element.childNodes) {
       let childText = "";
       if (child.nodeType === Node.TEXT_NODE) {
-        childText = getVisibleText(child).trim();
+        childText = getElementText(child).trim();
         if (childText.length > 0) {
           nodeTextContentList.push(childText);
         }
@@ -1207,7 +1228,7 @@ function buildElementObject(frame, element, interactable, purgeable = false) {
     tagName: elementTagNameLower,
     attributes: attrs,
     beforePseudoText: getPseudoContent(element, "::before"),
-    text: getElementContent(element),
+    text: getElementText(element),
     afterPseudoText: getPseudoContent(element, "::after"),
     children: [],
     rect: DomUtils.getVisibleClientRect(element, true),
@@ -1279,148 +1300,93 @@ function buildElementTree(starter = document.body, frame, full_tree = false) {
       return;
     }
 
+    const tagName = element.tagName.toLowerCase();
+
     // skip proccessing option element as they are already added to the select.options
-    if (element.tagName.toLowerCase() === "option") {
+    if (tagName === "option") {
       return;
     }
 
     // if element is an "a" tag and has a target="_blank" attribute, remove the target attribute
     // We're doing this so that skyvern can do all the navigation in a single page/tab and not open new tab
-    if (element.tagName.toLowerCase() === "a") {
+    if (tagName === "a") {
       if (element.getAttribute("target") === "_blank") {
         element.removeAttribute("target");
       }
     }
 
-    // Check if the element is interactable
-    var interactable = isInteractable(element, hoverStylesMap);
-    if (interactable || element.tagName.toLowerCase() === "frameset") {
-      var elementObj = buildElementObject(frame, element, interactable);
-      elements.push(elementObj);
-      // If the element is interactable but has no interactable parent,
-      // then it starts a new tree, so add it to the result array
-      // and set its id as the interactable parent id for the next elements
-      // under it
-      if (parentId === null) {
-        resultArray.push(elementObj);
-      }
-      // If the element is interactable and has an interactable parent,
-      // then add it to the children of the parent
-      else {
-        // TODO: use dict/object so that we access these in O(1) instead
-        elements
-          .find((element) => element.id === parentId)
-          .children.push(elementObj);
-      }
-      // Recursively process the children of the element
-      const children = getChildElements(element);
-      for (let i = 0; i < children.length; i++) {
-        const childElement = children[i];
-        processElement(childElement, elementObj.id);
-      }
-      return elementObj;
-    } else if (
-      element.tagName.toLowerCase() === "iframe" ||
-      element.tagName.toLowerCase() === "frame"
-    ) {
-      let iframeElementObject = buildElementObject(frame, element, false);
-
-      elements.push(iframeElementObject);
-      resultArray.push(iframeElementObject);
-    } else if (element.shadowRoot) {
-      // shadow host element
-      let shadowHostElement = buildElementObject(frame, element, false);
-      elements.push(shadowHostElement);
-      resultArray.push(shadowHostElement);
-
-      const children = getChildElements(element.shadowRoot);
-      for (let i = 0; i < children.length; i++) {
-        const childElement = children[i];
-        processElement(childElement, shadowHostElement.id);
-      }
-      const selfChildren = getChildElements(element);
-      for (let i = 0; i < selfChildren.length; i++) {
-        const childElement = selfChildren[i];
-        processElement(childElement, shadowHostElement.id);
-      }
-    } else {
-      // For a non-interactable element, if it has direct text, we also tagged
-      // it with unique_id, but with interatable=false in the element.
-      // After that, process its children
-      // and check if any of them are interactable
-      let interactableChildren = [];
-      if (
-        isElementVisible(element) &&
-        !isHidden(element) &&
-        !isScriptOrStyle(element)
+    let children = [];
+    const isVisible = isElementVisible(element);
+    if (isVisible && !isHidden(element) && !isScriptOrStyle(element)) {
+      const interactable = isInteractable(element, hoverStylesMap);
+      let elementObj = null;
+      let isParentSVG = null;
+      if (interactable) {
+        elementObj = buildElementObject(frame, element, interactable);
+      } else if (
+        tagName === "frameset" ||
+        tagName === "iframe" ||
+        tagName === "frame"
       ) {
-        let elementObj = null;
-        let isParentSVG = element.closest("svg");
-        if (element.tagName.toLowerCase() === "svg") {
-          // if element is <svg> we save all attributes and its children
-          elementObj = buildElementObject(frame, element, false);
-        } else if (isParentSVG && isParentSVG.getAttribute("unique_id")) {
-          // if elemnet is the children of the <svg> with an unique_id
-          elementObj = buildElementObject(frame, element, false);
-        } else if (isTableRelatedElement(element)) {
-          // build all table related elements into skyvern element
-          // we need these elements to preserve the DOM structure
-          elementObj = buildElementObject(frame, element, false);
-        } else if (hasBeforeOrAfterPseudoContent(element)) {
-          elementObj = buildElementObject(frame, element, false);
-        } else if (full_tree) {
-          // when building full tree, we only get text from element itself
-          // elements without text are purgeable
-          elementObj = buildElementObject(frame, element, false, true);
-          let textContent = "";
-          if (isElementVisible(element)) {
-            for (let i = 0; i < element.childNodes.length; i++) {
-              var node = element.childNodes[i];
-              if (node.nodeType === Node.TEXT_NODE) {
-                textContent += node.data.trim();
-              }
-            }
-          }
-          elementObj.text = textContent;
-          if (textContent.length > 0) {
-            elementObj.purgeable = false;
-          }
-        } else {
-          // character length limit for non-interactable elements should be 5000
-          // we don't use element context in HTML format,
-          // so we need to make sure we parse all text node to avoid missing text in HTML.
-          let textContent = "";
-          for (let i = 0; i < element.childNodes.length; i++) {
-            var node = element.childNodes[i];
-            if (node.nodeType === Node.TEXT_NODE) {
-              textContent += getVisibleText(node).trim();
-            }
-          }
-          if (textContent && textContent.length <= 5000) {
-            elementObj = buildElementObject(frame, element, false);
-          }
-        }
-
-        if (elementObj !== null) {
-          elements.push(elementObj);
-          if (parentId === null) {
-            resultArray.push(elementObj);
-          } else {
-            // TODO: use dict/object so that we access these in O(1) instead
-            elements
-              .find((element) => element.id === parentId)
-              .children.push(elementObj);
-          }
-          parentId = elementObj.id;
+        elementObj = buildElementObject(frame, element, interactable);
+      } else if (element.shadowRoot) {
+        elementObj = buildElementObject(frame, element, interactable);
+        children = getChildElements(element.shadowRoot);
+      } else if (isTableRelatedElement(element)) {
+        // build all table related elements into skyvern element
+        // we need these elements to preserve the DOM structure
+        elementObj = buildElementObject(frame, element, interactable);
+      } else if (hasBeforeOrAfterPseudoContent(element)) {
+        elementObj = buildElementObject(frame, element, interactable);
+      } else if (tagName === "svg") {
+        elementObj = buildElementObject(frame, element, interactable);
+      } else if (
+        (isParentSVG = element.closest("svg")) &&
+        isParentSVG.getAttribute("unique_id")
+      ) {
+        // if elemnet is the children of the <svg> with an unique_id
+        elementObj = buildElementObject(frame, element, interactable);
+      } else if (
+        getElementText(element).length > 0 &&
+        getElementText(element).length <= 5000
+      ) {
+        elementObj = buildElementObject(frame, element, interactable);
+      } else if (full_tree) {
+        // when building full tree, we only get text from element itself
+        // elements without text are purgeable
+        elementObj = buildElementObject(frame, element, interactable, true);
+        if (elementObj.text.length > 0) {
+          elementObj.purgeable = false;
         }
       }
 
-      const children = getChildElements(element);
-      for (let i = 0; i < children.length; i++) {
-        const childElement = children[i];
-        processElement(childElement, parentId);
+      if (elementObj) {
+        elements.push(elementObj);
+        // If the element is interactable but has no interactable parent,
+        // then it starts a new tree, so add it to the result array
+        // and set its id as the interactable parent id for the next elements
+        // under it
+        if (parentId === null) {
+          resultArray.push(elementObj);
+        }
+        // If the element is interactable and has an interactable parent,
+        // then add it to the children of the parent
+        else {
+          // TODO: use dict/object so that we access these in O(1) instead
+          elements
+            .find((element) => element.id === parentId)
+            .children.push(elementObj);
+        }
+        parentId = elementObj.id;
       }
     }
+
+    children = children.concat(getChildElements(element));
+    for (let i = 0; i < children.length; i++) {
+      const childElement = children[i];
+      processElement(childElement, parentId);
+    }
+    return;
   }
 
   const getContextByParent = (element, ctx) => {
