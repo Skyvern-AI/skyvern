@@ -1110,7 +1110,6 @@ function getWorkflowBlocksUtil(
           block_type: "for_loop",
           label: node.data.label,
           continue_on_failure: node.data.continueOnFailure,
-          loop_over_parameter_key: node.data.loopValue,
           loop_blocks: getOrderedChildrenBlocks(nodes, edges, node.id),
           loop_variable_reference: node.data.loopVariableReference,
         },
