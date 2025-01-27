@@ -571,3 +571,8 @@ class InteractWithDropdownContainer(SkyvernException):
 class UrlGenerationFailure(SkyvernHTTPException):
     def __init__(self) -> None:
         super().__init__("Failed to generate the url for the prompt")
+
+
+class ObserverCruiseNotFound(SkyvernHTTPException):
+    def __init__(self, observer_cruise_id: str) -> None:
+        super().__init__(f"Observer task {observer_cruise_id} not found")
