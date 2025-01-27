@@ -176,7 +176,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
 
         if background_tasks:
             background_tasks.add_task(
-                observer_service.run_observer_cruise,
+                observer_service.run_observer_task,
                 organization=organization,
                 observer_cruise_id=observer_cruise_id,
                 max_iterations_override=max_iterations_override,
