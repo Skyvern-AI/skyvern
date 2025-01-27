@@ -164,7 +164,7 @@ function PromptBox() {
           user_prompt: prompt,
           webhook_callback_url: webhookCallbackUrl,
           proxy_location: proxyLocation,
-          totp_idenfitifer: totpIdentifier,
+          totp_identifier: totpIdentifier,
           publish_workflow: publishWorkflow,
         },
       );
