@@ -101,17 +101,6 @@ function WorkflowParametersPanel() {
                 setOperationPanelState({
                   active: true,
                   operation: "add",
-                  type: "context",
-                });
-              }}
-            >
-              Context Parameter
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={() => {
-                setOperationPanelState({
-                  active: true,
-                  operation: "add",
                   type: "secret",
                 });
               }}
