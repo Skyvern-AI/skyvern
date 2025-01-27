@@ -1152,7 +1152,7 @@ async def observer_task(
         LOG.info("Overriding max iterations for observer", max_iterations_override=x_max_iterations_override)
 
     try:
-        observer_task = await observer_service.initialize_observer_cruise(
+        observer_task = await observer_service.initialize_observer_task(
             organization=organization,
             user_prompt=data.user_prompt,
             user_url=str(data.url) if data.url else None,
