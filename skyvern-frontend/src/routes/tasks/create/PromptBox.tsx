@@ -44,6 +44,7 @@ import {
 import { ExampleCasePill } from "./ExampleCasePill";
 import { Input } from "@/components/ui/input";
 import { ProxySelector } from "@/components/ProxySelector";
+import { Switch } from "@/components/ui/switch";
 
 function createTemplateTaskFromTaskGenerationParameters(
   values: TaskGenerationApiResponse,
@@ -150,6 +151,8 @@ function PromptBox() {
   const [proxyLocation, setProxyLocation] = useState<ProxyLocation>(
     ProxyLocation.Residential,
   );
+  const [publishWorkflow, setPublishWorkflow] = useState(false);
+  const [totpIdentifier, setTotpIdentifier] = useState("");
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
 
   const startObserverCruiseMutation = useMutation({
@@ -161,6 +164,8 @@ function PromptBox() {
           user_prompt: prompt,
           webhook_callback_url: webhookCallbackUrl,
           proxy_location: proxyLocation,
+          totp_identifier: totpIdentifier,
+          publish_workflow: publishWorkflow,
         },
       );
     },
@@ -336,7 +341,7 @@ function PromptBox() {
                 <div className="space-y-4 rounded-b-xl bg-slate-900 p-4">
                   <header>Advanced Settings</header>
                   <div className="flex gap-16">
-                    <div className="w-96">
+                    <div className="w-48 shrink-0">
                       <div className="text-sm">Webhook Callback URL</div>
                       <div className="text-xs text-slate-400">
                         The URL of a webhook endpoint to send the extracted
@@ -351,7 +356,7 @@ function PromptBox() {
                     />
                   </div>
                   <div className="flex gap-16">
-                    <div className="w-96">
+                    <div className="w-48 shrink-0">
                       <div className="text-sm">Proxy Location</div>
                       <div className="text-xs text-slate-400">
                         Route Skyvern through one of our available proxies.
@@ -360,6 +365,34 @@ function PromptBox() {
                     <ProxySelector
                       value={proxyLocation}
                       onChange={setProxyLocation}
+                    />
+                  </div>
+                  <div className="flex gap-16">
+                    <div className="w-48 shrink-0">
+                      <div className="text-sm">2FA Identifier</div>
+                      <div className="text-xs text-slate-400">
+                        The identifier for a 2FA code for this task.
+                      </div>
+                    </div>
+                    <Input
+                      value={totpIdentifier}
+                      onChange={(event) => {
+                        setTotpIdentifier(event.target.value);
+                      }}
+                    />
+                  </div>
+                  <div className="flex gap-16">
+                    <div className="w-48 shrink-0">
+                      <div className="text-sm">Publish Workflow</div>
+                      <div className="text-xs text-slate-400">
+                        Whether to create a workflow alongside this task run.
+                      </div>
+                    </div>
+                    <Switch
+                      checked={publishWorkflow}
+                      onCheckedChange={(checked) => {
+                        setPublishWorkflow(Boolean(checked));
+                      }}
                     />
                   </div>
                 </div>
