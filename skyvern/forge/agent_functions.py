@@ -122,6 +122,16 @@ async def _convert_svg_to_string(
 
     try:
         locater = skyvern_frame.get_frame().locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
+        if await locater.count() == 0:
+            del element["children"]
+            element["isDropped"] = True
+            return
+
+        if not await locater.is_visible(timeout=settings.BROWSER_ACTION_TIMEOUT_MS):
+            del element["children"]
+            element["isDropped"] = True
+            return
+
         skyvern_element = SkyvernElement(locator=locater, frame=skyvern_frame.get_frame(), static_element=element)
 
         _, blocked = await skyvern_frame.get_blocking_element_id(await skyvern_element.get_element_handler())

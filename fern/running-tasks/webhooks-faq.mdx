@@ -1,0 +1,49 @@
+---
+title: Webhooks FAQ
+subtitle: How Skyvern notifies you when its done
+slug: running-tasks/webhooks-faq
+---
+
+
+# FAQ 
+## Webhooks vs HTTP requests?
+
+We use Webhooks for executing tasks as the expected runtime of these jobs can exceed default HTTP timeouts (1 minute)
+
+## How do we handle webhook authentication? (ie how can we handle callbacks?)
+
+<CodeGroup>
+```python Python
+import hmac
+from fastapi import Request
+
+def validate_skyvern_request_headers(request: Request) -> bool:
+    header_skyvern_signature = request.headers["x-skyvern-signature"]
+    payload = request.body() # this is a bytes
+    hash_obj = hmac.new(SKYVERN_API_KEY.encode("utf-8"), msg=payload, digestmod=hashlib.sha256)
+    client_generated_signature = hash_obj.hexdigest()
+    return header_skyvern_signature == client_generated_signature
+```
+
+```javascript Javascript
+const crypto = require('crypto');
+
+function validateSkyvernRequestHeaders(req) {
+    const headerSkyvernSignature = req.headers['x-skyvern-signature'];
+    const payload = req.body; // assuming req.body is a Buffer or string
+    const hash = crypto.createHmac('sha256', process.env.SKYVERN_API_KEY)
+                        .update(payload)
+                        .digest('hex');
+    return headerSkyvernSignature === hash;
+}
+```
+
+</CodeGroup>
+
+SKYVERN_API_KEY: this is the [api key](/running-tasks/introduction) specific to your organization
+
+# Webhook common parameters
+
+| Parameter | Type | Required? | Sample Value | Description |
+| --- | --- | --- | --- | --- |
+| webhook_callback_url | String | yes | …  |  |

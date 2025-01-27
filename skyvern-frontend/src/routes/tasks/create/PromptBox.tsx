@@ -1,5 +1,10 @@
 import { getClient } from "@/api/AxiosClient";
-import { ObserverTask, TaskGenerationApiResponse } from "@/api/types";
+import {
+  Createv2TaskRequest,
+  ObserverTask,
+  ProxyLocation,
+  TaskGenerationApiResponse,
+} from "@/api/types";
 import img from "@/assets/promptBoxBg.png";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { CartIcon } from "@/components/icons/CartIcon";
@@ -37,6 +42,9 @@ import {
   generateUniqueEmail,
 } from "../data/sampleTaskData";
 import { ExampleCasePill } from "./ExampleCasePill";
+import { Input } from "@/components/ui/input";
+import { ProxySelector } from "@/components/ProxySelector";
+import { Switch } from "@/components/ui/switch";
 
 function createTemplateTaskFromTaskGenerationParameters(
   values: TaskGenerationApiResponse,
@@ -137,13 +145,28 @@ function PromptBox() {
   const [selectValue, setSelectValue] = useState<"v1" | "v2">("v2"); // Observer is the default
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
+  const [webhookCallbackUrl, setWebhookCallbackUrl] = useState<string | null>(
+    null,
+  );
+  const [proxyLocation, setProxyLocation] = useState<ProxyLocation>(
+    ProxyLocation.Residential,
+  );
+  const [publishWorkflow, setPublishWorkflow] = useState(false);
+  const [totpIdentifier, setTotpIdentifier] = useState("");
+  const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
 
   const startObserverCruiseMutation = useMutation({
     mutationFn: async (prompt: string) => {
       const client = await getClient(credentialGetter, "v2");
-      return client.post<{ user_prompt: string }, { data: ObserverTask }>(
+      return client.post<Createv2TaskRequest, { data: ObserverTask }>(
         "/tasks",
-        { user_prompt: prompt },
+        {
+          user_prompt: prompt,
+          webhook_callback_url: webhookCallbackUrl,
+          proxy_location: proxyLocation,
+          totp_identifier: totpIdentifier,
+          publish_workflow: publishWorkflow,
+        },
       );
     },
     onSuccess: (response) => {
@@ -190,10 +213,11 @@ function PromptBox() {
         .then((response) => response.data);
     },
     onError: (error: AxiosError) => {
+      const detail = (error.response?.data as { detail?: string })?.detail;
       toast({
         variant: "destructive",
         title: "Error creating task from prompt",
-        description: error.message,
+        description: detail ? detail : error.message,
       });
     },
   });
@@ -236,70 +260,144 @@ function PromptBox() {
           <span className="text-2xl">
             What task would you like to accomplish?
           </span>
-          <div className="flex w-full max-w-xl items-center rounded-xl bg-slate-700 py-2 pr-4 lg:w-3/4">
-            <AutoResizingTextarea
-              className="min-h-0 resize-none rounded-xl border-transparent px-4 hover:border-transparent focus-visible:ring-0"
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              placeholder="Enter your prompt..."
-            />
-            <Select
-              value={selectValue}
-              onValueChange={(value: "v1" | "v2") => {
-                setSelectValue(value);
-              }}
-            >
-              <SelectTrigger className="w-48 focus:ring-0">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent className="border-slate-500 bg-slate-elevation3">
-                <CustomSelectItem value="v1">
-                  <div className="space-y-2">
-                    <div>
-                      <SelectItemText>Skyvern 1.0</SelectItemText>
+          <div className="flex w-full max-w-xl flex-col">
+            <div className="flex w-full items-center gap-2 rounded-xl bg-slate-700 py-2 pr-4">
+              <AutoResizingTextarea
+                className="min-h-0 resize-none rounded-xl border-transparent px-4 hover:border-transparent focus-visible:ring-0"
+                value={prompt}
+                onChange={(e) => setPrompt(e.target.value)}
+                placeholder="Enter your prompt..."
+              />
+              <Select
+                value={selectValue}
+                onValueChange={(value: "v1" | "v2") => {
+                  setSelectValue(value);
+                }}
+              >
+                <SelectTrigger className="w-48 focus:ring-0">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="border-slate-500 bg-slate-elevation3">
+                  <CustomSelectItem value="v1">
+                    <div className="space-y-2">
+                      <div>
+                        <SelectItemText>Skyvern 1.0</SelectItemText>
+                      </div>
+                      <div className="text-xs text-slate-400">
+                        Best for simple tasks
+                      </div>
                     </div>
-                    <div className="text-xs text-slate-400">
-                      Best for simple tasks
+                  </CustomSelectItem>
+                  <CustomSelectItem value="v2" className="hover:bg-slate-800">
+                    <div className="space-y-2">
+                      <div>
+                        <SelectItemText>Skyvern 2.0</SelectItemText>
+                      </div>
+                      <div className="text-xs text-slate-400">
+                        Best for complex tasks
+                      </div>
                     </div>
-                  </div>
-                </CustomSelectItem>
-                <CustomSelectItem value="v2" className="hover:bg-slate-800">
-                  <div className="space-y-2">
-                    <div>
-                      <SelectItemText>Skyvern 2.0</SelectItemText>
-                    </div>
-                    <div className="text-xs text-slate-400">
-                      Best for complex tasks
-                    </div>
-                  </div>
-                </CustomSelectItem>
-              </SelectContent>
-            </Select>
-            <div className="flex items-center">
-              {startObserverCruiseMutation.isPending ||
-              getTaskFromPromptMutation.isPending ||
-              saveTaskMutation.isPending ? (
-                <ReloadIcon className="h-6 w-6 animate-spin" />
-              ) : (
-                <PaperPlaneIcon
-                  className="h-6 w-6 cursor-pointer"
-                  onClick={async () => {
-                    if (selectValue === "v2") {
-                      startObserverCruiseMutation.mutate(prompt);
-                      return;
-                    }
-                    const taskGenerationResponse =
-                      await getTaskFromPromptMutation.mutateAsync(prompt);
-                    await saveTaskMutation.mutateAsync(taskGenerationResponse);
-                    navigate("/tasks/create/from-prompt", {
-                      state: {
-                        data: taskGenerationResponse,
-                      },
-                    });
+                  </CustomSelectItem>
+                </SelectContent>
+              </Select>
+              <div className="flex items-center">
+                <GearIcon
+                  className="size-6 cursor-pointer"
+                  onClick={() => {
+                    setShowAdvancedSettings((value) => !value);
                   }}
                 />
-              )}
+              </div>
+              <div className="flex items-center">
+                {startObserverCruiseMutation.isPending ||
+                getTaskFromPromptMutation.isPending ||
+                saveTaskMutation.isPending ? (
+                  <ReloadIcon className="size-6 animate-spin" />
+                ) : (
+                  <PaperPlaneIcon
+                    className="size-6 cursor-pointer"
+                    onClick={async () => {
+                      if (selectValue === "v2") {
+                        startObserverCruiseMutation.mutate(prompt);
+                        return;
+                      }
+                      const taskGenerationResponse =
+                        await getTaskFromPromptMutation.mutateAsync(prompt);
+                      await saveTaskMutation.mutateAsync(
+                        taskGenerationResponse,
+                      );
+                      navigate("/tasks/create/from-prompt", {
+                        state: {
+                          data: taskGenerationResponse,
+                        },
+                      });
+                    }}
+                  />
+                )}
+              </div>
             </div>
+            {showAdvancedSettings ? (
+              <div className="rounded-b-lg px-2">
+                <div className="space-y-4 rounded-b-xl bg-slate-900 p-4">
+                  <header>Advanced Settings</header>
+                  <div className="flex gap-16">
+                    <div className="w-48 shrink-0">
+                      <div className="text-sm">Webhook Callback URL</div>
+                      <div className="text-xs text-slate-400">
+                        The URL of a webhook endpoint to send the extracted
+                        information
+                      </div>
+                    </div>
+                    <Input
+                      value={webhookCallbackUrl ?? ""}
+                      onChange={(event) => {
+                        setWebhookCallbackUrl(event.target.value);
+                      }}
+                    />
+                  </div>
+                  <div className="flex gap-16">
+                    <div className="w-48 shrink-0">
+                      <div className="text-sm">Proxy Location</div>
+                      <div className="text-xs text-slate-400">
+                        Route Skyvern through one of our available proxies.
+                      </div>
+                    </div>
+                    <ProxySelector
+                      value={proxyLocation}
+                      onChange={setProxyLocation}
+                    />
+                  </div>
+                  <div className="flex gap-16">
+                    <div className="w-48 shrink-0">
+                      <div className="text-sm">2FA Identifier</div>
+                      <div className="text-xs text-slate-400">
+                        The identifier for a 2FA code for this task.
+                      </div>
+                    </div>
+                    <Input
+                      value={totpIdentifier}
+                      onChange={(event) => {
+                        setTotpIdentifier(event.target.value);
+                      }}
+                    />
+                  </div>
+                  <div className="flex gap-16">
+                    <div className="w-48 shrink-0">
+                      <div className="text-sm">Publish Workflow</div>
+                      <div className="text-xs text-slate-400">
+                        Whether to create a workflow alongside this task run.
+                      </div>
+                    </div>
+                    <Switch
+                      checked={publishWorkflow}
+                      onCheckedChange={(checked) => {
+                        setPublishWorkflow(Boolean(checked));
+                      }}
+                    />
+                  </div>
+                </div>
+              </div>
+            ) : null}
           </div>
         </div>
       </div>
