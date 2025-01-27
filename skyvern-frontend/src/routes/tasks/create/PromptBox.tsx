@@ -12,7 +12,8 @@ import { GraphIcon } from "@/components/icons/GraphIcon";
 import { InboxIcon } from "@/components/icons/InboxIcon";
 import { MessageIcon } from "@/components/icons/MessageIcon";
 import { TrophyIcon } from "@/components/icons/TrophyIcon";
-import { Button } from "@/components/ui/button";
+import { ProxySelector } from "@/components/ProxySelector";
+import { Input } from "@/components/ui/input";
 import {
   CustomSelectItem,
   Select,
@@ -21,6 +22,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import {
@@ -31,20 +33,16 @@ import {
   PlusIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { ToastAction } from "@radix-ui/react-toast";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { stringify as convertToYAML } from "yaml";
 import {
   generatePhoneNumber,
   generateUniqueEmail,
 } from "../data/sampleTaskData";
 import { ExampleCasePill } from "./ExampleCasePill";
-import { Input } from "@/components/ui/input";
-import { ProxySelector } from "@/components/ProxySelector";
-import { Switch } from "@/components/ui/switch";
 
 function createTemplateTaskFromTaskGenerationParameters(
   values: TaskGenerationApiResponse,
@@ -174,17 +172,6 @@ function PromptBox() {
         variant: "success",
         title: "Workflow Run Created",
         description: `Workflow run created successfully.`,
-        action: (
-          <ToastAction altText="View">
-            <Button asChild>
-              <Link
-                to={`/workflows/${response.data.workflow_permanent_id}/${response.data.workflow_run_id}`}
-              >
-                View
-              </Link>
-            </Button>
-          </ToastAction>
-        ),
       });
       queryClient.invalidateQueries({
         queryKey: ["workflowRuns"],
@@ -192,6 +179,9 @@ function PromptBox() {
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
       });
+      navigate(
+        `/workflows/${response.data.workflow_permanent_id}/${response.data.workflow_run_id}`,
+      );
     },
     onError: (error: AxiosError) => {
       toast({

@@ -1,13 +1,11 @@
 import { getClient } from "@/api/AxiosClient";
 import { ObserverTask } from "@/api/types";
-import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { ReloadIcon } from "@radix-ui/react-icons";
-import { ToastAction } from "@radix-ui/react-toast";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
-import { Link, useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 
 type Props = {
   exampleId: string;
@@ -35,17 +33,6 @@ function ExampleCasePill({ exampleId, version, icon, label, prompt }: Props) {
         variant: "success",
         title: "Workflow Run Created",
         description: `Workflow run created successfully.`,
-        action: (
-          <ToastAction altText="View">
-            <Button asChild>
-              <Link
-                to={`/workflows/${response.data.workflow_permanent_id}/${response.data.workflow_run_id}`}
-              >
-                View
-              </Link>
-            </Button>
-          </ToastAction>
-        ),
       });
       queryClient.invalidateQueries({
         queryKey: ["workflowRuns"],
@@ -53,6 +40,9 @@ function ExampleCasePill({ exampleId, version, icon, label, prompt }: Props) {
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
       });
+      navigate(
+        `/workflows/${response.data.workflow_permanent_id}/${response.data.workflow_run_id}`,
+      );
     },
     onError: (error: AxiosError) => {
       toast({
