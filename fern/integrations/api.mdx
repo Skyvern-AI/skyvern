@@ -1,0 +1,86 @@
+---
+title: API Integrations
+subtitle: How to integrate and validate Skyverns API
+slug: integrations/api
+---
+
+
+# Organizations API Documentation
+
+## Get Organizations
+
+Retrieves the organization information for the current authenticated user.
+
+### Endpoint
+
+```
+GET https://api.skyvern.com/api/v1/organizations
+```
+
+### Authentication
+
+This endpoint requires Bearer Token authentication. Include the token in the `x-api-key` header of your request.
+
+```
+x-api-key: <your_api_key_here>
+```
+
+### Response
+
+#### Successful Response (200 OK)
+
+The API will return a JSON object containing an array of organizations associated with the authenticated user.
+
+```json
+{
+  "organizations": [
+    {
+      "organization_id": "uuid-string",
+      "organization_name": "Organization Name"
+    }
+  ]
+}
+```
+
+- `organizations`: An array of organization objects
+  - `organization_id`: A unique identifier for the organization (UUID format)
+  - `organization_name`: The name of the organization
+
+#### Error Responses
+
+- `401 Unauthorized`: The request lacks valid authentication credentials
+- `403 Forbidden`: The authenticated user does not have permission to access the requested resource
+- `500 Internal Server Error`: An unexpected error occurred on the server
+
+### Example Request
+
+Using cURL:
+
+```bash
+curl -X GET "https://api.skyvern.com/api/v1/organizations" \
+     -H "x-api-key: your_api_key_here"
+```
+
+Using Python with the `requests` library:
+
+```python
+import requests
+
+url = "https://api.skyvern.com/api/v1/organizations"
+headers = {
+    "x-api-key": "your_api_key"
+}
+
+response = requests.get(url, headers=headers)
+
+if response.status_code == 200:
+    organizations = response.json()["organizations"]
+    for org in organizations:
+        print(f"Organization ID: {org['organization_id']}")
+        print(f"Organization Name: {org['organization_name']}")
+else:
+    print(f"Error: {response.status_code}")
+    print(response.text)
+```
+
+Remember to replace `your_api_key` with your API Key token retrieved from Skyvern's setting page
