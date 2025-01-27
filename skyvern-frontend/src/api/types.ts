@@ -257,3 +257,9 @@ export type ObserverTask = {
   output: Record<string, unknown> | null;
   summary: string | null;
 };
+
+export type Createv2TaskRequest = {
+  user_prompt: string;
+  webhook_callback_url?: string | null;
+  proxy_location?: ProxyLocation | null;
+};
