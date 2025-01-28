@@ -1,0 +1,34 @@
+Confirm if the user has finished the multi-level selection based on the screenshot, user details, the HTML elements and select history provided in the list.
+
+Reply in JSON format with the following keys:
+{
+    "page_info": str, // Think step by step. Describe the page information you parsed from the HTML elements. Your action should be based on the current page information.
+    "think": str, // Think step by step. Describe how you think the user has finished the multi-level selection.
+    "confidence_float": float, // The confidence of the action. Pick a number between 0.0 and 1.0. 0.0 means no confidence, 1.0 means full confidence
+    "is_finished": bool, // True if the user has finished the multi-level selection, False otherwise.
+}
+
+User goal:
+```
+{{ navigation_goal }}
+```
+
+User details:
+```
+{{ navigation_payload_str }}
+```
+
+HTML elements:
+```
+{{ elements }}
+```
+
+Select History:
+```
+{{ select_history }}
+```
+
+Current datetime, ISO format:
+```
+{{ local_datetime }}
+```

@@ -161,7 +161,7 @@ def check_disappeared_element_id_in_incremental_factory(
                 incre_page=incremental_scraped, element_id=element_id
             )
         except Exception:
-            LOG.info(
+            LOG.debug(
                 "Failed to create skyvern element, going to drop the element from incremental tree",
                 exc_info=True,
                 element_id=element_id,
@@ -681,23 +681,25 @@ async def handle_input_text_action(
                 )
                 await skyvern_element.scroll_into_view()
             finally:
-                blocking_element, exist = await skyvern_element.find_blocking_element(
-                    dom=dom, incremental_page=incremental_scraped
-                )
-                if blocking_element and exist:
-                    LOG.info(
-                        "Find a blocking element to the current element, going to blur the blocking element first",
-                        task_id=task.task_id,
-                        step_id=step.step_id,
-                        blocking_element=blocking_element.get_locator(),
+                if await skyvern_element.is_visible():
+                    blocking_element, exist = await skyvern_element.find_blocking_element(
+                        dom=dom, incremental_page=incremental_scraped
                     )
-                    if await blocking_element.get_locator().count():
-                        await blocking_element.press_key("Escape")
-                    if await blocking_element.get_locator().count():
-                        await blocking_element.blur()
+                    if blocking_element and exist:
+                        LOG.info(
+                            "Find a blocking element to the current element, going to blur the blocking element first",
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            blocking_element=blocking_element.get_locator(),
+                        )
+                        if await blocking_element.get_locator().count():
+                            await blocking_element.press_key("Escape")
+                        if await blocking_element.get_locator().count():
+                            await blocking_element.blur()
 
-                await skyvern_element.press_key("Escape")
-                await skyvern_element.blur()
+                if await skyvern_element.is_visible():
+                    await skyvern_element.press_key("Escape")
+                    await skyvern_element.blur()
                 await incremental_scraped.stop_listen_dom_increment()
 
     # force to move focus back to the element
@@ -1098,6 +1100,7 @@ async def handle_select_option_action(
         except Exception:
             LOG.info(
                 "fail to open dropdown by clicking, try to press ArrowDown to open",
+                exc_info=True,
                 element_id=skyvern_element.get_id(),
                 task_id=task.task_id,
                 step_id=step.step_id,
@@ -1154,7 +1157,12 @@ async def handle_select_option_action(
         results.append(ActionFailure(exception=e))
         return results
     finally:
-        if is_open and len(results) > 0 and not isinstance(results[-1], ActionSuccess):
+        if (
+            await skyvern_element.is_visible()
+            and is_open
+            and len(results) > 0
+            and not isinstance(results[-1], ActionSuccess)
+        ):
             await skyvern_element.scroll_into_view()
             await skyvern_element.coordinate_click(page=page)
             await skyvern_element.press_key("Escape")
@@ -1207,11 +1215,16 @@ async def handle_select_option_action(
         return results
 
     finally:
-        if is_open and len(results) > 0 and not isinstance(results[-1], ActionSuccess):
+        if (
+            await skyvern_element.is_visible()
+            and is_open
+            and len(results) > 0
+            and not isinstance(results[-1], ActionSuccess)
+        ):
             await skyvern_element.scroll_into_view()
             await skyvern_element.coordinate_click(page=page)
             await skyvern_element.press_key("Escape")
-
+        is_open = False
         await skyvern_element.blur()
         await incremental_scraped.stop_listen_dom_increment()
 
@@ -2013,6 +2026,23 @@ async def sequentially_select_from_dropdown(
             )
             return single_select_result.action_result, values[-1] if len(values) > 0 else None
 
+        # it's for typing. it's been verified in `single_select_result.is_done()`
+        assert single_select_result.dropdown_menu is not None
+        screenshot = await single_select_result.dropdown_menu.get_locator().screenshot(
+            timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS
+        )
+        prompt = prompt_engine.load_prompt(
+            "confirm-multi-selection-finish",
+            navigation_goal=task.navigation_goal,
+            navigation_payload_str=json.dumps(task.navigation_payload),
+            elements="".join(json_to_html(element) for element in secondary_increment_element),
+            select_history=json.dumps(build_sequential_select_history(select_history)),
+            local_datetime=datetime.now(ensure_context().tz_info).isoformat(),
+        )
+        json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, screenshots=[screenshot], step=step)
+        if json_response.get("is_finished", False):
+            return single_select_result.action_result, values[-1] if len(values) > 0 else None
+
     return select_history[-1].action_result if len(select_history) > 0 else None, values[-1] if len(
         values
     ) > 0 else None
@@ -2292,6 +2322,9 @@ async def locate_dropdown_menu(
     step: Step,
     task: Task,
 ) -> SkyvernElement | None:
+    if not await current_anchor_element.is_visible():
+        return None
+
     skyvern_frame = incremental_scraped.skyvern_frame
 
     for idx, element_dict in enumerate(incremental_scraped.element_tree):

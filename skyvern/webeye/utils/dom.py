@@ -107,11 +107,11 @@ class SkyvernElement:
 
         num_elements = await locator.count()
         if num_elements < 1:
-            LOG.warning("No elements found with css. Validation failed.", css=css_selector, element_id=element_id)
+            LOG.debug("No elements found with css. Validation failed.", css=css_selector, element_id=element_id)
             raise MissingElement(selector=css_selector, element_id=element_id)
 
         elif num_elements > 1:
-            LOG.warning(
+            LOG.debug(
                 "Multiple elements found with css. Expected 1. Validation failed.",
                 num_elements=num_elements,
                 selector=css_selector,
@@ -584,13 +584,17 @@ class SkyvernElement:
         await page.mouse.click(click_x, click_y)
 
     async def blur(self) -> None:
+        if not await self.is_visible():
+            return
         await SkyvernFrame.evaluate(
             frame=self.get_frame(), expression="(element) => element.blur()", arg=await self.get_element_handler()
         )
 
     async def scroll_into_view(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
-        element_handler = await self.get_element_handler(timeout=timeout)
+        if not await self.is_visible():
+            return
         try:
+            element_handler = await self.get_element_handler(timeout=timeout)
             await element_handler.scroll_into_view_if_needed(timeout=timeout)
         except TimeoutError:
             LOG.info(
