@@ -29,6 +29,13 @@ class S3Storage(BaseStorage):
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
         return f"s3://{self.bucket}/{settings.ENV}/{step.task_id}/{step.order:02d}_{step.retry_index}_{step.step_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
+    async def retrieve_global_workflows(self) -> list[str]:
+        uri = f"s3://{self.bucket}/{settings.ENV}/global_workflows.txt"
+        data = await self.async_client.download_file(uri, log_exception=False)
+        if not data:
+            return []
+        return [line.strip() for line in data.decode("utf-8").split("\n") if line.strip()]
+
     def build_log_uri(self, log_entity_type: LogEntityType, log_entity_id: str, artifact_type: ArtifactType) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
         return f"s3://{self.bucket}/{settings.ENV}/logs/{log_entity_type}/{log_entity_id}/{datetime.utcnow().isoformat()}_{artifact_type}.{file_ext}"

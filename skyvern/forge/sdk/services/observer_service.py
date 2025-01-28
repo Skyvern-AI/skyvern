@@ -704,7 +704,7 @@ async def handle_block_result(
     # refresh workflow run model
     return await app.WORKFLOW_SERVICE.get_workflow_run(
         workflow_run_id=workflow_run_id,
-        organization_id=workflow.organization_id,
+        organization_id=workflow_run.organization_id,
     )
 
 

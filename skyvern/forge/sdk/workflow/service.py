@@ -93,6 +93,7 @@ class WorkflowService:
         workflow_request: WorkflowRequestBody,
         workflow_permanent_id: str,
         organization_id: str,
+        is_template_workflow: bool = False,
         version: int | None = None,
         max_steps_override: int | None = None,
     ) -> WorkflowRun:
@@ -109,7 +110,7 @@ class WorkflowService:
         # Validate the workflow and the organization
         workflow = await self.get_workflow_by_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
-            organization_id=organization_id,
+            organization_id=None if is_template_workflow else organization_id,
             version=version,
         )
         if workflow is None:
@@ -125,7 +126,7 @@ class WorkflowService:
             workflow_request=workflow_request,
             workflow_permanent_id=workflow_permanent_id,
             workflow_id=workflow_id,
-            organization_id=workflow.organization_id,
+            organization_id=organization_id,
         )
         LOG.info(
             f"Created workflow run {workflow_run.workflow_run_id} for workflow {workflow.workflow_id}",
@@ -202,7 +203,7 @@ class WorkflowService:
             browser_session_id=browser_session_id,
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
-        workflow = await self.get_workflow(workflow_id=workflow_run.workflow_id, organization_id=organization_id)
+        workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id=workflow_run.workflow_permanent_id)
 
         # Set workflow run status to running, create workflow run parameters
         await self.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
@@ -519,6 +520,24 @@ class WorkflowService:
         if not workflow:
             raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
         return workflow
+
+    async def get_workflows_by_permanent_ids(
+        self,
+        workflow_permanent_ids: list[str],
+        organization_id: str | None = None,
+        page: int = 1,
+        page_size: int = 10,
+        title: str = "",
+        statuses: list[WorkflowStatus] | None = None,
+    ) -> list[Workflow]:
+        return await app.DATABASE.get_workflows_by_permanent_ids(
+            workflow_permanent_ids,
+            organization_id=organization_id,
+            page=page,
+            page_size=page_size,
+            title=title,
+            statuses=statuses,
+        )
 
     async def get_workflows_by_organization_id(
         self,
@@ -864,7 +883,7 @@ class WorkflowService:
         organization_id: str,
         include_cost: bool = False,
     ) -> WorkflowRunStatusResponse:
-        workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id, organization_id=organization_id)
+        workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id)
         if workflow is None:
             LOG.error(f"Workflow {workflow_permanent_id} not found")
             raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id)
@@ -903,7 +922,9 @@ class WorkflowService:
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                 downloaded_file_urls = await app.STORAGE.get_downloaded_files(
-                    organization_id=workflow.organization_id, task_id=None, workflow_run_id=workflow_run.workflow_run_id
+                    organization_id=workflow_run.organization_id,
+                    task_id=None,
+                    workflow_run_id=workflow_run.workflow_run_id,
                 )
         except asyncio.TimeoutError:
             LOG.warning(
@@ -989,7 +1010,7 @@ class WorkflowService:
                 await self.persist_debug_artifacts(browser_state, tasks[-1], workflow, workflow_run)
             if workflow.persist_browser_session and browser_state.browser_artifacts.browser_session_dir:
                 await app.STORAGE.store_browser_session(
-                    workflow.organization_id,
+                    workflow_run.organization_id,
                     workflow.workflow_permanent_id,
                     browser_state.browser_artifacts.browser_session_dir,
                 )
@@ -1000,7 +1021,7 @@ class WorkflowService:
         try:
             async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                 await app.STORAGE.save_downloaded_files(
-                    workflow.organization_id, task_id=None, workflow_run_id=workflow_run.workflow_run_id
+                    workflow_run.organization_id, task_id=None, workflow_run_id=workflow_run.workflow_run_id
                 )
         except asyncio.TimeoutError:
             LOG.warning(
@@ -1106,7 +1127,7 @@ class WorkflowService:
         for video_artifact in video_artifacts:
             await app.ARTIFACT_MANAGER.update_artifact_data(
                 artifact_id=video_artifact.video_artifact_id,
-                organization_id=workflow.organization_id,
+                organization_id=workflow_run.organization_id,
                 data=video_artifact.video_data,
             )
 

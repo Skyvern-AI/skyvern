@@ -1172,6 +1172,55 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
+    async def get_workflows_by_permanent_ids(
+        self,
+        workflow_permanent_ids: list[str],
+        organization_id: str | None = None,
+        page: int = 1,
+        page_size: int = 10,
+        title: str = "",
+        statuses: list[WorkflowStatus] | None = None,
+    ) -> list[Workflow]:
+        """
+        Get all workflows with the latest version for the organization.
+        """
+        if page < 1:
+            raise ValueError(f"Page must be greater than 0, got {page}")
+        db_page = page - 1
+        try:
+            async with self.Session() as session:
+                subquery = (
+                    select(
+                        WorkflowModel.workflow_permanent_id,
+                        func.max(WorkflowModel.version).label("max_version"),
+                    )
+                    .where(WorkflowModel.workflow_permanent_id.in_(workflow_permanent_ids))
+                    .where(WorkflowModel.deleted_at.is_(None))
+                    .group_by(
+                        WorkflowModel.workflow_permanent_id,
+                    )
+                    .subquery()
+                )
+                main_query = select(WorkflowModel).join(
+                    subquery,
+                    (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
+                    & (WorkflowModel.version == subquery.c.max_version),
+                )
+                if organization_id:
+                    main_query = main_query.where(WorkflowModel.organization_id == organization_id)
+                if title:
+                    main_query = main_query.where(WorkflowModel.title.ilike(f"%{title}%"))
+                if statuses:
+                    main_query = main_query.where(WorkflowModel.status.in_(statuses))
+                main_query = (
+                    main_query.order_by(WorkflowModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
+                )
+                workflows = (await session.scalars(main_query)).all()
+                return [convert_to_workflow(workflow, self.debug_enabled) for workflow in workflows]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
     async def get_workflows_by_organization_id(
         self,
         organization_id: str,
