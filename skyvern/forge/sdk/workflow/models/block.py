@@ -49,7 +49,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core.validators import prepend_scheme_and_validate_url
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.observers import ObserverTaskStatus
-from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
+from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToFormatJinjaStyleParameter,
@@ -2106,15 +2106,12 @@ class TaskV2Block(Block):
         organization = await app.DATABASE.get_organization(organization_id)
         if not organization:
             raise ValueError(f"Organization not found {organization_id}")
-        workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id, organization_id)
-        if not workflow_run:
-            raise ValueError(f"WorkflowRun not found {workflow_run_id} when running TaskV2Block")
         observer_task = await observer_service.initialize_observer_task(
             organization,
             user_prompt=self.prompt,
             user_url=self.url,
             parent_workflow_run_id=workflow_run_id,
-            proxy_location=workflow_run.proxy_location,
+            proxy_location=ProxyLocation.NONE,
         )
         await app.DATABASE.update_observer_cruise(
             observer_task.observer_cruise_id, status=ObserverTaskStatus.queued, organization_id=organization_id
