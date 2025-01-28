@@ -56,11 +56,11 @@ services:
       # 4. In the Amazon Bedrock console, go to "Model Access"
       # 5. Click Modify Model Access button
       # 6. Enable "Claude 3.5 Sonnet v2" and save changes
-      - ENABLE_BEDROCK=true
-      - LLM_KEY=BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET   # This is the Claude 3.5 Sonnet "V2" model. Change to BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_V1 for the non-v2 version.
-      - AWS_REGION=us-west-2                         # Replace this with a different AWS region, if you desire
-      - AWS_ACCESS_KEY_ID=FILL_ME_IN_PLEASE
-      - AWS_SECRET_ACCESS_KEY=FILL_ME_IN_PLEASE
+      # - ENABLE_BEDROCK=true
+      # - LLM_KEY=BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET   # This is the Claude 3.5 Sonnet "V2" model. Change to BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_V1 for the non-v2 version.
+      # - AWS_REGION=us-west-2                         # Replace this with a different AWS region, if you desire
+      # - AWS_ACCESS_KEY_ID=FILL_ME_IN_PLEASE
+      # - AWS_SECRET_ACCESS_KEY=FILL_ME_IN_PLEASE
     depends_on:
       postgres:
         condition: service_healthy
