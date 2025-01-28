@@ -55,7 +55,7 @@ services:
       # - AZURE_DEPLOYMENT=<your_azure_deployment>      # Use the OpenAI model "Deployment Name" that you deployed, using the steps above
       # - AZURE_API_KEY=<your_azure_api_key>            # Copy and paste Key1 or Key2 from the OpenAI resource in Azure Portal
       # - AZURE_API_BASE=<your_azure_api_base>          # Copy and paste the "Endpoint" from the OpenAI resource in Azure Portal (eg. https://xyzxyzxyz.openai.azure.com/)
-      # - AZURE_API_VERSION=<your_azure_api_version>    # Specify a valid Azure OpenAI data-plane API version (eg. ) Docs: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference
+      # - AZURE_API_VERSION=<your_azure_api_version>    # Specify a valid Azure OpenAI data-plane API version (eg. 2024-08-01-preview) Docs: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference
       # Amazon Bedrock Support:
       # Amazon Bedrock is a managed service that enables you to invoke LLMs and bill them through your AWS account.
       # To use Amazon Bedrock as the LLM provider for Skyvern, specify the following environment variables.
