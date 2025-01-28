@@ -94,6 +94,7 @@ async def initialize_observer_task(
     totp_verification_url: str | None = None,
     webhook_callback_url: str | None = None,
     publish_workflow: bool = False,
+    parent_workflow_run_id: str | None = None,
 ) -> ObserverTask:
     observer_task = await app.DATABASE.create_observer_cruise(
         prompt=user_prompt,
@@ -148,6 +149,7 @@ async def initialize_observer_task(
             organization_id=organization.organization_id,
             version=None,
             max_steps_override=max_steps_override,
+            parent_workflow_run_id=parent_workflow_run_id,
         )
     except Exception:
         LOG.error("Failed to setup cruise workflow run", exc_info=True)
@@ -501,7 +503,10 @@ async def run_observer_task_helper(
             break
 
         # generate the extraction task
-        block_result = await block.execute_safe(workflow_run_id=workflow_run_id, organization_id=organization_id)
+        block_result = await block.execute_safe(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
         task_history_record["status"] = str(block_result.status)
         if block_result.failure_reason:
             task_history_record["reason"] = block_result.failure_reason

@@ -323,6 +323,15 @@ class UrlBlockYAML(BlockYAML):
     url: str
 
 
+class TaskV2BlockYAML(BlockYAML):
+    block_type: Literal[BlockType.TaskV2] = BlockType.TaskV2  # type: ignore
+    prompt: str
+    url: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    max_iterations: int = 10
+
+
 PARAMETER_YAML_SUBCLASSES = (
     AWSSecretParameterYAML
     | BitwardenLoginCredentialParameterYAML
@@ -352,6 +361,7 @@ BLOCK_YAML_SUBCLASSES = (
     | FileDownloadBlockYAML
     | UrlBlockYAML
     | PDFParserBlockYAML
+    | TaskV2BlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 
