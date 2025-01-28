@@ -554,7 +554,7 @@ class IncrementalScrapePage:
     ) -> list[dict]:
         frame = self.skyvern_frame.get_frame()
 
-        js_script = "() => getIncrementElements()"
+        js_script = "async () => await getIncrementElements()"
         incremental_elements, incremental_tree = await SkyvernFrame.evaluate(
             frame=frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
         )
@@ -580,8 +580,10 @@ class IncrementalScrapePage:
         js_script = "() => window.globalObserverForDOMIncrement === undefined"
         if await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script):
             return
-        js_script = "() => stopGlobalIncrementalObserver()"
-        await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script)
+        js_script = "async () => await stopGlobalIncrementalObserver()"
+        await SkyvernFrame.evaluate(
+            frame=self.skyvern_frame.get_frame(), expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+        )
 
     async def get_incremental_elements_num(self) -> int:
         js_script = "() => window.globalOneTimeIncrementElements.length"

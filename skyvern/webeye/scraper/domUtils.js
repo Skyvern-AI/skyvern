@@ -2044,25 +2044,60 @@ function isClassNameIncludesHidden(className) {
   return className.toLowerCase().includes("hide");
 }
 
-function addIncrementalNodeToMap(parentNode, childrenNode) {
-  // calculate the depth of targetNode element for sorting
-  const depth = getElementDomDepth(parentNode);
-  let newNodesTreeList = [];
-  if (window.globalDomDepthMap.has(depth)) {
-    newNodesTreeList = window.globalDomDepthMap.get(depth);
+function waitForNextFrame() {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => resolve());
+  });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+class SafeCounter {
+  constructor() {
+    this.value = 0;
+    this.lock = Promise.resolve();
   }
 
-  for (const child of childrenNode) {
-    const [_, newNodeTree] = buildElementTree(child, "", true);
-    if (newNodeTree.length > 0) {
-      newNodesTreeList.push(...newNodeTree);
-    }
+  async add() {
+    await this.lock;
+    this.lock = new Promise((resolve) => {
+      this.value += 1;
+      resolve();
+    });
   }
-  window.globalDomDepthMap.set(depth, newNodesTreeList);
+
+  async get() {
+    await this.lock;
+    return this.value;
+  }
+}
+
+async function addIncrementalNodeToMap(parentNode, childrenNode) {
+  // make the dom parser async
+  await waitForNextFrame();
+  if (window.globalListnerFlag) {
+    // calculate the depth of targetNode element for sorting
+    const depth = getElementDomDepth(parentNode);
+    let newNodesTreeList = [];
+    if (window.globalDomDepthMap.has(depth)) {
+      newNodesTreeList = window.globalDomDepthMap.get(depth);
+    }
+
+    for (const child of childrenNode) {
+      const [_, newNodeTree] = buildElementTree(child, "", true);
+      if (newNodeTree.length > 0) {
+        newNodesTreeList.push(...newNodeTree);
+      }
+    }
+    window.globalDomDepthMap.set(depth, newNodesTreeList);
+  }
+  await window.globalParsedElementCounter.add();
 }
 
 if (window.globalObserverForDOMIncrement === undefined) {
-  window.globalObserverForDOMIncrement = new MutationObserver(function (
+  window.globalObserverForDOMIncrement = new MutationObserver(async function (
     mutationsList,
     observer,
   ) {
@@ -2076,13 +2111,14 @@ if (window.globalObserverForDOMIncrement === undefined) {
               targetNode: node,
               newNodes: [node],
             });
-            addIncrementalNodeToMap(node, [node]);
+            await addIncrementalNodeToMap(node, [node]);
           }
         }
         if (mutation.attributeName === "style") {
           // TODO: need to confirm that elemnent is hidden previously
           const node = mutation.target;
           if (node.nodeType === Node.TEXT_NODE) continue;
+          if (node.tagName.toLowerCase() === "body") continue;
           const newStyle = getElementComputedStyle(node);
           const newDisplay = newStyle?.display;
           if (newDisplay !== "none") {
@@ -2090,7 +2126,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
               targetNode: node,
               newNodes: [node],
             });
-            addIncrementalNodeToMap(node, [node]);
+            await addIncrementalNodeToMap(node, [node]);
           }
         }
         if (mutation.attributeName === "class") {
@@ -2110,7 +2146,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
               targetNode: node,
               newNodes: [node],
             });
-            addIncrementalNodeToMap(node, [node]);
+            await addIncrementalNodeToMap(node, [node]);
           }
         }
       }
@@ -2122,26 +2158,30 @@ if (window.globalObserverForDOMIncrement === undefined) {
           targetNode: node, // TODO: for future usage, when we want to parse new elements into a tree
         };
         let newNodes = [];
-        if (
-          node.tagName.toLowerCase() === "ul" ||
-          (node.tagName.toLowerCase() === "div" &&
-            node.hasAttribute("role") &&
-            node.getAttribute("role").toLowerCase() === "listbox")
-        ) {
-          newNodes.push(node);
-        } else {
-          if (mutation.addedNodes && mutation.addedNodes.length > 0) {
-            for (const node of mutation.addedNodes) {
-              // skip the text nodes, they won't be interactable
-              if (node.nodeType === Node.TEXT_NODE) continue;
-              newNodes.push(node);
-            }
+        if (mutation.addedNodes && mutation.addedNodes.length > 0) {
+          for (const node of mutation.addedNodes) {
+            // skip the text nodes, they won't be interactable
+            if (node.nodeType === Node.TEXT_NODE) continue;
+            newNodes.push(node);
           }
         }
+        if (
+          newNodes.length == 0 &&
+          (node.tagName.toLowerCase() === "ul" ||
+            (node.tagName.toLowerCase() === "div" &&
+              node.hasAttribute("role") &&
+              node.getAttribute("role").toLowerCase() === "listbox"))
+        ) {
+          newNodes.push(node);
+        }
+
         if (newNodes.length > 0) {
           changedNode.newNodes = newNodes;
           window.globalOneTimeIncrementElements.push(changedNode);
-          addIncrementalNodeToMap(changedNode.targetNode, changedNode.newNodes);
+          await addIncrementalNodeToMap(
+            changedNode.targetNode,
+            changedNode.newNodes,
+          );
         }
       }
     }
@@ -2149,8 +2189,10 @@ if (window.globalObserverForDOMIncrement === undefined) {
 }
 
 function startGlobalIncrementalObserver() {
+  window.globalListnerFlag = true;
   window.globalDomDepthMap = new Map();
   window.globalOneTimeIncrementElements = [];
+  window.globalParsedElementCounter = new SafeCounter();
   window.globalObserverForDOMIncrement.takeRecords(); // cleanup the older data
   window.globalObserverForDOMIncrement.observe(document.body, {
     attributes: true,
@@ -2161,14 +2203,28 @@ function startGlobalIncrementalObserver() {
   });
 }
 
-function stopGlobalIncrementalObserver() {
-  window.globalDomDepthMap = new Map();
+async function stopGlobalIncrementalObserver() {
+  window.globalListnerFlag = false;
   window.globalObserverForDOMIncrement.disconnect();
   window.globalObserverForDOMIncrement.takeRecords(); // cleanup the older data
+  while (
+    (await window.globalParsedElementCounter.get()) <
+    window.globalOneTimeIncrementElements.length
+  ) {
+    await sleep(100);
+  }
   window.globalOneTimeIncrementElements = [];
+  window.globalDomDepthMap = new Map();
 }
 
-function getIncrementElements() {
+async function getIncrementElements() {
+  while (
+    (await window.globalParsedElementCounter.get()) <
+    window.globalOneTimeIncrementElements.length
+  ) {
+    await sleep(100);
+  }
+
   // cleanup the chidren tree, remove the duplicated element
   // search starting from the shallowest node:
   // 1. if deeper, the node could only be the children of the shallower one or no related one.
