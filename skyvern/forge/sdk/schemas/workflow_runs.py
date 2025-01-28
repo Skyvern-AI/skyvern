@@ -13,6 +13,7 @@ from skyvern.webeye.actions.actions import Action
 
 class WorkflowRunBlock(BaseModel):
     workflow_run_block_id: str
+    block_workflow_run_id: str | None = None
     workflow_run_id: str
     organization_id: str | None = None
     description: str | None = None

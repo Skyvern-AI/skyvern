@@ -202,6 +202,7 @@ def convert_to_workflow_run(workflow_run_model: WorkflowRunModel, debug_enabled:
     return WorkflowRun(
         workflow_run_id=workflow_run_model.workflow_run_id,
         workflow_permanent_id=workflow_run_model.workflow_permanent_id,
+        parent_workflow_run_id=workflow_run_model.parent_workflow_run_id,
         workflow_id=workflow_run_model.workflow_id,
         organization_id=workflow_run_model.organization_id,
         status=WorkflowRunStatus[workflow_run_model.status],
@@ -382,6 +383,7 @@ def convert_to_workflow_run_block(
     block = WorkflowRunBlock(
         workflow_run_block_id=workflow_run_block_model.workflow_run_block_id,
         workflow_run_id=workflow_run_block_model.workflow_run_id,
+        block_workflow_run_id=workflow_run_block_model.block_workflow_run_id,
         organization_id=workflow_run_block_model.organization_id,
         parent_workflow_run_block_id=workflow_run_block_model.parent_workflow_run_block_id,
         description=workflow_run_block_model.description,

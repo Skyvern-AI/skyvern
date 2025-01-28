@@ -1344,6 +1344,7 @@ class AgentDB:
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
+        parent_workflow_run_id: str | None = None,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
@@ -1356,6 +1357,7 @@ class AgentDB:
                     webhook_callback_url=webhook_callback_url,
                     totp_verification_url=totp_verification_url,
                     totp_identifier=totp_identifier,
+                    parent_workflow_run_id=parent_workflow_run_id,
                 )
                 session.add(workflow_run)
                 await session.commit()
@@ -1404,7 +1406,11 @@ class AgentDB:
         try:
             async with self.Session() as session:
                 db_page = page - 1  # offset logic is 0 based
-                query = select(WorkflowRunModel).filter(WorkflowRunModel.organization_id == organization_id)
+                query = (
+                    select(WorkflowRunModel)
+                    .filter(WorkflowRunModel.organization_id == organization_id)
+                    .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
+                )
                 if status:
                     query = query.filter(WorkflowRunModel.status.in_(status))
                 query = query.order_by(WorkflowRunModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
@@ -2293,6 +2299,7 @@ class AgentDB:
         prompt: str | None = None,
         wait_sec: int | None = None,
         description: str | None = None,
+        block_workflow_run_id: str | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             workflow_run_block = (
@@ -2331,6 +2338,8 @@ class AgentDB:
                     workflow_run_block.wait_sec = wait_sec
                 if description:
                     workflow_run_block.description = description
+                if block_workflow_run_id:
+                    workflow_run_block.block_workflow_run_id = block_workflow_run_id
                 await session.commit()
                 await session.refresh(workflow_run_block)
             else:

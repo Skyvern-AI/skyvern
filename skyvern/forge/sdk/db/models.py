@@ -230,6 +230,8 @@ class WorkflowRunModel(Base):
     workflow_run_id = Column(String, primary_key=True, index=True, default=generate_workflow_run_id)
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"), nullable=False)
     workflow_permanent_id = Column(String, nullable=False, index=True)
+    # workfow runs with parent_workflow_run_id are nested workflow runs which won't show up in the workflow run history
+    parent_workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True, index=True)
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False, index=True)
     status = Column(String, nullable=False)
     failure_reason = Column(String)
@@ -505,6 +507,8 @@ class WorkflowRunBlockModel(Base):
 
     workflow_run_block_id = Column(String, primary_key=True, default=generate_workflow_run_block_id)
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=False)
+    # this is the inner workflow run id of the taskv2 block
+    block_workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
     parent_workflow_run_block_id = Column(
         String, ForeignKey("workflow_run_blocks.workflow_run_block_id"), nullable=True
     )
