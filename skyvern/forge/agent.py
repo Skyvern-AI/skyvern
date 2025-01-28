@@ -156,7 +156,7 @@ class ForgeAgent:
             navigation_goal=task_block.navigation_goal,
             data_extraction_goal=task_block.data_extraction_goal,
             navigation_payload=navigation_payload,
-            organization_id=workflow.organization_id,
+            organization_id=workflow_run.organization_id,
             proxy_location=workflow_run.proxy_location,
             extracted_information_schema=task_block.data_schema,
             workflow_run_id=workflow_run.workflow_run_id,

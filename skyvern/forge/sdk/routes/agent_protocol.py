@@ -60,6 +60,7 @@ from skyvern.forge.sdk.services import observer_service, org_auth_service
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
+    InvalidTemplateWorkflowPermanentId,
     WorkflowParameterMissingRequiredValue,
 )
 from skyvern.forge.sdk.workflow.models.workflow import (
@@ -635,12 +636,18 @@ async def execute_workflow(
     workflow_request: WorkflowRequestBody,
     version: int | None = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    template: bool = Query(False),
     x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
 ) -> RunWorkflowResponse:
     analytics.capture("skyvern-oss-agent-workflow-execute")
     context = skyvern_context.ensure_context()
     request_id = context.request_id
+
+    if template:
+        if workflow_id not in await app.STORAGE.retrieve_global_workflows():
+            raise InvalidTemplateWorkflowPermanentId(workflow_permanent_id=workflow_id)
+
     workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
         request_id=request_id,
         workflow_request=workflow_request,
@@ -648,6 +655,7 @@ async def execute_workflow(
         organization_id=current_org.organization_id,
         version=version,
         max_steps_override=x_max_steps_override,
+        is_template_workflow=template,
     )
     if x_max_steps_override:
         LOG.info("Overriding max steps per run", max_steps_override=x_max_steps_override)
@@ -914,11 +922,25 @@ async def get_workflows(
     only_workflows: bool = Query(False),
     title: str = Query(""),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    template: bool = Query(False),
 ) -> list[Workflow]:
     """
     Get all workflows with the latest version for the organization.
     """
     analytics.capture("skyvern-oss-agent-workflows-get")
+
+    if template:
+        global_workflows_permanent_ids = await app.STORAGE.retrieve_global_workflows()
+        if not global_workflows_permanent_ids:
+            return []
+        workflows = await app.WORKFLOW_SERVICE.get_workflows_by_permanent_ids(
+            workflow_permanent_ids=global_workflows_permanent_ids,
+            page=page,
+            page_size=page_size,
+            title=title,
+            statuses=[WorkflowStatus.published, WorkflowStatus.draft],
+        )
+        return workflows
 
     if only_saved_tasks and only_workflows:
         raise HTTPException(
@@ -943,11 +965,16 @@ async def get_workflow(
     workflow_permanent_id: str,
     version: int | None = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    template: bool = Query(False),
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflows-get")
+    if template:
+        if workflow_permanent_id not in await app.STORAGE.retrieve_global_workflows():
+            raise InvalidTemplateWorkflowPermanentId(workflow_permanent_id=workflow_permanent_id)
+
     return await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_permanent_id,
-        organization_id=current_org.organization_id,
+        organization_id=None if template else current_org.organization_id,
         version=version,
     )
 

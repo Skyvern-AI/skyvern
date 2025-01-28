@@ -41,6 +41,10 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
+    async def retrieve_global_workflows(self) -> list[str]:
+        pass
+
+    @abstractmethod
     def build_log_uri(self, log_entity_type: LogEntityType, log_entity_id: str, artifact_type: ArtifactType) -> str:
         pass
 

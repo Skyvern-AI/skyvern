@@ -441,9 +441,8 @@ class BaseTaskBlock(Block):
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )
-        workflow = await app.WORKFLOW_SERVICE.get_workflow(
-            workflow_id=workflow_run.workflow_id,
-            organization_id=organization_id,
+        workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_run.workflow_permanent_id,
         )
         # if the task url is parameterized, we need to get the value from the workflow run context
         if self.url and workflow_run_context.has_parameter(self.url) and workflow_run_context.has_value(self.url):
@@ -512,12 +511,12 @@ class BaseTaskBlock(Block):
             workflow_run_block = await app.DATABASE.update_workflow_run_block(
                 workflow_run_block_id=workflow_run_block_id,
                 task_id=task.task_id,
-                organization_id=workflow.organization_id,
+                organization_id=organization_id,
             )
             current_running_task = task
-            organization = await app.DATABASE.get_organization(organization_id=workflow.organization_id)
+            organization = await app.DATABASE.get_organization(organization_id=workflow_run.organization_id)
             if not organization:
-                raise Exception(f"Organization is missing organization_id={workflow.organization_id}")
+                raise Exception(f"Organization is missing organization_id={workflow_run.organization_id}")
 
             browser_state: BrowserState | None = None
             if is_first_task:
@@ -544,7 +543,7 @@ class BaseTaskBlock(Block):
                     await app.DATABASE.update_task(
                         task.task_id,
                         status=TaskStatus.failed,
-                        organization_id=workflow.organization_id,
+                        organization_id=workflow_run.organization_id,
                         failure_reason=str(e),
                     )
                     raise e
@@ -569,7 +568,7 @@ class BaseTaskBlock(Block):
                         workflow_run_id=workflow_run_id,
                         task_id=task.task_id,
                         workflow_id=workflow.workflow_id,
-                        organization_id=workflow.organization_id,
+                        organization_id=workflow_run.organization_id,
                         step_id=step.step_id,
                     )
                     try:
@@ -578,7 +577,7 @@ class BaseTaskBlock(Block):
                         await app.DATABASE.update_task(
                             task.task_id,
                             status=TaskStatus.failed,
-                            organization_id=workflow.organization_id,
+                            organization_id=workflow_run.organization_id,
                             failure_reason=str(e),
                         )
                         raise e
@@ -597,13 +596,15 @@ class BaseTaskBlock(Block):
                 await app.DATABASE.update_task(
                     task.task_id,
                     status=TaskStatus.failed,
-                    organization_id=workflow.organization_id,
+                    organization_id=workflow_run.organization_id,
                     failure_reason=str(e),
                 )
                 raise e
 
             # Check task status
-            updated_task = await app.DATABASE.get_task(task_id=task.task_id, organization_id=workflow.organization_id)
+            updated_task = await app.DATABASE.get_task(
+                task_id=task.task_id, organization_id=workflow_run.organization_id
+            )
             if not updated_task:
                 raise TaskNotFound(task.task_id)
             if not updated_task.status.is_final():
@@ -624,7 +625,7 @@ class BaseTaskBlock(Block):
                     task_status=updated_task.status,
                     workflow_run_id=workflow_run_id,
                     workflow_id=workflow.workflow_id,
-                    organization_id=workflow.organization_id,
+                    organization_id=workflow_run.organization_id,
                 )
                 success = updated_task.status == TaskStatus.completed
                 task_output = TaskOutput.from_task(updated_task)
@@ -645,7 +646,7 @@ class BaseTaskBlock(Block):
                     task_status=updated_task.status,
                     workflow_run_id=workflow_run_id,
                     workflow_id=workflow.workflow_id,
-                    organization_id=workflow.organization_id,
+                    organization_id=workflow_run.organization_id,
                 )
                 return await self.build_block_result(
                     success=False,
@@ -662,7 +663,7 @@ class BaseTaskBlock(Block):
                     task_status=updated_task.status,
                     workflow_run_id=workflow_run_id,
                     workflow_id=workflow.workflow_id,
-                    organization_id=workflow.organization_id,
+                    organization_id=workflow_run.organization_id,
                 )
                 return await self.build_block_result(
                     success=False,
@@ -683,7 +684,7 @@ class BaseTaskBlock(Block):
                     status=updated_task.status,
                     workflow_run_id=workflow_run_id,
                     workflow_id=workflow.workflow_id,
-                    organization_id=workflow.organization_id,
+                    organization_id=workflow_run.organization_id,
                     current_retry=current_retry,
                     max_retries=self.max_retries,
                     task_output=task_output.model_dump_json(),
