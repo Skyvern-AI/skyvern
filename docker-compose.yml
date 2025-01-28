@@ -41,12 +41,21 @@ services:
       # - ENABLE_ANTHROPIC=true
       # - LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET
       # - ANTHROPIC_API_KEY=<your_anthropic_key>
+      # Microsoft Azure OpenAI support:
+      # If you'd like to use Microsoft Azure OpenAI as your managed LLM service integration with Skyvern, use the environment variables below.
+      # In your Microsoft Azure subscription, you will need to provision the OpenAI service and deploy a model, in order to utilize it.
+      # 1. Login to the Azure Portal
+      # 2. Create an Azure Resource Group
+      # 3. Create an OpenAI resource in the Resource Group (choose a region and pricing tier)
+      # 4. From the OpenAI resource's Overview page, open the "Azure AI Foundry" portal (click the "Explore Azure AI Foundry Portal" button)
+      # 5. In Azure AI Foundry, click "Shared Resources" --> "Deployments"
+      # 6. Click "Deploy Model" --> "Deploy Base Model" --> select a model (specify this model "Deployment Name" value for the AZURE_DEPLOYMENT variable below)
       # - ENABLE_AZURE=true
-      # - LLM_KEY=AZURE_OPENAI
-      # - AZURE_DEPLOYMENT=<your_azure_deployment>
-      # - AZURE_API_KEY=<your_azure_api_key>
-      # - AZURE_API_BASE=<your_azure_api_base>
-      # - AZURE_API_VERSION=<your_azure_api_version>
+      # - LLM_KEY=AZURE_OPENAI                          # Leave this value static, don't change it
+      # - AZURE_DEPLOYMENT=<your_azure_deployment>      # Use the OpenAI model "Deployment Name" that you deployed, using the steps above
+      # - AZURE_API_KEY=<your_azure_api_key>            # Copy and paste Key1 or Key2 from the OpenAI resource in Azure Portal
+      # - AZURE_API_BASE=<your_azure_api_base>          # Copy and paste the "Endpoint" from the OpenAI resource in Azure Portal (eg. https://xyzxyzxyz.openai.azure.com/)
+      # - AZURE_API_VERSION=<your_azure_api_version>    # Specify a valid Azure OpenAI data-plane API version (eg. 2024-08-01-preview) Docs: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference
       # Amazon Bedrock Support:
       # Amazon Bedrock is a managed service that enables you to invoke LLMs and bill them through your AWS account.
       # To use Amazon Bedrock as the LLM provider for Skyvern, specify the following environment variables.
