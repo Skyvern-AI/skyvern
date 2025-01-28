@@ -47,6 +47,20 @@ services:
       # - AZURE_API_KEY=<your_azure_api_key>
       # - AZURE_API_BASE=<your_azure_api_base>
       # - AZURE_API_VERSION=<your_azure_api_version>
+      # Amazon Bedrock Support:
+      # Amazon Bedrock is a managed service that enables you to invoke LLMs and bill them through your AWS account.
+      # To use Amazon Bedrock as the LLM provider for Skyvern, specify the following environment variables.
+      # 1. In the AWS IAM console, create a new AWS IAM User (name it whatever you want)
+      # 2. Assign the "AmazonBedrockFullAccess" policy to the user
+      # 3. Generate an IAM Access Key under the IAM User's Security Credentials tab
+      # 4. In the Amazon Bedrock console, go to "Model Access"
+      # 5. Click Modify Model Access button
+      # 6. Enable "Claude 3.5 Sonnet v2" and save changes
+      # - ENABLE_BEDROCK=true
+      # - LLM_KEY=BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET   # This is the Claude 3.5 Sonnet "V2" model. Change to BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_V1 for the non-v2 version.
+      # - AWS_REGION=us-west-2                         # Replace this with a different AWS region, if you desire
+      # - AWS_ACCESS_KEY_ID=FILL_ME_IN_PLEASE
+      # - AWS_SECRET_ACCESS_KEY=FILL_ME_IN_PLEASE
     depends_on:
       postgres:
         condition: service_healthy
