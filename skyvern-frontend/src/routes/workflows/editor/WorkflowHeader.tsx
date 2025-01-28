@@ -13,6 +13,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { globalWorkflowIds } from "@/util/env";
 
 type Props = {
   title: string;
@@ -30,6 +31,9 @@ function WorkflowHeader({
   onTitleChange,
 }: Props) {
   const { workflowPermanentId } = useParams();
+  const isGlobalWorkflow = Boolean(
+    workflowPermanentId && globalWorkflowIds.includes(workflowPermanentId),
+  );
   const navigate = useNavigate();
 
   return (
@@ -51,6 +55,7 @@ function WorkflowHeader({
                 size="icon"
                 variant="tertiary"
                 className="size-10"
+                disabled={isGlobalWorkflow}
                 onClick={() => {
                   onSave();
                 }}
