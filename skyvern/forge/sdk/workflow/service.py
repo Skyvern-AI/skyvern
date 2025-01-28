@@ -49,6 +49,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     PDFParserBlock,
     SendEmailBlock,
     TaskBlock,
+    TaskV2Block,
     TextPromptBlock,
     UploadToS3Block,
     ValidationBlock,
@@ -96,6 +97,7 @@ class WorkflowService:
         is_template_workflow: bool = False,
         version: int | None = None,
         max_steps_override: int | None = None,
+        parent_workflow_run_id: str | None = None,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -127,6 +129,7 @@ class WorkflowService:
             workflow_permanent_id=workflow_permanent_id,
             workflow_id=workflow_id,
             organization_id=organization_id,
+            parent_workflow_run_id=parent_workflow_run_id,
         )
         LOG.info(
             f"Created workflow run {workflow_run.workflow_run_id} for workflow {workflow.workflow_id}",
@@ -625,7 +628,12 @@ class WorkflowService:
         )
 
     async def create_workflow_run(
-        self, workflow_request: WorkflowRequestBody, workflow_permanent_id: str, workflow_id: str, organization_id: str
+        self,
+        workflow_request: WorkflowRequestBody,
+        workflow_permanent_id: str,
+        workflow_id: str,
+        organization_id: str,
+        parent_workflow_run_id: str | None = None,
     ) -> WorkflowRun:
         return await app.DATABASE.create_workflow_run(
             workflow_permanent_id=workflow_permanent_id,
@@ -635,6 +643,7 @@ class WorkflowService:
             webhook_callback_url=workflow_request.webhook_callback_url,
             totp_verification_url=workflow_request.totp_verification_url,
             totp_identifier=workflow_request.totp_identifier,
+            parent_workflow_run_id=parent_workflow_run_id,
         )
 
     async def mark_workflow_run_as_completed(self, workflow_run_id: str) -> None:
@@ -1730,6 +1739,16 @@ class WorkflowService:
                 totp_identifier=block_yaml.totp_identifier,
                 cache_actions=block_yaml.cache_actions,
                 complete_on_download=True,
+            )
+        elif block_yaml.block_type == BlockType.TaskV2:
+            return TaskV2Block(
+                label=block_yaml.label,
+                prompt=block_yaml.prompt,
+                url=block_yaml.url,
+                totp_verification_url=block_yaml.totp_verification_url,
+                totp_identifier=block_yaml.totp_identifier,
+                max_iterations=block_yaml.max_iterations,
+                output_parameter=output_parameter,
             )
 
         raise ValueError(f"Invalid block type {block_yaml.block_type}")
