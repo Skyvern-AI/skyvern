@@ -30,10 +30,11 @@ import {
   useParams,
   useSearchParams,
 } from "react-router-dom";
-import { WorkflowApiResponse } from "./types/workflowTypes";
 import { WorkflowActions } from "./WorkflowActions";
 import { useState } from "react";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
+import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
+import { globalWorkflowIds } from "@/util/env";
 
 function WorkflowPage() {
   const credentialGetter = useCredentialGetter();
@@ -49,7 +50,12 @@ function WorkflowPage() {
     queryKey: ["workflowRuns", workflowPermanentId, { statusFilters }, page],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
+      const isGlobalWorkflow =
+        workflowPermanentId && globalWorkflowIds.includes(workflowPermanentId);
       const params = new URLSearchParams();
+      if (isGlobalWorkflow) {
+        params.set("template", "true");
+      }
       params.append("page", String(page));
       return client
         .get(`/workflows/${workflowPermanentId}/runs`, {
@@ -60,16 +66,9 @@ function WorkflowPage() {
     refetchOnMount: "always",
   });
 
-  const { data: workflow, isLoading: workflowIsLoading } =
-    useQuery<WorkflowApiResponse>({
-      queryKey: ["workflow", workflowPermanentId],
-      queryFn: async () => {
-        const client = await getClient(credentialGetter);
-        return client
-          .get(`/workflows/${workflowPermanentId}`)
-          .then((response) => response.data);
-      },
-    });
+  const { data: workflow, isLoading: workflowIsLoading } = useWorkflowQuery({
+    workflowPermanentId,
+  });
 
   if (!workflowPermanentId) {
     return null; // this should never happen

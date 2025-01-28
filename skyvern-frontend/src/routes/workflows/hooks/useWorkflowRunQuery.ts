@@ -5,6 +5,7 @@ import {
   statusIsNotFinalized,
   statusIsRunningOrQueued,
 } from "@/routes/tasks/types";
+import { globalWorkflowIds } from "@/util/env";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useParams } from "react-router-dom";
 
@@ -16,8 +17,16 @@ function useWorkflowRunQuery() {
     queryKey: ["workflowRun", workflowPermanentId, workflowRunId],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
+      const isGlobalWorkflow =
+        workflowPermanentId && globalWorkflowIds.includes(workflowPermanentId);
+      const params = new URLSearchParams();
+      if (isGlobalWorkflow) {
+        params.set("template", "true");
+      }
       return client
-        .get(`/workflows/${workflowPermanentId}/runs/${workflowRunId}`)
+        .get(`/workflows/${workflowPermanentId}/runs/${workflowRunId}`, {
+          params,
+        })
         .then((response) => response.data);
     },
     refetchInterval: (query) => {
