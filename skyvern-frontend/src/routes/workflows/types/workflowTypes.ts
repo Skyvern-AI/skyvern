@@ -236,6 +236,7 @@ export type ForLoopBlock = WorkflowBlockBase & {
   loop_over: WorkflowParameter;
   loop_blocks: Array<WorkflowBlock>;
   loop_variable_reference: string | null;
+  complete_if_empty: boolean;
 };
 
 export type CodeBlock = WorkflowBlockBase & {
