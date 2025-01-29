@@ -78,7 +78,6 @@ function createTaskRequestObject(
     proxy_location: formValues.proxyLocation ?? ProxyLocation.Residential,
     navigation_payload: transform(formValues.navigationPayload),
     extracted_information_schema: extractedInformationSchema,
-    totp_verification_url: transform(formValues.totpVerificationUrl),
     totp_identifier: transform(formValues.totpIdentifier),
     error_code_mapping: errorCodeMapping,
   };
@@ -556,32 +555,6 @@ function CreateNewTaskForm({ initialValues }: Props) {
                   )}
                 />
                 <Separator />
-                <FormField
-                  control={form.control}
-                  name="totpVerificationUrl"
-                  render={({ field }) => (
-                    <FormItem>
-                      <div className="flex gap-16">
-                        <FormLabel>
-                          <div className="w-72">
-                            <h1 className="text-lg">2FA Verification URL</h1>
-                            <h2 className="text-base text-slate-400"></h2>
-                          </div>
-                        </FormLabel>
-                        <div className="w-full">
-                          <FormControl>
-                            <Input
-                              {...field}
-                              placeholder="Provide your 2FA endpoint"
-                              value={field.value === null ? "" : field.value}
-                            />
-                          </FormControl>
-                          <FormMessage />
-                        </div>
-                      </div>
-                    </FormItem>
-                  )}
-                />
                 <FormField
                   control={form.control}
                   name="totpIdentifier"
