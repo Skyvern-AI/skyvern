@@ -144,7 +144,7 @@ function layout(
     const loopNodeWidth = 600; // 600 px
     const layouted = layoutUtil(childNodes, childEdges, {
       marginx: (loopNodeWidth - maxChildWidth) / 2,
-      marginy: 200,
+      marginy: 225,
     });
     loopNodeChildren[index] = layouted.nodes;
   });
@@ -381,6 +381,7 @@ function convertToNode(
           ...commonData,
           loopValue: block.loop_over?.key ?? "",
           loopVariableReference: loopVariableReference,
+          completeIfEmpty: block.complete_if_empty,
         },
       };
     }
@@ -1112,6 +1113,7 @@ function getWorkflowBlocksUtil(
           continue_on_failure: node.data.continueOnFailure,
           loop_blocks: getOrderedChildrenBlocks(nodes, edges, node.id),
           loop_variable_reference: node.data.loopVariableReference,
+          complete_if_empty: node.data.completeIfEmpty,
         },
       ];
     }
@@ -1628,6 +1630,7 @@ function convertBlocksToBlockYAML(
           loop_over_parameter_key: block.loop_over?.key ?? "",
           loop_blocks: convertBlocksToBlockYAML(block.loop_blocks),
           loop_variable_reference: block.loop_variable_reference,
+          complete_if_empty: block.complete_if_empty,
         };
         return blockYaml;
       }

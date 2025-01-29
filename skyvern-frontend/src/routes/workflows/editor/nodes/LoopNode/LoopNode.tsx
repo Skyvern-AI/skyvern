@@ -20,6 +20,7 @@ import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import type { LoopNode } from "./types";
 import { useState } from "react";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
+import { Checkbox } from "@/components/ui/checkbox";
 
 function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const { updateNodeData } = useReactFlow();
@@ -124,6 +125,27 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                   updateNodeData(id, { loopVariableReference: value });
                 }}
               />
+            </div>
+            <div className="space-y-2">
+              <div className="space-y-2">
+                <div className="flex gap-4">
+                  <div className="flex gap-2">
+                    <Label className="text-xs text-slate-300">
+                      Complete if Empty
+                    </Label>
+                    <HelpTooltip content="When checked, this block will successfully complete when the loop value is an empty list" />
+                  </div>
+                  <Checkbox
+                    checked={data.completeIfEmpty}
+                    disabled={!data.editable}
+                    onCheckedChange={(checked) => {
+                      updateNodeData(id, {
+                        completeIfEmpty: checked,
+                      });
+                    }}
+                  />
+                </div>
+              </div>
             </div>
           </div>
         </div>

@@ -4,6 +4,7 @@ import { NodeBaseData } from "../types";
 export type LoopNodeData = NodeBaseData & {
   loopValue: string;
   loopVariableReference: string;
+  completeIfEmpty: boolean;
 };
 
 export type LoopNode = Node<LoopNodeData, "loop">;
@@ -13,6 +14,7 @@ export const loopNodeDefaultData: LoopNodeData = {
   label: "",
   loopValue: "",
   loopVariableReference: "",
+  completeIfEmpty: false,
   continueOnFailure: false,
 } as const;
 

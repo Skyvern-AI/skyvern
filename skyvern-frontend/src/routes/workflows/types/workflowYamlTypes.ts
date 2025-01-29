@@ -265,6 +265,7 @@ export type ForLoopBlockYAML = BlockYAMLBase & {
   loop_over_parameter_key?: string;
   loop_blocks: Array<BlockYAML>;
   loop_variable_reference: string | null;
+  complete_if_empty: boolean;
 };
 
 export type PDFParserBlockYAML = BlockYAMLBase & {
