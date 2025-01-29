@@ -361,29 +361,6 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                 <div className="space-y-2">
                   <div className="flex gap-2">
                     <Label className="text-xs text-slate-300">
-                      2FA Verification URL
-                    </Label>
-                    <HelpTooltip
-                      content={
-                        helpTooltips["navigation"]["totpVerificationUrl"]
-                      }
-                    />
-                  </div>
-                  <WorkflowBlockInputTextarea
-                    nodeId={id}
-                    onChange={(value) => {
-                      handleChange("totpVerificationUrl", value);
-                    }}
-                    value={inputs.totpVerificationUrl ?? ""}
-                    placeholder={
-                      placeholders["navigation"]["totpVerificationUrl"]
-                    }
-                    className="nopan text-xs"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <div className="flex gap-2">
-                    <Label className="text-xs text-slate-300">
                       2FA Identifier
                     </Label>
                     <HelpTooltip

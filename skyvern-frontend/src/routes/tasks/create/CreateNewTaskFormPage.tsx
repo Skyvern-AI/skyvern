@@ -59,7 +59,6 @@ function CreateNewTaskFormPage() {
             ),
             errorCodeMapping: null,
             totpIdentifier: null,
-            totpVerificationUrl: null,
             webhookCallbackUrl: null,
             proxyLocation: null,
           }}
@@ -127,8 +126,6 @@ function CreateNewTaskFormPage() {
               : JSON.stringify(navigationPayload, null, 2),
           maxStepsOverride,
           totpIdentifier: data.workflow_definition.blocks[0].totp_identifier,
-          totpVerificationUrl:
-            data.workflow_definition.blocks[0].totp_verification_url,
           errorCodeMapping: JSON.stringify(errorCodeMapping, null, 2),
         }}
       />
