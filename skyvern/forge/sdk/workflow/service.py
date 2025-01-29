@@ -1512,6 +1512,7 @@ class WorkflowService:
                 loop_blocks=loop_blocks,
                 output_parameter=output_parameter,
                 continue_on_failure=block_yaml.continue_on_failure,
+                complete_if_empty=block_yaml.complete_if_empty,
             )
         elif block_yaml.block_type == BlockType.CODE:
             return CodeBlock(

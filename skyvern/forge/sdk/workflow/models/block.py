@@ -765,6 +765,7 @@ class ForLoopBlock(Block):
     loop_blocks: list[BlockTypeVar]
     loop_over: PARAMETER_TYPE | None = None
     loop_variable_reference: str | None = None
+    complete_if_empty: bool = False
 
     def get_all_parameters(
         self,
@@ -849,7 +850,10 @@ class ForLoopBlock(Block):
                 raise NotImplementedError()
 
         else:
-            raise NoIterableValueFound()
+            if self.complete_if_empty:
+                return []
+            else:
+                raise NoIterableValueFound()
 
         if isinstance(parameter_value, list):
             return parameter_value

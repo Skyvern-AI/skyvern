@@ -146,6 +146,7 @@ class ForLoopBlockYAML(BlockYAML):
     loop_blocks: list["BLOCK_YAML_SUBCLASSES"]
     loop_over_parameter_key: str = ""
     loop_variable_reference: str | None = None
+    complete_if_empty: bool = False
 
 
 class CodeBlockYAML(BlockYAML):
