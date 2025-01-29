@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     UnicodeText,
     UniqueConstraint,
+    desc,
 )
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase
@@ -476,7 +477,10 @@ class TOTPCodeModel(Base):
 
 class ActionModel(Base):
     __tablename__ = "actions"
-    __table_args__ = (Index("action_org_task_step_index", "organization_id", "task_id", "step_id"),)
+    __table_args__ = (
+        Index("action_org_task_step_index", "organization_id", "task_id", "step_id"),
+        Index("action_org_created_at_index", "organization_id", desc("created_at")),
+    )
 
     action_id = Column(String, primary_key=True, index=True, default=generate_action_id)
     action_type = Column(String, nullable=False)
