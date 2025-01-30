@@ -33,6 +33,7 @@ import {
   WaitBlockYAML,
   FileDownloadBlockYAML,
   PDFParserBlockYAML,
+  Taskv2BlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -86,6 +87,7 @@ import { isWaitNode, waitNodeDefaultData } from "./nodes/WaitNode/types";
 import { fileDownloadNodeDefaultData } from "./nodes/FileDownloadNode/types";
 import { ProxyLocation } from "@/api/types";
 import { pdfParserNodeDefaultData } from "./nodes/PDFParserNode/types";
+import { taskv2NodeDefaultData } from "./nodes/Taskv2Node/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -196,6 +198,21 @@ function convertToNode(
           cacheActions: block.cache_actions,
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
+        },
+      };
+    }
+    case "task_v2": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "taskv2",
+        data: {
+          ...commonData,
+          prompt: block.prompt,
+          url: block.url ?? "",
+          maxIterations: block.max_iterations,
+          totpIdentifier: block.totp_identifier,
+          totpVerificationUrl: block.totp_verification_url,
         },
       };
     }
@@ -650,6 +667,17 @@ function createNode(
         },
       };
     }
+    case "taskv2": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "taskv2",
+        data: {
+          ...taskv2NodeDefaultData,
+          label,
+        },
+      };
+    }
     case "validation": {
       return {
         ...identifiers,
@@ -857,6 +885,17 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         cache_actions: node.data.cacheActions,
+      };
+    }
+    case "taskv2": {
+      return {
+        ...base,
+        block_type: "task_v2",
+        prompt: node.data.prompt,
+        max_iterations: node.data.maxIterations,
+        totp_identifier: node.data.totpIdentifier,
+        totp_verification_url: node.data.totpVerificationUrl,
+        url: node.data.url,
       };
     }
     case "validation": {
@@ -1510,6 +1549,18 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           cache_actions: block.cache_actions,
+        };
+        return blockYaml;
+      }
+      case "task_v2": {
+        const blockYaml: Taskv2BlockYAML = {
+          ...base,
+          block_type: "task_v2",
+          prompt: block.prompt,
+          url: block.url,
+          max_iterations: block.max_iterations,
+          totp_identifier: block.totp_identifier,
+          totp_verification_url: block.totp_verification_url,
         };
         return blockYaml;
       }
