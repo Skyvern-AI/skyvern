@@ -1924,6 +1924,33 @@ class AgentDB:
             totp_code = (await session.scalars(query)).all()
             return [TOTPCode.model_validate(totp_code) for totp_code in totp_code]
 
+    async def create_totp_code(
+        self,
+        organization_id: str,
+        totp_identifier: str,
+        content: str,
+        code: str,
+        task_id: str | None = None,
+        workflow_id: str | None = None,
+        source: str | None = None,
+        expired_at: datetime | None = None,
+    ) -> TOTPCode:
+        async with self.Session() as session:
+            new_totp_code = TOTPCodeModel(
+                organization_id=organization_id,
+                totp_identifier=totp_identifier,
+                content=content,
+                code=code,
+                task_id=task_id,
+                workflow_id=workflow_id,
+                source=source,
+                expired_at=expired_at,
+            )
+            session.add(new_totp_code)
+            await session.commit()
+            await session.refresh(new_totp_code)
+            return TOTPCode.model_validate(new_totp_code)
+
     async def create_action(self, action: Action) -> Action:
         async with self.Session() as session:
             new_action = ActionModel(
