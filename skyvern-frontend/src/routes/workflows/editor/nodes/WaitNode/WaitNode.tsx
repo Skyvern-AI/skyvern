@@ -10,8 +10,8 @@ import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import type { WaitNode } from "./types";
-import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
+import { Input } from "@/components/ui/input";
 
 function WaitNode({ id, data }: NodeProps<WaitNode>) {
   const { updateNodeData } = useReactFlow();
@@ -89,18 +89,10 @@ function WaitNode({ id, data }: NodeProps<WaitNode>) {
               </div>
             ) : null}
           </div>
-
-          <WorkflowBlockInput
-            nodeId={id}
-            type="number"
-            min="1"
-            max="300"
+          <Input
             value={inputs.waitInSeconds}
-            onChange={(value) => {
-              if (!editable) {
-                return;
-              }
-              handleChange("waitInSeconds", Number(value));
+            onChange={(event) => {
+              handleChange("waitInSeconds", event.target.value);
             }}
             className="nopan text-xs"
           />

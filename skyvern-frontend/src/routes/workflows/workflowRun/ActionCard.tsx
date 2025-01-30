@@ -19,7 +19,7 @@ function ActionCard({ action, onClick, active, index }: Props) {
     if (element && active) {
       element.scrollIntoView({
         behavior: "smooth",
-        block: "center",
+        block: "start",
       });
     }
     // this should only run once at mount.

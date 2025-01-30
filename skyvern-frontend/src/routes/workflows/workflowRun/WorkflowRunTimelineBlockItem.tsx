@@ -1,4 +1,9 @@
-import { CubeIcon, ExternalLinkIcon } from "@radix-ui/react-icons";
+import {
+  CheckCircledIcon,
+  CrossCircledIcon,
+  CubeIcon,
+  ExternalLinkIcon,
+} from "@radix-ui/react-icons";
 import { workflowBlockTitle } from "../editor/nodes/types";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
 import {
@@ -15,6 +20,7 @@ import { cn } from "@/util/utils";
 import { isTaskVariantBlock } from "../types/workflowTypes";
 import { Link } from "react-router-dom";
 import { useCallback } from "react";
+import { Status } from "@/api/types";
 
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
@@ -55,12 +61,22 @@ function WorkflowRunTimelineBlockItem({
     ) {
       element.scrollIntoView({
         behavior: "smooth",
-        block: "center",
+        block: "start",
       });
     }
     // this should only run once at mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const showStatusIndicator = block.status !== null;
+  const showSuccessIndicator =
+    showStatusIndicator && block.status === Status.Completed;
+  const showFailureIndicator =
+    showStatusIndicator &&
+    (block.status === Status.Failed ||
+      block.status === Status.Terminated ||
+      block.status === Status.TimedOut ||
+      block.status === Status.Canceled);
 
   return (
     <div
@@ -87,20 +103,32 @@ function WorkflowRunTimelineBlockItem({
             />
             <span>{workflowBlockTitle[block.block_type]}</span>
           </div>
-          <div className="flex items-center gap-1 rounded bg-slate-elevation5 px-2 py-1">
-            {showDiagnosticLink ? (
-              <Link to={`/tasks/${block.task_id}/diagnostics`}>
-                <div className="flex gap-1">
-                  <ExternalLinkIcon className="size-4" />
-                  <span className="text-xs">Diagnostics</span>
-                </div>
-              </Link>
-            ) : (
-              <>
-                <CubeIcon className="size-4" />
-                <span className="text-xs">Block</span>
-              </>
+          <div className="flex gap-2">
+            {showFailureIndicator && (
+              <div className="bg-slate-elevation5 px-2 py-1">
+                <CrossCircledIcon className="size-4 text-destructive" />
+              </div>
             )}
+            {showSuccessIndicator && (
+              <div className="bg-slate-elevation5 px-2 py-1">
+                <CheckCircledIcon className="size-4 text-success" />
+              </div>
+            )}
+            <div className="flex items-center gap-1 rounded bg-slate-elevation5 px-2 py-1">
+              {showDiagnosticLink ? (
+                <Link to={`/tasks/${block.task_id}/diagnostics`}>
+                  <div className="flex gap-1">
+                    <ExternalLinkIcon className="size-4" />
+                    <span className="text-xs">Diagnostics</span>
+                  </div>
+                </Link>
+              ) : (
+                <>
+                  <CubeIcon className="size-4" />
+                  <span className="text-xs">Block</span>
+                </>
+              )}
+            </div>
           </div>
         </div>
         {block.description ? (
