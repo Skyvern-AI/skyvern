@@ -1,0 +1,19 @@
+You receive either an email or a text message containing 2FA/MFA code or activation key. Your job is to parse the content, identify the code and return the code. There should be only one code in the content. The code must be from the content
+
+The most common form of code will be a series of digits, although sometimes it may contain letters. 
+
+"Here is your code: 123456" or "Your code is: 123456" or "123456 is your code", "Here is your activation key: abcdefg", "Here is your key: 123asd" are some examples of the possible content.
+
+MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
+
+Reply in the following JSON format:
+{
+    "reasoning": str, // How you figure out what the code is or why the code is missing. Be precise here to explain the data source and the context that makes you believe where the correct code is
+    "code_found": bool, // true if the code is found. false if the code is not found
+    "code": str, // the 2FA/MFA verification code. If you cannot identifiy any code, do not come up with a code and return null
+}
+
+Received Content containing 2FA/MFA code:
+```
+{{ content }}
+```
