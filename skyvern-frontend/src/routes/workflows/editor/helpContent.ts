@@ -39,6 +39,11 @@ export const basePlaceholderContent = {
 
 export const helpTooltips = {
   task: baseHelpTooltipContent,
+  taskv2: {
+    ...baseHelpTooltipContent,
+    maxIterations:
+      "The maximum number of iterations this task will take to achieve its goal.",
+  },
   navigation: baseHelpTooltipContent,
   extraction: {
     ...baseHelpTooltipContent,
@@ -100,6 +105,10 @@ export const helpTooltips = {
 
 export const placeholders = {
   task: basePlaceholderContent,
+  taskv2: {
+    ...basePlaceholderContent,
+    prompt: "Tell Skyvern what to do",
+  },
   navigation: {
     ...basePlaceholderContent,
     navigationGoal:

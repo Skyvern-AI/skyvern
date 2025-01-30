@@ -98,7 +98,8 @@ export type BlockYAML =
   | LoginBlockYAML
   | WaitBlockYAML
   | FileDownloadBlockYAML
-  | PDFParserBlockYAML;
+  | PDFParserBlockYAML
+  | Taskv2BlockYAML;
 
 export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
@@ -124,6 +125,15 @@ export type TaskBlockYAML = BlockYAMLBase & {
   cache_actions: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
+};
+
+export type Taskv2BlockYAML = BlockYAMLBase & {
+  block_type: "task_v2";
+  url: string | null;
+  prompt: string;
+  totp_verification_url: string | null;
+  totp_identifier: string | null;
+  max_iterations: number | null;
 };
 
 export type ValidationBlockYAML = BlockYAMLBase & {

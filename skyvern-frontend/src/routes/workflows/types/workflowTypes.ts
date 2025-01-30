@@ -155,7 +155,8 @@ export type WorkflowBlock =
   | LoginBlock
   | WaitBlock
   | FileDownloadBlock
-  | PDFParserBlock;
+  | PDFParserBlock
+  | Taskv2Block;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -174,6 +175,7 @@ export const WorkflowBlockTypes = {
   Wait: "wait",
   FileDownload: "file_download",
   PDFParser: "pdf_parser",
+  Taskv2: "task_v2",
 } as const;
 
 export function isTaskVariantBlock(item: {
@@ -229,6 +231,15 @@ export type TaskBlock = WorkflowBlockBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+};
+
+export type Taskv2Block = WorkflowBlockBase & {
+  block_type: "task_v2";
+  prompt: string;
+  url: string | null;
+  totp_verification_url: string | null;
+  totp_identifier: string | null;
+  max_iterations: number | null;
 };
 
 export type ForLoopBlock = WorkflowBlockBase & {

@@ -68,6 +68,17 @@ const nodeLibraryItems: Array<{
     description: "Takes actions or extracts information",
   },
   {
+    nodeType: "taskv2",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Taskv2}
+        className="size-6"
+      />
+    ),
+    title: "Task v2 Block",
+    description: "Runs a Skyvern v2 Task",
+  },
+  {
     nodeType: "textPrompt",
     icon: (
       <WorkflowBlockIcon
