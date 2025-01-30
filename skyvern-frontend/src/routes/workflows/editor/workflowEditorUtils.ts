@@ -82,7 +82,7 @@ import {
   isExtractionNode,
 } from "./nodes/ExtractionNode/types";
 import { loginNodeDefaultData } from "./nodes/LoginNode/types";
-import { waitNodeDefaultData } from "./nodes/WaitNode/types";
+import { isWaitNode, waitNodeDefaultData } from "./nodes/WaitNode/types";
 import { fileDownloadNodeDefaultData } from "./nodes/FileDownloadNode/types";
 import { ProxyLocation } from "@/api/types";
 import { pdfParserNodeDefaultData } from "./nodes/PDFParserNode/types";
@@ -301,7 +301,7 @@ function convertToNode(
         type: "wait",
         data: {
           ...commonData,
-          waitInSeconds: block.wait_sec ?? 1,
+          waitInSeconds: String(block.wait_sec ?? 1),
         },
       };
     }
@@ -962,7 +962,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
       return {
         ...base,
         block_type: "wait",
-        wait_sec: node.data.waitInSeconds,
+        wait_sec: Number(node.data.waitInSeconds),
       };
     }
     case "fileDownload": {
@@ -1806,6 +1806,18 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   extractionNodes.forEach((node) => {
     if (node.data.dataExtractionGoal.length === 0) {
       errors.push(`${node.data.label}: Data extraction goal is required.`);
+    }
+  });
+
+  const waitNodes = nodes.filter(isWaitNode);
+  waitNodes.forEach((node) => {
+    const waitTimeString = node.data.waitInSeconds.trim();
+
+    const decimalRegex = new RegExp("^\\d+$");
+    const isNumber = decimalRegex.test(waitTimeString);
+
+    if (!isNumber) {
+      errors.push(`${node.data.label}: Invalid input for wait time.`);
     }
   });
 
