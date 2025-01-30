@@ -79,6 +79,17 @@ const nodeLibraryItems: Array<{
     description: "Runs a Skyvern v2 Task",
   },
   {
+    nodeType: "url",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.URL}
+        className="size-6"
+      />
+    ),
+    title: "Go to URL Block",
+    description: "Navigates to a URL",
+  },
+  {
     nodeType: "textPrompt",
     icon: (
       <WorkflowBlockIcon

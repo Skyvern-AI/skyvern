@@ -34,6 +34,7 @@ import {
   FileDownloadBlockYAML,
   PDFParserBlockYAML,
   Taskv2BlockYAML,
+  URLBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -88,6 +89,7 @@ import { fileDownloadNodeDefaultData } from "./nodes/FileDownloadNode/types";
 import { ProxyLocation } from "@/api/types";
 import { pdfParserNodeDefaultData } from "./nodes/PDFParserNode/types";
 import { taskv2NodeDefaultData } from "./nodes/Taskv2Node/types";
+import { urlNodeDefaultData } from "./nodes/URLNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -447,6 +449,18 @@ function convertToNode(
         data: {
           ...commonData,
           path: block.path,
+        },
+      };
+    }
+
+    case "goto_url": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "url",
+        data: {
+          ...commonData,
+          url: block.url,
         },
       };
     }
@@ -843,6 +857,17 @@ function createNode(
         },
       };
     }
+    case "url": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "url",
+        data: {
+          ...urlNodeDefaultData,
+          label,
+        },
+      };
+    }
   }
 }
 
@@ -1092,6 +1117,13 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         block_type: "pdf_parser",
         file_url: node.data.fileUrl,
         json_schema: JSONParseSafe(node.data.jsonSchema),
+      };
+    }
+    case "url": {
+      return {
+        ...base,
+        block_type: "goto_url",
+        url: node.data.url,
       };
     }
     default: {
@@ -1751,6 +1783,14 @@ function convertBlocksToBlockYAML(
           subject: block.subject,
           body: block.body,
           file_attachments: block.file_attachments,
+        };
+        return blockYaml;
+      }
+      case "goto_url": {
+        const blockYaml: URLBlockYAML = {
+          ...base,
+          block_type: "goto_url",
+          url: block.url,
         };
         return blockYaml;
       }
