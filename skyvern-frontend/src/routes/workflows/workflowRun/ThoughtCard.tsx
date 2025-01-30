@@ -15,7 +15,7 @@ function ThoughtCard({ thought, onClick, active }: Props) {
     if (element && active) {
       element.scrollIntoView({
         behavior: "smooth",
-        block: "center",
+        block: "start",
       });
     }
     // this should only run once at mount.
