@@ -101,6 +101,7 @@ export const helpTooltips = {
     fileUrl: "The URL from which the file will be downloaded",
     jsonSchema: "Specify a format for the extracted information from the file",
   },
+  url: baseHelpTooltipContent,
 };
 
 export const placeholders = {
@@ -140,4 +141,8 @@ export const placeholders = {
   fileUrl: basePlaceholderContent,
   wait: basePlaceholderContent,
   pdfParser: basePlaceholderContent,
+  url: {
+    ...basePlaceholderContent,
+    url: "(required) Navigate to this URL: https://...",
+  },
 };

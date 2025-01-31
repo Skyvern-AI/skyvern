@@ -156,7 +156,8 @@ export type WorkflowBlock =
   | WaitBlock
   | FileDownloadBlock
   | PDFParserBlock
-  | Taskv2Block;
+  | Taskv2Block
+  | URLBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -176,6 +177,7 @@ export const WorkflowBlockTypes = {
   FileDownload: "file_download",
   PDFParser: "pdf_parser",
   Taskv2: "task_v2",
+  URL: "goto_url",
 } as const;
 
 export function isTaskVariantBlock(item: {
@@ -387,6 +389,11 @@ export type PDFParserBlock = WorkflowBlockBase & {
   block_type: "pdf_parser";
   file_url: string;
   json_schema: Record<string, unknown> | null;
+};
+
+export type URLBlock = WorkflowBlockBase & {
+  block_type: "goto_url";
+  url: string;
 };
 
 export type WorkflowDefinition = {

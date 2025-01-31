@@ -99,7 +99,8 @@ export type BlockYAML =
   | WaitBlockYAML
   | FileDownloadBlockYAML
   | PDFParserBlockYAML
-  | Taskv2BlockYAML;
+  | Taskv2BlockYAML
+  | URLBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
@@ -282,4 +283,9 @@ export type PDFParserBlockYAML = BlockYAMLBase & {
   block_type: "pdf_parser";
   file_url: string;
   json_schema: Record<string, unknown> | null;
+};
+
+export type URLBlockYAML = BlockYAMLBase & {
+  block_type: "goto_url";
+  url: string;
 };
