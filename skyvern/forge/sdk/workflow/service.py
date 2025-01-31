@@ -52,6 +52,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     TaskV2Block,
     TextPromptBlock,
     UploadToS3Block,
+    UrlBlock,
     ValidationBlock,
     WaitBlock,
 )
@@ -1749,6 +1750,12 @@ class WorkflowService:
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 max_iterations=block_yaml.max_iterations,
+                output_parameter=output_parameter,
+            )
+        elif block_yaml.block_type == BlockType.GOTO_URL:
+            return UrlBlock(
+                label=block_yaml.label,
+                url=block_yaml.url,
                 output_parameter=output_parameter,
             )
 
