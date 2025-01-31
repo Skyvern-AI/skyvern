@@ -342,6 +342,28 @@ class ForgeAgent:
                 detailed_output,
             ) = await self._initialize_execution_state(task, step, workflow_run, browser_session_id)
 
+            if (
+                not task.navigation_goal
+                and not task.data_extraction_goal
+                and not task.complete_criterion
+                and not task.terminate_criterion
+            ):
+                # most likely a GOTO_URL task block
+                # mark step as completed and mark task as completed
+                step = await self.update_step(
+                    step, status=StepStatus.completed, is_last=True, output=AgentStepOutput(action_results=[])
+                )
+                task = await self.update_task(task, status=TaskStatus.completed)
+                await self.clean_up_task(
+                    task=task,
+                    last_step=step,
+                    api_key=api_key,
+                    need_call_webhook=True,
+                    close_browser_on_completion=close_browser_on_completion,
+                    browser_session_id=browser_session_id,
+                )
+                return step, detailed_output, None
+
             if page := await browser_state.get_working_page():
                 await self.register_async_operations(organization, task, page)
 
