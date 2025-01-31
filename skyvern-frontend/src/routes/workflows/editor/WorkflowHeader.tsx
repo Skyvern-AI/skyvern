@@ -1,19 +1,19 @@
 import { SaveIcon } from "@/components/icons/SaveIcon";
 import { Button } from "@/components/ui/button";
 import {
-  ChevronDownIcon,
-  ChevronUpIcon,
-  PlayIcon,
-} from "@radix-ui/react-icons";
-import { useNavigate, useParams } from "react-router-dom";
-import { EditableNodeTitle } from "./nodes/components/EditableNodeTitle";
-import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { globalWorkflowIds } from "@/util/env";
+import {
+  ChevronDownIcon,
+  ChevronUpIcon,
+  PlayIcon,
+} from "@radix-ui/react-icons";
+import { useNavigate, useParams } from "react-router-dom";
+import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
+import { EditableNodeTitle } from "./nodes/components/EditableNodeTitle";
 
 type Props = {
   title: string;
@@ -31,10 +31,16 @@ function WorkflowHeader({
   onTitleChange,
 }: Props) {
   const { workflowPermanentId } = useParams();
-  const isGlobalWorkflow = Boolean(
-    workflowPermanentId && globalWorkflowIds.includes(workflowPermanentId),
-  );
+  const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const navigate = useNavigate();
+
+  if (!globalWorkflows) {
+    return null; // this should be loaded already by some other components
+  }
+
+  const isGlobalWorkflow = globalWorkflows.some(
+    (workflow) => workflow.workflow_permanent_id === workflowPermanentId,
+  );
 
   return (
     <div className="flex h-full w-full justify-between rounded-xl bg-slate-elevation2 px-6 py-5">
