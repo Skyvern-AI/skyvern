@@ -189,7 +189,7 @@ async def get_user_detail_answers(
         )
 
         llm_response = await app.SECONDARY_LLM_API_HANDLER(
-            prompt=question_answering_prompt, step=step, screenshots=None
+            prompt=question_answering_prompt, step=step, screenshots=None, prompt_name="answer-user-detail-questions"
         )
         return llm_response
     except Exception as e:

@@ -61,6 +61,7 @@ class LLMAPIHandlerFactory:
 
         async def llm_api_handler_with_router_and_fallback(
             prompt: str,
+            prompt_name: str,
             step: Step | None = None,
             observer_cruise: ObserverTask | None = None,
             observer_thought: ObserverThought | None = None,
@@ -80,6 +81,8 @@ class LLMAPIHandlerFactory:
             Returns:
                 The response from the LLM router.
             """
+            start_time = time.time()
+
             if parameters is None:
                 parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
 
@@ -195,6 +198,21 @@ class LLMAPIHandlerFactory:
                     ai_suggestion=ai_suggestion,
                 )
 
+            # Track LLM API handler duration
+            duration_seconds = time.time() - start_time
+            LOG.info(
+                "LLM API handler duration metrics",
+                llm_key=llm_key,
+                model=main_model_group,
+                prompt_name=prompt_name,
+                duration_seconds=duration_seconds,
+                step_id=step.step_id if step else None,
+                observer_thought_id=observer_thought.observer_thought_id if observer_thought else None,
+                organization_id=step.organization_id
+                if step
+                else (observer_thought.organization_id if observer_thought else None),
+            )
+
             return parsed_response
 
         return llm_api_handler_with_router_and_fallback
@@ -210,6 +228,7 @@ class LLMAPIHandlerFactory:
 
         async def llm_api_handler(
             prompt: str,
+            prompt_name: str,
             step: Step | None = None,
             observer_cruise: ObserverTask | None = None,
             observer_thought: ObserverThought | None = None,
@@ -217,6 +236,7 @@ class LLMAPIHandlerFactory:
             screenshots: list[bytes] | None = None,
             parameters: dict[str, Any] | None = None,
         ) -> dict[str, Any]:
+            start_time = time.time()
             active_parameters = base_parameters or {}
             if parameters is None:
                 parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
@@ -349,6 +369,21 @@ class LLMAPIHandlerFactory:
                     observer_thought=observer_thought,
                     ai_suggestion=ai_suggestion,
                 )
+
+            # Track LLM API handler duration
+            duration_seconds = time.time() - start_time
+            LOG.info(
+                "LLM API handler duration metrics",
+                llm_key=llm_key,
+                prompt_name=prompt_name,
+                model=llm_config.model_name,
+                duration_seconds=duration_seconds,
+                step_id=step.step_id if step else None,
+                observer_thought_id=observer_thought.observer_thought_id if observer_thought else None,
+                organization_id=step.organization_id
+                if step
+                else (observer_thought.organization_id if observer_thought else None),
+            )
 
             return parsed_response
 

@@ -41,5 +41,5 @@ async def save_totp_code(
 
 async def parse_totp_code(content: str) -> str | None:
     prompt = prompt_engine.load_prompt("parse-verification-code", content=content)
-    code_resp = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt)
+    code_resp = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, prompt_name="parse-verification-code")
     return code_resp.get("code", None)
