@@ -39,6 +39,9 @@ function ProxySelector({ value, onChange, className }: Props) {
         <SelectItem value={ProxyLocation.ResidentialFR}>
           Residential (France)
         </SelectItem>
+        <SelectItem value={ProxyLocation.ResidentialDE}>
+          Residential (Germany)
+        </SelectItem>
       </SelectContent>
     </Select>
   );
