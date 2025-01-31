@@ -943,6 +943,22 @@ async def get_workflows(
     )
 
 
+@base_router.get("/workflows/templates", response_model=list[Workflow])
+@base_router.get("/workflows/templates/", response_model=list[Workflow], include_in_schema=False)
+async def get_workflow_templates() -> list[Workflow]:
+    global_workflows_permanent_ids = await app.STORAGE.retrieve_global_workflows()
+
+    if not global_workflows_permanent_ids:
+        return []
+
+    workflows = await app.WORKFLOW_SERVICE.get_workflows_by_permanent_ids(
+        workflow_permanent_ids=global_workflows_permanent_ids,
+        statuses=[WorkflowStatus.published, WorkflowStatus.draft],
+    )
+
+    return workflows
+
+
 @base_router.get("/workflows/{workflow_permanent_id}", response_model=Workflow)
 @base_router.get("/workflows/{workflow_permanent_id}/", response_model=Workflow)
 async def get_workflow(
