@@ -101,7 +101,7 @@ services:
       - VITE_WSS_BASE_URL=ws://localhost:8000/api/v1
     #   - VITE_ARTIFACT_API_BASE_URL=http://localhost:9090
     #   - VITE_API_BASE_URL=http://localhost:8000/api/v1
-    #   - VITE_SKYVERN_API_KEY=
+    #   - VITE_SKYVERN_API_KEY=<get this from "settings" in the Skyvern UI>
     depends_on:
       skyvern:
         condition: service_healthy
