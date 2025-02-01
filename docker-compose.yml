@@ -97,7 +97,7 @@ services:
     # If you're self-hosting this behind a dns, you'll want to set:
     #   A route for the API: api.yourdomain.com -> localhost:8000
     #   A route for the UI: yourdomain.com -> localhost:8080
-    #   A route for the artifact API: artifact.yourdomain.com -> localhost:9090
+    #   A route for the artifact API: artifact.yourdomain.com -> localhost:9090 (maybe not needed)
       - VITE_WSS_BASE_URL=ws://localhost:8000/api/v1
     #   - VITE_ARTIFACT_API_BASE_URL=http://localhost:9090
     #   - VITE_API_BASE_URL=http://localhost:8000/api/v1
