@@ -67,7 +67,10 @@ import {
   StartNodeData,
 } from "./nodes/StartNode/types";
 import { isTaskNode, taskNodeDefaultData } from "./nodes/TaskNode/types";
-import { textPromptNodeDefaultData } from "./nodes/TextPromptNode/types";
+import {
+  isTextPromptNode,
+  textPromptNodeDefaultData,
+} from "./nodes/TextPromptNode/types";
 import { NodeBaseData } from "./nodes/types";
 import { uploadNodeDefaultData } from "./nodes/UploadNode/types";
 import {
@@ -87,7 +90,10 @@ import { loginNodeDefaultData } from "./nodes/LoginNode/types";
 import { isWaitNode, waitNodeDefaultData } from "./nodes/WaitNode/types";
 import { fileDownloadNodeDefaultData } from "./nodes/FileDownloadNode/types";
 import { ProxyLocation } from "@/api/types";
-import { pdfParserNodeDefaultData } from "./nodes/PDFParserNode/types";
+import {
+  isPdfParserNode,
+  pdfParserNodeDefaultData,
+} from "./nodes/PDFParserNode/types";
 import { taskv2NodeDefaultData } from "./nodes/Taskv2Node/types";
 import { urlNodeDefaultData } from "./nodes/URLNode/types";
 
@@ -1897,6 +1903,29 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   extractionNodes.forEach((node) => {
     if (node.data.dataExtractionGoal.length === 0) {
       errors.push(`${node.data.label}: Data extraction goal is required.`);
+    }
+    try {
+      JSON.parse(node.data.dataSchema);
+    } catch {
+      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+    }
+  });
+
+  const textPromptNodes = nodes.filter(isTextPromptNode);
+  textPromptNodes.forEach((node) => {
+    try {
+      JSON.parse(node.data.jsonSchema);
+    } catch {
+      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+    }
+  });
+
+  const pdfParserNodes = nodes.filter(isPdfParserNode);
+  pdfParserNodes.forEach((node) => {
+    try {
+      JSON.parse(node.data.jsonSchema);
+    } catch {
+      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
     }
   });
 

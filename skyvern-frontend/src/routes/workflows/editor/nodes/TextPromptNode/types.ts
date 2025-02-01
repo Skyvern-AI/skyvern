@@ -1,5 +1,6 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
+import { AppNode } from "..";
 
 export type TextPromptNodeData = NodeBaseData & {
   prompt: string;
@@ -17,3 +18,7 @@ export const textPromptNodeDefaultData: TextPromptNodeData = {
   continueOnFailure: false,
   parameterKeys: [],
 } as const;
+
+export function isTextPromptNode(node: AppNode): node is TextPromptNode {
+  return node.type === "textPrompt";
+}
