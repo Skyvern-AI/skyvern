@@ -1,5 +1,6 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
+import { AppNode } from "..";
 
 export type PDFParserNodeData = NodeBaseData & {
   fileUrl: string;
@@ -15,3 +16,7 @@ export const pdfParserNodeDefaultData: PDFParserNodeData = {
   continueOnFailure: false,
   jsonSchema: "null",
 } as const;
+
+export function isPdfParserNode(node: AppNode): node is PDFParserNode {
+  return node.type === "pdfParser";
+}
