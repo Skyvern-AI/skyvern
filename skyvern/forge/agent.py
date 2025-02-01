@@ -4,7 +4,7 @@ import os
 import random
 import string
 from asyncio.exceptions import CancelledError
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Tuple
 
@@ -755,6 +755,7 @@ class ForgeAgent:
                 self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)
                 json_response = await app.LLM_API_HANDLER(
                     prompt=extract_action_prompt,
+                    prompt_name="extract-actions",
                     step=step,
                     screenshots=scraped_page.screenshots,
                 )
@@ -1126,7 +1127,10 @@ class ForgeAgent:
 
         # this prompt is critical to our agent so let's use the primary LLM API handler
         verification_result = await app.LLM_API_HANDLER(
-            prompt=verification_prompt, step=step, screenshots=scraped_page_refreshed.screenshots
+            prompt=verification_prompt,
+            step=step,
+            screenshots=scraped_page_refreshed.screenshots,
+            prompt_name="check-user-goal",
         )
         return CompleteVerifyResult.model_validate(verification_result)
 
@@ -1411,8 +1415,10 @@ class ForgeAgent:
         elif task_type == TaskType.validation:
             template = "decisive-criterion-validate"
         elif task_type == TaskType.action:
-            prompt = prompt_engine.load_prompt("infer-action-type", navigation_goal=navigation_goal)
-            json_response = await app.LLM_API_HANDLER(prompt=prompt, step=step)
+            prompt = prompt_engine.load_prompt(
+                "infer-action-type", navigation_goal=navigation_goal, prompt_name="infer-action-type"
+            )
+            json_response = await app.LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="infer-action-type")
             if json_response.get("error"):
                 raise FailedToParseActionInstruction(
                     reason=json_response.get("thought"), error_type=json_response.get("error")
@@ -1914,6 +1920,18 @@ class ForgeAgent:
             diff=update_comparison,
         )
 
+        # Track step duration when step is completed or failed
+        if status in [StepStatus.completed, StepStatus.failed]:
+            duration_seconds = (datetime.now(UTC) - step.created_at.replace(tzinfo=UTC)).total_seconds()
+            LOG.info(
+                "Step duration metrics",
+                task_id=step.task_id,
+                step_id=step.step_id,
+                duration_seconds=duration_seconds,
+                status=status,
+                organization_id=step.organization_id,
+            )
+
         await save_step_logs(step.step_id)
 
         return await app.DATABASE.update_step(
@@ -1948,6 +1966,19 @@ class ForgeAgent:
             for key, value in updates.items()
             if getattr(task, key) != value
         }
+
+        # Track task duration when task is completed, failed, or terminated
+        if status in [TaskStatus.completed, TaskStatus.failed, TaskStatus.terminated]:
+            duration_seconds = (datetime.now(UTC) - task.created_at.replace(tzinfo=UTC)).total_seconds()
+            LOG.info(
+                "Task duration metrics",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                duration_seconds=duration_seconds,
+                status=status,
+                organization_id=task.organization_id,
+            )
+
         await save_task_logs(task.task_id)
         LOG.info("Updating task in db", task_id=task.task_id, diff=update_comparison)
         return await app.DATABASE.update_task(
@@ -2040,7 +2071,9 @@ class ForgeAgent:
                 navigation_payload=task.navigation_payload,
                 steps=steps_results,
             )
-            json_response = await app.LLM_API_HANDLER(prompt=prompt, screenshots=screenshots, step=step)
+            json_response = await app.LLM_API_HANDLER(
+                prompt=prompt, screenshots=screenshots, step=step, prompt_name="summarize-max-steps-reason"
+            )
             return json_response.get("reasoning", "")
         except Exception:
             LOG.warning("Failed to summary the failure reason", task_id=task.task_id, step_id=step.step_id)
@@ -2198,6 +2231,7 @@ class ForgeAgent:
                 prompt=extract_action_prompt,
                 step=step,
                 screenshots=scraped_page.screenshots,
+                prompt_name="extract-actions",
             )
         return json_response
 
@@ -2238,9 +2272,7 @@ class ForgeAgent:
         )
 
         data_extraction_summary_resp = await app.SECONDARY_LLM_API_HANDLER(
-            prompt=prompt,
-            step=step,
-            screenshots=scraped_page.screenshots,
+            prompt=prompt, step=step, screenshots=scraped_page.screenshots, prompt_name="data-extraction-summary"
         )
         return ExtractAction(
             reasoning=data_extraction_summary_resp.get("summary", "Extracting information from the page"),

@@ -246,7 +246,9 @@ class Block(BaseModel, abc.ABC):
                     "generate_workflow_run_block_description",
                     block=block_data,
                 )
-                json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=description_generation_prompt)
+                json_response = await app.SECONDARY_LLM_API_HANDLER(
+                    prompt=description_generation_prompt, prompt_name="generate-workflow-run-block-description"
+                )
                 description = json_response.get("summary")
                 LOG.info(
                     "Generated description for the workflow run block",
@@ -1198,7 +1200,7 @@ class TextPromptBlock(Block):
             prompt=prompt,
             llm_key=self.llm_key,
         )
-        response = await llm_api_handler(prompt=prompt)
+        response = await llm_api_handler(prompt=prompt, prompt_name="text-prompt")
         LOG.info("TextPromptBlock: Received response from LLM", response=response)
         return response
 
@@ -1954,7 +1956,7 @@ class PDFParserBlock(Block):
         llm_prompt = prompt_engine.load_prompt(
             "extract-information-from-file-text", extracted_text_content=extracted_text, json_schema=self.json_schema
         )
-        llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt)
+        llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt, prompt_name="extract-information-from-file-text")
         # Record the parsed data
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, llm_response)
         return await self.build_block_result(

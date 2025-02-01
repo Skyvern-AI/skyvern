@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -468,6 +469,18 @@ class WorkflowService:
             browser_session_id=browser_session_id,
             close_browser_on_completion=browser_session_id is None,
         )
+
+        # Track workflow run duration when completed
+        duration_seconds = (datetime.now(UTC) - workflow_run.created_at).total_seconds()
+        LOG.info(
+            "Workflow run duration metrics",
+            workflow_run_id=workflow_run_id,
+            workflow_id=workflow_run.workflow_id,
+            duration_seconds=duration_seconds,
+            status=WorkflowRunStatus.completed,
+            organization_id=organization_id,
+        )
+
         return workflow_run
 
     async def create_workflow(
