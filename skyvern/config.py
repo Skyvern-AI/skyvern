@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
     BROWSER_LOADING_TIMEOUT_MS: int = 120000
     OPTION_LOADING_TIMEOUT_MS: int = 600000
-    MAX_STEPS_PER_RUN: int = 10
+    MAX_STEPS_PER_RUN: int = 75
     MAX_NUM_SCREENSHOTS: int = 10
     # Ratio should be between 0 and 1.
     # If the task has been running for more steps than this ratio of the max steps per run, then we'll log a warning.

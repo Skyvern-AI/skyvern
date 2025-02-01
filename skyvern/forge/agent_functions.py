@@ -188,7 +188,9 @@ async def _convert_svg_to_string(
 
         for retry in range(SVG_SHAPE_CONVERTION_ATTEMPTS):
             try:
-                json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=svg_convert_prompt, step=step)
+                json_response = await app.SECONDARY_LLM_API_HANDLER(
+                    prompt=svg_convert_prompt, step=step, prompt_name="svg-convert"
+                )
                 svg_shape = json_response.get("shape", "")
                 recognized = json_response.get("recognized", False)
                 if not svg_shape or not recognized:
@@ -316,7 +318,7 @@ async def _convert_css_shape_to_string(
             for retry in range(CSS_SHAPE_CONVERTION_ATTEMPTS):
                 try:
                     json_response = await app.SECONDARY_LLM_API_HANDLER(
-                        prompt=prompt, screenshots=[screenshot], step=step
+                        prompt=prompt, screenshots=[screenshot], step=step, prompt_name="css-shape-convert"
                     )
                     css_shape = json_response.get("shape", "")
                     recognized = json_response.get("recognized", False)

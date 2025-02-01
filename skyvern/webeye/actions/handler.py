@@ -758,7 +758,9 @@ async def handle_input_text_action(
                 elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
             )
 
-            json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+            json_response = await app.SECONDARY_LLM_API_HANDLER(
+                prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
+            )
             input_or_select_context = InputOrSelectContext.model_validate(json_response)
             LOG.info(
                 "Parsed input/select context",
@@ -1675,7 +1677,9 @@ async def choose_auto_completion_dropdown(
             step_id=step.step_id,
             task_id=task.task_id,
         )
-        json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=auto_completion_confirm_prompt, step=step)
+        json_response = await app.SECONDARY_LLM_API_HANDLER(
+            prompt=auto_completion_confirm_prompt, step=step, prompt_name="auto-completion-choose-option"
+        )
         element_id = json_response.get("id", "")
         relevance_float = json_response.get("relevance_float", 0)
         if json_response.get("direct_searching", False):
@@ -1827,7 +1831,9 @@ async def input_or_auto_complete_input(
             task_id=task.task_id,
             potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
         )
-        json_respone = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+        json_respone = await app.SECONDARY_LLM_API_HANDLER(
+            prompt=prompt, step=step, prompt_name="auto-completion-potential-answers"
+        )
         values: list[dict] = json_respone.get("potential_values", [])
 
         for each_value in values:
@@ -1880,7 +1886,9 @@ async def input_or_auto_complete_input(
                 tried_values=json.dumps(tried_values),
                 popped_up_elements="".join([json_to_html(element) for element in cleaned_new_elements]),
             )
-            json_respone = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+            json_respone = await app.SECONDARY_LLM_API_HANDLER(
+                prompt=prompt, step=step, prompt_name="auto-completion-tweak-value"
+            )
             context_reasoning = json_respone.get("reasoning")
             new_current_value = json_respone.get("tweaked_value", "")
             if not new_current_value:
@@ -1929,7 +1937,9 @@ async def sequentially_select_from_dropdown(
         element_id=action.element_id,
         elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
     )
-    json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+    json_response = await app.SECONDARY_LLM_API_HANDLER(
+        prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
+    )
     input_or_select_context = InputOrSelectContext.model_validate(json_response)
     LOG.info(
         "Parsed input/select context",
@@ -2039,7 +2049,9 @@ async def sequentially_select_from_dropdown(
             select_history=json.dumps(build_sequential_select_history(select_history)),
             local_datetime=datetime.now(ensure_context().tz_info).isoformat(),
         )
-        json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, screenshots=[screenshot], step=step)
+        json_response = await app.SECONDARY_LLM_API_HANDLER(
+            prompt=prompt, screenshots=[screenshot], step=step, prompt_name="confirm-multi-selection-finish"
+        )
         if json_response.get("is_finished", False):
             return single_select_result.action_result, values[-1] if len(values) > 0 else None
 
@@ -2144,9 +2156,9 @@ async def select_from_dropdown(
     if context.is_date_related:
         # HACK: according to the test, secondary LLM is not doing well on the date picker
         # using the main LLM to handle the case
-        json_response = await app.LLM_API_HANDLER(prompt=prompt, step=step)
+        json_response = await app.LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
     else:
-        json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+        json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
     value: str | None = json_response.get("value", None)
     single_select_result.value = value
     select_reason: str | None = json_response.get("reasoning", None)
@@ -2426,7 +2438,7 @@ async def locate_dropdown_menu(
             element=element_dict,
         )
         json_response = await app.SECONDARY_LLM_API_HANDLER(
-            prompt=dropdown_confirm_prompt, screenshots=[screenshot], step=step
+            prompt=dropdown_confirm_prompt, screenshots=[screenshot], step=step, prompt_name="opened-dropdown-confirm"
         )
         is_opened_dropdown_menu = json_response.get("is_opened_dropdown_menu")
         if is_opened_dropdown_menu:
@@ -2573,7 +2585,9 @@ async def normal_select(
         element_id=action.element_id,
         elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
     )
-    json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+    json_response = await app.SECONDARY_LLM_API_HANDLER(
+        prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
+    )
     input_or_select_context = InputOrSelectContext.model_validate(json_response)
     LOG.info(
         "Parsed input/select context",
@@ -2593,7 +2607,7 @@ async def normal_select(
         options=options_html,
     )
 
-    json_response = await app.LLM_API_HANDLER(prompt=prompt, step=step)
+    json_response = await app.LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
     index: int | None = json_response.get("index")
     value: str | None = json_response.get("value")
 
@@ -2756,6 +2770,7 @@ async def extract_information_for_navigation_goal(
         prompt=extract_information_prompt,
         step=step,
         screenshots=scraped_page.screenshots,
+        prompt_name="extract-information",
     )
 
     return ScrapeResult(

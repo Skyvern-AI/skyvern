@@ -1001,7 +1001,9 @@ async def make_ai_suggestion(
             ai_suggestion_type=ai_suggestion_type,
         )
 
-        llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt, ai_suggestion=new_ai_suggestion)
+        llm_response = await app.LLM_API_HANDLER(
+            prompt=llm_prompt, ai_suggestion=new_ai_suggestion, prompt_name="suggest-data-schema"
+        )
         parsed_ai_suggestion = AISuggestionBase.model_validate(llm_response)
 
         return parsed_ai_suggestion
@@ -1045,7 +1047,7 @@ async def generate_task(
 
     llm_prompt = prompt_engine.load_prompt("generate-task", user_prompt=data.prompt)
     try:
-        llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt)
+        llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt, prompt_name="generate-task")
         parsed_task_generation_obj = TaskGenerationBase.model_validate(llm_response)
 
         # generate a TaskGenerationModel

@@ -79,6 +79,7 @@ class LLMAPIHandler(Protocol):
     def __call__(
         self,
         prompt: str,
+        prompt_name: str,
         step: Step | None = None,
         observer_cruise: ObserverTask | None = None,
         observer_thought: ObserverThought | None = None,
