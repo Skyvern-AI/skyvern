@@ -36,6 +36,7 @@ services:
       - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
       - BROWSER_TYPE=chromium-headful
       - ENABLE_OPENAI=true
+      - LLM_KEY=OPENAI_GPT4O
       - OPENAI_API_KEY=<your_openai_key>
       # If you want to use other LLM provider, like azure and anthropic:
       # - ENABLE_ANTHROPIC=true
@@ -93,9 +94,14 @@ services:
     environment:
     # if you want to run skyvern on a remote server,
     # you need to change the host in VITE_WSS_BASE_URL and VITE_API_BASE_URL to match your server ip
+    # If you're self-hosting this behind a dns, you'll want to set:
+    #   A route for the API: api.yourdomain.com -> localhost:8000
+    #   A route for the UI: yourdomain.com -> localhost:8080
+    #   A route for the artifact API: artifact.yourdomain.com -> localhost:9090 (maybe not needed)
       - VITE_WSS_BASE_URL=ws://localhost:8000/api/v1
+    #   - VITE_ARTIFACT_API_BASE_URL=http://localhost:9090
     #   - VITE_API_BASE_URL=http://localhost:8000/api/v1
-    #   - VITE_SKYVERN_API_KEY=
+    #   - VITE_SKYVERN_API_KEY=<get this from "settings" in the Skyvern UI>
     depends_on:
       skyvern:
         condition: service_healthy
