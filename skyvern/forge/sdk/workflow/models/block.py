@@ -685,7 +685,7 @@ class BaseTaskBlock(Block):
                 LOG.warning(
                     f"Task failed with status {updated_task.status}{retry_message}",
                     task_id=updated_task.task_id,
-                    status=updated_task.status,
+                    task_status=updated_task.status,
                     workflow_run_id=workflow_run_id,
                     workflow_id=workflow.workflow_id,
                     organization_id=workflow_run.organization_id,

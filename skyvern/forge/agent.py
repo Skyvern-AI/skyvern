@@ -1928,7 +1928,7 @@ class ForgeAgent:
                 task_id=step.task_id,
                 step_id=step.step_id,
                 duration_seconds=duration_seconds,
-                status=status,
+                step_status=status,
                 organization_id=step.organization_id,
             )
 
@@ -1975,7 +1975,7 @@ class ForgeAgent:
                 task_id=task.task_id,
                 workflow_run_id=task.workflow_run_id,
                 duration_seconds=duration_seconds,
-                status=status,
+                task_status=status,
                 organization_id=task.organization_id,
             )
 
