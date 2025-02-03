@@ -451,7 +451,7 @@ class FailedToFetchSecret(SkyvernException):
 class NoIncrementalElementFoundForCustomSelection(SkyvernException):
     def __init__(self, element_id: str) -> None:
         super().__init__(
-            f"No incremental element found, maybe try an input action or taking the select action on other elements. element_id={element_id}"
+            f"No incremental element found, try it again later or try another element. element_id={element_id}"
         )
 
 
