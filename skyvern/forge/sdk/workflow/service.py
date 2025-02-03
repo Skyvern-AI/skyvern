@@ -60,6 +60,9 @@ from skyvern.forge.sdk.workflow.models.block import (
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
+    BitwardenCreditCardDataParameter,
+    BitwardenLoginCredentialParameter,
+    BitwardenSensitiveInformationParameter,
     ContextParameter,
     OutputParameter,
     Parameter,
@@ -219,15 +222,56 @@ class WorkflowService:
             for parameter in workflow.workflow_definition.parameters
             if isinstance(parameter, ContextParameter)
         ]
+
+        secret_parameters = [
+            parameter
+            for parameter in workflow.workflow_definition.parameters
+            if isinstance(
+                parameter,
+                (
+                    AWSSecretParameter,
+                    BitwardenLoginCredentialParameter,
+                    BitwardenCreditCardDataParameter,
+                    BitwardenSensitiveInformationParameter,
+                ),
+            )
+        ]
+
         # Get all <workflow parameter, workflow run parameter> tuples
         wp_wps_tuples = await self.get_workflow_run_parameter_tuples(workflow_run_id=workflow_run.workflow_run_id)
         workflow_output_parameters = await self.get_workflow_output_parameters(workflow_id=workflow.workflow_id)
-        app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
-            workflow_run_id,
-            wp_wps_tuples,
-            workflow_output_parameters,
-            context_parameters,
-        )
+        try:
+            await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
+                organization,
+                workflow_run_id,
+                wp_wps_tuples,
+                workflow_output_parameters,
+                context_parameters,
+                secret_parameters,
+            )
+        except Exception as e:
+            LOG.exception(
+                f"Error while initializing workflow run context for workflow run {workflow_run.workflow_run_id}",
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
+
+            exception_message = f"Unexpected error: {str(e)}"
+            if isinstance(e, SkyvernException):
+                exception_message = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
+
+            failure_reason = f"Failed to initialize workflow run context. failure reason: {exception_message}"
+            await self.mark_workflow_run_as_failed(
+                workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
+            )
+            await self.clean_up_workflow(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                api_key=api_key,
+                browser_session_id=browser_session_id,
+                close_browser_on_completion=browser_session_id is None,
+            )
+            return workflow_run
+
         # Execute workflow blocks
         blocks = workflow.workflow_definition.blocks
         blocks_cnt = len(blocks)
