@@ -435,6 +435,24 @@ async def get_agent_tasks(
     return ORJSONResponse([(await app.agent.build_task_response(task=task)).model_dump() for task in tasks])
 
 
+@base_router.get("/runs", response_model=list[WorkflowRun | Task])
+@base_router.get("/runs/", response_model=list[WorkflowRun | Task], include_in_schema=False)
+async def get_runs(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1),
+    status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
+) -> Response:
+    analytics.capture("skyvern-oss-agent-runs-get")
+
+    # temporary limit to 100 runs
+    if page > 10:
+        return []
+
+    runs = await app.DATABASE.get_all_runs(current_org.organization_id, page=page, page_size=page_size, status=status)
+    return ORJSONResponse([run.model_dump() for run in runs])
+
+
 @base_router.get("/internal/tasks", tags=["agent"], response_model=list[Task])
 @base_router.get(
     "/internal/tasks/",
