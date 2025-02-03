@@ -80,7 +80,19 @@ if settings.ENABLE_OPENAI:
     LLMConfigRegistry.register_config(
         "OPENAI_GPT4O",
         LLMConfig(
-            "gpt-4o", ["OPENAI_API_KEY"], supports_vision=True, add_assistant_prefix=False, max_output_tokens=16384
+            "gpt-4o", ["OPENAI_API_KEY"], supports_vision=True, add_assistant_prefix=False, max_completion_tokens=16384
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_O3_MINI",
+        LLMConfig(
+            "o3-mini",
+            ["OPENAI_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            max_completion_tokens=16384,
+            temperature=None,  # Temperature isn't supported in the O-model series
+            reasoning_effort="high",
         ),
     )
     LLMConfigRegistry.register_config(
@@ -90,7 +102,7 @@ if settings.ENABLE_OPENAI:
             ["OPENAI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
-            max_output_tokens=16384,
+            max_completion_tokens=16384,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -100,7 +112,7 @@ if settings.ENABLE_OPENAI:
             ["OPENAI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
-            max_output_tokens=16384,
+            max_completion_tokens=16384,
         ),
     )
 
@@ -149,7 +161,7 @@ if settings.ENABLE_ANTHROPIC:
             ["ANTHROPIC_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=True,
-            max_output_tokens=8192,
+            max_completion_tokens=8192,
         ),
     )
 
@@ -275,7 +287,7 @@ if settings.ENABLE_GEMINI:
             ["GEMINI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
-            max_output_tokens=8192,
+            max_completion_tokens=8192,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -285,7 +297,7 @@ if settings.ENABLE_GEMINI:
             ["GEMINI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
-            max_output_tokens=8192,
+            max_completion_tokens=8192,
         ),
     )
 

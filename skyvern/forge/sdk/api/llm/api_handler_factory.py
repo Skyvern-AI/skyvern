@@ -155,7 +155,12 @@ class LLMAPIHandlerFactory:
                     LOG.exception("Failed to calculate LLM cost", error=str(e))
                     llm_cost = 0
                 prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
-                completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
+
+                # TODO (suchintan): Properly support reasoning tokens
+                reasoning_tokens = response.get("usage", {}).get("reasoning_tokens", 0)
+                LOG.info("Reasoning tokens", reasoning_tokens=reasoning_tokens)
+
+                completion_tokens = response.get("usage", {}).get("completion_tokens", 0) + reasoning_tokens
 
                 if step:
                     await app.DATABASE.update_step(
@@ -388,10 +393,15 @@ class LLMAPIHandlerFactory:
 
     @staticmethod
     def get_api_parameters(llm_config: LLMConfig | LLMRouterConfig) -> dict[str, Any]:
-        return {
-            "max_tokens": llm_config.max_output_tokens,
-            "temperature": settings.LLM_CONFIG_TEMPERATURE,
-        }
+        params: dict[str, Any] = {"max_completion_tokens": llm_config.max_completion_tokens}
+
+        if llm_config.temperature is not None:
+            params["temperature"] = llm_config.temperature
+
+        if llm_config.reasoning_effort is not None:
+            params["reasoning_effort"] = llm_config.reasoning_effort
+
+        return params
 
     @classmethod
     def register_custom_handler(cls, llm_key: str, handler: LLMAPIHandler) -> None:
