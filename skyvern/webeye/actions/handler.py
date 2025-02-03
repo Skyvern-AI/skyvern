@@ -582,6 +582,7 @@ async def handle_input_text_action(
         reasoning=action.reasoning,
         element_id=skyvern_element.get_id(),
         option=SelectOption(label=text),
+        intention=action.intention,
     )
     if skyvern_element.get_selectable():
         LOG.info(
@@ -761,6 +762,7 @@ async def handle_input_text_action(
             json_response = await app.SECONDARY_LLM_API_HANDLER(
                 prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
             )
+            json_response["intention"] = action.intention
             input_or_select_context = InputOrSelectContext.model_validate(json_response)
             LOG.info(
                 "Parsed input/select context",
@@ -999,6 +1001,7 @@ async def handle_select_option_action(
                 reasoning=action.reasoning,
                 element_id=selectable_child.get_id(),
                 option=action.option,
+                intention=action.intention,
             )
             action = select_action
             skyvern_element = selectable_child
@@ -1045,6 +1048,7 @@ async def handle_select_option_action(
             reasoning=action.reasoning,
             element_id=blocking_element.get_id(),
             option=action.option,
+            intention=action.intention,
         )
         action = select_action
         skyvern_element = blocking_element
@@ -1666,7 +1670,7 @@ async def choose_auto_completion_dropdown(
         auto_completion_confirm_prompt = prompt_engine.load_prompt(
             "auto-completion-choose-option",
             is_search=context.is_search_bar,
-            field_information=context.field,
+            field_information=context.field if not context.intention else context.intention,
             filled_value=text,
             navigation_goal=task.navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
@@ -1815,10 +1819,16 @@ async def input_or_auto_complete_input(
         tried_values.append(current_value)
         whole_new_elements.extend(result.incremental_elements)
 
+        field_information = (
+            input_or_select_context.field
+            if not input_or_select_context.intention
+            else input_or_select_context.intention
+        )
+
         prompt = prompt_engine.load_prompt(
             "auto-completion-potential-answers",
             potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
-            field_information=input_or_select_context.field,
+            field_information=field_information,
             current_value=current_value,
             navigation_goal=task.navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
@@ -1879,7 +1889,7 @@ async def input_or_auto_complete_input(
             cleaned_new_elements = remove_duplicated_HTML_element(whole_new_elements)
             prompt = prompt_engine.load_prompt(
                 "auto-completion-tweak-value",
-                field_information=input_or_select_context.field,
+                field_information=field_information,
                 current_value=current_value,
                 navigation_goal=task.navigation_goal,
                 navigation_payload_str=json.dumps(task.navigation_payload),
@@ -1940,6 +1950,7 @@ async def sequentially_select_from_dropdown(
     json_response = await app.SECONDARY_LLM_API_HANDLER(
         prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
     )
+    json_response["intention"] = action.intention
     input_or_select_context = InputOrSelectContext.model_validate(json_response)
     LOG.info(
         "Parsed input/select context",
@@ -2038,21 +2049,26 @@ async def sequentially_select_from_dropdown(
 
         # it's for typing. it's been verified in `single_select_result.is_done()`
         assert single_select_result.dropdown_menu is not None
-        screenshot = await single_select_result.dropdown_menu.get_locator().screenshot(
-            timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS
+        screenshot = await page.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
+        mini_goal = (
+            input_or_select_context.field
+            if not input_or_select_context.intention
+            else input_or_select_context.intention
         )
         prompt = prompt_engine.load_prompt(
             "confirm-multi-selection-finish",
+            mini_goal=mini_goal,
             navigation_goal=task.navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
             elements="".join(json_to_html(element) for element in secondary_increment_element),
             select_history=json.dumps(build_sequential_select_history(select_history)),
             local_datetime=datetime.now(ensure_context().tz_info).isoformat(),
         )
-        json_response = await app.SECONDARY_LLM_API_HANDLER(
+        json_response = await app.LLM_API_HANDLER(
             prompt=prompt, screenshots=[screenshot], step=step, prompt_name="confirm-multi-selection-finish"
         )
-        if json_response.get("is_finished", False):
+        if json_response.get("is_mini_goal_finished", False):
+            LOG.info("The user has finished the selection for the current opened dropdown", step_id=step.step_id)
             return single_select_result.action_result, values[-1] if len(values) > 0 else None
 
     return select_history[-1].action_result if len(select_history) > 0 else None, values[-1] if len(
@@ -2138,7 +2154,7 @@ async def select_from_dropdown(
     prompt = prompt_engine.load_prompt(
         "custom-select",
         is_date_related=context.is_date_related,
-        field_information=context.field,
+        field_information=context.field if not context.intention else context.intention,
         required_field=context.is_required,
         target_value="" if force_select else target_value,
         navigation_goal=task.navigation_goal,
@@ -2588,6 +2604,7 @@ async def normal_select(
     json_response = await app.SECONDARY_LLM_API_HANDLER(
         prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
     )
+    json_response["intention"] = action.intention
     input_or_select_context = InputOrSelectContext.model_validate(json_response)
     LOG.info(
         "Parsed input/select context",
@@ -2597,10 +2614,12 @@ async def normal_select(
     )
 
     options_html = skyvern_element.build_HTML()
-
+    field_information = (
+        input_or_select_context.field if not input_or_select_context.intention else input_or_select_context.intention
+    )
     prompt = prompt_engine.load_prompt(
         "normal-select",
-        field_information=input_or_select_context.field,
+        field_information=field_information,
         required_field=input_or_select_context.is_required,
         navigation_goal=task.navigation_goal,
         navigation_payload_str=json.dumps(task.navigation_payload),
