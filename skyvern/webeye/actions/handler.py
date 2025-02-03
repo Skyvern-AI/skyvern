@@ -17,12 +17,12 @@ from skyvern.config import settings
 from skyvern.constants import (
     AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
     BROWSER_DOWNLOAD_MAX_WAIT_TIME,
-    BROWSER_DOWNLOAD_TIMEOUT,
     DROPDOWN_MENU_MAX_DISTANCE,
     REPO_ROOT_DIR,
     SKYVERN_ID_ATTR,
 )
 from skyvern.exceptions import (
+    DownloadFileMaxWaitingTime,
     EmptySelect,
     ErrEmptyTweakValue,
     ErrFoundSelectableElement,
@@ -52,7 +52,13 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.files import download_file, get_download_dir, list_files_in_directory
+from skyvern.forge.sdk.api.files import (
+    download_file,
+    get_download_dir,
+    list_downloading_files_in_directory,
+    list_files_in_directory,
+    wait_for_download_finished,
+)
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_post
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
@@ -505,12 +511,7 @@ async def handle_click_to_download_file_action(
         return [ActionFailure(exception=NoFileDownloadTriggered(action.element_id))]
 
     # check if there's any file is still downloading
-    downloading_files: list[Path] = []
-    for file in list_files_after:
-        path = Path(file)
-        if path.suffix == ".crdownload":
-            downloading_files.append(path)
-
+    downloading_files = list_downloading_files_in_directory(download_dir)
     if len(downloading_files) == 0:
         return [ActionSuccess(download_triggered=True)]
 
@@ -522,20 +523,11 @@ async def handle_click_to_download_file_action(
         workflow_run_id=task.workflow_run_id,
     )
     try:
-        async with asyncio.timeout(BROWSER_DOWNLOAD_TIMEOUT):
-            while len(downloading_files) > 0:
-                new_downloading_files: list[Path] = []
-                for path in downloading_files:
-                    if not path.exists():
-                        continue
-                    new_downloading_files.append(path)
-                downloading_files = new_downloading_files
-                await asyncio.sleep(1)
-
-    except asyncio.TimeoutError:
+        await wait_for_download_finished(downloading_files=downloading_files)
+    except DownloadFileMaxWaitingTime as e:
         LOG.warning(
             "There're several long-time downloading files, these files might be broken",
-            downloading_files=downloading_files,
+            downloading_files=e.downloading_files,
             task_id=task.task_id,
             step_id=step.step_id,
             workflow_run_id=task.workflow_run_id,

@@ -16,6 +16,7 @@ from playwright.async_api import Page
 from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import (
+    BROWSER_DOWNLOADING_SUFFIX,
     GET_DOWNLOADED_FILES_TIMEOUT,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
     SCRAPE_TYPE_ORDER,
@@ -24,6 +25,7 @@ from skyvern.constants import (
 )
 from skyvern.exceptions import (
     BrowserStateMissingPage,
+    DownloadFileMaxWaitingTime,
     EmptyScrapePage,
     FailedToNavigateToUrl,
     FailedToParseActionInstruction,
@@ -45,7 +47,13 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.files import get_path_for_workflow_download_directory, list_files_in_directory, rename_file
+from skyvern.forge.sdk.api.files import (
+    get_path_for_workflow_download_directory,
+    list_downloading_files_in_directory,
+    list_files_in_directory,
+    rename_file,
+    wait_for_download_finished,
+)
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
@@ -375,12 +383,31 @@ class ForgeAgent:
 
             if task_block and task_block.complete_on_download and task.workflow_run_id:
                 workflow_download_directory = get_path_for_workflow_download_directory(task.workflow_run_id)
+
+                downloading_files: list[Path] = list_downloading_files_in_directory(workflow_download_directory)
+                if len(downloading_files) > 0:
+                    LOG.info(
+                        "Detecting files are still downloading, waiting for files to be completely downloaded.",
+                        downloading_files=downloading_files,
+                        step_id=step.step_id,
+                    )
+                    try:
+                        await wait_for_download_finished(downloading_files=downloading_files)
+                    except DownloadFileMaxWaitingTime as e:
+                        LOG.warning(
+                            "There're several long-time downloading files, these files might be broken",
+                            downloading_files=e.downloading_files,
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            workflow_run_id=task.workflow_run_id,
+                        )
+
                 list_files_after = list_files_in_directory(workflow_download_directory)
                 if len(list_files_after) > len(list_files_before):
                     files_to_rename = list(set(list_files_after) - set(list_files_before))
                     for file in files_to_rename:
                         file_extension = Path(file).suffix
-                        if file_extension == ".crdownload":
+                        if file_extension == BROWSER_DOWNLOADING_SUFFIX:
                             LOG.warning(
                                 "Detecting incompleted download file, skip the rename",
                                 file=file,

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from fastapi import status
 
 
@@ -250,6 +252,12 @@ class DownloadFileMaxSizeExceeded(SkyvernException):
     def __init__(self, max_size: int) -> None:
         self.max_size = max_size
         super().__init__(f"Download file size exceeded the maximum allowed size of {max_size} MB.")
+
+
+class DownloadFileMaxWaitingTime(SkyvernException):
+    def __init__(self, downloading_files: list[Path]) -> None:
+        self.downloading_files = downloading_files
+        super().__init__(f"Long-time downloading files [{downloading_files}].")
 
 
 class NoFileDownloadTriggered(SkyvernException):

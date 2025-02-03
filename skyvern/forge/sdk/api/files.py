@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import mimetypes
 import os
@@ -13,8 +14,8 @@ import structlog
 from multidict import CIMultiDictProxy
 
 from skyvern.config import settings
-from skyvern.constants import REPO_ROOT_DIR
-from skyvern.exceptions import DownloadFileMaxSizeExceeded
+from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, BROWSER_DOWNLOADING_SUFFIX, REPO_ROOT_DIR
+from skyvern.exceptions import DownloadFileMaxSizeExceeded, DownloadFileMaxWaitingTime
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 
 LOG = structlog.get_logger()
@@ -156,6 +157,34 @@ def list_files_in_directory(directory: Path, recursive: bool = False) -> list[st
             break
 
     return listed_files
+
+
+def list_downloading_files_in_directory(
+    directory: Path, downloading_suffix: str = BROWSER_DOWNLOADING_SUFFIX
+) -> list[Path]:
+    # check if there's any file is still downloading
+    downloading_files: list[Path] = []
+    for file in list_files_in_directory(directory):
+        path = Path(file)
+        if path.suffix == downloading_suffix:
+            downloading_files.append(path)
+    return downloading_files
+
+
+async def wait_for_download_finished(downloading_files: list[Path], timeout: float = BROWSER_DOWNLOAD_TIMEOUT) -> None:
+    cur_downloading_files = downloading_files
+    try:
+        async with asyncio.timeout(timeout):
+            while len(cur_downloading_files) > 0:
+                new_downloading_files: list[Path] = []
+                for path in cur_downloading_files:
+                    if not path.exists():
+                        continue
+                    new_downloading_files.append(path)
+                cur_downloading_files = new_downloading_files
+                await asyncio.sleep(1)
+    except asyncio.TimeoutError:
+        raise DownloadFileMaxWaitingTime(downloading_files=cur_downloading_files)
 
 
 def get_number_of_files_in_directory(directory: Path, recursive: bool = False) -> int:
