@@ -282,6 +282,10 @@ export type ObserverTask = {
   modified_at: string;
   output: Record<string, unknown> | null;
   summary: string | null;
+  webhook_callback_url: string | null;
+  totp_verification_url: string | null;
+  totp_identifier: string | null;
+  proxy_location: ProxyLocation | null;
 };
 
 export type Createv2TaskRequest = {
