@@ -279,6 +279,31 @@ if settings.ENABLE_AZURE_GPT4O_MINI:
         ),
     )
 
+if settings.ENABLE_AZURE_O3_MINI:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_O3_MINI",
+        LLMConfig(
+            f"azure/{settings.AZURE_O3_MINI_DEPLOYMENT}",
+            [
+                "AZURE_O3_MINI_DEPLOYMENT",
+                "AZURE_O3_MINI_API_KEY",
+                "AZURE_O3_MINI_API_BASE",
+                "AZURE_O3_MINI_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_O3_MINI_API_BASE,
+                api_key=settings.AZURE_O3_MINI_API_KEY,
+                api_version=settings.AZURE_O3_MINI_API_VERSION,
+                model_info={"model_name": "azure/o3-mini"},
+            ),
+            supports_vision=False,
+            add_assistant_prefix=False,
+            max_completion_tokens=16384,
+            temperature=None,  # Temperature isn't supported in the O-model series
+            reasoning_effort="low",
+        ),
+    )
+
 if settings.ENABLE_GEMINI:
     LLMConfigRegistry.register_config(
         "GEMINI_PRO",
