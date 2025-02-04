@@ -55,6 +55,14 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
     (furthestDownChild?.position.y ?? 0) +
     24;
 
+  function handleChange(key: string, value: unknown) {
+    if (!data.editable) {
+      return;
+    }
+    setInputs({ ...inputs, [key]: value });
+    updateNodeData(id, { [key]: value });
+  }
+
   return (
     <div>
       <Handle
@@ -118,11 +126,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                 nodeId={id}
                 value={inputs.loopVariableReference}
                 onChange={(value) => {
-                  setInputs({
-                    ...inputs,
-                    loopVariableReference: value,
-                  });
-                  updateNodeData(id, { loopVariableReference: value });
+                  handleChange("loopVariableReference", value);
                 }}
               />
             </div>
@@ -139,9 +143,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                     checked={data.completeIfEmpty}
                     disabled={!data.editable}
                     onCheckedChange={(checked) => {
-                      updateNodeData(id, {
-                        completeIfEmpty: checked,
-                      });
+                      handleChange("completeIfEmpty", checked);
                     }}
                   />
                 </div>

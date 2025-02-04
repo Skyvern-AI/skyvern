@@ -3,6 +3,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 import { WorkflowApiResponse } from "../types/workflowTypes";
 import { useGlobalWorkflowsQuery } from "./useGlobalWorkflowsQuery";
+
 type Props = {
   workflowPermanentId?: string;
 };

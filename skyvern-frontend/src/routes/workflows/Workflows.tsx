@@ -1,7 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
-import { Status, WorkflowRunApiResponse } from "@/api/types";
-import { StatusBadge } from "@/components/StatusBadge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Pagination,
   PaginationContent,
@@ -25,46 +24,51 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { downloadBlob } from "@/util/downloadBlob";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import {
-  DownloadIcon,
+  LightningBoltIcon,
   MagnifyingGlassIcon,
   Pencil2Icon,
   PlayIcon,
+  PlusIcon,
+  ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useQuery } from "@tanstack/react-query";
-import { useNavigate, useSearchParams } from "react-router-dom";
-import { WorkflowApiResponse } from "./types/workflowTypes";
-import { WorkflowActions } from "./WorkflowActions";
-import { WorkflowsPageBanner } from "./WorkflowsPageBanner";
-import { WorkflowTitle } from "./WorkflowTitle";
 import { useState } from "react";
-import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { useDebounce } from "use-debounce";
-import { Input } from "@/components/ui/input";
+import { NarrativeCard } from "./components/header/NarrativeCard";
+import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
+import { ImportWorkflowButton } from "./ImportWorkflowButton";
+import { WorkflowApiResponse } from "./types/workflowTypes";
+import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
+import { WorkflowActions } from "./WorkflowActions";
+
+const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
+  title: "New Workflow",
+  description: "",
+  workflow_definition: {
+    blocks: [],
+    parameters: [],
+  },
+};
 
 function Workflows() {
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
+  const createWorkflowMutation = useCreateWorkflowMutation();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
-  const workflowsPage = searchParams.get("workflowsPage")
-    ? Number(searchParams.get("workflowsPage"))
-    : 1;
-  const workflowRunsPage = searchParams.get("workflowRunsPage")
-    ? Number(searchParams.get("workflowRunsPage"))
-    : 1;
+  const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
 
   const { data: workflows, isLoading } = useQuery<Array<WorkflowApiResponse>>({
-    queryKey: ["workflows", debouncedSearch, workflowsPage],
+    queryKey: ["workflows", debouncedSearch, page],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
-      params.append("page", String(workflowsPage));
+      params.append("page", String(page));
       params.append("only_workflows", "true");
       params.append("title", debouncedSearch);
       return client
@@ -74,52 +78,6 @@ function Workflows() {
         .then((response) => response.data);
     },
   });
-
-  const { data: workflowRuns, isLoading: workflowRunsIsLoading } = useQuery<
-    Array<WorkflowRunApiResponse>
-  >({
-    queryKey: ["workflowRuns", { statusFilters }, workflowRunsPage],
-    queryFn: async () => {
-      const client = await getClient(credentialGetter);
-      const params = new URLSearchParams();
-      params.append("page", String(workflowRunsPage));
-      statusFilters.forEach((status) => {
-        params.append("status", status);
-      });
-      return client
-        .get("/workflows/runs", {
-          params,
-        })
-        .then((response) => response.data);
-    },
-    refetchOnMount: "always",
-  });
-
-  function handleExport() {
-    if (!workflowRuns) {
-      return; // should never happen
-    }
-    const data = ["workflow_run_id,workflow_id,status,created,failure_reason"];
-    workflowRuns.forEach((workflowRun) => {
-      const row = [
-        workflowRun.workflow_run_id,
-        workflowRun.workflow_permanent_id,
-        workflowRun.status,
-        workflowRun.created_at,
-        workflowRun.failure_reason ?? "",
-      ];
-      data.push(
-        row
-          .map(String) // convert every value to String
-          .map((v) => v.replace(new RegExp('"', "g"), '""')) // escape double quotes
-          .map((v) => `"${v}"`) // quote it
-          .join(","), // comma-separated
-      );
-    });
-    const contents = data.join("\r\n");
-
-    downloadBlob(contents, "export.csv", "data:text/csv;charset=utf-8;");
-  }
 
   function handleRowClick(
     event: React.MouseEvent<HTMLTableCellElement>,
@@ -152,11 +110,38 @@ function Workflows() {
   }
 
   return (
-    <div className="space-y-8">
-      <WorkflowsPageBanner />
+    <div className="space-y-10">
+      <div className="flex h-32 justify-between gap-6">
+        <div className="space-y-5">
+          <div className="flex items-center gap-2">
+            <LightningBoltIcon className="size-6" />
+            <h1 className="text-2xl">Workflows</h1>
+          </div>
+          <p className="text-slate-300">
+            Create your own complex workflows by connecting web agents together.
+            Define a series of actions, set it, and forget it.
+          </p>
+        </div>
+        <div className="flex gap-5">
+          <NarrativeCard
+            index={1}
+            description="Save browser sessions and reuse them in subsequent runs"
+          />
+          <NarrativeCard
+            index={2}
+            description="Connect multiple agents together to carry out complex objectives"
+          />
+          <NarrativeCard
+            index={3}
+            description="Execute non-browser tasks such as sending emails"
+          />
+        </div>
+      </div>
       <div className="space-y-4">
-        <header className="flex justify-between">
-          <h1 className="text-2xl font-semibold">Workflows</h1>
+        <header>
+          <h1 className="text-xl">My Flows</h1>
+        </header>
+        <div className="flex justify-between">
           <div className="relative">
             <div className="absolute left-0 top-0 flex size-9 items-center justify-center">
               <MagnifyingGlassIcon className="size-6" />
@@ -170,15 +155,35 @@ function Workflows() {
               className="w-48 pl-9 lg:w-72"
             />
           </div>
-        </header>
-        <div className="rounded-md border">
+          <div className="flex gap-4">
+            <ImportWorkflowButton />
+            <Button
+              disabled={createWorkflowMutation.isPending}
+              onClick={() => {
+                createWorkflowMutation.mutate(emptyWorkflowRequest);
+              }}
+            >
+              {createWorkflowMutation.isPending ? (
+                <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <PlusIcon className="mr-2 h-4 w-4" />
+              )}
+              Create
+            </Button>
+          </div>
+        </div>
+        <div className="rounded-lg border">
           <Table>
-            <TableHeader>
+            <TableHeader className="rounded-t-lg bg-slate-elevation2">
               <TableRow>
-                <TableHead className="w-1/3">ID</TableHead>
-                <TableHead className="w-1/3">Title</TableHead>
-                <TableHead className="w-1/3">Created At</TableHead>
-                <TableHead></TableHead>
+                <TableHead className="w-1/3 rounded-tl-lg text-slate-400">
+                  ID
+                </TableHead>
+                <TableHead className="w-1/3 text-slate-400">Title</TableHead>
+                <TableHead className="w-1/3 text-slate-400">
+                  Created At
+                </TableHead>
+                <TableHead className="rounded-tr-lg"></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -272,152 +277,25 @@ function Workflows() {
             <PaginationContent>
               <PaginationItem>
                 <PaginationPrevious
-                  className={cn({ "cursor-not-allowed": workflowsPage === 1 })}
+                  className={cn({ "cursor-not-allowed": page === 1 })}
                   onClick={() => {
-                    if (workflowsPage === 1) {
+                    if (page === 1) {
                       return;
                     }
                     const params = new URLSearchParams();
-                    params.set(
-                      "workflowsPage",
-                      String(Math.max(1, workflowsPage - 1)),
-                    );
+                    params.set("page", String(Math.max(1, page - 1)));
                     setSearchParams(params, { replace: true });
                   }}
                 />
               </PaginationItem>
               <PaginationItem>
-                <PaginationLink>{workflowsPage}</PaginationLink>
+                <PaginationLink>{page}</PaginationLink>
               </PaginationItem>
               <PaginationItem>
                 <PaginationNext
                   onClick={() => {
                     const params = new URLSearchParams();
-                    params.set("workflowsPage", String(workflowsPage + 1));
-                    setSearchParams(params, { replace: true });
-                  }}
-                />
-              </PaginationItem>
-            </PaginationContent>
-          </Pagination>
-        </div>
-      </div>
-      <div className="space-y-4">
-        <header>
-          <div className="flex justify-between">
-            <h1 className="text-2xl font-semibold">Workflow Runs</h1>
-            <div className="flex gap-2">
-              <StatusFilterDropdown
-                values={statusFilters}
-                onChange={setStatusFilters}
-              />
-              <Button variant="secondary" onClick={handleExport}>
-                <DownloadIcon className="mr-2" />
-                Export CSV
-              </Button>
-            </div>
-          </div>
-        </header>
-        <div className="rounded-md border">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="w-1/5">Workflow Run ID</TableHead>
-                <TableHead className="w-1/5">Workflow ID</TableHead>
-                <TableHead className="w-1/5">Workflow Title</TableHead>
-                <TableHead className="w-1/5">Status</TableHead>
-                <TableHead className="w-1/5">Created At</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {workflowRunsIsLoading ? (
-                <TableRow>
-                  <TableCell colSpan={5}>Loading...</TableCell>
-                </TableRow>
-              ) : workflowRuns?.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={5}>No workflow runs found</TableCell>
-                </TableRow>
-              ) : (
-                workflowRuns?.map((workflowRun) => {
-                  return (
-                    <TableRow
-                      key={workflowRun.workflow_run_id}
-                      onClick={(event) => {
-                        if (event.ctrlKey || event.metaKey) {
-                          window.open(
-                            window.location.origin +
-                              `/workflows/${workflowRun.workflow_permanent_id}/${workflowRun.workflow_run_id}/overview`,
-                            "_blank",
-                            "noopener,noreferrer",
-                          );
-                          return;
-                        }
-                        navigate(
-                          `/workflows/${workflowRun.workflow_permanent_id}/${workflowRun.workflow_run_id}/overview`,
-                        );
-                      }}
-                      className="cursor-pointer"
-                    >
-                      <TableCell className="w-1/5">
-                        {workflowRun.workflow_run_id}
-                      </TableCell>
-                      <TableCell className="w-1/5">
-                        {workflowRun.workflow_permanent_id}
-                      </TableCell>
-                      <TableCell className="w-1/5">
-                        <WorkflowTitle
-                          workflowPermanentId={
-                            workflowRun.workflow_permanent_id
-                          }
-                        />
-                      </TableCell>
-                      <TableCell className="w-1/5">
-                        <StatusBadge status={workflowRun.status} />
-                      </TableCell>
-                      <TableCell
-                        className="w-1/5"
-                        title={basicTimeFormat(workflowRun.created_at)}
-                      >
-                        {basicLocalTimeFormat(workflowRun.created_at)}
-                      </TableCell>
-                    </TableRow>
-                  );
-                })
-              )}
-            </TableBody>
-          </Table>
-          <Pagination className="pt-2">
-            <PaginationContent>
-              <PaginationItem>
-                <PaginationPrevious
-                  className={cn({
-                    "cursor-not-allowed": workflowRunsPage === 1,
-                  })}
-                  onClick={() => {
-                    if (workflowRunsPage === 1) {
-                      return;
-                    }
-                    const params = new URLSearchParams();
-                    params.set(
-                      "workflowRunsPage",
-                      String(Math.max(1, workflowRunsPage - 1)),
-                    );
-                    setSearchParams(params, { replace: true });
-                  }}
-                />
-              </PaginationItem>
-              <PaginationItem>
-                <PaginationLink>{workflowRunsPage}</PaginationLink>
-              </PaginationItem>
-              <PaginationItem>
-                <PaginationNext
-                  onClick={() => {
-                    const params = new URLSearchParams();
-                    params.set(
-                      "workflowRunsPage",
-                      String(workflowRunsPage + 1),
-                    );
+                    params.set("page", String(page + 1));
                     setSearchParams(params, { replace: true });
                   }}
                 />

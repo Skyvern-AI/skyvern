@@ -393,7 +393,14 @@ function FlowRenderer({
       const startNodeId = nanoid();
       const adderNodeId = nanoid();
       newNodes.push(
-        startNode(startNodeId, { withWorkflowSettings: false }, id),
+        startNode(
+          startNodeId,
+          {
+            withWorkflowSettings: false,
+            editable: true,
+          },
+          id,
+        ),
       );
       newNodes.push(nodeAdderNode(adderNodeId, id));
       newEdges.push(defaultEdge(startNodeId, adderNodeId));

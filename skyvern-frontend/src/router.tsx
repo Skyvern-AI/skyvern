@@ -21,6 +21,10 @@ import { WorkflowRunOutput } from "./routes/workflows/workflowRun/WorkflowRunOut
 import { WorkflowPostRunParameters } from "./routes/workflows/workflowRun/WorkflowPostRunParameters";
 import { WorkflowRunRecording } from "./routes/workflows/workflowRun/WorkflowRunRecording";
 import { WorkflowRunOverview } from "./routes/workflows/workflowRun/WorkflowRunOverview";
+import { DiscoverPageLayout } from "./routes/discover/DiscoverPageLayout";
+import { DiscoverPage } from "./routes/discover/DiscoverPage";
+import { HistoryPageLayout } from "./routes/history/HistoryPageLayout";
+import { HistoryPage } from "./routes/history/HistoryPage";
 
 const router = createBrowserRouter([
   {
@@ -29,7 +33,7 @@ const router = createBrowserRouter([
     children: [
       {
         index: true,
-        element: <Navigate to="/tasks" />,
+        element: <Navigate to="/discover" />,
       },
       {
         path: "tasks",
@@ -141,6 +145,26 @@ const router = createBrowserRouter([
                 ],
               },
             ],
+          },
+        ],
+      },
+      {
+        path: "discover",
+        element: <DiscoverPageLayout />,
+        children: [
+          {
+            index: true,
+            element: <DiscoverPage />,
+          },
+        ],
+      },
+      {
+        path: "history",
+        element: <HistoryPageLayout />,
+        children: [
+          {
+            index: true,
+            element: <HistoryPage />,
           },
         ],
       },
