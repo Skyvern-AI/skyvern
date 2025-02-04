@@ -31,11 +31,10 @@ import {
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
-import { useNavigate } from "react-router-dom";
 import { stringify as convertToYAML } from "yaml";
 import { convert } from "./editor/workflowEditorUtils";
+import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
 import { WorkflowApiResponse } from "./types/workflowTypes";
-import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 
 type Props = {
   workflow: WorkflowApiResponse;
@@ -61,7 +60,6 @@ function downloadFile(fileName: string, contents: string) {
 function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
-  const navigate = useNavigate();
 
   function handleExport(type: "json" | "yaml") {
     if (!workflow) {
@@ -75,27 +73,7 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
     downloadFile(fileName, contents);
   }
 
-  const createWorkflowMutation = useMutation({
-    mutationFn: async (workflow: WorkflowCreateYAMLRequest) => {
-      const client = await getClient(credentialGetter);
-      const yaml = convertToYAML(workflow);
-      return client.post<string, { data: WorkflowApiResponse }>(
-        "/workflows",
-        yaml,
-        {
-          headers: {
-            "Content-Type": "text/plain",
-          },
-        },
-      );
-    },
-    onSuccess: (response) => {
-      queryClient.invalidateQueries({
-        queryKey: ["workflows"],
-      });
-      navigate(`/workflows/${response.data.workflow_permanent_id}/edit`);
-    },
-  });
+  const createWorkflowMutation = useCreateWorkflowMutation();
 
   const deleteWorkflowMutation = useMutation({
     mutationFn: async (id: string) => {

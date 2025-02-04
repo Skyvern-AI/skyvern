@@ -13,6 +13,7 @@ import {
   WorkflowParameterTypes,
   WorkflowSettings,
 } from "../types/workflowTypes";
+import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
 
 function WorkflowEditor() {
   const { workflowPermanentId } = useParams();
@@ -27,12 +28,15 @@ function WorkflowEditor() {
     workflowPermanentId,
   });
 
+  const { data: globalWorkflows, isLoading: isGlobalWorkflowsLoading } =
+    useGlobalWorkflowsQuery();
+
   useMountEffect(() => {
     setCollapsed(true);
     setHasChanges(false);
   });
 
-  if (isLoading) {
+  if (isLoading || isGlobalWorkflowsLoading) {
     return (
       <div className="flex h-screen w-full items-center justify-center">
         <LogoMinimized />
@@ -44,13 +48,22 @@ function WorkflowEditor() {
     return null;
   }
 
+  const isGlobalWorkflow = globalWorkflows?.some(
+    (globalWorkflow) =>
+      globalWorkflow.workflow_permanent_id === workflowPermanentId,
+  );
+
   const settings: WorkflowSettings = {
     persistBrowserSession: workflow.persist_browser_session,
     proxyLocation: workflow.proxy_location,
     webhookCallbackUrl: workflow.webhook_callback_url,
   };
 
-  const elements = getElements(workflow.workflow_definition.blocks, settings);
+  const elements = getElements(
+    workflow.workflow_definition.blocks,
+    settings,
+    !isGlobalWorkflow,
+  );
 
   return (
     <div className="h-screen w-full">

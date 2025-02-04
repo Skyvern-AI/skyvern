@@ -172,6 +172,7 @@ function layout(
 function convertToNode(
   identifiers: { id: string; parentId?: string },
   block: WorkflowBlock,
+  editable: boolean,
 ): AppNode {
   const common = {
     draggable: false,
@@ -181,7 +182,7 @@ function convertToNode(
   const commonData: NodeBaseData = {
     label: block.label,
     continueOnFailure: block.continue_on_failure,
-    editable: true,
+    editable,
   };
   switch (block.block_type) {
     case "task": {
@@ -590,6 +591,7 @@ export function nodeAdderNode(id: string, parentId?: string): NodeAdderNode {
 function getElements(
   blocks: Array<WorkflowBlock>,
   settings: WorkflowSettings,
+  editable: boolean,
 ): {
   nodes: Array<AppNode>;
   edges: Array<Edge>;
@@ -605,6 +607,7 @@ function getElements(
       persistBrowserSession: settings.persistBrowserSession,
       proxyLocation: settings.proxyLocation ?? ProxyLocation.Residential,
       webhookCallbackUrl: settings.webhookCallbackUrl ?? "",
+      editable,
     }),
   );
 
@@ -615,6 +618,7 @@ function getElements(
         parentId: d.parentId ?? undefined,
       },
       d.block,
+      editable,
     );
     nodes.push(node);
     if (d.previous) {
@@ -633,6 +637,7 @@ function getElements(
         startNodeId,
         {
           withWorkflowSettings: false,
+          editable,
         },
         block.id,
       ),

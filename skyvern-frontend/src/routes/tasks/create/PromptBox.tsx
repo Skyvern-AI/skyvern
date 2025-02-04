@@ -30,7 +30,6 @@ import {
   GearIcon,
   PaperPlaneIcon,
   Pencil1Icon,
-  PlusIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -392,15 +391,6 @@ function PromptBox() {
         </div>
       </div>
       <div className="flex flex-wrap justify-center gap-4 rounded-sm bg-slate-elevation1 p-4">
-        <div
-          className="flex cursor-pointer gap-2 whitespace-normal rounded-sm border-2 border-dashed bg-slate-elevation3 px-4 py-3 hover:bg-slate-elevation5 lg:whitespace-nowrap"
-          onClick={() => {
-            navigate("/tasks/create/blank");
-          }}
-        >
-          <PlusIcon className="size-6" />
-          Build Your Own
-        </div>
         {exampleCases.map((example) => {
           return (
             <ExampleCasePill
