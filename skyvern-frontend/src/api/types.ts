@@ -82,6 +82,31 @@ export type StepApiResponse = {
   step_cost: number;
 };
 
+export type Task = {
+  task_id: string;
+  status: Status;
+  created_at: string; // ISO 8601
+  modified_at: string; // ISO 8601
+  extracted_information: Record<string, unknown> | string | null;
+  screenshot_url: string | null;
+  recording_url: string | null;
+  organization_id: string;
+  workflow_run_id: string | null;
+  order: number | null;
+  retry: number | null;
+  max_steps_per_run: number | null;
+  errors: Array<Record<string, unknown>>;
+  title: string | null;
+  url: string;
+  webhook_callback_url: string | null;
+  navigation_goal: string | null;
+  data_extraction_goal: string | null;
+  navigation_payload: Record<string, unknown> | string | null;
+  complete_criterion: string | null;
+  terminate_criterion: string | null;
+  application: string | null;
+};
+
 export type TaskApiResponse = {
   request: CreateTaskRequest;
   task_id: string;

@@ -1,4 +1,4 @@
-import { Status, TaskApiResponse, WorkflowRunApiResponse } from "@/api/types";
+import { Status, Task, WorkflowRunApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
 import {
@@ -23,10 +23,9 @@ import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { useState } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
+import { WorkflowTitle } from "../workflows/WorkflowTitle";
 
-function isTaskApiResponse(
-  run: TaskApiResponse | WorkflowRunApiResponse,
-): run is TaskApiResponse {
+function isTask(run: Task | WorkflowRunApiResponse): run is Task {
   return "task_id" in run;
 }
 
@@ -62,9 +61,9 @@ function RunHistory() {
           <TableHeader className="rounded-t-lg bg-slate-elevation2">
             <TableRow>
               <TableHead className="w-1/4 rounded-tl-lg text-slate-400">
-                Type
+                Run ID
               </TableHead>
-              <TableHead className="w-1/4 text-slate-400">Run ID</TableHead>
+              <TableHead className="w-1/4 text-slate-400">Title</TableHead>
               <TableHead className="w-1/4 text-slate-400">Status</TableHead>
               <TableHead className="w-1/4 rounded-tr-lg text-slate-400">
                 Created At
@@ -89,7 +88,7 @@ function RunHistory() {
               </TableRow>
             ) : null}
             {runs?.map((run) => {
-              if (isTaskApiResponse(run)) {
+              if (isTask(run)) {
                 return (
                   <TableRow
                     key={run.task_id}
@@ -98,8 +97,8 @@ function RunHistory() {
                       handleNavigate(event, `/tasks/${run.task_id}/actions`);
                     }}
                   >
-                    <TableCell>Task</TableCell>
                     <TableCell>{run.task_id}</TableCell>
+                    <TableCell>{run.title ?? "Untitled Task"}</TableCell>
                     <TableCell>
                       <StatusBadge status={run.status} />
                     </TableCell>
@@ -120,8 +119,12 @@ function RunHistory() {
                     );
                   }}
                 >
-                  <TableCell>Workflow</TableCell>
                   <TableCell>{run.workflow_run_id}</TableCell>
+                  <TableCell>
+                    <WorkflowTitle
+                      workflowPermanentId={run.workflow_permanent_id}
+                    />
+                  </TableCell>
                   <TableCell>
                     <StatusBadge status={run.status} />
                   </TableCell>
