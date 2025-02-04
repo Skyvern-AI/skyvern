@@ -2161,12 +2161,7 @@ async def select_from_dropdown(
         step_id=step.step_id,
         task_id=task.task_id,
     )
-    if context.is_date_related:
-        # HACK: according to the test, secondary LLM is not doing well on the date picker
-        # using the main LLM to handle the case
-        json_response = await app.LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
-    else:
-        json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
+    json_response = await app.SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
     value: str | None = json_response.get("value", None)
     single_select_result.value = value
     select_reason: str | None = json_response.get("reasoning", None)
@@ -2618,7 +2613,7 @@ async def normal_select(
         options=options_html,
     )
 
-    json_response = await app.LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
+    json_response = await app.SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
     index: int | None = json_response.get("index")
     value: str | None = json_response.get("value")
 
