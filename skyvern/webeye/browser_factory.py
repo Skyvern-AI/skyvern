@@ -480,14 +480,22 @@ class BrowserState:
             return
         if len(self.browser_artifacts.video_artifacts) > index:
             if self.browser_artifacts.video_artifacts[index].video_path is None:
-                self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
+                try:
+                    async with asyncio.timeout(settings.BROWSER_ACTION_TIMEOUT_MS / 1000):
+                        self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
+                except asyncio.TimeoutError:
+                    LOG.info("Timeout to get the page video, skip the exception")
             return
 
         target_lenght = index + 1
         self.browser_artifacts.video_artifacts.extend(
             [VideoArtifact()] * (target_lenght - len(self.browser_artifacts.video_artifacts))
         )
-        self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
+        try:
+            async with asyncio.timeout(settings.BROWSER_ACTION_TIMEOUT_MS / 1000):
+                self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
+        except asyncio.TimeoutError:
+            LOG.info("Timeout to get the page video, skip the exception")
         return
 
     async def get_or_create_page(
