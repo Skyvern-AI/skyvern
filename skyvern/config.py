@@ -103,6 +103,7 @@ class Settings(BaseSettings):
     ENABLE_ANTHROPIC: bool = False
     ENABLE_AZURE: bool = False
     ENABLE_AZURE_GPT4O_MINI: bool = False
+    ENABLE_AZURE_O3_MINI: bool = False
     ENABLE_BEDROCK: bool = False
     ENABLE_GEMINI: bool = False
     # OPENAI
@@ -120,6 +121,12 @@ class Settings(BaseSettings):
     AZURE_GPT4O_MINI_API_KEY: str | None = None
     AZURE_GPT4O_MINI_API_BASE: str | None = None
     AZURE_GPT4O_MINI_API_VERSION: str | None = None
+
+    # AZURE o3 mini
+    AZURE_O3_MINI_DEPLOYMENT: str | None = None
+    AZURE_O3_MINI_API_KEY: str | None = None
+    AZURE_O3_MINI_API_BASE: str | None = None
+    AZURE_O3_MINI_API_VERSION: str | None = None
 
     # GEMINI
     GEMINI_API_KEY: str | None = None
