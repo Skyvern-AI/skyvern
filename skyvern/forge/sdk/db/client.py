@@ -1409,7 +1409,11 @@ class AgentDB:
                     convert_to_workflow_run(run, debug_enabled=self.debug_enabled) for run in workflow_run_query_result
                 ]
 
-                task_query = select(TaskModel).filter(TaskModel.organization_id == organization_id)
+                task_query = (
+                    select(TaskModel)
+                    .filter(TaskModel.organization_id == organization_id)
+                    .filter(TaskModel.workflow_run_id.is_(None))
+                )
                 if status:
                     task_query = task_query.filter(TaskModel.status.in_(status))
                 task_query = task_query.order_by(TaskModel.created_at.desc()).limit(limit)
