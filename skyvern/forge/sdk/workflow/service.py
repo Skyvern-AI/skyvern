@@ -515,7 +515,7 @@ class WorkflowService:
         )
 
         # Track workflow run duration when completed
-        duration_seconds = (datetime.now(UTC) - workflow_run.created_at).total_seconds()
+        duration_seconds = (datetime.now(UTC) - workflow_run.created_at.replace(tzinfo=UTC)).total_seconds()
         LOG.info(
             "Workflow run duration metrics",
             workflow_run_id=workflow_run_id,
