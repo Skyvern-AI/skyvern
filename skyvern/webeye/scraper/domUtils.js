@@ -2085,11 +2085,15 @@ async function addIncrementalNodeToMap(parentNode, childrenNode) {
       newNodesTreeList = window.globalDomDepthMap.get(depth);
     }
 
-    for (const child of childrenNode) {
-      const [_, newNodeTree] = buildElementTree(child, "", true);
-      if (newNodeTree.length > 0) {
-        newNodesTreeList.push(...newNodeTree);
+    try {
+      for (const child of childrenNode) {
+        const [_, newNodeTree] = buildElementTree(child, "", true);
+        if (newNodeTree.length > 0) {
+          newNodesTreeList.push(...newNodeTree);
+        }
       }
+    } catch (error) {
+      console.error("Error building incremental element node:", error);
     }
     window.globalDomDepthMap.set(depth, newNodesTreeList);
   }
