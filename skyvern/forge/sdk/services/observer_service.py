@@ -1,7 +1,7 @@
 import os
 import random
 import string
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -119,7 +119,11 @@ async def initialize_observer_task(
     )
 
     metadata_prompt = prompt_engine.load_prompt("observer_generate_metadata", user_goal=user_prompt, user_url=user_url)
-    metadata_response = await app.LLM_API_HANDLER(prompt=metadata_prompt, observer_thought=observer_thought)
+    metadata_response = await app.LLM_API_HANDLER(
+        prompt=metadata_prompt,
+        observer_thought=observer_thought,
+        prompt_name="observer-generate-metadata",
+    )
     # validate
     LOG.info(f"Initialized observer initial response: {metadata_response}")
     url: str = user_url or metadata_response.get("url", "")
@@ -411,6 +415,7 @@ async def run_observer_task_helper(
                 prompt=observer_prompt,
                 screenshots=scraped_page.screenshots,
                 observer_thought=observer_thought,
+                prompt_name="observer",
             )
             LOG.info(
                 "Observer response",
@@ -615,6 +620,7 @@ async def run_observer_task_helper(
                 prompt=observer_completion_prompt,
                 screenshots=completion_screenshots,
                 observer_thought=observer_thought,
+                prompt_name="observer_check_completion",
             )
             LOG.info(
                 "Observer completion check response",
@@ -917,6 +923,7 @@ async def _generate_loop_task(
         task_in_loop_metadata_prompt,
         screenshots=scraped_page.screenshots,
         observer_thought=observer_thought_task_in_loop,
+        prompt_name="observer_generate_task_block",
     )
     LOG.info("Task in loop metadata response", task_in_loop_metadata_response=task_in_loop_metadata_response)
     navigation_goal = task_in_loop_metadata_response.get("navigation_goal")
@@ -1012,6 +1019,7 @@ async def _generate_extraction_task(
     generate_extraction_task_response = await app.LLM_API_HANDLER(
         generate_extraction_task_prompt,
         observer_cruise=observer_cruise,
+        prompt_name="observer_generate_extraction_task",
     )
     LOG.info("Data extraction response", data_extraction_response=generate_extraction_task_response)
 
@@ -1289,6 +1297,7 @@ async def _summarize_observer_task(
         prompt=observer_summary_prompt,
         screenshots=screenshots,
         observer_thought=observer_thought,
+        prompt_name="observer_summary",
     )
     LOG.info("Observer summary response", observer_summary_resp=observer_summary_resp)
 
