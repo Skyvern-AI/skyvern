@@ -1005,15 +1005,26 @@ class ForLoopBlock(Block):
                 block_type=self.block_type,
                 workflow_run_id=workflow_run_id,
                 num_loop_over_values=len(loop_over_values),
+                complete_if_empty=self.complete_if_empty,
             )
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, [])
-            return await self.build_block_result(
-                success=False,
-                failure_reason="No iterable value found for the loop block",
-                status=BlockStatus.terminated,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-            )
+            if self.complete_if_empty:
+                return await self.build_block_result(
+                    success=True,
+                    failure_reason=None,
+                    output_parameter_value=[],
+                    status=BlockStatus.completed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            else:
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason="No iterable value found for the loop block",
+                    status=BlockStatus.terminated,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
 
         if not self.loop_blocks or len(self.loop_blocks) == 0:
             LOG.info(
