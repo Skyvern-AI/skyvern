@@ -22,8 +22,7 @@ import { useRunsQuery } from "@/hooks/useRunsQuery";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { useState } from "react";
-import { useSearchParams, useNavigate } from "react-router-dom";
-import { WorkflowTitle } from "../workflows/WorkflowTitle";
+import { useNavigate, useSearchParams } from "react-router-dom";
 
 function isTask(run: Task | WorkflowRunApiResponse): run is Task {
   return "task_id" in run;
@@ -120,11 +119,7 @@ function RunHistory() {
                   }}
                 >
                   <TableCell>{run.workflow_run_id}</TableCell>
-                  <TableCell>
-                    <WorkflowTitle
-                      workflowPermanentId={run.workflow_permanent_id}
-                    />
-                  </TableCell>
+                  <TableCell>{run.workflow_title ?? ""}</TableCell>
                   <TableCell>
                     <StatusBadge status={run.status} />
                   </TableCell>
