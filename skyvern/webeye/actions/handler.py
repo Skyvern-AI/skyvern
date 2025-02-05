@@ -631,9 +631,10 @@ async def handle_input_text_action(
             await incremental_scraped.stop_listen_dom_increment()
         else:
             auto_complete_hacky_flag = True
+            try_to_quit_dropdown = True
             try:
                 # TODO: we don't select by value for the auto completion detect case
-                result, _ = await sequentially_select_from_dropdown(
+                select_result = await sequentially_select_from_dropdown(
                     action=select_action,
                     page=page,
                     dom=dom,
@@ -644,10 +645,11 @@ async def handle_input_text_action(
                     task=task,
                     target_value=text,
                 )
-                if result is not None and result.success:
-                    return [result]
 
-                if result is None:
+                if select_result is None or select_result.dropdown_menu is None:
+                    try_to_quit_dropdown = False
+
+                elif select_result.action_result is None:
                     LOG.info(
                         "It might not be a selectable auto-completion input, exit the custom selection mode",
                         task_id=task.task_id,
@@ -655,6 +657,10 @@ async def handle_input_text_action(
                         element_id=skyvern_element.get_id(),
                         action=action,
                     )
+
+                elif select_result.action_result.success:
+                    return [select_result.action_result]
+
                 else:
                     LOG.warning(
                         "Custom selection returned an error, continue to input text",
@@ -662,7 +668,7 @@ async def handle_input_text_action(
                         step_id=step.step_id,
                         element_id=skyvern_element.get_id(),
                         action=action,
-                        err_msg=result.exception_message,
+                        err_msg=select_result.action_result.exception_message,
                     )
 
             except Exception:
@@ -690,7 +696,7 @@ async def handle_input_text_action(
                         if await blocking_element.get_locator().count():
                             await blocking_element.blur()
 
-                if await skyvern_element.is_visible():
+                if try_to_quit_dropdown and await skyvern_element.is_visible():
                     await skyvern_element.press_key("Escape")
                     await skyvern_element.blur()
                 await incremental_scraped.stop_listen_dom_increment()
@@ -1133,7 +1139,7 @@ async def handle_select_option_action(
             raise NoIncrementalElementFoundForCustomSelection(element_id=skyvern_element.get_id())
 
         # TODO: support sequetially select from dropdown by value, just support single select now
-        result, suggested_value = await sequentially_select_from_dropdown(
+        result = await sequentially_select_from_dropdown(
             action=action,
             page=page,
             dom=dom,
@@ -1146,9 +1152,11 @@ async def handle_select_option_action(
         )
         # force_select won't return None result
         assert result is not None
-        results.append(result)
-        if isinstance(result, ActionSuccess) or suggested_value is None:
+        assert result.action_result is not None
+        results.append(result.action_result)
+        if isinstance(result.action_result, ActionSuccess) or result.value is None:
             return results
+        suggested_value = result.value
 
     except Exception as e:
         LOG.exception("Custom select error")
@@ -1927,7 +1935,7 @@ async def sequentially_select_from_dropdown(
     dropdown_menu_element: SkyvernElement | None = None,
     force_select: bool = False,
     target_value: str = "",
-) -> tuple[ActionResult | None, str | None]:
+) -> CustomSingleSelectResult | None:
     """
     TODO: support to return all values retrieved from the sequentially select
     Only return the last value today
@@ -1958,7 +1966,7 @@ async def sequentially_select_from_dropdown(
             task_id=task.task_id,
             step_id=step.step_id,
         )
-        return None, None
+        return None
 
     # TODO: only suport the third-level dropdown selection now
     MAX_SELECT_DEPTH = 3
@@ -1999,7 +2007,7 @@ async def sequentially_select_from_dropdown(
             break
 
         if await single_select_result.is_done():
-            return single_select_result.action_result, values[-1] if len(values) > 0 else None
+            return single_select_result
 
         if i == MAX_SELECT_DEPTH - 1:
             LOG.warning(
@@ -2037,7 +2045,7 @@ async def sequentially_select_from_dropdown(
                 task_id=task.task_id,
                 step_id=step.step_id,
             )
-            return single_select_result.action_result, values[-1] if len(values) > 0 else None
+            return single_select_result
 
         # it's for typing. it's been verified in `single_select_result.is_done()`
         assert single_select_result.dropdown_menu is not None
@@ -2061,11 +2069,9 @@ async def sequentially_select_from_dropdown(
         )
         if json_response.get("is_mini_goal_finished", False):
             LOG.info("The user has finished the selection for the current opened dropdown", step_id=step.step_id)
-            return single_select_result.action_result, values[-1] if len(values) > 0 else None
+            return single_select_result
 
-    return select_history[-1].action_result if len(select_history) > 0 else None, values[-1] if len(
-        values
-    ) > 0 else None
+    return select_history[-1] if len(select_history) > 0 else None
 
 
 def build_sequential_select_history(history_list: list[CustomSingleSelectResult]) -> list[dict[str, Any]]:
