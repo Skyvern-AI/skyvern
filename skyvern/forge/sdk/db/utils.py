@@ -192,7 +192,9 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
     )
 
 
-def convert_to_workflow_run(workflow_run_model: WorkflowRunModel, debug_enabled: bool = False) -> WorkflowRun:
+def convert_to_workflow_run(
+    workflow_run_model: WorkflowRunModel, workflow_title: str | None = None, debug_enabled: bool = False
+) -> WorkflowRun:
     if debug_enabled:
         LOG.debug(
             "Converting WorkflowRunModel to WorkflowRun",
@@ -215,6 +217,7 @@ def convert_to_workflow_run(workflow_run_model: WorkflowRunModel, debug_enabled:
         totp_identifier=workflow_run_model.totp_identifier,
         created_at=workflow_run_model.created_at,
         modified_at=workflow_run_model.modified_at,
+        workflow_title=workflow_title,
     )
 
 
