@@ -470,18 +470,16 @@ async def get_interactable_element_tree_in_frame(
 
         try:
             frame_element = await frame.frame_element()
+            # it will get stuck when we `frame.evaluate()` on an invisible iframe
+            if not await frame_element.is_visible():
+                continue
+            unique_id = await frame_element.get_attribute("unique_id")
         except Exception:
             LOG.warning(
-                "Unable to get frame_element",
+                "Unable to get unique_id from frame_element",
                 exc_info=True,
             )
             continue
-
-        # it will get stuck when we `frame.evaluate()` on an invisible iframe
-        if not await frame_element.is_visible():
-            continue
-
-        unique_id = await frame_element.get_attribute("unique_id")
 
         frame_js_script = f"() => buildTreeFromBody('{unique_id}')"
 

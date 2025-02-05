@@ -248,7 +248,7 @@ async def _convert_svg_to_string(
 
 
 async def _convert_css_shape_to_string(
-    frame: Page | Frame,
+    skyvern_frame: SkyvernFrame,
     element: Dict,
     task: Task | None = None,
     step: Step | None = None,
@@ -279,28 +279,18 @@ async def _convert_css_shape_to_string(
     if css_shape:
         LOG.debug("CSS shape loaded from cache", element_id=element_id, key=shape_key, shape=css_shape)
     else:
-        # FIXME: support element in iframe
-        locater = frame.locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
-        if await locater.count() == 0:
-            LOG.info(
-                "No locater found to convert css shape",
-                task_id=task_id,
-                step_id=step_id,
-                element_id=element_id,
-            )
-            return None
-
-        if await locater.count() > 1:
-            LOG.info(
-                "multiple locaters found to convert css shape",
-                task_id=task_id,
-                step_id=step_id,
-                element_id=element_id,
-            )
-            return None
-
         try:
-            LOG.debug("call LLM to convert css shape to string shape", element_id=element_id)
+            locater = skyvern_frame.get_frame().locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
+            if await locater.count() == 0:
+                LOG.info(
+                    "No locater found to convert css shape",
+                    task_id=task_id,
+                    step_id=step_id,
+                    element_id=element_id,
+                    key=shape_key,
+                )
+                return None
+
             if not await locater.is_visible(timeout=settings.BROWSER_ACTION_TIMEOUT_MS):
                 LOG.info(
                     "element is not visible on the page, going to abort conversion",
@@ -309,9 +299,22 @@ async def _convert_css_shape_to_string(
                     element_id=element_id,
                     key=shape_key,
                 )
+
+            skyvern_element = SkyvernElement(locator=locater, frame=skyvern_frame.get_frame(), static_element=element)
+
+            _, blocked = await skyvern_frame.get_blocking_element_id(await skyvern_element.get_element_handler())
+            if blocked:
+                LOG.info(
+                    "element is blocked by another element, going to abort conversion",
+                    task_id=task_id,
+                    step_id=step_id,
+                    element_id=element_id,
+                    key=shape_key,
+                )
                 return None
 
-            screenshot = await locater.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
+            LOG.debug("call LLM to convert css shape to string shape", element_id=element_id)
+            screenshot = await locater.screenshot(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
             prompt = prompt_engine.load_prompt("css-shape-convert")
 
             # TODO: we don't retry the css shape conversion today
@@ -466,7 +469,7 @@ class AgentFunction:
 
                 if _should_css_shape_convert(element=queue_ele):
                     await _convert_css_shape_to_string(
-                        frame=frame,
+                        skyvern_frame=skyvern_frame,
                         element=queue_ele,
                         task=task,
                         step=step,
