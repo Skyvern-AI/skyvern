@@ -225,6 +225,7 @@ export type WorkflowRunApiResponse = {
   created_at: string;
   modified_at: string;
   failure_reason: string | null;
+  workflow_title: string | null;
 };
 
 export type WorkflowRunStatusApiResponse = {
@@ -244,6 +245,7 @@ export type WorkflowRunStatusApiResponse = {
   total_steps: number | null;
   total_cost: number | null;
   observer_task: ObserverTask | null;
+  workflow_title: string | null;
 };
 
 export type TaskGenerationApiResponse = {
