@@ -343,7 +343,7 @@ async def run_observer_task_helper(
         observer_cruise_id=observer_cruise_id, organization_id=organization_id, status=ObserverTaskStatus.running
     )
     await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
-    await _set_up_workflow_context(workflow_id, workflow_run_id)
+    await _set_up_workflow_context(workflow_id, workflow_run_id, organization)
 
     url = str(observer_task.url)
     user_prompt = observer_task.prompt
@@ -742,17 +742,19 @@ async def handle_block_result(
     )
 
 
-async def _set_up_workflow_context(workflow_id: str, workflow_run_id: str) -> None:
+async def _set_up_workflow_context(workflow_id: str, workflow_run_id: str, organization: Organization) -> None:
     """
     TODO: see if we could remove this function as we can just set an empty workflow context
     """
     # Get all <workflow parameter, workflow run parameter> tuples
     wp_wps_tuples = await app.WORKFLOW_SERVICE.get_workflow_run_parameter_tuples(workflow_run_id=workflow_run_id)
     workflow_output_parameters = await app.WORKFLOW_SERVICE.get_workflow_output_parameters(workflow_id=workflow_id)
-    app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
+    await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
+        organization,
         workflow_run_id,
         wp_wps_tuples,
         workflow_output_parameters,
+        [],
         [],
     )
 
