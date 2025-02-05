@@ -369,7 +369,6 @@ async def run_observer_task_helper(
                 workflow_id=workflow_id,
                 url=url,
             )
-            task_history_record = {"type": task_type, "task": plan}
         else:
             try:
                 browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
