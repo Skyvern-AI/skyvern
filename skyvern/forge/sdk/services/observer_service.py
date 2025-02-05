@@ -1136,7 +1136,7 @@ async def mark_observer_task_as_completed(
     )
 
     # Track observer cruise duration when completed
-    duration_seconds = (datetime.now(UTC) - observer_task.created_at).total_seconds()
+    duration_seconds = (datetime.now(UTC) - observer_task.created_at.replace(tzinfo=UTC)).total_seconds()
     LOG.info(
         "Observer cruise duration metrics",
         observer_cruise_id=observer_cruise_id,
