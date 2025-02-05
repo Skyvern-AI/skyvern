@@ -1050,6 +1050,7 @@ class WorkflowService:
             outputs=outputs,
             total_steps=total_steps,
             total_cost=total_cost,
+            workflow_title=workflow.title,
         )
 
     async def clean_up_workflow(

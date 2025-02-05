@@ -1398,15 +1398,18 @@ class AgentDB:
 
                 limit = page * page_size
 
-                workflow_run_query = select(WorkflowRunModel).filter(
-                    WorkflowRunModel.organization_id == organization_id
+                workflow_run_query = (
+                    select(WorkflowRunModel, WorkflowModel.title)
+                    .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
+                    .filter(WorkflowRunModel.organization_id == organization_id)
                 )
                 if status:
                     workflow_run_query = workflow_run_query.filter(WorkflowRunModel.status.in_(status))
                 workflow_run_query = workflow_run_query.order_by(WorkflowRunModel.created_at.desc()).limit(limit)
-                workflow_run_query_result = (await session.scalars(workflow_run_query)).all()
+                workflow_run_query_result = (await session.execute(workflow_run_query)).all()
                 workflow_runs = [
-                    convert_to_workflow_run(run, debug_enabled=self.debug_enabled) for run in workflow_run_query_result
+                    convert_to_workflow_run(run, workflow_title=title, debug_enabled=self.debug_enabled)
+                    for run, title in workflow_run_query_result
                 ]
 
                 task_query = (
@@ -1453,15 +1456,19 @@ class AgentDB:
             async with self.Session() as session:
                 db_page = page - 1  # offset logic is 0 based
                 query = (
-                    select(WorkflowRunModel)
+                    select(WorkflowRunModel, WorkflowModel.title)
+                    .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
                     .filter(WorkflowRunModel.organization_id == organization_id)
                     .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
                 )
                 if status:
                     query = query.filter(WorkflowRunModel.status.in_(status))
                 query = query.order_by(WorkflowRunModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
-                workflow_runs = (await session.scalars(query)).all()
-                return [convert_to_workflow_run(run) for run in workflow_runs]
+                workflow_runs = (await session.execute(query)).all()
+                return [
+                    convert_to_workflow_run(run, workflow_title=title, debug_enabled=self.debug_enabled)
+                    for run, title in workflow_runs
+                ]
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -1478,15 +1485,21 @@ class AgentDB:
             async with self.Session() as session:
                 db_page = page - 1  # offset logic is 0 based
                 query = (
-                    select(WorkflowRunModel)
+                    select(WorkflowRunModel, WorkflowModel.title)
+                    .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
                     .filter(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
                     .filter(WorkflowRunModel.organization_id == organization_id)
                 )
                 if status:
                     query = query.filter(WorkflowRunModel.status.in_(status))
                 query = query.order_by(WorkflowRunModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
-                workflow_runs = (await session.scalars(query)).all()
-                return [convert_to_workflow_run(run) for run in workflow_runs]
+                workflow_runs_and_titles_tuples = (await session.execute(query)).all()
+                workflow_runs = [
+                    convert_to_workflow_run(run, workflow_title=title, debug_enabled=self.debug_enabled)
+                    for run, title in workflow_runs_and_titles_tuples
+                ]
+                return workflow_runs
+
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise

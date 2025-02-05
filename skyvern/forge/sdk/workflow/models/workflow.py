@@ -109,6 +109,7 @@ class WorkflowRun(BaseModel):
     totp_identifier: str | None = None
     failure_reason: str | None = None
     parent_workflow_run_id: str | None = None
+    workflow_title: str | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -147,3 +148,4 @@ class WorkflowRunStatusResponse(BaseModel):
     total_steps: int | None = None
     total_cost: float | None = None
     observer_task: ObserverTask | None = None
+    workflow_title: str | None = None
