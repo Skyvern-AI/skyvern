@@ -54,8 +54,6 @@ pyotp = "^2.9.0"
 asyncpg = "^0.30.0"
 json-repair = "^0.34.0"
 pypdf = "^5.1.0"
-build = "^1.2.2.post1"
-twine = "^6.1.0"
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"
@@ -78,6 +76,8 @@ snoop = "^0.4.3"
 rich = {extras = ["jupyter"], version = "^13.7.0"}
 fpdf = "^1.7.2"
 pypdf = "^5.0.1"
+twine = "^6.1.0"
+build = "^1.2.2.post1"
 
 
 [build-system]
