@@ -344,8 +344,22 @@ async def _create_headful_chromium(
             "headless": False,
         }
     )
+
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(har_path=browser_args["record_har_path"])
-    browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
+
+    browserbase_ws = (
+        "wss://connect.browserbase.com/?apiKey="
+        + "bb_live_tkbzfjRRifsNRK1TeGLENjs9VjE"
+        + "&enableProxy=true"
+    )
+    LOG.info("Connecting to Browserbase remote browser", browserbase_ws=browserbase_ws)
+    browser = await playwright.chromium.connect_over_cdp(browserbase_ws)
+
+    if browser.contexts:
+        browser_context = browser.contexts[0]
+    else:
+        browser_context = await browser.new_context()
+
     return browser_context, browser_artifacts, None
 
 
