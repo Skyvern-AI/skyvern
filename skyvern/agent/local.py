@@ -1,24 +1,17 @@
 from dotenv import load_dotenv
 
+from skyvern.agent.parameter import TaskV1Request, TaskV2Request
 from skyvern.forge import app
 from skyvern.forge.sdk.core import security, skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-from skyvern.forge.sdk.schemas.observers import ObserverTask, ObserverTaskRequest, ObserverTaskStatus
+from skyvern.forge.sdk.schemas.observers import ObserverTask, ObserverTaskStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.tasks import TaskRequest, TaskResponse, TaskStatus
+from skyvern.forge.sdk.schemas.tasks import TaskResponse, TaskStatus
 from skyvern.forge.sdk.services import observer_service
 from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.utils import migrate_db
-
-
-class TaskV1Request(TaskRequest):
-    max_steps: int = 10
-
-
-class TaskV2Request(ObserverTaskRequest):
-    max_iterations: int = 10
 
 
 class Agent:
@@ -142,12 +135,10 @@ class Agent:
             max_iterations_override=task_request.max_iterations,
         )
 
+        refreshed_observer_task = await app.DATABASE.get_observer_cruise(
+            observer_cruise_id=observer_task.observer_cruise_id, organization_id=organization.organization_id
+        )
+        if refreshed_observer_task:
+            return refreshed_observer_task
+
         return observer_task
-
-
-class CloudAgent:
-    def __init__(self) -> None:
-        pass
-
-    async def create_task(self) -> None:
-        pass
