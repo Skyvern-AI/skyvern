@@ -55,6 +55,7 @@ asyncpg = "^0.30.0"
 json-repair = "^0.34.0"
 pypdf = "^5.1.0"
 build = "^1.2.2.post1"
+twine = "^6.1.0"
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"
