@@ -1193,7 +1193,7 @@ async def observer_task(
     background_tasks: BackgroundTasks,
     data: ObserverTaskRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
-    x_max_iterations_override: Annotated[int | None, Header()] = None,
+    x_max_iterations_override: Annotated[int | str | None, Header()] = None,
 ) -> dict[str, Any]:
     if x_max_iterations_override:
         LOG.info("Overriding max iterations for observer", max_iterations_override=x_max_iterations_override)
