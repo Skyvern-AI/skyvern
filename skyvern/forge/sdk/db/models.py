@@ -44,7 +44,6 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_run_id,
 )
 from skyvern.forge.sdk.schemas.observers import ObserverThoughtType
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 
 
 class Base(AsyncAttrs, DeclarativeBase):
@@ -70,7 +69,7 @@ class TaskModel(Base):
     navigation_payload = Column(JSON)
     extracted_information = Column(JSON)
     failure_reason = Column(String)
-    proxy_location = Column(Enum(ProxyLocation))
+    proxy_location = Column(String)
     extracted_information_schema = Column(JSON)
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), index=True)
     order = Column(Integer, nullable=True)
