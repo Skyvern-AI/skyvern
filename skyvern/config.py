@@ -11,7 +11,7 @@ class Settings(BaseSettings):
 
     BROWSER_TYPE: str = "chromium-headful"
     MAX_SCRAPING_RETRIES: int = 0
-    VIDEO_PATH: str | None = None
+    VIDEO_PATH: str | None = "./video"
     HAR_PATH: str | None = "./har"
     LOG_PATH: str = "./log"
     TEMP_PATH: str = "./temp"

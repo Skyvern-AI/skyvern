@@ -4,7 +4,7 @@ version = "0.1.0"
 description = ""
 authors = ["Skyvern AI <info@skyvern.com>"]
 readme = "README.md"
-packages = [{ include = "skyvern" }]
+packages = [{ include = "skyvern" }, { include = "alembic" }]
 
 [tool.poetry.dependencies]
 python = "^3.11,<3.12"
@@ -129,3 +129,6 @@ skip = ["webeye/actions/__init__.py", "forge/sdk/__init__.py"]
 
 [tool.mypy]
 plugins = "sqlalchemy.ext.mypy.plugin"
+
+[tool.poetry.scripts]
+skyvern = "skyvern.cli.commands:app"
