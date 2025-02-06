@@ -3,8 +3,8 @@ services:
     image: postgres:14-alpine
     restart: always
     # comment out if you want to externally connect DB
-    # ports:
-    #   - 5432:5432
+    ports:
+      - 5432:5432
     volumes:
       - ./postgres-data:/var/lib/postgresql/data
     environment:
@@ -19,7 +19,10 @@ services:
       retries: 5
 
   skyvern:
-    image: public.ecr.aws/skyvern/skyvern:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: my-skyvern:latest
     restart: on-failure
     # comment out if you want to externally call skyvern API
     ports:
