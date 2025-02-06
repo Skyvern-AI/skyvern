@@ -328,7 +328,7 @@ async def _create_headless_chromium(
 
 async def _create_headful_chromium(
     playwright: Playwright, proxy_location: ProxyLocation | None = None, **kwargs: dict
-) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+) -> tuple[BrowserContext | None, BrowserArtifacts | None, BrowserCleanupFunc | None]:
     user_data_dir = make_temp_directory(prefix="skyvern_browser_")
     download_dir = initialize_download_dir()
     BrowserContextFactory.update_chromium_browser_preferences(
@@ -347,9 +347,13 @@ async def _create_headful_chromium(
 
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(har_path=browser_args["record_har_path"])
 
+    if not settings.BROWSERBASE_API_KEY:
+        LOG.error("Please set the browserbase api key!")
+        return None, None, None
+
     browserbase_ws = (
         "wss://connect.browserbase.com/?apiKey="
-        + "bb_live_tkbzfjRRifsNRK1TeGLENjs9VjE"
+        + settings.BROWSERBASE_API_KEY
         + "&enableProxy=true"
     )
     LOG.info("Connecting to Browserbase remote browser", browserbase_ws=browserbase_ws)
@@ -492,24 +496,24 @@ class BrowserState:
         self.__page = page
         if page is None:
             return
-        if len(self.browser_artifacts.video_artifacts) > index:
-            if self.browser_artifacts.video_artifacts[index].video_path is None:
-                try:
-                    async with asyncio.timeout(settings.BROWSER_ACTION_TIMEOUT_MS / 1000):
-                        self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
-                except asyncio.TimeoutError:
-                    LOG.info("Timeout to get the page video, skip the exception")
-            return
+        # if len(self.browser_artifacts.video_artifacts) > index:
+        #     if self.browser_artifacts.video_artifacts[index].video_path is None:
+        #         try:
+        #             async with asyncio.timeout(settings.BROWSER_ACTION_TIMEOUT_MS / 1000):
+        #                 self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
+        #         except asyncio.TimeoutError:
+        #             LOG.info("Timeout to get the page video, skip the exception")
+        #     return
 
         target_lenght = index + 1
         self.browser_artifacts.video_artifacts.extend(
             [VideoArtifact()] * (target_lenght - len(self.browser_artifacts.video_artifacts))
         )
-        try:
-            async with asyncio.timeout(settings.BROWSER_ACTION_TIMEOUT_MS / 1000):
-                self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
-        except asyncio.TimeoutError:
-            LOG.info("Timeout to get the page video, skip the exception")
+        # try:
+        #     async with asyncio.timeout(settings.BROWSER_ACTION_TIMEOUT_MS / 1000):
+        #         self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
+        # except asyncio.TimeoutError:
+        #     LOG.info("Timeout to get the page video, skip the exception")
         return
 
     async def get_or_create_page(

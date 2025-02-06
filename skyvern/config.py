@@ -151,6 +151,9 @@ class Settings(BaseSettings):
 
     ENABLE_LOG_ARTIFACTS: bool = False
 
+    # Browserbase API
+    BROWSERBASE_API_KEY: str | None = None
+
     def is_cloud_environment(self) -> bool:
         """
         :return: True if env is not local, else False
