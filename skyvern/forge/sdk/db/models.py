@@ -44,7 +44,6 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_run_id,
 )
 from skyvern.forge.sdk.schemas.observers import ObserverThoughtType
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 
 
 class Base(AsyncAttrs, DeclarativeBase):
@@ -70,7 +69,7 @@ class TaskModel(Base):
     navigation_payload = Column(JSON)
     extracted_information = Column(JSON)
     failure_reason = Column(String)
-    proxy_location = Column(Enum(ProxyLocation))
+    proxy_location = Column(String)
     extracted_information_schema = Column(JSON)
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), index=True)
     order = Column(Integer, nullable=True)
@@ -204,7 +203,7 @@ class WorkflowModel(Base):
     title = Column(String, nullable=False)
     description = Column(String, nullable=True)
     workflow_definition = Column(JSON, nullable=False)
-    proxy_location = Column(Enum(ProxyLocation))
+    proxy_location = Column(String)
     webhook_callback_url = Column(String)
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
@@ -236,7 +235,7 @@ class WorkflowRunModel(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False, index=True)
     status = Column(String, nullable=False)
     failure_reason = Column(String)
-    proxy_location = Column(Enum(ProxyLocation))
+    proxy_location = Column(String)
     webhook_callback_url = Column(String)
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
@@ -564,7 +563,7 @@ class ObserverCruiseModel(Base):
     webhook_callback_url = Column(String, nullable=True)
     totp_verification_url = Column(String, nullable=True)
     totp_identifier = Column(String, nullable=True)
-    proxy_location = Column(Enum(ProxyLocation), nullable=True)
+    proxy_location = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
