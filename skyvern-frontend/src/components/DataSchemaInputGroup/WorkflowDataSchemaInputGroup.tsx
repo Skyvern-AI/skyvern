@@ -61,20 +61,66 @@ function WorkflowDataSchemaInputGroup({
 
   return (
     <div className="space-y-2">
-      <div className="flex gap-4">
-        <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">Data Schema</Label>
-          <HelpTooltip content={helpTooltips["task"]["dataSchema"]} />
+      <div className="flex h-7 items-center justify-between">
+        <div className="flex gap-4">
+          <div className="flex gap-2">
+            <Label className="text-xs text-slate-300">Data Schema</Label>
+            <HelpTooltip content={helpTooltips["task"]["dataSchema"]} />
+          </div>
+          <Checkbox
+            checked={value !== "null"}
+            onCheckedChange={(checked) => {
+              onChange(
+                checked ? JSON.stringify(exampleValue, null, 2) : "null",
+              );
+            }}
+          />
         </div>
-        <Checkbox
-          checked={value !== "null"}
-          onCheckedChange={(checked) => {
-            onChange(checked ? JSON.stringify(exampleValue, null, 2) : "null");
-          }}
-        />
+        {value !== "null" && !generateWithAIActive && (
+          <Button
+            variant="tertiary"
+            className="h-7 text-xs"
+            onClick={() => {
+              setGenerateWithAIActive(true);
+            }}
+          >
+            <MagicWandIcon className="mr-2 size-4" />
+            Generate with AI
+          </Button>
+        )}
       </div>
+
       {value !== "null" && (
         <div className="space-y-2">
+          {generateWithAIActive ? (
+            <div className="flex w-full items-center rounded-xl border px-4">
+              <Cross2Icon
+                className="size-4 cursor-pointer"
+                onClick={() => {
+                  setGenerateWithAIActive(false);
+                  setGenerateWithAIPrompt("");
+                }}
+              />
+              <AutoResizingTextarea
+                className="min-h-0 resize-none rounded-md border-transparent px-4 py-2 text-xs hover:border-transparent focus-visible:ring-0"
+                value={generateWithAIPrompt}
+                onChange={(event) => {
+                  setGenerateWithAIPrompt(event.target.value);
+                }}
+                placeholder="Describe how you want your output formatted"
+              />
+              {getDataSchemaSuggestionMutation.isPending ? (
+                <ReloadIcon className="size-4 animate-spin" />
+              ) : (
+                <PaperPlaneIcon
+                  className="size-4 cursor-pointer"
+                  onClick={() => {
+                    getDataSchemaSuggestionMutation.mutate();
+                  }}
+                />
+              )}
+            </div>
+          ) : null}
           <CodeEditor
             language="json"
             value={value}
@@ -82,47 +128,6 @@ function WorkflowDataSchemaInputGroup({
             className="nowheel nopan"
             fontSize={8}
           />
-          {value !== "null" &&
-            (generateWithAIActive ? (
-              <div className="flex w-full items-center rounded-xl border px-4">
-                <Cross2Icon
-                  className="size-4"
-                  onClick={() => {
-                    setGenerateWithAIActive(false);
-                    setGenerateWithAIPrompt("");
-                  }}
-                />
-                <AutoResizingTextarea
-                  className="min-h-0 resize-none rounded-md border-transparent px-4 py-2 text-xs hover:border-transparent focus-visible:ring-0"
-                  value={generateWithAIPrompt}
-                  onChange={(event) => {
-                    setGenerateWithAIPrompt(event.target.value);
-                  }}
-                  placeholder="Describe how you want your output formatted"
-                />
-                {getDataSchemaSuggestionMutation.isPending ? (
-                  <ReloadIcon className="size-4 animate-spin" />
-                ) : (
-                  <PaperPlaneIcon
-                    className="size-4"
-                    onClick={() => {
-                      getDataSchemaSuggestionMutation.mutate();
-                    }}
-                  />
-                )}
-              </div>
-            ) : (
-              <Button
-                variant="tertiary"
-                size="sm"
-                onClick={() => {
-                  setGenerateWithAIActive(true);
-                }}
-              >
-                <MagicWandIcon className="mr-2 size-4" />
-                Generate with AI
-              </Button>
-            ))}
         </div>
       )}
     </div>
