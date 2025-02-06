@@ -356,7 +356,7 @@ async def _create_headful_chromium(
         + settings.BROWSERBASE_API_KEY
         + "&enableProxy=true"
     )
-    LOG.info("Connecting to Browserbase remote browser", browserbase_ws=browserbase_ws)
+    LOG.info("Connecting to Browserbase remote browser")
     browser = await playwright.chromium.connect_over_cdp(browserbase_ws)
 
     if browser.contexts:
