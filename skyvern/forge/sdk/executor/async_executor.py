@@ -52,7 +52,7 @@ class AsyncExecutor(abc.ABC):
         background_tasks: BackgroundTasks | None,
         organization_id: str,
         observer_cruise_id: str,
-        max_iterations_override: int | None,
+        max_iterations_override: int | str | None,
         browser_session_id: str | None,
         **kwargs: dict,
     ) -> None:
@@ -144,7 +144,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         background_tasks: BackgroundTasks | None,
         organization_id: str,
         observer_cruise_id: str,
-        max_iterations_override: int | None,
+        max_iterations_override: int | str | None,
         browser_session_id: str | None,
         **kwargs: dict,
     ) -> None:
