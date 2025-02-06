@@ -603,6 +603,7 @@ function FlowRenderer({
             <Panel position="top-center" className="h-20">
               <WorkflowHeader
                 title={title}
+                saving={saveWorkflowMutation.isPending}
                 onTitleChange={(newTitle) => {
                   setTitle(newTitle);
                   setHasChanges(true);

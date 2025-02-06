@@ -25,6 +25,7 @@ type Props = {
   onParametersClick: () => void;
   onSave: () => void;
   onTitleChange: (title: string) => void;
+  saving: boolean;
 };
 
 function WorkflowHeader({
@@ -33,6 +34,7 @@ function WorkflowHeader({
   onParametersClick,
   onSave,
   onTitleChange,
+  saving,
 }: Props) {
   const { workflowPermanentId } = useParams();
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
@@ -95,7 +97,11 @@ function WorkflowHeader({
                       onSave();
                     }}
                   >
-                    <SaveIcon />
+                    {saving ? (
+                      <ReloadIcon className="size-6 animate-spin" />
+                    ) : (
+                      <SaveIcon className="size-6" />
+                    )}
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>Save</TooltipContent>
