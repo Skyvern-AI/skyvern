@@ -117,6 +117,7 @@ def init(
         env_file.write("ENABLE_OPENAI=true\n")
         env_file.write(f"OPENAI_API_KEY={openai_api_key}\n")
         env_file.write(f"LOG_LEVEL={log_level}\n")
+        env_file.write("ARTIFACT_STORAGE_PATH=./artifacts\n")
     print(".env file created with the parameters provided.")
 
 
