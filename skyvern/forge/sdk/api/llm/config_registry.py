@@ -306,6 +306,26 @@ if settings.ENABLE_AZURE_O3_MINI:
 
 if settings.ENABLE_GEMINI:
     LLMConfigRegistry.register_config(
+        "GEMINI_FLASH_2_0",
+        LLMConfig(
+            "gemini/gemini-2.0-flash-001",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=8192,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "GEMINI_FLASH_2_0_LITE",
+        LLMConfig(
+            "gemini/gemini-2.0-flash-lite-preview-02-05",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=8192,
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "GEMINI_PRO",
         LLMConfig(
             "gemini/gemini-1.5-pro",
