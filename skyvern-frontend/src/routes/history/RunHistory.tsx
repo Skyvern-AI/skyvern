@@ -62,7 +62,7 @@ function RunHistory() {
               <TableHead className="w-1/4 rounded-tl-lg text-slate-400">
                 Run ID
               </TableHead>
-              <TableHead className="w-1/4 text-slate-400">Title</TableHead>
+              <TableHead className="w-1/4 text-slate-400">Detail</TableHead>
               <TableHead className="w-1/4 text-slate-400">Status</TableHead>
               <TableHead className="w-1/4 rounded-tr-lg text-slate-400">
                 Created At
@@ -97,7 +97,7 @@ function RunHistory() {
                     }}
                   >
                     <TableCell>{run.task_id}</TableCell>
-                    <TableCell>{run.title ?? "Untitled Task"}</TableCell>
+                    <TableCell>{run.url}</TableCell>
                     <TableCell>
                       <StatusBadge status={run.status} />
                     </TableCell>
@@ -118,12 +118,25 @@ function RunHistory() {
                     );
                   }}
                 >
-                  <TableCell>{run.workflow_run_id}</TableCell>
-                  <TableCell>{run.workflow_title ?? ""}</TableCell>
+                  <TableCell
+                    className="max-w-0 truncate"
+                    title={run.workflow_run_id}
+                  >
+                    {run.workflow_run_id}
+                  </TableCell>
+                  <TableCell
+                    className="max-w-0 truncate"
+                    title={run.workflow_title ?? undefined}
+                  >
+                    {run.workflow_title ?? ""}
+                  </TableCell>
                   <TableCell>
                     <StatusBadge status={run.status} />
                   </TableCell>
-                  <TableCell title={basicTimeFormat(run.created_at)}>
+                  <TableCell
+                    className="max-w-0 truncate"
+                    title={basicTimeFormat(run.created_at)}
+                  >
                     {basicLocalTimeFormat(run.created_at)}
                   </TableCell>
                 </TableRow>
