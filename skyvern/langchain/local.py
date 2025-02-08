@@ -8,11 +8,11 @@ from skyvern.forge.sdk.schemas.observers import ObserverTask
 
 @tool("run-skyvern-simple-task", args_schema=TaskV1Request)
 async def run_task_v1(**kwargs: Dict[str, Any]) -> TaskResponse:
-    """Run a simple task"""
+    """Use local Skyvern to run a v1 task. v1 task is usually used for the simple tasks."""
     return await Agent().run_task_v1(TaskV1Request(**kwargs))
 
 
-@tool("run-skyvern-task-v2", args_schema=TaskV2Request)
+@tool("run-skyvern-complicated-task", args_schema=TaskV2Request)
 async def run_task_v2(**kwargs: Dict[str, Any]) -> ObserverTask:
-    """Run a simple task"""
+    """Use local Skyvern to run a v2 task. v2 task is usually used for the complicated tasks."""
     return await Agent().run_task_v2(TaskV2Request(**kwargs))
