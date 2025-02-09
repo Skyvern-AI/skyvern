@@ -17,7 +17,7 @@ function UpdateOrAddEnvVar {
     )
     $envFilePath = ".env"
     if (Test-Path $envFilePath) {
-        $envContent = Get-Content $envFilePath
+        $envContent = Get-Content -Raw $envFilePath
         $envContent = $envContent -replace "^$key=.*", "$key=$value"
         if ($envContent -notmatch "^$key=") {
             Add-Content $envFilePath "$key=$value"
