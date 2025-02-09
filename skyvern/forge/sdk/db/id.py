@@ -43,6 +43,7 @@ PERSISTENT_BROWSER_SESSION_ID = "pbs"
 STEP_PREFIX = "stp"
 TASK_GENERATION_PREFIX = "tg"
 TASK_PREFIX = "tsk"
+TASK_RUN_PREFIX = "tr"
 TOTP_CODE_PREFIX = "totp"
 USER_PREFIX = "u"
 WORKFLOW_PARAMETER_PREFIX = "wp"
@@ -165,6 +166,11 @@ def generate_observer_thought_id() -> str:
 def generate_persistent_browser_session_id() -> str:
     int_id = generate_id()
     return f"{PERSISTENT_BROWSER_SESSION_ID}_{int_id}"
+
+
+def generate_task_run_id() -> str:
+    int_id = generate_id()
+    return f"{TASK_RUN_PREFIX}_{int_id}"
 
 
 def generate_id() -> int:

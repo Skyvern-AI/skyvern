@@ -36,6 +36,7 @@ from skyvern.forge.sdk.db.id import (
     generate_step_id,
     generate_task_generation_id,
     generate_task_id,
+    generate_task_run_id,
     generate_totp_code_id,
     generate_workflow_id,
     generate_workflow_parameter_id,
@@ -609,3 +610,19 @@ class PersistentBrowserSessionModel(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
+
+
+class TaskRunModel(Base):
+    __tablename__ = "task_runs"
+    __table_args__ = (Index("task_run_org_url_index", "organization_id", "url_hash", "cached"),)
+
+    task_run_id = Column(String, primary_key=True, default=generate_task_run_id)
+    organization_id = Column(String, nullable=False)
+    task_run_type = Column(String, nullable=False)
+    run_id = Column(String, nullable=False)
+    title = Column(String, nullable=True)
+    url = Column(String, nullable=True)
+    url_hash = Column(String, nullable=True)
+    cached = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
