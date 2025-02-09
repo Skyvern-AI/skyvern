@@ -247,7 +247,7 @@ function RunAlembicUpgrade {
 function CreateOrganization {
     Write-Host "Creating organization and API token..."
     $orgOutput = poetry run python scripts/create_organization.py Skyvern-Open-Source
-    $apiToken = $orgOutput -match "token='([^']+)'" | Out-Null; $matches[1]
+    if ($orgOutput -match "token='([^']+)'") { $apiToken = $matches[1] } else { Write-Host 'Error: API token not found.'; exit 1 }
 
     if (-not (Test-Path ".streamlit")) {
         New-Item -ItemType Directory -Path ".streamlit" | Out-Null
