@@ -32,6 +32,7 @@ from skyvern.forge.sdk.api.aws import aws_client
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import Artifact
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.hashing import generate_url_hash
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
@@ -46,6 +47,7 @@ from skyvern.forge.sdk.schemas.organizations import (
     OrganizationUpdate,
 )
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration, TaskGenerationBase
+from skyvern.forge.sdk.schemas.task_runs import TaskRunType
 from skyvern.forge.sdk.schemas.tasks import (
     CreateTaskResponse,
     OrderBy,
@@ -149,6 +151,15 @@ async def create_agent_task(
     await PermissionCheckerFactory.get_instance().check(current_org)
 
     created_task = await app.agent.create_task(task, current_org.organization_id)
+    url_hash = generate_url_hash(task.url)
+    await app.DATABASE.create_task_run(
+        task_run_type=TaskRunType.task_v1,
+        organization_id=current_org.organization_id,
+        run_id=created_task.task_id,
+        title=task.title,
+        url=task.url,
+        url_hash=url_hash,
+    )
     if x_max_steps_override:
         LOG.info(
             "Overriding max steps per run",
@@ -675,6 +686,17 @@ async def execute_workflow(
         version=version,
         max_steps_override=x_max_steps_override,
         is_template_workflow=template,
+    )
+    workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_id,
+        organization_id=current_org.organization_id,
+        version=version,
+    )
+    await app.DATABASE.create_task_run(
+        task_run_type=TaskRunType.workflow_run,
+        organization_id=current_org.organization_id,
+        run_id=workflow_run.workflow_run_id,
+        title=workflow.title,
     )
     if x_max_steps_override:
         LOG.info("Overriding max steps per run", max_steps_override=x_max_steps_override)
@@ -1208,6 +1230,7 @@ async def observer_task(
             webhook_callback_url=data.webhook_callback_url,
             proxy_location=data.proxy_location,
             publish_workflow=data.publish_workflow,
+            create_task_run=True,
         )
     except LLMProviderError:
         LOG.error("LLM failure to initialize observer cruise", exc_info=True)

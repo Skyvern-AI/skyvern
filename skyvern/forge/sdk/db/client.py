@@ -29,6 +29,7 @@ from skyvern.forge.sdk.db.models import (
     StepModel,
     TaskGenerationModel,
     TaskModel,
+    TaskRunModel,
     TOTPCodeModel,
     WorkflowModel,
     WorkflowParameterModel,
@@ -62,6 +63,7 @@ from skyvern.forge.sdk.schemas.observers import ObserverTask, ObserverTaskStatus
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
+from skyvern.forge.sdk.schemas.task_runs import TaskRun, TaskRunType
 from skyvern.forge.sdk.schemas.tasks import OrderBy, ProxyLocation, SortDirection, Task, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
@@ -2647,3 +2649,26 @@ class AgentDB:
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)
             raise
+
+    async def create_task_run(
+        self,
+        task_run_type: TaskRunType,
+        organization_id: str,
+        run_id: str,
+        title: str | None = None,
+        url: str | None = None,
+        url_hash: str | None = None,
+    ) -> TaskRun:
+        async with self.Session() as session:
+            task_run = TaskRunModel(
+                task_run_type=task_run_type,
+                organization_id=organization_id,
+                run_id=run_id,
+                title=title,
+                url=url,
+                url_hash=url_hash,
+            )
+            session.add(task_run)
+            await session.commit()
+            await session.refresh(task_run)
+            return TaskRun.model_validate(task_run)

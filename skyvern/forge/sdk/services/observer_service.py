@@ -13,6 +13,7 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.hashing import generate_url_hash
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
@@ -24,6 +25,7 @@ from skyvern.forge.sdk.schemas.observers import (
     ObserverThoughtType,
 )
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.task_runs import TaskRunType
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.workflow.models.block import (
@@ -97,6 +99,7 @@ async def initialize_observer_task(
     webhook_callback_url: str | None = None,
     publish_workflow: bool = False,
     parent_workflow_run_id: str | None = None,
+    create_task_run: bool = False,
 ) -> ObserverTask:
     observer_task = await app.DATABASE.create_observer_cruise(
         prompt=user_prompt,
@@ -189,6 +192,15 @@ async def initialize_observer_task(
             url=url,
             organization_id=organization.organization_id,
         )
+        if create_task_run:
+            await app.DATABASE.create_task_run(
+                task_run_type=TaskRunType.task_v2,
+                organization_id=organization.organization_id,
+                run_id=observer_task.observer_cruise_id,
+                title=new_workflow.title,
+                url=url,
+                url_hash=generate_url_hash(url),
+            )
     except Exception:
         LOG.warning("Failed to update task 2.0", exc_info=True)
         # fail the workflow run
