@@ -53,7 +53,7 @@ async def get_task_v1(task_id: str, api_key: str, endpoint: str = "https://api.s
     return await RemoteAgent(api_key, endpoint).get_task_v1(task_id)
 
 
-@tool("run-skyvern-complicated-task", args_schema=RunTaskV2Schema)
+@tool("run-remote-skyvern-complicated-task", args_schema=RunTaskV2Schema)
 async def run_task_v2(task: Dict[str, Any], api_key: str, endpoint: str = "https://api.skyvern.com") -> ObserverTask:
     """Use remote Skyvern to run a v2 task. v2 task is usually used for the complicated tasks."""
     return await RemoteAgent(api_key, endpoint).run_task_v2(TaskV2Request.model_validate(task))
