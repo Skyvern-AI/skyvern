@@ -348,7 +348,7 @@ class ForgeAgent:
                 step,
                 browser_state,
                 detailed_output,
-            ) = await self._initialize_execution_state(task, step, workflow_run, browser_session_id)
+            ) = await self.initialize_execution_state(task, step, workflow_run, browser_session_id)
 
             if (
                 not task.navigation_goal
@@ -759,7 +759,7 @@ class ForgeAgent:
             (
                 scraped_page,
                 extract_action_prompt,
-            ) = await self._build_and_record_step_prompt(
+            ) = await self.build_and_record_step_prompt(
                 task,
                 step,
                 browser_state,
@@ -1245,7 +1245,7 @@ class ForgeAgent:
                 exc_info=True,
             )
 
-    async def _initialize_execution_state(
+    async def initialize_execution_state(
         self,
         task: Task,
         step: Step,
@@ -1322,7 +1322,7 @@ class ForgeAgent:
             scrape_exclude=app.scrape_exclude,
         )
 
-    async def _build_and_record_step_prompt(
+    async def build_and_record_step_prompt(
         self,
         task: Task,
         step: Step,
