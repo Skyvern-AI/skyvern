@@ -282,6 +282,15 @@ class ScrapedPage(BaseModel):
         self.url = refreshed_page.url
         return self
 
+    async def generate_scraped_page_without_screenshots(self) -> Self:
+        return await scrape_website(
+            browser_state=self._browser_state,
+            url=self.url,
+            cleanup_element_tree=self._clean_up_func,
+            scrape_exclude=self._scrape_exclude,
+            take_screenshots=False,
+        )
+
 
 async def scrape_website(
     browser_state: BrowserState,
@@ -289,6 +298,7 @@ async def scrape_website(
     cleanup_element_tree: CleanupElementTreeFunc,
     num_retry: int = 0,
     scrape_exclude: ScrapeExcludeFunc | None = None,
+    take_screenshots: bool = True,
 ) -> ScrapedPage:
     """
     ************************************************************************************************
@@ -318,6 +328,7 @@ async def scrape_website(
             url=url,
             cleanup_element_tree=cleanup_element_tree,
             scrape_exclude=scrape_exclude,
+            take_screenshots=take_screenshots,
         )
     except Exception as e:
         # NOTE: MAX_SCRAPING_RETRIES is set to 0 in both staging and production
@@ -386,6 +397,7 @@ async def scrape_web_unsafe(
     url: str,
     cleanup_element_tree: CleanupElementTreeFunc,
     scrape_exclude: ScrapeExcludeFunc | None = None,
+    take_screenshots: bool = True,
 ) -> ScrapedPage:
     """
     Asynchronous function that performs web scraping without any built-in error handling. This function is intended
@@ -410,7 +422,9 @@ async def scrape_web_unsafe(
     LOG.info("Waiting for 5 seconds before scraping the website.")
     await asyncio.sleep(5)
 
-    screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=url, draw_boxes=True)
+    screenshots = []
+    if take_screenshots:
+        screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=url, draw_boxes=True)
 
     elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
     element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))

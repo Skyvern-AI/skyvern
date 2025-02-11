@@ -614,7 +614,10 @@ class PersistentBrowserSessionModel(Base):
 
 class TaskRunModel(Base):
     __tablename__ = "task_runs"
-    __table_args__ = (Index("task_run_org_url_index", "organization_id", "url_hash", "cached"),)
+    __table_args__ = (
+        Index("task_run_org_url_index", "organization_id", "url_hash", "cached"),
+        Index("task_run_org_run_id_index", "organization_id", "run_id"),
+    )
 
     task_run_id = Column(String, primary_key=True, default=generate_task_run_id)
     organization_id = Column(String, nullable=False)
