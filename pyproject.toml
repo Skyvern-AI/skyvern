@@ -55,6 +55,7 @@ asyncpg = "^0.30.0"
 json-repair = "^0.34.0"
 pypdf = "^5.1.0"
 langchain = "^0.3.18"
+llama-index = "^0.12.16"
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"
