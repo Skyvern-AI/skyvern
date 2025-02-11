@@ -2675,8 +2675,10 @@ class AgentDB:
 
     async def cache_task_run(self, run_id: str, organization_id: str | None = None) -> TaskRun:
         async with self.Session() as session:
-            task_run = await session.scalars(
-                select(TaskRunModel).filter_by(organization_id=organization_id).filter_by(run_id=run_id)
+            task_run = (
+                await session.scalars(
+                    select(TaskRunModel).filter_by(organization_id=organization_id).filter_by(run_id=run_id)
+                )
             ).first()
             if task_run:
                 task_run.cached = True
@@ -2697,5 +2699,5 @@ class AgentDB:
             if organization_id:
                 query = query.filter_by(organization_id=organization_id)
             query = query.filter_by(cached=True).order_by(TaskRunModel.created_at.desc())
-            task_run = await session.scalars(query).first()
+            task_run = (await session.scalars(query)).first()
             return TaskRun.model_validate(task_run) if task_run else None
