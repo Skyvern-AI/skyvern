@@ -70,78 +70,78 @@ function RunHistory() {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {isFetching
-              ? Array.from({ length: 10 }).map((_, index) => (
-                  <TableRow key={index}>
-                    <TableCell colSpan={4}>
-                      <Skeleton className="h-4 w-full" />
-                    </TableCell>
-                  </TableRow>
-                ))
-              : null}
-            {!isFetching && runs?.length === 0 ? (
+            {isFetching ? (
+              Array.from({ length: 10 }).map((_, index) => (
+                <TableRow key={index}>
+                  <TableCell colSpan={4}>
+                    <Skeleton className="h-4 w-full" />
+                  </TableCell>
+                </TableRow>
+              ))
+            ) : runs?.length === 0 ? (
               <TableRow>
                 <TableCell colSpan={4}>
                   <div className="text-center">No runs found</div>
                 </TableCell>
               </TableRow>
-            ) : null}
-            {runs?.map((run) => {
-              if (isTask(run)) {
+            ) : (
+              runs?.map((run) => {
+                if (isTask(run)) {
+                  return (
+                    <TableRow
+                      key={run.task_id}
+                      className="cursor-pointer"
+                      onClick={(event) => {
+                        handleNavigate(event, `/tasks/${run.task_id}/actions`);
+                      }}
+                    >
+                      <TableCell>{run.task_id}</TableCell>
+                      <TableCell>{run.url}</TableCell>
+                      <TableCell>
+                        <StatusBadge status={run.status} />
+                      </TableCell>
+                      <TableCell title={basicTimeFormat(run.created_at)}>
+                        {basicLocalTimeFormat(run.created_at)}
+                      </TableCell>
+                    </TableRow>
+                  );
+                }
                 return (
                   <TableRow
-                    key={run.task_id}
+                    key={run.workflow_run_id}
                     className="cursor-pointer"
                     onClick={(event) => {
-                      handleNavigate(event, `/tasks/${run.task_id}/actions`);
+                      handleNavigate(
+                        event,
+                        `/workflows/${run.workflow_permanent_id}/${run.workflow_run_id}/overview`,
+                      );
                     }}
                   >
-                    <TableCell>{run.task_id}</TableCell>
-                    <TableCell>{run.url}</TableCell>
+                    <TableCell
+                      className="max-w-0 truncate"
+                      title={run.workflow_run_id}
+                    >
+                      {run.workflow_run_id}
+                    </TableCell>
+                    <TableCell
+                      className="max-w-0 truncate"
+                      title={run.workflow_title ?? undefined}
+                    >
+                      {run.workflow_title ?? ""}
+                    </TableCell>
                     <TableCell>
                       <StatusBadge status={run.status} />
                     </TableCell>
-                    <TableCell title={basicTimeFormat(run.created_at)}>
+                    <TableCell
+                      className="max-w-0 truncate"
+                      title={basicTimeFormat(run.created_at)}
+                    >
                       {basicLocalTimeFormat(run.created_at)}
                     </TableCell>
                   </TableRow>
                 );
-              }
-              return (
-                <TableRow
-                  key={run.workflow_run_id}
-                  className="cursor-pointer"
-                  onClick={(event) => {
-                    handleNavigate(
-                      event,
-                      `/workflows/${run.workflow_permanent_id}/${run.workflow_run_id}/overview`,
-                    );
-                  }}
-                >
-                  <TableCell
-                    className="max-w-0 truncate"
-                    title={run.workflow_run_id}
-                  >
-                    {run.workflow_run_id}
-                  </TableCell>
-                  <TableCell
-                    className="max-w-0 truncate"
-                    title={run.workflow_title ?? undefined}
-                  >
-                    {run.workflow_title ?? ""}
-                  </TableCell>
-                  <TableCell>
-                    <StatusBadge status={run.status} />
-                  </TableCell>
-                  <TableCell
-                    className="max-w-0 truncate"
-                    title={basicTimeFormat(run.created_at)}
-                  >
-                    {basicLocalTimeFormat(run.created_at)}
-                  </TableCell>
-                </TableRow>
-              );
-            })}
+              })
+            )}
           </TableBody>
         </Table>
         <Pagination className="pt-2">
