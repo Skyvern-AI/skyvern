@@ -1291,27 +1291,6 @@ async def handle_complete_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    # If this action has a source_action_id, then we need to make sure if the goal is actually completed.
-    if action.source_action_id and task.navigation_goal:
-        LOG.info(
-            "CompleteAction has source_action_id, checking if goal is completed",
-            task_id=task.task_id,
-            step_id=step.step_id,
-            workflow_run_id=task.workflow_run_id,
-        )
-        verified_complete_action = await app.agent.check_user_goal_complete(page, scraped_page, task, step)
-        if verified_complete_action is None:
-            return [
-                ActionFailure(
-                    exception=IllegitComplete(
-                        data={
-                            "error": "Cached complete action wasn't verified by LLM, fallback to default execution mode"
-                        }
-                    )
-                )
-            ]
-        action.verified = True
-
     if not action.verified and task.navigation_goal:
         LOG.info(
             "CompleteAction hasn't been verified, going to verify the user goal",

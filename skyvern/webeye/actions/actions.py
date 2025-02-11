@@ -120,6 +120,7 @@ class Action(BaseModel):
     text: str | None = None
     option: SelectOption | None = None
     is_checked: bool | None = None
+    verified: bool = False
 
     created_at: datetime | None = None
     modified_at: datetime | None = None
