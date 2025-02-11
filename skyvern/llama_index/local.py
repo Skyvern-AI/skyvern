@@ -1,4 +1,3 @@
-from typing import Any, Dict
 from llama_index.core.tools import FunctionTool
 
 from skyvern.agent.local import Agent
