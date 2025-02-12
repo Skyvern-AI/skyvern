@@ -1,42 +1,11 @@
 from typing import Any, Dict
 
 from langchain.tools import tool
-from pydantic import BaseModel, Field
 
-from skyvern.agent.parameter import TaskV1Request, TaskV2Request
+from skyvern.agent.parameter import GetTaskSchema, RunTaskV1Schema, RunTaskV2Schema, TaskV1Request, TaskV2Request
 from skyvern.agent.remote import RemoteAgent
 from skyvern.forge.sdk.schemas.observers import ObserverTask
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskResponse
-
-
-class RunTaskV1Schema(BaseModel):
-    api_key: str = Field(
-        description="The API key of the Skyvern API. You can get the API key from the Skyvern dashboard."
-    )
-    endpoint: str = Field(
-        description="The endpoint of the Skyvern API. Don't add any path to the endpoint. Default is https://api.skyvern.com"
-    )
-    task: TaskV1Request
-
-
-class RunTaskV2Schema(BaseModel):
-    api_key: str = Field(
-        description="The API key of the Skyvern API. You can get the API key from the Skyvern dashboard."
-    )
-    endpoint: str = Field(
-        description="The endpoint of the Skyvern API. Don't add any path to the endpoint. Default is https://api.skyvern.com"
-    )
-    task: TaskV2Request
-
-
-class GetTaskSchema(BaseModel):
-    api_key: str = Field(
-        description="The API key of the Skyvern API. You can get the API key from the Skyvern dashboard."
-    )
-    endpoint: str = Field(
-        description="The endpoint of the Skyvern API. Don't add any path to the endpoint. Default is https://api.skyvern.com"
-    )
-    task_id: str
 
 
 @tool("run-remote-skyvern-simple-task", args_schema=RunTaskV1Schema)
