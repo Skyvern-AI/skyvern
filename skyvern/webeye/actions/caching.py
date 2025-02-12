@@ -108,7 +108,7 @@ async def _retrieve_action_plan(task: Task, step: Step, scraped_page: ScrapedPag
 
     LOG.info("Found cached actions to execute", actions=cached_actions_to_execute)
 
-    actions_queries: list[Action] = []
+    actions: list[Action] = []
     for idx, cached_action in enumerate(cached_actions_to_execute):
         updated_action = cached_action.model_copy()
         updated_action.status = ActionStatus.pending
@@ -135,18 +135,16 @@ async def _retrieve_action_plan(task: Task, step: Step, scraped_page: ScrapedPag
                     "All elements with either no hash or multiple hashes should have been already filtered out"
                 )
 
-        actions_queries.append(updated_action)
+        actions.append(updated_action)
 
     # Check for unsupported actions before personalizing the actions
     # Classify the supported actions into two groups:
     # 1. Actions that can be cached with a query
     # 2. Actions that can be cached without a query
     # We'll use this classification to determine if we should continue with caching or fallback to no-cache mode
-    check_for_unsupported_actions(actions_queries)
+    check_for_unsupported_actions(actions)
 
-    personalized_actions = await personalize_actions(
-        task=task, step=step, scraped_page=scraped_page, actions_queries=actions_queries
-    )
+    personalized_actions = await personalize_actions(task=task, step=step, scraped_page=scraped_page, actions=actions)
 
     LOG.info("Personalized cached actions are ready", actions=personalized_actions)
     return personalized_actions
@@ -155,12 +153,10 @@ async def _retrieve_action_plan(task: Task, step: Step, scraped_page: ScrapedPag
 async def personalize_actions(
     task: Task,
     step: Step,
-    actions_queries: list[Action],
+    actions: list[Action],
     scraped_page: ScrapedPage,
 ) -> list[Action]:
-    queries_and_answers: dict[str, str | None] = {
-        action.intention: None for action in actions_queries if action.intention
-    }
+    queries_and_answers: dict[str, str | None] = {action.intention: None for action in actions if action.intention}
 
     answered_queries: dict[str, str] = {}
     if queries_and_answers:
@@ -170,7 +166,7 @@ async def personalize_actions(
         )
 
     personalized_actions = []
-    for action in actions_queries:
+    for action in actions:
         query = action.intention
         if query and (personalized_answer := answered_queries.get(query)):
             current_personized_actions = await personalize_action(
@@ -230,10 +226,11 @@ async def personalize_action(
     elif action.action_type in [
         ActionType.COMPLETE,
         ActionType.WAIT,
-        ActionType.TERMINATE,
         ActionType.SOLVE_CAPTCHA,
     ]:
         return [action]
+    elif action.action_type == ActionType.TERMINATE:
+        return []
     else:
         raise CachedActionPlanError(
             f"Unsupported action type for personalization, fallback to no-cache mode: {action.action_type}"
@@ -242,10 +239,10 @@ async def personalize_action(
     return [action]
 
 
-def check_for_unsupported_actions(actions_queries: list[Action]) -> None:
+def check_for_unsupported_actions(actions: list[Action]) -> None:
     supported_actions = [ActionType.INPUT_TEXT, ActionType.WAIT, ActionType.CLICK, ActionType.COMPLETE]
     supported_actions_with_query = [ActionType.INPUT_TEXT]
-    for action in actions_queries:
+    for action in actions:
         query = action.intention
         if action.action_type not in supported_actions:
             raise CachedActionPlanError(
