@@ -213,6 +213,8 @@ async def personalize_action(
 
     if action.action_type == ActionType.INPUT_TEXT:
         action.text = answer
+        if not answer:
+            return []
     elif action.action_type == ActionType.UPLOAD_FILE:
         action.file_url = answer
     elif action.action_type == ActionType.CLICK:
