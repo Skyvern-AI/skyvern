@@ -95,12 +95,19 @@ function RunHistory() {
                         handleNavigate(event, `/tasks/${run.task_id}/actions`);
                       }}
                     >
-                      <TableCell>{run.task_id}</TableCell>
-                      <TableCell>{run.url}</TableCell>
+                      <TableCell className="max-w-0 truncate">
+                        {run.task_id}
+                      </TableCell>
+                      <TableCell className="max-w-0 truncate">
+                        {run.url}
+                      </TableCell>
                       <TableCell>
                         <StatusBadge status={run.status} />
                       </TableCell>
-                      <TableCell title={basicTimeFormat(run.created_at)}>
+                      <TableCell
+                        title={basicTimeFormat(run.created_at)}
+                        className="max-w-0 truncate"
+                      >
                         {basicLocalTimeFormat(run.created_at)}
                       </TableCell>
                     </TableRow>
