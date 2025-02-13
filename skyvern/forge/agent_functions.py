@@ -436,6 +436,9 @@ class AgentFunction:
         """
         return
 
+    async def post_step_execution(self, task: Task, step: Step) -> None:
+        return
+
     async def generate_async_operations(
         self,
         organization: Organization,

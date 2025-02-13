@@ -378,6 +378,7 @@ class ForgeAgent:
             step, detailed_output = await self.agent_step(
                 task, step, browser_state, organization=organization, task_block=task_block
             )
+            await app.AGENT_FUNCTION.post_step_execution(task, step)
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)
             retry = False
 
