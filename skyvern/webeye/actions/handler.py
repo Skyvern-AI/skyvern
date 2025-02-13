@@ -102,6 +102,7 @@ class CustomSingleSelectResult:
     def __init__(self, skyvern_frame: SkyvernFrame) -> None:
         self.reasoning: str | None = None
         self.action_result: ActionResult | None = None
+        self.action_type: ActionType | None = None
         self.value: str | None = None
         self.dropdown_menu: SkyvernElement | None = None
         self.skyvern_frame = skyvern_frame
@@ -2028,6 +2029,15 @@ async def sequentially_select_from_dropdown(
 
         # it's for typing. it's been verified in `single_select_result.is_done()`
         assert single_select_result.dropdown_menu is not None
+
+        if single_select_result.action_type is not None and single_select_result.action_type == ActionType.INPUT_TEXT:
+            LOG.info(
+                "It's an input mini action, going to continue the select action",
+                step_id=step.step_id,
+                task_id=task.task_id,
+            )
+            continue
+
         screenshot = await page.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
         mini_goal = (
             input_or_select_context.field
@@ -2161,9 +2171,10 @@ async def select_from_dropdown(
     )
 
     action_type: str = json_response.get("action_type", "")
-    action_type = action_type.upper()
+    action_type = action_type.lower()
+    single_select_result.action_type = ActionType(action_type)
     element_id: str | None = json_response.get("id", None)
-    if not element_id or action_type not in ["CLICK", "INPUT_TEXT"]:
+    if not element_id or action_type not in [ActionType.CLICK, ActionType.INPUT_TEXT]:
         raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
 
     if not force_select and target_value:
@@ -2176,7 +2187,7 @@ async def select_from_dropdown(
             )
             return single_select_result
 
-    if value is not None and action_type == "INPUT_TEXT":
+    if value is not None and action_type == ActionType.INPUT_TEXT:
         LOG.info(
             "No clickable option found, but found input element to search",
             element_id=element_id,
