@@ -594,3 +594,23 @@ class UrlGenerationFailure(SkyvernHTTPException):
 class ObserverCruiseNotFound(SkyvernHTTPException):
     def __init__(self, observer_cruise_id: str) -> None:
         super().__init__(f"Observer task {observer_cruise_id} not found")
+
+
+class NoTOTPVerificationCodeFound(SkyvernHTTPException):
+    def __init__(
+        self,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        totp_verification_url: str | None = None,
+        totp_identifier: str | None = None,
+    ) -> None:
+        msg = "No TOTP verification code found."
+        if task_id:
+            msg += f" task_id={task_id}"
+        if workflow_run_id:
+            msg += f" workflow_run_id={workflow_run_id}"
+        if totp_verification_url:
+            msg += f" totp_verification_url={totp_verification_url}"
+        if totp_identifier:
+            msg += f" totp_identifier={totp_identifier}"
+        super().__init__(msg)

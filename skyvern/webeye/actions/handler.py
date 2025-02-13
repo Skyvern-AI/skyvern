@@ -47,6 +47,7 @@ from skyvern.exceptions import (
     NoIncrementalElementFoundForAutoCompletion,
     NoIncrementalElementFoundForCustomSelection,
     NoSuitableAutoCompleteOption,
+    NoTOTPVerificationCodeFound,
     OptionIndexOutOfBound,
     WrongElementToUploadFile,
 )
@@ -2847,7 +2848,12 @@ async def poll_verification_code(
         # check timeout
         if datetime.utcnow() > timeout_datetime:
             LOG.warning("Polling verification code timed out", workflow_id=workflow_id)
-            return None
+            raise NoTOTPVerificationCodeFound(
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+                totp_verification_url=totp_verification_url,
+                totp_identifier=totp_identifier,
+            )
         verification_code = None
         if totp_verification_url:
             verification_code = await _get_verification_code_from_url(task_id, totp_verification_url, org_token.token)
