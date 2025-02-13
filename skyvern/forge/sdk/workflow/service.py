@@ -64,6 +64,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
     ContextParameter,
+    CredentialParameter,
     OutputParameter,
     Parameter,
     ParameterType,
@@ -233,6 +234,7 @@ class WorkflowService:
                     BitwardenLoginCredentialParameter,
                     BitwardenCreditCardDataParameter,
                     BitwardenSensitiveInformationParameter,
+                    CredentialParameter,
                 ),
             )
         ]
@@ -817,6 +819,20 @@ class WorkflowService:
             bitwarden_collection_id=bitwarden_collection_id,
         )
 
+    async def create_credential_parameter(
+        self,
+        workflow_id: str,
+        key: str,
+        credential_id: str,
+        description: str | None = None,
+    ) -> CredentialParameter:
+        return await app.DATABASE.create_credential_parameter(
+            workflow_id=workflow_id,
+            key=key,
+            credential_id=credential_id,
+            description=description,
+        )
+
     async def create_bitwarden_sensitive_information_parameter(
         self,
         workflow_id: str,
@@ -1357,6 +1373,13 @@ class WorkflowService:
                         aws_key=parameter.aws_key,
                         key=parameter.key,
                         description=parameter.description,
+                    )
+                elif parameter.parameter_type == ParameterType.CREDENTIAL:
+                    parameters[parameter.key] = await self.create_credential_parameter(
+                        workflow_id=workflow.workflow_id,
+                        key=parameter.key,
+                        description=parameter.description,
+                        credential_id=parameter.credential_id,
                     )
                 elif parameter.parameter_type == ParameterType.BITWARDEN_LOGIN_CREDENTIAL:
                     if not parameter.bitwarden_collection_id:

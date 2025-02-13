@@ -43,6 +43,11 @@ class BitwardenLoginCredentialParameterYAML(ParameterYAML):
     bitwarden_collection_id: str | None = None
 
 
+class CredentialParameterYAML(ParameterYAML):
+    parameter_type: Literal[ParameterType.CREDENTIAL] = ParameterType.CREDENTIAL  # type: ignore
+    credential_id: str
+
+
 class BitwardenSensitiveInformationParameterYAML(ParameterYAML):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -341,6 +346,7 @@ PARAMETER_YAML_SUBCLASSES = (
     | WorkflowParameterYAML
     | ContextParameterYAML
     | OutputParameterYAML
+    | CredentialParameterYAML
 )
 PARAMETER_YAML_TYPES = Annotated[PARAMETER_YAML_SUBCLASSES, Field(discriminator="parameter_type")]
 

@@ -27,6 +27,8 @@ from skyvern.forge.sdk.db.id import (
     generate_bitwarden_credit_card_data_parameter_id,
     generate_bitwarden_login_credential_parameter_id,
     generate_bitwarden_sensitive_information_parameter_id,
+    generate_credential_id,
+    generate_credential_parameter_id,
     generate_observer_cruise_id,
     generate_observer_thought_id,
     generate_org_id,
@@ -382,6 +384,21 @@ class BitwardenCreditCardDataParameterModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
+class CredentialParameterModel(Base):
+    __tablename__ = "credential_parameters"
+
+    credential_parameter_id = Column(String, primary_key=True, index=True, default=generate_credential_parameter_id)
+    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), index=True, nullable=False)
+    key = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+
+    credential_id = Column(String, nullable=False)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)
+
+
 class WorkflowRunParameterModel(Base):
     __tablename__ = "workflow_run_parameters"
 
@@ -629,3 +646,18 @@ class TaskRunModel(Base):
     cached = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
+
+class CredentialModel(Base):
+    __tablename__ = "credentials"
+
+    credential_id = Column(String, primary_key=True, default=generate_credential_id)
+    organization_id = Column(String, nullable=False)
+
+    credential_type = Column(String, nullable=False)
+    name = Column(String, nullable=False)
+    website_url = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)
