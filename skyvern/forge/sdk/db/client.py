@@ -20,6 +20,8 @@ from skyvern.forge.sdk.db.models import (
     BitwardenCreditCardDataParameterModel,
     BitwardenLoginCredentialParameterModel,
     BitwardenSensitiveInformationParameterModel,
+    CredentialModel,
+    CredentialParameterModel,
     ObserverCruiseModel,
     ObserverThoughtModel,
     OrganizationAuthTokenModel,
@@ -59,6 +61,7 @@ from skyvern.forge.sdk.db.utils import (
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
+from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
 from skyvern.forge.sdk.schemas.observers import ObserverTask, ObserverTaskStatus, ObserverThought, ObserverThoughtType
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -73,6 +76,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenCreditCardDataParameter,
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
+    CredentialParameter,
     OutputParameter,
     WorkflowParameter,
     WorkflowParameterType,
@@ -1666,6 +1670,30 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
+    async def create_credential_parameter(
+        self, workflow_id: str, key: str, credential_id: str, description: str | None = None
+    ) -> CredentialParameter:
+        async with self.Session() as session:
+            credential_parameter = CredentialParameterModel(
+                workflow_id=workflow_id,
+                key=key,
+                description=description,
+                credential_id=credential_id,
+            )
+            session.add(credential_parameter)
+            await session.commit()
+            await session.refresh(credential_parameter)
+            return CredentialParameter(
+                credential_parameter_id=credential_parameter.credential_parameter_id,
+                workflow_id=credential_parameter.workflow_id,
+                key=credential_parameter.key,
+                description=credential_parameter.description,
+                credential_id=credential_parameter.credential_id,
+                created_at=credential_parameter.created_at,
+                modified_at=credential_parameter.modified_at,
+                deleted_at=credential_parameter.deleted_at,
+            )
+
     async def get_workflow_run_output_parameters(self, workflow_run_id: str) -> list[WorkflowRunOutputParameter]:
         try:
             async with self.Session() as session:
@@ -2672,6 +2700,84 @@ class AgentDB:
             await session.commit()
             await session.refresh(task_run)
             return TaskRun.model_validate(task_run)
+
+    async def create_credential(
+        self, name: str, website_url: str | None, credential_type: CredentialType, organization_id: str
+    ) -> Credential:
+        async with self.Session() as session:
+            credential = CredentialModel(
+                organization_id=organization_id,
+                name=name,
+                website_url=website_url,
+                credential_type=credential_type,
+            )
+            session.add(credential)
+            await session.commit()
+            await session.refresh(credential)
+            return Credential.model_validate(credential)
+
+    async def get_credential(self, credential_id: str, organization_id: str) -> Credential:
+        async with self.Session() as session:
+            credential = (
+                await session.scalars(
+                    select(CredentialModel)
+                    .filter_by(credential_id=credential_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter(CredentialModel.deleted_at.is_(None))
+                )
+            ).first()
+            if credential:
+                return Credential.model_validate(credential)
+            raise NotFoundError(f"Credential {credential_id} not found")
+
+    async def get_credentials(self, organization_id: str) -> list[Credential]:
+        async with self.Session() as session:
+            credentials = (
+                await session.scalars(
+                    select(CredentialModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter(CredentialModel.deleted_at.is_(None))
+                    .order_by(CredentialModel.created_at.desc())
+                )
+            ).all()
+            return [Credential.model_validate(credential) for credential in credentials]
+
+    async def update_credential(
+        self, credential_id: str, organization_id: str, name: str | None = None, website_url: str | None = None
+    ) -> Credential:
+        async with self.Session() as session:
+            credential = (
+                await session.scalars(
+                    select(CredentialModel)
+                    .filter_by(credential_id=credential_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if not credential:
+                raise NotFoundError(f"Credential {credential_id} not found")
+            if name:
+                credential.name = name
+            if website_url:
+                credential.website_url = website_url
+            await session.commit()
+            await session.refresh(credential)
+            return Credential.model_validate(credential)
+
+    async def delete_credential(self, credential_id: str, organization_id: str) -> None:
+        async with self.Session() as session:
+            credential = (
+                await session.scalars(
+                    select(CredentialModel)
+                    .filter_by(credential_id=credential_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if not credential:
+                raise NotFoundError(f"Credential {credential_id} not found")
+            credential.deleted_at = datetime.utcnow()
+            await session.commit()
+            await session.refresh(credential)
+            return None
 
     async def cache_task_run(self, run_id: str, organization_id: str | None = None) -> TaskRun:
         async with self.Session() as session:

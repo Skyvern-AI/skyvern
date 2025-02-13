@@ -44,6 +44,30 @@ class AsyncAWSClient:
             LOG.exception("Failed to get secret.", secret_name=secret_name, error_code=error_code)
             return None
 
+    @execute_with_async_client(client_type=AWSClientType.SECRETS_MANAGER)
+    async def create_secret(self, secret_name: str, secret_value: str, client: AioBaseClient = None) -> None:
+        try:
+            await client.create_secret(Name=secret_name, SecretString=secret_value)
+        except Exception as e:
+            LOG.exception("Failed to create secret.", secret_name=secret_name)
+            raise e
+
+    @execute_with_async_client(client_type=AWSClientType.SECRETS_MANAGER)
+    async def set_secret(self, secret_name: str, secret_value: str, client: AioBaseClient = None) -> None:
+        try:
+            await client.put_secret_value(SecretId=secret_name, SecretString=secret_value)
+        except Exception as e:
+            LOG.exception("Failed to set secret.", secret_name=secret_name)
+            raise e
+
+    @execute_with_async_client(client_type=AWSClientType.SECRETS_MANAGER)
+    async def delete_secret(self, secret_name: str, client: AioBaseClient = None) -> None:
+        try:
+            await client.delete_secret(SecretId=secret_name)
+        except Exception as e:
+            LOG.exception("Failed to delete secret.", secret_name=secret_name)
+            raise e
+
     @execute_with_async_client(client_type=AWSClientType.S3)
     async def upload_file(self, uri: str, data: bytes, client: AioBaseClient = None) -> str | None:
         try:

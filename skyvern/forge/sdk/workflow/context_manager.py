@@ -1,10 +1,17 @@
+import json
 import uuid
 from typing import TYPE_CHECKING, Any, Self
 
 import structlog
 
 from skyvern.config import settings
-from skyvern.exceptions import BitwardenBaseError, SkyvernException, WorkflowRunContextNotInitialized
+from skyvern.exceptions import (
+    BitwardenBaseError,
+    CredentialParameterNotFoundError,
+    CredentialParameterParsingError,
+    SkyvernException,
+    WorkflowRunContextNotInitialized,
+)
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
@@ -17,6 +24,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
     ContextParameter,
+    CredentialParameter,
     OutputParameter,
     Parameter,
     ParameterType,
@@ -45,6 +53,7 @@ class WorkflowRunContext:
             | BitwardenLoginCredentialParameter
             | BitwardenCreditCardDataParameter
             | BitwardenSensitiveInformationParameter
+            | CredentialParameter
         ],
     ) -> Self:
         # key is label name
@@ -68,6 +77,10 @@ class WorkflowRunContext:
         for secrete_parameter in secret_parameters:
             if isinstance(secrete_parameter, AWSSecretParameter):
                 await workflow_run_context.register_aws_secret_parameter_value(aws_client, secrete_parameter)
+            elif isinstance(secrete_parameter, CredentialParameter):
+                await workflow_run_context.register_credential_parameter_value(
+                    aws_client, secrete_parameter, organization
+                )
             elif isinstance(secrete_parameter, BitwardenLoginCredentialParameter):
                 await workflow_run_context.register_bitwarden_login_credential_parameter_value(
                     aws_client, secrete_parameter, organization
@@ -160,6 +173,37 @@ class WorkflowRunContext:
     @staticmethod
     def generate_random_secret_id() -> str:
         return f"secret_{uuid.uuid4()}"
+
+    async def register_credential_parameter_value(
+        self,
+        aws_client: AsyncAWSClient,
+        parameter: CredentialParameter,
+        organization: Organization,
+    ) -> None:
+        LOG.info(f"Fetching credential parameter value for credential: {parameter.credential_id}")
+        org_secret_values = await aws_client.get_secret(organization.organization_id)
+        if org_secret_values is None:
+            raise CredentialParameterNotFoundError(parameter.credential_id)
+        # Parse the items and extract credentials
+        try:
+            org_secret_values_json = json.loads(org_secret_values)
+
+        except json.JSONDecodeError:
+            raise CredentialParameterParsingError(
+                f"Failed to parse credential JSON. Credential ID: {parameter.credential_id}"
+            )
+
+        credentials = org_secret_values_json.get(parameter.credential_id)
+        if credentials is None:
+            raise CredentialParameterNotFoundError(parameter.credential_id)
+
+        self.parameters[parameter.key] = parameter
+        self.values[parameter.key] = {}
+        for key, value in credentials.items():
+            random_secret_id = self.generate_random_secret_id()
+            secret_id = f"{random_secret_id}_{key}"
+            self.secrets[secret_id] = value
+            self.values[parameter.key][key] = secret_id
 
     async def register_aws_secret_parameter_value(
         self,
@@ -550,6 +594,7 @@ class WorkflowRunContext:
                     BitwardenLoginCredentialParameter,
                     BitwardenCreditCardDataParameter,
                     BitwardenSensitiveInformationParameter,
+                    CredentialParameter,
                 ),
             ):
                 LOG.error(

@@ -309,6 +309,16 @@ class BitwardenAccessDeniedError(BitwardenBaseError):
         )
 
 
+class CredentialParameterParsingError(SkyvernException):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Error parsing credential parameter: {message}")
+
+
+class CredentialParameterNotFoundError(SkyvernException):
+    def __init__(self, credential_parameter_id: str) -> None:
+        super().__init__(f"Could not find credential parameter: {credential_parameter_id}")
+
+
 class UnknownElementTreeFormat(SkyvernException):
     def __init__(self, fmt: str) -> None:
         super().__init__(f"Unknown element tree format {fmt}")
