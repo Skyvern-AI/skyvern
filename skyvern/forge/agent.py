@@ -35,6 +35,7 @@ from skyvern.exceptions import (
     InvalidWorkflowTaskURLState,
     MissingBrowserState,
     MissingBrowserStatePage,
+    NoTOTPVerificationCodeFound,
     SkyvernException,
     StepTerminationError,
     StepUnableToExecuteError,
@@ -74,6 +75,7 @@ from skyvern.webeye.actions.actions import (
     DecisiveAction,
     ExtractAction,
     ReloadPageAction,
+    TerminateAction,
     UserDefinedError,
     WebAction,
 )
@@ -787,16 +789,29 @@ class ForgeAgent:
                     step=step,
                     screenshots=scraped_page.screenshots,
                 )
-                json_response = await self.handle_potential_verification_code(
-                    task,
-                    step,
-                    scraped_page,
-                    browser_state,
-                    json_response,
-                )
-                detailed_agent_step_output.llm_response = json_response
-
-                actions = parse_actions(task, step.step_id, step.order, scraped_page, json_response["actions"])
+                try:
+                    json_response = await self.handle_potential_verification_code(
+                        task,
+                        step,
+                        scraped_page,
+                        browser_state,
+                        json_response,
+                    )
+                    detailed_agent_step_output.llm_response = json_response
+                    actions = parse_actions(task, step.step_id, step.order, scraped_page, json_response["actions"])
+                except NoTOTPVerificationCodeFound:
+                    actions = [
+                        TerminateAction(
+                            organization_id=task.organization_id,
+                            workflow_run_id=task.workflow_run_id,
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            step_order=step.order,
+                            action_order=0,
+                            reasoning="No TOTP verification code found. Going to terminate.",
+                            intention="No TOTP verification code found. Going to terminate.",
+                        )
+                    ]
 
             detailed_agent_step_output.actions = actions
             if len(actions) == 0:
