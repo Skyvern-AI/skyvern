@@ -54,6 +54,7 @@ class AsyncExecutor(abc.ABC):
         observer_cruise_id: str,
         max_iterations_override: int | str | None,
         browser_session_id: str | None,
+        api_key: str | None,
         **kwargs: dict,
     ) -> None:
         pass
@@ -146,6 +147,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         observer_cruise_id: str,
         max_iterations_override: int | str | None,
         browser_session_id: str | None,
+        api_key: str | None,
         **kwargs: dict,
     ) -> None:
         LOG.info(
@@ -154,6 +156,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         )
 
         organization = await app.DATABASE.get_organization(organization_id)
+        
         if organization is None:
             raise OrganizationNotFound(organization_id)
 
@@ -181,4 +184,5 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 observer_cruise_id=observer_cruise_id,
                 max_iterations_override=max_iterations_override,
                 browser_session_id=browser_session_id,
+                api_key=api_key
             )

@@ -1215,7 +1215,8 @@ async def observer_task(
     background_tasks: BackgroundTasks,
     data: ObserverTaskRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
-    x_max_iterations_override: Annotated[int | str | None, Header()] = None,
+    x_max_iterations_override: Annotated[int | None, Header()] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
 ) -> dict[str, Any]:
     if x_max_iterations_override:
         LOG.info("Overriding max iterations for observer", max_iterations_override=x_max_iterations_override)
@@ -1245,6 +1246,7 @@ async def observer_task(
         observer_cruise_id=observer_task.observer_cruise_id,
         max_iterations_override=x_max_iterations_override,
         browser_session_id=data.browser_session_id,
+        api_key=x_api_key
     )
     return observer_task.model_dump(by_alias=True)
 

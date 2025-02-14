@@ -1171,7 +1171,7 @@ class WorkflowService:
             headers=headers,
         )
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(follow_redirects=True) as client:
                 resp = await client.post(
                     url=workflow_run.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
                 )
