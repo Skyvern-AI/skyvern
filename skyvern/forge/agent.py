@@ -352,6 +352,7 @@ class ForgeAgent:
                 detailed_output,
             ) = await self.initialize_execution_state(task, step, workflow_run, browser_session_id)
 
+            # mark step as completed and mark task as completed
             if (
                 not task.navigation_goal
                 and not task.data_extraction_goal
@@ -359,7 +360,10 @@ class ForgeAgent:
                 and not task.terminate_criterion
             ):
                 # most likely a GOTO_URL task block
-                # mark step as completed and mark task as completed
+                page = await browser_state.must_get_working_page()
+                current_url = page.url
+                if current_url.rstrip("/") != task.url.rstrip("/"):
+                    await page.goto(task.url)
                 step = await self.update_step(
                     step, status=StepStatus.completed, is_last=True, output=AgentStepOutput(action_results=[])
                 )
