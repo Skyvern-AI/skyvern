@@ -262,7 +262,7 @@ async def run_observer_task(
             organization_id=organization_id,
         )
     finally:
-        if workflow and workflow_run:
+        if workflow and workflow_run and workflow_run.parent_workflow_run_id is None:
             await app.WORKFLOW_SERVICE.clean_up_workflow(
                 workflow=workflow,
                 workflow_run=workflow_run,
@@ -699,14 +699,6 @@ async def handle_block_result(
         )
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id=workflow_run.workflow_run_id)
 
-        # TODO: we can also support webhook by adding api_key to the function signature
-        await app.WORKFLOW_SERVICE.clean_up_workflow(
-            workflow=workflow,
-            workflow_run=workflow_run,
-            need_call_webhook=False,
-            close_browser_on_completion=browser_session_id is None,
-            browser_session_id=browser_session_id,
-        )
     elif block_result.status == BlockStatus.failed:
         LOG.error(
             f"Block with type {block.block_type} failed for workflow run {workflow_run_id}",
