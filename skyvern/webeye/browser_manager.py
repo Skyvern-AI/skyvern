@@ -135,7 +135,8 @@ class BrowserManager:
         browser_state = self.get_for_workflow_run(workflow_run_id=workflow_run_id)
         if parent_workflow_run_id:
             browser_state = self.get_for_workflow_run(workflow_run_id=parent_workflow_run_id)
-            self.pages[workflow_run_id] = browser_state
+            if browser_state:
+                self.pages[workflow_run_id] = browser_state
 
         if browser_state is not None:
             return browser_state
