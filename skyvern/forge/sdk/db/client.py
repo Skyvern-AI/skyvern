@@ -2323,7 +2323,7 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def get_persistent_browser_session_by_id(self, session_id: str) -> Optional[PersistentBrowserSessionModel]:
+    async def get_persistent_browser_session_by_id(self, session_id: str) -> Optional[PersistentBrowserSession]:
         """Get a specific persistent browser session."""
         try:
             async with self.Session() as session:
