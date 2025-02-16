@@ -2112,6 +2112,7 @@ class TaskV2Block(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        api_key: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         from skyvern.forge.sdk.services import observer_service
@@ -2153,6 +2154,7 @@ class TaskV2Block(Block):
             request_id=None,
             max_iterations_override=self.max_iterations,
             browser_session_id=browser_session_id,
+            api_key=api_key
         )
         result_dict = None
         if observer_task:

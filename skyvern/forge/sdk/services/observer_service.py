@@ -153,7 +153,7 @@ async def initialize_observer_task(
         )
         workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
             request_id=None,
-            workflow_request=WorkflowRequestBody(),
+            workflow_request=WorkflowRequestBody(webhook_callback_url=webhook_callback_url),
             workflow_permanent_id=new_workflow.workflow_permanent_id,
             organization_id=organization.organization_id,
             version=None,
@@ -219,6 +219,7 @@ async def run_observer_task(
     request_id: str | None = None,
     max_iterations_override: str | int | None = None,
     browser_session_id: str | None = None,
+    api_key: str | None = None
 ) -> ObserverTask:
     organization_id = organization.organization_id
     try:
@@ -243,6 +244,7 @@ async def run_observer_task(
             request_id=request_id,
             max_iterations_override=max_iterations_override,
             browser_session_id=browser_session_id,
+            api_key=api_key
         )
     except OperationalError:
         LOG.error("Database error when running observer cruise", exc_info=True)
@@ -268,6 +270,7 @@ async def run_observer_task(
                 workflow_run=workflow_run,
                 browser_session_id=browser_session_id,
                 close_browser_on_completion=browser_session_id is None,
+                api_key=api_key
             )
         else:
             LOG.warning("Workflow or workflow run not found")
@@ -283,6 +286,7 @@ async def run_observer_task_helper(
     request_id: str | None = None,
     max_iterations_override: str | int | None = None,
     browser_session_id: str | None = None,
+    api_key: str | None = None
 ) -> tuple[Workflow, WorkflowRun, ObserverTask] | tuple[None, None, ObserverTask]:
     organization_id = organization.organization_id
     observer_cruise_id = observer_task.observer_cruise_id
@@ -585,6 +589,7 @@ async def run_observer_task_helper(
             workflow,
             workflow_run,
             browser_session_id=browser_session_id,
+            api_key=api_key
         )
         if workflow_run.status != WorkflowRunStatus.running:
             LOG.info(
@@ -686,6 +691,7 @@ async def handle_block_result(
     workflow_run: WorkflowRun,
     is_last_block: bool = True,
     browser_session_id: str | None = None,
+    api_key: str | None = None
 ) -> WorkflowRun:
     workflow_run_id = workflow_run.workflow_run_id
     if block_result.status == BlockStatus.canceled:
@@ -699,13 +705,13 @@ async def handle_block_result(
         )
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id=workflow_run.workflow_run_id)
 
-        # TODO: we can also support webhook by adding api_key to the function signature
         await app.WORKFLOW_SERVICE.clean_up_workflow(
             workflow=workflow,
             workflow_run=workflow_run,
             need_call_webhook=False,
             close_browser_on_completion=browser_session_id is None,
             browser_session_id=browser_session_id,
+            api_key=api_key
         )
     elif block_result.status == BlockStatus.failed:
         LOG.error(
