@@ -81,7 +81,7 @@ class BrowserManager:
                 "Getting browser state for task from persistent sessions manager",
                 browser_session_id=browser_session_id,
             )
-            browser_state = app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id)
+            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id)
             if browser_state is None:
                 LOG.warning(
                     "Browser state not found in persistent sessions manager",
@@ -139,7 +139,7 @@ class BrowserManager:
                 "Getting browser state for workflow run from persistent sessions manager",
                 browser_session_id=browser_session_id,
             )
-            browser_state = app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id)
+            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id)
             if browser_state is None:
                 LOG.warning(
                     "Browser state not found in persistent sessions manager", browser_session_id=browser_session_id
