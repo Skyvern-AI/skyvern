@@ -1408,6 +1408,7 @@ class AgentDB:
                     select(WorkflowRunModel, WorkflowModel.title)
                     .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
                     .filter(WorkflowRunModel.organization_id == organization_id)
+                    .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
                 )
                 if status:
                     workflow_run_query = workflow_run_query.filter(WorkflowRunModel.status.in_(status))
