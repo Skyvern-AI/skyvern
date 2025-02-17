@@ -1084,8 +1084,8 @@ class WorkflowService:
         browser_state = await app.BROWSER_MANAGER.cleanup_for_workflow_run(
             workflow_run.workflow_run_id,
             all_workflow_task_ids,
-            close_browser_on_completion,
-            browser_session_id,
+            close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+            browser_session_id=browser_session_id,
             organization_id=workflow_run.organization_id,
         )
         if browser_state:

@@ -317,7 +317,7 @@ class ForgeAgent:
                 api_key=api_key,
                 need_call_webhook=True,
                 browser_session_id=browser_session_id,
-                close_browser_on_completion=close_browser_on_completion,
+                close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
             )
             return step, None, None
 
@@ -373,7 +373,7 @@ class ForgeAgent:
                     last_step=step,
                     api_key=api_key,
                     need_call_webhook=True,
-                    close_browser_on_completion=close_browser_on_completion,
+                    close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
                     browser_session_id=browser_session_id,
                 )
                 return step, detailed_output, None
@@ -445,7 +445,7 @@ class ForgeAgent:
                         task=completed_task,
                         last_step=last_step,
                         api_key=api_key,
-                        close_browser_on_completion=close_browser_on_completion,
+                        close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
                         browser_session_id=browser_session_id,
                     )
                     return last_step, detailed_output, None
@@ -462,7 +462,7 @@ class ForgeAgent:
                         task=task,
                         last_step=step,
                         api_key=api_key,
-                        close_browser_on_completion=close_browser_on_completion,
+                        close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
                         browser_session_id=browser_session_id,
                     )
                     return step, detailed_output, None
@@ -485,7 +485,7 @@ class ForgeAgent:
                         task=task,
                         last_step=last_step,
                         api_key=api_key,
-                        close_browser_on_completion=close_browser_on_completion,
+                        close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
                         browser_session_id=browser_session_id,
                     )
                     return last_step, detailed_output, None
@@ -558,7 +558,7 @@ class ForgeAgent:
                 task=task,
                 last_step=step,
                 api_key=api_key,
-                close_browser_on_completion=close_browser_on_completion,
+                close_browser_on_completion=browser_session_id is None,
                 browser_session_id=browser_session_id,
             )
             return step, detailed_output, None
@@ -575,7 +575,7 @@ class ForgeAgent:
                     task=task,
                     last_step=step,
                     api_key=api_key,
-                    close_browser_on_completion=close_browser_on_completion,
+                    close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
                     browser_session_id=browser_session_id,
                 )
             else:
@@ -610,7 +610,7 @@ class ForgeAgent:
                     task=task,
                     last_step=step,
                     api_key=api_key,
-                    close_browser_on_completion=close_browser_on_completion,
+                    close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
                     need_final_screenshot=False,
                     browser_session_id=browser_session_id,
                 )
@@ -632,6 +632,7 @@ class ForgeAgent:
                 api_key=api_key,
                 need_call_webhook=False,
                 browser_session_id=browser_session_id,
+                close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
             )
             return step, detailed_output, None
         except InvalidTaskStatusTransition:
@@ -647,7 +648,7 @@ class ForgeAgent:
                 api_key=api_key,
                 need_call_webhook=False,
                 browser_session_id=browser_session_id,
-                close_browser_on_completion=close_browser_on_completion,
+                close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
             )
             return step, detailed_output, None
         except (UnsupportedActionType, UnsupportedTaskType, FailedToParseActionInstruction) as e:
@@ -665,7 +666,7 @@ class ForgeAgent:
                 api_key=api_key,
                 need_call_webhook=False,
                 browser_session_id=browser_session_id,
-                close_browser_on_completion=close_browser_on_completion,
+                close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
             )
             return step, detailed_output, None
 
@@ -686,7 +687,7 @@ class ForgeAgent:
                     task=task,
                     last_step=step,
                     api_key=api_key,
-                    close_browser_on_completion=close_browser_on_completion,
+                    close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
                     browser_session_id=browser_session_id,
                 )
             else:
