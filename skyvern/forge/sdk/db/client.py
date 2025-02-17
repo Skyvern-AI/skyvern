@@ -1524,7 +1524,7 @@ class AgentDB:
                     .filter(WorkflowRunModel.parent_workflow_run_id == parent_workflow_run_id)
                     .filter(WorkflowRunModel.status.in_(["running", "created", "queued"]))
                 )
-                workflow_runs = (await session.execute(query)).all()
+                workflow_runs = (await session.scalars(query)).all()
                 return [convert_to_workflow_run(run) for run in workflow_runs]
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
