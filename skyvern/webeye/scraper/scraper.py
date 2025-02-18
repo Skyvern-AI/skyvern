@@ -159,6 +159,7 @@ def clean_element_before_hashing(element: dict) -> dict:
     element_copy = copy.deepcopy(element)
     element_copy.pop("id", None)
     element_copy.pop("rect", None)
+    element_copy.pop("frame_index", None)
     if "attributes" in element_copy:
         element_copy["attributes"].pop(SKYVERN_ID_ATTR, None)
     if "children" in element_copy:
