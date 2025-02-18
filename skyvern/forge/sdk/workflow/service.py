@@ -523,7 +523,7 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             workflow_id=workflow_run.workflow_id,
             duration_seconds=duration_seconds,
-            status=WorkflowRunStatus.completed,
+            workflow_run_status=WorkflowRunStatus.completed,
             organization_id=organization_id,
         )
 
