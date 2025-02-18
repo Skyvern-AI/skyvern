@@ -186,7 +186,7 @@ async def initialize_observer_task(
 
     # update oserver cruise
     try:
-        observer_task = await app.database.update_observer_cruise(
+        observer_task = await app.DATABASE.update_observer_cruise(
             observer_cruise_id=observer_task.observer_cruise_id,
             workflow_run_id=workflow_run.workflow_run_id,
             workflow_id=new_workflow.workflow_id,
