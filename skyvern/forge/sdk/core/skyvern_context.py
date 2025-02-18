@@ -2,6 +2,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo
 
+from playwright.async_api import Frame
+
 
 @dataclass
 class SkyvernContext:
@@ -17,6 +19,7 @@ class SkyvernContext:
     log: list[dict] = field(default_factory=list)
     hashed_href_map: dict[str, str] = field(default_factory=dict)
     refresh_working_page: bool = False
+    frame_index_map: dict[Frame, int] = field(default_factory=dict)
 
     def __repr__(self) -> str:
         return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, max_steps_override={self.max_steps_override})"

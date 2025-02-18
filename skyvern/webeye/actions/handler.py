@@ -1630,7 +1630,9 @@ async def choose_auto_completion_dropdown(
                 continue
 
             current_element = await skyvern_frame.parse_element_from_html(
-                skyvern_element.get_frame_id(), element_handler, skyvern_element.is_interactable()
+                skyvern_element.get_frame_id(),
+                element_handler,
+                skyvern_element.is_interactable(),
             )
             confirmed_preserved_list.append(current_element)
 
