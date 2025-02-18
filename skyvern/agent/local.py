@@ -73,6 +73,8 @@ class Agent:
             status=ObserverTaskStatus.queued,
             organization_id=organization.organization_id,
         )
+
+        assert observer_task.workflow_run_id
         await app.DATABASE.update_workflow_run(
             workflow_run_id=observer_task.workflow_run_id,
             status=WorkflowRunStatus.queued,
