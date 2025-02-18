@@ -312,6 +312,9 @@ class SkyvernElement:
     def get_frame(self) -> Page | Frame:
         return self.__frame
 
+    def get_frame_index(self) -> int:
+        return self.__static_element.get("frame_index", -1)
+
     def get_locator(self) -> Locator:
         return self.locator
 

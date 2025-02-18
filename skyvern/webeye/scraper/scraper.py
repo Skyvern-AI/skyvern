@@ -469,12 +469,20 @@ async def scrape_web_unsafe(
     )
 
 
-async def get_interactable_element_tree_in_frame(
-    frames: list[Frame],
-    elements: list[dict],
-    element_tree: list[dict],
-    scrape_exclude: ScrapeExcludeFunc | None = None,
-) -> tuple[list[dict], list[dict]]:
+async def get_all_children_frames(page: Page) -> list[Frame]:
+    start_index = 0
+    frames = page.main_frame.child_frames
+
+    while start_index < len(frames):
+        frame = frames[start_index]
+        start_index += 1
+        frames.extend(frame.child_frames)
+
+    return frames
+
+
+async def filter_frames(frames: list[Frame], scrape_exclude: ScrapeExcludeFunc | None = None) -> list[Frame]:
+    filtered_frames = []
     for frame in frames:
         if frame.is_detached():
             continue
@@ -482,39 +490,44 @@ async def get_interactable_element_tree_in_frame(
         if scrape_exclude is not None and await scrape_exclude(frame.page, frame):
             continue
 
-        try:
-            frame_element = await frame.frame_element()
-            # it will get stuck when we `frame.evaluate()` on an invisible iframe
-            if not await frame_element.is_visible():
-                continue
-            unique_id = await frame_element.get_attribute("unique_id")
-        except Exception:
-            LOG.warning(
-                "Unable to get unique_id from frame_element",
-                exc_info=True,
-            )
-            continue
+        filtered_frames.append(frame)
+    return filtered_frames
 
-        frame_js_script = f"() => buildTreeFromBody('{unique_id}')"
 
-        await SkyvernFrame.evaluate(frame=frame, expression=JS_FUNCTION_DEFS)
-        frame_elements, frame_element_tree = await SkyvernFrame.evaluate(
-            frame=frame, expression=frame_js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+async def add_frame_interactable_elements(
+    frame: Frame,
+    frame_index: int,
+    elements: list[dict],
+    element_tree: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """
+    Add the interactable element of the frame to the elements and element_tree.
+    """
+    try:
+        frame_element = await frame.frame_element()
+        # it will get stuck when we `frame.evaluate()` on an invisible iframe
+        if not await frame_element.is_visible():
+            return elements, element_tree
+        unique_id = await frame_element.get_attribute("unique_id")
+    except Exception:
+        LOG.warning(
+            "Unable to get unique_id from frame_element",
+            exc_info=True,
         )
+        return elements, element_tree
 
-        if len(frame.child_frames) > 0:
-            frame_elements, frame_element_tree = await get_interactable_element_tree_in_frame(
-                frame.child_frames,
-                frame_elements,
-                frame_element_tree,
-                scrape_exclude=scrape_exclude,
-            )
+    frame_js_script = f"async () => await buildTreeFromBody('{unique_id}', {frame_index})"
 
-        for element in elements:
-            if element["id"] == unique_id:
-                element["children"] = frame_element_tree
+    await SkyvernFrame.evaluate(frame=frame, expression=JS_FUNCTION_DEFS)
+    frame_elements, frame_element_tree = await SkyvernFrame.evaluate(
+        frame=frame, expression=frame_js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+    )
 
-        elements = elements + frame_elements
+    for element in elements:
+        if element["id"] == unique_id:
+            element["children"] = frame_element_tree
+
+    elements = elements + frame_elements
 
     return elements, element_tree
 
@@ -529,17 +542,29 @@ async def get_interactable_element_tree(
     :return: Tuple containing the element tree and a map of element IDs to elements.
     """
     await SkyvernFrame.evaluate(frame=page, expression=JS_FUNCTION_DEFS)
-    main_frame_js_script = "() => buildTreeFromBody()"
+    # main page index is 0
+    main_frame_js_script = "async () => await buildTreeFromBody('main.frame', 0)"
     elements, element_tree = await SkyvernFrame.evaluate(
         frame=page, expression=main_frame_js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
     )
 
-    if len(page.main_frame.child_frames) > 0:
-        elements, element_tree = await get_interactable_element_tree_in_frame(
-            page.main_frame.child_frames,
+    context = skyvern_context.ensure_context()
+    frames = await get_all_children_frames(page)
+    frames = await filter_frames(frames, scrape_exclude)
+
+    for frame in frames:
+        frame_index = context.frame_index_map.get(frame, None)
+        if frame_index is None:
+            frame_index = len(context.frame_index_map) + 1
+            context.frame_index_map[frame] = frame_index
+
+    for frame in frames:
+        frame_index = context.frame_index_map[frame]
+        elements, element_tree = await add_frame_interactable_elements(
+            frame,
+            frame_index,
             elements,
             element_tree,
-            scrape_exclude=scrape_exclude,
         )
 
     return elements, element_tree
@@ -678,6 +703,9 @@ def trim_element(element: dict) -> dict:
         queue_ele = queue.pop(0)
         if "frame" in queue_ele:
             del queue_ele["frame"]
+
+        if "frame_index" in queue_ele:
+            del queue_ele["frame_index"]
 
         if "id" in queue_ele and not _should_keep_unique_id(queue_ele):
             del queue_ele["id"]
