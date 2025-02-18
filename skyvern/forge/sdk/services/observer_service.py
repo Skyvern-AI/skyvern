@@ -165,7 +165,7 @@ async def initialize_observer_task(
         # fail the workflow run
         await mark_observer_task_as_failed(
             observer_cruise_id=observer_task.observer_cruise_id,
-            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_run_id=observer_task.workflow_run_id,
             failure_reason="Skyvern failed to setup the workflow run",
             organization_id=organization.organization_id,
         )
@@ -186,7 +186,7 @@ async def initialize_observer_task(
 
     # update oserver cruise
     try:
-        observer_task = await app.DATABASE.update_observer_cruise(
+        observer_task = await app.database.update_observer_cruise(
             observer_cruise_id=observer_task.observer_cruise_id,
             workflow_run_id=workflow_run.workflow_run_id,
             workflow_id=new_workflow.workflow_id,
