@@ -22,7 +22,7 @@ repos:
         args: [--fix]
         exclude: |
           (?x)(
-            ^skyvern/client/*
+            ^skyvern/client/.*
           )
       # Run the formatter.
       - id: ruff-format
@@ -33,7 +33,7 @@ repos:
         language_version: python3.11
         exclude: |
           (?x)(
-            ^skyvern/client/*
+            ^skyvern/client/.*
           )
 
   - repo: https://github.com/pre-commit/pygrep-hooks
@@ -62,7 +62,7 @@ repos:
             ^tests.*|
             ^streamlit_app.*|
             ^alembic.*|
-            ^skyvern/client/*
+            ^skyvern/client/.*
           )
 
   - repo: https://github.com/PyCQA/autoflake
@@ -75,7 +75,7 @@ repos:
         types: [ python ]
         exclude: |
           (?x)(
-            ^skyvern/client/*
+            ^skyvern/client/.*
           )
       # Mono repo has bronken this TODO: fix
       # - id: pytest-check
