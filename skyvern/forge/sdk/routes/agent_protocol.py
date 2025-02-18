@@ -345,6 +345,12 @@ async def cancel_workflow_run(
         parent_workflow_run_id=workflow_run_id,
     )
     for child_workflow_run in child_workflow_runs:
+        if child_workflow_run.status not in [
+            WorkflowRunStatus.running,
+            WorkflowRunStatus.created,
+            WorkflowRunStatus.queued,
+        ]:
+            continue
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(child_workflow_run.workflow_run_id)
     await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
     await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=x_api_key)
