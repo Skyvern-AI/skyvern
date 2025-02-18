@@ -379,7 +379,7 @@ async def run_observer_task_helper(
             LOG.error("Workflow run not found", workflow_run_id=workflow_run_id)
             break
 
-        if workflow_run.status and workflow_run.status == WorkflowRunStatus.canceled:
+        if workflow_run.status == WorkflowRunStatus.canceled:
             LOG.info(
                 "Task v2 is canceled. Stopping task v2",
                 workflow_run_id=workflow_run_id,
