@@ -482,7 +482,8 @@ class BrowserState:
             if self.browser_artifacts.video_artifacts[index].video_path is None:
                 try:
                     async with asyncio.timeout(settings.BROWSER_ACTION_TIMEOUT_MS / 1000):
-                        self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
+                        if page.video:
+                            self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
                 except asyncio.TimeoutError:
                     LOG.info("Timeout to get the page video, skip the exception")
                 except Exception:
@@ -495,7 +496,8 @@ class BrowserState:
         )
         try:
             async with asyncio.timeout(settings.BROWSER_ACTION_TIMEOUT_MS / 1000):
-                self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
+                if page.video:
+                    self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
         except asyncio.TimeoutError:
             LOG.info("Timeout to get the page video, skip the exception")
         except Exception:
