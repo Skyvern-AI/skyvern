@@ -229,7 +229,7 @@ async def run_observer_task(
         observer_task = await app.DATABASE.get_observer_cruise(observer_cruise_id, organization_id=organization_id)
     except Exception:
         LOG.error(
-            "Failed to get observer cruise",
+            "Failed to get observer task",
             observer_cruise_id=observer_cruise_id,
             organization_id=organization_id,
             exc_info=True,
@@ -237,10 +237,10 @@ async def run_observer_task(
         return await mark_observer_task_as_failed(
             observer_cruise_id,
             organization_id=organization_id,
-            failure_reason="Failed to get observer cruise",
+            failure_reason="Failed to get task v2",
         )
     if not observer_task:
-        LOG.error("Observer cruise not found", observer_cruise_id=observer_cruise_id, organization_id=organization_id)
+        LOG.error("Task v2 not found", observer_cruise_id=observer_cruise_id, organization_id=organization_id)
         raise ObserverCruiseNotFound(observer_cruise_id=observer_cruise_id)
 
     workflow, workflow_run = None, None
