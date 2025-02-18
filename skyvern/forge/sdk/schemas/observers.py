@@ -20,6 +20,9 @@ class ObserverTaskStatus(StrEnum):
     timed_out = "timed_out"
     completed = "completed"
 
+    def is_final(self) -> bool:
+        return self in [self.failed, self.terminated, self.canceled, self.timed_out, self.completed]
+
 
 class ObserverTask(BaseModel):
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)

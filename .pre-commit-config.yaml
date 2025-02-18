@@ -20,6 +20,10 @@ repos:
       # Run the linter.
       - id: ruff
         args: [--fix]
+        exclude: |
+          (?x)(
+            ^skyvern/client/*
+          )
       # Run the formatter.
       - id: ruff-format
   - repo: https://github.com/pycqa/isort
@@ -27,6 +31,10 @@ repos:
     hooks:
       - id: isort
         language_version: python3.11
+        exclude: |
+          (?x)(
+            ^skyvern/client/*
+          )
 
   - repo: https://github.com/pre-commit/pygrep-hooks
     rev: v1.10.0
@@ -53,7 +61,8 @@ repos:
           (?x)(
             ^tests.*|
             ^streamlit_app.*|
-            ^alembic.*
+            ^alembic.*|
+            ^skyvern/client/*
           )
 
   - repo: https://github.com/PyCQA/autoflake
@@ -64,6 +73,10 @@ repos:
         entry: autoflake --in-place --remove-all-unused-imports --recursive --ignore-init-module-imports
         language: python
         types: [ python ]
+        exclude: |
+          (?x)(
+            ^skyvern/client/*
+          )
       # Mono repo has bronken this TODO: fix
       # - id: pytest-check
       #   name: pytest-check
