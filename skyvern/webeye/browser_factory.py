@@ -485,6 +485,8 @@ class BrowserState:
                         self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
                 except asyncio.TimeoutError:
                     LOG.info("Timeout to get the page video, skip the exception")
+                except Exception:
+                    LOG.exception("Error while getting the page video", exc_info=True)
             return
 
         target_lenght = index + 1
@@ -496,6 +498,8 @@ class BrowserState:
                 self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
         except asyncio.TimeoutError:
             LOG.info("Timeout to get the page video, skip the exception")
+        except Exception:
+            LOG.exception("Error while getting the page video", exc_info=True)
         return
 
     async def get_or_create_page(
