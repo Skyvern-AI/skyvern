@@ -702,7 +702,7 @@ async def execute_workflow(
     )
     workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_id,
-        organization_id=current_org.organization_id,
+        organization_id=None if template else current_org.organization_id,
         version=version,
     )
     await app.DATABASE.create_task_run(
