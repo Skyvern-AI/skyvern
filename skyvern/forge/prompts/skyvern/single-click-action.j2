@@ -15,6 +15,7 @@ Reply in JSON format with the following keys:
         "action_type": str, // It's a string enum: "CLICK". "CLICK" type means there's an element you'd like to click.
         "id": str, // The id of the element to take action on. The id has to be one from the elements list.
         "download": bool, // If true, the browser will trigger a download by clicking the element. If false, the browser will click the element without triggering a download.
+        "file_url": str, // The url of the file to upload if applicable. This field can be present for CLICK only if the click is to upload the file. It should be null otherwise.
     }]
 }
 
