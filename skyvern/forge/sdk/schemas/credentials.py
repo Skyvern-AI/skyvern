@@ -9,6 +9,15 @@ class CredentialType(StrEnum):
     CREDIT_CARD = "credit_card"
 
 
+class PasswordCredentialResponse(BaseModel):
+    username: str
+
+
+class CreditCardCredentialResponse(BaseModel):
+    last_four: str
+    brand: str
+
+
 class PasswordCredential(BaseModel):
     password: str
     username: str
@@ -23,16 +32,24 @@ class CreditCardCredential(BaseModel):
     card_holder_name: str
 
 
-class UpdateCredentialRequest(BaseModel):
-    name: str | None = None
-    website_url: str | None = None
+class CredentialItem(BaseModel):
+    item_id: str
+    name: str
+    credential_type: CredentialType
+    credential: PasswordCredential | CreditCardCredential
 
 
 class CreateCredentialRequest(BaseModel):
     name: str
-    website_url: str | None = None
     credential_type: CredentialType
     credential: PasswordCredential | CreditCardCredential
+
+
+class CredentialResponse(BaseModel):
+    credential_id: str
+    credential: PasswordCredentialResponse | CreditCardCredentialResponse
+    credential_type: CredentialType
+    name: str
 
 
 class Credential(BaseModel):
@@ -41,8 +58,9 @@ class Credential(BaseModel):
     credential_id: str
     organization_id: str
     name: str
-    website_url: str | None = None
     credential_type: CredentialType
+
+    item_id: str
 
     created_at: datetime
     modified_at: datetime

@@ -25,6 +25,7 @@ from skyvern.forge.sdk.db.models import (
     ObserverCruiseModel,
     ObserverThoughtModel,
     OrganizationAuthTokenModel,
+    OrganizationBitwardenCollectionModel,
     OrganizationModel,
     OutputParameterModel,
     PersistentBrowserSessionModel,
@@ -63,6 +64,7 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
 from skyvern.forge.sdk.schemas.observers import ObserverTask, ObserverTaskStatus, ObserverThought, ObserverThoughtType
+from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
@@ -2745,14 +2747,18 @@ class AgentDB:
             return TaskRun.model_validate(task_run)
 
     async def create_credential(
-        self, name: str, website_url: str | None, credential_type: CredentialType, organization_id: str
+        self,
+        name: str,
+        credential_type: CredentialType,
+        organization_id: str,
+        item_id: str,
     ) -> Credential:
         async with self.Session() as session:
             credential = CredentialModel(
                 organization_id=organization_id,
                 name=name,
-                website_url=website_url,
                 credential_type=credential_type,
+                item_id=item_id,
             )
             session.add(credential)
             await session.commit()
@@ -2773,7 +2779,7 @@ class AgentDB:
                 return Credential.model_validate(credential)
             raise NotFoundError(f"Credential {credential_id} not found")
 
-    async def get_credentials(self, organization_id: str) -> list[Credential]:
+    async def get_credentials(self, organization_id: str, page: int = 1, page_size: int = 10) -> list[Credential]:
         async with self.Session() as session:
             credentials = (
                 await session.scalars(
@@ -2781,6 +2787,8 @@ class AgentDB:
                     .filter_by(organization_id=organization_id)
                     .filter(CredentialModel.deleted_at.is_(None))
                     .order_by(CredentialModel.created_at.desc())
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
                 )
             ).all()
             return [Credential.model_validate(credential) for credential in credentials]
@@ -2820,6 +2828,34 @@ class AgentDB:
             credential.deleted_at = datetime.utcnow()
             await session.commit()
             await session.refresh(credential)
+            return None
+
+    async def create_organization_bitwarden_collection(
+        self,
+        organization_id: str,
+        collection_id: str,
+    ) -> OrganizationBitwardenCollection:
+        async with self.Session() as session:
+            organization_bitwarden_collection = OrganizationBitwardenCollectionModel(
+                organization_id=organization_id, collection_id=collection_id
+            )
+            session.add(organization_bitwarden_collection)
+            await session.commit()
+            await session.refresh(organization_bitwarden_collection)
+            return OrganizationBitwardenCollection.model_validate(organization_bitwarden_collection)
+
+    async def get_organization_bitwarden_collection(
+        self,
+        organization_id: str,
+    ) -> OrganizationBitwardenCollection | None:
+        async with self.Session() as session:
+            organization_bitwarden_collection = (
+                await session.scalars(
+                    select(OrganizationBitwardenCollectionModel).filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if organization_bitwarden_collection:
+                return OrganizationBitwardenCollection.model_validate(organization_bitwarden_collection)
             return None
 
     async def cache_task_run(self, run_id: str, organization_id: str | None = None) -> TaskRun:
