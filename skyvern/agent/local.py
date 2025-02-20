@@ -145,8 +145,8 @@ class Agent:
     ) -> TaskResponse:
         created_task = await self.create_task(task_request)
 
-        while True:
-            async with asyncio.timeout(timeout_seconds):
+        async with asyncio.timeout(timeout_seconds):
+            while True:
                 task_response = await self.get_task(created_task.task_id)
                 assert task_response is not None
                 if task_response.status.is_final():
@@ -182,8 +182,8 @@ class Agent:
     ) -> ObserverTask:
         observer_task = await self.observer_task_v_2(task_request)
 
-        while True:
-            async with asyncio.timeout(timeout_seconds):
+        async with asyncio.timeout(timeout_seconds):
+            while True:
                 refreshed_observer_task = await self.get_observer_task_v_2(observer_task.observer_cruise_id)
                 assert refreshed_observer_task is not None
                 if refreshed_observer_task.status.is_final():
