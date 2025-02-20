@@ -25,7 +25,7 @@ function WorkflowTemplates() {
 
   return (
     <div className="space-y-5">
-      <h1 className="text-xl">Start Simple</h1>
+      <h1 className="text-xl">Explore Workflows</h1>
       <div className="flex gap-6">
         {workflowTemplates.map((workflow) => {
           return (
