@@ -25,6 +25,7 @@ from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
 from skyvern.config import settings
+from skyvern.constants import MAX_UPLOAD_FILE_COUNT
 from skyvern.exceptions import (
     ContextParameterValueNotFound,
     DisabledBlockExecutionError,
@@ -1429,7 +1430,7 @@ class UploadToS3Block(Block):
             if os.path.isdir(self.path):
                 # get all files in the directory, if there are more than 25 files, we will not upload them
                 files = os.listdir(self.path)
-                if len(files) > 25:
+                if len(files) > MAX_UPLOAD_FILE_COUNT:
                     raise ValueError("Too many files in the directory, not uploading")
                 for file in files:
                     # if the file is a directory, we will not upload it
