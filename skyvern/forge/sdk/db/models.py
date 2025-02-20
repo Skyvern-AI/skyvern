@@ -33,6 +33,7 @@ from skyvern.forge.sdk.db.id import (
     generate_observer_thought_id,
     generate_org_id,
     generate_organization_auth_token_id,
+    generate_organization_bitwarden_collection_id,
     generate_output_parameter_id,
     generate_persistent_browser_session_id,
     generate_step_id,
@@ -648,15 +649,29 @@ class TaskRunModel(Base):
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
 
+class OrganizationBitwardenCollectionModel(Base):
+    __tablename__ = "organization_bitwarden_collections"
+
+    organization_bitwarden_collection_id = Column(
+        String, primary_key=True, default=generate_organization_bitwarden_collection_id
+    )
+
+    organization_id = Column(String, nullable=False, index=True)
+    collection_id = Column(String, nullable=False)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
+
 class CredentialModel(Base):
     __tablename__ = "credentials"
 
     credential_id = Column(String, primary_key=True, default=generate_credential_id)
     organization_id = Column(String, nullable=False)
+    item_id = Column(String, nullable=True)
 
-    credential_type = Column(String, nullable=False)
     name = Column(String, nullable=False)
-    website_url = Column(String, nullable=True)
+    credential_type = Column(String, nullable=False)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

@@ -266,6 +266,11 @@ class NoFileDownloadTriggered(SkyvernException):
         super().__init__(f"Clicking on element doesn't trigger the file download. element_id={element_id}")
 
 
+class BitwardenSecretError(SkyvernException):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Bitwarden secret error: {message}")
+
+
 class BitwardenBaseError(SkyvernException):
     def __init__(self, message: str) -> None:
         super().__init__(f"Bitwarden error: {message}")
@@ -279,6 +284,31 @@ class BitwardenLoginError(BitwardenBaseError):
 class BitwardenUnlockError(BitwardenBaseError):
     def __init__(self, message: str) -> None:
         super().__init__(f"Error unlocking Bitwarden: {message}")
+
+
+class BitwardenCreateCollectionError(BitwardenBaseError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Error creating collection in Bitwarden: {message}")
+
+
+class BitwardenCreateLoginItemError(BitwardenBaseError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Error creating login item in Bitwarden: {message}")
+
+
+class BitwardenCreateCreditCardItemError(BitwardenBaseError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Error creating credit card item in Bitwarden: {message}")
+
+
+class BitwardenCreateFolderError(BitwardenBaseError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Error creating folder in Bitwarden: {message}")
+
+
+class BitwardenGetItemError(BitwardenBaseError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Error getting item in Bitwarden: {message}")
 
 
 class BitwardenListItemsError(BitwardenBaseError):
