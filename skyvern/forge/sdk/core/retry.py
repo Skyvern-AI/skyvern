@@ -14,8 +14,8 @@ F = TypeVar("F", bound=Callable[..., Any])
 def retry(
     exceptions: Type[Exception] | tuple[Type[Exception], ...] | None = None,
     tries: int = 3,
-    delay: int = 3,
-    backoff: int = 2,
+    delay: float = 3.0,
+    backoff: float = 2.0,
 ) -> Callable[[F], F]:
     """
     Decorator to retry a function a specified number of times with a delay between attempts.
