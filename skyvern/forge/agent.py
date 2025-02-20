@@ -1683,6 +1683,16 @@ class ForgeAgent:
                         step_id=last_step.step_id,
                     )
 
+        # if it's a task block from workflow run,
+        # we don't need to close the browser, save browser artifacts, or call webhook
+        if task.workflow_run_id:
+            LOG.info(
+                "Task is part of a workflow run, not sending a webhook response",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+            )
+            return
+
         if task.organization_id:
             try:
                 async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
@@ -1702,16 +1712,6 @@ class ForgeAgent:
                     task_id=task.task_id,
                     workflow_run_id=task.workflow_run_id,
                 )
-
-        # if it's a task block from workflow run,
-        # we don't need to close the browser, save browser artifacts, or call webhook
-        if task.workflow_run_id:
-            LOG.info(
-                "Task is part of a workflow run, not sending a webhook response",
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
-            )
-            return
 
         await self.async_operation_pool.remove_task(task.task_id)
         await self.cleanup_browser_and_create_artifacts(
