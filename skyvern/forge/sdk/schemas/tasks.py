@@ -352,15 +352,17 @@ class TaskOutput(BaseModel):
     extracted_information: list | dict[str, Any] | str | None = None
     failure_reason: str | None = None
     errors: list[dict[str, Any]] = []
+    downloaded_file_urls: list[str] | None = None
 
     @staticmethod
-    def from_task(task: Task) -> TaskOutput:
+    def from_task(task: Task, downloaded_file_urls: list[str] | None = None) -> TaskOutput:
         return TaskOutput(
             task_id=task.task_id,
             status=task.status,
             extracted_information=task.extracted_information,
             failure_reason=task.failure_reason,
             errors=task.errors,
+            downloaded_file_urls=downloaded_file_urls,
         )
 
 
