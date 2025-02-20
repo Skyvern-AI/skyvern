@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import zipfile
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import aiohttp
 import structlog
@@ -71,6 +71,15 @@ async def download_file(url: str, max_size_mb: int | None = None) -> str:
             LOG.info("Downloading Skyvern file from S3", url=url)
             client = AsyncAWSClient()
             return await download_from_s3(client, url)
+
+        # Check if URL is a file:// URI
+        # we only support to download local files when the environment is local
+        # and the file is in the skyvern downloads directory
+        if url.startswith("file://") and settings.ENV == "local":
+            file_path = parse_uri_to_path(url)
+            if file_path.startswith(f"{REPO_ROOT_DIR}/downloads"):
+                LOG.info("Downloading file from local file system", url=url)
+                return file_path
 
         async with aiohttp.ClientSession(raise_for_status=True) as session:
             LOG.info("Starting to download file", url=url)
@@ -273,3 +282,11 @@ def clean_up_dir(dir: str) -> None:
 
 def clean_up_skyvern_temp_dir() -> None:
     return clean_up_dir(get_skyvern_temp_dir())
+
+
+def parse_uri_to_path(uri: str) -> str:
+    parsed_uri = urlparse(uri)
+    if parsed_uri.scheme != "file":
+        raise ValueError(f"Invalid URI scheme: {parsed_uri.scheme} expected: file")
+    path = parsed_uri.netloc + parsed_uri.path
+    return unquote(path)

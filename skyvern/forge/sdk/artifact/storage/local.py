@@ -2,12 +2,11 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 
 import structlog
 
 from skyvern.config import settings
-from skyvern.forge.sdk.api.files import get_download_dir, get_skyvern_temp_dir
+from skyvern.forge.sdk.api.files import get_download_dir, get_skyvern_temp_dir, parse_uri_to_path
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP, BaseStorage
 from skyvern.forge.sdk.models import Step
@@ -68,7 +67,7 @@ class LocalStorage(BaseStorage):
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         file_path = None
         try:
-            file_path = Path(self._parse_uri_to_path(artifact.uri))
+            file_path = Path(parse_uri_to_path(artifact.uri))
             self._create_directories_if_not_exists(file_path)
             with open(file_path, "wb") as f:
                 f.write(data)
@@ -82,7 +81,7 @@ class LocalStorage(BaseStorage):
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
         file_path = None
         try:
-            file_path = Path(self._parse_uri_to_path(artifact.uri))
+            file_path = Path(parse_uri_to_path(artifact.uri))
             self._create_directories_if_not_exists(file_path)
             Path(path).replace(file_path)
         except Exception:
@@ -95,7 +94,7 @@ class LocalStorage(BaseStorage):
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         file_path = None
         try:
-            file_path = self._parse_uri_to_path(artifact.uri)
+            file_path = parse_uri_to_path(artifact.uri)
             with open(file_path, "rb") as f:
                 return f.read()
         except Exception:
@@ -169,14 +168,6 @@ class LocalStorage(BaseStorage):
             if os.path.isfile(path):
                 files.append(f"file://{path}")
         return files
-
-    @staticmethod
-    def _parse_uri_to_path(uri: str) -> str:
-        parsed_uri = urlparse(uri)
-        if parsed_uri.scheme != "file":
-            raise ValueError("Invalid URI scheme: {parsed_uri.scheme} expected: file")
-        path = parsed_uri.netloc + parsed_uri.path
-        return unquote(path)
 
     @staticmethod
     def _create_directories_if_not_exists(path_including_file_name: Path) -> None:

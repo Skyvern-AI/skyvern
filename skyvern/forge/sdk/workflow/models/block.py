@@ -25,7 +25,7 @@ from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
 from skyvern.config import settings
-from skyvern.constants import MAX_UPLOAD_FILE_COUNT
+from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, MAX_UPLOAD_FILE_COUNT
 from skyvern.exceptions import (
     ContextParameterValueNotFound,
     DisabledBlockExecutionError,
@@ -633,7 +633,18 @@ class BaseTaskBlock(Block):
                     organization_id=workflow_run.organization_id,
                 )
                 success = updated_task.status == TaskStatus.completed
-                task_output = TaskOutput.from_task(updated_task)
+
+                downloaded_file_urls = []
+                try:
+                    async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                        downloaded_file_urls = await app.STORAGE.get_downloaded_files(
+                            organization_id=workflow_run.organization_id,
+                            task_id=updated_task.task_id,
+                            workflow_run_id=workflow_run_id,
+                        )
+                except asyncio.TimeoutError:
+                    LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
+                task_output = TaskOutput.from_task(updated_task, downloaded_file_urls)
                 output_parameter_value = task_output.model_dump()
                 await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_parameter_value)
                 return await self.build_block_result(
@@ -682,7 +693,18 @@ class BaseTaskBlock(Block):
                 current_retry += 1
                 will_retry = current_retry <= self.max_retries
                 retry_message = f", retrying task {current_retry}/{self.max_retries}" if will_retry else ""
-                task_output = TaskOutput.from_task(updated_task)
+                downloaded_file_urls = []
+                try:
+                    async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                        downloaded_file_urls = await app.STORAGE.get_downloaded_files(
+                            organization_id=workflow_run.organization_id,
+                            task_id=updated_task.task_id,
+                            workflow_run_id=workflow_run_id,
+                        )
+                except asyncio.TimeoutError:
+                    LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
+
+                task_output = TaskOutput.from_task(updated_task, downloaded_file_urls)
                 LOG.warning(
                     f"Task failed with status {updated_task.status}{retry_message}",
                     task_id=updated_task.task_id,
