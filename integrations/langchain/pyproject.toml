@@ -12,6 +12,9 @@ skyvern = "^0.1.56"
 langchain = "^0.3.19"
 
 
+[tool.poetry.group.dev.dependencies]
+twine = "^6.1.0"
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
