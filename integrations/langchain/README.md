@@ -7,8 +7,8 @@
   - [Usage](#usage)
     - [Run a task(sync) with notebook style (code block)](#run-a-tasksync-with-notebook-style-code-block)
     - [Run a task(async) with notebook style (code block)](#run-a-taskasync-with-notebook-style-code-block)
-    - [Run a task(sync) with client style (callling skyvern cloud api)](#run-a-tasksync-with-client-style-callling-skyvern-cloud-api)
-    - [Run a task(async) with client style (callling skyvern cloud api)](#run-a-taskasync-with-client-style-callling-skyvern-cloud-api)
+    - [Run a task(sync) with client style (calling skyvern cloud api)](#run-a-tasksync-with-client-style-calling-skyvern-cloud-api)
+    - [Run a task(async) with client style (calling skyvern cloud api)](#run-a-taskasync-with-client-style-calling-skyvern-cloud-api)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
@@ -25,7 +25,7 @@ pip install skyvern-langchain
 ## Usage
 
 ### Run a task(sync) with notebook style (code block)
-:warning: :warning: if you want to run this code block, you need to run `skvyern init` command in your terminal to set up skyvern first.
+:warning: :warning: if you want to run this code block, you need to run `skyvern init` command in your terminal to set up skyvern first.
 
 ```python
 import asyncio
@@ -47,7 +47,7 @@ agent = initialize_agent(
 
 
 async def main():
-    # to run skyvern agent locally, must run `skvyern init` first
+    # to run skyvern agent locally, must run `skyvern init` first
     print(await agent.ainvoke("Create a task by Skyvern. The task is about 'Navigate to the Hacker News homepage and get the top 3 posts.'"))
 
 
@@ -56,7 +56,7 @@ if __name__ == "__main__":
 ```
 
 ### Run a task(async) with notebook style (code block)
-:warning: :warning: if you want to run this code block, you need to run `skvyern init` command in your terminal to set up skyvern first.
+:warning: :warning: if you want to run this code block, you need to run `skyvern init` command in your terminal to set up skyvern first.
 
 ```python
 import asyncio
@@ -93,8 +93,8 @@ if __name__ == "__main__":
 
 ```
 
-### Run a task(sync) with client style (callling skyvern cloud api)
-no need to run `skvyern init` command in your terminal to set up skyvern before using this integration.
+### Run a task(sync) with client style (calling skyvern cloud api)
+no need to run `skyvern init` command in your terminal to set up skyvern before using this integration.
 
 ```python
 import asyncio
@@ -126,8 +126,8 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### Run a task(async) with client style (callling skyvern cloud api)
-no need to run `skvyern init` command in your terminal to set up skyvern before using this integration.
+### Run a task(async) with client style (calling skyvern cloud api)
+no need to run `skyvern init` command in your terminal to set up skyvern before using this integration.
 
 ```python
 import asyncio
