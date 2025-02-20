@@ -309,8 +309,6 @@ class ForgeAgent:
                 status=StepStatus.canceled,
                 is_last=True,
             )
-            # We don't send task response for now as the task is canceled
-            # TODO: shall we send task response here?
             await self.clean_up_task(
                 task=task,
                 last_step=step,
@@ -1687,7 +1685,7 @@ class ForgeAgent:
             try:
                 async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                     await app.STORAGE.save_downloaded_files(
-                        task.organization_id, task_id=task.task_id, workflow_run_id=None
+                        task.organization_id, task_id=task.task_id, workflow_run_id=task.workflow_run_id
                     )
             except asyncio.TimeoutError:
                 LOG.warning(
