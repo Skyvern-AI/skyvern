@@ -135,6 +135,32 @@ Note: Our setup script does these two for you, but they are here for reference.
     ```
 1. Navigate to `http://localhost:8080` in your browser to start using the UI
 
+## Windows Setup
+This section provides instructions for setting up Skyvern on a Windows machine using PowerShell scripts.
+
+### Prerequisites
+Before you begin, make sure you have the following installed:
+- [Poetry](https://python-poetry.org/docs/#installation)
+- [node](https://nodejs.org/en/download/)
+- [Docker](https://docs.docker.com/engine/install/)
+
+### Setup
+1. Clone the repository and navigate to the root directory
+1. Open Docker Desktop (Works for Windows, macOS, and Linux) or run Docker Daemon
+1. Run the setup script to install the necessary dependencies and setup your environment
+    ```powershell
+    .\setup.ps1
+    ```
+1. Start the server
+    ```powershell
+    .\run_skyvern.ps1
+    ```
+1. You can start sending requests to the server, but we built a simple UI to help you get started. To start the UI, run the following command:
+    ```powershell
+    .\run_ui.ps1
+    ```
+1. Navigate to `http://localhost:8080` in your browser to start using the UI
+
 ## Additional Setup for Contributors
 If you're looking to contribute to Skyvern, you'll need to install the pre-commit hooks to ensure code quality and consistency. You can do this by running the following command:
 ```bash
