@@ -640,7 +640,7 @@ class BaseTaskBlock(Block):
                         downloaded_file_urls = await app.STORAGE.get_downloaded_files(
                             organization_id=workflow_run.organization_id,
                             task_id=updated_task.task_id,
-                            workflow_run_id=None,
+                            workflow_run_id=workflow_run_id,
                         )
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
@@ -699,8 +699,9 @@ class BaseTaskBlock(Block):
                         downloaded_file_urls = await app.STORAGE.get_downloaded_files(
                             organization_id=workflow_run.organization_id,
                             task_id=updated_task.task_id,
-                            workflow_run_id=None,
+                            workflow_run_id=workflow_run_id,
                         )
+
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
 
