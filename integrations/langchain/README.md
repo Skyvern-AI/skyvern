@@ -118,7 +118,12 @@ agent = initialize_agent(
     agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
 )
 
-print(await agent.ainvoke("Create a task by Skyvern. The task is about 'Navigate to the Hacker News homepage and get the top 3 posts.'"))
+async def main():
+    print(await agent.ainvoke("Create a task by Skyvern. The task is about 'Navigate to the Hacker News homepage and get the top 3 posts.'"))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
 ### Run a task(async) with client style (callling skyvern cloud api)
