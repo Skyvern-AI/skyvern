@@ -32,7 +32,7 @@ import asyncio
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, AgentType
-from skyvern_langchain.agent import run_observer_task_v_2
+from skyvern_langchain.agent import run_task_v_2
 
 load_dotenv()
 
@@ -40,7 +40,7 @@ llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
 agent = initialize_agent(
     llm=llm,
-    tools=[run_observer_task_v_2],
+    tools=[run_task_v_2],
     verbose=True,
     agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
 )
@@ -63,7 +63,7 @@ import asyncio
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, AgentType
-from skyvern_langchain.agent import create_observer_task_v_2, get_observer_task_v_2
+from skyvern_langchain.agent import create_task_v_2, get_task_v_2
 
 from langchain_community.tools.sleep.tool import SleepTool
 
@@ -74,8 +74,8 @@ llm = ChatOpenAI(model="gpt-4o", temperature=0)
 agent = initialize_agent(
     llm=llm,
     tools=[
-        create_observer_task_v_2,
-        get_observer_task_v_2,
+        create_task_v_2,
+        get_task_v_2,
         SleepTool(),
     ],
     verbose=True,
@@ -101,13 +101,13 @@ import asyncio
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, AgentType
-from skyvern_langchain.client import RunSkyvernClientObserverTaskTool
+from skyvern_langchain.client import RunSkyvernClientTaskV2Tool
 
 load_dotenv()
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-run_observer_task = RunSkyvernClientObserverTaskTool(
+run_observer_task = RunSkyvernClientTaskV2Tool(
     credential="<your_organization_api_key>",
 )
 
@@ -135,7 +135,7 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, AgentType
 from skyvern_langchain.client import (
-    CreateSkyvernClientObserverTaskV2Tool,
+    CreateSkyvernClientTaskV2Tool,
     GetSkyvernClientObserverTaskV2Tool,
 )
 
@@ -145,19 +145,19 @@ load_dotenv()
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-create_observer_task_v_2 = CreateSkyvernClientObserverTaskV2Tool(
+create_task_v_2 = CreateSkyvernClientTaskV2Tool(
     credential="<your_organization_api_key>",
 )
 
-get_observer_task_v_2 = GetSkyvernClientObserverTaskV2Tool(
+get_task_v_2 = GetSkyvernClientObserverTaskV2Tool(
     credential="<your_organization_api_key>",
 )
 
 agent = initialize_agent(
     llm=llm,
     tools=[
-        create_observer_task_v_2,
-        get_observer_task_v_2,
+        create_task_v_2,
+        get_task_v_2,
         SleepTool(),
     ],
     verbose=True,

@@ -27,11 +27,9 @@ class SkyvernClientBaseTool(BaseTool):
         raise NotImplementedError("skyvern client tool does not support sync")
 
 
-class RunSkyvernClientTaskTool(SkyvernClientBaseTool):
-    name: str = "run-skyvern-client-task"
-    description: str = (
-        """Use Skyvern client to run a task, also named v1 task. It is usually used for the simple tasks."""
-    )
+class RunSkyvernClientTaskV1Tool(SkyvernClientBaseTool):
+    name: str = "run-skyvern-client-task-v1"
+    description: str = """Use Skyvern client to run a v1 task. It is usually used for the simple tasks."""
     args_schema: Type[BaseModel] = TaskV1Request
 
     async def _arun(self, **kwargs: Dict[str, Any]) -> TaskResponse:
@@ -56,31 +54,9 @@ class RunSkyvernClientTaskTool(SkyvernClientBaseTool):
         )
 
 
-class RunSkyvernClientObserverTaskTool(SkyvernClientBaseTool):
-    name: str = "run-skyvern-client-observer-task"
-    description: str = """Use Skyvern client to run a v2 task, also named observer task. It is usually used for the complicated tasks."""
-    args_schema: Type[BaseModel] = TaskV2Request
-
-    async def _arun(self, **kwargs: Dict[str, Any]) -> Dict[str, Any | None]:
-        task_request = TaskV2Request(**kwargs)
-        return await self.get_client().agent.run_observer_task_v_2(
-            max_iterations_override=task_request.max_iterations,
-            timeout_seconds=task_request.timeout_seconds,
-            user_prompt=task_request.user_prompt,
-            url=task_request.url,
-            browser_session_id=task_request.browser_session_id,
-            webhook_callback_url=task_request.webhook_callback_url,
-            totp_verification_url=task_request.totp_verification_url,
-            totp_identifier=task_request.totp_identifier,
-            proxy_location=task_request.proxy_location,
-        )
-
-
-class CreateSkyvernClientTaskTool(SkyvernClientBaseTool):
-    name: str = "create-skyvern-agent-task"
-    description: str = (
-        """Use Skyvern client to create a task, also named v1 task. It is usually used for the simple tasks."""
-    )
+class CreateSkyvernClientTaskV1Tool(SkyvernClientBaseTool):
+    name: str = "create-skyvern-client-task-v1"
+    description: str = """Use Skyvern client to create a v1 task. It is usually used for the simple tasks."""
     args_schema: Type[BaseModel] = TaskV1Request
 
     async def _arun(self, **kwargs: Dict[str, Any]) -> CreateTaskResponse:
@@ -104,18 +80,38 @@ class CreateSkyvernClientTaskTool(SkyvernClientBaseTool):
         )
 
 
-class GetSkyvernClientTaskTool(SkyvernClientBaseTool):
-    name: str = "get-skyvern-agent-task"
-    description: str = """Use Skyvern client to get a task, also named v1 task. v1 tasks are usually simple tasks."""
+class GetSkyvernClientTaskV1Tool(SkyvernClientBaseTool):
+    name: str = "get-skyvern-client-task-v1"
+    description: str = """Use Skyvern client to get a v1 task. v1 tasks are usually simple tasks."""
     args_schema: Type[BaseModel] = GetTaskInput
 
     async def _arun(self, task_id: str) -> TaskResponse:
         return await self.get_client().agent.get_task(task_id=task_id)
 
 
-class CreateSkyvernClientObserverTaskV2Tool(SkyvernClientBaseTool):
-    name: str = "create-skyvern-agent-observer-task"
-    description: str = """Use Skyvern client to create a observer task, also named v2 task. It is usually used for the complicated tasks."""
+class RunSkyvernClientTaskV2Tool(SkyvernClientBaseTool):
+    name: str = "run-skyvern-client-task-v2"
+    description: str = """Use Skyvern client to run a v2 task. It is usually used for the complicated tasks."""
+    args_schema: Type[BaseModel] = TaskV2Request
+
+    async def _arun(self, **kwargs: Dict[str, Any]) -> Dict[str, Any | None]:
+        task_request = TaskV2Request(**kwargs)
+        return await self.get_client().agent.run_observer_task_v_2(
+            max_iterations_override=task_request.max_iterations,
+            timeout_seconds=task_request.timeout_seconds,
+            user_prompt=task_request.user_prompt,
+            url=task_request.url,
+            browser_session_id=task_request.browser_session_id,
+            webhook_callback_url=task_request.webhook_callback_url,
+            totp_verification_url=task_request.totp_verification_url,
+            totp_identifier=task_request.totp_identifier,
+            proxy_location=task_request.proxy_location,
+        )
+
+
+class CreateSkyvernClientTaskV2Tool(SkyvernClientBaseTool):
+    name: str = "create-skyvern-client-task-v2"
+    description: str = """Use Skyvern client to create a v2 task. It is usually used for the complicated tasks."""
     args_schema: Type[BaseModel] = TaskV2Request
 
     async def _arun(self, **kwargs: Dict[str, Any]) -> Dict[str, Any | None]:
@@ -132,9 +128,9 @@ class CreateSkyvernClientObserverTaskV2Tool(SkyvernClientBaseTool):
         )
 
 
-class GetSkyvernClientObserverTaskV2Tool(SkyvernClientBaseTool):
-    name: str = "get-skyvern-agent-observer-task"
-    description: str = """Use Skyvern client to get a observer task, also named v2 task. It is usually used for the complicated tasks."""
+class GetSkyvernClientTaskV2Tool(SkyvernClientBaseTool):
+    name: str = "get-skyvern-client-task-v2"
+    description: str = """Use Skyvern client to get a v2 task. It is usually used for the complicated tasks."""
     args_schema: Type[BaseModel] = GetTaskInput
 
     async def _arun(self, task_id: str) -> Dict[str, Any | None]:
