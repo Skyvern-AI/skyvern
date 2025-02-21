@@ -18,7 +18,7 @@ class SkyvernAgentToolSpec(BaseToolSpec):
         "queue_task_v2",
         "get_task_v2",
     ]
-    spec_schemas: Dict[str, ToolMetadata] = {
+    spec_metadata: Dict[str, ToolMetadata] = {
         "run_task_v1": ToolMetadata(
             name="run-skyvern-agent-task-v1",
             description="Use Skyvern agent to run a v1 task. It is usually used for the simple tasks. This function won't return until the task is finished.",
@@ -62,7 +62,7 @@ class SkyvernAgentToolSpec(BaseToolSpec):
         except AttributeError:
             return None
 
-        return self.spec_schemas.get(fn_name)
+        return self.spec_metadata.get(fn_name)
 
     async def run_task_v1(self, **kwargs: Dict[str, Any]) -> TaskResponse:
         """Use Skyvern agent to run a v1 task. It is usually used for the simple tasks. This function won't return until the task is finished."""
