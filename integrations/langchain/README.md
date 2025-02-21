@@ -5,10 +5,10 @@
 - [Skyvern Langchain](#skyvern-langchain)
   - [Installation](#installation)
   - [Usage](#usage)
-    - [Run a task(sync) with notebook style (code block)](#run-a-tasksync-with-notebook-style-code-block)
-    - [Run a task(async) with notebook style (code block)](#run-a-taskasync-with-notebook-style-code-block)
-    - [Run a task(sync) with client style (calling skyvern cloud api)](#run-a-tasksync-with-client-style-calling-skyvern-cloud-api)
-    - [Run a task(async) with client style (calling skyvern cloud api)](#run-a-taskasync-with-client-style-calling-skyvern-cloud-api)
+    - [Run a task(sync) with skyvern agent (calling skyvern agent function directly in the tool)](#run-a-tasksync-with-skyvern-agent-calling-skyvern-agent-function-directly-in-the-tool)
+    - [Run a task(async) with skyvern agent (calling skyvern agent function directly in the tool)](#run-a-taskasync-with-skyvern-agent-calling-skyvern-agent-function-directly-in-the-tool)
+    - [Run a task(sync) with skyvern client (calling skyvern server api in the tool)](#run-a-tasksync-with-skyvern-client-calling-skyvern-server-api-in-the-tool)
+    - [Run a task(async) with skyvern client (calling skyvern server api in the tool)](#run-a-taskasync-with-skyvern-client-calling-skyvern-server-api-in-the-tool)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
@@ -24,8 +24,9 @@ pip install skyvern-langchain
 
 ## Usage
 
-### Run a task(sync) with notebook style (code block)
+### Run a task(sync) with skyvern agent (calling skyvern agent function directly in the tool)
 :warning: :warning: if you want to run this code block, you need to run `skyvern init` command in your terminal to set up skyvern first.
+sync task won't return until the task is finished.
 
 ```python
 import asyncio
@@ -48,15 +49,16 @@ agent = initialize_agent(
 
 async def main():
     # to run skyvern agent locally, must run `skyvern init` first
-    print(await agent.ainvoke("Create a task by Skyvern. The task is about 'Navigate to the Hacker News homepage and get the top 3 posts.'"))
+    print(await agent.ainvoke("Run a task with Skyvern. The task is about 'Navigate to the Hacker News homepage and get the top 3 posts.'"))
 
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### Run a task(async) with notebook style (code block)
+### Run a task(async) with skyvern agent (calling skyvern agent function directly in the tool)
 :warning: :warning: if you want to run this code block, you need to run `skyvern init` command in your terminal to set up skyvern first.
+async task will return immediately and the task will be running in the background. You can use `get_task_v2` tool to poll the task information until the task is finished.
 
 ```python
 import asyncio
@@ -84,8 +86,8 @@ agent = initialize_agent(
 
 
 async def main():
-    # use sleep tool to set up the polling logic until the task is completed, if you only want to run the create task, you can remove the sleep tool
-    print(await agent.ainvoke("Create a task by Skyvern. The task is about 'Navigate to the Hacker News homepage and get the top 3 posts.' Then, get this task information until it's completed. The task information re-get interval should be 60s."))
+    # use sleep tool to set up the polling logic until the task is completed, if you only want to queue a task, you can remove the sleep tool
+    print(await agent.ainvoke("Queue a task with Skyvern. The task is about 'Navigate to the Hacker News homepage and get the top 3 posts.' Then, get this task information until it's completed. The task information re-get interval should be 60s."))
 
 
 if __name__ == "__main__":
@@ -93,8 +95,9 @@ if __name__ == "__main__":
 
 ```
 
-### Run a task(sync) with client style (calling skyvern cloud api)
+### Run a task(sync) with skyvern client (calling skyvern server api in the tool)
 no need to run `skyvern init` command in your terminal to set up skyvern before using this integration.
+sync task won't return until the task is finished.
 
 ```python
 import asyncio
@@ -119,15 +122,16 @@ agent = initialize_agent(
 )
 
 async def main():
-    print(await agent.ainvoke("Create a task by Skyvern. The task is about 'Navigate to the Hacker News homepage and get the top 3 posts.'"))
+    print(await agent.ainvoke("Run a task with Skyvern. The task is about 'Navigate to the Hacker News homepage and get the top 3 posts.'"))
 
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### Run a task(async) with client style (calling skyvern cloud api)
+### Run a task(async) with skyvern client (calling skyvern server api in the tool)
 no need to run `skyvern init` command in your terminal to set up skyvern before using this integration.
+async task will return immediately and the task will be running in the background. You can use `GetSkyvernClientTaskV2Tool` tool to poll the task information until the task is finished.
 
 ```python
 import asyncio
@@ -166,8 +170,8 @@ agent = initialize_agent(
 
 
 async def main():
-    # use sleep tool to set up the polling logic until the task is completed, if you only want to run the create task, you can remove the sleep tool
-    print(await agent.ainvoke("Create a task by Skyvern. The task is about 'Navigate to the Hacker News homepage and get the top 3 posts.' Then, get this task information until it's completed. The task information re-get interval should be 60s."))
+    # use sleep tool to set up the polling logic until the task is completed, if you only want to queue a task, you can remove the sleep tool
+    print(await agent.ainvoke("Queue a task with Skyvern. The task is about 'Navigate to the Hacker News homepage and get the top 3 posts.' Then, get this task information until it's completed. The task information re-get interval should be 60s."))
 
 
 if __name__ == "__main__":
