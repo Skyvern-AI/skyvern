@@ -14,6 +14,7 @@ from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
@@ -41,7 +42,7 @@ def _should_css_shape_convert(element: Dict) -> bool:
         return False
 
     tag_name = element.get("tagName")
-    if tag_name not in ["a", "span", "i"]:
+    if tag_name not in ["a", "span", "i", "button"]:
         return False
 
     # should be without children
@@ -53,7 +54,7 @@ def _should_css_shape_convert(element: Dict) -> bool:
         return False
 
     # if <span> and <i>  we try to convert the shape
-    if tag_name in ["span", "i"]:
+    if tag_name in ["span", "i", "button"]:
         return True
 
     # if <a>, it should be no text, no href/target attribute
@@ -461,12 +462,23 @@ class AgentFunction:
             :param elements: List of elements to remove xpaths from.
             :return: List of elements without xpaths.
             """
+            context = skyvern_context.ensure_context()
+            # page won't be in the context.frame_index_map, so the index is going to be 0
             skyvern_frame = await SkyvernFrame.create_instance(frame=frame)
+            current_frame_index = context.frame_index_map.get(frame, 0)
+
             queue = []
             for element in element_tree:
                 queue.append(element)
             while queue:
                 queue_ele = queue.pop(0)
+                if queue_ele.get("frame_index") != current_frame_index:
+                    new_frame = next(
+                        (k for k, v in context.frame_index_map.items() if v == queue_ele.get("frame_index")), frame
+                    )
+                    skyvern_frame = await SkyvernFrame.create_instance(frame=new_frame)
+                    current_frame_index = queue_ele.get("frame_index", 0)
+
                 _remove_rect(queue_ele)
                 await _convert_svg_to_string(skyvern_frame, queue_ele, task, step)
 

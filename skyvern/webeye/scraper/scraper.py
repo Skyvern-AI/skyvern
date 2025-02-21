@@ -158,7 +158,7 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
 def clean_element_before_hashing(element: dict) -> dict:
     element_copy = {}
     # pick up these element keys: frame, tagName, attributes, beforePseudoText, text, afterPseudoText, children
-    for key in ["frame", "tagName", "attributes", "beforePseudoText", "text", "afterPseudoText", "children"]:
+    for key in ["tagName", "attributes", "beforePseudoText", "text", "afterPseudoText", "children"]:
         if key not in element:
             continue
         element_copy[key] = copy.deepcopy(element[key])

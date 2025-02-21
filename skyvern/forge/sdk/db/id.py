@@ -35,6 +35,8 @@ BITWARDEN_CREDIT_CARD_DATA_PARAMETER_PREFIX = "bccd"
 BITWARDEN_LOGIN_CREDENTIAL_PARAMETER_PREFIX = "blc"
 BITWARDEN_SENSITIVE_INFORMATION_PARAMETER_PREFIX = "bsi"
 CREDENTIAL_PARAMETER_PREFIX = "cp"
+CREDENTIAL_PREFIX = "cred"
+ORGANIZATION_BITWARDEN_COLLECTION_PREFIX = "obc"
 OBSERVER_CRUISE_ID = "oc"
 OBSERVER_THOUGHT_ID = "ot"
 ORGANIZATION_AUTH_TOKEN_PREFIX = "oat"
@@ -52,7 +54,6 @@ WORKFLOW_PERMANENT_ID_PREFIX = "wpid"
 WORKFLOW_PREFIX = "w"
 WORKFLOW_RUN_BLOCK_PREFIX = "wrb"
 WORKFLOW_RUN_PREFIX = "wr"
-CREDENTIAL_PREFIX = "cred"
 
 
 def generate_workflow_id() -> str:
@@ -175,14 +176,19 @@ def generate_task_run_id() -> str:
     return f"{TASK_RUN_PREFIX}_{int_id}"
 
 
+def generate_credential_parameter_id() -> str:
+    int_id = generate_id()
+    return f"{CREDENTIAL_PARAMETER_PREFIX}_{int_id}"
+
+
 def generate_credential_id() -> str:
     int_id = generate_id()
     return f"{CREDENTIAL_PREFIX}_{int_id}"
 
 
-def generate_credential_parameter_id() -> str:
+def generate_organization_bitwarden_collection_id() -> str:
     int_id = generate_id()
-    return f"{CREDENTIAL_PARAMETER_PREFIX}_{int_id}"
+    return f"{ORGANIZATION_BITWARDEN_COLLECTION_PREFIX}_{int_id}"
 
 
 def generate_id() -> int:

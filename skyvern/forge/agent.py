@@ -309,8 +309,6 @@ class ForgeAgent:
                 status=StepStatus.canceled,
                 is_last=True,
             )
-            # We don't send task response for now as the task is canceled
-            # TODO: shall we send task response here?
             await self.clean_up_task(
                 task=task,
                 last_step=step,
@@ -1683,21 +1681,11 @@ class ForgeAgent:
                         step_id=last_step.step_id,
                     )
 
-        # if it's a task block from workflow run,
-        # we don't need to close the browser, save browser artifacts, or call webhook
-        if task.workflow_run_id:
-            LOG.info(
-                "Task is part of a workflow run, not sending a webhook response",
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
-            )
-            return
-
         if task.organization_id:
             try:
                 async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                     await app.STORAGE.save_downloaded_files(
-                        task.organization_id, task_id=task.task_id, workflow_run_id=None
+                        task.organization_id, task_id=task.task_id, workflow_run_id=task.workflow_run_id
                     )
             except asyncio.TimeoutError:
                 LOG.warning(
@@ -1712,6 +1700,16 @@ class ForgeAgent:
                     task_id=task.task_id,
                     workflow_run_id=task.workflow_run_id,
                 )
+
+        # if it's a task block from workflow run,
+        # we don't need to close the browser, save browser artifacts, or call webhook
+        if task.workflow_run_id:
+            LOG.info(
+                "Task is part of a workflow run, not sending a webhook response",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+            )
+            return
 
         await self.async_operation_pool.remove_task(task.task_id)
         await self.cleanup_browser_and_create_artifacts(
