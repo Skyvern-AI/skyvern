@@ -3,11 +3,10 @@ from typing import Any, Dict, Type
 from httpx import AsyncClient
 from langchain.tools import BaseTool
 from pydantic import BaseModel
+from skyvern_langchain.scheme import GetTaskInput, TaskV1Request, TaskV2Request
 
 from skyvern.client import AsyncSkyvern
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskResponse
-
-from .scheme import GetTaskInput, TaskV1Request, TaskV2Request
 
 
 class SkyvernClientBaseTool(BaseTool):

@@ -1,12 +1,11 @@
 from typing import Any, Dict
 
 from langchain.tools import tool
+from skyvern_langchain.scheme import GetTaskInput, TaskV1Request, TaskV2Request
 
 from skyvern.agent import Agent
 from skyvern.forge.sdk.schemas.observers import ObserverTask
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskResponse
-
-from .scheme import GetTaskInput, TaskV1Request, TaskV2Request
 
 
 @tool("run-skyvern-agent-task-v1", args_schema=TaskV1Request)
