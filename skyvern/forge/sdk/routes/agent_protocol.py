@@ -1393,7 +1393,7 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
             final_workflow_run_block_timeline.append(timeline)
             continue
         if not timeline.block.block_workflow_run_id:
-            LOG.error(
+            LOG.warning(
                 "Block workflow run id is not set for task_v2 block",
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
