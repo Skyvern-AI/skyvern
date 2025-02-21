@@ -7,8 +7,8 @@
   - [Usage](#usage)
     - [Run a task(sync) with skyvern agent (calling skyvern agent function directly in the tool)](#run-a-tasksync-with-skyvern-agent-calling-skyvern-agent-function-directly-in-the-tool)
     - [Run a task(async) with skyvern agent (calling skyvern agent function directly in the tool)](#run-a-taskasync-with-skyvern-agent-calling-skyvern-agent-function-directly-in-the-tool)
-    - [Run a task(sync) with skyvern client (calling skyvern server api in the tool)](#run-a-tasksync-with-skyvern-client-calling-skyvern-server-api-in-the-tool)
-    - [Run a task(async) with skyvern client (calling skyvern server api in the tool)](#run-a-taskasync-with-skyvern-client-calling-skyvern-server-api-in-the-tool)
+    - [Run a task(sync) with skyvern client (calling skyvern OpenAPI in the tool)](#run-a-tasksync-with-skyvern-client-calling-skyvern-openapi-in-the-tool)
+    - [Run a task(async) with skyvern client (calling skyvern OpenAPI in the tool)](#run-a-taskasync-with-skyvern-client-calling-skyvern-openapi-in-the-tool)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
@@ -98,7 +98,7 @@ if __name__ == "__main__":
 
 ```
 
-### Run a task(sync) with skyvern client (calling skyvern server api in the tool)
+### Run a task(sync) with skyvern client (calling skyvern OpenAPI in the tool)
 > sync task won't return until the task is finished.
 
 no need to run `skyvern init` command in your terminal to set up skyvern before using this integration.
@@ -133,7 +133,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### Run a task(async) with skyvern client (calling skyvern server api in the tool)
+### Run a task(async) with skyvern client (calling skyvern OpenAPI in the tool)
 > async task will return immediately and the task will be running in the background. You can use `GetSkyvernClientTaskV2Tool` tool to poll the task information until the task is finished.
 
 no need to run `skyvern init` command in your terminal to set up skyvern before using this integration.
