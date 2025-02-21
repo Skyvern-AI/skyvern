@@ -29,7 +29,7 @@ class SkyvernClientBaseTool(BaseTool):
 
 class RunSkyvernClientTaskV1Tool(SkyvernClientBaseTool):
     name: str = "run-skyvern-client-task-v1"
-    description: str = """Use Skyvern client to run a v1 task. It is usually used for the simple tasks."""
+    description: str = """Use Skyvern client to run a v1 task. It is usually used for the simple tasks. This function won't return until the task is finished."""
     args_schema: Type[BaseModel] = TaskV1Request
 
     async def _arun(self, **kwargs: Dict[str, Any]) -> TaskResponse:
@@ -54,9 +54,9 @@ class RunSkyvernClientTaskV1Tool(SkyvernClientBaseTool):
         )
 
 
-class CreateSkyvernClientTaskV1Tool(SkyvernClientBaseTool):
-    name: str = "create-skyvern-client-task-v1"
-    description: str = """Use Skyvern client to create a v1 task. It is usually used for the simple tasks."""
+class QueueSkyvernClientTaskV1Tool(SkyvernClientBaseTool):
+    name: str = "queue-skyvern-client-task-v1"
+    description: str = """Use Skyvern client to queue a v1 task. It is usually used for the simple tasks. This function will return immediately and the task will be running in the background."""
     args_schema: Type[BaseModel] = TaskV1Request
 
     async def _arun(self, **kwargs: Dict[str, Any]) -> CreateTaskResponse:
@@ -91,7 +91,7 @@ class GetSkyvernClientTaskV1Tool(SkyvernClientBaseTool):
 
 class RunSkyvernClientTaskV2Tool(SkyvernClientBaseTool):
     name: str = "run-skyvern-client-task-v2"
-    description: str = """Use Skyvern client to run a v2 task. It is usually used for the complicated tasks."""
+    description: str = """Use Skyvern client to run a v2 task. It is usually used for the complicated tasks. This function won't return until the task is finished."""
     args_schema: Type[BaseModel] = TaskV2Request
 
     async def _arun(self, **kwargs: Dict[str, Any]) -> Dict[str, Any | None]:
@@ -109,9 +109,9 @@ class RunSkyvernClientTaskV2Tool(SkyvernClientBaseTool):
         )
 
 
-class CreateSkyvernClientTaskV2Tool(SkyvernClientBaseTool):
-    name: str = "create-skyvern-client-task-v2"
-    description: str = """Use Skyvern client to create a v2 task. It is usually used for the complicated tasks."""
+class QueueSkyvernClientTaskV2Tool(SkyvernClientBaseTool):
+    name: str = "queue-skyvern-client-task-v2"
+    description: str = """Use Skyvern client to queue a v2 task. It is usually used for the complicated tasks. This function will return immediately and the task will be running in the background."""
     args_schema: Type[BaseModel] = TaskV2Request
 
     async def _arun(self, **kwargs: Dict[str, Any]) -> Dict[str, Any | None]:

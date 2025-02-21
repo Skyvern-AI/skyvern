@@ -63,7 +63,7 @@ import asyncio
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, AgentType
-from skyvern_langchain.agent import create_task_v2, get_task_v2
+from skyvern_langchain.agent import queue_task_v2, get_task_v2
 
 from langchain_community.tools.sleep.tool import SleepTool
 
@@ -74,7 +74,7 @@ llm = ChatOpenAI(model="gpt-4o", temperature=0)
 agent = initialize_agent(
     llm=llm,
     tools=[
-        create_task_v2,
+        queue_task_v2,
         get_task_v2,
         SleepTool(),
     ],
@@ -135,7 +135,7 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, AgentType
 from skyvern_langchain.client import (
-    CreateSkyvernClientTaskV2Tool,
+    QueueSkyvernClientTaskV2Tool,
     GetSkyvernClientTaskV2Tool,
 )
 
@@ -145,7 +145,7 @@ load_dotenv()
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-create_task_v2 = CreateSkyvernClientTaskV2Tool(
+queue_task_v2 = QueueSkyvernClientTaskV2Tool(
     credential="<your_organization_api_key>",
 )
 
@@ -156,7 +156,7 @@ get_task_v2 = GetSkyvernClientTaskV2Tool(
 agent = initialize_agent(
     llm=llm,
     tools=[
-        create_task_v2,
+        queue_task_v2,
         get_task_v2,
         SleepTool(),
     ],
