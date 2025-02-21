@@ -1,7 +1,7 @@
 from typing import Any, Dict
 
 from langchain.tools import tool
-from skyvern_langchain.scheme import GetTaskInput, TaskV1Request, TaskV2Request
+from skyvern_langchain.schema import GetTaskInput, TaskV1Request, TaskV2Request
 
 from skyvern.agent import Agent
 from skyvern.forge.sdk.schemas.observers import ObserverTask
