@@ -145,7 +145,7 @@ class WorkflowParameterType(StrEnum):
                 if isinstance(value, bool):
                     return value
                 lower_case = str(value).lower()
-                if lower_case in ["true", "false", "1", "0"]:
+                if lower_case not in ["true", "false", "1", "0"]:
                     raise InvalidWorkflowParameter(expected_parameter_type=self, value=str(value))
                 return lower_case in ["true", "1"]
             elif self == WorkflowParameterType.JSON:
