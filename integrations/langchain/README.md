@@ -107,13 +107,13 @@ load_dotenv()
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-run_observer_task = RunSkyvernClientTaskV2Tool(
+run_task_v2 = RunSkyvernClientTaskV2Tool(
     credential="<your_organization_api_key>",
 )
 
 agent = initialize_agent(
     llm=llm,
-    tools=[run_observer_task],
+    tools=[run_task_v2],
     verbose=True,
     agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
 )
