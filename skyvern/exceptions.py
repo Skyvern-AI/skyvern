@@ -355,9 +355,19 @@ class UnknownElementTreeFormat(SkyvernException):
         super().__init__(f"Unknown element tree format {fmt}")
 
 
-class StepTerminationError(SkyvernException):
-    def __init__(self, step_id: str, reason: str) -> None:
+class TerminationError(SkyvernException):
+    def __init__(self, reason: str, step_id: str | None = None, task_id: str | None = None) -> None:
+        super().__init__(f"Termination error. Reason: {reason}")
+
+
+class StepTerminationError(TerminationError):
+    def __init__(self, reason: str, step_id: str | None = None, task_id: str | None = None) -> None:
         super().__init__(f"Step {step_id} cannot be executed and task is failed. Reason: {reason}")
+
+
+class TaskTerminationError(TerminationError):
+    def __init__(self, reason: str, step_id: str | None = None, task_id: str | None = None) -> None:
+        super().__init__(f"Task {task_id} failed. Reason: {reason}")
 
 
 class BlockTerminationError(SkyvernException):

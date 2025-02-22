@@ -425,6 +425,11 @@ class AgentFunction:
     ) -> None:
         return
 
+    async def validate_task_execution(
+        self, organization_id: str | None = None, task_id: str | None = None, task_version: str | None = None
+    ) -> None:
+        return
+
     async def prepare_step_execution(
         self,
         organization: Organization | None,
