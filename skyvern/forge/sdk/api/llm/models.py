@@ -5,7 +5,7 @@ from litellm import AllowedFailsPolicy
 
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.observers import ObserverTask, ObserverThought
+from skyvern.forge.sdk.schemas.task_v2 import ObserverTask, ObserverThought
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
 

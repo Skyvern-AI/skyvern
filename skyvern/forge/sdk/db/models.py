@@ -47,7 +47,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_run_block_id,
     generate_workflow_run_id,
 )
-from skyvern.forge.sdk.schemas.observers import ObserverThoughtType
+from skyvern.forge.sdk.schemas.task_v2 import ObserverThoughtType
 
 
 class Base(AsyncAttrs, DeclarativeBase):

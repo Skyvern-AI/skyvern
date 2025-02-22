@@ -7,7 +7,7 @@ from skyvern.exceptions import OrganizationNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.schemas.observers import ObserverTaskStatus
+from skyvern.forge.sdk.schemas.task_v2 import ObserverTaskStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services import task_v2_service
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus

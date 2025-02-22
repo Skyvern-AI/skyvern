@@ -49,7 +49,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core.validators import prepend_scheme_and_validate_url
 from skyvern.forge.sdk.db.enums import TaskType
-from skyvern.forge.sdk.schemas.observers import ObserverTaskStatus
+from skyvern.forge.sdk.schemas.task_v2 import ObserverTaskStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (

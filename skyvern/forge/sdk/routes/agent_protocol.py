@@ -39,7 +39,6 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
-from skyvern.forge.sdk.schemas.observers import ObserverTaskRequest
 from skyvern.forge.sdk.schemas.organizations import (
     GetOrganizationAPIKeysResponse,
     GetOrganizationsResponse,
@@ -48,6 +47,7 @@ from skyvern.forge.sdk.schemas.organizations import (
 )
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration, TaskGenerationBase
 from skyvern.forge.sdk.schemas.task_runs import TaskRunType
+from skyvern.forge.sdk.schemas.task_v2 import ObserverTaskRequest
 from skyvern.forge.sdk.schemas.tasks import (
     CreateTaskResponse,
     OrderBy,

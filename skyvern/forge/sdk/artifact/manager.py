@@ -9,7 +9,7 @@ from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityT
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.observers import ObserverTask, ObserverThought
+from skyvern.forge.sdk.schemas.task_v2 import ObserverTask, ObserverThought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
 LOG = structlog.get_logger(__name__)
