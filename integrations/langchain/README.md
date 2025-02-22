@@ -22,6 +22,12 @@ This is a langchain integration for Skyvern.
 pip install skyvern-langchain
 ```
 
+To run the example scenarios, you might need to install other langchain dependencies.
+```bash
+pip install langchain-openai
+pip install langchain-community
+```
+
 ## Usage
 
 ### Run a task(sync) with skyvern agent (calling skyvern agent function directly in the tool)
