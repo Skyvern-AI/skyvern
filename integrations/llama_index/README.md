@@ -40,9 +40,9 @@ from skyvern_llamaindex.agent import SkyvernTaskToolSpec
 # load OpenAI API key from .env
 load_dotenv()
 
-skyvern_tool = SkyvernTaskToolSpec()
+skyvern_task_tool = SkyvernTaskToolSpec()
 
-tools = skyvern_tool.to_tool_list(["run"])
+tools = skyvern_task_tool.to_tool_list(["run"])
 
 agent = OpenAIAgent.from_tools(
     tools=tools,
@@ -76,7 +76,7 @@ async def sleep(seconds: int) -> str:
 # load OpenAI API key from .env
 load_dotenv()
 
-skyvern_tool = SkyvernTaskToolSpec()
+skyvern_task_tool = SkyvernTaskToolSpec()
 
 sleep_tool = FunctionTool.from_defaults(
     async_fn=sleep,
@@ -84,7 +84,7 @@ sleep_tool = FunctionTool.from_defaults(
     name="sleep",
 )
 
-tools = skyvern_tool.to_tool_list(["dispatch", "get"])
+tools = skyvern_task_tool.to_tool_list(["dispatch", "get"])
 tools.append(sleep_tool)
 
 agent = OpenAIAgent.from_tools(
@@ -119,11 +119,11 @@ async def sleep(seconds: int) -> str:
 # load OpenAI API key from .env
 load_dotenv()
 
-skyvern_client_tool = SkyvernTaskToolSpec(
+skyvern_task_tool = SkyvernTaskToolSpec(
     credential="<your_organization_api_key>",
 )
 
-tools = skyvern_client_tool.to_tool_list(["run"])
+tools = skyvern_task_tool.to_tool_list(["run"])
 
 agent = OpenAIAgent.from_tools(
     tools=tools,
@@ -158,7 +158,7 @@ async def sleep(seconds: int) -> str:
 # load OpenAI API key from .env
 load_dotenv()
 
-skyvern_client_tool = SkyvernTaskToolSpec(
+skyvern_task_tool = SkyvernTaskToolSpec(
     credential="<your_organization_api_key>",
 )
 
@@ -168,7 +168,7 @@ sleep_tool = FunctionTool.from_defaults(
     name="sleep",
 )
 
-tools = skyvern_client_tool.to_tool_list(["dispatch", "get"])
+tools = skyvern_task_tool.to_tool_list(["dispatch", "get"])
 tools.append(sleep_tool)
 
 agent = OpenAIAgent.from_tools(
