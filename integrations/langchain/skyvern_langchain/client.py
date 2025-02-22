@@ -30,14 +30,12 @@ class SkyvernTaskBaseTool(BaseTool):
 class RunSkyvernTaskTool(SkyvernTaskBaseTool):
     name: str = "run-skyvern-client-task"
     description: str = """Use Skyvern client to run a task. This function won't return until the task is finished."""
-    args_schema: Type[BaseModel] = TaskV2Request
 
-    def __init__(self, *args: Any, **kwargs: Any):
-        super().__init__(*args, **kwargs)
+    def get_input_schema(self) -> Type[BaseModel]:
         if self.engine == "TaskV1":
-            self.args_schema = TaskV1Request
+            return TaskV1Request
         else:
-            self.args_schema = TaskV2Request
+            return TaskV2Request
 
     async def _arun(self, **kwargs: Dict[str, Any]) -> TaskResponse | Dict[str, Any | None]:
         if self.engine == "TaskV1":
@@ -84,14 +82,12 @@ class RunSkyvernTaskTool(SkyvernTaskBaseTool):
 class DispatchSkyvernTaskTool(SkyvernTaskBaseTool):
     name: str = "dispatch-skyvern-client-task"
     description: str = """Use Skyvern client to dispatch a task. This function will return immediately and the task will be running in the background."""
-    args_schema: Type[BaseModel] = TaskV2Request
 
-    def __init__(self, *args: Any, **kwargs: Any):
-        super().__init__(*args, **kwargs)
+    def get_input_schema(self) -> Type[BaseModel]:
         if self.engine == "TaskV1":
-            self.args_schema = TaskV1Request
+            return TaskV1Request
         else:
-            self.args_schema = TaskV2Request
+            return TaskV2Request
 
     async def _arun(self, **kwargs: Dict[str, Any]) -> CreateTaskResponse | Dict[str, Any | None]:
         if self.engine == "TaskV1":

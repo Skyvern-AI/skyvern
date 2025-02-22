@@ -19,15 +19,13 @@ class SkyvernTaskBaseTool(BaseTool):
 class RunSkyvernTaskTool(SkyvernTaskBaseTool):
     name: str = "run-skyvern-agent-task"
     description: str = """Use Skyvern agent to run a task. This function won't return until the task is finished."""
-    args_schema: Type[BaseModel] = TaskV2Request
+    agent: Agent = Agent()
 
-    def __init__(self, *args: Any, **kwargs: Any):
-        super().__init__(*args, **kwargs)
+    def get_input_schema(self) -> Type[BaseModel]:
         if self.engine == "TaskV1":
-            self.args_schema = TaskV1Request
+            return TaskV1Request
         else:
-            self.args_schema = TaskV2Request
-        self.agent = Agent()
+            return TaskV2Request
 
     async def _arun(self, **kwargs: Dict[str, Any]) -> Dict[str, Any | None]:
         if self.engine == "TaskV1":
@@ -49,15 +47,13 @@ class RunSkyvernTaskTool(SkyvernTaskBaseTool):
 class DispatchSkyvernTaskTool(SkyvernTaskBaseTool):
     name: str = "dispatch-skyvern-agent-task"
     description: str = """Use Skyvern agent to dispatch a task. This function will return immediately and the task will be running in the background."""
-    args_schema: Type[BaseModel] = TaskV2Request
+    agent: Agent = Agent()
 
-    def __init__(self, *args: Any, **kwargs: Any):
-        super().__init__(*args, **kwargs)
+    def get_input_schema(self) -> Type[BaseModel]:
         if self.engine == "TaskV1":
-            self.args_schema = TaskV1Request
+            return TaskV1Request
         else:
-            self.args_schema = TaskV2Request
-        self.agent = Agent()
+            return TaskV2Request
 
     async def _arun(self, **kwargs: Dict[str, Any]) -> CreateTaskResponse | ObserverTask:
         if self.engine == "TaskV1":
@@ -79,13 +75,7 @@ class GetSkyvernTaskTool(SkyvernTaskBaseTool):
     description: str = """Use Skyvern agent to get a task."""
     args_schema: Type[BaseModel] = GetTaskInput
 
-    def __init__(self, *args: Any, **kwargs: Any):
-        super().__init__(*args, **kwargs)
-        if self.engine == "TaskV1":
-            self.args_schema = TaskV1Request
-        else:
-            self.args_schema = TaskV2Request
-        self.agent = Agent()
+    agent: Agent = Agent()
 
     async def _arun(self, task_id: str) -> TaskResponse | ObserverTask | None:
         if self.engine == "TaskV1":
