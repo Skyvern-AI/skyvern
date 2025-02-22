@@ -9,7 +9,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.observers import ObserverTask, ObserverTaskRequest, ObserverTaskStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskRequest, TaskResponse, TaskStatus
-from skyvern.forge.sdk.services import observer_service
+from skyvern.forge.sdk.services import task_v2_service
 from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.utils import migrate_db
@@ -80,7 +80,7 @@ class Agent:
             status=WorkflowRunStatus.queued,
         )
 
-        await observer_service.run_observer_task(
+        await task_v2_service.run_observer_task(
             organization=organization,
             observer_cruise_id=observer_task.observer_cruise_id,
         )
@@ -156,7 +156,7 @@ class Agent:
     async def observer_task_v_2(self, task_request: ObserverTaskRequest) -> ObserverTask:
         organization = await self._get_organization()
 
-        observer_task = await observer_service.initialize_observer_task(
+        observer_task = await task_v2_service.initialize_observer_task(
             organization=organization,
             user_prompt=task_request.user_prompt,
             user_url=str(task_request.url) if task_request.url else None,

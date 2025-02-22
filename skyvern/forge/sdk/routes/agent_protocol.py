@@ -58,7 +58,7 @@ from skyvern.forge.sdk.schemas.tasks import (
     TaskStatus,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline
-from skyvern.forge.sdk.services import observer_service, org_auth_service
+from skyvern.forge.sdk.services import org_auth_service, task_v2_service
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
@@ -1234,7 +1234,7 @@ async def observer_task(
         LOG.info("Overriding max iterations for observer", max_iterations_override=x_max_iterations_override)
 
     try:
-        observer_task = await observer_service.initialize_observer_task(
+        observer_task = await task_v2_service.initialize_observer_task(
             organization=organization,
             user_prompt=data.user_prompt,
             user_url=str(data.url) if data.url else None,
@@ -1268,7 +1268,7 @@ async def get_observer_task(
     task_id: str,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> dict[str, Any]:
-    observer_task = await observer_service.get_observer_cruise(task_id, organization.organization_id)
+    observer_task = await task_v2_service.get_observer_cruise(task_id, organization.organization_id)
     if not observer_task:
         raise HTTPException(status_code=404, detail=f"Observer task {task_id} not found")
     return observer_task.model_dump(by_alias=True)
@@ -1408,7 +1408,7 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
         final_workflow_run_block_timeline.extend(workflow_blocks)
 
     if observer_task_obj and observer_task_obj.observer_cruise_id:
-        observer_thought_timeline = await observer_service.get_observer_thought_timelines(
+        observer_thought_timeline = await task_v2_service.get_observer_thought_timelines(
             observer_cruise_id=observer_task_obj.observer_cruise_id,
             organization_id=organization_id,
         )
