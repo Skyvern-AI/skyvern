@@ -9,42 +9,42 @@ from skyvern.forge.sdk.schemas.observers import ObserverTask
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskResponse
 
 
-class SkyvernToolSpec(BaseToolSpec):
+class SkyvernTaskToolSpec(BaseToolSpec):
     spec_functions: List[SPEC_FUNCTION_TYPE] = [
-        "run_task",
-        "dispatch_task",
-        "get_task",
+        "run",
+        "dispatch",
+        "get",
     ]
     spec_metadata: Dict[str, Dict[str, ToolMetadata]] = {
         "TaskV1": {
-            "run_task": ToolMetadata(
+            "run": ToolMetadata(
                 name="run-skyvern-agent-task",
                 description="Use Skyvern agent to run a task. This function won't return until the task is finished.",
                 fn_schema=TaskV1Request,
             ),
-            "dispatch_task": ToolMetadata(
+            "dispatch": ToolMetadata(
                 name="dispatch-skyvern-agent-task",
                 description="Use Skyvern agent to dispatch a task. This function will return immediately and the task will be running in the background.",
                 fn_schema=TaskV1Request,
             ),
-            "get_task": ToolMetadata(
+            "get": ToolMetadata(
                 name="get-skyvern-agent-task",
                 description="Use Skyvern agent to get a task.",
                 fn_schema=GetTaskInput,
             ),
         },
         "TaskV2": {
-            "run_task": ToolMetadata(
+            "run": ToolMetadata(
                 name="run-skyvern-agent-task",
                 description="Use Skyvern agent to run a task. This function won't return until the task is finished.",
                 fn_schema=TaskV2Request,
             ),
-            "dispatch_task": ToolMetadata(
+            "dispatch": ToolMetadata(
                 name="dispatch-skyvern-agent-task",
                 description="Use Skyvern agent to dispatch a task. This function will return immediately and the task will be running in the background.",
                 fn_schema=TaskV2Request,
             ),
-            "get_task": ToolMetadata(
+            "get": ToolMetadata(
                 name="get-skyvern-agent-task",
                 description="Use Skyvern agent to get a task.",
                 fn_schema=GetTaskInput,
@@ -66,19 +66,19 @@ class SkyvernToolSpec(BaseToolSpec):
 
         return self.spec_metadata.get(self.engine, {}).get(fn_name)
 
-    async def run_task(self, **kwargs: Dict[str, Any]) -> TaskResponse | ObserverTask:
+    async def run(self, **kwargs: Dict[str, Any]) -> TaskResponse | ObserverTask:
         if self.engine == "TaskV1":
             return await self.run_task_v1(**kwargs)
         else:
             return await self.run_task_v2(**kwargs)
 
-    async def dispatch_task(self, **kwargs: Dict[str, Any]) -> CreateTaskResponse | ObserverTask:
+    async def dispatch(self, **kwargs: Dict[str, Any]) -> CreateTaskResponse | ObserverTask:
         if self.engine == "TaskV1":
             return await self.dispatch_task_v1(**kwargs)
         else:
             return await self.dispatch_task_v2(**kwargs)
 
-    async def get_task(self, task_id: str) -> TaskResponse | ObserverTask | None:
+    async def get(self, task_id: str) -> TaskResponse | ObserverTask | None:
         if self.engine == "TaskV1":
             return await self.get_task_v1(task_id)
         else:
