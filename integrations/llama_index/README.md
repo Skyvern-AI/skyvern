@@ -35,14 +35,14 @@ import asyncio
 from dotenv import load_dotenv
 from llama_index.agent.openai import OpenAIAgent
 from llama_index.llms.openai import OpenAI
-from skyvern_llamaindex.agent import SkyvernToolSpec
+from skyvern_llamaindex.agent import SkyvernTaskToolSpec
 
 # load OpenAI API key from .env
 load_dotenv()
 
-skyvern_tool = SkyvernToolSpec()
+skyvern_tool = SkyvernTaskToolSpec()
 
-tools = skyvern_tool.to_tool_list(["run_task"])
+tools = skyvern_tool.to_tool_list(["run"])
 
 agent = OpenAIAgent.from_tools(
     tools=tools,
@@ -57,7 +57,7 @@ print(response)
 ```
 
 ### Dispatch a task(async) with skyvern agent (calling skyvern agent function directly in the tool)
-> dispatch task will return immediately and the task will be running in the background. You can use `get_task` tool to poll the task information until the task is finished.
+> dispatch task will return immediately and the task will be running in the background. You can use `get` tool to poll the task information until the task is finished.
 
 :warning: :warning: if you want to run this code block, you need to run `skyvern init --openai-api-key <your_openai_api_key>` command in your terminal to set up skyvern first.
 
@@ -67,7 +67,7 @@ from dotenv import load_dotenv
 from llama_index.agent.openai import OpenAIAgent
 from llama_index.llms.openai import OpenAI
 from llama_index.core.tools import FunctionTool
-from skyvern_llamaindex.agent import SkyvernToolSpec
+from skyvern_llamaindex.agent import SkyvernTaskToolSpec
 
 async def sleep(seconds: int) -> str:
     await asyncio.sleep(seconds)
@@ -76,7 +76,7 @@ async def sleep(seconds: int) -> str:
 # load OpenAI API key from .env
 load_dotenv()
 
-skyvern_tool = SkyvernToolSpec()
+skyvern_tool = SkyvernTaskToolSpec()
 
 sleep_tool = FunctionTool.from_defaults(
     async_fn=sleep,
@@ -84,7 +84,7 @@ sleep_tool = FunctionTool.from_defaults(
     name="sleep",
 )
 
-tools = skyvern_tool.to_tool_list(["dispatch_task", "get_task"])
+tools = skyvern_tool.to_tool_list(["dispatch", "get"])
 tools.append(sleep_tool)
 
 agent = OpenAIAgent.from_tools(
@@ -109,7 +109,7 @@ import asyncio
 from dotenv import load_dotenv
 from llama_index.agent.openai import OpenAIAgent
 from llama_index.llms.openai import OpenAI
-from skyvern_llamaindex.client import SkyvernToolSpec
+from skyvern_llamaindex.client import SkyvernTaskToolSpec
 
 
 async def sleep(seconds: int) -> str:
@@ -119,11 +119,11 @@ async def sleep(seconds: int) -> str:
 # load OpenAI API key from .env
 load_dotenv()
 
-skyvern_client_tool = SkyvernToolSpec(
+skyvern_client_tool = SkyvernTaskToolSpec(
     credential="<your_organization_api_key>",
 )
 
-tools = skyvern_client_tool.to_tool_list(["run_task"])
+tools = skyvern_client_tool.to_tool_list(["run"])
 
 agent = OpenAIAgent.from_tools(
     tools=tools,
@@ -138,7 +138,7 @@ print(response)
 ```
 
 ### Dispatch a task(async) with skyvern client (calling skyvern OpenAPI in the tool)
-> dispatch task will return immediately and the task will be running in the background. You can use `get_task` tool to poll the task information until the task is finished.
+> dispatch task will return immediately and the task will be running in the background. You can use `get` tool to poll the task information until the task is finished.
 
 no need to run `skyvern init` command in your terminal to set up skyvern before using this integration.
 
@@ -148,7 +148,7 @@ from dotenv import load_dotenv
 from llama_index.agent.openai import OpenAIAgent
 from llama_index.llms.openai import OpenAI
 from llama_index.core.tools import FunctionTool
-from skyvern_llamaindex.client import SkyvernToolSpec
+from skyvern_llamaindex.client import SkyvernTaskToolSpec
 
 
 async def sleep(seconds: int) -> str:
@@ -158,7 +158,7 @@ async def sleep(seconds: int) -> str:
 # load OpenAI API key from .env
 load_dotenv()
 
-skyvern_client_tool = SkyvernToolSpec(
+skyvern_client_tool = SkyvernTaskToolSpec(
     credential="<your_organization_api_key>",
 )
 
@@ -168,7 +168,7 @@ sleep_tool = FunctionTool.from_defaults(
     name="sleep",
 )
 
-tools = skyvern_client_tool.to_tool_list(["dispatch_task", "get_task"])
+tools = skyvern_client_tool.to_tool_list(["dispatch", "get"])
 tools.append(sleep_tool)
 
 agent = OpenAIAgent.from_tools(
