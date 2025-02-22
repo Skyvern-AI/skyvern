@@ -9,7 +9,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.observers import ObserverTaskStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
-from skyvern.forge.sdk.services import observer_service
+from skyvern.forge.sdk.services import task_v2_service
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 
 LOG = structlog.get_logger()
@@ -176,7 +176,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
 
         if background_tasks:
             background_tasks.add_task(
-                observer_service.run_observer_task,
+                task_v2_service.run_observer_task,
                 organization=organization,
                 observer_cruise_id=observer_cruise_id,
                 max_iterations_override=max_iterations_override,

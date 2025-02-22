@@ -2138,7 +2138,7 @@ class TaskV2Block(Block):
         browser_session_id: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
-        from skyvern.forge.sdk.services import observer_service
+        from skyvern.forge.sdk.services import task_v2_service
         from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 
         if not organization_id:
@@ -2150,7 +2150,7 @@ class TaskV2Block(Block):
         workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id, organization_id)
         if not workflow_run:
             raise ValueError(f"WorkflowRun not found {workflow_run_id} when running TaskV2Block")
-        observer_task = await observer_service.initialize_observer_task(
+        observer_task = await task_v2_service.initialize_observer_task(
             organization,
             user_prompt=self.prompt,
             user_url=self.url,
@@ -2171,7 +2171,7 @@ class TaskV2Block(Block):
                 block_workflow_run_id=observer_task.workflow_run_id,
             )
 
-        observer_task = await observer_service.run_observer_task(
+        observer_task = await task_v2_service.run_observer_task(
             organization=organization,
             observer_cruise_id=observer_task.observer_cruise_id,
             request_id=None,
