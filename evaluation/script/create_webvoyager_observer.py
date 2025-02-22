@@ -9,7 +9,7 @@ from evaluation.core import Evaluator, SkyvernClient
 from evaluation.core.utils import load_webvoyager_case_from_json
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.schemas.observers import ObserverTaskRequest
+from skyvern.forge.sdk.schemas.task_v2 import ObserverTaskRequest
 
 
 async def create_observer_cruise(
