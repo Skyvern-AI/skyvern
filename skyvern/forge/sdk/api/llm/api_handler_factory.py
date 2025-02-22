@@ -23,7 +23,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.observers import ObserverTask, ObserverThought
+from skyvern.forge.sdk.schemas.task_v2 import ObserverTask, ObserverThought
 
 LOG = structlog.get_logger()
 

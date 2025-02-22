@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import create_folder_if_not_exist
-from skyvern.forge.sdk.schemas.observers import ObserverTask, ObserverTaskRequest
+from skyvern.forge.sdk.schemas.task_v2 import ObserverTask, ObserverTaskRequest
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus, WorkflowRunStatusResponse
 

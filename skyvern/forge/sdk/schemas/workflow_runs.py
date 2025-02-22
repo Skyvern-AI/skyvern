@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from skyvern.forge.sdk.schemas.observers import ObserverThought
+from skyvern.forge.sdk.schemas.task_v2 import ObserverThought
 from skyvern.forge.sdk.workflow.models.block import BlockType
 from skyvern.webeye.actions.actions import Action
 
