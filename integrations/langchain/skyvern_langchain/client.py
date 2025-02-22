@@ -1,4 +1,4 @@
-from typing import Any, Dict, Literal, Type
+from typing import Any, Dict, List, Literal, Type
 
 from httpx import AsyncClient
 from langchain.tools import BaseTool
@@ -9,8 +9,40 @@ from skyvern.client import AsyncSkyvern
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskResponse
 
 
+class SkyvernTaskTools:
+    def __init__(
+        self,
+        credential: str,
+        *,
+        base_url: str = "https://api.skyvern.com",
+        engine: Literal["TaskV1", "TaskV2"] = "TaskV2",
+    ) -> None:
+        self.engine = engine
+        self.credential = credential
+        self.base_url = base_url
+
+    @property
+    def run(self) -> BaseTool:
+        return RunSkyvernTaskTool(engine=self.engine, credential=self.credential, base_url=self.base_url)
+
+    @property
+    def dispatch(self) -> BaseTool:
+        return DispatchSkyvernTaskTool(engine=self.engine, credential=self.credential, base_url=self.base_url)
+
+    @property
+    def get(self) -> BaseTool:
+        return GetSkyvernTaskTool(engine=self.engine, credential=self.credential, base_url=self.base_url)
+
+    def get_tools(self) -> List[BaseTool]:
+        return [
+            self.run,
+            self.dispatch,
+            self.get,
+        ]
+
+
 class SkyvernTaskBaseTool(BaseTool):
-    credential: str = ""
+    credential: str
     base_url: str = "https://api.skyvern.com"
     engine: Literal["TaskV1", "TaskV2"] = "TaskV2"
 
