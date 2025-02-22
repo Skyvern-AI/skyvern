@@ -24,14 +24,15 @@ def run_command(command: str, check: bool = True) -> tuple[Optional[str], Option
 
 def is_postgres_running() -> bool:
     if command_exists("pg_isready"):
-        result = run_command("pg_isready")
+        result, _ = run_command("pg_isready")
         return result is not None and "accepting connections" in result
     return False
 
 
 def database_exists(dbname: str, user: str) -> bool:
     check_db_command = f'psql {dbname} -U {user} -c "\\q"'
-    return run_command(check_db_command, check=False) is not None
+    output, _ = run_command(check_db_command, check=False)
+    return output is not None
 
 
 def create_database_and_user() -> None:
