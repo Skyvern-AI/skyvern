@@ -9,7 +9,7 @@ from skyvern.client import AsyncSkyvern
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskResponse
 
 
-class SkyvernClientBaseTool(BaseTool):
+class SkyvernTaskBaseTool(BaseTool):
     credential: str = ""
     base_url: str = "https://api.skyvern.com"
     engine: Literal["TaskV1", "TaskV2"] = "TaskV2"
@@ -24,10 +24,10 @@ class SkyvernClientBaseTool(BaseTool):
         return AsyncSkyvern(base_url=self.base_url, httpx_client=httpx_client)
 
     def _run(self) -> None:
-        raise NotImplementedError("skyvern client tool does not support sync")
+        raise NotImplementedError("skyvern task tool does not support sync")
 
 
-class RunSkyvernTaskTool(SkyvernClientBaseTool):
+class RunSkyvernTaskTool(SkyvernTaskBaseTool):
     name: str = "run-skyvern-client-task"
     description: str = """Use Skyvern client to run a task. This function won't return until the task is finished."""
     args_schema: Type[BaseModel] = TaskV2Request
@@ -70,6 +70,7 @@ class RunSkyvernTaskTool(SkyvernClientBaseTool):
         task_request = TaskV2Request(**kwargs)
         return await self.get_client().agent.run_observer_task_v_2(
             max_iterations_override=task_request.max_iterations,
+            timeout_seconds=task_request.timeout_seconds,
             user_prompt=task_request.user_prompt,
             url=task_request.url,
             browser_session_id=task_request.browser_session_id,
@@ -80,7 +81,7 @@ class RunSkyvernTaskTool(SkyvernClientBaseTool):
         )
 
 
-class DispatchSkyvernTaskTool(SkyvernClientBaseTool):
+class DispatchSkyvernTaskTool(SkyvernTaskBaseTool):
     name: str = "dispatch-skyvern-client-task"
     description: str = """Use Skyvern client to dispatch a task. This function will return immediately and the task will be running in the background."""
     args_schema: Type[BaseModel] = TaskV2Request
@@ -132,7 +133,7 @@ class DispatchSkyvernTaskTool(SkyvernClientBaseTool):
         )
 
 
-class GetSkyvernTaskTool(SkyvernClientBaseTool):
+class GetSkyvernTaskTool(SkyvernTaskBaseTool):
     name: str = "get-skyvern-client-task"
     description: str = """Use Skyvern client to get a task."""
     args_schema: Type[BaseModel] = GetTaskInput
