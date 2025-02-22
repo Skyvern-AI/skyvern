@@ -8,7 +8,7 @@ import httpx
 import structlog
 from sqlalchemy.exc import OperationalError
 
-from skyvern.exceptions import FailedToSendWebhook, ObserverCruiseNotFound, UrlGenerationFailure
+from skyvern.exceptions import FailedToSendWebhook, ObserverCruiseNotFound, TaskTerminationError, UrlGenerationFailure
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -252,6 +252,15 @@ async def run_observer_task(
             max_iterations_override=max_iterations_override,
             browser_session_id=browser_session_id,
         )
+    except TaskTerminationError as e:
+        observer_task = await mark_observer_task_as_terminated(
+            observer_cruise_id=observer_cruise_id,
+            workflow_run_id=observer_task.workflow_run_id,
+            organization_id=organization_id,
+            failure_reason=e.message,
+        )
+        LOG.info("Task v2 is terminated", observer_cruise_id=observer_cruise_id, failure_reason=e.message)
+        return observer_task
     except OperationalError:
         LOG.error("Database error when running observer cruise", exc_info=True)
         observer_task = await mark_observer_task_as_failed(
@@ -373,6 +382,13 @@ async def run_observer_task_helper(
 
     max_iterations = int_max_iterations_override or DEFAULT_MAX_ITERATIONS
     for i in range(max_iterations):
+        # validate the task execution
+        await app.AGENT_FUNCTION.validate_task_execution(
+            organization_id=organization_id,
+            task_id=observer_cruise_id,
+            task_version="v2",
+        )
+
         # check the status of the workflow run
         workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(workflow_run_id, organization_id=organization_id)
         if not workflow_run:
@@ -1247,6 +1263,23 @@ async def mark_observer_task_as_canceled(
     )
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
+    await send_observer_task_webhook(observer_task)
+    return observer_task
+
+
+async def mark_observer_task_as_terminated(
+    observer_cruise_id: str,
+    workflow_run_id: str | None = None,
+    organization_id: str | None = None,
+    failure_reason: str | None = None,
+) -> ObserverTask:
+    observer_task = await app.DATABASE.update_observer_cruise(
+        observer_cruise_id,
+        organization_id=organization_id,
+        status=ObserverTaskStatus.terminated,
+    )
+    if workflow_run_id:
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_terminated(workflow_run_id, failure_reason)
     await send_observer_task_webhook(observer_task)
     return observer_task
 
