@@ -43,6 +43,7 @@ from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, AgentType
 from skyvern_langchain.agent import SkyvernTaskTools
 
+# load OpenAI API key from .env
 load_dotenv()
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
@@ -80,6 +81,7 @@ from skyvern_langchain.agent import SkyvernTaskTools
 
 from langchain_community.tools.sleep.tool import SleepTool
 
+# load OpenAI API key from .env
 load_dotenv()
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
@@ -120,6 +122,7 @@ from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, AgentType
 from skyvern_langchain.client import SkyvernTaskTools
 
+# load OpenAI API key from .env
 load_dotenv()
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
@@ -157,6 +160,7 @@ from skyvern_langchain.client import SkyvernTaskTools
 
 from langchain_community.tools.sleep.tool import SleepTool
 
+# load OpenAI API key from .env
 load_dotenv()
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
