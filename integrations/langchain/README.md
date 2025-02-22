@@ -35,15 +35,17 @@ import asyncio
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, AgentType
-from skyvern_langchain.agent import run_task_v2
+from skyvern_langchain.agent import SkyvernTaskTools
 
 load_dotenv()
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
+skyvern_task_tools = SkyvernTaskTools()
+
 agent = initialize_agent(
     llm=llm,
-    tools=[run_task_v2],
+    tools=[skyvern_task_tools.run],
     verbose=True,
     agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
 )
@@ -59,7 +61,7 @@ if __name__ == "__main__":
 ```
 
 ### Run a task(async) with skyvern agent (calling skyvern agent function directly in the tool)
-> async task will return immediately and the task will be running in the background. You can use `get_task_v2` tool to poll the task information until the task is finished.
+> async task will return immediately and the task will be running in the background. You can use `SkyvernTaskTools().get` tool to poll the task information until the task is finished.
 
 :warning: :warning: if you want to run this code block, you need to run `skyvern init --openai-api-key <your_openai_api_key>` command in your terminal to set up skyvern first.
 
@@ -68,7 +70,7 @@ import asyncio
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, AgentType
-from skyvern_langchain.agent import queue_task_v2, get_task_v2
+from skyvern_langchain.agent import SkyvernTaskTools
 
 from langchain_community.tools.sleep.tool import SleepTool
 
@@ -76,11 +78,13 @@ load_dotenv()
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
+skyvern_task_tools = SkyvernTaskTools()
+
 agent = initialize_agent(
     llm=llm,
     tools=[
-        queue_task_v2,
-        get_task_v2,
+        skyvern_task_tools.dispatch,
+        skyvern_task_tools.get,
         SleepTool(),
     ],
     verbose=True,
@@ -89,8 +93,8 @@ agent = initialize_agent(
 
 
 async def main():
-    # use sleep tool to set up the polling logic until the task is completed, if you only want to queue a task, you can remove the sleep tool
-    print(await agent.ainvoke("Queue a task with Skyvern. The task is about 'Navigate to the Hacker News homepage and get the top 3 posts.' Then, get this task information until it's completed. The task information re-get interval should be 60s."))
+    # use sleep tool to set up the polling logic until the task is completed, if you only want to dispatch a task, you can remove the sleep tool
+    print(await agent.ainvoke("Run a task with Skyvern. The task is about 'Navigate to the Hacker News homepage and get the top 3 posts.' Then, get this task information until it's completed. The task information re-get interval should be 60s."))
 
 
 if __name__ == "__main__":
@@ -108,19 +112,19 @@ import asyncio
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, AgentType
-from skyvern_langchain.client import RunSkyvernClientTaskV2Tool
+from skyvern_langchain.client import SkyvernTaskTools
 
 load_dotenv()
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-run_task_v2 = RunSkyvernClientTaskV2Tool(
+skyvern_task_tools = SkyvernTaskTools(
     credential="<your_organization_api_key>",
 )
 
 agent = initialize_agent(
     llm=llm,
-    tools=[run_task_v2],
+    tools=[skyvern_task_tools.run],
     verbose=True,
     agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
 )
@@ -134,7 +138,7 @@ if __name__ == "__main__":
 ```
 
 ### Run a task(async) with skyvern client (calling skyvern OpenAPI in the tool)
-> async task will return immediately and the task will be running in the background. You can use `GetSkyvernClientTaskV2Tool` tool to poll the task information until the task is finished.
+> async task will return immediately and the task will be running in the background. You can use `SkyvernTaskTools().get` tool to poll the task information until the task is finished.
 
 no need to run `skyvern init` command in your terminal to set up skyvern before using this integration.
 
@@ -143,10 +147,7 @@ import asyncio
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, AgentType
-from skyvern_langchain.client import (
-    QueueSkyvernClientTaskV2Tool,
-    GetSkyvernClientTaskV2Tool,
-)
+from skyvern_langchain.client import SkyvernTaskTools
 
 from langchain_community.tools.sleep.tool import SleepTool
 
@@ -154,19 +155,15 @@ load_dotenv()
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-queue_task_v2 = QueueSkyvernClientTaskV2Tool(
-    credential="<your_organization_api_key>",
-)
-
-get_task_v2 = GetSkyvernClientTaskV2Tool(
+skyvern_task_tools = SkyvernTaskTools(
     credential="<your_organization_api_key>",
 )
 
 agent = initialize_agent(
     llm=llm,
     tools=[
-        queue_task_v2,
-        get_task_v2,
+        skyvern_task_tools.dispatch,
+        skyvern_task_tools.get,
         SleepTool(),
     ],
     verbose=True,
@@ -175,8 +172,8 @@ agent = initialize_agent(
 
 
 async def main():
-    # use sleep tool to set up the polling logic until the task is completed, if you only want to queue a task, you can remove the sleep tool
-    print(await agent.ainvoke("Queue a task with Skyvern. The task is about 'Navigate to the Hacker News homepage and get the top 3 posts.' Then, get this task information until it's completed. The task information re-get interval should be 60s."))
+    # use sleep tool to set up the polling logic until the task is completed, if you only want to dispatch a task, you can remove the sleep tool
+    print(await agent.ainvoke("Run a task with Skyvern. The task is about 'Navigate to the Hacker News homepage and get the top 3 posts.' Then, get this task information until it's completed. The task information re-get interval should be 60s."))
 
 
 if __name__ == "__main__":
