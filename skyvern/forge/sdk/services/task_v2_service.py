@@ -121,11 +121,11 @@ async def initialize_observer_task(
         observer_thought_scenario=ObserverThoughtScenario.generate_metadata,
     )
 
-    metadata_prompt = prompt_engine.load_prompt("observer_generate_metadata", user_goal=user_prompt, user_url=user_url)
+    metadata_prompt = prompt_engine.load_prompt("task_v2_generate_metadata", user_goal=user_prompt, user_url=user_url)
     metadata_response = await app.LLM_API_HANDLER(
         prompt=metadata_prompt,
         observer_thought=observer_thought,
-        prompt_name="observer-generate-metadata",
+        prompt_name="task_v2_generate_metadata",
     )
     # validate
     LOG.info(f"Initialized observer initial response: {metadata_response}")
@@ -449,7 +449,7 @@ async def run_observer_task_helper(
             )
 
             observer_prompt = prompt_engine.load_prompt(
-                "observer",
+                "task_v2",
                 current_url=current_url,
                 elements=element_tree_in_prompt,
                 user_goal=user_prompt,
@@ -469,7 +469,7 @@ async def run_observer_task_helper(
                 prompt=observer_prompt,
                 screenshots=scraped_page.screenshots,
                 observer_thought=observer_thought,
-                prompt_name="observer",
+                prompt_name="task_v2",
             )
             LOG.info(
                 "Observer response",
@@ -660,7 +660,7 @@ async def run_observer_task_helper(
 
             # validate completion only happens at the last iteration
             observer_completion_prompt = prompt_engine.load_prompt(
-                "observer_check_completion",
+                "task_v2_check_completion",
                 user_goal=user_prompt,
                 task_history=task_history,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
@@ -826,7 +826,7 @@ async def _generate_loop_task(
 ) -> tuple[ForLoopBlock, list[BLOCK_YAML_TYPES], list[PARAMETER_YAML_TYPES], dict[str, Any], dict[str, Any]]:
     for_loop_parameter_yaml_list: list[PARAMETER_YAML_TYPES] = []
     loop_value_extraction_goal = prompt_engine.load_prompt(
-        "observer_loop_task_extraction_goal",
+        "task_v2_loop_task_extraction_goal",
         plan=plan,
     )
     data_extraction_thought = f"Going to generate a list of values to go through based on the plan: {plan}."
@@ -953,7 +953,7 @@ async def _generate_loop_task(
     task_in_loop_label = f"task_in_loop_{_generate_random_string()}"
     context = skyvern_context.ensure_context()
     task_in_loop_metadata_prompt = prompt_engine.load_prompt(
-        "observer_generate_task_block",
+        "task_v2_generate_task_block",
         plan=plan,
         local_datetime=datetime.now(context.tz_info).isoformat(),
         is_link=is_loop_value_link,
@@ -972,7 +972,7 @@ async def _generate_loop_task(
         task_in_loop_metadata_prompt,
         screenshots=scraped_page.screenshots,
         observer_thought=observer_thought_task_in_loop,
-        prompt_name="observer_generate_task_block",
+        prompt_name="task_v2_generate_task_block",
     )
     LOG.info("Task in loop metadata response", task_in_loop_metadata_response=task_in_loop_metadata_response)
     navigation_goal = task_in_loop_metadata_response.get("navigation_goal")
@@ -1059,7 +1059,7 @@ async def _generate_extraction_task(
     # extract the data
     context = skyvern_context.ensure_context()
     generate_extraction_task_prompt = prompt_engine.load_prompt(
-        "observer_generate_extraction_task",
+        "task_v2_generate_extraction_task",
         current_url=current_url,
         elements=element_tree_in_prompt,
         data_extraction_goal=data_extraction_goal,
@@ -1068,7 +1068,7 @@ async def _generate_extraction_task(
     generate_extraction_task_response = await app.LLM_API_HANDLER(
         generate_extraction_task_prompt,
         observer_cruise=observer_cruise,
-        prompt_name="observer_generate_extraction_task",
+        prompt_name="task_v2_generate_extraction_task",
     )
     LOG.info("Data extraction response", data_extraction_response=generate_extraction_task_response)
 
@@ -1369,27 +1369,27 @@ async def _summarize_observer_task(
         observer_thought_scenario=ObserverThoughtScenario.summarization,
     )
     # summarize the observer cruise and format the output
-    observer_summary_prompt = prompt_engine.load_prompt(
-        "observer_summary",
+    task_v2_summary_prompt = prompt_engine.load_prompt(
+        "task_v2_summary",
         user_goal=observer_task.prompt,
         task_history=task_history,
         local_datetime=datetime.now(context.tz_info).isoformat(),
     )
-    observer_summary_resp = await app.LLM_API_HANDLER(
-        prompt=observer_summary_prompt,
+    task_v2_summary_resp = await app.LLM_API_HANDLER(
+        prompt=task_v2_summary_prompt,
         screenshots=screenshots,
         observer_thought=observer_thought,
-        prompt_name="observer_summary",
+        prompt_name="task_v2_summary",
     )
-    LOG.info("Observer summary response", observer_summary_resp=observer_summary_resp)
+    LOG.info("Task v2 summary response", task_v2_summary_resp=task_v2_summary_resp)
 
-    thought = observer_summary_resp.get("description")
-    summarized_output = observer_summary_resp.get("output")
+    thought = task_v2_summary_resp.get("description")
+    summarized_output = task_v2_summary_resp.get("output")
     await app.DATABASE.update_observer_thought(
         observer_thought_id=observer_thought.observer_thought_id,
         organization_id=observer_task.organization_id,
         thought=thought,
-        output=observer_summary_resp,
+        output=task_v2_summary_resp,
     )
 
     return await mark_observer_task_as_completed(
