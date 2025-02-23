@@ -3115,7 +3115,7 @@ class AgentClient:
             publish_workflow=publish_workflow,
             request_options=request_options,
         )
-        observer_cruise_id = observer_task.get("task_id")
+        task_id = observer_task.get("task_id")
 
         start_time = time.time()
         while True:
@@ -3123,7 +3123,7 @@ class AgentClient:
                 raise TimeoutError(f"Task timed out after {timeout_seconds} seconds")
 
             task = self.get_observer_task_v_2(
-                str(observer_cruise_id), api_key=api_key, authorization=authorization, request_options=request_options
+                str(task_id), api_key=api_key, authorization=authorization, request_options=request_options
             )
             if str(task.get("status")) in ["timed_out", "failed", "terminated", "completed", "canceled"]:
                 return task
@@ -7358,11 +7358,11 @@ class AsyncAgentClient:
             publish_workflow=publish_workflow,
             request_options=request_options,
         )
-        observer_cruise_id = observer_task.get("task_id")
+        task_id = observer_task.get("task_id")
         async with asyncio.timeout(timeout_seconds):
             while True:
                 task = await self.get_observer_task_v_2(
-                    str(observer_cruise_id),
+                    str(task_id),
                     api_key=api_key,
                     authorization=authorization,
                     request_options=request_options,

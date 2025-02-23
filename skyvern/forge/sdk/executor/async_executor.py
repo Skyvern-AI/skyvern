@@ -46,12 +46,12 @@ class AsyncExecutor(abc.ABC):
         pass
 
     @abc.abstractmethod
-    async def execute_cruise(
+    async def execute_task_v2(
         self,
         request: Request | None,
         background_tasks: BackgroundTasks | None,
         organization_id: str,
-        observer_cruise_id: str,
+        task_v2_id: str,
         max_iterations_override: int | str | None,
         browser_session_id: str | None,
         **kwargs: dict,
@@ -138,39 +138,37 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 browser_session_id=browser_session_id,
             )
 
-    async def execute_cruise(
+    async def execute_task_v2(
         self,
         request: Request | None,
         background_tasks: BackgroundTasks | None,
         organization_id: str,
-        observer_cruise_id: str,
+        task_v2_id: str,
         max_iterations_override: int | str | None,
         browser_session_id: str | None,
         **kwargs: dict,
     ) -> None:
         LOG.info(
             "Executing cruise using background task executor",
-            observer_cruise_id=observer_cruise_id,
+            task_v2_id=task_v2_id,
         )
 
         organization = await app.DATABASE.get_organization(organization_id)
         if organization is None:
             raise OrganizationNotFound(organization_id)
 
-        observer_cruise = await app.DATABASE.get_observer_cruise(
-            observer_cruise_id=observer_cruise_id, organization_id=organization_id
-        )
-        if not observer_cruise or not observer_cruise.workflow_run_id:
+        task_v2 = await app.DATABASE.get_task_v2(task_v2_id=task_v2_id, organization_id=organization_id)
+        if not task_v2 or not task_v2.workflow_run_id:
             raise ValueError("No observer cruise or no workflow run associated with observer cruise")
 
         # mark observer cruise as queued
-        await app.DATABASE.update_observer_cruise(
-            observer_cruise_id,
+        await app.DATABASE.update_task_v2(
+            task_v2_id=task_v2_id,
             status=ObserverTaskStatus.queued,
             organization_id=organization_id,
         )
         await app.DATABASE.update_workflow_run(
-            workflow_run_id=observer_cruise.workflow_run_id,
+            workflow_run_id=task_v2.workflow_run_id,
             status=WorkflowRunStatus.queued,
         )
 
@@ -178,7 +176,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
             background_tasks.add_task(
                 task_v2_service.run_observer_task,
                 organization=organization,
-                observer_cruise_id=observer_cruise_id,
+                task_v2_id=task_v2_id,
                 max_iterations_override=max_iterations_override,
                 browser_session_id=browser_session_id,
             )

@@ -31,13 +31,13 @@ class FailedToSendWebhook(SkyvernException):
         task_id: str | None = None,
         workflow_run_id: str | None = None,
         workflow_id: str | None = None,
-        observer_cruise_id: str | None = None,
+        task_v2_id: str | None = None,
     ):
         workflow_run_str = f"workflow_run_id={workflow_run_id}" if workflow_run_id else ""
         workflow_str = f"workflow_id={workflow_id}" if workflow_id else ""
         task_str = f"task_id={task_id}" if task_id else ""
-        observer_cruise_str = f"observer_cruise_id={observer_cruise_id}" if observer_cruise_id else ""
-        super().__init__(f"Failed to send webhook. {workflow_run_str} {workflow_str} {task_str} {observer_cruise_str}")
+        task_v2_str = f"task_v2_id={task_v2_id}" if task_v2_id else ""
+        super().__init__(f"Failed to send webhook. {workflow_run_str} {workflow_str} {task_str} {task_v2_str}")
 
 
 class ProxyLocationNotSupportedError(SkyvernException):
@@ -632,9 +632,9 @@ class UrlGenerationFailure(SkyvernHTTPException):
         super().__init__("Failed to generate the url for the prompt")
 
 
-class ObserverCruiseNotFound(SkyvernHTTPException):
-    def __init__(self, observer_cruise_id: str) -> None:
-        super().__init__(f"Observer task {observer_cruise_id} not found")
+class TaskV2NotFound(SkyvernHTTPException):
+    def __init__(self, task_v2_id: str) -> None:
+        super().__init__(f"Task v2 {task_v2_id} not found")
 
 
 class NoTOTPVerificationCodeFound(SkyvernHTTPException):

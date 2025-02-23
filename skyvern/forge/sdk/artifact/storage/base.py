@@ -55,9 +55,7 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
-    def build_observer_cruise_uri(
-        self, artifact_id: str, observer_cruise: ObserverTask, artifact_type: ArtifactType
-    ) -> str:
+    def build_task_v2_uri(self, artifact_id: str, task_v2: ObserverTask, artifact_type: ArtifactType) -> str:
         pass
 
     @abstractmethod
