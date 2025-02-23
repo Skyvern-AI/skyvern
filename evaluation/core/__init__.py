@@ -25,6 +25,7 @@ class TaskOutput(BaseModel):
 class SkyvernClient:
     def __init__(self, base_url: str, credentials: str):
         self.base_url = base_url
+        self.v2_base_url = base_url.replace("/api/v1", "/api/v2")
         self.credentials = credentials
 
     def generate_curl_params(self, request_body: BaseModel, max_steps: int | None = None) -> tuple[dict, dict]:
@@ -54,11 +55,11 @@ class SkyvernClient:
         assert "workflow_run_id" in response.json(), f"Failed to create workflow run: {response.text}"
         return response.json()["workflow_run_id"]
 
-    def create_cruise(self, cruise_request: ObserverTaskRequest, max_steps: int | None = None) -> ObserverTask:
-        url = f"{self.base_url}/cruise"
-        payload, headers = self.generate_curl_params(cruise_request, max_steps=max_steps)
+    def create_task_v2(self, task_v2_request: ObserverTaskRequest, max_steps: int | None = None) -> ObserverTask:
+        url = f"{self.v2_base_url}/tasks"
+        payload, headers = self.generate_curl_params(task_v2_request, max_steps=max_steps)
         response = requests.post(url, headers=headers, data=payload)
-        assert "observer_cruise_id" in response.json(), f"Failed to create observer cruise: {response.text}"
+        assert "task_id" in response.json(), f"Failed to create task v2: {response.text}"
         return ObserverTask.model_validate(response.json())
 
     def get_task(self, task_id: str) -> TaskResponse:
@@ -213,7 +214,7 @@ class Evaluator:
         return workflow_run_id
 
     def queue_skyvern_cruise(self, cruise_request: ObserverTaskRequest, max_step: int | None = None) -> ObserverTask:
-        cruise = self.client.create_cruise(cruise_request=cruise_request, max_steps=max_step)
+        cruise = self.client.create_task_v2(task_v2_request=cruise_request, max_steps=max_step)
         self._save_artifact("cruise.json", cruise.model_dump_json(indent=2).encode())
         return cruise
 
@@ -259,7 +260,7 @@ class Evaluator:
         )
 
         extracted_information: list | dict[str, Any] | str | None = None
-        if workflow_run_response.observer_cruise is None:
+        if workflow_run_response.observer_task is None:
             assert workflow_run_response.outputs and len(workflow_run_response.outputs) > 0, (
                 f"Expected {workflow_pid + '/' + workflow_run_id} with output, but got empty output"
             )
@@ -271,10 +272,10 @@ class Evaluator:
                 # FIXME: improve this when the last block is loop block
                 extracted_information = result
         else:
-            workflow_run_response.observer_cruise.summary
-            workflow_run_response.observer_cruise.output
-            summary = f"{('summary:' + workflow_run_response.observer_cruise.summary) if workflow_run_response.observer_cruise.summary else ''}"
-            output = f"{('output: ' + json.dumps(workflow_run_response.observer_cruise.output)) if workflow_run_response.observer_cruise.output else ''}"
+            workflow_run_response.observer_task.summary
+            workflow_run_response.observer_task.output
+            summary = f"{('summary:' + workflow_run_response.observer_task.summary) if workflow_run_response.observer_task.summary else ''}"
+            output = f"{('output: ' + json.dumps(workflow_run_response.observer_task.output)) if workflow_run_response.observer_task.output else ''}"
             extracted_information = ""
             if summary:
                 extracted_information = summary
