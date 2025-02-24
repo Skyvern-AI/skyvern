@@ -244,7 +244,7 @@ export type WorkflowRunStatusApiResponse = {
   downloaded_file_urls: Array<string> | null;
   total_steps: number | null;
   total_cost: number | null;
-  observer_task: ObserverTask | null;
+  task_v2: ObserverTask | null;
   workflow_title: string | null;
 };
 
