@@ -20,6 +20,7 @@ export type ParameterYAML =
   | WorkflowParameterYAML
   | BitwardenLoginCredentialParameterYAML
   | AWSSecretParameterYAML
+  | CredentialParameterYAML
   | ContextParameterYAML
   | OutputParameterYAML
   | BitwardenSensitiveInformationParameterYAML
@@ -80,6 +81,11 @@ export type ContextParameterYAML = ParameterYAMLBase & {
 
 export type OutputParameterYAML = ParameterYAMLBase & {
   parameter_type: "output";
+};
+
+export type CredentialParameterYAML = ParameterYAMLBase & {
+  parameter_type: "credential";
+  credential_id: string;
 };
 
 export type BlockYAML =

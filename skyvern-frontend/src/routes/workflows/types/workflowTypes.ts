@@ -59,6 +59,16 @@ export type BitwardenCreditCardDataParameter = WorkflowParameterBase & {
   deleted_at: string | null;
 };
 
+export type CredentialParameter = WorkflowParameterBase & {
+  parameter_type: "credential";
+  workflow_id: string;
+  credential_parameter_id: string;
+  credential_id: string;
+  created_at: string;
+  modified_at: string;
+  deleted_at: string | null;
+};
+
 export type WorkflowParameter = WorkflowParameterBase & {
   parameter_type: "workflow";
   workflow_id: string;
@@ -105,6 +115,7 @@ export const WorkflowParameterTypes = {
   Bitwarden_Login_Credential: "bitwarden_login_credential",
   Bitwarden_Sensitive_Information: "bitwarden_sensitive_information",
   Bitwarden_Credit_Card_Data: "bitwarden_credit_card_data",
+  Credential: "credential",
 } as const;
 
 export type WorkflowParameterType =
@@ -117,7 +128,8 @@ export function isDisplayedInWorkflowEditor(
   | ContextParameter
   | BitwardenCreditCardDataParameter
   | BitwardenLoginCredentialParameter
-  | BitwardenSensitiveInformationParameter {
+  | BitwardenSensitiveInformationParameter
+  | CredentialParameter {
   return (
     parameter.parameter_type === WorkflowParameterTypes.Workflow ||
     parameter.parameter_type ===
@@ -126,7 +138,8 @@ export function isDisplayedInWorkflowEditor(
     parameter.parameter_type ===
       WorkflowParameterTypes.Bitwarden_Sensitive_Information ||
     parameter.parameter_type ===
-      WorkflowParameterTypes.Bitwarden_Credit_Card_Data
+      WorkflowParameterTypes.Bitwarden_Credit_Card_Data ||
+    parameter.parameter_type === WorkflowParameterTypes.Credential
   );
 }
 
@@ -137,7 +150,8 @@ export type Parameter =
   | BitwardenLoginCredentialParameter
   | BitwardenSensitiveInformationParameter
   | BitwardenCreditCardDataParameter
-  | AWSSecretParameter;
+  | AWSSecretParameter
+  | CredentialParameter;
 
 export type WorkflowBlock =
   | TaskBlock
@@ -199,6 +213,7 @@ export type WorkflowBlockType =
 
 export const WorkflowEditorParameterTypes = {
   Workflow: "workflow",
+  BitwardenLoginCredential: "bitwardenLoginCredential",
   Credential: "credential",
   Secret: "secret",
   Context: "context",
