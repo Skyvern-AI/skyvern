@@ -1,5 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import { ObserverTask } from "@/api/types";
+import { TaskV2 } from "@/api/types";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { ReloadIcon } from "@radix-ui/react-icons";
@@ -23,7 +23,7 @@ function ExampleCasePill({ exampleId, version, icon, label, prompt }: Props) {
   const startObserverCruiseMutation = useMutation({
     mutationFn: async (prompt: string) => {
       const client = await getClient(credentialGetter, "v2");
-      return client.post<{ user_prompt: string }, { data: ObserverTask }>(
+      return client.post<{ user_prompt: string }, { data: TaskV2 }>(
         "/tasks",
         { user_prompt: prompt },
       );
