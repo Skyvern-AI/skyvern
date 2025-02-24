@@ -804,7 +804,7 @@ async def get_workflow_run(
         organization_id=current_org.organization_id,
     )
     if task_v2:
-        return_dict["observer_task"] = task_v2.model_dump(by_alias=True)
+        return_dict["task_v2"] = task_v2.model_dump(by_alias=True)
     return return_dict
 
 
@@ -1223,7 +1223,7 @@ async def upload_file(
 
 @v2_router.post("/tasks")
 @v2_router.post("/tasks/", include_in_schema=False)
-async def observer_task(
+async def create_task_v2(
     request: Request,
     background_tasks: BackgroundTasks,
     data: ObserverTaskRequest,
@@ -1234,7 +1234,7 @@ async def observer_task(
         LOG.info("Overriding max iterations for observer", max_iterations_override=x_max_iterations_override)
 
     try:
-        observer_task = await task_v2_service.initialize_observer_task(
+        task_v2 = await task_v2_service.initialize_task_v2(
             organization=organization,
             user_prompt=data.user_prompt,
             user_url=str(data.url) if data.url else None,
@@ -1250,21 +1250,21 @@ async def observer_task(
         raise HTTPException(
             status_code=500, detail="Skyvern LLM failure to initialize observer cruise. Please try again later."
         )
-    analytics.capture("skyvern-oss-agent-observer-cruise", data={"url": observer_task.url})
+    analytics.capture("skyvern-oss-agent-observer-cruise", data={"url": task_v2.url})
     await AsyncExecutorFactory.get_executor().execute_task_v2(
         request=request,
         background_tasks=background_tasks,
         organization_id=organization.organization_id,
-        task_v2_id=observer_task.observer_cruise_id,
+        task_v2_id=task_v2.observer_cruise_id,
         max_iterations_override=x_max_iterations_override,
         browser_session_id=data.browser_session_id,
     )
-    return observer_task.model_dump(by_alias=True)
+    return task_v2.model_dump(by_alias=True)
 
 
 @v2_router.get("/tasks/{task_id}")
 @v2_router.get("/tasks/{task_id}/", include_in_schema=False)
-async def get_observer_task(
+async def get_task_v2(
     task_id: str,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> dict[str, Any]:
