@@ -1,7 +1,7 @@
 import { Cross2Icon } from "@radix-ui/react-icons";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
-import { useState } from "react";
+import { useContext, useState } from "react";
 import {
   WorkflowEditorParameterType,
   WorkflowParameterValueType,
@@ -22,6 +22,8 @@ import { getDefaultValueForParameterType } from "../workflowEditorUtils";
 import { toast } from "@/components/ui/use-toast";
 import { SourceParameterKeySelector } from "../../components/SourceParameterKeySelector";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
+import CloudContext from "@/store/CloudContext";
+import { CredentialSelector } from "../../components/CredentialSelector";
 
 type Props = {
   type: WorkflowEditorParameterType;
@@ -45,6 +47,9 @@ function header(type: WorkflowEditorParameterType) {
   if (type === "credential") {
     return "Add Credential Parameter";
   }
+  if (type === "bitwardenLoginCredential") {
+    return "Add Bitwarden Login Credential Parameter";
+  }
   if (type === "secret") {
     return "Add Secret Parameter";
   }
@@ -55,6 +60,7 @@ function header(type: WorkflowEditorParameterType) {
 }
 
 function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
+  const isCloud = useContext(CloudContext);
   const [key, setKey] = useState("");
   const [urlParameterKey, setUrlParameterKey] = useState("");
   const [description, setDescription] = useState("");
@@ -75,6 +81,8 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
   const [identityKey, setIdentityKey] = useState("");
   const [identityFields, setIdentityFields] = useState("");
   const [itemId, setItemId] = useState("");
+
+  const [credentialId, setCredentialId] = useState("");
 
   return (
     <ScrollArea>
@@ -181,7 +189,7 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
               </div>
             </>
           )}
-          {type === "credential" && (
+          {type === "bitwardenLoginCredential" && (
             <>
               <div className="space-y-1">
                 <Label className="text-xs text-slate-300">
@@ -255,6 +263,18 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
               </div>
             </>
           )}
+          {
+            // temporarily cloud only
+            type === "credential" && isCloud && (
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Credential</Label>
+                <CredentialSelector
+                  value={credentialId}
+                  onChange={(value) => setCredentialId(value)}
+                />
+              </div>
+            )
+          }
           <div className="flex justify-end">
             <Button
               onClick={() => {
@@ -290,7 +310,7 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                   });
                 }
                 if (
-                  type === "credential" ||
+                  type === "bitwardenLoginCredential" ||
                   type === "secret" ||
                   type === "creditCardData"
                 ) {
@@ -303,10 +323,10 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                     return;
                   }
                 }
-                if (type === "credential") {
+                if (type === "bitwardenLoginCredential") {
                   onSave({
                     key,
-                    parameterType: "credential",
+                    parameterType: "bitwardenLoginCredential",
                     collectionId,
                     urlParameterKey,
                     description,
@@ -346,7 +366,23 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                   onSave({
                     key,
                     parameterType: "context",
-                    sourceParameterKey: sourceParameterKey,
+                    sourceParameterKey,
+                    description,
+                  });
+                }
+                if (type === "credential") {
+                  if (!credentialId) {
+                    toast({
+                      variant: "destructive",
+                      title: "Failed to add parameter",
+                      description: "Credential is required",
+                    });
+                    return;
+                  }
+                  onSave({
+                    key,
+                    parameterType: "credential",
+                    credentialId,
                     description,
                   });
                 }

@@ -75,27 +75,32 @@ function WorkflowEditor() {
           initialParameters={workflow.workflow_definition.parameters
             .filter((parameter) => isDisplayedInWorkflowEditor(parameter))
             .map((parameter) => {
-              if (parameter.parameter_type === "workflow") {
+              if (
+                parameter.parameter_type === WorkflowParameterTypes.Workflow
+              ) {
                 return {
                   key: parameter.key,
-                  parameterType: "workflow",
+                  parameterType: WorkflowEditorParameterTypes.Workflow,
                   dataType: parameter.workflow_parameter_type,
                   defaultValue: parameter.default_value,
                   description: parameter.description,
                 };
-              } else if (parameter.parameter_type === "context") {
+              } else if (
+                parameter.parameter_type === WorkflowParameterTypes.Context
+              ) {
                 return {
                   key: parameter.key,
-                  parameterType: "context",
+                  parameterType: WorkflowEditorParameterTypes.Context,
                   sourceParameterKey: parameter.source.key,
                   description: parameter.description,
                 };
               } else if (
-                parameter.parameter_type === "bitwarden_sensitive_information"
+                parameter.parameter_type ===
+                WorkflowParameterTypes.Bitwarden_Sensitive_Information
               ) {
                 return {
                   key: parameter.key,
-                  parameterType: "secret",
+                  parameterType: WorkflowEditorParameterTypes.Secret,
                   collectionId: parameter.bitwarden_collection_id,
                   identityKey: parameter.bitwarden_identity_key,
                   identityFields: parameter.bitwarden_identity_fields,
@@ -112,10 +117,20 @@ function WorkflowEditor() {
                   itemId: parameter.bitwarden_item_id,
                   description: parameter.description,
                 };
+              } else if (
+                parameter.parameter_type === WorkflowParameterTypes.Credential
+              ) {
+                return {
+                  key: parameter.key,
+                  parameterType: WorkflowEditorParameterTypes.Credential,
+                  credentialId: parameter.credential_id,
+                  description: parameter.description,
+                };
               } else {
                 return {
                   key: parameter.key,
-                  parameterType: "credential",
+                  parameterType:
+                    WorkflowEditorParameterTypes.BitwardenLoginCredential,
                   collectionId: parameter.bitwarden_collection_id,
                   urlParameterKey: parameter.url_parameter_key,
                   description: parameter.description,

@@ -47,6 +47,7 @@ import {
   BitwardenSensitiveInformationParameterYAML,
   BlockYAML,
   ContextParameterYAML,
+  CredentialParameterYAML,
   ParameterYAML,
   WorkflowCreateYAMLRequest,
   WorkflowParameterYAML,
@@ -91,6 +92,7 @@ function convertToParametersYAML(
   | ContextParameterYAML
   | BitwardenSensitiveInformationParameterYAML
   | BitwardenCreditCardDataParameterYAML
+  | CredentialParameterYAML
 > {
   return parameters.map((parameter) => {
     if (parameter.parameterType === WorkflowEditorParameterTypes.Workflow) {
@@ -143,6 +145,15 @@ function convertToParametersYAML(
         bitwarden_master_password_aws_secret_key:
           BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
       };
+    } else if (
+      parameter.parameterType === WorkflowEditorParameterTypes.Credential
+    ) {
+      return {
+        parameter_type: WorkflowParameterTypes.Credential,
+        key: parameter.key,
+        description: parameter.description || null,
+        credential_id: parameter.credentialId,
+      };
     } else {
       return {
         parameter_type: WorkflowParameterTypes.Bitwarden_Login_Credential,
@@ -170,7 +181,7 @@ export type ParametersState = Array<
     }
   | {
       key: string;
-      parameterType: "credential";
+      parameterType: "bitwardenLoginCredential";
       collectionId: string;
       urlParameterKey: string;
       description?: string | null;
@@ -194,6 +205,12 @@ export type ParametersState = Array<
       parameterType: "creditCardData";
       itemId: string;
       collectionId: string;
+      description?: string | null;
+    }
+  | {
+      key: string;
+      parameterType: "credential";
+      credentialId: string;
       description?: string | null;
     }
 >;

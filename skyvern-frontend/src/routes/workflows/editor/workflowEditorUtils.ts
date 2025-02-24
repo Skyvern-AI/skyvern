@@ -1559,6 +1559,13 @@ function convertParametersToParameterYAML(
           default_value: parameter.default_value,
         };
       }
+      case WorkflowParameterTypes.Credential: {
+        return {
+          ...base,
+          parameter_type: WorkflowParameterTypes.Credential,
+          credential_id: parameter.credential_id,
+        };
+      }
     }
   });
 }

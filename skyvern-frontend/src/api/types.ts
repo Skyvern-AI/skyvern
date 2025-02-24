@@ -296,3 +296,19 @@ export type Createv2TaskRequest = {
   webhook_callback_url?: string | null;
   proxy_location?: ProxyLocation | null;
 };
+
+export type PasswordCredentialApiResponse = {
+  username: string;
+};
+
+export type CreditCardCredentialApiResponse = {
+  last_four: string;
+  brand: string;
+};
+
+export type CredentialApiResponse = {
+  credential_id: string;
+  credential: PasswordCredentialApiResponse | CreditCardCredentialApiResponse;
+  credential_type: "password" | "credit_card";
+  name: string;
+};

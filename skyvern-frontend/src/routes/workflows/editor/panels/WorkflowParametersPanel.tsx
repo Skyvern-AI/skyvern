@@ -79,7 +79,7 @@ function WorkflowParametersPanel() {
                 setOperationPanelState({
                   active: true,
                   operation: "add",
-                  type: "workflow",
+                  type: WorkflowEditorParameterTypes.Workflow,
                 });
               }}
             >
@@ -90,7 +90,7 @@ function WorkflowParametersPanel() {
                 setOperationPanelState({
                   active: true,
                   operation: "add",
-                  type: "credential",
+                  type: WorkflowEditorParameterTypes.Credential,
                 });
               }}
             >
@@ -101,7 +101,18 @@ function WorkflowParametersPanel() {
                 setOperationPanelState({
                   active: true,
                   operation: "add",
-                  type: "secret",
+                  type: WorkflowEditorParameterTypes.BitwardenLoginCredential,
+                });
+              }}
+            >
+              Bitwarden Login Credential Parameter
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              onClick={() => {
+                setOperationPanelState({
+                  active: true,
+                  operation: "add",
+                  type: WorkflowEditorParameterTypes.Secret,
                 });
               }}
             >
