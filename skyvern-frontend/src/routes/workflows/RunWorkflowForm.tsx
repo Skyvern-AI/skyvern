@@ -24,6 +24,7 @@ import { useNavigate, useParams } from "react-router-dom";
 import { z } from "zod";
 import { WorkflowParameter } from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
+import { AxiosError } from "axios";
 
 type Props = {
   workflowParameters: Array<WorkflowParameter>;
@@ -139,11 +140,12 @@ function RunWorkflowForm({
         `/workflows/${workflowPermanentId}/${response.data.workflow_run_id}/overview`,
       );
     },
-    onError: (error) => {
+    onError: (error: AxiosError) => {
+      const detail = (error.response?.data as { detail?: string })?.detail;
       toast({
         variant: "destructive",
         title: "Failed to start workflow run",
-        description: error.message,
+        description: detail ?? error.message,
       });
     },
   });
