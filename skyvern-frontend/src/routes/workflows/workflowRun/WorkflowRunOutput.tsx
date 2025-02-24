@@ -77,7 +77,7 @@ function WorkflowRunOutput() {
     ? formatExtractedInformation(outputs)
     : outputs;
   const fileUrls = workflowRun?.downloaded_file_urls ?? [];
-  const observerOutput = workflowRun?.observer_task?.output;
+  const observerOutput = workflowRun?.task_v2?.output;
 
   return (
     <div className="space-y-5">

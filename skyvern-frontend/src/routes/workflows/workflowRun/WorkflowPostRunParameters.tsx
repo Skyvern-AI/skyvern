@@ -44,14 +44,14 @@ function WorkflowPostRunParameters() {
   }
 
   const activeBlock = getActiveBlock();
-  const isObserverTask = workflowRun.observer_task !== null;
+  const isObserverTask = workflowRun.task_v2 !== null;
 
   const webhookCallbackUrl = isObserverTask
-    ? workflowRun.observer_task?.webhook_callback_url
+    ? workflowRun.task_v2?.webhook_callback_url
     : workflowRun.webhook_callback_url;
 
   const proxyLocation = isObserverTask
-    ? workflowRun.observer_task?.proxy_location
+    ? workflowRun.task_v2?.proxy_location
     : workflowRun.proxy_location;
 
   return (
@@ -149,7 +149,7 @@ function WorkflowPostRunParameters() {
           </div>
         </div>
       </div>
-      {workflowRun.observer_task ? (
+      {workflowRun.task_v2 ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
             <h1 className="text-lg font-bold">Task 2.0 Parameters</h1>
@@ -161,7 +161,7 @@ function WorkflowPostRunParameters() {
                 </h2>
               </div>
               <AutoResizingTextarea
-                value={workflowRun.observer_task.prompt ?? ""}
+                value={workflowRun.task_v2.prompt ?? ""}
                 readOnly
               />
             </div>
