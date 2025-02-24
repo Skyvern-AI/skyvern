@@ -67,7 +67,7 @@ class Agent:
         )
 
     async def _run_task_v2(self, organization: Organization, task_v2: ObserverTask) -> None:
-        # mark observer cruise as queued
+        # mark task v2 as queued
         await app.DATABASE.update_task_v2(
             task_v2_id=task_v2.observer_cruise_id,
             status=ObserverTaskStatus.queued,
@@ -80,7 +80,7 @@ class Agent:
             status=WorkflowRunStatus.queued,
         )
 
-        await task_v2_service.run_observer_task(
+        await task_v2_service.run_task_v2(
             organization=organization,
             task_v2_id=task_v2.observer_cruise_id,
         )
@@ -156,7 +156,7 @@ class Agent:
     async def observer_task_v_2(self, task_request: ObserverTaskRequest) -> ObserverTask:
         organization = await self._get_organization()
 
-        observer_task = await task_v2_service.initialize_observer_task(
+        task_v2 = await task_v2_service.initialize_task_v2(
             organization=organization,
             user_prompt=task_request.user_prompt,
             user_url=str(task_request.url) if task_request.url else None,
@@ -167,11 +167,11 @@ class Agent:
             publish_workflow=task_request.publish_workflow,
         )
 
-        if not observer_task.workflow_run_id:
-            raise Exception("Observer cruise missing workflow run id")
+        if not task_v2.workflow_run_id:
+            raise Exception("Task v2 missing workflow run id")
 
-        asyncio.create_task(self._run_task_v2(organization, observer_task))
-        return observer_task
+        asyncio.create_task(self._run_task_v2(organization, task_v2))
+        return task_v2
 
     async def get_observer_task_v_2(self, task_id: str) -> ObserverTask | None:
         organization = await self._get_organization()
@@ -180,12 +180,12 @@ class Agent:
     async def run_observer_task_v_2(
         self, task_request: ObserverTaskRequest, timeout_seconds: int = 600
     ) -> ObserverTask:
-        observer_task = await self.observer_task_v_2(task_request)
+        task_v2 = await self.observer_task_v_2(task_request)
 
         async with asyncio.timeout(timeout_seconds):
             while True:
-                refreshed_observer_task = await self.get_observer_task_v_2(observer_task.observer_cruise_id)
-                assert refreshed_observer_task is not None
-                if refreshed_observer_task.status.is_final():
-                    return refreshed_observer_task
+                refreshed_task_v2 = await self.get_observer_task_v_2(task_v2.observer_cruise_id)
+                assert refreshed_task_v2 is not None
+                if refreshed_task_v2.status.is_final():
+                    return refreshed_task_v2
                 await asyncio.sleep(1)
