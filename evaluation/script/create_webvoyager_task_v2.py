@@ -12,7 +12,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.schemas.task_v2 import ObserverTaskRequest
 
 
-async def create_observer_cruise(
+async def create_task_v2(
     base_url: str,
     cred: str,
 ) -> None:
@@ -42,7 +42,7 @@ async def create_observer_cruise(
             dumped_data = case_data.model_dump()
             dumped_data.update(
                 {
-                    "observer_cruise_id": cruise.observer_cruise_id,
+                    "task_v2_id": cruise.observer_cruise_id,
                     "workflow_run_id": cruise.workflow_run_id,
                     "workflow_permanent_id": cruise.workflow_permanent_id,
                     "cruise_url": str(cruise.url) if cruise.url else cruise.url,
@@ -59,7 +59,7 @@ def main(
     base_url: str = typer.Option(..., "--base-url", help="base url for Skyvern client"),
     cred: str = typer.Option(..., "--cred", help="credential for Skyvern organization"),
 ) -> None:
-    asyncio.run(create_observer_cruise(base_url=base_url, cred=cred))
+    asyncio.run(create_task_v2(base_url=base_url, cred=cred))
 
 
 if __name__ == "__main__":

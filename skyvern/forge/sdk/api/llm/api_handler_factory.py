@@ -63,7 +63,7 @@ class LLMAPIHandlerFactory:
             prompt: str,
             prompt_name: str,
             step: Step | None = None,
-            observer_cruise: ObserverTask | None = None,
+            task_v2: ObserverTask | None = None,
             observer_thought: ObserverThought | None = None,
             ai_suggestion: AISuggestion | None = None,
             screenshots: list[bytes] | None = None,
@@ -92,7 +92,7 @@ class LLMAPIHandlerFactory:
                     data=json.dumps(context.hashed_href_map, indent=2).encode("utf-8"),
                     artifact_type=ArtifactType.HASHED_HREF_MAP,
                     step=step,
-                    observer_cruise=observer_cruise,
+                    task_v2=task_v2,
                     observer_thought=observer_thought,
                     ai_suggestion=ai_suggestion,
                 )
@@ -102,7 +102,7 @@ class LLMAPIHandlerFactory:
                 artifact_type=ArtifactType.LLM_PROMPT,
                 screenshots=screenshots,
                 step=step,
-                observer_cruise=observer_cruise,
+                task_v2=task_v2,
                 observer_thought=observer_thought,
             )
             messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
@@ -117,7 +117,7 @@ class LLMAPIHandlerFactory:
                 ).encode("utf-8"),
                 artifact_type=ArtifactType.LLM_REQUEST,
                 step=step,
-                observer_cruise=observer_cruise,
+                task_v2=task_v2,
                 observer_thought=observer_thought,
                 ai_suggestion=ai_suggestion,
             )
@@ -144,7 +144,7 @@ class LLMAPIHandlerFactory:
                 data=response.model_dump_json(indent=2).encode("utf-8"),
                 artifact_type=ArtifactType.LLM_RESPONSE,
                 step=step,
-                observer_cruise=observer_cruise,
+                task_v2=task_v2,
                 observer_thought=observer_thought,
                 ai_suggestion=ai_suggestion,
             )
@@ -184,7 +184,7 @@ class LLMAPIHandlerFactory:
                 data=json.dumps(parsed_response, indent=2).encode("utf-8"),
                 artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
                 step=step,
-                observer_cruise=observer_cruise,
+                task_v2=task_v2,
                 observer_thought=observer_thought,
                 ai_suggestion=ai_suggestion,
             )
@@ -197,7 +197,7 @@ class LLMAPIHandlerFactory:
                     data=json.dumps(parsed_response, indent=2).encode("utf-8"),
                     artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
                     step=step,
-                    observer_cruise=observer_cruise,
+                    task_v2=task_v2,
                     observer_thought=observer_thought,
                     ai_suggestion=ai_suggestion,
                 )
@@ -234,7 +234,7 @@ class LLMAPIHandlerFactory:
             prompt: str,
             prompt_name: str,
             step: Step | None = None,
-            observer_cruise: ObserverTask | None = None,
+            task_v2: ObserverTask | None = None,
             observer_thought: ObserverThought | None = None,
             ai_suggestion: AISuggestion | None = None,
             screenshots: list[bytes] | None = None,
@@ -255,7 +255,7 @@ class LLMAPIHandlerFactory:
                     data=json.dumps(context.hashed_href_map, indent=2).encode("utf-8"),
                     artifact_type=ArtifactType.HASHED_HREF_MAP,
                     step=step,
-                    observer_cruise=observer_cruise,
+                    task_v2=task_v2,
                     observer_thought=observer_thought,
                     ai_suggestion=ai_suggestion,
                 )
@@ -265,7 +265,7 @@ class LLMAPIHandlerFactory:
                 artifact_type=ArtifactType.LLM_PROMPT,
                 screenshots=screenshots,
                 step=step,
-                observer_cruise=observer_cruise,
+                task_v2=task_v2,
                 observer_thought=observer_thought,
                 ai_suggestion=ai_suggestion,
             )
@@ -285,7 +285,7 @@ class LLMAPIHandlerFactory:
                 ).encode("utf-8"),
                 artifact_type=ArtifactType.LLM_REQUEST,
                 step=step,
-                observer_cruise=observer_cruise,
+                task_v2=task_v2,
                 observer_thought=observer_thought,
                 ai_suggestion=ai_suggestion,
             )
@@ -319,7 +319,7 @@ class LLMAPIHandlerFactory:
                 data=response.model_dump_json(indent=2).encode("utf-8"),
                 artifact_type=ArtifactType.LLM_RESPONSE,
                 step=step,
-                observer_cruise=observer_cruise,
+                task_v2=task_v2,
                 observer_thought=observer_thought,
                 ai_suggestion=ai_suggestion,
             )
@@ -354,7 +354,7 @@ class LLMAPIHandlerFactory:
                 data=json.dumps(parsed_response, indent=2).encode("utf-8"),
                 artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
                 step=step,
-                observer_cruise=observer_cruise,
+                task_v2=task_v2,
                 observer_thought=observer_thought,
                 ai_suggestion=ai_suggestion,
             )
@@ -367,7 +367,7 @@ class LLMAPIHandlerFactory:
                     data=json.dumps(parsed_response, indent=2).encode("utf-8"),
                     artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
                     step=step,
-                    observer_cruise=observer_cruise,
+                    task_v2=task_v2,
                     observer_thought=observer_thought,
                     ai_suggestion=ai_suggestion,
                 )

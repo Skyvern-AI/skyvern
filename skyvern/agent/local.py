@@ -66,23 +66,23 @@ class Agent:
             api_key=org_auth_token.token if org_auth_token else None,
         )
 
-    async def _run_observer_task(self, organization: Organization, observer_task: ObserverTask) -> None:
+    async def _run_task_v2(self, organization: Organization, task_v2: ObserverTask) -> None:
         # mark observer cruise as queued
-        await app.DATABASE.update_observer_cruise(
-            observer_cruise_id=observer_task.observer_cruise_id,
+        await app.DATABASE.update_task_v2(
+            task_v2_id=task_v2.observer_cruise_id,
             status=ObserverTaskStatus.queued,
             organization_id=organization.organization_id,
         )
 
-        assert observer_task.workflow_run_id
+        assert task_v2.workflow_run_id
         await app.DATABASE.update_workflow_run(
-            workflow_run_id=observer_task.workflow_run_id,
+            workflow_run_id=task_v2.workflow_run_id,
             status=WorkflowRunStatus.queued,
         )
 
         await task_v2_service.run_observer_task(
             organization=organization,
-            observer_cruise_id=observer_task.observer_cruise_id,
+            task_v2_id=task_v2.observer_cruise_id,
         )
 
     async def create_task(
@@ -170,12 +170,12 @@ class Agent:
         if not observer_task.workflow_run_id:
             raise Exception("Observer cruise missing workflow run id")
 
-        asyncio.create_task(self._run_observer_task(organization, observer_task))
+        asyncio.create_task(self._run_task_v2(organization, observer_task))
         return observer_task
 
     async def get_observer_task_v_2(self, task_id: str) -> ObserverTask | None:
         organization = await self._get_organization()
-        return await app.DATABASE.get_observer_cruise(task_id, organization.organization_id)
+        return await app.DATABASE.get_task_v2(task_id, organization.organization_id)
 
     async def run_observer_task_v_2(
         self, task_request: ObserverTaskRequest, timeout_seconds: int = 600

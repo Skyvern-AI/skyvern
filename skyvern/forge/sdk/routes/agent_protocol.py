@@ -799,12 +799,12 @@ async def get_workflow_run(
         include_cost=True,
     )
     return_dict = workflow_run_status_response.model_dump()
-    observer_cruise = await app.DATABASE.get_observer_cruise_by_workflow_run_id(
+    task_v2 = await app.DATABASE.get_task_v2_by_workflow_run_id(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
     )
-    if observer_cruise:
-        return_dict["observer_task"] = observer_cruise.model_dump(by_alias=True)
+    if task_v2:
+        return_dict["observer_task"] = task_v2.model_dump(by_alias=True)
     return return_dict
 
 
@@ -1251,11 +1251,11 @@ async def observer_task(
             status_code=500, detail="Skyvern LLM failure to initialize observer cruise. Please try again later."
         )
     analytics.capture("skyvern-oss-agent-observer-cruise", data={"url": observer_task.url})
-    await AsyncExecutorFactory.get_executor().execute_cruise(
+    await AsyncExecutorFactory.get_executor().execute_task_v2(
         request=request,
         background_tasks=background_tasks,
         organization_id=organization.organization_id,
-        observer_cruise_id=observer_task.observer_cruise_id,
+        task_v2_id=observer_task.observer_cruise_id,
         max_iterations_override=x_max_iterations_override,
         browser_session_id=data.browser_session_id,
     )
@@ -1268,10 +1268,10 @@ async def get_observer_task(
     task_id: str,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> dict[str, Any]:
-    observer_task = await task_v2_service.get_observer_cruise(task_id, organization.organization_id)
-    if not observer_task:
-        raise HTTPException(status_code=404, detail=f"Observer task {task_id} not found")
-    return observer_task.model_dump(by_alias=True)
+    task_v2 = await task_v2_service.get_task_v2(task_id, organization.organization_id)
+    if not task_v2:
+        raise HTTPException(status_code=404, detail=f"Task v2 {task_id} not found")
+    return task_v2.model_dump(by_alias=True)
 
 
 @base_router.get(
@@ -1374,7 +1374,7 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
     """
 
     # get observer task by workflow run id
-    observer_task_obj = await app.DATABASE.get_observer_cruise_by_workflow_run_id(
+    task_v2_obj = await app.DATABASE.get_task_v2_by_workflow_run_id(
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
     )
@@ -1397,7 +1397,7 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
                 "Block workflow run id is not set for task_v2 block",
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
-                observer_cruise_id=observer_task_obj.observer_cruise_id if observer_task_obj else None,
+                task_v2_id=task_v2_obj.observer_cruise_id if task_v2_obj else None,
             )
             continue
         # in the future if we want to nested taskv2 shows up as a nested block, we should not flatten the timeline
@@ -1407,9 +1407,9 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
         )
         final_workflow_run_block_timeline.extend(workflow_blocks)
 
-    if observer_task_obj and observer_task_obj.observer_cruise_id:
+    if task_v2_obj and task_v2_obj.observer_cruise_id:
         observer_thought_timeline = await task_v2_service.get_observer_thought_timelines(
-            observer_cruise_id=observer_task_obj.observer_cruise_id,
+            task_v2_id=task_v2_obj.observer_cruise_id,
             organization_id=organization_id,
         )
         final_workflow_run_block_timeline.extend(observer_thought_timeline)

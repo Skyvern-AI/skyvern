@@ -48,8 +48,8 @@ def main(
                     {
                         "workflow_permanent_id": workflow_pid,
                         "status": str(workflow_run_response.status),
-                        "summary": workflow_run_response.observer_cruise.summary,
-                        "output": workflow_run_response.observer_cruise.output,
+                        "summary": workflow_run_response.observer_task.summary,
+                        "output": workflow_run_response.observer_task.output,
                         "assertion": workflow_run_response.status == WorkflowRunStatus.completed,
                         "failure_reason": workflow_run_response.failure_reason or "",
                     }

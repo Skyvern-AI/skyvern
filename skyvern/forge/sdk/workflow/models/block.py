@@ -2157,7 +2157,7 @@ class TaskV2Block(Block):
             parent_workflow_run_id=workflow_run_id,
             proxy_location=workflow_run.proxy_location,
         )
-        await app.DATABASE.update_observer_cruise(
+        await app.DATABASE.update_task_v2(
             observer_task.observer_cruise_id, status=ObserverTaskStatus.queued, organization_id=organization_id
         )
         if observer_task.workflow_run_id:
@@ -2173,7 +2173,7 @@ class TaskV2Block(Block):
 
         observer_task = await task_v2_service.run_observer_task(
             organization=organization,
-            observer_cruise_id=observer_task.observer_cruise_id,
+            task_v2_id=observer_task.observer_cruise_id,
             request_id=None,
             max_iterations_override=self.max_iterations,
             browser_session_id=browser_session_id,

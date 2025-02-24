@@ -12,7 +12,7 @@ class SkyvernContext:
     task_id: str | None = None
     workflow_id: str | None = None
     workflow_run_id: str | None = None
-    observer_cruise_id: str | None = None
+    task_v2_id: str | None = None
     max_steps_override: int | None = None
     tz_info: ZoneInfo | None = None
     totp_codes: dict[str, str | None] = field(default_factory=dict)
@@ -22,7 +22,7 @@ class SkyvernContext:
     frame_index_map: dict[Frame, int] = field(default_factory=dict)
 
     def __repr__(self) -> str:
-        return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, max_steps_override={self.max_steps_override})"
+        return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, task_v2_id={self.task_v2_id}, max_steps_override={self.max_steps_override})"
 
     def __str__(self) -> str:
         return self.__repr__()

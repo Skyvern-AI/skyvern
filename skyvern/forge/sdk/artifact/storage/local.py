@@ -46,11 +46,9 @@ class LocalStorage(BaseStorage):
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
         return f"file://{self.artifact_path}/{settings.ENV}/observers/{observer_thought.observer_cruise_id}/{observer_thought.observer_thought_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
-    def build_observer_cruise_uri(
-        self, artifact_id: str, observer_cruise: ObserverTask, artifact_type: ArtifactType
-    ) -> str:
+    def build_task_v2_uri(self, artifact_id: str, task_v2: ObserverTask, artifact_type: ArtifactType) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"file://{self.artifact_path}/{settings.ENV}/observers/{observer_cruise.observer_cruise_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"file://{self.artifact_path}/{settings.ENV}/observers/{task_v2.observer_cruise_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_workflow_run_block_uri(
         self, artifact_id: str, workflow_run_block: WorkflowRunBlock, artifact_type: ArtifactType

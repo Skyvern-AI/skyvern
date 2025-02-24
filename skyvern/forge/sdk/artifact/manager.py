@@ -30,7 +30,7 @@ class ArtifactManager:
         workflow_run_id: str | None = None,
         workflow_run_block_id: str | None = None,
         observer_thought_id: str | None = None,
-        observer_cruise_id: str | None = None,
+        task_v2_id: str | None = None,
         ai_suggestion_id: str | None = None,
         organization_id: str | None = None,
         data: bytes | None = None,
@@ -49,7 +49,7 @@ class ArtifactManager:
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
             observer_thought_id=observer_thought_id,
-            observer_cruise_id=observer_cruise_id,
+            task_v2_id=task_v2_id,
             organization_id=organization_id,
             ai_suggestion_id=ai_suggestion_id,
         )
@@ -129,28 +129,28 @@ class ArtifactManager:
             artifact_type=artifact_type,
             uri=uri,
             observer_thought_id=observer_thought.observer_thought_id,
-            observer_cruise_id=observer_thought.observer_cruise_id,
+            task_v2_id=observer_thought.observer_cruise_id,
             organization_id=observer_thought.organization_id,
             data=data,
             path=path,
         )
 
-    async def create_observer_cruise_artifact(
+    async def create_task_v2_artifact(
         self,
-        observer_cruise: ObserverTask,
+        task_v2: ObserverTask,
         artifact_type: ArtifactType,
         data: bytes | None = None,
         path: str | None = None,
     ) -> str:
         artifact_id = generate_artifact_id()
-        uri = app.STORAGE.build_observer_cruise_uri(artifact_id, observer_cruise, artifact_type)
+        uri = app.STORAGE.build_task_v2_uri(artifact_id, task_v2, artifact_type)
         return await self._create_artifact(
-            aio_task_primary_key=observer_cruise.observer_cruise_id,
+            aio_task_primary_key=task_v2.observer_cruise_id,
             artifact_id=artifact_id,
             artifact_type=artifact_type,
             uri=uri,
-            observer_cruise_id=observer_cruise.observer_cruise_id,
-            organization_id=observer_cruise.organization_id,
+            task_v2_id=task_v2.observer_cruise_id,
+            organization_id=task_v2.organization_id,
             data=data,
             path=path,
         )
@@ -203,7 +203,7 @@ class ArtifactManager:
         screenshots: list[bytes] | None = None,
         step: Step | None = None,
         observer_thought: ObserverThought | None = None,
-        observer_cruise: ObserverTask | None = None,
+        task_v2: ObserverTask | None = None,
         ai_suggestion: AISuggestion | None = None,
     ) -> None:
         if step:
@@ -218,15 +218,15 @@ class ArtifactManager:
                     artifact_type=ArtifactType.SCREENSHOT_LLM,
                     data=screenshot,
                 )
-        elif observer_cruise:
-            await self.create_observer_cruise_artifact(
-                observer_cruise=observer_cruise,
+        elif task_v2:
+            await self.create_task_v2_artifact(
+                task_v2=task_v2,
                 artifact_type=artifact_type,
                 data=data,
             )
             for screenshot in screenshots or []:
-                await self.create_observer_cruise_artifact(
-                    observer_cruise=observer_cruise,
+                await self.create_task_v2_artifact(
+                    task_v2=task_v2,
                     artifact_type=ArtifactType.SCREENSHOT_LLM,
                     data=screenshot,
                 )

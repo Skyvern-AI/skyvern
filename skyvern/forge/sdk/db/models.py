@@ -29,7 +29,6 @@ from skyvern.forge.sdk.db.id import (
     generate_bitwarden_sensitive_information_parameter_id,
     generate_credential_id,
     generate_credential_parameter_id,
-    generate_observer_cruise_id,
     generate_observer_thought_id,
     generate_org_id,
     generate_organization_auth_token_id,
@@ -40,6 +39,7 @@ from skyvern.forge.sdk.db.id import (
     generate_task_generation_id,
     generate_task_id,
     generate_task_run_id,
+    generate_task_v2_id,
     generate_totp_code_id,
     generate_workflow_id,
     generate_workflow_parameter_id,
@@ -569,7 +569,8 @@ class ObserverCruiseModel(Base):
     __tablename__ = "observer_cruises"
     __table_args__ = (Index("oc_org_wfr_index", "organization_id", "workflow_run_id"),)
 
-    observer_cruise_id = Column(String, primary_key=True, default=generate_observer_cruise_id)
+    # observer_cruise_id is the task_id for task v2
+    observer_cruise_id = Column(String, primary_key=True, default=generate_task_v2_id)
     status = Column(String, nullable=False, default="created")
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)

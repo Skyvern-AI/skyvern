@@ -85,7 +85,7 @@ class LLMAPIHandler(Protocol):
         prompt: str,
         prompt_name: str,
         step: Step | None = None,
-        observer_cruise: ObserverTask | None = None,
+        task_v2: ObserverTask | None = None,
         observer_thought: ObserverThought | None = None,
         ai_suggestion: AISuggestion | None = None,
         screenshots: list[bytes] | None = None,

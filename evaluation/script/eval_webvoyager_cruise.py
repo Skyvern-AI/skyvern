@@ -33,8 +33,8 @@ async def process_record(client: SkyvernClient, one_record: dict[str, Any]) -> d
     one_record.update(
         {
             "status": str(workflow_run_response.status),
-            "summary": workflow_run_response.observer_cruise.summary,
-            "output": workflow_run_response.observer_cruise.output,
+            "summary": workflow_run_response.observer_task.summary,
+            "output": workflow_run_response.observer_task.output,
         }
     )
     if workflow_run_response.status != WorkflowRunStatus.completed:
