@@ -4,9 +4,12 @@ import json
 from typing import Any
 
 import typer
+from dotenv import load_dotenv
 
 from evaluation.core import Evaluator, SkyvernClient
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+
+load_dotenv()
 
 csv_headers = [
     "id",
