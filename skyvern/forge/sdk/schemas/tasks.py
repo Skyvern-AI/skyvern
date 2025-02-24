@@ -26,6 +26,7 @@ class ProxyLocation(StrEnum):
     RESIDENTIAL_JP = "RESIDENTIAL_JP"
     RESIDENTIAL_FR = "RESIDENTIAL_FR"
     RESIDENTIAL_DE = "RESIDENTIAL_DE"
+    RESIDENTIAL_ISP = "RESIDENTIAL_ISP"
     NONE = "NONE"
 
 
@@ -71,6 +72,9 @@ def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
 
     if proxy_location == ProxyLocation.RESIDENTIAL_DE:
         return ZoneInfo("Europe/Berlin")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_ISP:
+        return ZoneInfo("America/New_York")
 
     return None
 

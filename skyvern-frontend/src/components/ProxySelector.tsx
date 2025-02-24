@@ -21,6 +21,9 @@ function ProxySelector({ value, onChange, className }: Props) {
       </SelectTrigger>
       <SelectContent>
         <SelectItem value={ProxyLocation.Residential}>Residential</SelectItem>
+        <SelectItem value={ProxyLocation.ResidentialISP}>
+          Residential ISP (US)
+        </SelectItem>
         <SelectItem value={ProxyLocation.ResidentialES}>
           Residential (Spain)
         </SelectItem>
