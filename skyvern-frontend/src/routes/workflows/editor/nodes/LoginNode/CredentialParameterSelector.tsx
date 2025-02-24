@@ -16,7 +16,9 @@ type Props = {
 function CredentialParameterSelector({ value, onChange }: Props) {
   const [workflowParameters] = useWorkflowParametersState();
   const credentialParameters = workflowParameters.filter(
-    (parameter) => parameter.parameterType === "credential",
+    (parameter) =>
+      parameter.parameterType === "credential" ||
+      parameter.parameterType === "bitwardenLoginCredential",
   );
   const noneItemValue = useId();
 
