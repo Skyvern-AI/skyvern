@@ -5,6 +5,7 @@ from typing import Optional
 from uuid import uuid4
 
 import typer
+from dotenv import load_dotenv
 
 from evaluation.core import Evaluator, SkyvernClient
 from evaluation.core.utils import load_webvoyager_case_from_json
@@ -12,6 +13,8 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
+
+load_dotenv()
 
 
 async def create_workflow_run(

@@ -4,9 +4,12 @@ import json
 from typing import Any
 
 import typer
+from dotenv import load_dotenv
 
 from evaluation.core import Evaluator, SkyvernClient
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+
+load_dotenv()
 
 csv_headers = [
     "id",
@@ -33,8 +36,8 @@ async def process_record(client: SkyvernClient, one_record: dict[str, Any]) -> d
     one_record.update(
         {
             "status": str(workflow_run_response.status),
-            "summary": workflow_run_response.observer_task.summary,
-            "output": workflow_run_response.observer_task.output,
+            "summary": workflow_run_response.task_v2.summary,
+            "output": workflow_run_response.task_v2.output,
         }
     )
     if workflow_run_response.status != WorkflowRunStatus.completed:

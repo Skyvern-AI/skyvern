@@ -260,7 +260,7 @@ class Evaluator:
         )
 
         extracted_information: list | dict[str, Any] | str | None = None
-        if workflow_run_response.observer_task is None:
+        if workflow_run_response.task_v2 is None:
             assert workflow_run_response.outputs and len(workflow_run_response.outputs) > 0, (
                 f"Expected {workflow_pid + '/' + workflow_run_id} with output, but got empty output"
             )
@@ -272,10 +272,10 @@ class Evaluator:
                 # FIXME: improve this when the last block is loop block
                 extracted_information = result
         else:
-            workflow_run_response.observer_task.summary
-            workflow_run_response.observer_task.output
-            summary = f"{('summary:' + workflow_run_response.observer_task.summary) if workflow_run_response.observer_task.summary else ''}"
-            output = f"{('output: ' + json.dumps(workflow_run_response.observer_task.output)) if workflow_run_response.observer_task.output else ''}"
+            workflow_run_response.task_v2.summary
+            workflow_run_response.task_v2.output
+            summary = f"{('summary:' + workflow_run_response.task_v2.summary) if workflow_run_response.task_v2.summary else ''}"
+            output = f"{('output: ' + json.dumps(workflow_run_response.task_v2.output)) if workflow_run_response.task_v2.output else ''}"
             extracted_information = ""
             if summary:
                 extracted_information = summary

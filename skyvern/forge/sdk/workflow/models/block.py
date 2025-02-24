@@ -2150,7 +2150,7 @@ class TaskV2Block(Block):
         workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id, organization_id)
         if not workflow_run:
             raise ValueError(f"WorkflowRun not found {workflow_run_id} when running TaskV2Block")
-        observer_task = await task_v2_service.initialize_observer_task(
+        task_v2 = await task_v2_service.initialize_task_v2(
             organization,
             user_prompt=self.prompt,
             user_url=self.url,
@@ -2158,29 +2158,29 @@ class TaskV2Block(Block):
             proxy_location=workflow_run.proxy_location,
         )
         await app.DATABASE.update_task_v2(
-            observer_task.observer_cruise_id, status=ObserverTaskStatus.queued, organization_id=organization_id
+            task_v2.observer_cruise_id, status=ObserverTaskStatus.queued, organization_id=organization_id
         )
-        if observer_task.workflow_run_id:
+        if task_v2.workflow_run_id:
             await app.DATABASE.update_workflow_run(
-                workflow_run_id=observer_task.workflow_run_id,
+                workflow_run_id=task_v2.workflow_run_id,
                 status=WorkflowRunStatus.queued,
             )
             await app.DATABASE.update_workflow_run_block(
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
-                block_workflow_run_id=observer_task.workflow_run_id,
+                block_workflow_run_id=task_v2.workflow_run_id,
             )
 
-        observer_task = await task_v2_service.run_observer_task(
+        task_v2 = await task_v2_service.run_task_v2(
             organization=organization,
-            task_v2_id=observer_task.observer_cruise_id,
+            task_v2_id=task_v2.observer_cruise_id,
             request_id=None,
             max_iterations_override=self.max_iterations,
             browser_session_id=browser_session_id,
         )
         result_dict = None
-        if observer_task:
-            result_dict = observer_task.output
+        if task_v2:
+            result_dict = task_v2.output
 
         return await self.build_block_result(
             success=True,
