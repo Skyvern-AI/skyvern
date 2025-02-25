@@ -1,5 +1,3 @@
-import { getClient } from "@/api/AxiosClient";
-import { CredentialApiResponse } from "@/api/types";
 import {
   Select,
   SelectContent,
@@ -8,8 +6,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useQuery } from "@tanstack/react-query";
+import { useCredentialsQuery } from "../hooks/useCredentialsQuery";
 
 type Props = {
   value: string;
@@ -17,17 +14,7 @@ type Props = {
 };
 
 function CredentialSelector({ value, onChange }: Props) {
-  const credentialGetter = useCredentialGetter();
-
-  const { data: credentials, isFetching } = useQuery<
-    Array<CredentialApiResponse>
-  >({
-    queryKey: ["credentials"],
-    queryFn: async () => {
-      const client = await getClient(credentialGetter);
-      return await client.get("/credentials").then((res) => res.data);
-    },
-  });
+  const { data: credentials, isFetching } = useCredentialsQuery();
 
   if (isFetching) {
     return <Skeleton className="h-10 w-full" />;
