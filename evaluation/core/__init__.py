@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import create_folder_if_not_exist
-from skyvern.forge.sdk.schemas.task_v2 import ObserverTask, ObserverTaskRequest
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus, WorkflowRunStatusResponse
 
@@ -55,12 +55,12 @@ class SkyvernClient:
         assert "workflow_run_id" in response.json(), f"Failed to create workflow run: {response.text}"
         return response.json()["workflow_run_id"]
 
-    def create_task_v2(self, task_v2_request: ObserverTaskRequest, max_steps: int | None = None) -> ObserverTask:
+    def create_task_v2(self, task_v2_request: TaskV2Request, max_steps: int | None = None) -> TaskV2:
         url = f"{self.v2_base_url}/tasks"
         payload, headers = self.generate_curl_params(task_v2_request, max_steps=max_steps)
         response = requests.post(url, headers=headers, data=payload)
         assert "task_id" in response.json(), f"Failed to create task v2: {response.text}"
-        return ObserverTask.model_validate(response.json())
+        return TaskV2.model_validate(response.json())
 
     def get_task(self, task_id: str) -> TaskResponse:
         """Get a task by id."""
@@ -213,7 +213,7 @@ class Evaluator:
         assert workflow_run_id
         return workflow_run_id
 
-    def queue_skyvern_cruise(self, cruise_request: ObserverTaskRequest, max_step: int | None = None) -> ObserverTask:
+    def queue_skyvern_task_v2(self, cruise_request: TaskV2Request, max_step: int | None = None) -> TaskV2:
         cruise = self.client.create_task_v2(task_v2_request=cruise_request, max_steps=max_step)
         self._save_artifact("cruise.json", cruise.model_dump_json(indent=2).encode())
         return cruise
