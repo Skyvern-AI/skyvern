@@ -223,6 +223,15 @@ if settings.ENABLE_BEDROCK:
         ),
     )
     LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE3.7_SONNET_INFERENCE_PROFILE",
+        LLMConfig(
+            "bedrock/us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_V1",
         LLMConfig(
             "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
