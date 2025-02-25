@@ -5,7 +5,7 @@ from typing import Any, List
 from pydantic import BaseModel, field_validator
 
 from skyvern.forge.sdk.core.validators import validate_url
-from skyvern.forge.sdk.schemas.task_v2 import ObserverTask
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicateBlockLabels
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
@@ -147,5 +147,5 @@ class WorkflowRunStatusResponse(BaseModel):
     outputs: dict[str, Any] | None = None
     total_steps: int | None = None
     total_cost: float | None = None
-    task_v2: ObserverTask | None = None
+    task_v2: TaskV2 | None = None
     workflow_title: str | None = None

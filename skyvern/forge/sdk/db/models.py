@@ -29,7 +29,6 @@ from skyvern.forge.sdk.db.id import (
     generate_bitwarden_sensitive_information_parameter_id,
     generate_credential_id,
     generate_credential_parameter_id,
-    generate_observer_thought_id,
     generate_org_id,
     generate_organization_auth_token_id,
     generate_organization_bitwarden_collection_id,
@@ -40,6 +39,7 @@ from skyvern.forge.sdk.db.id import (
     generate_task_id,
     generate_task_run_id,
     generate_task_v2_id,
+    generate_thought_id,
     generate_totp_code_id,
     generate_workflow_id,
     generate_workflow_parameter_id,
@@ -47,7 +47,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_run_block_id,
     generate_workflow_run_id,
 )
-from skyvern.forge.sdk.schemas.task_v2 import ObserverThoughtType
+from skyvern.forge.sdk.schemas.task_v2 import ThoughtType
 
 
 class Base(AsyncAttrs, DeclarativeBase):
@@ -565,7 +565,7 @@ class WorkflowRunBlockModel(Base):
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
 
-class ObserverCruiseModel(Base):
+class TaskV2Model(Base):
     __tablename__ = "observer_cruises"
     __table_args__ = (Index("oc_org_wfr_index", "organization_id", "workflow_run_id"),)
 
@@ -589,11 +589,11 @@ class ObserverCruiseModel(Base):
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
 
-class ObserverThoughtModel(Base):
+class ThoughtModel(Base):
     __tablename__ = "observer_thoughts"
     __table_args__ = (Index("observer_cruise_index", "organization_id", "observer_cruise_id"),)
 
-    observer_thought_id = Column(String, primary_key=True, default=generate_observer_thought_id)
+    observer_thought_id = Column(String, primary_key=True, default=generate_thought_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
     observer_cruise_id = Column(String, ForeignKey("observer_cruises.observer_cruise_id"), nullable=False)
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
@@ -608,7 +608,7 @@ class ObserverThoughtModel(Base):
     output_token_count = Column(Integer, nullable=True)
     thought_cost = Column(Numeric, nullable=True)
 
-    observer_thought_type = Column(String, nullable=True, default=ObserverThoughtType.plan)
+    observer_thought_type = Column(String, nullable=True, default=ThoughtType.plan)
     observer_thought_scenario = Column(String, nullable=True)
     output = Column(JSON, nullable=True)
 

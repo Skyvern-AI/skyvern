@@ -10,7 +10,7 @@ from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
 
 
-class ObserverTaskStatus(StrEnum):
+class TaskV2Status(StrEnum):
     created = "created"
     queued = "queued"
     running = "running"
@@ -24,11 +24,11 @@ class ObserverTaskStatus(StrEnum):
         return self in [self.failed, self.terminated, self.canceled, self.timed_out, self.completed]
 
 
-class ObserverTask(BaseModel):
+class TaskV2(BaseModel):
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
     observer_cruise_id: str = Field(alias="task_id")
-    status: ObserverTaskStatus
+    status: TaskV2Status
     organization_id: str | None = None
     workflow_run_id: str | None = None
     workflow_id: str | None = None
@@ -54,14 +54,14 @@ class ObserverTask(BaseModel):
         return validate_url(url)
 
 
-class ObserverThoughtType(StrEnum):
+class ThoughtType(StrEnum):
     plan = "plan"
     metadata = "metadata"
     user_goal_check = "user_goal_check"
     internal_plan = "internal_plan"
 
 
-class ObserverThoughtScenario(StrEnum):
+class ThoughtScenario(StrEnum):
     generate_plan = "generate_plan"
     user_goal_check = "user_goal_check"
     summarization = "summarization"
@@ -71,7 +71,7 @@ class ObserverThoughtScenario(StrEnum):
     generate_task = "generate_general_task"
 
 
-class ObserverThought(BaseModel):
+class Thought(BaseModel):
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
     observer_thought_id: str = Field(alias="thought_id")
@@ -85,8 +85,8 @@ class ObserverThought(BaseModel):
     observation: str | None = None
     thought: str | None = None
     answer: str | None = None
-    observer_thought_type: ObserverThoughtType | None = Field(alias="thought_type", default=ObserverThoughtType.plan)
-    observer_thought_scenario: ObserverThoughtScenario | None = Field(alias="thought_scenario", default=None)
+    observer_thought_type: ThoughtType | None = Field(alias="thought_type", default=ThoughtType.plan)
+    observer_thought_scenario: ThoughtScenario | None = Field(alias="thought_scenario", default=None)
     output: dict[str, Any] | None = None
     input_token_count: int | None = None
     output_token_count: int | None = None
@@ -96,7 +96,7 @@ class ObserverThought(BaseModel):
     modified_at: datetime
 
 
-class ObserverMetadata(BaseModel):
+class TaskV2Metadata(BaseModel):
     url: str
     workflow_title: str = DEFAULT_WORKFLOW_TITLE
 
@@ -108,7 +108,7 @@ class ObserverMetadata(BaseModel):
         return validate_url(v)
 
 
-class ObserverTaskRequest(BaseModel):
+class TaskV2Request(BaseModel):
     user_prompt: str
     url: str | None = None
     browser_session_id: str | None = None

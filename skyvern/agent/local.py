@@ -7,7 +7,7 @@ from skyvern.forge.sdk.core import security, skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.task_v2 import ObserverTask, ObserverTaskRequest, ObserverTaskStatus
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Request, TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.services import task_v2_service
 from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
@@ -66,11 +66,11 @@ class Agent:
             api_key=org_auth_token.token if org_auth_token else None,
         )
 
-    async def _run_task_v2(self, organization: Organization, task_v2: ObserverTask) -> None:
+    async def _run_task_v2(self, organization: Organization, task_v2: TaskV2) -> None:
         # mark task v2 as queued
         await app.DATABASE.update_task_v2(
             task_v2_id=task_v2.observer_cruise_id,
-            status=ObserverTaskStatus.queued,
+            status=TaskV2Status.queued,
             organization_id=organization.organization_id,
         )
 
@@ -153,7 +153,7 @@ class Agent:
                     return task_response
                 await asyncio.sleep(1)
 
-    async def observer_task_v_2(self, task_request: ObserverTaskRequest) -> ObserverTask:
+    async def observer_task_v_2(self, task_request: TaskV2Request) -> TaskV2:
         organization = await self._get_organization()
 
         task_v2 = await task_v2_service.initialize_task_v2(
@@ -173,13 +173,11 @@ class Agent:
         asyncio.create_task(self._run_task_v2(organization, task_v2))
         return task_v2
 
-    async def get_observer_task_v_2(self, task_id: str) -> ObserverTask | None:
+    async def get_observer_task_v_2(self, task_id: str) -> TaskV2 | None:
         organization = await self._get_organization()
         return await app.DATABASE.get_task_v2(task_id, organization.organization_id)
 
-    async def run_observer_task_v_2(
-        self, task_request: ObserverTaskRequest, timeout_seconds: int = 600
-    ) -> ObserverTask:
+    async def run_observer_task_v_2(self, task_request: TaskV2Request, timeout_seconds: int = 600) -> TaskV2:
         task_v2 = await self.observer_task_v_2(task_request)
 
         async with asyncio.timeout(timeout_seconds):

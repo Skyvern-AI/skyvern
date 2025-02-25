@@ -47,7 +47,7 @@ from skyvern.forge.sdk.schemas.organizations import (
 )
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration, TaskGenerationBase
 from skyvern.forge.sdk.schemas.task_runs import TaskRunType
-from skyvern.forge.sdk.schemas.task_v2 import ObserverTaskRequest
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import (
     CreateTaskResponse,
     OrderBy,
@@ -529,7 +529,7 @@ class EntityType(str, Enum):
     TASK = "task"
     WORKFLOW_RUN = "workflow_run"
     WORKFLOW_RUN_BLOCK = "workflow_run_block"
-    OBSERVER_THOUGHT = "observer_thought"
+    THOUGHT = "thought"
 
 
 entity_type_to_param = {
@@ -537,7 +537,7 @@ entity_type_to_param = {
     EntityType.TASK: "task_id",
     EntityType.WORKFLOW_RUN: "workflow_run_id",
     EntityType.WORKFLOW_RUN_BLOCK: "workflow_run_block_id",
-    EntityType.OBSERVER_THOUGHT: "observer_thought_id",
+    EntityType.THOUGHT: "thought_id",
 }
 
 
@@ -1226,12 +1226,12 @@ async def upload_file(
 async def create_task_v2(
     request: Request,
     background_tasks: BackgroundTasks,
-    data: ObserverTaskRequest,
+    data: TaskV2Request,
     organization: Organization = Depends(org_auth_service.get_current_org),
     x_max_iterations_override: Annotated[int | str | None, Header()] = None,
 ) -> dict[str, Any]:
     if x_max_iterations_override:
-        LOG.info("Overriding max iterations for observer", max_iterations_override=x_max_iterations_override)
+        LOG.info("Overriding max iterations for task v2", max_iterations_override=x_max_iterations_override)
 
     try:
         task_v2 = await task_v2_service.initialize_task_v2(
@@ -1246,11 +1246,11 @@ async def create_task_v2(
             create_task_run=True,
         )
     except LLMProviderError:
-        LOG.error("LLM failure to initialize observer cruise", exc_info=True)
+        LOG.error("LLM failure to initialize task v2", exc_info=True)
         raise HTTPException(
-            status_code=500, detail="Skyvern LLM failure to initialize observer cruise. Please try again later."
+            status_code=500, detail="Skyvern LLM failure to initialize task v2. Please try again later."
         )
-    analytics.capture("skyvern-oss-agent-observer-cruise", data={"url": task_v2.url})
+    analytics.capture("skyvern-oss-agent-task-v2", data={"url": task_v2.url})
     await AsyncExecutorFactory.get_executor().execute_task_v2(
         request=request,
         background_tasks=background_tasks,
@@ -1373,7 +1373,7 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
     Get the timeline workflow runs including the nested workflow runs in a flattened list
     """
 
-    # get observer task by workflow run id
+    # get task v2 by workflow run id
     task_v2_obj = await app.DATABASE.get_task_v2_by_workflow_run_id(
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
@@ -1408,10 +1408,10 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
         final_workflow_run_block_timeline.extend(workflow_blocks)
 
     if task_v2_obj and task_v2_obj.observer_cruise_id:
-        observer_thought_timeline = await task_v2_service.get_observer_thought_timelines(
+        thought_timeline = await task_v2_service.get_thought_timelines(
             task_v2_id=task_v2_obj.observer_cruise_id,
             organization_id=organization_id,
         )
-        final_workflow_run_block_timeline.extend(observer_thought_timeline)
+        final_workflow_run_block_timeline.extend(thought_timeline)
     final_workflow_run_block_timeline.sort(key=lambda x: x.created_at, reverse=True)
     return final_workflow_run_block_timeline
