@@ -164,6 +164,16 @@ if settings.ENABLE_ANTHROPIC:
             max_completion_tokens=8192,
         ),
     )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE3.7_SONNET",
+        LLMConfig(
+            "anthropic/claude-3-7-sonnet-latest",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+            max_completion_tokens=8192,
+        ),
+    )
 
 if settings.ENABLE_BEDROCK:
     # Supported through AWS IAM authentication
