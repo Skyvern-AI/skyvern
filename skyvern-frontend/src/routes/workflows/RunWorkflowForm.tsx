@@ -136,6 +136,9 @@ function RunWorkflowForm({
       queryClient.invalidateQueries({
         queryKey: ["workflowRuns"],
       });
+      queryClient.invalidateQueries({
+        queryKey: ["runs"],
+      });
       navigate(
         `/workflows/${workflowPermanentId}/${response.data.workflow_run_id}/overview`,
       );

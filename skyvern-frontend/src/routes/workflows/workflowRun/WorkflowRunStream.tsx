@@ -69,6 +69,9 @@ function WorkflowRunStream() {
             queryClient.invalidateQueries({
               queryKey: ["workflowTasks", workflowRunId],
             });
+            queryClient.invalidateQueries({
+              queryKey: ["runs"],
+            });
             if (
               message.status === "failed" ||
               message.status === "terminated"

@@ -173,6 +173,9 @@ function CreateNewTaskForm({ initialValues }: Props) {
       queryClient.invalidateQueries({
         queryKey: ["tasks"],
       });
+      queryClient.invalidateQueries({
+        queryKey: ["runs"],
+      });
     },
   });
 
