@@ -536,7 +536,7 @@ class BrowserState:
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
             )
-        await self.__assert_page()
+        page = await self.__assert_page()
 
         if not await BrowserContextFactory.validate_browser_context(await self.get_working_page()):
             await self.close_current_open_page()
@@ -547,8 +547,7 @@ class BrowserState:
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
             )
-            await self.__assert_page()
-
+            page = await self.__assert_page()
         return page
 
     async def close_current_open_page(self) -> None:
