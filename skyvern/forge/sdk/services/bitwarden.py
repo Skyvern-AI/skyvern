@@ -548,10 +548,10 @@ class BitwardenService:
         try:
             session_key = BitwardenService._extract_session_key(unlock_result.stdout)
         except Exception as e:
-            raise BitwardenUnlockError(f"Unable to extract session key: {str(e)}")
+            raise BitwardenUnlockError(f"Unable to extract session key: {str(e)}. stderr: {unlock_result.stderr}")
 
         if not session_key:
-            raise BitwardenUnlockError("Session key is empty.")
+            raise BitwardenUnlockError(f"Session key is empty. stderr: {unlock_result.stderr}")
 
         return session_key
 
