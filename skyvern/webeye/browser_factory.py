@@ -549,6 +549,8 @@ class BrowserState:
             )
             await self.__assert_page()
 
+        page = await self.get_working_page()
+
         return page
 
     async def close_current_open_page(self) -> None:
