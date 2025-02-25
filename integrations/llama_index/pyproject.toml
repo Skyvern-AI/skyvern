@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "skyvern-llamaindex"
+version = "0.0.3"
+description = "Skyvern integration for LlamaIndex"
+authors = ["lawyzheng <lawy@skyvern.com>"]
+packages = [{ include = "skyvern_llamaindex" }]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11,<3.12"
+skyvern = "^0.1.56"
+llama-index = "^0.12.19"
+
+
+[tool.poetry.group.dev.dependencies]
+twine = "^6.1.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
