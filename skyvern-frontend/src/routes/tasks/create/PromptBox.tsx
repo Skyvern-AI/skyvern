@@ -184,6 +184,9 @@ function PromptBox() {
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
       });
+      queryClient.invalidateQueries({
+        queryKey: ["runs"],
+      });
       navigate(
         `/workflows/${response.data.workflow_permanent_id}/${response.data.workflow_run_id}`,
       );
