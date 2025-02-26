@@ -141,7 +141,7 @@ class Settings(BaseSettings):
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
-    VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 5
+    VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 15
 
     # Bitwarden Settings
     BITWARDEN_CLIENT_ID: str | None = None

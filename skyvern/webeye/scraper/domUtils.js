@@ -799,6 +799,21 @@ function isDatePickerSelector(element) {
   return false;
 }
 
+function isCheckableDiv(element) {
+  const tagName = element.tagName.toLowerCase();
+  if (tagName !== "div") {
+    return false;
+  }
+  if (
+    element.className &&
+    element.className.includes("checkbox") &&
+    element.childElementCount === 0
+  ) {
+    return true;
+  }
+  return false;
+}
+
 const isComboboxDropdown = (element) => {
   if (element.tagName.toLowerCase() !== "input") {
     return false;
@@ -1300,6 +1315,7 @@ async function buildElementObject(
       isAngularDropdown(element) ||
       isSelect2Dropdown(element) ||
       isSelect2MultiChoice(element),
+    isCheckable: isCheckableDiv(element),
   };
 
   let isInShadowRoot = element.getRootNode() instanceof ShadowRoot;
