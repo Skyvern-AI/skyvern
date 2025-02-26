@@ -24,8 +24,9 @@ function ExampleCasePill({ exampleId, version, icon, label, prompt }: Props) {
     mutationFn: async (prompt: string) => {
       const client = await getClient(credentialGetter, "v2");
       return client.post<{ user_prompt: string }, { data: TaskV2 }>(
-        "/tasks",
-        { user_prompt: prompt },
+        "/tasks", {
+          user_prompt: prompt
+        },
       );
     },
     onSuccess: (response) => {
