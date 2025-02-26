@@ -100,6 +100,10 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
     tag = element["tagName"]
     attributes: dict[str, Any] = copy.deepcopy(element.get("attributes", {}))
 
+    if element.get("isCheckable", False) and tag != "input":
+        tag = "input"
+        attributes["type"] = "checkbox"
+
     context = skyvern_context.ensure_context()
 
     # FIXME: Theoretically, all href links with over 69(64+1+4) length could be hashed
