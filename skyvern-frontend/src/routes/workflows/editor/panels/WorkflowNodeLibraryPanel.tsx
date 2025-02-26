@@ -166,17 +166,17 @@ const nodeLibraryItems: Array<{
   //   title: "Download Block",
   //   description: "Downloads a file from S3",
   // },
-  {
-    nodeType: "upload",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.UploadToS3}
-        className="size-6"
-      />
-    ),
-    title: "Upload Block",
-    description: "Uploads a file to S3",
-  },
+  // {
+  //   nodeType: "upload",
+  //   icon: (
+  //     <WorkflowBlockIcon
+  //       workflowBlockType={WorkflowBlockTypes.UploadToS3}
+  //       className="size-6"
+  //     />
+  //   ),
+  //   title: "Upload Block",
+  //   description: "Uploads a file to S3",
+  // },
   {
     nodeType: "fileDownload",
     icon: (
