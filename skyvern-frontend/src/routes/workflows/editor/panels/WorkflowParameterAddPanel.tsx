@@ -278,6 +278,14 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
           <div className="flex justify-end">
             <Button
               onClick={() => {
+                if (!key) {
+                  toast({
+                    variant: "destructive",
+                    title: "Failed to add parameter",
+                    description: "Key is required",
+                  });
+                  return;
+                }
                 if (type === "workflow") {
                   if (
                     parameterType === "json" &&

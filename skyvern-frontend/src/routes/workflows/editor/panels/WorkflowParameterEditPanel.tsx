@@ -329,6 +329,14 @@ function WorkflowParameterEditPanel({
           <div className="flex justify-end">
             <Button
               onClick={() => {
+                if (!key) {
+                  toast({
+                    variant: "destructive",
+                    title: "Failed to save parameter",
+                    description: "Key is required",
+                  });
+                  return;
+                }
                 if (type === "workflow") {
                   if (
                     parameterType === "json" &&
