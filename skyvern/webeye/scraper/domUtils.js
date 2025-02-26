@@ -806,7 +806,7 @@ function isCheckableDiv(element) {
   }
   if (
     element.className &&
-    element.className.includes("checkbox") &&
+    element.className.toString().includes("checkbox") &&
     element.childElementCount === 0
   ) {
     return true;
