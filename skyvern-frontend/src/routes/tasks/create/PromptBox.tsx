@@ -157,7 +157,8 @@ function PromptBox() {
     mutationFn: async (prompt: string) => {
       const client = await getClient(credentialGetter, "v2");
       return client.post<Createv2TaskRequest, { data: TaskV2 }>(
-        "/tasks", {
+        "/tasks",
+        {
           user_prompt: prompt,
           webhook_callback_url: webhookCallbackUrl,
           proxy_location: proxyLocation,
