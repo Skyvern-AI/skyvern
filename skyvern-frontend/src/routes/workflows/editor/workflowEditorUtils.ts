@@ -48,7 +48,7 @@ import {
   SMTP_USERNAME_AWS_KEY,
   SMTP_USERNAME_PARAMETER_KEY,
 } from "./constants";
-import { ParametersState } from "./FlowRenderer";
+import { ParametersState } from "./types";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
