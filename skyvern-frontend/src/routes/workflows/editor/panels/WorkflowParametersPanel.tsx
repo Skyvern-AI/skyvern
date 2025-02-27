@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useWorkflowParametersState } from "../useWorkflowParametersState";
 import { WorkflowParameterAddPanel } from "./WorkflowParameterAddPanel";
-import { ParametersState } from "../FlowRenderer";
+import { ParametersState } from "../types";
 import { WorkflowParameterEditPanel } from "./WorkflowParameterEditPanel";
 import { MixerVerticalIcon, PlusIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
@@ -95,17 +95,6 @@ function WorkflowParametersPanel() {
               }}
             >
               Credential Parameter
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={() => {
-                setOperationPanelState({
-                  active: true,
-                  operation: "add",
-                  type: WorkflowEditorParameterTypes.BitwardenLoginCredential,
-                });
-              }}
-            >
-              Bitwarden Login Credential Parameter
             </DropdownMenuItem>
             <DropdownMenuItem
               onClick={() => {
