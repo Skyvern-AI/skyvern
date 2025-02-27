@@ -90,10 +90,21 @@ class AsyncAWSClient:
             return None
 
     @execute_with_async_client(client_type=AWSClientType.S3)
-    async def upload_file_from_path(self, uri: str, file_path: str, client: AioBaseClient = None) -> None:
+    async def upload_file_from_path(
+        self, uri: str, file_path: str, client: AioBaseClient = None, metadata: dict | None = None
+    ) -> None:
         try:
             parsed_uri = S3Uri(uri)
-            await client.upload_file(file_path, parsed_uri.bucket, parsed_uri.key)
+            params: dict[str, Any] = {
+                "Filename": file_path,
+                "Bucket": parsed_uri.bucket,
+                "Key": parsed_uri.key,
+            }
+
+            if metadata:
+                params["ExtraArgs"] = {"Metadata": metadata}
+
+            await client.upload_file(**params)
         except Exception:
             LOG.exception("S3 upload failed.", uri=uri)
 
@@ -101,11 +112,39 @@ class AsyncAWSClient:
     async def download_file(self, uri: str, client: AioBaseClient = None, log_exception: bool = True) -> bytes | None:
         try:
             parsed_uri = S3Uri(uri)
+
+            # Get full object including body
             response = await client.get_object(Bucket=parsed_uri.bucket, Key=parsed_uri.key)
             return await response["Body"].read()
         except Exception:
             if log_exception:
                 LOG.exception("S3 download failed", uri=uri)
+            return None
+
+    @execute_with_async_client(client_type=AWSClientType.S3)
+    async def get_file_metadata(
+        self, uri: str, client: AioBaseClient = None, log_exception: bool = True
+    ) -> dict | None:
+        """
+        Retrieves only the metadata of a file without downloading its content.
+
+        Args:
+            uri: The S3 URI of the file
+            client: Optional S3 client to use
+            log_exception: Whether to log exceptions
+
+        Returns:
+            The metadata dictionary or None if the request fails
+        """
+        try:
+            parsed_uri = S3Uri(uri)
+
+            # Only get object metadata without the body
+            response = await client.head_object(Bucket=parsed_uri.bucket, Key=parsed_uri.key)
+            return response.get("Metadata", {})
+        except Exception:
+            if log_exception:
+                LOG.exception("S3 metadata retrieval failed", uri=uri)
             return None
 
     @execute_with_async_client(client_type=AWSClientType.S3)

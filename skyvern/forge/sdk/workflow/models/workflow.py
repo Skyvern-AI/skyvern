@@ -5,6 +5,7 @@ from typing import Any, List
 from pydantic import BaseModel, field_validator
 
 from skyvern.forge.sdk.core.validators import validate_url
+from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import ObserverTask
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicateBlockLabels
@@ -143,6 +144,7 @@ class WorkflowRunStatusResponse(BaseModel):
     parameters: dict[str, Any]
     screenshot_urls: list[str] | None = None
     recording_url: str | None = None
+    downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None
     outputs: dict[str, Any] | None = None
     total_steps: int | None = None
