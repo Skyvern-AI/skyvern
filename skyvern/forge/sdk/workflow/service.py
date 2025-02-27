@@ -1030,14 +1030,17 @@ class WorkflowService:
         )
 
         outputs = None
+        EXTRACTED_INFORMATION_KEY = "extracted_information"
         if output_parameter_tuples:
             outputs = {output_parameter.key: output.value for output_parameter, output in output_parameter_tuples}
             extracted_information = {
-                output_parameter.key: output.value["extracted_information"]
+                output_parameter.key: output.value[EXTRACTED_INFORMATION_KEY]
                 for output_parameter, output in output_parameter_tuples
-                if isinstance(output.value, dict) and output.value["extracted_information"] is not None
+                if output.value is not None
+                and isinstance(output.value, dict)
+                and output.value[EXTRACTED_INFORMATION_KEY] is not None
             }
-            outputs["extracted_information"] = extracted_information
+            outputs[EXTRACTED_INFORMATION_KEY] = extracted_information
 
         total_steps = None
         total_cost = None
