@@ -2,24 +2,23 @@ from typing import Any, Dict, Literal, Type
 
 from langchain.tools import BaseTool
 from litellm import BaseModel
+from pydantic import Field
 from skyvern_langchain.schema import GetTaskInput, TaskV1Request, TaskV2Request
+from skyvern_langchain.settings import settings
 
 from skyvern.agent import Agent
 from skyvern.forge.sdk.schemas.observers import ObserverTask
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskResponse
 
+agent = Agent()
+
 
 class SkyvernTaskBaseTool(BaseTool):
-    engine: Literal["TaskV1", "TaskV2"] = "TaskV2"
-    agent: Agent | None = None
+    engine: Literal["TaskV1", "TaskV2"] = Field(default=settings.engine)
+    agent: Agent = agent
 
     def _run(self) -> None:
         raise NotImplementedError("skyvern task tool does not support sync")
-
-    def get_agent(self) -> Agent:
-        if self.agent is None:
-            self.agent = Agent()
-        return self.agent
 
 
 class RunTask(SkyvernTaskBaseTool):
@@ -40,11 +39,11 @@ class RunTask(SkyvernTaskBaseTool):
 
     async def _arun_task_v1(self, **kwargs: Dict[str, Any]) -> Dict[str, Any | None]:
         task_request = TaskV1Request(**kwargs)
-        return await self.get_agent().run_task(task_request=task_request, timeout_seconds=task_request.timeout_seconds)
+        return await self.agent.run_task(task_request=task_request, timeout_seconds=task_request.timeout_seconds)
 
     async def _arun_task_v2(self, **kwargs: Dict[str, Any]) -> Dict[str, Any | None]:
         task_request = TaskV2Request(**kwargs)
-        return await self.get_agent().run_observer_task_v_2(
+        return await self.agent.run_observer_task_v_2(
             task_request=task_request, timeout_seconds=task_request.timeout_seconds
         )
 
@@ -67,11 +66,11 @@ class DispatchTask(SkyvernTaskBaseTool):
 
     async def _arun_task_v1(self, **kwargs: Dict[str, Any]) -> CreateTaskResponse:
         task_request = TaskV1Request(**kwargs)
-        return await self.get_agent().create_task(task_request=task_request)
+        return await self.agent.create_task(task_request=task_request)
 
     async def _arun_task_v2(self, **kwargs: Dict[str, Any]) -> ObserverTask:
         task_request = TaskV2Request(**kwargs)
-        return await self.get_agent().observer_task_v_2(task_request=task_request)
+        return await self.agent.observer_task_v_2(task_request=task_request)
 
 
 class GetTask(SkyvernTaskBaseTool):
@@ -86,7 +85,7 @@ class GetTask(SkyvernTaskBaseTool):
             return await self._arun_task_v2(task_id=task_id)
 
     async def _arun_task_v1(self, task_id: str) -> TaskResponse | None:
-        return await self.get_agent().get_task(task_id=task_id)
+        return await self.agent.get_task(task_id=task_id)
 
     async def _arun_task_v2(self, task_id: str) -> ObserverTask | None:
-        return await self.get_agent().get_observer_task_v_2(task_id=task_id)
+        return await self.agent.get_observer_task_v_2(task_id=task_id)

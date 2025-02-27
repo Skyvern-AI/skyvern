@@ -2,17 +2,18 @@ from typing import Any, Dict, Literal, Type
 
 from httpx import AsyncClient
 from langchain.tools import BaseTool
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from skyvern_langchain.schema import GetTaskInput, TaskV1Request, TaskV2Request
+from skyvern_langchain.settings import settings
 
 from skyvern.client import AsyncSkyvern
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskResponse
 
 
 class SkyvernTaskBaseTool(BaseTool):
-    credential: str
-    base_url: str = "https://api.skyvern.com"
-    engine: Literal["TaskV1", "TaskV2"] = "TaskV2"
+    credential: str = Field(default=settings.credential)
+    base_url: str = Field(default=settings.base_url)
+    engine: Literal["TaskV1", "TaskV2"] = Field(default=settings.engine)
 
     def get_client(self) -> AsyncSkyvern:
         httpx_client = AsyncClient(
