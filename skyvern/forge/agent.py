@@ -906,19 +906,18 @@ class ForgeAgent:
                     action_result = ActionSuccess()
                     action_result.step_order = step.order
                     action_result.step_retry_number = step.retry_index
-                    detailed_agent_step_output.actions_and_results[action_idx] = (
-                        ReloadPageAction(
-                            reasoning="Something wrong with the current page, reload to continue",
-                            status=ActionStatus.completed,
-                            organization_id=task.organization_id,
-                            workflow_run_id=task.workflow_run_id,
-                            task_id=task.task_id,
-                            step_id=step.step_id,
-                            step_order=step.order,
-                            action_order=action_idx,
-                        ),
-                        [action_result],
+                    action = ReloadPageAction(
+                        reasoning="Something wrong with the current page, reload to continue",
+                        status=ActionStatus.completed,
+                        organization_id=task.organization_id,
+                        workflow_run_id=task.workflow_run_id,
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        step_order=step.order,
+                        action_order=action_idx,
                     )
+                    detailed_agent_step_output.actions_and_results[action_idx] = (action, [action_result])
+                    await app.DATABASE.create_action(action=action)
                     await self.record_artifacts_after_action(task, step, browser_state)
                     break
 
