@@ -1,18 +1,14 @@
 from __future__ import annotations
 
-import asyncio
-import socket
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import structlog
 from playwright._impl._errors import TargetClosedError
-from playwright.async_api import async_playwright
 
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation
-from skyvern.webeye.browser_factory import BrowserContextFactory, BrowserState
+from skyvern.webeye.browser_factory import BrowserState
 
 LOG = structlog.get_logger()
 
@@ -51,11 +47,9 @@ class PersistentSessionsManager:
     async def create_session(
         self,
         organization_id: str,
-        proxy_location: ProxyLocation | None = None,
-        url: str | None = None,
         runnable_id: str | None = None,
         runnable_type: str | None = None,
-    ) -> Tuple[PersistentBrowserSession, BrowserState]:
+    ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
 
         LOG.info(
@@ -69,55 +63,7 @@ class PersistentSessionsManager:
             runnable_id=runnable_id,
         )
 
-        cdp_port = None
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            cdp_port = s.getsockname()[1]
-
-        session_id = browser_session_db.persistent_browser_session_id
-
-        pw = await async_playwright().start()
-        browser_context, browser_artifacts, browser_cleanup = await BrowserContextFactory.create_browser_context(
-            pw,
-            proxy_location=proxy_location,
-            url=url,
-            organization_id=organization_id,
-            cdp_port=cdp_port,
-        )
-
-        async def on_context_close() -> None:
-            await self._clean_up_on_session_close(session_id, organization_id)
-
-        browser_context.on("close", lambda: asyncio.create_task(on_context_close()))
-
-        browser_state = BrowserState(
-            pw=pw,
-            browser_context=browser_context,
-            page=None,
-            browser_artifacts=browser_artifacts,
-            browser_cleanup=browser_cleanup,
-        )
-
-        browser_session = BrowserSession(
-            browser_state=browser_state,
-            cdp_port=cdp_port,
-        )
-        LOG.info(
-            "Created new browser session",
-            session_id=session_id,
-            cdp_port=cdp_port,
-            cdp_host="localhost",
-        )
-        self._browser_sessions[session_id] = browser_session
-
-        if url:
-            await browser_state.get_or_create_page(
-                url=url,
-                proxy_location=proxy_location,
-                organization_id=organization_id,
-            )
-
-        return browser_session_db, browser_state
+        return browser_session_db
 
     async def occupy_browser_session(
         self,
