@@ -41,18 +41,18 @@ import asyncio
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, AgentType
-from skyvern_langchain.agent import SkyvernTaskTools
+from skyvern_langchain.agent import RunTask
 
 # load OpenAI API key from .env
 load_dotenv()
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-skyvern_task_tools = SkyvernTaskTools()
+run_task = RunTask()
 
 agent = initialize_agent(
     llm=llm,
-    tools=[skyvern_task_tools.run],
+    tools=[run_task],
     verbose=True,
     agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
 )
@@ -77,7 +77,7 @@ import asyncio
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, AgentType
-from skyvern_langchain.agent import SkyvernTaskTools
+from skyvern_langchain.agent import DispatchTask, GetTask
 
 from langchain_community.tools.sleep.tool import SleepTool
 
@@ -86,13 +86,14 @@ load_dotenv()
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-skyvern_task_tools = SkyvernTaskTools()
+dispatch_task = DispatchTask()
+get_task = GetTask()
 
 agent = initialize_agent(
     llm=llm,
     tools=[
-        skyvern_task_tools.dispatch,
-        skyvern_task_tools.get,
+        dispatch_task,
+        get_task,
         SleepTool(),
     ],
     verbose=True,
@@ -120,20 +121,20 @@ import asyncio
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, AgentType
-from skyvern_langchain.client import SkyvernTaskTools
+from skyvern_langchain.client import RunTask
 
 # load OpenAI API key from .env
 load_dotenv()
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-skyvern_task_tools = SkyvernTaskTools(
-    credential="<your_organization_api_key>",
+run_task = RunTask(
+    credential="<your_organization_api_key>", # or load it from SKYVERN_CREDENTIAL in .env
 )
 
 agent = initialize_agent(
     llm=llm,
-    tools=[skyvern_task_tools.run],
+    tools=[run_task],
     verbose=True,
     agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
 )
@@ -156,7 +157,7 @@ import asyncio
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.agents import initialize_agent, AgentType
-from skyvern_langchain.client import SkyvernTaskTools
+from skyvern_langchain.client import DispatchTask, GetTask
 
 from langchain_community.tools.sleep.tool import SleepTool
 
@@ -165,15 +166,18 @@ load_dotenv()
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-skyvern_task_tools = SkyvernTaskTools(
-    credential="<your_organization_api_key>",
+dispatch_task = DispatchTask(
+    credential="<your_organization_api_key>", # or load it from SKYVERN_CREDENTIAL in .env
+)
+get_task = GetTask(
+    credential="<your_organization_api_key>", # or load it from SKYVERN_CREDENTIAL in .env
 )
 
 agent = initialize_agent(
     llm=llm,
     tools=[
-        skyvern_task_tools.dispatch,
-        skyvern_task_tools.get,
+        dispatch_task,
+        get_task,
         SleepTool(),
     ],
     verbose=True,
