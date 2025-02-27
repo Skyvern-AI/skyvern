@@ -173,6 +173,7 @@ export const ActionTypes = {
   terminate: "terminate",
   SolveCaptcha: "solve_captcha",
   extract: "extract",
+  ReloadPage: "reload_page",
 } as const;
 
 export type ActionType = (typeof ActionTypes)[keyof typeof ActionTypes];
@@ -189,6 +190,7 @@ export const ReadableActionTypes: {
   terminate: "Terminate",
   solve_captcha: "Solve Captcha",
   extract: "Extract Data",
+  reload_page: "Reload Page",
 };
 
 export type Option = {
