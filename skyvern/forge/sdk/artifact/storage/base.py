@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
+from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import ObserverTask, ObserverThought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
@@ -115,5 +116,5 @@ class BaseStorage(ABC):
     @abstractmethod
     async def get_downloaded_files(
         self, organization_id: str, task_id: str | None, workflow_run_id: str | None
-    ) -> list[str]:
+    ) -> list[FileInfo]:
         pass
