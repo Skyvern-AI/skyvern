@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Literal, Type
+from typing import Any, Dict, Literal, Type
 
 from langchain.tools import BaseTool
 from litellm import BaseModel
@@ -7,31 +7,6 @@ from skyvern_langchain.schema import GetTaskInput, TaskV1Request, TaskV2Request
 from skyvern.agent import Agent
 from skyvern.forge.sdk.schemas.observers import ObserverTask
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskResponse
-
-
-class SkyvernTaskTools:
-    def __init__(self, engine: Literal["TaskV1", "TaskV2"] = "TaskV2") -> None:
-        self.agent = Agent()
-        self.engine = engine
-
-    @property
-    def get(self) -> BaseTool:
-        return GetSkyvernTaskTool(agent=self.agent, engine=self.engine)
-
-    @property
-    def dispatch(self) -> BaseTool:
-        return DispatchSkyvernTaskTool(agent=self.agent, engine=self.engine)
-
-    @property
-    def run(self) -> BaseTool:
-        return RunSkyvernTaskTool(agent=self.agent, engine=self.engine)
-
-    def get_tools(self) -> List[BaseTool]:
-        return [
-            self.run,
-            self.dispatch,
-            self.get,
-        ]
 
 
 class SkyvernTaskBaseTool(BaseTool):
@@ -47,7 +22,7 @@ class SkyvernTaskBaseTool(BaseTool):
         return self.agent
 
 
-class RunSkyvernTaskTool(SkyvernTaskBaseTool):
+class RunTask(SkyvernTaskBaseTool):
     name: str = "run-skyvern-agent-task"
     description: str = """Use Skyvern agent to run a task. This function won't return until the task is finished."""
 
@@ -74,7 +49,7 @@ class RunSkyvernTaskTool(SkyvernTaskBaseTool):
         )
 
 
-class DispatchSkyvernTaskTool(SkyvernTaskBaseTool):
+class DispatchTask(SkyvernTaskBaseTool):
     name: str = "dispatch-skyvern-agent-task"
     description: str = """Use Skyvern agent to dispatch a task. This function will return immediately and the task will be running in the background."""
 
@@ -99,7 +74,7 @@ class DispatchSkyvernTaskTool(SkyvernTaskBaseTool):
         return await self.get_agent().observer_task_v_2(task_request=task_request)
 
 
-class GetSkyvernTaskTool(SkyvernTaskBaseTool):
+class GetTask(SkyvernTaskBaseTool):
     name: str = "get-skyvern-agent-task"
     description: str = """Use Skyvern agent to get a task."""
     args_schema: Type[BaseModel] = GetTaskInput

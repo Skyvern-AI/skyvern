@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Literal, Type
+from typing import Any, Dict, Literal, Type
 
 from httpx import AsyncClient
 from langchain.tools import BaseTool
@@ -7,38 +7,6 @@ from skyvern_langchain.schema import GetTaskInput, TaskV1Request, TaskV2Request
 
 from skyvern.client import AsyncSkyvern
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskResponse
-
-
-class SkyvernTaskTools:
-    def __init__(
-        self,
-        credential: str,
-        *,
-        base_url: str = "https://api.skyvern.com",
-        engine: Literal["TaskV1", "TaskV2"] = "TaskV2",
-    ) -> None:
-        self.engine = engine
-        self.credential = credential
-        self.base_url = base_url
-
-    @property
-    def run(self) -> BaseTool:
-        return RunSkyvernTaskTool(engine=self.engine, credential=self.credential, base_url=self.base_url)
-
-    @property
-    def dispatch(self) -> BaseTool:
-        return DispatchSkyvernTaskTool(engine=self.engine, credential=self.credential, base_url=self.base_url)
-
-    @property
-    def get(self) -> BaseTool:
-        return GetSkyvernTaskTool(engine=self.engine, credential=self.credential, base_url=self.base_url)
-
-    def get_tools(self) -> List[BaseTool]:
-        return [
-            self.run,
-            self.dispatch,
-            self.get,
-        ]
 
 
 class SkyvernTaskBaseTool(BaseTool):
@@ -59,7 +27,7 @@ class SkyvernTaskBaseTool(BaseTool):
         raise NotImplementedError("skyvern task tool does not support sync")
 
 
-class RunSkyvernTaskTool(SkyvernTaskBaseTool):
+class RunTask(SkyvernTaskBaseTool):
     name: str = "run-skyvern-client-task"
     description: str = """Use Skyvern client to run a task. This function won't return until the task is finished."""
 
@@ -111,7 +79,7 @@ class RunSkyvernTaskTool(SkyvernTaskBaseTool):
         )
 
 
-class DispatchSkyvernTaskTool(SkyvernTaskBaseTool):
+class DispatchTask(SkyvernTaskBaseTool):
     name: str = "dispatch-skyvern-client-task"
     description: str = """Use Skyvern client to dispatch a task. This function will return immediately and the task will be running in the background."""
 
@@ -161,7 +129,7 @@ class DispatchSkyvernTaskTool(SkyvernTaskBaseTool):
         )
 
 
-class GetSkyvernTaskTool(SkyvernTaskBaseTool):
+class GetTask(SkyvernTaskBaseTool):
     name: str = "get-skyvern-client-task"
     description: str = """Use Skyvern client to get a task."""
     args_schema: Type[BaseModel] = GetTaskInput
