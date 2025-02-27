@@ -1038,6 +1038,7 @@ class WorkflowService:
                 for output_parameter, output in output_parameter_tuples
                 if output.value is not None
                 and isinstance(output.value, dict)
+                and EXTRACTED_INFORMATION_KEY in output.value
                 and output.value[EXTRACTED_INFORMATION_KEY] is not None
             }
             outputs[EXTRACTED_INFORMATION_KEY] = extracted_information
