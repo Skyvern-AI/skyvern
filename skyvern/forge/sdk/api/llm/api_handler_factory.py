@@ -23,7 +23,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.task_v2 import ObserverTask, ObserverThought
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 
 LOG = structlog.get_logger()
 
@@ -63,8 +63,8 @@ class LLMAPIHandlerFactory:
             prompt: str,
             prompt_name: str,
             step: Step | None = None,
-            task_v2: ObserverTask | None = None,
-            observer_thought: ObserverThought | None = None,
+            task_v2: TaskV2 | None = None,
+            thought: Thought | None = None,
             ai_suggestion: AISuggestion | None = None,
             screenshots: list[bytes] | None = None,
             parameters: dict[str, Any] | None = None,
@@ -93,7 +93,7 @@ class LLMAPIHandlerFactory:
                     artifact_type=ArtifactType.HASHED_HREF_MAP,
                     step=step,
                     task_v2=task_v2,
-                    observer_thought=observer_thought,
+                    thought=thought,
                     ai_suggestion=ai_suggestion,
                 )
 
@@ -103,7 +103,7 @@ class LLMAPIHandlerFactory:
                 screenshots=screenshots,
                 step=step,
                 task_v2=task_v2,
-                observer_thought=observer_thought,
+                thought=thought,
             )
             messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
 
@@ -118,7 +118,7 @@ class LLMAPIHandlerFactory:
                 artifact_type=ArtifactType.LLM_REQUEST,
                 step=step,
                 task_v2=task_v2,
-                observer_thought=observer_thought,
+                thought=thought,
                 ai_suggestion=ai_suggestion,
             )
             try:
@@ -145,10 +145,10 @@ class LLMAPIHandlerFactory:
                 artifact_type=ArtifactType.LLM_RESPONSE,
                 step=step,
                 task_v2=task_v2,
-                observer_thought=observer_thought,
+                thought=thought,
                 ai_suggestion=ai_suggestion,
             )
-            if step or observer_thought:
+            if step or thought:
                 try:
                     llm_cost = litellm.completion_cost(completion_response=response)
                 except Exception as e:
@@ -171,10 +171,10 @@ class LLMAPIHandlerFactory:
                         incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
                         incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
                     )
-                if observer_thought:
-                    await app.DATABASE.update_observer_thought(
-                        observer_thought_id=observer_thought.observer_thought_id,
-                        organization_id=observer_thought.organization_id,
+                if thought:
+                    await app.DATABASE.update_thought(
+                        thought_id=thought.observer_thought_id,
+                        organization_id=thought.organization_id,
                         input_token_count=prompt_tokens if prompt_tokens > 0 else None,
                         output_token_count=completion_tokens if completion_tokens > 0 else None,
                         thought_cost=llm_cost,
@@ -185,7 +185,7 @@ class LLMAPIHandlerFactory:
                 artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
                 step=step,
                 task_v2=task_v2,
-                observer_thought=observer_thought,
+                thought=thought,
                 ai_suggestion=ai_suggestion,
             )
 
@@ -198,7 +198,7 @@ class LLMAPIHandlerFactory:
                     artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
                     step=step,
                     task_v2=task_v2,
-                    observer_thought=observer_thought,
+                    thought=thought,
                     ai_suggestion=ai_suggestion,
                 )
 
@@ -211,10 +211,8 @@ class LLMAPIHandlerFactory:
                 prompt_name=prompt_name,
                 duration_seconds=duration_seconds,
                 step_id=step.step_id if step else None,
-                observer_thought_id=observer_thought.observer_thought_id if observer_thought else None,
-                organization_id=step.organization_id
-                if step
-                else (observer_thought.organization_id if observer_thought else None),
+                thought_id=thought.observer_thought_id if thought else None,
+                organization_id=step.organization_id if step else (thought.organization_id if thought else None),
             )
 
             return parsed_response
@@ -234,8 +232,8 @@ class LLMAPIHandlerFactory:
             prompt: str,
             prompt_name: str,
             step: Step | None = None,
-            task_v2: ObserverTask | None = None,
-            observer_thought: ObserverThought | None = None,
+            task_v2: TaskV2 | None = None,
+            thought: Thought | None = None,
             ai_suggestion: AISuggestion | None = None,
             screenshots: list[bytes] | None = None,
             parameters: dict[str, Any] | None = None,
@@ -256,7 +254,7 @@ class LLMAPIHandlerFactory:
                     artifact_type=ArtifactType.HASHED_HREF_MAP,
                     step=step,
                     task_v2=task_v2,
-                    observer_thought=observer_thought,
+                    thought=thought,
                     ai_suggestion=ai_suggestion,
                 )
 
@@ -266,7 +264,7 @@ class LLMAPIHandlerFactory:
                 screenshots=screenshots,
                 step=step,
                 task_v2=task_v2,
-                observer_thought=observer_thought,
+                thought=thought,
                 ai_suggestion=ai_suggestion,
             )
 
@@ -286,7 +284,7 @@ class LLMAPIHandlerFactory:
                 artifact_type=ArtifactType.LLM_REQUEST,
                 step=step,
                 task_v2=task_v2,
-                observer_thought=observer_thought,
+                thought=thought,
                 ai_suggestion=ai_suggestion,
             )
             t_llm_request = time.perf_counter()
@@ -320,11 +318,11 @@ class LLMAPIHandlerFactory:
                 artifact_type=ArtifactType.LLM_RESPONSE,
                 step=step,
                 task_v2=task_v2,
-                observer_thought=observer_thought,
+                thought=thought,
                 ai_suggestion=ai_suggestion,
             )
 
-            if step or observer_thought:
+            if step or thought:
                 try:
                     llm_cost = litellm.completion_cost(completion_response=response)
                 except Exception as e:
@@ -341,10 +339,10 @@ class LLMAPIHandlerFactory:
                         incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
                         incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
                     )
-                if observer_thought:
-                    await app.DATABASE.update_observer_thought(
-                        observer_thought_id=observer_thought.observer_thought_id,
-                        organization_id=observer_thought.organization_id,
+                if thought:
+                    await app.DATABASE.update_thought(
+                        thought_id=thought.observer_thought_id,
+                        organization_id=thought.organization_id,
                         input_token_count=prompt_tokens if prompt_tokens > 0 else None,
                         output_token_count=completion_tokens if completion_tokens > 0 else None,
                         thought_cost=llm_cost,
@@ -355,7 +353,7 @@ class LLMAPIHandlerFactory:
                 artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
                 step=step,
                 task_v2=task_v2,
-                observer_thought=observer_thought,
+                thought=thought,
                 ai_suggestion=ai_suggestion,
             )
 
@@ -368,7 +366,7 @@ class LLMAPIHandlerFactory:
                     artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
                     step=step,
                     task_v2=task_v2,
-                    observer_thought=observer_thought,
+                    thought=thought,
                     ai_suggestion=ai_suggestion,
                 )
 
@@ -381,10 +379,8 @@ class LLMAPIHandlerFactory:
                 model=llm_config.model_name,
                 duration_seconds=duration_seconds,
                 step_id=step.step_id if step else None,
-                observer_thought_id=observer_thought.observer_thought_id if observer_thought else None,
-                organization_id=step.organization_id
-                if step
-                else (observer_thought.organization_id if observer_thought else None),
+                thought_id=thought.observer_thought_id if thought else None,
+                organization_id=step.organization_id if step else (thought.organization_id if thought else None),
             )
 
             return parsed_response

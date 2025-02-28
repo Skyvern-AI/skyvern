@@ -38,7 +38,7 @@ CREDENTIAL_PARAMETER_PREFIX = "cp"
 CREDENTIAL_PREFIX = "cred"
 ORGANIZATION_BITWARDEN_COLLECTION_PREFIX = "obc"
 TASK_V2_ID = "oc"
-OBSERVER_THOUGHT_ID = "ot"
+THOUGHT_ID = "ot"
 ORGANIZATION_AUTH_TOKEN_PREFIX = "oat"
 ORG_PREFIX = "o"
 OUTPUT_PARAMETER_PREFIX = "op"
@@ -161,9 +161,9 @@ def generate_task_v2_id() -> str:
     return f"{TASK_V2_ID}_{int_id}"
 
 
-def generate_observer_thought_id() -> str:
+def generate_thought_id() -> str:
     int_id = generate_id()
-    return f"{OBSERVER_THOUGHT_ID}_{int_id}"
+    return f"{THOUGHT_ID}_{int_id}"
 
 
 def generate_persistent_browser_session_id() -> str:

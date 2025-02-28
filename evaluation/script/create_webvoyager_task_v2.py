@@ -10,7 +10,7 @@ from evaluation.core import Evaluator, SkyvernClient
 from evaluation.core.utils import load_webvoyager_case_from_json
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.schemas.task_v2 import ObserverTaskRequest
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
 
 load_dotenv()
 
@@ -37,21 +37,21 @@ async def create_task_v2(
             case_data.question = tweaked_user_goal
 
             evaluator = Evaluator(client=client, artifact_folder=f"test/artifacts/{case_data.group_id}/{case_data.id}")
-            request_body = ObserverTaskRequest(
+            request_body = TaskV2Request(
                 url=case_data.url,
                 user_prompt=case_data.question,
             )
-            cruise = evaluator.queue_skyvern_cruise(cruise_request=request_body, max_step=case_data.max_steps)
+            task_v2 = evaluator.queue_skyvern_task_v2(cruise_request=request_body, max_step=case_data.max_steps)
             dumped_data = case_data.model_dump()
             dumped_data.update(
                 {
-                    "task_v2_id": cruise.observer_cruise_id,
-                    "workflow_run_id": cruise.workflow_run_id,
-                    "workflow_permanent_id": cruise.workflow_permanent_id,
-                    "cruise_url": str(cruise.url) if cruise.url else cruise.url,
+                    "task_v2_id": task_v2.observer_cruise_id,
+                    "workflow_run_id": task_v2.workflow_run_id,
+                    "workflow_permanent_id": task_v2.workflow_permanent_id,
+                    "cruise_url": str(task_v2.url) if task_v2.url else task_v2.url,
                 }
             )
-            print(f"Queued {cruise.observer_cruise_id} for {case_data.model_dump_json()}")
+            print(f"Queued {task_v2.observer_cruise_id} for {case_data.model_dump_json()}")
             f.write(json.dumps(dumped_data) + "\n")
             cnt += 1
 

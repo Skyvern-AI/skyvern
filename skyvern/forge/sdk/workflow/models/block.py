@@ -50,7 +50,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core.validators import prepend_scheme_and_validate_url
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
-from skyvern.forge.sdk.schemas.task_v2 import ObserverTaskStatus
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -2116,7 +2116,6 @@ class UrlBlock(BaseTaskBlock):
     url: str
 
 
-# observer block
 class TaskV2Block(Block):
     block_type: Literal[BlockType.TaskV2] = BlockType.TaskV2
     prompt: str
@@ -2159,7 +2158,7 @@ class TaskV2Block(Block):
             proxy_location=workflow_run.proxy_location,
         )
         await app.DATABASE.update_task_v2(
-            task_v2.observer_cruise_id, status=ObserverTaskStatus.queued, organization_id=organization_id
+            task_v2.observer_cruise_id, status=TaskV2Status.queued, organization_id=organization_id
         )
         if task_v2.workflow_run_id:
             await app.DATABASE.update_workflow_run(

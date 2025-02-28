@@ -4,7 +4,7 @@ from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityT
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
-from skyvern.forge.sdk.schemas.task_v2 import ObserverTask, ObserverThought
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
 # TODO: This should be a part of the ArtifactType model
@@ -50,13 +50,11 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
-    def build_observer_thought_uri(
-        self, artifact_id: str, observer_thought: ObserverThought, artifact_type: ArtifactType
-    ) -> str:
+    def build_thought_uri(self, artifact_id: str, thought: Thought, artifact_type: ArtifactType) -> str:
         pass
 
     @abstractmethod
-    def build_task_v2_uri(self, artifact_id: str, task_v2: ObserverTask, artifact_type: ArtifactType) -> str:
+    def build_task_v2_uri(self, artifact_id: str, task_v2: TaskV2, artifact_type: ArtifactType) -> str:
         pass
 
     @abstractmethod

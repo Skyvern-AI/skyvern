@@ -9,7 +9,7 @@ from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityT
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.task_v2 import ObserverTask, ObserverThought
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
 LOG = structlog.get_logger(__name__)
@@ -29,7 +29,7 @@ class ArtifactManager:
         task_id: str | None = None,
         workflow_run_id: str | None = None,
         workflow_run_block_id: str | None = None,
-        observer_thought_id: str | None = None,
+        thought_id: str | None = None,
         task_v2_id: str | None = None,
         ai_suggestion_id: str | None = None,
         organization_id: str | None = None,
@@ -48,7 +48,7 @@ class ArtifactManager:
             task_id=task_id,
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
-            observer_thought_id=observer_thought_id,
+            thought_id=thought_id,
             task_v2_id=task_v2_id,
             organization_id=organization_id,
             ai_suggestion_id=ai_suggestion_id,
@@ -114,30 +114,30 @@ class ArtifactManager:
             path=path,
         )
 
-    async def create_observer_thought_artifact(
+    async def create_thought_artifact(
         self,
-        observer_thought: ObserverThought,
+        thought: Thought,
         artifact_type: ArtifactType,
         data: bytes | None = None,
         path: str | None = None,
     ) -> str:
         artifact_id = generate_artifact_id()
-        uri = app.STORAGE.build_observer_thought_uri(artifact_id, observer_thought, artifact_type)
+        uri = app.STORAGE.build_thought_uri(artifact_id, thought, artifact_type)
         return await self._create_artifact(
-            aio_task_primary_key=observer_thought.observer_cruise_id,
+            aio_task_primary_key=thought.observer_cruise_id,
             artifact_id=artifact_id,
             artifact_type=artifact_type,
             uri=uri,
-            observer_thought_id=observer_thought.observer_thought_id,
-            task_v2_id=observer_thought.observer_cruise_id,
-            organization_id=observer_thought.organization_id,
+            thought_id=thought.observer_thought_id,
+            task_v2_id=thought.observer_cruise_id,
+            organization_id=thought.organization_id,
             data=data,
             path=path,
         )
 
     async def create_task_v2_artifact(
         self,
-        task_v2: ObserverTask,
+        task_v2: TaskV2,
         artifact_type: ArtifactType,
         data: bytes | None = None,
         path: str | None = None,
@@ -202,8 +202,8 @@ class ArtifactManager:
         artifact_type: ArtifactType,
         screenshots: list[bytes] | None = None,
         step: Step | None = None,
-        observer_thought: ObserverThought | None = None,
-        task_v2: ObserverTask | None = None,
+        thought: Thought | None = None,
+        task_v2: TaskV2 | None = None,
         ai_suggestion: AISuggestion | None = None,
     ) -> None:
         if step:
@@ -230,15 +230,15 @@ class ArtifactManager:
                     artifact_type=ArtifactType.SCREENSHOT_LLM,
                     data=screenshot,
                 )
-        elif observer_thought:
-            await self.create_observer_thought_artifact(
-                observer_thought=observer_thought,
+        elif thought:
+            await self.create_thought_artifact(
+                thought=thought,
                 artifact_type=artifact_type,
                 data=data,
             )
             for screenshot in screenshots or []:
-                await self.create_observer_thought_artifact(
-                    observer_thought=observer_thought,
+                await self.create_thought_artifact(
+                    thought=thought,
                     artifact_type=ArtifactType.SCREENSHOT_LLM,
                     data=screenshot,
                 )
