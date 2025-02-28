@@ -14,5 +14,10 @@ class TaskV2Request(ObserverTaskRequest):
     timeout_seconds: int = 60 * 60
 
 
+class CreateTaskInput(BaseModel):
+    user_prompt: str
+    url: str | None = None
+
+
 class GetTaskInput(BaseModel):
     task_id: str

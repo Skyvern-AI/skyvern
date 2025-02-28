@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     credential: str = ""
     base_url: str = "https://api.skyvern.com"
     engine: Literal["TaskV1", "TaskV2"] = "TaskV2"
+    run_task_timeout: int = 60 * 60
 
     class Config:
         env_prefix = "SKYVERN_"
