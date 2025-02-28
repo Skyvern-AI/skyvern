@@ -6,11 +6,17 @@ from pathlib import Path
 import structlog
 
 from skyvern.config import settings
-from skyvern.forge.sdk.api.files import get_download_dir, get_skyvern_temp_dir, parse_uri_to_path
+from skyvern.forge.sdk.api.files import (
+    calculate_sha256_for_file,
+    get_download_dir,
+    get_skyvern_temp_dir,
+    parse_uri_to_path,
+)
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP, BaseStorage
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
+from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
@@ -155,15 +161,18 @@ class LocalStorage(BaseStorage):
 
     async def get_downloaded_files(
         self, organization_id: str, task_id: str | None, workflow_run_id: str | None
-    ) -> list[str]:
+    ) -> list[FileInfo]:
         download_dir = get_download_dir(workflow_run_id=workflow_run_id, task_id=task_id)
-        files: list[str] = []
+        file_infos: list[FileInfo] = []
         files_and_folders = os.listdir(download_dir)
         for file_or_folder in files_and_folders:
             path = os.path.join(download_dir, file_or_folder)
             if os.path.isfile(path):
-                files.append(f"file://{path}")
-        return files
+                # Calculate checksum for the file
+                checksum = calculate_sha256_for_file(path)
+                file_info = FileInfo(url=f"file://{path}", checksum=checksum, filename=file_or_folder)
+                file_infos.append(file_info)
+        return file_infos
 
     @staticmethod
     def _create_directories_if_not_exists(path_including_file_name: Path) -> None:

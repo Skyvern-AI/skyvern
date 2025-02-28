@@ -49,6 +49,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core.validators import prepend_scheme_and_validate_url
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
@@ -634,17 +635,18 @@ class BaseTaskBlock(Block):
                 )
                 success = updated_task.status == TaskStatus.completed
 
-                downloaded_file_urls = []
+                downloaded_files: list[FileInfo] = []
                 try:
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                        downloaded_file_urls = await app.STORAGE.get_downloaded_files(
+                        downloaded_files = await app.STORAGE.get_downloaded_files(
                             organization_id=workflow_run.organization_id,
                             task_id=updated_task.task_id,
                             workflow_run_id=workflow_run_id,
                         )
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
-                task_output = TaskOutput.from_task(updated_task, downloaded_file_urls)
+
+                task_output = TaskOutput.from_task(updated_task, downloaded_files)
                 output_parameter_value = task_output.model_dump()
                 await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_parameter_value)
                 return await self.build_block_result(
@@ -693,10 +695,9 @@ class BaseTaskBlock(Block):
                 current_retry += 1
                 will_retry = current_retry <= self.max_retries
                 retry_message = f", retrying task {current_retry}/{self.max_retries}" if will_retry else ""
-                downloaded_file_urls = []
                 try:
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                        downloaded_file_urls = await app.STORAGE.get_downloaded_files(
+                        downloaded_files = await app.STORAGE.get_downloaded_files(
                             organization_id=workflow_run.organization_id,
                             task_id=updated_task.task_id,
                             workflow_run_id=workflow_run_id,
@@ -705,7 +706,7 @@ class BaseTaskBlock(Block):
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
 
-                task_output = TaskOutput.from_task(updated_task, downloaded_file_urls)
+                task_output = TaskOutput.from_task(updated_task, downloaded_files)
                 LOG.warning(
                     f"Task failed with status {updated_task.status}{retry_message}",
                     task_id=updated_task.task_id,

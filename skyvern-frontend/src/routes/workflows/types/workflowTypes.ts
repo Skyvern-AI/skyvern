@@ -213,7 +213,6 @@ export type WorkflowBlockType =
 
 export const WorkflowEditorParameterTypes = {
   Workflow: "workflow",
-  BitwardenLoginCredential: "bitwardenLoginCredential",
   Credential: "credential",
   Secret: "secret",
   Context: "context",

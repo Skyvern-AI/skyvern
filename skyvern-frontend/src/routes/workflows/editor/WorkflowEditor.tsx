@@ -129,8 +129,7 @@ function WorkflowEditor() {
               } else {
                 return {
                   key: parameter.key,
-                  parameterType:
-                    WorkflowEditorParameterTypes.BitwardenLoginCredential,
+                  parameterType: WorkflowEditorParameterTypes.Credential,
                   collectionId: parameter.bitwarden_collection_id,
                   urlParameterKey: parameter.url_parameter_key,
                   description: parameter.description,

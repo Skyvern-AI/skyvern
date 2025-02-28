@@ -601,6 +601,13 @@ function isInteractable(element, hoverStylesMap) {
     return false;
   }
 
+  // element with pointer-events: none should not be considered as interactable
+  // https://developer.mozilla.org/en-US/docs/Web/CSS/pointer-events#none
+  const elementPointerEvent = getElementComputedStyle(element)?.pointerEvents;
+  if (elementPointerEvent === "none") {
+    return false;
+  }
+
   if (hasWidgetRole(element)) {
     return true;
   }
@@ -793,6 +800,21 @@ function isDatePickerSelector(element) {
   if (
     tagName === "button" &&
     element.getAttribute("data-testid")?.includes("date")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isCheckableDiv(element) {
+  const tagName = element.tagName.toLowerCase();
+  if (tagName !== "div") {
+    return false;
+  }
+  if (
+    element.className &&
+    element.className.toString().includes("checkbox") &&
+    element.childElementCount === 0
   ) {
     return true;
   }
@@ -1300,6 +1322,7 @@ async function buildElementObject(
       isAngularDropdown(element) ||
       isSelect2Dropdown(element) ||
       isSelect2MultiChoice(element),
+    isCheckable: isCheckableDiv(element),
   };
 
   let isInShadowRoot = element.getRootNode() instanceof ShadowRoot;

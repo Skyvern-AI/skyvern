@@ -23,6 +23,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
@@ -1001,14 +1002,17 @@ class WorkflowService:
         if recording_artifact:
             recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
+        downloaded_files: list[FileInfo] | None = None
         downloaded_file_urls: list[str] | None = None
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                downloaded_file_urls = await app.STORAGE.get_downloaded_files(
+                downloaded_files = await app.STORAGE.get_downloaded_files(
                     organization_id=workflow_run.organization_id,
                     task_id=None,
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
+                if downloaded_files:
+                    downloaded_file_urls = [file_info.url for file_info in downloaded_files]
         except asyncio.TimeoutError:
             LOG.warning(
                 "Timeout to get downloaded files",
@@ -1030,14 +1034,18 @@ class WorkflowService:
         )
 
         outputs = None
+        EXTRACTED_INFORMATION_KEY = "extracted_information"
         if output_parameter_tuples:
             outputs = {output_parameter.key: output.value for output_parameter, output in output_parameter_tuples}
             extracted_information = {
-                output_parameter.key: output.value["extracted_information"]
+                output_parameter.key: output.value[EXTRACTED_INFORMATION_KEY]
                 for output_parameter, output in output_parameter_tuples
-                if isinstance(output.value, dict) and output.value["extracted_information"] is not None
+                if output.value is not None
+                and isinstance(output.value, dict)
+                and EXTRACTED_INFORMATION_KEY in output.value
+                and output.value[EXTRACTED_INFORMATION_KEY] is not None
             }
-            outputs["extracted_information"] = extracted_information
+            outputs[EXTRACTED_INFORMATION_KEY] = extracted_information
 
         total_steps = None
         total_cost = None
@@ -1068,6 +1076,7 @@ class WorkflowService:
             parameters=parameters_with_value,
             screenshot_urls=screenshot_urls,
             recording_url=recording_url,
+            downloaded_files=downloaded_files,
             downloaded_file_urls=downloaded_file_urls,
             outputs=outputs,
             total_steps=total_steps,

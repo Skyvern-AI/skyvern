@@ -61,6 +61,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
@@ -905,19 +906,18 @@ class ForgeAgent:
                     action_result = ActionSuccess()
                     action_result.step_order = step.order
                     action_result.step_retry_number = step.retry_index
-                    detailed_agent_step_output.actions_and_results[action_idx] = (
-                        ReloadPageAction(
-                            reasoning="Something wrong with the current page, reload to continue",
-                            status=ActionStatus.completed,
-                            organization_id=task.organization_id,
-                            workflow_run_id=task.workflow_run_id,
-                            task_id=task.task_id,
-                            step_id=step.step_id,
-                            step_order=step.order,
-                            action_order=action_idx,
-                        ),
-                        [action_result],
+                    action = ReloadPageAction(
+                        reasoning="Something wrong with the current page, reload to continue",
+                        status=ActionStatus.completed,
+                        organization_id=task.organization_id,
+                        workflow_run_id=task.workflow_run_id,
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        step_order=step.order,
+                        action_order=action_idx,
                     )
+                    detailed_agent_step_output.actions_and_results[action_idx] = (action, [action_result])
+                    await app.DATABASE.create_action(action=action)
                     await self.record_artifacts_after_action(task, step, browser_state)
                     break
 
@@ -1794,7 +1794,7 @@ class ForgeAgent:
         recording_url = None
         browser_console_log_url: str | None = None
         latest_action_screenshot_urls: list[str] | None = None
-        downloaded_file_urls: list[str] | None = None
+        downloaded_files: list[FileInfo] | None = None
 
         # get the artifact of the screenshot and get the screenshot_url
         screenshot_artifact = await app.DATABASE.get_artifact(
@@ -1832,7 +1832,7 @@ class ForgeAgent:
         if task.organization_id:
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                    downloaded_file_urls = await app.STORAGE.get_downloaded_files(
+                    downloaded_files = await app.STORAGE.get_downloaded_files(
                         organization_id=task.organization_id, task_id=task.task_id, workflow_run_id=task.workflow_run_id
                     )
             except asyncio.TimeoutError:
@@ -1869,8 +1869,8 @@ class ForgeAgent:
             action_screenshot_urls=latest_action_screenshot_urls,
             screenshot_url=screenshot_url,
             recording_url=recording_url,
-            downloaded_file_urls=downloaded_file_urls,
             browser_console_log_url=browser_console_log_url,
+            downloaded_files=downloaded_files,
             failure_reason=failure_reason,
         )
 

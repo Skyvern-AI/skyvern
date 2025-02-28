@@ -1327,7 +1327,7 @@ async def get_browser_sessions(
 async def create_browser_session(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> BrowserSessionResponse:
-    browser_session, _ = await app.PERSISTENT_SESSIONS_MANAGER.create_session(current_org.organization_id)
+    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(current_org.organization_id)
     return BrowserSessionResponse.from_browser_session(browser_session)
 
 
