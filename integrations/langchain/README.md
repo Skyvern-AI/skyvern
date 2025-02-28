@@ -7,9 +7,10 @@
   - [Basic Usage](#basic-usage)
     - [Run a task(sync) with skyvern agent (calling skyvern agent function directly in the tool)](#run-a-tasksync-with-skyvern-agent-calling-skyvern-agent-function-directly-in-the-tool)
     - [Run a task(async) with skyvern agent (calling skyvern agent function directly in the tool)](#run-a-taskasync-with-skyvern-agent-calling-skyvern-agent-function-directly-in-the-tool)
-    - [Get a task(async) with skyvern agent (calling skyvern agent function directly in the tool)](#get-a-taskasync-with-skyvern-agent-calling-skyvern-agent-function-directly-in-the-tool)
+    - [Get a task with skyvern agent (calling skyvern agent function directly in the tool)](#get-a-task-with-skyvern-agent-calling-skyvern-agent-function-directly-in-the-tool)
     - [Run a task(sync) with skyvern client (calling skyvern OpenAPI in the tool)](#run-a-tasksync-with-skyvern-client-calling-skyvern-openapi-in-the-tool)
     - [Run a task(async) with skyvern client (calling skyvern OpenAPI in the tool)](#run-a-taskasync-with-skyvern-client-calling-skyvern-openapi-in-the-tool)
+    - [Get a task with skyvern client (calling skyvern OpenAPI in the tool)](#get-a-task-with-skyvern-client-calling-skyvern-openapi-in-the-tool)
   - [Agent Usage](#agent-usage)
     - [Run a task(async) and wait until the task is finished by skyvern agent (calling skyvern agent function directly in the tool)](#run-a-taskasync-and-wait-until-the-task-is-finished-by-skyvern-agent-calling-skyvern-agent-function-directly-in-the-tool)
     - [Run a task(async) and wait until the task is finished by skyvern client (calling skyvern OpenAPI in the tool)](#run-a-taskasync-and-wait-until-the-task-is-finished-by-skyvern-client-calling-skyvern-openapi-in-the-tool)
@@ -77,13 +78,16 @@ async def main():
     # to run skyvern agent locally, must run `skyvern init` first
     print(await dispatch_task.invoke("Navigate to the Hacker News homepage and get the top 3 posts."))
 
+    # keep the script running until the task is finished
+    await asyncio.sleep(600)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
 
 ```
 
-### Get a task(async) with skyvern agent (calling skyvern agent function directly in the tool)
+### Get a task with skyvern agent (calling skyvern agent function directly in the tool)
 
 :warning: :warning: if you want to run this code block, you need to run `skyvern init --openai-api-key <your_openai_api_key>` command in your terminal to set up skyvern first.
 
@@ -141,10 +145,36 @@ dispatch_task = DispatchTask(
     credential="<your_organization_api_key>",
 )
 # or you can load the credential from SKYVERN_CREDENTIAL in .env
-# run_task = RunTask()
+# dispatch_task = DispatchTask()
 
 async def main():
     print(await dispatch_task.invoke("Navigate to the Hacker News homepage and get the top 3 posts."))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+
+### Get a task with skyvern client (calling skyvern OpenAPI in the tool)
+> async task will return immediately and the task will be running in the background.
+
+no need to run `skyvern init` command in your terminal to set up skyvern before using this integration.
+
+the task is actually running in the skyvern cloud service, so you don't need to keep your script running until the task is finished.
+
+```python
+import asyncio
+from skyvern_langchain.client import GetTask
+
+get_task = GetTask(
+    credential="<your_organization_api_key>",
+)
+# or you can load the credential from SKYVERN_CREDENTIAL in .env
+# get_task = GetTask()
+
+async def main():
+    print(await get_task.invoke("tsk_xxxxxxx"))
 
 
 if __name__ == "__main__":
