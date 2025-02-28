@@ -26,7 +26,7 @@ class SkyvernTaskBaseTool(BaseTool):
         )
         return AsyncSkyvern(base_url=self.base_url, httpx_client=httpx_client)
 
-    def _run(self) -> None:
+    def _run(self, *args: Any, **kwargs: Any) -> None:
         raise NotImplementedError("skyvern task tool does not support sync")
 
 

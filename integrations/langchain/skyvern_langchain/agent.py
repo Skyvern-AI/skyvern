@@ -1,4 +1,4 @@
-from typing import Literal, Type
+from typing import Any, Literal, Type
 
 from langchain.tools import BaseTool
 from litellm import BaseModel
@@ -21,7 +21,7 @@ class SkyvernTaskBaseTool(BaseTool):
     timeout_seconds: int = Field(default=settings.run_task_timeout)
     agent: Agent = agent
 
-    def _run(self) -> None:
+    def _run(self, *args: Any, **kwargs: Any) -> None:
         raise NotImplementedError("skyvern task tool does not support sync")
 
     # TODO: agent haven't exposed the task v1 generate function, we can migrate to use agent interface when it's available
