@@ -68,7 +68,7 @@ if __name__ == "__main__":
 ```
 
 ### Run a task(async) with skyvern agent (calling skyvern agent function directly in the tool)
-> async task will return immediately and the task will be running in the background. You can use `SkyvernTaskTools().get` tool to poll the task information until the task is finished.
+> async task will return immediately and the task will be running in the background. You can use `GetTask` tool to poll the task information until the task is finished.
 
 :warning: :warning: if you want to run this code block, you need to run `skyvern init --openai-api-key <your_openai_api_key>` command in your terminal to set up skyvern first.
 
@@ -150,7 +150,7 @@ if __name__ == "__main__":
 ```
 
 ### Run a task(async) with skyvern client (calling skyvern OpenAPI in the tool)
-> async task will return immediately and the task will be running in the background. You can use `SkyvernTaskTools().get` tool to poll the task information until the task is finished.
+> async task will return immediately and the task will be running in the background. You can use `GetTask` tool to poll the task information until the task is finished.
 
 no need to run `skyvern init` command in your terminal to set up skyvern before using this integration.
 
