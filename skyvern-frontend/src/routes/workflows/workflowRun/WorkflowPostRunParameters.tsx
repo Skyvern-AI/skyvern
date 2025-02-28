@@ -44,13 +44,13 @@ function WorkflowPostRunParameters() {
   }
 
   const activeBlock = getActiveBlock();
-  const isObserverTask = workflowRun.task_v2 !== null;
+  const isTaskV2 = workflowRun.task_v2 !== null;
 
-  const webhookCallbackUrl = isObserverTask
+  const webhookCallbackUrl = isTaskV2
     ? workflowRun.task_v2?.webhook_callback_url
     : workflowRun.webhook_callback_url;
 
-  const proxyLocation = isObserverTask
+  const proxyLocation = isTaskV2
     ? workflowRun.task_v2?.proxy_location
     : workflowRun.proxy_location;
 

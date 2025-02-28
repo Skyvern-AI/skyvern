@@ -1,7 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
 import {
   Createv2TaskRequest,
-  ObserverTask,
+  TaskV2,
   ProxyLocation,
   TaskGenerationApiResponse,
 } from "@/api/types";
@@ -156,7 +156,7 @@ function PromptBox() {
   const startObserverCruiseMutation = useMutation({
     mutationFn: async (prompt: string) => {
       const client = await getClient(credentialGetter, "v2");
-      return client.post<Createv2TaskRequest, { data: ObserverTask }>(
+      return client.post<Createv2TaskRequest, { data: TaskV2 }>(
         "/tasks",
         {
           user_prompt: prompt,
