@@ -33,6 +33,7 @@ function ExampleCasePill({ exampleId, version, icon, label, prompt }: Props) {
         title: "Workflow Run Created",
         description: `Workflow run created successfully.`,
       });
+
       queryClient.invalidateQueries({
         queryKey: ["workflowRuns"],
       });
@@ -42,6 +43,7 @@ function ExampleCasePill({ exampleId, version, icon, label, prompt }: Props) {
       queryClient.invalidateQueries({
         queryKey: ["runs"],
       });
+
       navigate(
         `/workflows/${response.data.workflow_permanent_id}/${response.data.workflow_run_id}`,
       );
