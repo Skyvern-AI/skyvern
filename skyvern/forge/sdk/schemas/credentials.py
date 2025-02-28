@@ -21,6 +21,7 @@ class CreditCardCredentialResponse(BaseModel):
 class PasswordCredential(BaseModel):
     password: str
     username: str
+    totp: str | None = None
 
 
 class CreditCardCredential(BaseModel):

@@ -60,6 +60,7 @@ def get_list_response_item_from_bitwarden_item(item: dict) -> CredentialItem:
             credential=PasswordCredential(
                 username=login["username"],
                 password=login["password"],
+                totp=login["totp"],
             ),
             name=item["name"],
             credential_type=CredentialType.PASSWORD,
@@ -726,6 +727,7 @@ class BitwardenService:
         return PasswordCredential(
             username=login["username"],
             password=login["password"],
+            totp=login["totp"],
         )
 
     @staticmethod
@@ -743,6 +745,7 @@ class BitwardenService:
 
         login_template["username"] = credential.username
         login_template["password"] = credential.password
+        login_template["totp"] = credential.totp
 
         item_template["type"] = get_bitwarden_item_type_code(BitwardenItemType.LOGIN)
         item_template["name"] = name
@@ -968,6 +971,7 @@ class BitwardenService:
                 credential=PasswordCredential(
                     username=login_item["username"],
                     password=login_item["password"],
+                    totp=login_item["totp"],
                 ),
             )
         elif response["data"]["type"] == BitwardenItemType.CREDIT_CARD:
