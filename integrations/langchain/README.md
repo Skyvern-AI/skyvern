@@ -129,8 +129,10 @@ load_dotenv()
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
 run_task = RunTask(
-    credential="<your_organization_api_key>", # or load it from SKYVERN_CREDENTIAL in .env
+    credential="<your_organization_api_key>",
 )
+# or you can load the credential from SKYVERN_CREDENTIAL in .env
+# run_task = RunTask()
 
 agent = initialize_agent(
     llm=llm,
@@ -167,11 +169,16 @@ load_dotenv()
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
 dispatch_task = DispatchTask(
-    credential="<your_organization_api_key>", # or load it from SKYVERN_CREDENTIAL in .env
+    credential="<your_organization_api_key>",
 )
+# or you can load the credential from SKYVERN_CREDENTIAL in .env
+# dispatch_task = DispatchTask()
+
 get_task = GetTask(
-    credential="<your_organization_api_key>", # or load it from SKYVERN_CREDENTIAL in .env
+    credential="<your_organization_api_key>",
 )
+# or you can load the credential from SKYVERN_CREDENTIAL in .env
+# get_task = GetTask()
 
 agent = initialize_agent(
     llm=llm,
