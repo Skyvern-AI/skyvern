@@ -76,7 +76,7 @@ dispatch_task = DispatchTask()
 
 async def main():
     # to run skyvern agent locally, must run `skyvern init` first
-    print(await dispatch_task.invoke("Navigate to the Hacker News homepage and get the top 3 posts."))
+    print(await dispatch_task.ainvoke("Navigate to the Hacker News homepage and get the top 3 posts."))
 
     # keep the script running until the task is finished
     await asyncio.sleep(600)
@@ -99,7 +99,7 @@ get_task = GetTask()
 
 async def main():
     # to run skyvern agent locally, must run `skyvern init` first
-    print(await get_task.invoke("tsk_xxxxxxx"))
+    print(await get_task.ainvoke("tsk_xxxxxxx"))
 
 
 if __name__ == "__main__":
@@ -148,7 +148,7 @@ dispatch_task = DispatchTask(
 # dispatch_task = DispatchTask()
 
 async def main():
-    print(await dispatch_task.invoke("Navigate to the Hacker News homepage and get the top 3 posts."))
+    print(await dispatch_task.ainvoke("Navigate to the Hacker News homepage and get the top 3 posts."))
 
 
 if __name__ == "__main__":
@@ -174,7 +174,7 @@ get_task = GetTask(
 # get_task = GetTask()
 
 async def main():
-    print(await get_task.invoke("tsk_xxxxxxx"))
+    print(await get_task.ainvoke("tsk_xxxxxxx"))
 
 
 if __name__ == "__main__":
