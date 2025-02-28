@@ -12,6 +12,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
+from skyvern.forge.sdk.schemas.credentials import PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
@@ -177,21 +178,32 @@ class WorkflowRunContext:
         organization: Organization,
     ) -> None:
         LOG.info(f"Fetching credential parameter value for credential: {parameter.credential_id}")
-        credential_item = await app.DATABASE.get_credential(
+        db_credential = await app.DATABASE.get_credential(
             parameter.credential_id, organization_id=organization.organization_id
         )
-        if credential_item is None:
+        if db_credential is None:
             raise CredentialParameterNotFoundError(parameter.credential_id)
-        credential = await BitwardenService.get_credential_item(credential_item.item_id)
-        credential_dict = credential.credential.model_dump()
+
+        bitwarden_credential = await BitwardenService.get_credential_item(db_credential.item_id)
+
+        credential_item = bitwarden_credential.credential
 
         self.parameters[parameter.key] = parameter
         self.values[parameter.key] = {}
+        credential_dict = credential_item.model_dump()
         for key, value in credential_dict.items():
             random_secret_id = self.generate_random_secret_id()
             secret_id = f"{random_secret_id}_{key}"
             self.secrets[secret_id] = value
             self.values[parameter.key][key] = secret_id
+
+        if isinstance(credential_item, PasswordCredential) and credential_item.totp is not None:
+            random_secret_id = self.generate_random_secret_id()
+            totp_secret_id = f"{random_secret_id}_totp"
+            self.secrets[totp_secret_id] = BitwardenConstants.TOTP
+            totp_secret_value = self.totp_secret_value_key(totp_secret_id)
+            self.secrets[totp_secret_value] = credential_item.totp
+            self.values[parameter.key]["totp"] = totp_secret_id
 
     async def register_aws_secret_parameter_value(
         self,
