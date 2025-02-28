@@ -99,7 +99,7 @@ get_task = GetTask()
 
 async def main():
     # to run skyvern agent locally, must run `skyvern init` first
-    print(await get_task.ainvoke("tsk_xxxxxxx"))
+    print(await get_task.ainvoke("<task_id>"))
 
 
 if __name__ == "__main__":
@@ -174,7 +174,7 @@ get_task = GetTask(
 # get_task = GetTask()
 
 async def main():
-    print(await get_task.ainvoke("tsk_xxxxxxx"))
+    print(await get_task.ainvoke("<task_id>"))
 
 
 if __name__ == "__main__":
