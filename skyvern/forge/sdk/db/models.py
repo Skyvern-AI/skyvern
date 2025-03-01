@@ -56,6 +56,7 @@ class Base(AsyncAttrs, DeclarativeBase):
 
 class TaskModel(Base):
     __tablename__ = "tasks"
+    __table_args__ = (Index("idx_tasks_org_created", "organization_id", "created_at"),)
 
     task_id = Column(String, primary_key=True, index=True, default=generate_task_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
@@ -101,7 +102,7 @@ class StepModel(Base):
 
     step_id = Column(String, primary_key=True, index=True, default=generate_step_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
-    task_id = Column(String, ForeignKey("tasks.task_id"))
+    task_id = Column(String, ForeignKey("tasks.task_id"), index=True)
     status = Column(String)
     output = Column(JSON)
     order = Column(Integer)
@@ -230,6 +231,7 @@ class WorkflowModel(Base):
 
 class WorkflowRunModel(Base):
     __tablename__ = "workflow_runs"
+    __table_args__ = (Index("idx_workflow_runs_org_created", "organization_id", "created_at"),)
 
     workflow_run_id = Column(String, primary_key=True, index=True, default=generate_workflow_run_id)
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"), nullable=False)
@@ -250,6 +252,7 @@ class WorkflowRunModel(Base):
         default=datetime.datetime.utcnow,
         onupdate=datetime.datetime.utcnow,
         nullable=False,
+        index=True,
     )
 
 
