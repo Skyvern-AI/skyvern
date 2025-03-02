@@ -36,7 +36,8 @@ class LLMConfigBase:
 @dataclass(frozen=True)
 class LLMConfig(LLMConfigBase):
     litellm_params: Optional[LiteLLMParams] = field(default=None)
-    max_completion_tokens: int = SettingsManager.get_settings().LLM_CONFIG_MAX_TOKENS
+    max_tokens: int | None = SettingsManager.get_settings().LLM_CONFIG_MAX_TOKENS
+    max_completion_tokens: int | None = None
     temperature: float | None = SettingsManager.get_settings().LLM_CONFIG_TEMPERATURE
     reasoning_effort: str | None = None
 
@@ -74,7 +75,8 @@ class LLMRouterConfig(LLMConfigBase):
     allowed_fails: int | None = None
     allowed_fails_policy: AllowedFailsPolicy | None = None
     cooldown_time: float | None = None
-    max_completion_tokens: int = SettingsManager.get_settings().LLM_CONFIG_MAX_TOKENS
+    max_tokens: int | None = SettingsManager.get_settings().LLM_CONFIG_MAX_TOKENS
+    max_completion_tokens: int | None = None
     reasoning_effort: str | None = None
     temperature: float | None = SettingsManager.get_settings().LLM_CONFIG_TEMPERATURE
 
