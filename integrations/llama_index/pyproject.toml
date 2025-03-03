@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "skyvern-llamaindex"
-version = "0.0.3"
+version = "0.0.4"
 description = "Skyvern integration for LlamaIndex"
 authors = ["lawyzheng <lawy@skyvern.com>"]
 packages = [{ include = "skyvern_llamaindex" }]
