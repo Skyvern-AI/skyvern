@@ -12,9 +12,11 @@ from skyvern.forge.sdk.schemas.observers import ObserverTask, ObserverTaskReques
 from skyvern.forge.sdk.schemas.task_generations import TaskGenerationBase
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskRequest, TaskResponse
 
+agent = Agent()
+
 
 class SkyvernTool(BaseModel):
-    agent: Agent = Agent()
+    agent: Agent = agent
 
     def run_task(self) -> FunctionTool:
         task_tool_spec = SkyvernTaskToolSpec(agent=self.agent)
