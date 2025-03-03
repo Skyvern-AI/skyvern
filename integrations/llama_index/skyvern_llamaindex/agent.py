@@ -2,7 +2,6 @@ from typing import List, Literal, Optional
 
 from llama_index.core.tools import FunctionTool
 from llama_index.core.tools.tool_spec.base import SPEC_FUNCTION_TYPE, BaseToolSpec
-from pydantic import BaseModel
 from skyvern_llamaindex.settings import settings
 
 from skyvern.agent import Agent
@@ -15,8 +14,9 @@ from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskRequest, Tas
 agent = Agent()
 
 
-class SkyvernTool(BaseModel):
-    agent: Agent = agent
+class SkyvernTool:
+    def __init__(self, agent: Agent = agent):
+        self.agent = agent
 
     def run_task(self) -> FunctionTool:
         task_tool_spec = SkyvernTaskToolSpec(agent=self.agent)
@@ -62,8 +62,8 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         Use Skyvern agent to run a task. This function won't return until the task is finished.
 
         Args:
-            user_prompt[str]: User's prompt about the task description.
-            url (Optional[str]): The url of the target website in the task.
+            user_prompt[str]: The user's prompt describing the task.
+            url (Optional[str]): The URL of the target website for the task.
         """
 
         if self.engine == "TaskV1":
@@ -76,8 +76,8 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         Use Skyvern agent to dispatch a task. This function will return immediately and the task will be running in the background.
 
         Args:
-            user_prompt[str]: User's prompt about the task description.
-            url (Optional[str]): The url of the target website in the task.
+            user_prompt[str]: The user's prompt describing the task.
+            url (Optional[str]): The URL of the target website for the task.
         """
 
         if self.engine == "TaskV1":

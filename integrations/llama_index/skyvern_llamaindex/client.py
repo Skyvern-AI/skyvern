@@ -70,8 +70,8 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         Use Skyvern client to run a task. This function won't return until the task is finished.
 
         Args:
-            user_prompt[str]: User's prompt about the task description.
-            url (Optional[str]): The url of the target website in the task.
+            user_prompt[str]: The user's prompt describing the task.
+            url (Optional[str]): The URL of the target website for the task.
         """
 
         if self.engine == "TaskV1":
@@ -86,8 +86,8 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         Use Skyvern client to dispatch a task. This function will return immediately and the task will be running in the background.
 
         Args:
-            user_prompt[str]: User's prompt about the task description.
-            url (Optional[str]): The url of the target website in the task.
+            user_prompt[str]: The user's prompt describing the task.
+            url (Optional[str]): The URL of the target website for the task.
         """
 
         if self.engine == "TaskV1":
