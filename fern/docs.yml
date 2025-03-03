@@ -1,5 +1,6 @@
 instances:
   - url: https://skyvern.docs.buildwithfern.com
+    custom-domain: https://docs.skyvern.com
 title: Skyvern
 favicon: images/skyvern_favicon.png
 logo:
@@ -8,8 +9,8 @@ logo:
   height: 28
 colors:
   accentPrimary:
-    dark: '#14D4A7'
-    light: '#038B5A'
+    dark: '#0D9373'
+    light: '#07C983'
   background:
     dark: '#000000'
     light: '#FFFFFF'
@@ -28,6 +29,10 @@ navigation:
         path: running-tasks/introduction.mdx
       - page: Tasks API
         path: running-tasks/api-spec.mdx
+      - api: Endpoints
+        paginated: true
+        snippets: 
+          python: skyvern
       - page: Webhooks FAQ
         path: running-tasks/webhooks-faq.mdx
       - page: Visualizing Results
