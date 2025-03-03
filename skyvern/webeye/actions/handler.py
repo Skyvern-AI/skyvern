@@ -43,7 +43,6 @@ from skyvern.exceptions import (
     NoAutoCompleteOptionMeetCondition,
     NoAvailableOptionFoundForCustomSelection,
     NoElementMatchedForTargetOption,
-    NoFileDownloadTriggered,
     NoIncrementalElementFoundForAutoCompletion,
     NoIncrementalElementFoundForCustomSelection,
     NoSuitableAutoCompleteOption,
@@ -510,7 +509,7 @@ async def handle_click_to_download_file_action(
             step_id=step.step_id,
             workflow_run_id=task.workflow_run_id,
         )
-        return [ActionFailure(exception=NoFileDownloadTriggered(action.element_id))]
+        return [ActionSuccess(download_triggered=False)]
 
     # check if there's any file is still downloading
     downloading_files = list_downloading_files_in_directory(download_dir)
