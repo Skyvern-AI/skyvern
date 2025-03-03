@@ -804,20 +804,22 @@ class WorkflowService:
         bitwarden_client_id_aws_secret_key: str,
         bitwarden_client_secret_aws_secret_key: str,
         bitwarden_master_password_aws_secret_key: str,
-        url_parameter_key: str,
         key: str,
+        url_parameter_key: str | None = None,
         description: str | None = None,
         bitwarden_collection_id: str | None = None,
+        bitwarden_item_id: str | None = None,
     ) -> Parameter:
         return await app.DATABASE.create_bitwarden_login_credential_parameter(
             workflow_id=workflow_id,
             bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
             bitwarden_client_secret_aws_secret_key=bitwarden_client_secret_aws_secret_key,
             bitwarden_master_password_aws_secret_key=bitwarden_master_password_aws_secret_key,
-            url_parameter_key=url_parameter_key,
             key=key,
+            url_parameter_key=url_parameter_key,
             description=description,
             bitwarden_collection_id=bitwarden_collection_id,
+            bitwarden_item_id=bitwarden_item_id,
         )
 
     async def create_credential_parameter(
@@ -1397,11 +1399,17 @@ class WorkflowService:
                         credential_id=parameter.credential_id,
                     )
                 elif parameter.parameter_type == ParameterType.BITWARDEN_LOGIN_CREDENTIAL:
-                    if not parameter.bitwarden_collection_id:
+                    if not parameter.bitwarden_collection_id and not parameter.bitwarden_item_id:
                         raise WorkflowParameterMissingRequiredValue(
                             workflow_parameter_type=ParameterType.BITWARDEN_LOGIN_CREDENTIAL,
                             workflow_parameter_key=parameter.key,
-                            required_value="bitwarden_collection_id",
+                            required_value="bitwarden_collection_id or bitwarden_item_id",
+                        )
+                    if parameter.bitwarden_collection_id and not parameter.url_parameter_key:
+                        raise WorkflowParameterMissingRequiredValue(
+                            workflow_parameter_type=ParameterType.BITWARDEN_LOGIN_CREDENTIAL,
+                            workflow_parameter_key=parameter.key,
+                            required_value="url_parameter_key",
                         )
                     parameters[parameter.key] = await self.create_bitwarden_login_credential_parameter(
                         workflow_id=workflow.workflow_id,
@@ -1412,6 +1420,7 @@ class WorkflowService:
                         key=parameter.key,
                         description=parameter.description,
                         bitwarden_collection_id=parameter.bitwarden_collection_id,
+                        bitwarden_item_id=parameter.bitwarden_item_id,
                     )
                 elif parameter.parameter_type == ParameterType.BITWARDEN_SENSITIVE_INFORMATION:
                     parameters[parameter.key] = await self.create_bitwarden_sensitive_information_parameter(
@@ -1434,7 +1443,7 @@ class WorkflowService:
                         bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
                         # TODO: remove "# type: ignore" after ensuring bitwarden_collection_id is always set
                         bitwarden_collection_id=parameter.bitwarden_collection_id,  # type: ignore
-                        bitwarden_item_id=parameter.bitwarden_item_id,
+                        bitwarden_item_id=parameter.bitwarden_item_id,  # type: ignore
                         key=parameter.key,
                         description=parameter.description,
                     )

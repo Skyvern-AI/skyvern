@@ -165,6 +165,7 @@ class WorkflowRunContext:
             bw_organization_id=self.secrets[BitwardenConstants.BW_ORGANIZATION_ID],
             bw_collection_ids=self.secrets[BitwardenConstants.BW_COLLECTION_IDS],
             collection_id=self.secrets[BitwardenConstants.BW_COLLECTION_ID],
+            item_id=self.secrets[BitwardenConstants.BW_ITEM_ID],
         )
         return secret_credentials
 
@@ -241,11 +242,17 @@ class WorkflowRunContext:
             LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
             raise e
 
-        if self.has_parameter(parameter.url_parameter_key) and self.has_value(parameter.url_parameter_key):
+        if (
+            parameter.url_parameter_key
+            and self.has_parameter(parameter.url_parameter_key)
+            and self.has_value(parameter.url_parameter_key)
+        ):
             url = self.values[parameter.url_parameter_key]
         elif parameter.url_parameter_key:
             # If a key can't be found within the parameter values dict, assume it's a URL (and not a URL Parameter)
             url = parameter.url_parameter_key
+        elif parameter.bitwarden_item_id:
+            url = None
         else:
             LOG.error(f"URL parameter {parameter.url_parameter_key} not found or has no value")
             raise SkyvernException("URL parameter for Bitwarden login credentials not found or has no value")
@@ -259,6 +266,13 @@ class WorkflowRunContext:
             else:
                 collection_id = parameter.bitwarden_collection_id
 
+        item_id = None
+        if parameter.bitwarden_item_id:
+            if self.has_parameter(parameter.bitwarden_item_id) and self.has_value(parameter.bitwarden_item_id):
+                item_id = self.values[parameter.bitwarden_item_id]
+            else:
+                item_id = parameter.bitwarden_item_id
+
         try:
             secret_credentials = await BitwardenService.get_secret_value_from_url(
                 client_id,
@@ -268,6 +282,7 @@ class WorkflowRunContext:
                 organization.bw_collection_ids,
                 url,
                 collection_id=collection_id,
+                item_id=item_id,
             )
             if secret_credentials:
                 self.secrets[BitwardenConstants.BW_ORGANIZATION_ID] = organization.bw_organization_id
@@ -277,6 +292,7 @@ class WorkflowRunContext:
                 self.secrets[BitwardenConstants.CLIENT_ID] = client_id
                 self.secrets[BitwardenConstants.MASTER_PASSWORD] = master_password
                 self.secrets[BitwardenConstants.BW_COLLECTION_ID] = parameter.bitwarden_collection_id
+                self.secrets[BitwardenConstants.BW_ITEM_ID] = item_id
 
                 random_secret_id = self.generate_random_secret_id()
                 # username secret
@@ -410,7 +426,7 @@ class WorkflowRunContext:
             self.secrets[BitwardenConstants.CLIENT_ID] = client_id
             self.secrets[BitwardenConstants.CLIENT_SECRET] = client_secret
             self.secrets[BitwardenConstants.MASTER_PASSWORD] = master_password
-            self.secrets[BitwardenConstants.ITEM_ID] = item_id
+            self.secrets[BitwardenConstants.BW_ITEM_ID] = item_id
 
             fields_to_obfuscate = {
                 BitwardenConstants.CREDIT_CARD_NUMBER: "card_number",

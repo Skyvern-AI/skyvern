@@ -326,7 +326,8 @@ class BitwardenLoginCredentialParameterModel(Base):
     bitwarden_client_secret_aws_secret_key = Column(String, nullable=False)
     bitwarden_master_password_aws_secret_key = Column(String, nullable=False)
     bitwarden_collection_id = Column(String, nullable=True, default=None)
-    url_parameter_key = Column(String, nullable=False)
+    bitwarden_item_id = Column(String, nullable=True, default=None)
+    url_parameter_key = Column(String, nullable=True, default=None)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,

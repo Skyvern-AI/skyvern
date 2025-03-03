@@ -286,6 +286,7 @@ def convert_to_bitwarden_login_credential_parameter(
         bitwarden_client_secret_aws_secret_key=bitwarden_login_credential_parameter_model.bitwarden_client_secret_aws_secret_key,
         bitwarden_master_password_aws_secret_key=bitwarden_login_credential_parameter_model.bitwarden_master_password_aws_secret_key,
         bitwarden_collection_id=bitwarden_login_credential_parameter_model.bitwarden_collection_id,
+        bitwarden_item_id=bitwarden_login_credential_parameter_model.bitwarden_item_id,
         url_parameter_key=bitwarden_login_credential_parameter_model.url_parameter_key,
         created_at=bitwarden_login_credential_parameter_model.created_at,
         modified_at=bitwarden_login_credential_parameter_model.modified_at,
