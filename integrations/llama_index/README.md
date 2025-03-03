@@ -41,6 +41,9 @@ from llama_index.agent.openai import OpenAIAgent
 from llama_index.llms.openai import OpenAI
 from skyvern_llamaindex.agent import SkyvernTool
 
+# load OpenAI API key from .env
+load_dotenv()
+
 skyvern_tool = SkyvernTool()
 
 agent = OpenAIAgent.from_tools(
@@ -66,6 +69,9 @@ from dotenv import load_dotenv
 from llama_index.agent.openai import OpenAIAgent
 from llama_index.llms.openai import OpenAI
 from skyvern_llamaindex.agent import SkyvernTool
+
+# load OpenAI API key from .env
+load_dotenv()
 
 skyvern_tool = SkyvernTool()
 
@@ -98,6 +104,9 @@ from llama_index.agent.openai import OpenAIAgent
 from llama_index.llms.openai import OpenAI
 from skyvern_llamaindex.agent import SkyvernTool
 
+# load OpenAI API key from .env
+load_dotenv()
+
 skyvern_tool = SkyvernTool()
 
 agent = OpenAIAgent.from_tools(
@@ -120,6 +129,9 @@ from dotenv import load_dotenv
 from llama_index.agent.openai import OpenAIAgent
 from llama_index.llms.openai import OpenAI
 from skyvern_llamaindex.agent import SkyvernTool
+
+# load OpenAI API key from .env
+load_dotenv()
 
 skyvern_tool = SkyvernTool(api_key="<your_organization_api_key>")
 # or you can load the api_key from SKYVERN_API_KEY in .env
@@ -148,6 +160,9 @@ from llama_index.agent.openai import OpenAIAgent
 from llama_index.llms.openai import OpenAI
 from skyvern_llamaindex.client import SkyvernTool
 
+# load OpenAI API key from .env
+load_dotenv()
+
 skyvern_tool = SkyvernTool(api_key="<your_organization_api_key>")
 # or you can load the api_key from SKYVERN_API_KEY in .env
 # skyvern_tool = SkyvernTool()
@@ -172,6 +187,9 @@ from dotenv import load_dotenv
 from llama_index.agent.openai import OpenAIAgent
 from llama_index.llms.openai import OpenAI
 from skyvern_llamaindex.client import SkyvernTool
+
+# load OpenAI API key from .env
+load_dotenv()
 
 skyvern_tool = SkyvernTool(api_key="<your_organization_api_key>")
 # or you can load the api_key from SKYVERN_API_KEY in .env
