@@ -18,7 +18,7 @@ agent = Agent()
 
 class SkyvernTaskBaseTool(BaseTool):
     engine: Literal["TaskV1", "TaskV2"] = Field(default=settings.engine)
-    timeout_seconds: int = Field(default=settings.run_task_timeout)
+    run_task_timeout_seconds: int = Field(default=settings.run_task_timeout_seconds)
     agent: Agent = agent
 
     def _run(self, *args: Any, **kwargs: Any) -> None:
@@ -48,11 +48,13 @@ class RunTask(SkyvernTaskBaseTool):
         if url is not None:
             task_request.url = url
 
-        return await self.agent.run_task(task_request=task_request, timeout_seconds=self.timeout_seconds)
+        return await self.agent.run_task(task_request=task_request, timeout_seconds=self.run_task_timeout_seconds)
 
     async def _arun_task_v2(self, user_prompt: str, url: str | None = None) -> ObserverTask:
         task_request = ObserverTaskRequest(user_prompt=user_prompt, url=url)
-        return await self.agent.run_observer_task_v_2(task_request=task_request, timeout_seconds=self.timeout_seconds)
+        return await self.agent.run_observer_task_v_2(
+            task_request=task_request, timeout_seconds=self.run_task_timeout_seconds
+        )
 
 
 class DispatchTask(SkyvernTaskBaseTool):
