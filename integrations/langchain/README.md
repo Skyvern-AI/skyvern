@@ -203,6 +203,7 @@ from skyvern_langchain.agent import DispatchTask, GetTask
 
 from langchain_community.tools.sleep.tool import SleepTool
 
+# load OpenAI API key from .env
 load_dotenv()
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
@@ -247,6 +248,7 @@ from skyvern_langchain.client import DispatchTask, GetTask
 
 from langchain_community.tools.sleep.tool import SleepTool
 
+# load OpenAI API key from .env
 load_dotenv()
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
