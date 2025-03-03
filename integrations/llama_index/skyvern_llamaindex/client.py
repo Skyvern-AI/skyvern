@@ -1,171 +1,143 @@
-from typing import Any, Dict, List, Literal, Tuple
+from typing import Any, Dict, List, Literal, Optional
 
 from httpx import AsyncClient
 from llama_index.core.tools.tool_spec.base import SPEC_FUNCTION_TYPE, BaseToolSpec
-from llama_index.core.tools.types import ToolMetadata
-from skyvern_llamaindex.schema import GetTaskInput, TaskV1Request, TaskV2Request
+from skyvern_llamaindex.settings import settings
 
 from skyvern.client import AsyncSkyvern
-from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskResponse
+from skyvern.forge.sdk.schemas.observers import ObserverTaskRequest
+from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskRequest, TaskResponse
 
 
 class SkyvernTaskToolSpec(BaseToolSpec):
     spec_functions: List[SPEC_FUNCTION_TYPE] = [
-        "run",
-        "dispatch",
-        "get",
+        "run_task",
+        "dispatch_task",
+        "get_task",
     ]
-
-    spec_metadata: Dict[str, Dict[str, ToolMetadata]] = {
-        "TaskV1": {
-            "run": ToolMetadata(
-                name="run-skyvern-client-task",
-                description="Use Skyvern client to run a task. This function won't return until the task is finished.",
-                fn_schema=TaskV1Request,
-            ),
-            "dispatch": ToolMetadata(
-                name="dispatch-skyvern-client-task",
-                description="Use Skyvern client to dispatch a task. This function will return immediately and the task will be running in the background.",
-                fn_schema=TaskV1Request,
-            ),
-            "get": ToolMetadata(
-                name="get-skyvern-client-task",
-                description="Use Skyvern client to get a task.",
-                fn_schema=GetTaskInput,
-            ),
-        },
-        "TaskV2": {
-            "run": ToolMetadata(
-                name="run-skyvern-client-task",
-                description="Use Skyvern client to run a task. This function won't return until the task is finished.",
-                fn_schema=TaskV2Request,
-            ),
-            "dispatch": ToolMetadata(
-                name="dispatch-skyvern-client-task",
-                description="Use Skyvern client to dispatch a task. This function will return immediately and the task will be running in the background.",
-                fn_schema=TaskV2Request,
-            ),
-            "get": ToolMetadata(
-                name="get-skyvern-client-task",
-                description="Use Skyvern client to get a task.",
-                fn_schema=GetTaskInput,
-            ),
-        },
-    }
 
     def __init__(
         self,
-        credential: str,
         *,
-        base_url: str = "https://api.skyvern.com",
-        engine: Literal["TaskV1", "TaskV2"] = "TaskV2",
+        api_key: str = settings.api_key,
+        base_url: str = settings.base_url,
+        engine: Literal["TaskV1", "TaskV2"] = settings.engine,
+        run_task_timeout_seconds: int = settings.run_task_timeout,
     ):
         httpx_client = AsyncClient(
             headers={
                 "Content-Type": "application/json",
-                "x-api-key": credential,
+                "x-api-key": api_key,
             },
         )
         self.engine = engine
+        self.run_task_timeout_seconds = run_task_timeout_seconds
         self.client = AsyncSkyvern(base_url=base_url, httpx_client=httpx_client)
 
-    def get_metadata_from_fn_name(
-        self, fn_name: str, spec_functions: List[str | Tuple[str, str]] | None = None
-    ) -> ToolMetadata | None:
-        try:
-            getattr(self, fn_name)
-        except AttributeError:
-            return None
+    async def run_task(self, user_prompt: str, url: Optional[str] = None) -> TaskResponse | Dict[str, Any | None]:
+        """
+        Use Skyvern client to run a task. This function won't return until the task is finished.
 
-        return self.spec_metadata.get(self.engine, {}).get(fn_name)
+        Args:
+            user_prompt[str]: User's prompt about the task description.
+            url (Optional[str]): The url of the target website in the task.
+        """
 
-    async def run(self, **kwargs: Dict[str, Any]) -> TaskResponse | Dict[str, Any | None]:
         if self.engine == "TaskV1":
-            return await self.run_task_v1(**kwargs)
+            return await self.run_task_v1(user_prompt=user_prompt, url=url)
         else:
-            return await self.run_task_v2(**kwargs)
+            return await self.run_task_v2(user_prompt=user_prompt, url=url)
 
-    async def dispatch(self, **kwargs: Dict[str, Any]) -> CreateTaskResponse | Dict[str, Any | None]:
+    async def dispatch_task(
+        self, user_prompt: str, url: Optional[str] = None
+    ) -> CreateTaskResponse | Dict[str, Any | None]:
+        """
+        Use Skyvern client to dispatch a task. This function will return immediately and the task will be running in the background.
+
+        Args:
+            user_prompt[str]: User's prompt about the task description.
+            url (Optional[str]): The url of the target website in the task.
+        """
+
         if self.engine == "TaskV1":
-            return await self.dispatch_task_v1(**kwargs)
+            return await self.dispatch_task_v1(user_prompt=user_prompt, url=url)
         else:
-            return await self.dispatch_task_v2(**kwargs)
+            return await self.dispatch_task_v2(user_prompt=user_prompt, url=url)
 
-    async def get(self, task_id: str) -> TaskResponse | Dict[str, Any | None]:
+    async def get_task(self, task_id: str) -> TaskResponse | Dict[str, Any | None]:
+        """
+        Use Skyvern client to get a task.
+
+        Args:
+            task_id[str]: The id of the task.
+        """
+
         if self.engine == "TaskV1":
             return await self.get_task_v1(task_id)
         else:
             return await self.get_task_v2(task_id)
 
-    async def run_task_v1(self, **kwargs: Dict[str, Any]) -> TaskResponse:
-        task_request = TaskV1Request(**kwargs)
-        return await self.client.agent.run_task(
-            max_steps_override=task_request.max_steps,
-            timeout_seconds=task_request.timeout_seconds,
-            url=task_request.url,
-            title=task_request.title,
-            webhook_callback_url=task_request.webhook_callback_url,
-            totp_verification_url=task_request.totp_verification_url,
-            totp_identifier=task_request.totp_identifier,
-            navigation_goal=task_request.navigation_goal,
-            data_extraction_goal=task_request.data_extraction_goal,
-            navigation_payload=task_request.navigation_goal,
-            error_code_mapping=task_request.error_code_mapping,
-            proxy_location=task_request.proxy_location,
-            extracted_information_schema=task_request.extracted_information_schema,
-            complete_criterion=task_request.complete_criterion,
-            terminate_criterion=task_request.terminate_criterion,
-            browser_session_id=task_request.browser_session_id,
+    async def run_task_v1(self, user_prompt: str, url: Optional[str] = None) -> TaskResponse:
+        task_generation = await self.client.agent.generate_task(
+            prompt=user_prompt,
         )
 
-    async def dispatch_task_v1(self, **kwargs: Dict[str, Any]) -> CreateTaskResponse:
-        task_request = TaskV1Request(**kwargs)
-        return await self.client.agent.create_task(
-            max_steps_override=task_request.max_steps,
+        if url is not None:
+            task_generation.url = url
+
+        task_request = TaskRequest.model_validate(task_generation, from_attributes=True)
+        return await self.client.agent.run_task(
+            timeout_seconds=self.run_task_timeout_seconds,
             url=task_request.url,
             title=task_request.title,
-            webhook_callback_url=task_request.webhook_callback_url,
-            totp_verification_url=task_request.totp_verification_url,
-            totp_identifier=task_request.totp_identifier,
             navigation_goal=task_request.navigation_goal,
             data_extraction_goal=task_request.data_extraction_goal,
             navigation_payload=task_request.navigation_goal,
             error_code_mapping=task_request.error_code_mapping,
-            proxy_location=task_request.proxy_location,
             extracted_information_schema=task_request.extracted_information_schema,
             complete_criterion=task_request.complete_criterion,
             terminate_criterion=task_request.terminate_criterion,
-            browser_session_id=task_request.browser_session_id,
+        )
+
+    async def dispatch_task_v1(self, user_prompt: str, url: Optional[str] = None) -> CreateTaskResponse:
+        task_generation = await self.client.agent.generate_task(
+            prompt=user_prompt,
+        )
+
+        if url is not None:
+            task_generation.url = url
+
+        task_request = TaskRequest.model_validate(task_generation, from_attributes=True)
+        return await self.client.agent.create_task(
+            url=task_request.url,
+            title=task_request.title,
+            navigation_goal=task_request.navigation_goal,
+            data_extraction_goal=task_request.data_extraction_goal,
+            navigation_payload=task_request.navigation_goal,
+            error_code_mapping=task_request.error_code_mapping,
+            extracted_information_schema=task_request.extracted_information_schema,
+            complete_criterion=task_request.complete_criterion,
+            terminate_criterion=task_request.terminate_criterion,
         )
 
     async def get_task_v1(self, task_id: str) -> TaskResponse:
         return await self.client.agent.get_task(task_id=task_id)
 
-    async def run_task_v2(self, **kwargs: Dict[str, Any]) -> Dict[str, Any | None]:
-        task_request = TaskV2Request(**kwargs)
+    async def run_task_v2(self, user_prompt: str, url: Optional[str] = None) -> Dict[str, Any | None]:
+        task_request = ObserverTaskRequest(url=url, user_prompt=user_prompt)
         return await self.client.agent.run_observer_task_v_2(
-            max_iterations_override=task_request.max_iterations,
-            timeout_seconds=task_request.timeout_seconds,
+            timeout_seconds=self.run_task_timeout_seconds,
             user_prompt=task_request.user_prompt,
             url=task_request.url,
             browser_session_id=task_request.browser_session_id,
-            webhook_callback_url=task_request.webhook_callback_url,
-            totp_verification_url=task_request.totp_verification_url,
-            totp_identifier=task_request.totp_identifier,
-            proxy_location=task_request.proxy_location,
         )
 
-    async def dispatch_task_v2(self, **kwargs: Dict[str, Any]) -> Dict[str, Any | None]:
-        task_request = TaskV2Request(**kwargs)
+    async def dispatch_task_v2(self, user_prompt: str, url: Optional[str] = None) -> Dict[str, Any | None]:
+        task_request = ObserverTaskRequest(url=url, user_prompt=user_prompt)
         return await self.client.agent.observer_task_v_2(
-            max_iterations_override=task_request.max_iterations,
             user_prompt=task_request.user_prompt,
             url=task_request.url,
             browser_session_id=task_request.browser_session_id,
-            webhook_callback_url=task_request.webhook_callback_url,
-            totp_verification_url=task_request.totp_verification_url,
-            totp_identifier=task_request.totp_identifier,
-            proxy_location=task_request.proxy_location,
         )
 
     async def get_task_v2(self, task_id: str) -> Dict[str, Any | None]:
