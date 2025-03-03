@@ -112,11 +112,10 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         task_generation = await self.client.agent.generate_task(
             prompt=user_prompt,
         )
-
-        if url is not None:
-            task_generation = task_generation.model_copy(update={"url": url})
-
         task_request = TaskRequest.model_validate(task_generation, from_attributes=True)
+        if url is not None:
+            task_request.url = url
+
         return await self.client.agent.run_task(
             timeout_seconds=self.run_task_timeout_seconds,
             url=url,
@@ -134,11 +133,10 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         task_generation = await self.client.agent.generate_task(
             prompt=user_prompt,
         )
-
-        if url is not None:
-            task_generation = task_generation.model_copy(update={"url": url})
-
         task_request = TaskRequest.model_validate(task_generation, from_attributes=True)
+        if url is not None:
+            task_request.url = url
+
         return await self.client.agent.create_task(
             url=task_request.url,
             title=task_request.title,
