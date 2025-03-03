@@ -1,12 +1,43 @@
 from typing import Any, Dict, List, Literal, Optional
 
 from httpx import AsyncClient
+from llama_index.core.tools import FunctionTool
 from llama_index.core.tools.tool_spec.base import SPEC_FUNCTION_TYPE, BaseToolSpec
+from pydantic import BaseModel
 from skyvern_llamaindex.settings import settings
 
 from skyvern.client import AsyncSkyvern
 from skyvern.forge.sdk.schemas.observers import ObserverTaskRequest
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskRequest, TaskResponse
+
+
+class SkyvernTool(BaseModel):
+    api_key: str = settings.api_key
+    base_url: str = settings.base_url
+
+    def run_task(self) -> FunctionTool:
+        task_tool_spec = SkyvernTaskToolSpec(
+            api_key=self.api_key,
+            base_url=self.base_url,
+        )
+
+        return task_tool_spec.to_tool_list(["run_task"])[0]
+
+    def dispatch_task(self) -> FunctionTool:
+        task_tool_spec = SkyvernTaskToolSpec(
+            api_key=self.api_key,
+            base_url=self.base_url,
+        )
+
+        return task_tool_spec.to_tool_list(["dispatch_task"])[0]
+
+    def get_task(self) -> FunctionTool:
+        task_tool_spec = SkyvernTaskToolSpec(
+            api_key=self.api_key,
+            base_url=self.base_url,
+        )
+
+        return task_tool_spec.to_tool_list(["get_task"])[0]
 
 
 class SkyvernTaskToolSpec(BaseToolSpec):
@@ -22,7 +53,7 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         api_key: str = settings.api_key,
         base_url: str = settings.base_url,
         engine: Literal["TaskV1", "TaskV2"] = settings.engine,
-        run_task_timeout_seconds: int = settings.run_task_timeout,
+        run_task_timeout_seconds: int = settings.run_task_timeout_seconds,
     ):
         httpx_client = AsyncClient(
             headers={
@@ -83,12 +114,12 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         )
 
         if url is not None:
-            task_generation.url = url
+            task_generation = task_generation.model_copy(update={"url": url})
 
         task_request = TaskRequest.model_validate(task_generation, from_attributes=True)
         return await self.client.agent.run_task(
             timeout_seconds=self.run_task_timeout_seconds,
-            url=task_request.url,
+            url=url,
             title=task_request.title,
             navigation_goal=task_request.navigation_goal,
             data_extraction_goal=task_request.data_extraction_goal,
@@ -105,7 +136,7 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         )
 
         if url is not None:
-            task_generation.url = url
+            task_generation = task_generation.model_copy(update={"url": url})
 
         task_request = TaskRequest.model_validate(task_generation, from_attributes=True)
         return await self.client.agent.create_task(
