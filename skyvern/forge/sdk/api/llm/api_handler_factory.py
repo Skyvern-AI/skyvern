@@ -9,6 +9,7 @@ import structlog
 from jinja2 import Template
 
 from skyvern.config import settings
+from skyvern.exceptions import SkyvernContextWindowExceededError
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import (
@@ -125,6 +126,13 @@ class LLMAPIHandlerFactory:
                 response = await router.acompletion(model=main_model_group, messages=messages, **parameters)
             except litellm.exceptions.APIError as e:
                 raise LLMProviderErrorRetryableTask(llm_key) from e
+            except litellm.exceptions.ContextWindowExceededError as e:
+                LOG.exception(
+                    "Context window exceeded",
+                    llm_key=llm_key,
+                    model=main_model_group,
+                )
+                raise SkyvernContextWindowExceededError() from e
             except ValueError as e:
                 LOG.exception(
                     "LLM token limit exceeded",
@@ -300,6 +308,13 @@ class LLMAPIHandlerFactory:
                 )
             except litellm.exceptions.APIError as e:
                 raise LLMProviderErrorRetryableTask(llm_key) from e
+            except litellm.exceptions.ContextWindowExceededError as e:
+                LOG.exception(
+                    "Context window exceeded",
+                    llm_key=llm_key,
+                    model=llm_config.model_name,
+                )
+                raise SkyvernContextWindowExceededError() from e
             except CancelledError:
                 t_llm_cancelled = time.perf_counter()
                 LOG.error(

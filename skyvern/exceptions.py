@@ -655,3 +655,9 @@ class NoTOTPVerificationCodeFound(SkyvernHTTPException):
         if totp_identifier:
             msg += f" totp_identifier={totp_identifier}"
         super().__init__(msg)
+
+
+class SkyvernContextWindowExceededError(SkyvernException):
+    def __init__(self) -> None:
+        message = "Context window exceeded. Please contact support@skyvern.com for help."
+        super().__init__(message)
