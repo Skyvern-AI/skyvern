@@ -14,6 +14,7 @@ class SkyvernContext:
     workflow_run_id: str | None = None
     task_v2_id: str | None = None
     max_steps_override: int | None = None
+    browser_session_id: str | None = None
     tz_info: ZoneInfo | None = None
     totp_codes: dict[str, str | None] = field(default_factory=dict)
     log: list[dict] = field(default_factory=list)
