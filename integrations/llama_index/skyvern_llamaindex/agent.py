@@ -11,11 +11,13 @@ from skyvern.forge.sdk.schemas.observers import ObserverTask, ObserverTaskReques
 from skyvern.forge.sdk.schemas.task_generations import TaskGenerationBase
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskRequest, TaskResponse
 
-agent = Agent()
+default_agent = Agent()
 
 
 class SkyvernTool:
-    def __init__(self, agent: Agent = agent):
+    def __init__(self, agent: Optional[Agent] = None):
+        if agent is None:
+            agent = default_agent
         self.agent = agent
 
     def run_task(self) -> FunctionTool:
