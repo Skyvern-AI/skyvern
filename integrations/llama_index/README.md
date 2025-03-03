@@ -131,7 +131,7 @@ no need to run `skyvern init` command in your terminal to set up skyvern before 
 from dotenv import load_dotenv
 from llama_index.agent.openai import OpenAIAgent
 from llama_index.llms.openai import OpenAI
-from skyvern_llamaindex.agent import SkyvernTool
+from skyvern_llamaindex.client import SkyvernTool
 
 # load OpenAI API key from .env
 load_dotenv()
