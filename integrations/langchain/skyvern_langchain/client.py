@@ -46,10 +46,10 @@ class RunTask(SkyvernTaskBaseTool):
             prompt=user_prompt,
         )
 
-        if url is not None:
-            task_generation.url = url
-
         task_request = TaskRequest.model_validate(task_generation, from_attributes=True)
+        if url is not None:
+            task_request.url = url
+
         return await self.get_client().agent.run_task(
             timeout_seconds=self.run_task_timeout_seconds,
             url=task_request.url,
@@ -89,10 +89,10 @@ class DispatchTask(SkyvernTaskBaseTool):
             prompt=user_prompt,
         )
 
-        if url is not None:
-            task_generation.url = url
-
         task_request = TaskRequest.model_validate(task_generation, from_attributes=True)
+        if url is not None:
+            task_request.url = url
+
         return await self.get_client().agent.create_task(
             url=task_request.url,
             title=task_request.title,

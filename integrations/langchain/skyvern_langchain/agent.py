@@ -18,7 +18,7 @@ agent = Agent()
 
 class SkyvernTaskBaseTool(BaseTool):
     engine: Literal["TaskV1", "TaskV2"] = Field(default=settings.engine)
-    timeout_seconds: int = Field(default=settings.run_task_timeout)
+    timeout_seconds: int = Field(default=settings.run_task_timeout_seconds)
     agent: Agent = agent
 
     def _run(self, *args: Any, **kwargs: Any) -> None:
