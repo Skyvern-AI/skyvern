@@ -37,10 +37,12 @@ class BitwardenLoginCredentialParameterYAML(ParameterYAML):
     bitwarden_client_secret_aws_secret_key: str
     bitwarden_master_password_aws_secret_key: str
     # parameter key for the url to request the login credentials from bitwarden
-    url_parameter_key: str
+    url_parameter_key: str | None = None
     # bitwarden collection id to filter the login credentials from,
     # if not provided, no filtering will be done
     bitwarden_collection_id: str | None = None
+    # bitwarden item id to request the login credential
+    bitwarden_item_id: str | None = None
 
 
 class CredentialParameterYAML(ParameterYAML):

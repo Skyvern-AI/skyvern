@@ -106,7 +106,7 @@ class BitwardenConstants(StrEnum):
     URL = "BW_URL"
     BW_COLLECTION_ID = "BW_COLLECTION_ID"
     IDENTITY_KEY = "BW_IDENTITY_KEY"
-    ITEM_ID = "BW_ITEM_ID"
+    BW_ITEM_ID = "BW_ITEM_ID"
 
     USERNAME = "BW_USERNAME"
     PASSWORD = "BW_PASSWORD"
@@ -190,8 +190,9 @@ class BitwardenService:
         master_password: str,
         bw_organization_id: str | None,
         bw_collection_ids: list[str] | None,
-        url: str,
+        url: str | None = None,
         collection_id: str | None = None,
+        item_id: str | None = None,
         max_retries: int = settings.BITWARDEN_MAX_RETRIES,
         timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
     ) -> dict[str, str]:
@@ -215,6 +216,7 @@ class BitwardenService:
                         bw_collection_ids=bw_collection_ids,
                         url=url,
                         collection_id=collection_id,
+                        item_id=item_id,
                         timeout=timeout,
                     )
             except BitwardenAccessDeniedError as e:
@@ -271,8 +273,9 @@ class BitwardenService:
         master_password: str,
         bw_organization_id: str | None,
         bw_collection_ids: list[str] | None,
-        url: str,
+        url: str | None = None,
         collection_id: str | None = None,
+        item_id: str | None = None,
         timeout: int = 60,
     ) -> dict[str, str]:
         """
@@ -282,6 +285,26 @@ class BitwardenService:
             await BitwardenService.login(client_id, client_secret)
             await BitwardenService.sync()
             session_key = await BitwardenService.unlock(master_password)
+
+            if item_id:  # if item_id provided, get single item by item id
+                command = ["bw", "get", "item", item_id, "--session", session_key]
+                item_result = await BitwardenService.run_command(command)
+                if item_result.stderr:
+                    raise BitwardenGetItemError(
+                        f"Failed to get the bitwarden item {item_id}. Error: {item_result.stderr}"
+                    )
+                try:
+                    item = json.loads(item_result.stdout)
+                except json.JSONDecodeError:
+                    raise BitwardenGetItemError(f"Failed to parse item JSON for item ID: {item_id}")
+                return {
+                    BitwardenConstants.USERNAME: item["login"]["username"],
+                    BitwardenConstants.PASSWORD: item["login"]["password"],
+                    BitwardenConstants.TOTP: item["login"]["totp"],
+                }
+            elif not url:
+                # if item_id is not provided, we need a url to search for items
+                raise BitwardenGetItemError("No url or item ID provided")
 
             # Extract the domain from the URL and search for items in Bitwarden with that domain
             extract_url = tldextract.extract(url)
