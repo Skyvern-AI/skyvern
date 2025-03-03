@@ -15,7 +15,7 @@ class SkyvernTaskBaseTool(BaseTool):
     api_key: str = Field(default=settings.api_key)
     base_url: str = Field(default=settings.base_url)
     engine: Literal["TaskV1", "TaskV2"] = Field(default=settings.engine)
-    run_task_timeout_seconds: int = Field(default=settings.run_task_timeout)
+    run_task_timeout_seconds: int = Field(default=settings.run_task_timeout_seconds)
 
     def get_client(self) -> AsyncSkyvern:
         httpx_client = AsyncClient(
