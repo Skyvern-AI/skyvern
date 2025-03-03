@@ -118,7 +118,7 @@ class SkyvernTaskToolSpec(BaseToolSpec):
 
         return await self.client.agent.run_task(
             timeout_seconds=self.run_task_timeout_seconds,
-            url=url,
+            url=task_request.url,
             title=task_request.title,
             navigation_goal=task_request.navigation_goal,
             data_extraction_goal=task_request.data_extraction_goal,
