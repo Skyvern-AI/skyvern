@@ -59,7 +59,7 @@ print(response)
 ### Run a task(async) locally in your local environment
 > async task will return immediately and the task will be running in the background.
 
-:warning: :warning: if you want to run the task in the background, you need to keep the script running until the task is finished, otherwise the task will be killed when the script is finished.
+:warning: :warning: if you want to run the task in the background, you need to keep the agent running until the task is finished, otherwise the task will be killed when the agent finished the chat.
 
 :warning: :warning: if you want to run this code block, you need to run `skyvern init --openai-api-key <your_openai_api_key>` command in your terminal to set up skyvern first.
 
@@ -69,29 +69,32 @@ from dotenv import load_dotenv
 from llama_index.agent.openai import OpenAIAgent
 from llama_index.llms.openai import OpenAI
 from skyvern_llamaindex.agent import SkyvernTool
+from llama_index.core.tools import FunctionTool
 
 # load OpenAI API key from .env
 load_dotenv()
 
+async def sleep(seconds: int) -> str:
+    await asyncio.sleep(seconds)
+    return f"Slept for {seconds} seconds"
+
+# define a sleep tool to keep the agent running until the task is finished
+sleep_tool = FunctionTool.from_defaults(
+    async_fn=sleep,
+    description="Sleep for a given number of seconds",
+    name="sleep",
+)
+
 skyvern_tool = SkyvernTool()
 
 agent = OpenAIAgent.from_tools(
-    tools=[skyvern_tool.dispatch_task()],
+    tools=[skyvern_tool.dispatch_task(), sleep_tool],
     llm=OpenAI(model="gpt-4o"),
     verbose=True,
 )
 
-async def main():
-    response = agent.chat("Run a task with Skyvern. The task is about 'Navigate to the Hacker News homepage and get the top 3 posts.'")
-    print(response)
-
-    # keep the script running until the task is finished
-    await asyncio.sleep(600)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
+response = agent.chat("Run a task with Skyvern. The task is about 'Navigate to the Hacker News homepage and get the top 3 posts.' Then, sleep for 10 minutes.")
+print(response)
 ```
 
 ### Get a task locally in your local environment
@@ -152,7 +155,7 @@ print(response)
 
 no need to run `skyvern init` command in your terminal to set up skyvern before using this integration.
 
-the task is actually running in the skyvern cloud service, so you don't need to keep your script running until the task is finished.
+the task is actually running in the skyvern cloud service, so you don't need to keep your agent running until the task is finished.
 
 ```python
 from dotenv import load_dotenv
@@ -222,20 +225,20 @@ from llama_index.llms.openai import OpenAI
 from llama_index.core.tools import FunctionTool
 from skyvern_llamaindex.agent import SkyvernTool
 
-async def sleep(seconds: int) -> str:
-    await asyncio.sleep(seconds)
-    return f"Slept for {seconds} seconds"
-
 # load OpenAI API key from .env
 load_dotenv()
 
-skyvern_tool = SkyvernTool()
+async def sleep(seconds: int) -> str:
+    await asyncio.sleep(seconds)
+    return f"Slept for {seconds} seconds"
 
 sleep_tool = FunctionTool.from_defaults(
     async_fn=sleep,
     description="Sleep for a given number of seconds",
     name="sleep",
 )
+
+skyvern_tool = SkyvernTool()
 
 agent = OpenAIAgent.from_tools(
     tools=[skyvern_tool.dispatch_task(), skyvern_tool.get_task(), sleep_tool],
@@ -262,23 +265,22 @@ from llama_index.llms.openai import OpenAI
 from llama_index.core.tools import FunctionTool
 from skyvern_llamaindex.client import SkyvernTool
 
+# load OpenAI API key from .env
+load_dotenv()
 
 async def sleep(seconds: int) -> str:
     await asyncio.sleep(seconds)
     return f"Slept for {seconds} seconds"
-
-# load OpenAI API key from .env
-load_dotenv()
-
-skyvern_tool = SkyvernTool(api_key="<your_organization_api_key>")
-# or you can load the api_key from SKYVERN_API_KEY in .env
-# skyvern_tool = SkyvernTool()
 
 sleep_tool = FunctionTool.from_defaults(
     async_fn=sleep,
     description="Sleep for a given number of seconds",
     name="sleep",
 )
+
+skyvern_tool = SkyvernTool(api_key="<your_organization_api_key>")
+# or you can load the api_key from SKYVERN_API_KEY in .env
+# skyvern_tool = SkyvernTool()
 
 agent = OpenAIAgent.from_tools(
     tools=[skyvern_tool.dispatch_task(), skyvern_tool.get_task(), sleep_tool],
