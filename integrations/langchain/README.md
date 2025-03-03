@@ -117,9 +117,9 @@ import asyncio
 from skyvern_langchain.client import RunTask
 
 run_task = RunTask(
-    credential="<your_organization_api_key>",
+    api_key="<your_organization_api_key>",
 )
-# or you can load the credential from SKYVERN_CREDENTIAL in .env
+# or you can load the api_key from SKYVERN_API_KEY in .env
 # run_task = RunTask()
 
 async def main():
@@ -142,9 +142,9 @@ import asyncio
 from skyvern_langchain.client import DispatchTask
 
 dispatch_task = DispatchTask(
-    credential="<your_organization_api_key>",
+    api_key="<your_organization_api_key>",
 )
-# or you can load the credential from SKYVERN_CREDENTIAL in .env
+# or you can load the api_key from SKYVERN_API_KEY in .env
 # dispatch_task = DispatchTask()
 
 async def main():
@@ -168,9 +168,9 @@ import asyncio
 from skyvern_langchain.client import GetTask
 
 get_task = GetTask(
-    credential="<your_organization_api_key>",
+    api_key="<your_organization_api_key>",
 )
-# or you can load the credential from SKYVERN_CREDENTIAL in .env
+# or you can load the api_key from SKYVERN_API_KEY in .env
 # get_task = GetTask()
 
 async def main():
@@ -254,15 +254,15 @@ load_dotenv()
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
 dispatch_task = DispatchTask(
-    credential="<your_organization_api_key>",
+    api_key="<your_organization_api_key>",
 )
-# or you can load the credential from SKYVERN_CREDENTIAL in .env
+# or you can load the api_key from SKYVERN_API_KEY in .env
 # dispatch_task = DispatchTask()
 
 get_task = GetTask(
-    credential="<your_organization_api_key>",
+    api_key="<your_organization_api_key>",
 )
-# or you can load the credential from SKYVERN_CREDENTIAL in .env
+# or you can load the api_key from SKYVERN_API_KEY in .env
 # get_task = GetTask()
 
 agent = initialize_agent(

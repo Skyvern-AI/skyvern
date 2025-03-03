@@ -12,7 +12,7 @@ from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskRequest, Tas
 
 
 class SkyvernTaskBaseTool(BaseTool):
-    credential: str = Field(default=settings.credential)
+    api_key: str = Field(default=settings.api_key)
     base_url: str = Field(default=settings.base_url)
     engine: Literal["TaskV1", "TaskV2"] = Field(default=settings.engine)
     run_task_timeout_seconds: int = Field(default=settings.run_task_timeout)
@@ -21,7 +21,7 @@ class SkyvernTaskBaseTool(BaseTool):
         httpx_client = AsyncClient(
             headers={
                 "Content-Type": "application/json",
-                "x-api-key": self.credential,
+                "x-api-key": self.api_key,
             },
         )
         return AsyncSkyvern(base_url=self.base_url, httpx_client=httpx_client)
