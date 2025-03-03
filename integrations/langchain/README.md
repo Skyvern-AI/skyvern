@@ -5,15 +5,15 @@
 - [Skyvern Langchain](#skyvern-langchain)
   - [Installation](#installation)
   - [Basic Usage](#basic-usage)
-    - [Run a task(sync) with skyvern agent (calling skyvern agent function directly in the tool)](#run-a-tasksync-with-skyvern-agent-calling-skyvern-agent-function-directly-in-the-tool)
-    - [Run a task(async) with skyvern agent (calling skyvern agent function directly in the tool)](#run-a-taskasync-with-skyvern-agent-calling-skyvern-agent-function-directly-in-the-tool)
-    - [Get a task with skyvern agent (calling skyvern agent function directly in the tool)](#get-a-task-with-skyvern-agent-calling-skyvern-agent-function-directly-in-the-tool)
-    - [Run a task(sync) with skyvern client (calling skyvern OpenAPI in the tool)](#run-a-tasksync-with-skyvern-client-calling-skyvern-openapi-in-the-tool)
-    - [Run a task(async) with skyvern client (calling skyvern OpenAPI in the tool)](#run-a-taskasync-with-skyvern-client-calling-skyvern-openapi-in-the-tool)
-    - [Get a task with skyvern client (calling skyvern OpenAPI in the tool)](#get-a-task-with-skyvern-client-calling-skyvern-openapi-in-the-tool)
+    - [Run a task(sync) locally in your local environment](#run-a-tasksync-locally-in-your-local-environment)
+    - [Run a task(async) locally in your local environment](#run-a-taskasync-locally-in-your-local-environment)
+    - [Get a task locally in your local environment](#get-a-task-locally-in-your-local-environment)
+    - [Run a task(sync) by calling skyvern APIs](#run-a-tasksync-by-calling-skyvern-apis)
+    - [Run a task(async) by calling skyvern APIs](#run-a-taskasync-by-calling-skyvern-apis)
+    - [Get a task by calling skyvern APIs](#get-a-task-by-calling-skyvern-apis)
   - [Agent Usage](#agent-usage)
-    - [Run a task(async) and wait until the task is finished by skyvern agent (calling skyvern agent function directly in the tool)](#run-a-taskasync-and-wait-until-the-task-is-finished-by-skyvern-agent-calling-skyvern-agent-function-directly-in-the-tool)
-    - [Run a task(async) and wait until the task is finished by skyvern client (calling skyvern OpenAPI in the tool)](#run-a-taskasync-and-wait-until-the-task-is-finished-by-skyvern-client-calling-skyvern-openapi-in-the-tool)
+    - [Run a task(async) locally in your local environment and wait until the task is finished](#run-a-taskasync-locally-in-your-local-environment-and-wait-until-the-task-is-finished)
+    - [Run a task(async) by calling skyvern APIs and wait until the task is finished](#run-a-taskasync-by-calling-skyvern-apis-and-wait-until-the-task-is-finished)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
@@ -40,7 +40,7 @@ This is the only basic usage of skyvern langchain tool. If you want a full langc
 Go to [Langchain Tools](https://python.langchain.com/v0.1/docs/modules/tools/) to see more advanced langchain tool usage.
 
 
-### Run a task(sync) with skyvern agent (calling skyvern agent function directly in the tool)
+### Run a task(sync) locally in your local environment
 > sync task won't return until the task is finished.
 
 :warning: :warning: if you want to run this code block, you need to run `skyvern init --openai-api-key <your_openai_api_key>` command in your terminal to set up skyvern first.
@@ -61,7 +61,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### Run a task(async) with skyvern agent (calling skyvern agent function directly in the tool)
+### Run a task(async) locally in your local environment
 > async task will return immediately and the task will be running in the background.
 
 :warning: :warning: if you want to run the task in the background, you need to keep the script running until the task is finished, otherwise the task will be killed when the script is finished.
@@ -87,7 +87,7 @@ if __name__ == "__main__":
 
 ```
 
-### Get a task with skyvern agent (calling skyvern agent function directly in the tool)
+### Get a task locally in your local environment
 
 :warning: :warning: if you want to run this code block, you need to run `skyvern init --openai-api-key <your_openai_api_key>` command in your terminal to set up skyvern first.
 
@@ -107,7 +107,7 @@ if __name__ == "__main__":
 
 ```
 
-### Run a task(sync) with skyvern client (calling skyvern OpenAPI in the tool)
+### Run a task(sync) by calling skyvern APIs
 > sync task won't return until the task is finished.
 
 no need to run `skyvern init` command in your terminal to set up skyvern before using this integration.
@@ -130,7 +130,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### Run a task(async) with skyvern client (calling skyvern OpenAPI in the tool)
+### Run a task(async) by calling skyvern APIs
 > async task will return immediately and the task will be running in the background.
 
 no need to run `skyvern init` command in your terminal to set up skyvern before using this integration.
@@ -156,7 +156,7 @@ if __name__ == "__main__":
 ```
 
 
-### Get a task with skyvern client (calling skyvern OpenAPI in the tool)
+### Get a task by calling skyvern APIs
 > async task will return immediately and the task will be running in the background.
 
 no need to run `skyvern init` command in your terminal to set up skyvern before using this integration.
@@ -183,10 +183,12 @@ if __name__ == "__main__":
 
 ## Agent Usage
 
-Langchain is more powerful when used with [Langchain Agents](https://python.langchain.com/v0.1/docs/modules/agents/). Here is an example of how to use skyvern langchain tool with agent.
+Langchain is more powerful when used with [Langchain Agents](https://python.langchain.com/v0.1/docs/modules/agents/).
+
+The following two examples show how to build an agent that executes a specified task, waits for its completion, and then returns the results. For example, the agent is tasked with navigating to the Hacker News homepage and retrieving the top three posts.
 
 
-### Run a task(async) and wait until the task is finished by skyvern agent (calling skyvern agent function directly in the tool)
+### Run a task(async) locally in your local environment and wait until the task is finished
 
 > async task will return immediately and the task will be running in the background. You can use `GetTask` tool to poll the task information until the task is finished.
 
@@ -231,7 +233,7 @@ if __name__ == "__main__":
 
 ```
 
-### Run a task(async) and wait until the task is finished by skyvern client (calling skyvern OpenAPI in the tool)
+### Run a task(async) by calling skyvern APIs and wait until the task is finished
 
 > async task will return immediately and the task will be running in the background. You can use `GetTask` tool to poll the task information until the task is finished.
 
