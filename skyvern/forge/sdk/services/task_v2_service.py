@@ -359,6 +359,7 @@ async def run_task_v2_helper(
             workflow_run_id=workflow_run_id,
             request_id=request_id,
             task_v2_id=task_v2_id,
+            browser_session_id=browser_session_id,
         )
     )
 
