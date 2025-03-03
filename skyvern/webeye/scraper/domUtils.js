@@ -1,6 +1,27 @@
 // we only use chromium browser for now
 let browserNameForWorkarounds = "chromium";
 
+class SafeCounter {
+  constructor() {
+    this.value = 0;
+    this.lock = Promise.resolve();
+  }
+
+  async add() {
+    await this.lock;
+    this.lock = new Promise((resolve) => {
+      this.value += 1;
+      resolve();
+    });
+    return this.value;
+  }
+
+  async get() {
+    await this.lock;
+    return this.value;
+  }
+}
+
 // Commands for manipulating rects.
 // Want to debug this? Run chromium, go to sources, and create a new snippet with the code in domUtils.js
 class Rect {
@@ -580,6 +601,13 @@ function isInteractable(element, hoverStylesMap) {
     return false;
   }
 
+  // element with pointer-events: none should not be considered as interactable
+  // https://developer.mozilla.org/en-US/docs/Web/CSS/pointer-events#none
+  const elementPointerEvent = getElementComputedStyle(element)?.pointerEvents;
+  if (elementPointerEvent === "none") {
+    return false;
+  }
+
   if (hasWidgetRole(element)) {
     return true;
   }
@@ -772,6 +800,21 @@ function isDatePickerSelector(element) {
   if (
     tagName === "button" &&
     element.getAttribute("data-testid")?.includes("date")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isCheckableDiv(element) {
+  const tagName = element.tagName.toLowerCase();
+  if (tagName !== "div") {
+    return false;
+  }
+  if (
+    element.className &&
+    element.className.toString().includes("checkbox") &&
+    element.childElementCount === 0
   ) {
     return true;
   }
@@ -1141,19 +1184,52 @@ function getDOMElementBySkyvenElement(elementObj) {
   return document.querySelector(`[unique_id="${elementObj.id}"]`);
 }
 
-function uniqueId() {
+if (window.elementIdCounter === undefined) {
+  window.elementIdCounter = new SafeCounter();
+}
+
+// generate a unique id for the element
+// length is 4, the first character is from the frame index, the last 3 characters are from the counter,
+async function uniqueId() {
   const characters =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const base = characters.length;
+
+  const extraCharacters = "~!@#$%^&*()-_+=";
+  const extraBase = extraCharacters.length;
+
   let result = "";
-  for (let i = 0; i < 4; i++) {
-    const randomIndex = Math.floor(Math.random() * characters.length);
-    result += characters[randomIndex];
+
+  if (
+    window.GlobalSkyvernFrameIndex === undefined ||
+    window.GlobalSkyvernFrameIndex < 0
+  ) {
+    const randomIndex = Math.floor(Math.random() * extraBase);
+    result += extraCharacters[randomIndex];
+  } else {
+    const c1 = window.GlobalSkyvernFrameIndex % base;
+    result += characters[c1];
   }
+
+  const countPart =
+    (await window.elementIdCounter.add()) % (base * base * base);
+  const c2 = Math.floor(countPart / (base * base));
+  result += characters[c2];
+  const c3 = Math.floor(countPart / base) % base;
+  result += characters[c3];
+  const c4 = countPart % base;
+  result += characters[c4];
+
   return result;
 }
 
-function buildElementObject(frame, element, interactable, purgeable = false) {
-  var element_id = element.getAttribute("unique_id") ?? uniqueId();
+async function buildElementObject(
+  frame,
+  element,
+  interactable,
+  purgeable = false,
+) {
+  var element_id = element.getAttribute("unique_id") ?? (await uniqueId());
   var elementTagNameLower = element.tagName.toLowerCase();
   element.setAttribute("unique_id", element_id);
 
@@ -1224,6 +1300,7 @@ function buildElementObject(frame, element, interactable, purgeable = false) {
   let elementObj = {
     id: element_id,
     frame: frame,
+    frame_index: window.GlobalSkyvernFrameIndex,
     interactable: interactable,
     tagName: elementTagNameLower,
     attributes: attrs,
@@ -1245,6 +1322,7 @@ function buildElementObject(frame, element, interactable, purgeable = false) {
       isAngularDropdown(element) ||
       isSelect2Dropdown(element) ||
       isSelect2MultiChoice(element),
+    isCheckable: isCheckableDiv(element),
   };
 
   let isInShadowRoot = element.getRootNode() instanceof ShadowRoot;
@@ -1253,7 +1331,7 @@ function buildElementObject(frame, element, interactable, purgeable = false) {
     let shadowHostId = shadowHostEle.getAttribute("unique_id");
     // assign shadowHostId to the shadowHost element if it doesn't have unique_id
     if (!shadowHostId) {
-      shadowHostId = uniqueId();
+      shadowHostId = await uniqueId();
       shadowHostEle.setAttribute("unique_id", shadowHostId);
     }
     elementObj.shadowHost = shadowHostId;
@@ -1276,11 +1354,25 @@ function buildElementObject(frame, element, interactable, purgeable = false) {
   return elementObj;
 }
 
-function buildTreeFromBody(frame = "main.frame") {
-  return buildElementTree(document.body, frame);
+// build the element tree for the body
+async function buildTreeFromBody(
+  frame = "main.frame",
+  frame_index = undefined,
+) {
+  if (
+    window.GlobalSkyvernFrameIndex === undefined &&
+    frame_index !== undefined
+  ) {
+    window.GlobalSkyvernFrameIndex = frame_index;
+  }
+  return await buildElementTree(document.body, frame);
 }
 
-function buildElementTree(starter = document.body, frame, full_tree = false) {
+async function buildElementTree(
+  starter = document.body,
+  frame,
+  full_tree = false,
+) {
   // Generate hover styles map at the start
   const hoverStylesMap = getHoverStylesMap();
 
@@ -1294,7 +1386,7 @@ function buildElementTree(starter = document.body, frame, full_tree = false) {
       return [];
     }
   }
-  function processElement(element, parentId) {
+  async function processElement(element, parentId) {
     if (element === null) {
       console.log("get a null element");
       return;
@@ -1322,39 +1414,44 @@ function buildElementTree(starter = document.body, frame, full_tree = false) {
       let elementObj = null;
       let isParentSVG = null;
       if (interactable) {
-        elementObj = buildElementObject(frame, element, interactable);
+        elementObj = await buildElementObject(frame, element, interactable);
       } else if (
         tagName === "frameset" ||
         tagName === "iframe" ||
         tagName === "frame"
       ) {
-        elementObj = buildElementObject(frame, element, interactable);
+        elementObj = await buildElementObject(frame, element, interactable);
       } else if (element.shadowRoot) {
-        elementObj = buildElementObject(frame, element, interactable);
+        elementObj = await buildElementObject(frame, element, interactable);
         children = getChildElements(element.shadowRoot);
       } else if (isTableRelatedElement(element)) {
         // build all table related elements into skyvern element
         // we need these elements to preserve the DOM structure
-        elementObj = buildElementObject(frame, element, interactable);
+        elementObj = await buildElementObject(frame, element, interactable);
       } else if (hasBeforeOrAfterPseudoContent(element)) {
-        elementObj = buildElementObject(frame, element, interactable);
+        elementObj = await buildElementObject(frame, element, interactable);
       } else if (tagName === "svg") {
-        elementObj = buildElementObject(frame, element, interactable);
+        elementObj = await buildElementObject(frame, element, interactable);
       } else if (
         (isParentSVG = element.closest("svg")) &&
         isParentSVG.getAttribute("unique_id")
       ) {
         // if elemnet is the children of the <svg> with an unique_id
-        elementObj = buildElementObject(frame, element, interactable);
+        elementObj = await buildElementObject(frame, element, interactable);
       } else if (
         getElementText(element).length > 0 &&
         getElementText(element).length <= 5000
       ) {
-        elementObj = buildElementObject(frame, element, interactable);
+        elementObj = await buildElementObject(frame, element, interactable);
       } else if (full_tree) {
         // when building full tree, we only get text from element itself
         // elements without text are purgeable
-        elementObj = buildElementObject(frame, element, interactable, true);
+        elementObj = await buildElementObject(
+          frame,
+          element,
+          interactable,
+          true,
+        );
         if (elementObj.text.length > 0) {
           elementObj.purgeable = false;
         }
@@ -1384,7 +1481,7 @@ function buildElementTree(starter = document.body, frame, full_tree = false) {
     children = children.concat(getChildElements(element));
     for (let i = 0; i < children.length; i++) {
       const childElement = children[i];
-      processElement(childElement, parentId);
+      await processElement(childElement, parentId);
     }
     return;
   }
@@ -1594,7 +1691,7 @@ function buildElementTree(starter = document.body, frame, full_tree = false) {
   };
 
   // setup before parsing the dom
-  processElement(starter, null);
+  await processElement(starter, null);
 
   for (var element of elements) {
     if (
@@ -1660,8 +1757,11 @@ function drawBoundingBoxes(elements) {
   addHintMarkersToPage(hintMarkers);
 }
 
-function buildElementsAndDrawBoundingBoxes() {
-  var elementsAndResultArray = buildTreeFromBody();
+async function buildElementsAndDrawBoundingBoxes(
+  frame = "main.frame",
+  frame_index = undefined,
+) {
+  var elementsAndResultArray = await buildTreeFromBody(frame, frame_index);
   drawBoundingBoxes(elementsAndResultArray[0]);
 }
 
@@ -1845,11 +1945,15 @@ function removeBoundingBoxes() {
   }
 }
 
-function scrollToTop(draw_boxes) {
+async function scrollToTop(
+  draw_boxes,
+  frame = "main.frame",
+  frame_index = undefined,
+) {
   removeBoundingBoxes();
   window.scroll({ left: 0, top: 0, behavior: "instant" });
   if (draw_boxes) {
-    buildElementsAndDrawBoundingBoxes();
+    await buildElementsAndDrawBoundingBoxes(frame, frame_index);
   }
   return window.scrollY;
 }
@@ -1862,7 +1966,11 @@ function scrollToXY(x, y) {
   window.scroll({ left: x, top: y, behavior: "instant" });
 }
 
-function scrollToNextPage(draw_boxes) {
+async function scrollToNextPage(
+  draw_boxes,
+  frame = "main.frame",
+  frame_index = undefined,
+) {
   // remove bounding boxes, scroll to next page with 200px overlap, then draw bounding boxes again
   // return true if there is a next page, false otherwise
   removeBoundingBoxes();
@@ -1872,7 +1980,7 @@ function scrollToNextPage(draw_boxes) {
     behavior: "instant",
   });
   if (draw_boxes) {
-    buildElementsAndDrawBoundingBoxes();
+    await buildElementsAndDrawBoundingBoxes(frame, frame_index);
   }
   return window.scrollY;
 }
@@ -2054,26 +2162,6 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-class SafeCounter {
-  constructor() {
-    this.value = 0;
-    this.lock = Promise.resolve();
-  }
-
-  async add() {
-    await this.lock;
-    this.lock = new Promise((resolve) => {
-      this.value += 1;
-      resolve();
-    });
-  }
-
-  async get() {
-    await this.lock;
-    return this.value;
-  }
-}
-
 async function addIncrementalNodeToMap(parentNode, childrenNode) {
   // make the dom parser async
   await waitForNextFrame();
@@ -2085,11 +2173,16 @@ async function addIncrementalNodeToMap(parentNode, childrenNode) {
       newNodesTreeList = window.globalDomDepthMap.get(depth);
     }
 
-    for (const child of childrenNode) {
-      const [_, newNodeTree] = buildElementTree(child, "", true);
-      if (newNodeTree.length > 0) {
-        newNodesTreeList.push(...newNodeTree);
+    try {
+      for (const child of childrenNode) {
+        // Pass -1 as frame_index to indicate the frame number is not sensitive in this case
+        const [_, newNodeTree] = await buildElementTree(child, "", true);
+        if (newNodeTree.length > 0) {
+          newNodesTreeList.push(...newNodeTree);
+        }
       }
+    } catch (error) {
+      console.error("Error building incremental element node:", error);
     }
     window.globalDomDepthMap.set(depth, newNodesTreeList);
   }
@@ -2238,14 +2331,14 @@ async function getIncrementElements() {
     const depth = sortedDepth[idx];
     const treeList = window.globalDomDepthMap.get(depth);
 
-    const removeDupAndConcatChildren = (element) => {
+    const removeDupAndConcatChildren = async (element) => {
       let children = element.children;
       for (let i = 0; i < children.length; i++) {
         const child = children[i];
         const domElement = document.querySelector(`[unique_id="${child.id}"]`);
         // if the element is still on the page, we rebuild the element to update the information
         if (domElement) {
-          let newChild = buildElementObject(
+          let newChild = await buildElementObject(
             "",
             domElement,
             child.interactable,
@@ -2268,7 +2361,7 @@ async function getIncrementElements() {
       idToElement.set(element.id, element);
       for (let i = 0; i < children.length; i++) {
         const child = children[i];
-        removeDupAndConcatChildren(child);
+        await removeDupAndConcatChildren(child);
       }
     };
 
@@ -2278,7 +2371,7 @@ async function getIncrementElements() {
       );
       // if the element is still on the page, we rebuild the element to update the information
       if (domElement) {
-        let newHead = buildElementObject(
+        let newHead = await buildElementObject(
           "",
           domElement,
           treeHeadElement.interactable,
@@ -2292,7 +2385,7 @@ async function getIncrementElements() {
       if (!idToElement.has(treeHeadElement.id)) {
         cleanedTreeList.push(treeHeadElement);
       }
-      removeDupAndConcatChildren(treeHeadElement);
+      await removeDupAndConcatChildren(treeHeadElement);
     }
   }
 

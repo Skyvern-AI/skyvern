@@ -17,14 +17,14 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { copyText } from "@/util/copyText";
 import { apiBaseUrl } from "@/util/env";
 import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
-import { ToastAction } from "@radix-ui/react-toast";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import fetchToCurl from "fetch-to-curl";
 import { useForm } from "react-hook-form";
-import { Link, useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import { z } from "zod";
 import { WorkflowParameter } from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
+import { AxiosError } from "axios";
 
 type Props = {
   workflowParameters: Array<WorkflowParameter>;
@@ -107,6 +107,7 @@ function RunWorkflowForm({
 }: Props) {
   const { workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const form = useForm<RunWorkflowFormType>({
     defaultValues: {
@@ -131,27 +132,23 @@ function RunWorkflowForm({
         variant: "success",
         title: "Workflow run started",
         description: "The workflow run has been started successfully",
-        action: (
-          <ToastAction altText="View">
-            <Button asChild>
-              <Link
-                to={`/workflows/${workflowPermanentId}/${response.data.workflow_run_id}/overview`}
-              >
-                View
-              </Link>
-            </Button>
-          </ToastAction>
-        ),
       });
       queryClient.invalidateQueries({
         queryKey: ["workflowRuns"],
       });
+      queryClient.invalidateQueries({
+        queryKey: ["runs"],
+      });
+      navigate(
+        `/workflows/${workflowPermanentId}/${response.data.workflow_run_id}/overview`,
+      );
     },
-    onError: (error) => {
+    onError: (error: AxiosError) => {
+      const detail = (error.response?.data as { detail?: string })?.detail;
       toast({
         variant: "destructive",
         title: "Failed to start workflow run",
-        description: error.message,
+        description: detail ?? error.message,
       });
     },
   });

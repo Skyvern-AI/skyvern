@@ -27,15 +27,19 @@ from skyvern.forge.sdk.db.id import (
     generate_bitwarden_credit_card_data_parameter_id,
     generate_bitwarden_login_credential_parameter_id,
     generate_bitwarden_sensitive_information_parameter_id,
-    generate_observer_cruise_id,
-    generate_observer_thought_id,
+    generate_credential_id,
+    generate_credential_parameter_id,
     generate_org_id,
     generate_organization_auth_token_id,
+    generate_organization_bitwarden_collection_id,
     generate_output_parameter_id,
     generate_persistent_browser_session_id,
     generate_step_id,
     generate_task_generation_id,
     generate_task_id,
+    generate_task_run_id,
+    generate_task_v2_id,
+    generate_thought_id,
     generate_totp_code_id,
     generate_workflow_id,
     generate_workflow_parameter_id,
@@ -43,8 +47,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_run_block_id,
     generate_workflow_run_id,
 )
-from skyvern.forge.sdk.schemas.observers import ObserverThoughtType
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation
+from skyvern.forge.sdk.schemas.task_v2 import ThoughtType
 
 
 class Base(AsyncAttrs, DeclarativeBase):
@@ -53,6 +56,7 @@ class Base(AsyncAttrs, DeclarativeBase):
 
 class TaskModel(Base):
     __tablename__ = "tasks"
+    __table_args__ = (Index("idx_tasks_org_created", "organization_id", "created_at"),)
 
     task_id = Column(String, primary_key=True, index=True, default=generate_task_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
@@ -70,7 +74,7 @@ class TaskModel(Base):
     navigation_payload = Column(JSON)
     extracted_information = Column(JSON)
     failure_reason = Column(String)
-    proxy_location = Column(Enum(ProxyLocation))
+    proxy_location = Column(String)
     extracted_information_schema = Column(JSON)
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), index=True)
     order = Column(Integer, nullable=True)
@@ -98,7 +102,7 @@ class StepModel(Base):
 
     step_id = Column(String, primary_key=True, index=True, default=generate_step_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
-    task_id = Column(String, ForeignKey("tasks.task_id"))
+    task_id = Column(String, ForeignKey("tasks.task_id"), index=True)
     status = Column(String)
     output = Column(JSON)
     order = Column(Integer)
@@ -204,7 +208,7 @@ class WorkflowModel(Base):
     title = Column(String, nullable=False)
     description = Column(String, nullable=True)
     workflow_definition = Column(JSON, nullable=False)
-    proxy_location = Column(Enum(ProxyLocation))
+    proxy_location = Column(String)
     webhook_callback_url = Column(String)
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
@@ -227,6 +231,7 @@ class WorkflowModel(Base):
 
 class WorkflowRunModel(Base):
     __tablename__ = "workflow_runs"
+    __table_args__ = (Index("idx_workflow_runs_org_created", "organization_id", "created_at"),)
 
     workflow_run_id = Column(String, primary_key=True, index=True, default=generate_workflow_run_id)
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"), nullable=False)
@@ -236,7 +241,7 @@ class WorkflowRunModel(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False, index=True)
     status = Column(String, nullable=False)
     failure_reason = Column(String)
-    proxy_location = Column(Enum(ProxyLocation))
+    proxy_location = Column(String)
     webhook_callback_url = Column(String)
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
@@ -247,6 +252,7 @@ class WorkflowRunModel(Base):
         default=datetime.datetime.utcnow,
         onupdate=datetime.datetime.utcnow,
         nullable=False,
+        index=True,
     )
 
 
@@ -377,6 +383,21 @@ class BitwardenCreditCardDataParameterModel(Base):
     bitwarden_master_password_aws_secret_key = Column(String, nullable=False)
     bitwarden_collection_id = Column(String, nullable=False)
     bitwarden_item_id = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class CredentialParameterModel(Base):
+    __tablename__ = "credential_parameters"
+
+    credential_parameter_id = Column(String, primary_key=True, index=True, default=generate_credential_parameter_id)
+    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), index=True, nullable=False)
+    key = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+
+    credential_id = Column(String, nullable=False)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
@@ -547,11 +568,12 @@ class WorkflowRunBlockModel(Base):
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
 
-class ObserverCruiseModel(Base):
+class TaskV2Model(Base):
     __tablename__ = "observer_cruises"
     __table_args__ = (Index("oc_org_wfr_index", "organization_id", "workflow_run_id"),)
 
-    observer_cruise_id = Column(String, primary_key=True, default=generate_observer_cruise_id)
+    # observer_cruise_id is the task_id for task v2
+    observer_cruise_id = Column(String, primary_key=True, default=generate_task_v2_id)
     status = Column(String, nullable=False, default="created")
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
@@ -564,17 +586,17 @@ class ObserverCruiseModel(Base):
     webhook_callback_url = Column(String, nullable=True)
     totp_verification_url = Column(String, nullable=True)
     totp_identifier = Column(String, nullable=True)
-    proxy_location = Column(Enum(ProxyLocation), nullable=True)
+    proxy_location = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
 
-class ObserverThoughtModel(Base):
+class ThoughtModel(Base):
     __tablename__ = "observer_thoughts"
     __table_args__ = (Index("observer_cruise_index", "organization_id", "observer_cruise_id"),)
 
-    observer_thought_id = Column(String, primary_key=True, default=generate_observer_thought_id)
+    observer_thought_id = Column(String, primary_key=True, default=generate_thought_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
     observer_cruise_id = Column(String, ForeignKey("observer_cruises.observer_cruise_id"), nullable=False)
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
@@ -589,7 +611,7 @@ class ObserverThoughtModel(Base):
     output_token_count = Column(Integer, nullable=True)
     thought_cost = Column(Numeric, nullable=True)
 
-    observer_thought_type = Column(String, nullable=True, default=ObserverThoughtType.plan)
+    observer_thought_type = Column(String, nullable=True, default=ThoughtType.plan)
     observer_thought_scenario = Column(String, nullable=True)
     output = Column(JSON, nullable=True)
 
@@ -607,6 +629,54 @@ class PersistentBrowserSessionModel(Base):
     browser_id = Column(String, nullable=True)
     browser_address = Column(String, nullable=True)
     status = Column(String, nullable=True, default="created")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class TaskRunModel(Base):
+    __tablename__ = "task_runs"
+    __table_args__ = (
+        Index("task_run_org_url_index", "organization_id", "url_hash", "cached"),
+        Index("task_run_org_run_id_index", "organization_id", "run_id"),
+    )
+
+    task_run_id = Column(String, primary_key=True, default=generate_task_run_id)
+    organization_id = Column(String, nullable=False)
+    task_run_type = Column(String, nullable=False)
+    run_id = Column(String, nullable=False)
+    title = Column(String, nullable=True)
+    url = Column(String, nullable=True)
+    url_hash = Column(String, nullable=True)
+    cached = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
+
+class OrganizationBitwardenCollectionModel(Base):
+    __tablename__ = "organization_bitwarden_collections"
+
+    organization_bitwarden_collection_id = Column(
+        String, primary_key=True, default=generate_organization_bitwarden_collection_id
+    )
+
+    organization_id = Column(String, nullable=False, index=True)
+    collection_id = Column(String, nullable=False)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
+
+class CredentialModel(Base):
+    __tablename__ = "credentials"
+
+    credential_id = Column(String, primary_key=True, default=generate_credential_id)
+    organization_id = Column(String, nullable=False)
+    item_id = Column(String, nullable=True)
+
+    name = Column(String, nullable=False)
+    credential_type = Column(String, nullable=False)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)

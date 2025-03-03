@@ -46,4 +46,6 @@ export const workflowBlockTitle: {
   validation: "Validation",
   wait: "Wait",
   pdf_parser: "PDF Parser",
+  task_v2: "Task v2",
+  goto_url: "Go to URL",
 };

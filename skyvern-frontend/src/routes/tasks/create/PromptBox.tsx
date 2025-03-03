@@ -1,7 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
 import {
   Createv2TaskRequest,
-  ObserverTask,
+  TaskV2,
   ProxyLocation,
   TaskGenerationApiResponse,
 } from "@/api/types";
@@ -30,7 +30,6 @@ import {
   GearIcon,
   PaperPlaneIcon,
   Pencil1Icon,
-  PlusIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -151,12 +150,13 @@ function PromptBox() {
   );
   const [publishWorkflow, setPublishWorkflow] = useState(false);
   const [totpIdentifier, setTotpIdentifier] = useState("");
+  const [maxStepsOverride, setMaxStepsOverride] = useState<string | null>(null);
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
 
   const startObserverCruiseMutation = useMutation({
     mutationFn: async (prompt: string) => {
       const client = await getClient(credentialGetter, "v2");
-      return client.post<Createv2TaskRequest, { data: ObserverTask }>(
+      return client.post<Createv2TaskRequest, { data: TaskV2 }>(
         "/tasks",
         {
           user_prompt: prompt,
@@ -164,6 +164,11 @@ function PromptBox() {
           proxy_location: proxyLocation,
           totp_identifier: totpIdentifier,
           publish_workflow: publishWorkflow,
+        },
+        {
+          headers: {
+            "x-max-iterations-override": maxStepsOverride,
+          },
         },
       );
     },
@@ -178,6 +183,9 @@ function PromptBox() {
       });
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["runs"],
       });
       navigate(
         `/workflows/${response.data.workflow_permanent_id}/${response.data.workflow_run_id}`,
@@ -385,6 +393,20 @@ function PromptBox() {
                       }}
                     />
                   </div>
+                  <div className="flex gap-16">
+                    <div className="w-48 shrink-0">
+                      <div className="text-sm">Max Steps Override</div>
+                      <div className="text-xs text-slate-400">
+                        The maximum number of steps to take for this task.
+                      </div>
+                    </div>
+                    <Input
+                      value={maxStepsOverride ?? ""}
+                      onChange={(event) => {
+                        setMaxStepsOverride(event.target.value);
+                      }}
+                    />
+                  </div>
                 </div>
               </div>
             ) : null}
@@ -392,15 +414,6 @@ function PromptBox() {
         </div>
       </div>
       <div className="flex flex-wrap justify-center gap-4 rounded-sm bg-slate-elevation1 p-4">
-        <div
-          className="flex cursor-pointer gap-2 whitespace-normal rounded-sm border-2 border-dashed bg-slate-elevation3 px-4 py-3 hover:bg-slate-elevation5 lg:whitespace-nowrap"
-          onClick={() => {
-            navigate("/tasks/create/blank");
-          }}
-        >
-          <PlusIcon className="size-6" />
-          Build Your Own
-        </div>
         {exampleCases.map((example) => {
           return (
             <ExampleCasePill

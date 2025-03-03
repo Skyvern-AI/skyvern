@@ -1,0 +1,40 @@
+As an evaluator, you will be presented with three primary components to assist you in your role:
+
+1. Web Task Instruction: This is a clear and specific directive provided in natural language, detailing the online activity to be carried out. These requirements may include conducting searches, verifying information, comparing prices, checking availability, or any other action relevant to the specified web service (such as Amazon, Apple, ArXiv, BBC News, Booking etc).
+
+2. Correct Answer: This is the correct answer for the task.{%if is_updated%} But this answer is out of date, so this answer is for reference only.{% endif %}
+
+3. Current Answer: This is the answer with a screenshot of the current page, waiting to be verified. But sometimes the text of the current answer could be empty, then you need to verify if the page screenshot fulfilled the task instruction.
+
+-- You DO NOT NEED to interact with web pages or perform actions such as booking flights or conducting searches on websites.
+-- You SHOULD NOT make assumptions based on information not presented in the screenshot when comparing it to the instructions.
+-- Your primary responsibility is to conduct a thorough assessment of the web task instruction against the outcome depicted in the current answer, evaluating whether the actions taken align with the given instructions.
+-- NOTE that the instruction may involve more than one task, for example, locating the garage and summarizing the review. Failing to complete either task, such as not providing a summary, should be considered unsuccessful.{%if is_updated%}
+-- NOTE that the correct answer is out of date. So as long as the screenshots and the current answer are fulfilled all the task instruction, consider task has been successfully accomplished.{% endif %}
+-- NOTE that the screenshot is authentic, but the text of current answer is generated before the screenshot was taken, and there may be discrepancies between the text and the screenshots.
+-- NOTE the difference: 1) The text in answer may contradict the screenshot in answer, then the content of the text prevails, 2) The text in the answer is not mentioned on the screenshot, choose to believe the text. 3) The text may be empty, choose to belive the screenshot.
+You should elaborate on how you arrived at your final evaluation and then provide a definitive verdict on whether the task has been successfully accomplished, either as 'SUCCESS' or 'NOT SUCCESS'.
+
+Make sure to ONLY return the JSON object in this format with no additional text before or after it:
+```json
+{
+  "evaluation_criteria" : str, // Think step by step. Based on the web task instruction and the correct answer, how to verify the task is successfully completed.
+  "thoughts": str, // Think step by step. What information makes you believe the result meets or does not meet the criterion.
+  "verdict": str, // string enum. "SUCCESS", "NOT SUCCESS"
+}
+```
+
+Web Task Instruction
+```
+{{ ques }}
+```
+
+Correct Answer
+```
+{{ answer }}
+```
+
+Current Answer:
+```
+{{ extracted_information }}
+```

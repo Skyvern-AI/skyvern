@@ -33,6 +33,8 @@ import {
   WaitBlockYAML,
   FileDownloadBlockYAML,
   PDFParserBlockYAML,
+  Taskv2BlockYAML,
+  URLBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -46,7 +48,7 @@ import {
   SMTP_USERNAME_AWS_KEY,
   SMTP_USERNAME_PARAMETER_KEY,
 } from "./constants";
-import { ParametersState } from "./FlowRenderer";
+import { ParametersState } from "./types";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
@@ -65,7 +67,10 @@ import {
   StartNodeData,
 } from "./nodes/StartNode/types";
 import { isTaskNode, taskNodeDefaultData } from "./nodes/TaskNode/types";
-import { textPromptNodeDefaultData } from "./nodes/TextPromptNode/types";
+import {
+  isTextPromptNode,
+  textPromptNodeDefaultData,
+} from "./nodes/TextPromptNode/types";
 import { NodeBaseData } from "./nodes/types";
 import { uploadNodeDefaultData } from "./nodes/UploadNode/types";
 import {
@@ -85,7 +90,12 @@ import { loginNodeDefaultData } from "./nodes/LoginNode/types";
 import { isWaitNode, waitNodeDefaultData } from "./nodes/WaitNode/types";
 import { fileDownloadNodeDefaultData } from "./nodes/FileDownloadNode/types";
 import { ProxyLocation } from "@/api/types";
-import { pdfParserNodeDefaultData } from "./nodes/PDFParserNode/types";
+import {
+  isPdfParserNode,
+  pdfParserNodeDefaultData,
+} from "./nodes/PDFParserNode/types";
+import { taskv2NodeDefaultData } from "./nodes/Taskv2Node/types";
+import { urlNodeDefaultData } from "./nodes/URLNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -162,6 +172,7 @@ function layout(
 function convertToNode(
   identifiers: { id: string; parentId?: string },
   block: WorkflowBlock,
+  editable: boolean,
 ): AppNode {
   const common = {
     draggable: false,
@@ -171,7 +182,7 @@ function convertToNode(
   const commonData: NodeBaseData = {
     label: block.label,
     continueOnFailure: block.continue_on_failure,
-    editable: true,
+    editable,
   };
   switch (block.block_type) {
     case "task": {
@@ -196,6 +207,21 @@ function convertToNode(
           cacheActions: block.cache_actions,
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
+        },
+      };
+    }
+    case "task_v2": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "taskv2",
+        data: {
+          ...commonData,
+          prompt: block.prompt,
+          url: block.url ?? "",
+          maxIterations: block.max_iterations,
+          totpIdentifier: block.totp_identifier,
+          totpVerificationUrl: block.totp_verification_url,
         },
       };
     }
@@ -433,6 +459,18 @@ function convertToNode(
         },
       };
     }
+
+    case "goto_url": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "url",
+        data: {
+          ...commonData,
+          url: block.url,
+        },
+      };
+    }
   }
 }
 
@@ -553,6 +591,7 @@ export function nodeAdderNode(id: string, parentId?: string): NodeAdderNode {
 function getElements(
   blocks: Array<WorkflowBlock>,
   settings: WorkflowSettings,
+  editable: boolean,
 ): {
   nodes: Array<AppNode>;
   edges: Array<Edge>;
@@ -568,6 +607,7 @@ function getElements(
       persistBrowserSession: settings.persistBrowserSession,
       proxyLocation: settings.proxyLocation ?? ProxyLocation.Residential,
       webhookCallbackUrl: settings.webhookCallbackUrl ?? "",
+      editable,
     }),
   );
 
@@ -578,6 +618,7 @@ function getElements(
         parentId: d.parentId ?? undefined,
       },
       d.block,
+      editable,
     );
     nodes.push(node);
     if (d.previous) {
@@ -596,6 +637,7 @@ function getElements(
         startNodeId,
         {
           withWorkflowSettings: false,
+          editable,
         },
         block.id,
       ),
@@ -646,6 +688,17 @@ function createNode(
         type: "task",
         data: {
           ...taskNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "taskv2": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "taskv2",
+        data: {
+          ...taskv2NodeDefaultData,
           label,
         },
       };
@@ -815,6 +868,17 @@ function createNode(
         },
       };
     }
+    case "url": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "url",
+        data: {
+          ...urlNodeDefaultData,
+          label,
+        },
+      };
+    }
   }
 }
 
@@ -857,6 +921,17 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         cache_actions: node.data.cacheActions,
+      };
+    }
+    case "taskv2": {
+      return {
+        ...base,
+        block_type: "task_v2",
+        prompt: node.data.prompt,
+        max_iterations: node.data.maxIterations,
+        totp_identifier: node.data.totpIdentifier,
+        totp_verification_url: node.data.totpVerificationUrl,
+        url: node.data.url,
       };
     }
     case "validation": {
@@ -1053,6 +1128,13 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         block_type: "pdf_parser",
         file_url: node.data.fileUrl,
         json_schema: JSONParseSafe(node.data.jsonSchema),
+      };
+    }
+    case "url": {
+      return {
+        ...base,
+        block_type: "goto_url",
+        url: node.data.url,
       };
     }
     default: {
@@ -1477,6 +1559,13 @@ function convertParametersToParameterYAML(
           default_value: parameter.default_value,
         };
       }
+      case WorkflowParameterTypes.Credential: {
+        return {
+          ...base,
+          parameter_type: WorkflowParameterTypes.Credential,
+          credential_id: parameter.credential_id,
+        };
+      }
     }
   });
 }
@@ -1510,6 +1599,18 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           cache_actions: block.cache_actions,
+        };
+        return blockYaml;
+      }
+      case "task_v2": {
+        const blockYaml: Taskv2BlockYAML = {
+          ...base,
+          block_type: "task_v2",
+          prompt: block.prompt,
+          url: block.url,
+          max_iterations: block.max_iterations,
+          totp_identifier: block.totp_identifier,
+          totp_verification_url: block.totp_verification_url,
         };
         return blockYaml;
       }
@@ -1703,6 +1804,14 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "goto_url": {
+        const blockYaml: URLBlockYAML = {
+          ...base,
+          block_type: "goto_url",
+          url: block.url,
+        };
+        return blockYaml;
+      }
     }
   });
 }
@@ -1806,6 +1915,29 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   extractionNodes.forEach((node) => {
     if (node.data.dataExtractionGoal.length === 0) {
       errors.push(`${node.data.label}: Data extraction goal is required.`);
+    }
+    try {
+      JSON.parse(node.data.dataSchema);
+    } catch {
+      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+    }
+  });
+
+  const textPromptNodes = nodes.filter(isTextPromptNode);
+  textPromptNodes.forEach((node) => {
+    try {
+      JSON.parse(node.data.jsonSchema);
+    } catch {
+      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+    }
+  });
+
+  const pdfParserNodes = nodes.filter(isPdfParserNode);
+  pdfParserNodes.forEach((node) => {
+    try {
+      JSON.parse(node.data.jsonSchema);
+    } catch {
+      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
     }
   });
 

@@ -59,6 +59,16 @@ export type BitwardenCreditCardDataParameter = WorkflowParameterBase & {
   deleted_at: string | null;
 };
 
+export type CredentialParameter = WorkflowParameterBase & {
+  parameter_type: "credential";
+  workflow_id: string;
+  credential_parameter_id: string;
+  credential_id: string;
+  created_at: string;
+  modified_at: string;
+  deleted_at: string | null;
+};
+
 export type WorkflowParameter = WorkflowParameterBase & {
   parameter_type: "workflow";
   workflow_id: string;
@@ -105,6 +115,7 @@ export const WorkflowParameterTypes = {
   Bitwarden_Login_Credential: "bitwarden_login_credential",
   Bitwarden_Sensitive_Information: "bitwarden_sensitive_information",
   Bitwarden_Credit_Card_Data: "bitwarden_credit_card_data",
+  Credential: "credential",
 } as const;
 
 export type WorkflowParameterType =
@@ -117,7 +128,8 @@ export function isDisplayedInWorkflowEditor(
   | ContextParameter
   | BitwardenCreditCardDataParameter
   | BitwardenLoginCredentialParameter
-  | BitwardenSensitiveInformationParameter {
+  | BitwardenSensitiveInformationParameter
+  | CredentialParameter {
   return (
     parameter.parameter_type === WorkflowParameterTypes.Workflow ||
     parameter.parameter_type ===
@@ -126,7 +138,8 @@ export function isDisplayedInWorkflowEditor(
     parameter.parameter_type ===
       WorkflowParameterTypes.Bitwarden_Sensitive_Information ||
     parameter.parameter_type ===
-      WorkflowParameterTypes.Bitwarden_Credit_Card_Data
+      WorkflowParameterTypes.Bitwarden_Credit_Card_Data ||
+    parameter.parameter_type === WorkflowParameterTypes.Credential
   );
 }
 
@@ -137,7 +150,8 @@ export type Parameter =
   | BitwardenLoginCredentialParameter
   | BitwardenSensitiveInformationParameter
   | BitwardenCreditCardDataParameter
-  | AWSSecretParameter;
+  | AWSSecretParameter
+  | CredentialParameter;
 
 export type WorkflowBlock =
   | TaskBlock
@@ -155,7 +169,9 @@ export type WorkflowBlock =
   | LoginBlock
   | WaitBlock
   | FileDownloadBlock
-  | PDFParserBlock;
+  | PDFParserBlock
+  | Taskv2Block
+  | URLBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -174,6 +190,8 @@ export const WorkflowBlockTypes = {
   Wait: "wait",
   FileDownload: "file_download",
   PDFParser: "pdf_parser",
+  Taskv2: "task_v2",
+  URL: "goto_url",
 } as const;
 
 export function isTaskVariantBlock(item: {
@@ -229,6 +247,15 @@ export type TaskBlock = WorkflowBlockBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+};
+
+export type Taskv2Block = WorkflowBlockBase & {
+  block_type: "task_v2";
+  prompt: string;
+  url: string | null;
+  totp_verification_url: string | null;
+  totp_identifier: string | null;
+  max_iterations: number | null;
 };
 
 export type ForLoopBlock = WorkflowBlockBase & {
@@ -376,6 +403,11 @@ export type PDFParserBlock = WorkflowBlockBase & {
   block_type: "pdf_parser";
   file_url: string;
   json_schema: Record<string, unknown> | null;
+};
+
+export type URLBlock = WorkflowBlockBase & {
+  block_type: "goto_url";
+  url: string;
 };
 
 export type WorkflowDefinition = {

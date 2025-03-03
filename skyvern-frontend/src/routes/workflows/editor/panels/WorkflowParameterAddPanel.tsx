@@ -1,7 +1,7 @@
 import { Cross2Icon } from "@radix-ui/react-icons";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
-import { useState } from "react";
+import { useContext, useState } from "react";
 import {
   WorkflowEditorParameterType,
   WorkflowParameterValueType,
@@ -15,13 +15,16 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
-import { ParametersState } from "../FlowRenderer";
+import { ParametersState } from "../types";
 import { WorkflowParameterInput } from "../../WorkflowParameterInput";
 import { Checkbox } from "@/components/ui/checkbox";
 import { getDefaultValueForParameterType } from "../workflowEditorUtils";
 import { toast } from "@/components/ui/use-toast";
 import { SourceParameterKeySelector } from "../../components/SourceParameterKeySelector";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
+import CloudContext from "@/store/CloudContext";
+import { CredentialSelector } from "../../components/CredentialSelector";
+import { SwitchBar } from "@/components/SwitchBar";
 
 type Props = {
   type: WorkflowEditorParameterType;
@@ -55,6 +58,7 @@ function header(type: WorkflowEditorParameterType) {
 }
 
 function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
+  const isCloud = useContext(CloudContext);
   const [key, setKey] = useState("");
   const [urlParameterKey, setUrlParameterKey] = useState("");
   const [description, setDescription] = useState("");
@@ -72,9 +76,15 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
     string | undefined
   >(undefined);
 
+  const [credentialType, setCredentialType] = useState<"bitwarden" | "skyvern">(
+    "skyvern",
+  );
+
   const [identityKey, setIdentityKey] = useState("");
   const [identityFields, setIdentityFields] = useState("");
   const [itemId, setItemId] = useState("");
+
+  const [credentialId, setCredentialId] = useState("");
 
   return (
     <ScrollArea>
@@ -182,6 +192,18 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
             </>
           )}
           {type === "credential" && (
+            <SwitchBar
+              value={credentialType}
+              onChange={(value) => {
+                setCredentialType(value as "bitwarden" | "skyvern");
+              }}
+              options={[
+                { label: "Skyvern", value: "skyvern" },
+                { label: "Bitwarden", value: "bitwarden" },
+              ]}
+            />
+          )}
+          {type === "credential" && credentialType === "bitwarden" && (
             <>
               <div className="space-y-1">
                 <Label className="text-xs text-slate-300">
@@ -255,9 +277,31 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
               </div>
             </>
           )}
+          {
+            // temporarily cloud only
+            type === "credential" &&
+              credentialType === "skyvern" &&
+              isCloud && (
+                <div className="space-y-1">
+                  <Label className="text-xs text-slate-300">Credential</Label>
+                  <CredentialSelector
+                    value={credentialId}
+                    onChange={(value) => setCredentialId(value)}
+                  />
+                </div>
+              )
+          }
           <div className="flex justify-end">
             <Button
               onClick={() => {
+                if (!key) {
+                  toast({
+                    variant: "destructive",
+                    title: "Failed to add parameter",
+                    description: "Key is required",
+                  });
+                  return;
+                }
                 if (type === "workflow") {
                   if (
                     parameterType === "json" &&
@@ -290,7 +334,7 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                   });
                 }
                 if (
-                  type === "credential" ||
+                  (type === "credential" && credentialType === "bitwarden") ||
                   type === "secret" ||
                   type === "creditCardData"
                 ) {
@@ -303,7 +347,7 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                     return;
                   }
                 }
-                if (type === "credential") {
+                if (type === "credential" && credentialType === "bitwarden") {
                   onSave({
                     key,
                     parameterType: "credential",
@@ -346,7 +390,23 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                   onSave({
                     key,
                     parameterType: "context",
-                    sourceParameterKey: sourceParameterKey,
+                    sourceParameterKey,
+                    description,
+                  });
+                }
+                if (type === "credential" && credentialType === "skyvern") {
+                  if (!credentialId) {
+                    toast({
+                      variant: "destructive",
+                      title: "Failed to add parameter",
+                      description: "Credential is required",
+                    });
+                    return;
+                  }
+                  onSave({
+                    key,
+                    parameterType: "credential",
+                    credentialId,
                     description,
                   });
                 }

@@ -8,8 +8,8 @@ logo:
   height: 28
 colors:
   accentPrimary:
-    dark: '#0D9373'
-    light: '#07C983'
+    dark: '#14D4A7'
+    light: '#038B5A'
   background:
     dark: '#000000'
     light: '#FFFFFF'

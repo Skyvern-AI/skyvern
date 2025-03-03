@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, field_validator
 from skyvern.exceptions import InvalidTaskStatusTransition, TaskAlreadyCanceled, TaskAlreadyTimeout
 from skyvern.forge.sdk.core.validators import validate_url
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.schemas.files import FileInfo
 
 
 class ProxyLocation(StrEnum):
@@ -26,6 +27,10 @@ class ProxyLocation(StrEnum):
     RESIDENTIAL_JP = "RESIDENTIAL_JP"
     RESIDENTIAL_FR = "RESIDENTIAL_FR"
     RESIDENTIAL_DE = "RESIDENTIAL_DE"
+    RESIDENTIAL_NZ = "RESIDENTIAL_NZ"
+    RESIDENTIAL_ZA = "RESIDENTIAL_ZA"
+    RESIDENTIAL_AR = "RESIDENTIAL_AR"
+    RESIDENTIAL_ISP = "RESIDENTIAL_ISP"
     NONE = "NONE"
 
 
@@ -71,6 +76,18 @@ def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
 
     if proxy_location == ProxyLocation.RESIDENTIAL_DE:
         return ZoneInfo("Europe/Berlin")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_NZ:
+        return ZoneInfo("Pacific/Auckland")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_ZA:
+        return ZoneInfo("Africa/Johannesburg")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_AR:
+        return ZoneInfo("America/Argentina/Buenos_Aires")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_ISP:
+        return ZoneInfo("America/New_York")
 
     return None
 
@@ -306,7 +323,7 @@ class Task(TaskBase):
         screenshot_url: str | None = None,
         recording_url: str | None = None,
         browser_console_log_url: str | None = None,
-        downloaded_file_urls: list[str] | None = None,
+        downloaded_files: list[FileInfo] | None = None,
         failure_reason: str | None = None,
     ) -> TaskResponse:
         return TaskResponse(
@@ -321,7 +338,8 @@ class Task(TaskBase):
             screenshot_url=screenshot_url,
             recording_url=recording_url,
             browser_console_log_url=browser_console_log_url,
-            downloaded_file_urls=downloaded_file_urls,
+            downloaded_files=downloaded_files,
+            downloaded_file_urls=[file.url for file in downloaded_files] if downloaded_files else None,
             errors=self.errors,
             max_steps_per_run=self.max_steps_per_run,
             workflow_run_id=self.workflow_run_id,
@@ -339,6 +357,7 @@ class TaskResponse(BaseModel):
     screenshot_url: str | None = None
     recording_url: str | None = None
     browser_console_log_url: str | None = None
+    downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None
     failure_reason: str | None = None
     errors: list[dict[str, Any]] = []
@@ -352,15 +371,22 @@ class TaskOutput(BaseModel):
     extracted_information: list | dict[str, Any] | str | None = None
     failure_reason: str | None = None
     errors: list[dict[str, Any]] = []
+    downloaded_files: list[FileInfo] | None = None
+    downloaded_file_urls: list[str] | None = None  # For backward compatibility
 
     @staticmethod
-    def from_task(task: Task) -> TaskOutput:
+    def from_task(task: Task, downloaded_files: list[FileInfo] | None = None) -> TaskOutput:
+        # For backward compatibility, extract just the URLs from FileInfo objects
+        downloaded_file_urls = [file_info.url for file_info in downloaded_files] if downloaded_files else None
+
         return TaskOutput(
             task_id=task.task_id,
             status=task.status,
             extracted_information=task.extracted_information,
             failure_reason=task.failure_reason,
             errors=task.errors,
+            downloaded_files=downloaded_files,
+            downloaded_file_urls=downloaded_file_urls,
         )
 
 

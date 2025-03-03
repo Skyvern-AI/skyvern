@@ -108,7 +108,7 @@ async def _retrieve_action_plan(task: Task, step: Step, scraped_page: ScrapedPag
 
     LOG.info("Found cached actions to execute", actions=cached_actions_to_execute)
 
-    actions_queries: list[tuple[Action, str | None]] = []
+    actions: list[Action] = []
     for idx, cached_action in enumerate(cached_actions_to_execute):
         updated_action = cached_action.model_copy()
         updated_action.status = ActionStatus.pending
@@ -135,18 +135,16 @@ async def _retrieve_action_plan(task: Task, step: Step, scraped_page: ScrapedPag
                     "All elements with either no hash or multiple hashes should have been already filtered out"
                 )
 
-        actions_queries.append((updated_action, updated_action.intention))
+        actions.append(updated_action)
 
     # Check for unsupported actions before personalizing the actions
     # Classify the supported actions into two groups:
     # 1. Actions that can be cached with a query
     # 2. Actions that can be cached without a query
     # We'll use this classification to determine if we should continue with caching or fallback to no-cache mode
-    check_for_unsupported_actions(actions_queries)
+    check_for_unsupported_actions(actions)
 
-    personalized_actions = await personalize_actions(
-        task=task, step=step, scraped_page=scraped_page, actions_queries=actions_queries
-    )
+    personalized_actions = await personalize_actions(task=task, step=step, scraped_page=scraped_page, actions=actions)
 
     LOG.info("Personalized cached actions are ready", actions=personalized_actions)
     return personalized_actions
@@ -155,10 +153,10 @@ async def _retrieve_action_plan(task: Task, step: Step, scraped_page: ScrapedPag
 async def personalize_actions(
     task: Task,
     step: Step,
-    actions_queries: list[tuple[Action, str | None]],
+    actions: list[Action],
     scraped_page: ScrapedPage,
 ) -> list[Action]:
-    queries_and_answers: dict[str, str | None] = {query: None for _, query in actions_queries if query}
+    queries_and_answers: dict[str, str | None] = {action.intention: None for action in actions if action.intention}
 
     answered_queries: dict[str, str] = {}
     if queries_and_answers:
@@ -168,9 +166,13 @@ async def personalize_actions(
         )
 
     personalized_actions = []
-    for action, query in actions_queries:
+    for action in actions:
+        query = action.intention
         if query and (personalized_answer := answered_queries.get(query)):
-            personalized_actions.append(personalize_action(action, query, personalized_answer))
+            current_personized_actions = await personalize_action(
+                action, query, personalized_answer, task, step, scraped_page
+            )
+            personalized_actions.extend(current_personized_actions)
         else:
             personalized_actions.append(action)
 
@@ -189,7 +191,7 @@ async def get_user_detail_answers(
         )
 
         llm_response = await app.SECONDARY_LLM_API_HANDLER(
-            prompt=question_answering_prompt, step=step, screenshots=None
+            prompt=question_answering_prompt, step=step, screenshots=None, prompt_name="answer-user-detail-questions"
         )
         return llm_response
     except Exception as e:
@@ -198,24 +200,52 @@ async def get_user_detail_answers(
         raise e
 
 
-def personalize_action(action: Action, query: str, answer: str) -> Action:
+async def personalize_action(
+    action: Action,
+    query: str,
+    answer: str,
+    task: Task,
+    step: Step,
+    scraped_page: ScrapedPage,
+) -> list[Action]:
     action.intention = query
     action.response = answer
 
     if action.action_type == ActionType.INPUT_TEXT:
         action.text = answer
+        if not answer:
+            return []
+    elif action.action_type == ActionType.UPLOAD_FILE:
+        action.file_url = answer
+    elif action.action_type == ActionType.CLICK:
+        # TODO: we only use cached action.intention. send the intention, navigation payload + navigation goal, html
+        # to small llm and make a decision of which elements to click. Not clicking anything is also an option here
+        return [action]
+    elif action.action_type == ActionType.SELECT_OPTION:
+        # TODO: send the selection action with the original/previous option value. Our current selection agent
+        # is already able to handle it
+        return [action]
+    elif action.action_type in [
+        ActionType.COMPLETE,
+        ActionType.WAIT,
+        ActionType.SOLVE_CAPTCHA,
+    ]:
+        return [action]
+    elif action.action_type == ActionType.TERMINATE:
+        return []
     else:
         raise CachedActionPlanError(
             f"Unsupported action type for personalization, fallback to no-cache mode: {action.action_type}"
         )
 
-    return action
+    return [action]
 
 
-def check_for_unsupported_actions(actions_queries: list[tuple[Action, str | None]]) -> None:
+def check_for_unsupported_actions(actions: list[Action]) -> None:
     supported_actions = [ActionType.INPUT_TEXT, ActionType.WAIT, ActionType.CLICK, ActionType.COMPLETE]
     supported_actions_with_query = [ActionType.INPUT_TEXT]
-    for action, query in actions_queries:
+    for action in actions:
+        query = action.intention
         if action.action_type not in supported_actions:
             raise CachedActionPlanError(
                 f"This action type does not support caching: {action.action_type}, fallback to no-cache mode"

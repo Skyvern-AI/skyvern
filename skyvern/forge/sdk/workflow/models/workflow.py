@@ -5,7 +5,8 @@ from typing import Any, List
 from pydantic import BaseModel, field_validator
 
 from skyvern.forge.sdk.core.validators import validate_url
-from skyvern.forge.sdk.schemas.observers import ObserverTask
+from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicateBlockLabels
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
@@ -109,6 +110,7 @@ class WorkflowRun(BaseModel):
     totp_identifier: str | None = None
     failure_reason: str | None = None
     parent_workflow_run_id: str | None = None
+    workflow_title: str | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -142,8 +144,10 @@ class WorkflowRunStatusResponse(BaseModel):
     parameters: dict[str, Any]
     screenshot_urls: list[str] | None = None
     recording_url: str | None = None
+    downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None
     outputs: dict[str, Any] | None = None
     total_steps: int | None = None
     total_cost: float | None = None
-    observer_task: ObserverTask | None = None
+    task_v2: TaskV2 | None = None
+    workflow_title: str | None = None

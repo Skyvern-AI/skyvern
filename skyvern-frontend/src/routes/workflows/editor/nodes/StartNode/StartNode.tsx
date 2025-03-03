@@ -30,6 +30,9 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
   });
 
   function handleChange(key: string, value: unknown) {
+    if (!data.editable) {
+      return;
+    }
     setInputs({ ...inputs, [key]: value });
     updateNodeData(id, { [key]: value });
   }

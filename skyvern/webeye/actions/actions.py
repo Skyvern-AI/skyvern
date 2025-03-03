@@ -75,6 +75,7 @@ class CompleteVerifyResult(BaseModel):
 
 
 class InputOrSelectContext(BaseModel):
+    intention: str | None = None
     field: str | None = None
     is_required: bool | None = None
     is_search_bar: bool | None = None  # don't trigger custom-selection logic when it's a search bar
@@ -82,7 +83,7 @@ class InputOrSelectContext(BaseModel):
     is_date_related: bool | None = None  # date picker mini agent requires some special logic
 
     def __repr__(self) -> str:
-        return f"InputOrSelectContext(field={self.field}, is_required={self.is_required}, is_search_bar={self.is_search_bar}, is_location_input={self.is_location_input})"
+        return f"InputOrSelectContext(field={self.field}, is_required={self.is_required}, is_search_bar={self.is_search_bar}, is_location_input={self.is_location_input}, intention={self.intention})"
 
 
 class Action(BaseModel):
@@ -119,6 +120,7 @@ class Action(BaseModel):
     text: str | None = None
     option: SelectOption | None = None
     is_checked: bool | None = None
+    verified: bool = False
 
     created_at: datetime | None = None
     modified_at: datetime | None = None

@@ -44,6 +44,15 @@ function WorkflowPostRunParameters() {
   }
 
   const activeBlock = getActiveBlock();
+  const isTaskV2 = workflowRun.task_v2 !== null;
+
+  const webhookCallbackUrl = isTaskV2
+    ? workflowRun.task_v2?.webhook_callback_url
+    : workflowRun.webhook_callback_url;
+
+  const proxyLocation = isTaskV2
+    ? workflowRun.task_v2?.proxy_location
+    : workflowRun.proxy_location;
 
   return (
     <div className="space-y-5">
@@ -125,14 +134,14 @@ function WorkflowPostRunParameters() {
             <div className="w-80">
               <h1 className="text-lg">Webhook Callback URL</h1>
             </div>
-            <Input value={workflowRun.webhook_callback_url ?? ""} readOnly />
+            <Input value={webhookCallbackUrl ?? ""} readOnly />
           </div>
           <div className="flex gap-16">
             <div className="w-80">
               <h1 className="text-lg">Proxy Location</h1>
             </div>
             <ProxySelector
-              value={workflowRun.proxy_location ?? ProxyLocation.Residential}
+              value={proxyLocation ?? ProxyLocation.Residential}
               onChange={() => {
                 // TODO
               }}
@@ -140,7 +149,7 @@ function WorkflowPostRunParameters() {
           </div>
         </div>
       </div>
-      {workflowRun.observer_task ? (
+      {workflowRun.task_v2 ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
             <h1 className="text-lg font-bold">Task 2.0 Parameters</h1>
@@ -152,7 +161,7 @@ function WorkflowPostRunParameters() {
                 </h2>
               </div>
               <AutoResizingTextarea
-                value={workflowRun.observer_task.prompt ?? ""}
+                value={workflowRun.task_v2.prompt ?? ""}
                 readOnly
               />
             </div>

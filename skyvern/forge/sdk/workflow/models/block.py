@@ -25,6 +25,7 @@ from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
 from skyvern.config import settings
+from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, MAX_UPLOAD_FILE_COUNT
 from skyvern.exceptions import (
     ContextParameterValueNotFound,
     DisabledBlockExecutionError,
@@ -48,7 +49,8 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core.validators import prepend_scheme_and_validate_url
 from skyvern.forge.sdk.db.enums import TaskType
-from skyvern.forge.sdk.schemas.observers import ObserverTaskStatus
+from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -246,7 +248,9 @@ class Block(BaseModel, abc.ABC):
                     "generate_workflow_run_block_description",
                     block=block_data,
                 )
-                json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=description_generation_prompt)
+                json_response = await app.SECONDARY_LLM_API_HANDLER(
+                    prompt=description_generation_prompt, prompt_name="generate-workflow-run-block-description"
+                )
                 description = json_response.get("summary")
                 LOG.info(
                     "Generated description for the workflow run block",
@@ -630,7 +634,19 @@ class BaseTaskBlock(Block):
                     organization_id=workflow_run.organization_id,
                 )
                 success = updated_task.status == TaskStatus.completed
-                task_output = TaskOutput.from_task(updated_task)
+
+                downloaded_files: list[FileInfo] = []
+                try:
+                    async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                        downloaded_files = await app.STORAGE.get_downloaded_files(
+                            organization_id=workflow_run.organization_id,
+                            task_id=updated_task.task_id,
+                            workflow_run_id=workflow_run_id,
+                        )
+                except asyncio.TimeoutError:
+                    LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
+
+                task_output = TaskOutput.from_task(updated_task, downloaded_files)
                 output_parameter_value = task_output.model_dump()
                 await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_parameter_value)
                 return await self.build_block_result(
@@ -679,11 +695,22 @@ class BaseTaskBlock(Block):
                 current_retry += 1
                 will_retry = current_retry <= self.max_retries
                 retry_message = f", retrying task {current_retry}/{self.max_retries}" if will_retry else ""
-                task_output = TaskOutput.from_task(updated_task)
+                try:
+                    async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                        downloaded_files = await app.STORAGE.get_downloaded_files(
+                            organization_id=workflow_run.organization_id,
+                            task_id=updated_task.task_id,
+                            workflow_run_id=workflow_run_id,
+                        )
+
+                except asyncio.TimeoutError:
+                    LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
+
+                task_output = TaskOutput.from_task(updated_task, downloaded_files)
                 LOG.warning(
                     f"Task failed with status {updated_task.status}{retry_message}",
                     task_id=updated_task.task_id,
-                    status=updated_task.status,
+                    task_status=updated_task.status,
                     workflow_run_id=workflow_run_id,
                     workflow_id=workflow.workflow_id,
                     organization_id=workflow_run.organization_id,
@@ -1003,15 +1030,26 @@ class ForLoopBlock(Block):
                 block_type=self.block_type,
                 workflow_run_id=workflow_run_id,
                 num_loop_over_values=len(loop_over_values),
+                complete_if_empty=self.complete_if_empty,
             )
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, [])
-            return await self.build_block_result(
-                success=False,
-                failure_reason="No iterable value found for the loop block",
-                status=BlockStatus.terminated,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-            )
+            if self.complete_if_empty:
+                return await self.build_block_result(
+                    success=True,
+                    failure_reason=None,
+                    output_parameter_value=[],
+                    status=BlockStatus.completed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            else:
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason="No iterable value found for the loop block",
+                    status=BlockStatus.terminated,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
 
         if not self.loop_blocks or len(self.loop_blocks) == 0:
             LOG.info(
@@ -1198,7 +1236,7 @@ class TextPromptBlock(Block):
             prompt=prompt,
             llm_key=self.llm_key,
         )
-        response = await llm_api_handler(prompt=prompt)
+        response = await llm_api_handler(prompt=prompt, prompt_name="text-prompt")
         LOG.info("TextPromptBlock: Received response from LLM", response=response)
         return response
 
@@ -1416,7 +1454,7 @@ class UploadToS3Block(Block):
             if os.path.isdir(self.path):
                 # get all files in the directory, if there are more than 25 files, we will not upload them
                 files = os.listdir(self.path)
-                if len(files) > 25:
+                if len(files) > MAX_UPLOAD_FILE_COUNT:
                     raise ValueError("Too many files in the directory, not uploading")
                 for file in files:
                     # if the file is a directory, we will not upload it
@@ -1954,7 +1992,7 @@ class PDFParserBlock(Block):
         llm_prompt = prompt_engine.load_prompt(
             "extract-information-from-file-text", extracted_text_content=extracted_text, json_schema=self.json_schema
         )
-        llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt)
+        llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt, prompt_name="extract-information-from-file-text")
         # Record the parsed data
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, llm_response)
         return await self.build_block_result(
@@ -2078,7 +2116,6 @@ class UrlBlock(BaseTaskBlock):
     url: str
 
 
-# observer block
 class TaskV2Block(Block):
     block_type: Literal[BlockType.TaskV2] = BlockType.TaskV2
     prompt: str
@@ -2101,7 +2138,7 @@ class TaskV2Block(Block):
         browser_session_id: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
-        from skyvern.forge.sdk.services import observer_service
+        from skyvern.forge.sdk.services import task_v2_service
         from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 
         if not organization_id:
@@ -2113,37 +2150,37 @@ class TaskV2Block(Block):
         workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id, organization_id)
         if not workflow_run:
             raise ValueError(f"WorkflowRun not found {workflow_run_id} when running TaskV2Block")
-        observer_task = await observer_service.initialize_observer_task(
+        task_v2 = await task_v2_service.initialize_task_v2(
             organization,
             user_prompt=self.prompt,
             user_url=self.url,
             parent_workflow_run_id=workflow_run_id,
             proxy_location=workflow_run.proxy_location,
         )
-        await app.DATABASE.update_observer_cruise(
-            observer_task.observer_cruise_id, status=ObserverTaskStatus.queued, organization_id=organization_id
+        await app.DATABASE.update_task_v2(
+            task_v2.observer_cruise_id, status=TaskV2Status.queued, organization_id=organization_id
         )
-        if observer_task.workflow_run_id:
+        if task_v2.workflow_run_id:
             await app.DATABASE.update_workflow_run(
-                workflow_run_id=observer_task.workflow_run_id,
+                workflow_run_id=task_v2.workflow_run_id,
                 status=WorkflowRunStatus.queued,
             )
             await app.DATABASE.update_workflow_run_block(
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
-                block_workflow_run_id=observer_task.workflow_run_id,
+                block_workflow_run_id=task_v2.workflow_run_id,
             )
 
-        observer_task = await observer_service.run_observer_task(
+        task_v2 = await task_v2_service.run_task_v2(
             organization=organization,
-            observer_cruise_id=observer_task.observer_cruise_id,
+            task_v2_id=task_v2.observer_cruise_id,
             request_id=None,
             max_iterations_override=self.max_iterations,
             browser_session_id=browser_session_id,
         )
         result_dict = None
-        if observer_task:
-            result_dict = observer_task.output
+        if task_v2:
+            result_dict = task_v2.output
 
         return await self.build_block_result(
             success=True,

@@ -1,6 +1,6 @@
-import { getClient } from "@/api/AxiosClient";
-import { Status, WorkflowRunApiResponse } from "@/api/types";
+import { Status } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
+import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
 import { Button } from "@/components/ui/button";
 import {
   Pagination,
@@ -19,50 +19,31 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { Pencil2Icon, PlayIcon } from "@radix-ui/react-icons";
-import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
 import {
   Link,
   useNavigate,
   useParams,
   useSearchParams,
 } from "react-router-dom";
-import { WorkflowActions } from "./WorkflowActions";
-import { useState } from "react";
-import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
 import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
-import { globalWorkflowIds } from "@/util/env";
+import { useWorkflowRunsQuery } from "./hooks/useWorkflowRunsQuery";
+import { WorkflowActions } from "./WorkflowActions";
 
 function WorkflowPage() {
-  const credentialGetter = useCredentialGetter();
   const { workflowPermanentId } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
   const navigate = useNavigate();
 
-  const { data: workflowRuns, isLoading } = useQuery<
-    Array<WorkflowRunApiResponse>
-  >({
-    queryKey: ["workflowRuns", workflowPermanentId, { statusFilters }, page],
-    queryFn: async () => {
-      const client = await getClient(credentialGetter);
-      const isGlobalWorkflow =
-        workflowPermanentId && globalWorkflowIds.includes(workflowPermanentId);
-      const params = new URLSearchParams();
-      if (isGlobalWorkflow) {
-        params.set("template", "true");
-      }
-      params.append("page", String(page));
-      return client
-        .get(`/workflows/${workflowPermanentId}/runs`, {
-          params,
-        })
-        .then((response) => response.data);
-    },
+  const { data: workflowRuns, isLoading } = useWorkflowRunsQuery({
+    workflowPermanentId,
+    statusFilters,
+    page,
     refetchOnMount: "always",
   });
 

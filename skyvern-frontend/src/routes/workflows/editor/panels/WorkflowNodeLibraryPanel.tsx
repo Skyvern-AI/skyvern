@@ -68,6 +68,28 @@ const nodeLibraryItems: Array<{
     description: "Takes actions or extracts information",
   },
   {
+    nodeType: "taskv2",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Taskv2}
+        className="size-6"
+      />
+    ),
+    title: "Task v2 Block",
+    description: "Runs a Skyvern v2 Task",
+  },
+  {
+    nodeType: "url",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.URL}
+        className="size-6"
+      />
+    ),
+    title: "Go to URL Block",
+    description: "Navigates to a URL",
+  },
+  {
     nodeType: "textPrompt",
     icon: (
       <WorkflowBlockIcon
@@ -144,17 +166,17 @@ const nodeLibraryItems: Array<{
   //   title: "Download Block",
   //   description: "Downloads a file from S3",
   // },
-  {
-    nodeType: "upload",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.UploadToS3}
-        className="size-6"
-      />
-    ),
-    title: "Upload Block",
-    description: "Uploads a file to S3",
-  },
+  // {
+  //   nodeType: "upload",
+  //   icon: (
+  //     <WorkflowBlockIcon
+  //       workflowBlockType={WorkflowBlockTypes.UploadToS3}
+  //       className="size-6"
+  //     />
+  //   ),
+  //   title: "Upload Block",
+  //   description: "Uploads a file to S3",
+  // },
   {
     nodeType: "fileDownload",
     icon: (

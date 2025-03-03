@@ -17,12 +17,12 @@ from skyvern.config import settings
 from skyvern.constants import (
     AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
     BROWSER_DOWNLOAD_MAX_WAIT_TIME,
-    BROWSER_DOWNLOAD_TIMEOUT,
     DROPDOWN_MENU_MAX_DISTANCE,
     REPO_ROOT_DIR,
     SKYVERN_ID_ATTR,
 )
 from skyvern.exceptions import (
+    DownloadFileMaxWaitingTime,
     EmptySelect,
     ErrEmptyTweakValue,
     ErrFoundSelectableElement,
@@ -47,12 +47,19 @@ from skyvern.exceptions import (
     NoIncrementalElementFoundForAutoCompletion,
     NoIncrementalElementFoundForCustomSelection,
     NoSuitableAutoCompleteOption,
+    NoTOTPVerificationCodeFound,
     OptionIndexOutOfBound,
     WrongElementToUploadFile,
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.files import download_file, get_download_dir, list_files_in_directory
+from skyvern.forge.sdk.api.files import (
+    download_file,
+    get_download_dir,
+    list_downloading_files_in_directory,
+    list_files_in_directory,
+    wait_for_download_finished,
+)
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_post
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
@@ -96,6 +103,7 @@ class CustomSingleSelectResult:
     def __init__(self, skyvern_frame: SkyvernFrame) -> None:
         self.reasoning: str | None = None
         self.action_result: ActionResult | None = None
+        self.action_type: ActionType | None = None
         self.value: str | None = None
         self.dropdown_menu: SkyvernElement | None = None
         self.skyvern_frame = skyvern_frame
@@ -505,12 +513,7 @@ async def handle_click_to_download_file_action(
         return [ActionFailure(exception=NoFileDownloadTriggered(action.element_id))]
 
     # check if there's any file is still downloading
-    downloading_files: list[Path] = []
-    for file in list_files_after:
-        path = Path(file)
-        if path.suffix == ".crdownload":
-            downloading_files.append(path)
-
+    downloading_files = list_downloading_files_in_directory(download_dir)
     if len(downloading_files) == 0:
         return [ActionSuccess(download_triggered=True)]
 
@@ -522,20 +525,11 @@ async def handle_click_to_download_file_action(
         workflow_run_id=task.workflow_run_id,
     )
     try:
-        async with asyncio.timeout(BROWSER_DOWNLOAD_TIMEOUT):
-            while len(downloading_files) > 0:
-                new_downloading_files: list[Path] = []
-                for path in downloading_files:
-                    if not path.exists():
-                        continue
-                    new_downloading_files.append(path)
-                downloading_files = new_downloading_files
-                await asyncio.sleep(1)
-
-    except asyncio.TimeoutError:
+        await wait_for_download_finished(downloading_files=downloading_files)
+    except DownloadFileMaxWaitingTime as e:
         LOG.warning(
             "There're several long-time downloading files, these files might be broken",
-            downloading_files=downloading_files,
+            downloading_files=e.downloading_files,
             task_id=task.task_id,
             step_id=step.step_id,
             workflow_run_id=task.workflow_run_id,
@@ -582,6 +576,7 @@ async def handle_input_text_action(
         reasoning=action.reasoning,
         element_id=skyvern_element.get_id(),
         option=SelectOption(label=text),
+        intention=action.intention,
     )
     if skyvern_element.get_selectable():
         LOG.info(
@@ -638,9 +633,10 @@ async def handle_input_text_action(
             await incremental_scraped.stop_listen_dom_increment()
         else:
             auto_complete_hacky_flag = True
+            try_to_quit_dropdown = True
             try:
                 # TODO: we don't select by value for the auto completion detect case
-                result, _ = await sequentially_select_from_dropdown(
+                select_result = await sequentially_select_from_dropdown(
                     action=select_action,
                     page=page,
                     dom=dom,
@@ -651,10 +647,11 @@ async def handle_input_text_action(
                     task=task,
                     target_value=text,
                 )
-                if result is not None and result.success:
-                    return [result]
 
-                if result is None:
+                if select_result is None or select_result.dropdown_menu is None:
+                    try_to_quit_dropdown = False
+
+                elif select_result.action_result is None:
                     LOG.info(
                         "It might not be a selectable auto-completion input, exit the custom selection mode",
                         task_id=task.task_id,
@@ -662,6 +659,10 @@ async def handle_input_text_action(
                         element_id=skyvern_element.get_id(),
                         action=action,
                     )
+
+                elif select_result.action_result.success:
+                    return [select_result.action_result]
+
                 else:
                     LOG.warning(
                         "Custom selection returned an error, continue to input text",
@@ -669,7 +670,7 @@ async def handle_input_text_action(
                         step_id=step.step_id,
                         element_id=skyvern_element.get_id(),
                         action=action,
-                        err_msg=result.exception_message,
+                        err_msg=select_result.action_result.exception_message,
                     )
 
             except Exception:
@@ -697,7 +698,7 @@ async def handle_input_text_action(
                         if await blocking_element.get_locator().count():
                             await blocking_element.blur()
 
-                if await skyvern_element.is_visible():
+                if try_to_quit_dropdown and await skyvern_element.is_visible():
                     await skyvern_element.press_key("Escape")
                     await skyvern_element.blur()
                 await incremental_scraped.stop_listen_dom_increment()
@@ -758,7 +759,10 @@ async def handle_input_text_action(
                 elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
             )
 
-            json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+            json_response = await app.SECONDARY_LLM_API_HANDLER(
+                prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
+            )
+            json_response["intention"] = action.intention
             input_or_select_context = InputOrSelectContext.model_validate(json_response)
             LOG.info(
                 "Parsed input/select context",
@@ -997,6 +1001,7 @@ async def handle_select_option_action(
                 reasoning=action.reasoning,
                 element_id=selectable_child.get_id(),
                 option=action.option,
+                intention=action.intention,
             )
             action = select_action
             skyvern_element = selectable_child
@@ -1043,6 +1048,7 @@ async def handle_select_option_action(
             reasoning=action.reasoning,
             element_id=blocking_element.get_id(),
             option=action.option,
+            intention=action.intention,
         )
         action = select_action
         skyvern_element = blocking_element
@@ -1135,7 +1141,7 @@ async def handle_select_option_action(
             raise NoIncrementalElementFoundForCustomSelection(element_id=skyvern_element.get_id())
 
         # TODO: support sequetially select from dropdown by value, just support single select now
-        result, suggested_value = await sequentially_select_from_dropdown(
+        result = await sequentially_select_from_dropdown(
             action=action,
             page=page,
             dom=dom,
@@ -1148,9 +1154,11 @@ async def handle_select_option_action(
         )
         # force_select won't return None result
         assert result is not None
-        results.append(result)
-        if isinstance(result, ActionSuccess) or suggested_value is None:
+        assert result.action_result is not None
+        results.append(result.action_result)
+        if isinstance(result.action_result, ActionSuccess) or result.value is None:
             return results
+        suggested_value = result.value
 
     except Exception as e:
         LOG.exception("Custom select error")
@@ -1285,27 +1293,6 @@ async def handle_complete_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    # If this action has a source_action_id, then we need to make sure if the goal is actually completed.
-    if action.source_action_id and task.navigation_goal:
-        LOG.info(
-            "CompleteAction has source_action_id, checking if goal is completed",
-            task_id=task.task_id,
-            step_id=step.step_id,
-            workflow_run_id=task.workflow_run_id,
-        )
-        verified_complete_action = await app.agent.check_user_goal_complete(page, scraped_page, task, step)
-        if verified_complete_action is None:
-            return [
-                ActionFailure(
-                    exception=IllegitComplete(
-                        data={
-                            "error": "Cached complete action wasn't verified by LLM, fallback to default execution mode"
-                        }
-                    )
-                )
-            ]
-        action.verified = True
-
     if not action.verified and task.navigation_goal:
         LOG.info(
             "CompleteAction hasn't been verified, going to verify the user goal",
@@ -1643,7 +1630,9 @@ async def choose_auto_completion_dropdown(
                 continue
 
             current_element = await skyvern_frame.parse_element_from_html(
-                skyvern_element.get_frame_id(), element_handler, skyvern_element.is_interactable()
+                skyvern_element.get_frame_id(),
+                element_handler,
+                skyvern_element.is_interactable(),
             )
             confirmed_preserved_list.append(current_element)
 
@@ -1664,7 +1653,7 @@ async def choose_auto_completion_dropdown(
         auto_completion_confirm_prompt = prompt_engine.load_prompt(
             "auto-completion-choose-option",
             is_search=context.is_search_bar,
-            field_information=context.field,
+            field_information=context.field if not context.intention else context.intention,
             filled_value=text,
             navigation_goal=task.navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
@@ -1675,7 +1664,9 @@ async def choose_auto_completion_dropdown(
             step_id=step.step_id,
             task_id=task.task_id,
         )
-        json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=auto_completion_confirm_prompt, step=step)
+        json_response = await app.SECONDARY_LLM_API_HANDLER(
+            prompt=auto_completion_confirm_prompt, step=step, prompt_name="auto-completion-choose-option"
+        )
         element_id = json_response.get("id", "")
         relevance_float = json_response.get("relevance_float", 0)
         if json_response.get("direct_searching", False):
@@ -1811,10 +1802,16 @@ async def input_or_auto_complete_input(
         tried_values.append(current_value)
         whole_new_elements.extend(result.incremental_elements)
 
+        field_information = (
+            input_or_select_context.field
+            if not input_or_select_context.intention
+            else input_or_select_context.intention
+        )
+
         prompt = prompt_engine.load_prompt(
             "auto-completion-potential-answers",
             potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
-            field_information=input_or_select_context.field,
+            field_information=field_information,
             current_value=current_value,
             navigation_goal=task.navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
@@ -1827,7 +1824,9 @@ async def input_or_auto_complete_input(
             task_id=task.task_id,
             potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
         )
-        json_respone = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+        json_respone = await app.SECONDARY_LLM_API_HANDLER(
+            prompt=prompt, step=step, prompt_name="auto-completion-potential-answers"
+        )
         values: list[dict] = json_respone.get("potential_values", [])
 
         for each_value in values:
@@ -1873,14 +1872,16 @@ async def input_or_auto_complete_input(
             cleaned_new_elements = remove_duplicated_HTML_element(whole_new_elements)
             prompt = prompt_engine.load_prompt(
                 "auto-completion-tweak-value",
-                field_information=input_or_select_context.field,
+                field_information=field_information,
                 current_value=current_value,
                 navigation_goal=task.navigation_goal,
                 navigation_payload_str=json.dumps(task.navigation_payload),
                 tried_values=json.dumps(tried_values),
                 popped_up_elements="".join([json_to_html(element) for element in cleaned_new_elements]),
             )
-            json_respone = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+            json_respone = await app.SECONDARY_LLM_API_HANDLER(
+                prompt=prompt, step=step, prompt_name="auto-completion-tweak-value"
+            )
             context_reasoning = json_respone.get("reasoning")
             new_current_value = json_respone.get("tweaked_value", "")
             if not new_current_value:
@@ -1917,7 +1918,7 @@ async def sequentially_select_from_dropdown(
     dropdown_menu_element: SkyvernElement | None = None,
     force_select: bool = False,
     target_value: str = "",
-) -> tuple[ActionResult | None, str | None]:
+) -> CustomSingleSelectResult | None:
     """
     TODO: support to return all values retrieved from the sequentially select
     Only return the last value today
@@ -1929,7 +1930,10 @@ async def sequentially_select_from_dropdown(
         element_id=action.element_id,
         elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
     )
-    json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+    json_response = await app.SECONDARY_LLM_API_HANDLER(
+        prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
+    )
+    json_response["intention"] = action.intention
     input_or_select_context = InputOrSelectContext.model_validate(json_response)
     LOG.info(
         "Parsed input/select context",
@@ -1945,7 +1949,7 @@ async def sequentially_select_from_dropdown(
             task_id=task.task_id,
             step_id=step.step_id,
         )
-        return None, None
+        return None
 
     # TODO: only suport the third-level dropdown selection now
     MAX_SELECT_DEPTH = 3
@@ -1986,7 +1990,7 @@ async def sequentially_select_from_dropdown(
             break
 
         if await single_select_result.is_done():
-            return single_select_result.action_result, values[-1] if len(values) > 0 else None
+            return single_select_result
 
         if i == MAX_SELECT_DEPTH - 1:
             LOG.warning(
@@ -2024,28 +2028,42 @@ async def sequentially_select_from_dropdown(
                 task_id=task.task_id,
                 step_id=step.step_id,
             )
-            return single_select_result.action_result, values[-1] if len(values) > 0 else None
+            return single_select_result
 
         # it's for typing. it's been verified in `single_select_result.is_done()`
         assert single_select_result.dropdown_menu is not None
-        screenshot = await single_select_result.dropdown_menu.get_locator().screenshot(
-            timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS
+
+        if single_select_result.action_type is not None and single_select_result.action_type == ActionType.INPUT_TEXT:
+            LOG.info(
+                "It's an input mini action, going to continue the select action",
+                step_id=step.step_id,
+                task_id=task.task_id,
+            )
+            continue
+
+        screenshot = await page.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
+        mini_goal = (
+            input_or_select_context.field
+            if not input_or_select_context.intention
+            else input_or_select_context.intention
         )
         prompt = prompt_engine.load_prompt(
             "confirm-multi-selection-finish",
+            mini_goal=mini_goal,
             navigation_goal=task.navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
             elements="".join(json_to_html(element) for element in secondary_increment_element),
             select_history=json.dumps(build_sequential_select_history(select_history)),
             local_datetime=datetime.now(ensure_context().tz_info).isoformat(),
         )
-        json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, screenshots=[screenshot], step=step)
-        if json_response.get("is_finished", False):
-            return single_select_result.action_result, values[-1] if len(values) > 0 else None
+        json_response = await app.LLM_API_HANDLER(
+            prompt=prompt, screenshots=[screenshot], step=step, prompt_name="confirm-multi-selection-finish"
+        )
+        if json_response.get("is_mini_goal_finished", False):
+            LOG.info("The user has finished the selection for the current opened dropdown", step_id=step.step_id)
+            return single_select_result
 
-    return select_history[-1].action_result if len(select_history) > 0 else None, values[-1] if len(
-        values
-    ) > 0 else None
+    return select_history[-1] if len(select_history) > 0 else None
 
 
 def build_sequential_select_history(history_list: list[CustomSingleSelectResult]) -> list[dict[str, Any]]:
@@ -2126,7 +2144,7 @@ async def select_from_dropdown(
     prompt = prompt_engine.load_prompt(
         "custom-select",
         is_date_related=context.is_date_related,
-        field_information=context.field,
+        field_information=context.field if not context.intention else context.intention,
         required_field=context.is_required,
         target_value="" if force_select else target_value,
         navigation_goal=task.navigation_goal,
@@ -2141,12 +2159,7 @@ async def select_from_dropdown(
         step_id=step.step_id,
         task_id=task.task_id,
     )
-    if context.is_date_related:
-        # HACK: according to the test, secondary LLM is not doing well on the date picker
-        # using the main LLM to handle the case
-        json_response = await app.LLM_API_HANDLER(prompt=prompt, step=step)
-    else:
-        json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+    json_response = await app.SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
     value: str | None = json_response.get("value", None)
     single_select_result.value = value
     select_reason: str | None = json_response.get("reasoning", None)
@@ -2161,9 +2174,10 @@ async def select_from_dropdown(
     )
 
     action_type: str = json_response.get("action_type", "")
-    action_type = action_type.upper()
+    action_type = action_type.lower()
+    single_select_result.action_type = ActionType(action_type)
     element_id: str | None = json_response.get("id", None)
-    if not element_id or action_type not in ["CLICK", "INPUT_TEXT"]:
+    if not element_id or action_type not in [ActionType.CLICK, ActionType.INPUT_TEXT]:
         raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
 
     if not force_select and target_value:
@@ -2176,7 +2190,7 @@ async def select_from_dropdown(
             )
             return single_select_result
 
-    if value is not None and action_type == "INPUT_TEXT":
+    if value is not None and action_type == ActionType.INPUT_TEXT:
         LOG.info(
             "No clickable option found, but found input element to search",
             element_id=element_id,
@@ -2426,7 +2440,7 @@ async def locate_dropdown_menu(
             element=element_dict,
         )
         json_response = await app.SECONDARY_LLM_API_HANDLER(
-            prompt=dropdown_confirm_prompt, screenshots=[screenshot], step=step
+            prompt=dropdown_confirm_prompt, screenshots=[screenshot], step=step, prompt_name="opened-dropdown-confirm"
         )
         is_opened_dropdown_menu = json_response.get("is_opened_dropdown_menu")
         if is_opened_dropdown_menu:
@@ -2573,7 +2587,10 @@ async def normal_select(
         element_id=action.element_id,
         elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
     )
-    json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step)
+    json_response = await app.SECONDARY_LLM_API_HANDLER(
+        prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
+    )
+    json_response["intention"] = action.intention
     input_or_select_context = InputOrSelectContext.model_validate(json_response)
     LOG.info(
         "Parsed input/select context",
@@ -2583,17 +2600,19 @@ async def normal_select(
     )
 
     options_html = skyvern_element.build_HTML()
-
+    field_information = (
+        input_or_select_context.field if not input_or_select_context.intention else input_or_select_context.intention
+    )
     prompt = prompt_engine.load_prompt(
         "normal-select",
-        field_information=input_or_select_context.field,
+        field_information=field_information,
         required_field=input_or_select_context.is_required,
         navigation_goal=task.navigation_goal,
         navigation_payload_str=json.dumps(task.navigation_payload),
         options=options_html,
     )
 
-    json_response = await app.LLM_API_HANDLER(prompt=prompt, step=step)
+    json_response = await app.SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
     index: int | None = json_response.get("index")
     value: str | None = json_response.get("value")
 
@@ -2756,6 +2775,7 @@ async def extract_information_for_navigation_goal(
         prompt=extract_information_prompt,
         step=step,
         screenshots=scraped_page.screenshots,
+        prompt_name="extract-information",
     )
 
     return ScrapeResult(
@@ -2830,7 +2850,12 @@ async def poll_verification_code(
         # check timeout
         if datetime.utcnow() > timeout_datetime:
             LOG.warning("Polling verification code timed out", workflow_id=workflow_id)
-            return None
+            raise NoTOTPVerificationCodeFound(
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+                totp_verification_url=totp_verification_url,
+                totp_identifier=totp_identifier,
+            )
         verification_code = None
         if totp_verification_url:
             verification_code = await _get_verification_code_from_url(task_id, totp_verification_url, org_token.token)

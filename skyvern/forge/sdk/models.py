@@ -18,7 +18,7 @@ class StepStatus(StrEnum):
 
     def can_update_to(self, new_status: StepStatus) -> bool:
         allowed_transitions: dict[StepStatus, set[StepStatus]] = {
-            StepStatus.created: {StepStatus.running, StepStatus.failed, StepStatus.canceled},
+            StepStatus.created: {StepStatus.running, StepStatus.failed, StepStatus.canceled, StepStatus.completed},
             StepStatus.running: {StepStatus.completed, StepStatus.failed, StepStatus.canceled},
             StepStatus.failed: set(),
             StepStatus.completed: set(),
@@ -79,9 +79,6 @@ class Step(BaseModel):
 
         if self.output is not None and output is not None:
             raise ValueError(f"cant_override_output({self.step_id})")
-
-        if is_last and not self.status.is_terminal():
-            raise ValueError(f"is_last_but_status_not_terminal({self.status},{self.step_id})")
 
         if is_last is False:
             raise ValueError(f"cant_set_is_last_to_false({self.step_id})")

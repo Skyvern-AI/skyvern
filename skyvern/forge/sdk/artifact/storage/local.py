@@ -2,17 +2,22 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 
 import structlog
 
 from skyvern.config import settings
-from skyvern.forge.sdk.api.files import get_download_dir, get_skyvern_temp_dir
+from skyvern.forge.sdk.api.files import (
+    calculate_sha256_for_file,
+    get_download_dir,
+    get_skyvern_temp_dir,
+    parse_uri_to_path,
+)
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP, BaseStorage
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.observers import ObserverTask, ObserverThought
+from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
 LOG = structlog.get_logger()
@@ -41,17 +46,13 @@ class LocalStorage(BaseStorage):
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
         return f"file://{self.artifact_path}/logs/{log_entity_type}/{log_entity_id}/{datetime.utcnow().isoformat()}_{artifact_type}.{file_ext}"
 
-    def build_observer_thought_uri(
-        self, artifact_id: str, observer_thought: ObserverThought, artifact_type: ArtifactType
-    ) -> str:
+    def build_thought_uri(self, artifact_id: str, thought: Thought, artifact_type: ArtifactType) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"file://{self.artifact_path}/{settings.ENV}/observers/{observer_thought.observer_cruise_id}/{observer_thought.observer_thought_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"file://{self.artifact_path}/{settings.ENV}/tasks/{thought.observer_cruise_id}/{thought.observer_thought_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
-    def build_observer_cruise_uri(
-        self, artifact_id: str, observer_cruise: ObserverTask, artifact_type: ArtifactType
-    ) -> str:
+    def build_task_v2_uri(self, artifact_id: str, task_v2: TaskV2, artifact_type: ArtifactType) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"file://{self.artifact_path}/{settings.ENV}/observers/{observer_cruise.observer_cruise_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"file://{self.artifact_path}/{settings.ENV}/observers/{task_v2.observer_cruise_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_workflow_run_block_uri(
         self, artifact_id: str, workflow_run_block: WorkflowRunBlock, artifact_type: ArtifactType
@@ -68,7 +69,7 @@ class LocalStorage(BaseStorage):
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         file_path = None
         try:
-            file_path = Path(self._parse_uri_to_path(artifact.uri))
+            file_path = Path(parse_uri_to_path(artifact.uri))
             self._create_directories_if_not_exists(file_path)
             with open(file_path, "wb") as f:
                 f.write(data)
@@ -82,7 +83,7 @@ class LocalStorage(BaseStorage):
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
         file_path = None
         try:
-            file_path = Path(self._parse_uri_to_path(artifact.uri))
+            file_path = Path(parse_uri_to_path(artifact.uri))
             self._create_directories_if_not_exists(file_path)
             Path(path).replace(file_path)
         except Exception:
@@ -95,7 +96,7 @@ class LocalStorage(BaseStorage):
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         file_path = None
         try:
-            file_path = self._parse_uri_to_path(artifact.uri)
+            file_path = parse_uri_to_path(artifact.uri)
             with open(file_path, "rb") as f:
                 return f.read()
         except Exception:
@@ -160,23 +161,18 @@ class LocalStorage(BaseStorage):
 
     async def get_downloaded_files(
         self, organization_id: str, task_id: str | None, workflow_run_id: str | None
-    ) -> list[str]:
+    ) -> list[FileInfo]:
         download_dir = get_download_dir(workflow_run_id=workflow_run_id, task_id=task_id)
-        files: list[str] = []
+        file_infos: list[FileInfo] = []
         files_and_folders = os.listdir(download_dir)
         for file_or_folder in files_and_folders:
             path = os.path.join(download_dir, file_or_folder)
             if os.path.isfile(path):
-                files.append(f"file://{path}")
-        return files
-
-    @staticmethod
-    def _parse_uri_to_path(uri: str) -> str:
-        parsed_uri = urlparse(uri)
-        if parsed_uri.scheme != "file":
-            raise ValueError("Invalid URI scheme: {parsed_uri.scheme} expected: file")
-        path = parsed_uri.netloc + parsed_uri.path
-        return unquote(path)
+                # Calculate checksum for the file
+                checksum = calculate_sha256_for_file(path)
+                file_info = FileInfo(url=f"file://{path}", checksum=checksum, filename=file_or_folder)
+                file_infos.append(file_info)
+        return file_infos
 
     @staticmethod
     def _create_directories_if_not_exists(path_including_file_name: Path) -> None:

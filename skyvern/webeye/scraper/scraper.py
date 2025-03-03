@@ -100,6 +100,10 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
     tag = element["tagName"]
     attributes: dict[str, Any] = copy.deepcopy(element.get("attributes", {}))
 
+    if element.get("isCheckable", False) and tag != "input":
+        tag = "input"
+        attributes["type"] = "checkbox"
+
     context = skyvern_context.ensure_context()
 
     # FIXME: Theoretically, all href links with over 69(64+1+4) length could be hashed
@@ -159,6 +163,7 @@ def clean_element_before_hashing(element: dict) -> dict:
     element_copy = copy.deepcopy(element)
     element_copy.pop("id", None)
     element_copy.pop("rect", None)
+    element_copy.pop("frame_index", None)
     if "attributes" in element_copy:
         element_copy["attributes"].pop(SKYVERN_ID_ATTR, None)
     if "children" in element_copy:
@@ -282,6 +287,15 @@ class ScrapedPage(BaseModel):
         self.url = refreshed_page.url
         return self
 
+    async def generate_scraped_page_without_screenshots(self) -> Self:
+        return await scrape_website(
+            browser_state=self._browser_state,
+            url=self.url,
+            cleanup_element_tree=self._clean_up_func,
+            scrape_exclude=self._scrape_exclude,
+            take_screenshots=False,
+        )
+
 
 async def scrape_website(
     browser_state: BrowserState,
@@ -289,6 +303,7 @@ async def scrape_website(
     cleanup_element_tree: CleanupElementTreeFunc,
     num_retry: int = 0,
     scrape_exclude: ScrapeExcludeFunc | None = None,
+    take_screenshots: bool = True,
 ) -> ScrapedPage:
     """
     ************************************************************************************************
@@ -318,6 +333,7 @@ async def scrape_website(
             url=url,
             cleanup_element_tree=cleanup_element_tree,
             scrape_exclude=scrape_exclude,
+            take_screenshots=take_screenshots,
         )
     except Exception as e:
         # NOTE: MAX_SCRAPING_RETRIES is set to 0 in both staging and production
@@ -386,6 +402,7 @@ async def scrape_web_unsafe(
     url: str,
     cleanup_element_tree: CleanupElementTreeFunc,
     scrape_exclude: ScrapeExcludeFunc | None = None,
+    take_screenshots: bool = True,
 ) -> ScrapedPage:
     """
     Asynchronous function that performs web scraping without any built-in error handling. This function is intended
@@ -410,7 +427,9 @@ async def scrape_web_unsafe(
     LOG.info("Waiting for 5 seconds before scraping the website.")
     await asyncio.sleep(5)
 
-    screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=url, draw_boxes=True)
+    screenshots = []
+    if take_screenshots:
+        screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=url, draw_boxes=True)
 
     elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
     element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))
@@ -455,12 +474,20 @@ async def scrape_web_unsafe(
     )
 
 
-async def get_interactable_element_tree_in_frame(
-    frames: list[Frame],
-    elements: list[dict],
-    element_tree: list[dict],
-    scrape_exclude: ScrapeExcludeFunc | None = None,
-) -> tuple[list[dict], list[dict]]:
+async def get_all_children_frames(page: Page) -> list[Frame]:
+    start_index = 0
+    frames = page.main_frame.child_frames
+
+    while start_index < len(frames):
+        frame = frames[start_index]
+        start_index += 1
+        frames.extend(frame.child_frames)
+
+    return frames
+
+
+async def filter_frames(frames: list[Frame], scrape_exclude: ScrapeExcludeFunc | None = None) -> list[Frame]:
+    filtered_frames = []
     for frame in frames:
         if frame.is_detached():
             continue
@@ -468,41 +495,44 @@ async def get_interactable_element_tree_in_frame(
         if scrape_exclude is not None and await scrape_exclude(frame.page, frame):
             continue
 
-        try:
-            frame_element = await frame.frame_element()
-        except Exception:
-            LOG.warning(
-                "Unable to get frame_element",
-                exc_info=True,
-            )
-            continue
+        filtered_frames.append(frame)
+    return filtered_frames
 
+
+async def add_frame_interactable_elements(
+    frame: Frame,
+    frame_index: int,
+    elements: list[dict],
+    element_tree: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """
+    Add the interactable element of the frame to the elements and element_tree.
+    """
+    try:
+        frame_element = await frame.frame_element()
         # it will get stuck when we `frame.evaluate()` on an invisible iframe
         if not await frame_element.is_visible():
-            continue
-
+            return elements, element_tree
         unique_id = await frame_element.get_attribute("unique_id")
-
-        frame_js_script = f"() => buildTreeFromBody('{unique_id}')"
-
-        await SkyvernFrame.evaluate(frame=frame, expression=JS_FUNCTION_DEFS)
-        frame_elements, frame_element_tree = await SkyvernFrame.evaluate(
-            frame=frame, expression=frame_js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+    except Exception:
+        LOG.warning(
+            "Unable to get unique_id from frame_element",
+            exc_info=True,
         )
+        return elements, element_tree
 
-        if len(frame.child_frames) > 0:
-            frame_elements, frame_element_tree = await get_interactable_element_tree_in_frame(
-                frame.child_frames,
-                frame_elements,
-                frame_element_tree,
-                scrape_exclude=scrape_exclude,
-            )
+    frame_js_script = f"async () => await buildTreeFromBody('{unique_id}', {frame_index})"
 
-        for element in elements:
-            if element["id"] == unique_id:
-                element["children"] = frame_element_tree
+    await SkyvernFrame.evaluate(frame=frame, expression=JS_FUNCTION_DEFS)
+    frame_elements, frame_element_tree = await SkyvernFrame.evaluate(
+        frame=frame, expression=frame_js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+    )
 
-        elements = elements + frame_elements
+    for element in elements:
+        if element["id"] == unique_id:
+            element["children"] = frame_element_tree
+
+    elements = elements + frame_elements
 
     return elements, element_tree
 
@@ -517,17 +547,29 @@ async def get_interactable_element_tree(
     :return: Tuple containing the element tree and a map of element IDs to elements.
     """
     await SkyvernFrame.evaluate(frame=page, expression=JS_FUNCTION_DEFS)
-    main_frame_js_script = "() => buildTreeFromBody()"
+    # main page index is 0
+    main_frame_js_script = "async () => await buildTreeFromBody('main.frame', 0)"
     elements, element_tree = await SkyvernFrame.evaluate(
         frame=page, expression=main_frame_js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
     )
 
-    if len(page.main_frame.child_frames) > 0:
-        elements, element_tree = await get_interactable_element_tree_in_frame(
-            page.main_frame.child_frames,
+    context = skyvern_context.ensure_context()
+    frames = await get_all_children_frames(page)
+    frames = await filter_frames(frames, scrape_exclude)
+
+    for frame in frames:
+        frame_index = context.frame_index_map.get(frame, None)
+        if frame_index is None:
+            frame_index = len(context.frame_index_map) + 1
+            context.frame_index_map[frame] = frame_index
+
+    for frame in frames:
+        frame_index = context.frame_index_map[frame]
+        elements, element_tree = await add_frame_interactable_elements(
+            frame,
+            frame_index,
             elements,
             element_tree,
-            scrape_exclude=scrape_exclude,
         )
 
     return elements, element_tree
@@ -666,6 +708,9 @@ def trim_element(element: dict) -> dict:
         queue_ele = queue.pop(0)
         if "frame" in queue_ele:
             del queue_ele["frame"]
+
+        if "frame_index" in queue_ele:
+            del queue_ele["frame_index"]
 
         if "id" in queue_ele and not _should_keep_unique_id(queue_ele):
             del queue_ele["id"]

@@ -1,29 +1,25 @@
 import os
 import random
 import string
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 import structlog
 from sqlalchemy.exc import OperationalError
 
-from skyvern.exceptions import FailedToSendWebhook, ObserverCruiseNotFound, UrlGenerationFailure
+from skyvern.exceptions import FailedToSendWebhook, TaskTerminationError, TaskV2NotFound, UrlGenerationFailure
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.hashing import generate_url_hash
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-from skyvern.forge.sdk.schemas.observers import (
-    ObserverMetadata,
-    ObserverTask,
-    ObserverTaskStatus,
-    ObserverThoughtScenario,
-    ObserverThoughtType,
-)
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.task_runs import TaskRunType
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Metadata, TaskV2Status, ThoughtScenario, ThoughtType
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.workflow.models.block import (
@@ -34,6 +30,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ForLoopBlock,
     NavigationBlock,
     TaskBlock,
+    UrlBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, ContextParameter
 from skyvern.forge.sdk.workflow.models.workflow import (
@@ -51,6 +48,7 @@ from skyvern.forge.sdk.workflow.models.yaml import (
     ForLoopBlockYAML,
     NavigationBlockYAML,
     TaskBlockYAML,
+    UrlBlockYAML,
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
 )
@@ -85,7 +83,7 @@ def _generate_data_extraction_schema_for_loop(loop_values_key: str) -> dict:
     }
 
 
-async def initialize_observer_task(
+async def initialize_task_v2(
     organization: Organization,
     user_prompt: str,
     user_url: str | None = None,
@@ -95,8 +93,9 @@ async def initialize_observer_task(
     webhook_callback_url: str | None = None,
     publish_workflow: bool = False,
     parent_workflow_run_id: str | None = None,
-) -> ObserverTask:
-    observer_task = await app.DATABASE.create_observer_cruise(
+    create_task_run: bool = False,
+) -> TaskV2:
+    task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
         organization_id=organization.organization_id,
         totp_verification_url=totp_verification_url,
@@ -104,27 +103,31 @@ async def initialize_observer_task(
         webhook_callback_url=webhook_callback_url,
         proxy_location=proxy_location,
     )
-    # set observer cruise id in context
+    # set task_v2_id in context
     context = skyvern_context.current()
     if context:
-        context.observer_cruise_id = observer_task.observer_cruise_id
+        context.task_v2_id = task_v2.observer_cruise_id
 
-    observer_thought = await app.DATABASE.create_observer_thought(
-        observer_cruise_id=observer_task.observer_cruise_id,
+    thought = await app.DATABASE.create_thought(
+        task_v2_id=task_v2.observer_cruise_id,
         organization_id=organization.organization_id,
-        observer_thought_type=ObserverThoughtType.metadata,
-        observer_thought_scenario=ObserverThoughtScenario.generate_metadata,
+        thought_type=ThoughtType.metadata,
+        thought_scenario=ThoughtScenario.generate_metadata,
     )
 
-    metadata_prompt = prompt_engine.load_prompt("observer_generate_metadata", user_goal=user_prompt, user_url=user_url)
-    metadata_response = await app.LLM_API_HANDLER(prompt=metadata_prompt, observer_thought=observer_thought)
+    metadata_prompt = prompt_engine.load_prompt("task_v2_generate_metadata", user_goal=user_prompt, user_url=user_url)
+    metadata_response = await app.LLM_API_HANDLER(
+        prompt=metadata_prompt,
+        thought=thought,
+        prompt_name="task_v2_generate_metadata",
+    )
     # validate
-    LOG.info(f"Initialized observer initial response: {metadata_response}")
+    LOG.info(f"Initialized task v2 initial response: {metadata_response}")
     url: str = user_url or metadata_response.get("url", "")
     if not url:
         raise UrlGenerationFailure()
     title: str = metadata_response.get("title", DEFAULT_WORKFLOW_TITLE)
-    metadata = ObserverMetadata(
+    metadata = TaskV2Metadata(
         url=url,
         workflow_title=title,
     )
@@ -154,15 +157,17 @@ async def initialize_observer_task(
     except Exception:
         LOG.error("Failed to setup cruise workflow run", exc_info=True)
         # fail the workflow run
-        await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
-            workflow_run_id=workflow_run.workflow_run_id,
+        await mark_task_v2_as_failed(
+            task_v2_id=task_v2.observer_cruise_id,
+            workflow_run_id=task_v2.workflow_run_id,
             failure_reason="Skyvern failed to setup the workflow run",
+            organization_id=organization.organization_id,
         )
         raise
 
     try:
-        await app.DATABASE.update_observer_thought(
-            observer_thought_id=observer_thought.observer_thought_id,
+        await app.DATABASE.update_thought(
+            thought_id=thought.observer_thought_id,
             organization_id=organization.organization_id,
             workflow_run_id=workflow_run.workflow_run_id,
             workflow_id=new_workflow.workflow_id,
@@ -171,80 +176,104 @@ async def initialize_observer_task(
             output=metadata.model_dump(),
         )
     except Exception:
-        LOG.warning("Failed to update observer thought", exc_info=True)
+        LOG.warning("Failed to update thought", exc_info=True)
 
     # update oserver cruise
     try:
-        observer_task = await app.DATABASE.update_observer_cruise(
-            observer_cruise_id=observer_task.observer_cruise_id,
+        task_v2 = await app.DATABASE.update_task_v2(
+            task_v2_id=task_v2.observer_cruise_id,
             workflow_run_id=workflow_run.workflow_run_id,
             workflow_id=new_workflow.workflow_id,
             workflow_permanent_id=new_workflow.workflow_permanent_id,
             url=url,
             organization_id=organization.organization_id,
         )
+        if create_task_run:
+            await app.DATABASE.create_task_run(
+                task_run_type=TaskRunType.task_v2,
+                organization_id=organization.organization_id,
+                run_id=task_v2.observer_cruise_id,
+                title=new_workflow.title,
+                url=url,
+                url_hash=generate_url_hash(url),
+            )
     except Exception:
         LOG.warning("Failed to update task 2.0", exc_info=True)
         # fail the workflow run
-        await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
+        await mark_task_v2_as_failed(
+            task_v2_id=task_v2.observer_cruise_id,
             workflow_run_id=workflow_run.workflow_run_id,
             failure_reason="Skyvern failed to update the task 2.0 after initializing the workflow run",
+            organization_id=organization.organization_id,
         )
         raise
 
-    return observer_task
+    return task_v2
 
 
-async def run_observer_task(
+async def run_task_v2(
     organization: Organization,
-    observer_cruise_id: str,
+    task_v2_id: str,
     request_id: str | None = None,
     max_iterations_override: str | int | None = None,
     browser_session_id: str | None = None,
-) -> ObserverTask:
+) -> TaskV2:
     organization_id = organization.organization_id
     try:
-        observer_task = await app.DATABASE.get_observer_cruise(observer_cruise_id, organization_id=organization_id)
+        task_v2 = await app.DATABASE.get_task_v2(task_v2_id, organization_id=organization_id)
     except Exception:
         LOG.error(
-            "Failed to get observer cruise",
-            observer_cruise_id=observer_cruise_id,
+            "Failed to get task v2",
+            task_v2_id=task_v2_id,
             organization_id=organization_id,
             exc_info=True,
         )
-        return await mark_observer_task_as_failed(observer_cruise_id, organization_id=organization_id)
-    if not observer_task:
-        LOG.error("Observer cruise not found", observer_cruise_id=observer_cruise_id, organization_id=organization_id)
-        raise ObserverCruiseNotFound(observer_cruise_id=observer_cruise_id)
+        return await mark_task_v2_as_failed(
+            task_v2_id,
+            organization_id=organization_id,
+            failure_reason="Failed to get task v2",
+        )
+    if not task_v2:
+        LOG.error("Task v2 not found", task_v2_id=task_v2_id, organization_id=organization_id)
+        raise TaskV2NotFound(task_v2_id=task_v2_id)
 
     workflow, workflow_run = None, None
     try:
-        workflow, workflow_run, observer_task = await run_observer_task_helper(
+        workflow, workflow_run, task_v2 = await run_task_v2_helper(
             organization=organization,
-            observer_task=observer_task,
+            task_v2=task_v2,
             request_id=request_id,
             max_iterations_override=max_iterations_override,
             browser_session_id=browser_session_id,
         )
+    except TaskTerminationError as e:
+        task_v2 = await mark_task_v2_as_terminated(
+            task_v2_id=task_v2_id,
+            workflow_run_id=task_v2.workflow_run_id,
+            organization_id=organization_id,
+            failure_reason=e.message,
+        )
+        LOG.info("Task v2 is terminated", task_v2_id=task_v2_id, failure_reason=e.message)
+        return task_v2
     except OperationalError:
-        LOG.error("Database error when running observer cruise", exc_info=True)
-        observer_task = await mark_observer_task_as_failed(
-            observer_cruise_id,
-            workflow_run_id=observer_task.workflow_run_id,
+        LOG.error("Database error when running task v2", exc_info=True)
+        task_v2 = await mark_task_v2_as_failed(
+            task_v2_id,
+            workflow_run_id=task_v2.workflow_run_id,
             failure_reason="Database error when running task 2.0",
             organization_id=organization_id,
         )
     except Exception as e:
-        LOG.error("Failed to run observer cruise", exc_info=True)
+        LOG.error("Failed to run task v2", exc_info=True)
         failure_reason = f"Failed to run task 2.0: {str(e)}"
-        observer_task = await mark_observer_task_as_failed(
-            observer_cruise_id,
-            workflow_run_id=observer_task.workflow_run_id,
+        task_v2 = await mark_task_v2_as_failed(
+            task_v2_id,
+            workflow_run_id=task_v2.workflow_run_id,
             failure_reason=failure_reason,
             organization_id=organization_id,
         )
     finally:
-        if workflow and workflow_run:
+        if workflow and workflow_run and workflow_run.parent_workflow_run_id is None:
             await app.WORKFLOW_SERVICE.clean_up_workflow(
                 workflow=workflow,
                 workflow_run=workflow_run,
@@ -256,40 +285,40 @@ async def run_observer_task(
 
         skyvern_context.reset()
 
-    return observer_task
+    return task_v2
 
 
-async def run_observer_task_helper(
+async def run_task_v2_helper(
     organization: Organization,
-    observer_task: ObserverTask,
+    task_v2: TaskV2,
     request_id: str | None = None,
     max_iterations_override: str | int | None = None,
     browser_session_id: str | None = None,
-) -> tuple[Workflow, WorkflowRun, ObserverTask] | tuple[None, None, ObserverTask]:
+) -> tuple[Workflow, WorkflowRun, TaskV2] | tuple[None, None, TaskV2]:
     organization_id = organization.organization_id
-    observer_cruise_id = observer_task.observer_cruise_id
-    if observer_task.status != ObserverTaskStatus.queued:
+    task_v2_id = task_v2.observer_cruise_id
+    if task_v2.status != TaskV2Status.queued:
         LOG.error(
-            "Observer cruise is not queued. Duplicate observer cruise",
-            observer_cruise_id=observer_cruise_id,
-            status=observer_task.status,
+            "Task v2 is not queued. Duplicate task v2",
+            task_v2_id=task_v2_id,
+            status=task_v2.status,
             organization_id=organization_id,
         )
-        return None, None, observer_task
-    if not observer_task.url or not observer_task.prompt:
+        return None, None, task_v2
+    if not task_v2.url or not task_v2.prompt:
         LOG.error(
-            "Observer cruise url or prompt not found",
-            observer_cruise_id=observer_cruise_id,
+            "Task v2 url or prompt not found",
+            task_v2_id=task_v2_id,
             organization_id=organization_id,
         )
-        return None, None, observer_task
-    if not observer_task.workflow_run_id:
+        return None, None, task_v2
+    if not task_v2.workflow_run_id:
         LOG.error(
-            "Workflow run id not found in observer cruise",
-            observer_cruise_id=observer_cruise_id,
+            "Workflow run id not found in task v2",
+            task_v2_id=task_v2_id,
             organization_id=organization_id,
         )
-        return None, None, observer_task
+        return None, None, task_v2
 
     int_max_iterations_override = None
     if max_iterations_override:
@@ -302,26 +331,26 @@ async def run_observer_task_helper(
                 max_iterations_override=max_iterations_override,
             )
 
-    workflow_run_id = observer_task.workflow_run_id
+    workflow_run_id = task_v2.workflow_run_id
 
     workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(workflow_run_id, organization_id=organization_id)
     if not workflow_run:
         LOG.error("Workflow run not found", workflow_run_id=workflow_run_id)
-        return None, None, observer_task
+        return None, None, task_v2
     else:
         LOG.info("Workflow run found", workflow_run_id=workflow_run_id)
 
     if workflow_run.status != WorkflowRunStatus.queued:
         LOG.warning("Duplicate workflow run execution", workflow_run_id=workflow_run_id, status=workflow_run.status)
-        return None, None, observer_task
+        return None, None, task_v2
 
     workflow_id = workflow_run.workflow_id
     workflow = await app.WORKFLOW_SERVICE.get_workflow(workflow_id, organization_id=organization_id)
     if not workflow:
         LOG.error("Workflow not found", workflow_id=workflow_id)
-        return None, None, observer_task
+        return None, None, task_v2
 
-    ###################### run observer ######################
+    ###################### run task v2 ######################
 
     skyvern_context.set(
         SkyvernContext(
@@ -329,178 +358,224 @@ async def run_observer_task_helper(
             workflow_id=workflow_id,
             workflow_run_id=workflow_run_id,
             request_id=request_id,
-            observer_cruise_id=observer_cruise_id,
+            task_v2_id=task_v2_id,
+            browser_session_id=browser_session_id,
         )
     )
 
-    observer_task = await app.DATABASE.update_observer_cruise(
-        observer_cruise_id=observer_cruise_id, organization_id=organization_id, status=ObserverTaskStatus.running
+    task_v2 = await app.DATABASE.update_task_v2(
+        task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running
     )
     await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
-    await _set_up_workflow_context(workflow_id, workflow_run_id)
+    await _set_up_workflow_context(workflow_id, workflow_run_id, organization)
 
-    url = str(observer_task.url)
-    user_prompt = observer_task.prompt
+    url = str(task_v2.url)
+    user_prompt = task_v2.prompt
     task_history: list[dict] = []
     yaml_blocks: list[BLOCK_YAML_TYPES] = []
     yaml_parameters: list[PARAMETER_YAML_TYPES] = []
 
     max_iterations = int_max_iterations_override or DEFAULT_MAX_ITERATIONS
     for i in range(max_iterations):
-        LOG.info(f"Observer iteration i={i}", workflow_run_id=workflow_run_id, url=url)
-        try:
-            browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                workflow_run=workflow_run,
-                url=url,
-                browser_session_id=browser_session_id,
-            )
-            scraped_page = await scrape_website(
-                browser_state,
-                url,
-                app.AGENT_FUNCTION.cleanup_element_tree_factory(),
-                scrape_exclude=app.scrape_exclude,
-            )
-            element_tree_in_prompt: str = scraped_page.build_element_tree(ElementTreeFormat.HTML)
-            page = await browser_state.get_working_page()
-        except Exception:
-            LOG.exception("Failed to get browser state or scrape website in observer iteration", iteration=i, url=url)
-            continue
-        current_url = str(
-            await SkyvernFrame.evaluate(frame=page, expression="() => document.location.href") if page else url
+        # validate the task execution
+        await app.AGENT_FUNCTION.validate_task_execution(
+            organization_id=organization_id,
+            task_id=task_v2_id,
+            task_version="v2",
         )
 
-        context = skyvern_context.ensure_context()
-        observer_prompt = prompt_engine.load_prompt(
-            "observer",
-            current_url=current_url,
-            elements=element_tree_in_prompt,
-            user_goal=user_prompt,
-            task_history=task_history,
-            local_datetime=datetime.now(context.tz_info).isoformat(),
-        )
-        observer_thought = await app.DATABASE.create_observer_thought(
-            observer_cruise_id=observer_cruise_id,
-            organization_id=organization_id,
-            workflow_run_id=workflow_run.workflow_run_id,
-            workflow_id=workflow.workflow_id,
-            workflow_permanent_id=workflow.workflow_permanent_id,
-            observer_thought_type=ObserverThoughtType.plan,
-            observer_thought_scenario=ObserverThoughtScenario.generate_plan,
-        )
-        observer_response = await app.LLM_API_HANDLER(
-            prompt=observer_prompt,
-            screenshots=scraped_page.screenshots,
-            observer_thought=observer_thought,
-        )
-        LOG.info(
-            "Observer response",
-            observer_response=observer_response,
-            iteration=i,
-            current_url=current_url,
-            workflow_run_id=workflow_run_id,
-        )
-        # see if the user goal has achieved or not
-        user_goal_achieved = observer_response.get("user_goal_achieved", False)
-        observation = observer_response.get("page_info", "")
-        thoughts: str = observer_response.get("thoughts", "")
-        plan: str = observer_response.get("plan", "")
-        task_type: str = observer_response.get("task_type", "")
-        # Create and save observer thought
-        await app.DATABASE.update_observer_thought(
-            observer_thought_id=observer_thought.observer_thought_id,
-            organization_id=organization_id,
-            thought=thoughts,
-            observation=observation,
-            answer=plan,
-            output={"task_type": task_type, "user_goal_achieved": user_goal_achieved},
-        )
+        # check the status of the workflow run
+        workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(workflow_run_id, organization_id=organization_id)
+        if not workflow_run:
+            LOG.error("Workflow run not found", workflow_run_id=workflow_run_id)
+            break
 
-        if user_goal_achieved is True:
+        if workflow_run.status == WorkflowRunStatus.canceled:
             LOG.info(
-                "User goal achieved. Workflow run will complete. Observer is stopping",
-                iteration=i,
+                "Task v2 is canceled. Stopping task v2",
                 workflow_run_id=workflow_run_id,
+                task_v2_id=task_v2_id,
             )
-            observer_task = await _summarize_observer_task(
-                observer_task=observer_task,
-                task_history=task_history,
-                context=context,
-                screenshots=scraped_page.screenshots,
-            )
-            break
-
-        if not plan:
-            LOG.warning("No plan found in observer response", observer_response=observer_response)
-            continue
-
-        # parse observer repsonse and run the next task
-        if not task_type:
-            LOG.error("No task type found in observer response", observer_response=observer_response)
-            await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
+            await mark_task_v2_as_canceled(
+                task_v2_id=task_v2_id,
                 workflow_run_id=workflow_run_id,
-                failure_reason="Skyvern failed to generate a task. Please try again later.",
+                organization_id=organization_id,
             )
-            break
+            return workflow, workflow_run, task_v2
 
+        LOG.info(f"Task v2 iteration i={i}", workflow_run_id=workflow_run_id, url=url)
+        task_type = ""
+        plan = ""
         block: BlockTypeVar | None = None
         task_history_record: dict[str, Any] = {}
-        if task_type == "extract":
-            block, block_yaml_list, parameter_yaml_list = await _generate_extraction_task(
-                observer_cruise=observer_task,
-                workflow_id=workflow_id,
-                workflow_permanent_id=workflow.workflow_permanent_id,
-                workflow_run_id=workflow_run_id,
-                current_url=current_url,
-                element_tree_in_prompt=element_tree_in_prompt,
-                data_extraction_goal=plan,
-                task_history=task_history,
-            )
+        context = skyvern_context.ensure_context()
+
+        if i == 0:
+            # The first iteration is always a GOTO_URL task
+            task_type = "goto_url"
+            plan = f"Go to this website: {url}"
             task_history_record = {"type": task_type, "task": plan}
-        elif task_type == "navigate":
-            original_url = url if i == 0 else None
-            navigation_goal = MINI_GOAL_TEMPLATE.format(main_goal=user_prompt, mini_goal=plan)
-            block, block_yaml_list, parameter_yaml_list = await _generate_navigation_task(
+            block, block_yaml_list, parameter_yaml_list = await _generate_goto_url_task(
                 workflow_id=workflow_id,
-                workflow_permanent_id=workflow.workflow_permanent_id,
-                workflow_run_id=workflow_run_id,
-                original_url=original_url,
-                navigation_goal=navigation_goal,
-                totp_verification_url=observer_task.totp_verification_url,
-                totp_identifier=observer_task.totp_identifier,
+                url=url,
             )
-            task_history_record = {"type": task_type, "task": plan}
-        elif task_type == "loop":
+        else:
             try:
-                block, block_yaml_list, parameter_yaml_list, extraction_obj, inner_task = await _generate_loop_task(
-                    observer_cruise=observer_task,
+                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                    workflow_run=workflow_run,
+                    url=url,
+                    browser_session_id=browser_session_id,
+                )
+                scraped_page = await scrape_website(
+                    browser_state,
+                    url,
+                    app.AGENT_FUNCTION.cleanup_element_tree_factory(),
+                    scrape_exclude=app.scrape_exclude,
+                )
+                element_tree_in_prompt: str = scraped_page.build_element_tree(ElementTreeFormat.HTML)
+                page = await browser_state.get_working_page()
+            except Exception:
+                LOG.exception(
+                    "Failed to get browser state or scrape website in task v2 iteration", iteration=i, url=url
+                )
+                continue
+            current_url = str(
+                await SkyvernFrame.evaluate(frame=page, expression="() => document.location.href") if page else url
+            )
+
+            task_v2_prompt = prompt_engine.load_prompt(
+                "task_v2",
+                current_url=current_url,
+                elements=element_tree_in_prompt,
+                user_goal=user_prompt,
+                task_history=task_history,
+                local_datetime=datetime.now(context.tz_info).isoformat(),
+            )
+            thought = await app.DATABASE.create_thought(
+                task_v2_id=task_v2_id,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_id=workflow.workflow_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                thought_type=ThoughtType.plan,
+                thought_scenario=ThoughtScenario.generate_plan,
+            )
+            task_v2_response = await app.LLM_API_HANDLER(
+                prompt=task_v2_prompt,
+                screenshots=scraped_page.screenshots,
+                thought=thought,
+                prompt_name="task_v2",
+            )
+            LOG.info(
+                "Task v2 response",
+                task_v2_response=task_v2_response,
+                iteration=i,
+                current_url=current_url,
+                workflow_run_id=workflow_run_id,
+            )
+            # see if the user goal has achieved or not
+            user_goal_achieved = task_v2_response.get("user_goal_achieved", False)
+            observation = task_v2_response.get("page_info", "")
+            thoughts: str = task_v2_response.get("thoughts", "")
+            plan = task_v2_response.get("plan", "")
+            task_type = task_v2_response.get("task_type", "")
+            # Create and save task thought
+            await app.DATABASE.update_thought(
+                thought_id=thought.observer_thought_id,
+                organization_id=organization_id,
+                thought=thoughts,
+                observation=observation,
+                answer=plan,
+                output={"task_type": task_type, "user_goal_achieved": user_goal_achieved},
+            )
+
+            if user_goal_achieved is True:
+                LOG.info(
+                    "User goal achieved. Workflow run will complete. Task v2 is stopping",
+                    iteration=i,
+                    workflow_run_id=workflow_run_id,
+                )
+                task_v2 = await _summarize_task_v2(
+                    task_v2=task_v2,
+                    task_history=task_history,
+                    context=context,
+                    screenshots=scraped_page.screenshots,
+                )
+                break
+
+            if not plan:
+                LOG.warning("No plan found in task v2 response", task_v2_response=task_v2_response)
+                continue
+
+            # parse task v2 response and run the next task
+            if not task_type:
+                LOG.error("No task type found in task v2 response", task_v2_response=task_v2_response)
+                await mark_task_v2_as_failed(
+                    task_v2_id=task_v2_id,
+                    workflow_run_id=workflow_run_id,
+                    failure_reason="Skyvern failed to generate a task. Please try again later.",
+                )
+                break
+
+            if task_type == "extract":
+                block, block_yaml_list, parameter_yaml_list = await _generate_extraction_task(
+                    task_v2=task_v2,
                     workflow_id=workflow_id,
                     workflow_permanent_id=workflow.workflow_permanent_id,
                     workflow_run_id=workflow_run_id,
-                    plan=plan,
-                    browser_state=browser_state,
-                    original_url=url,
-                    scraped_page=scraped_page,
+                    current_url=current_url,
+                    element_tree_in_prompt=element_tree_in_prompt,
+                    data_extraction_goal=plan,
+                    task_history=task_history,
                 )
-                task_history_record = {
-                    "type": task_type,
-                    "task": plan,
-                    "loop_over_values": extraction_obj.get("loop_values"),
-                    "task_inside_the_loop": inner_task,
-                }
-            except Exception:
-                LOG.exception("Failed to generate loop task")
-                await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
+                task_history_record = {"type": task_type, "task": plan}
+            elif task_type == "navigate":
+                original_url = url if i == 0 else None
+                navigation_goal = MINI_GOAL_TEMPLATE.format(main_goal=user_prompt, mini_goal=plan)
+                block, block_yaml_list, parameter_yaml_list = await _generate_navigation_task(
+                    workflow_id=workflow_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
                     workflow_run_id=workflow_run_id,
-                    failure_reason="Failed to generate the loop.",
+                    original_url=original_url,
+                    navigation_goal=navigation_goal,
+                    totp_verification_url=task_v2.totp_verification_url,
+                    totp_identifier=task_v2.totp_identifier,
+                )
+                task_history_record = {"type": task_type, "task": plan}
+            elif task_type == "loop":
+                try:
+                    block, block_yaml_list, parameter_yaml_list, extraction_obj, inner_task = await _generate_loop_task(
+                        task_v2=task_v2,
+                        workflow_id=workflow_id,
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                        workflow_run_id=workflow_run_id,
+                        plan=plan,
+                        browser_state=browser_state,
+                        original_url=url,
+                        scraped_page=scraped_page,
+                    )
+                    task_history_record = {
+                        "type": task_type,
+                        "task": plan,
+                        "loop_over_values": extraction_obj.get("loop_values"),
+                        "task_inside_the_loop": inner_task,
+                    }
+                except Exception:
+                    LOG.exception("Failed to generate loop task")
+                    await mark_task_v2_as_failed(
+                        task_v2_id=task_v2_id,
+                        workflow_run_id=workflow_run_id,
+                        failure_reason="Failed to generate the loop.",
+                    )
+                    break
+            else:
+                LOG.info("Unsupported task type", task_type=task_type)
+                await mark_task_v2_as_failed(
+                    task_v2_id=task_v2_id,
+                    workflow_run_id=workflow_run_id,
+                    failure_reason=f"Unsupported task block type gets generated: {task_type}",
                 )
                 break
-        else:
-            LOG.info("Unsupported task type", task_type=task_type)
-            await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
-                workflow_run_id=workflow_run_id,
-                failure_reason=f"Unsupported task block type gets generated: {task_type}",
-            )
-            break
 
         # generate the extraction task
         block_result = await block.execute_safe(
@@ -514,7 +589,7 @@ async def run_observer_task_helper(
         extracted_data = _get_extracted_data_from_block_result(
             block_result,
             task_type,
-            observer_cruise_id=observer_cruise_id,
+            task_v2_id=task_v2_id,
             workflow_run_id=workflow_run_id,
         )
         if extracted_data is not None:
@@ -532,7 +607,7 @@ async def run_observer_task_helper(
         workflow_create_request = WorkflowCreateYAMLRequest(
             title=workflow.title,
             description=workflow.description,
-            proxy_location=observer_task.proxy_location or ProxyLocation.RESIDENTIAL,
+            proxy_location=task_v2.proxy_location or ProxyLocation.RESIDENTIAL,
             workflow_definition=workflow_definition_yaml,
             status=workflow.status,
         )
@@ -546,6 +621,7 @@ async def run_observer_task_helper(
 
         # execute the extraction task
         workflow_run = await handle_block_result(
+            task_v2_id,
             block,
             block_result,
             workflow,
@@ -554,7 +630,7 @@ async def run_observer_task_helper(
         )
         if workflow_run.status != WorkflowRunStatus.running:
             LOG.info(
-                "Workflow run is not running anymore, stopping the observer",
+                "Workflow run is not running anymore, stopping the task v2",
                 workflow_run_id=workflow_run_id,
                 status=workflow_run.status,
             )
@@ -562,6 +638,11 @@ async def run_observer_task_helper(
         if block_result.success is True:
             completion_screenshots = []
             try:
+                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                    workflow_run=workflow_run,
+                    url=url,
+                    browser_session_id=browser_session_id,
+                )
                 scraped_page = await scrape_website(
                     browser_state,
                     url,
@@ -570,53 +651,54 @@ async def run_observer_task_helper(
                 )
                 completion_screenshots = scraped_page.screenshots
             except Exception:
-                LOG.warning("Failed to scrape the website for observer completion check")
+                LOG.warning("Failed to scrape the website for task v2 completion check")
 
             # validate completion only happens at the last iteration
-            observer_completion_prompt = prompt_engine.load_prompt(
-                "observer_check_completion",
+            task_v2_completion_prompt = prompt_engine.load_prompt(
+                "task_v2_check_completion",
                 user_goal=user_prompt,
                 task_history=task_history,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
             )
-            observer_thought = await app.DATABASE.create_observer_thought(
-                observer_cruise_id=observer_cruise_id,
+            thought = await app.DATABASE.create_thought(
+                task_v2_id=task_v2_id,
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
                 workflow_id=workflow_id,
                 workflow_permanent_id=workflow.workflow_permanent_id,
-                observer_thought_type=ObserverThoughtType.user_goal_check,
-                observer_thought_scenario=ObserverThoughtScenario.user_goal_check,
+                thought_type=ThoughtType.user_goal_check,
+                thought_scenario=ThoughtScenario.user_goal_check,
             )
             completion_resp = await app.LLM_API_HANDLER(
-                prompt=observer_completion_prompt,
+                prompt=task_v2_completion_prompt,
                 screenshots=completion_screenshots,
-                observer_thought=observer_thought,
+                thought=thought,
+                prompt_name="task_v2_check_completion",
             )
             LOG.info(
-                "Observer completion check response",
+                "Task v2 completion check response",
                 completion_resp=completion_resp,
                 iteration=i,
                 workflow_run_id=workflow_run_id,
                 task_history=task_history,
             )
             user_goal_achieved = completion_resp.get("user_goal_achieved", False)
-            thought = completion_resp.get("thoughts", "")
-            await app.DATABASE.update_observer_thought(
-                observer_thought_id=observer_thought.observer_thought_id,
+            thought_content = completion_resp.get("thoughts", "")
+            await app.DATABASE.update_thought(
+                thought_id=thought.observer_thought_id,
                 organization_id=organization_id,
-                thought=thought,
+                thought=thought_content,
                 output={"user_goal_achieved": user_goal_achieved},
             )
             if user_goal_achieved:
                 LOG.info(
-                    "User goal achieved according to the observer completion check",
+                    "User goal achieved according to the task v2 completion check",
                     iteration=i,
                     workflow_run_id=workflow_run_id,
                     completion_resp=completion_resp,
                 )
-                observer_task = await _summarize_observer_task(
-                    observer_task=observer_task,
+                task_v2 = await _summarize_task_v2(
+                    task_v2=task_v2,
                     task_history=task_history,
                     context=context,
                     screenshots=completion_screenshots,
@@ -624,22 +706,23 @@ async def run_observer_task_helper(
                 break
     else:
         LOG.info(
-            "Observer cruise failed - run out of iterations",
+            "Task v2 failed - run out of iterations",
             max_iterations=max_iterations,
             workflow_run_id=workflow_run_id,
         )
-        observer_task = await mark_observer_task_as_failed(
-            observer_cruise_id=observer_cruise_id,
+        task_v2 = await mark_task_v2_as_failed(
+            task_v2_id=task_v2_id,
             workflow_run_id=workflow_run_id,
             # TODO: add a better failure reason with LLM
             failure_reason="Max iterations reached",
             organization_id=organization_id,
         )
 
-    return workflow, workflow_run, observer_task
+    return workflow, workflow_run, task_v2
 
 
 async def handle_block_result(
+    task_v2_id: str,
     block: BlockTypeVar,
     block_result: BlockResult,
     workflow: Workflow,
@@ -657,16 +740,12 @@ async def handle_block_result(
             block_type_var=block.block_type,
             block_label=block.label,
         )
-        await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id=workflow_run.workflow_run_id)
-
-        # TODO: we can also support webhook by adding api_key to the function signature
-        await app.WORKFLOW_SERVICE.clean_up_workflow(
-            workflow=workflow,
-            workflow_run=workflow_run,
-            need_call_webhook=False,
-            close_browser_on_completion=browser_session_id is None,
-            browser_session_id=browser_session_id,
+        await mark_task_v2_as_canceled(
+            task_v2_id=task_v2_id,
+            workflow_run_id=workflow_run_id,
+            organization_id=workflow_run.organization_id,
         )
+
     elif block_result.status == BlockStatus.failed:
         LOG.error(
             f"Block with type {block.block_type} failed for workflow run {workflow_run_id}",
@@ -686,7 +765,7 @@ async def handle_block_result(
                 block_type_var=block.block_type,
                 block_label=block.label,
             )
-        # observer will continue running the workflow
+        # task v2 will continue running the workflow
     elif block_result.status == BlockStatus.terminated:
         LOG.info(
             f"Block with type {block.block_type} was terminated for workflow run {workflow_run_id}",
@@ -713,23 +792,25 @@ async def handle_block_result(
     )
 
 
-async def _set_up_workflow_context(workflow_id: str, workflow_run_id: str) -> None:
+async def _set_up_workflow_context(workflow_id: str, workflow_run_id: str, organization: Organization) -> None:
     """
     TODO: see if we could remove this function as we can just set an empty workflow context
     """
     # Get all <workflow parameter, workflow run parameter> tuples
     wp_wps_tuples = await app.WORKFLOW_SERVICE.get_workflow_run_parameter_tuples(workflow_run_id=workflow_run_id)
     workflow_output_parameters = await app.WORKFLOW_SERVICE.get_workflow_output_parameters(workflow_id=workflow_id)
-    app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
+    await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
+        organization,
         workflow_run_id,
         wp_wps_tuples,
         workflow_output_parameters,
+        [],
         [],
     )
 
 
 async def _generate_loop_task(
-    observer_cruise: ObserverTask,
+    task_v2: TaskV2,
     workflow_id: str,
     workflow_permanent_id: str,
     workflow_run_id: str,
@@ -740,25 +821,25 @@ async def _generate_loop_task(
 ) -> tuple[ForLoopBlock, list[BLOCK_YAML_TYPES], list[PARAMETER_YAML_TYPES], dict[str, Any], dict[str, Any]]:
     for_loop_parameter_yaml_list: list[PARAMETER_YAML_TYPES] = []
     loop_value_extraction_goal = prompt_engine.load_prompt(
-        "observer_loop_task_extraction_goal",
+        "task_v2_loop_task_extraction_goal",
         plan=plan,
     )
     data_extraction_thought = f"Going to generate a list of values to go through based on the plan: {plan}."
-    observer_thought = await app.DATABASE.create_observer_thought(
-        observer_cruise_id=observer_cruise.observer_cruise_id,
-        organization_id=observer_cruise.organization_id,
+    thought = await app.DATABASE.create_thought(
+        task_v2_id=task_v2.observer_cruise_id,
+        organization_id=task_v2.organization_id,
         workflow_run_id=workflow_run_id,
         workflow_id=workflow_id,
         workflow_permanent_id=workflow_permanent_id,
-        observer_thought_type=ObserverThoughtType.plan,
-        observer_thought_scenario=ObserverThoughtScenario.extract_loop_values,
+        thought_type=ThoughtType.plan,
+        thought_scenario=ThoughtScenario.extract_loop_values,
         thought=data_extraction_thought,
     )
-    # generate screenshot artifact for the observer thought
+    # generate screenshot artifact for the thought
     if scraped_page.screenshots:
         for screenshot in scraped_page.screenshots:
-            await app.ARTIFACT_MANAGER.create_observer_thought_artifact(
-                observer_thought=observer_thought,
+            await app.ARTIFACT_MANAGER.create_thought_artifact(
+                thought=thought,
                 artifact_type=ArtifactType.SCREENSHOT_LLM,
                 data=screenshot,
             )
@@ -784,7 +865,7 @@ async def _generate_loop_task(
     # execute the extraction block
     extraction_block_result = await extraction_block_for_loop.execute_safe(
         workflow_run_id=workflow_run_id,
-        organization_id=observer_cruise.organization_id,
+        organization_id=task_v2.organization_id,
     )
     LOG.info("Extraction block result", extraction_block_result=extraction_block_result)
     if extraction_block_result.success is False:
@@ -792,11 +873,7 @@ async def _generate_loop_task(
             "Failed to execute the extraction block for the loop task",
             extraction_block_result=extraction_block_result,
         )
-        # TODO: fail the workflow run
-        await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
-            workflow_run_id=workflow_run_id,
-            failure_reason="Failed to extract loop values for the loop. Please try again later.",
-        )
+        # wofklow run and task v2 status update is handled in the upper caller layer
         raise Exception("extraction_block failed")
     # validate output parameter
     try:
@@ -814,16 +891,12 @@ async def _generate_loop_task(
             "Failed to validate the output parameter of the extraction block for the loop task",
             extraction_block_result=extraction_block_result,
         )
-        await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
-            workflow_run_id=workflow_run_id,
-            failure_reason="Invalid output parameter of the extraction block for the loop. Please try again later.",
-        )
         raise
 
-    # update the observer thought
-    await app.DATABASE.update_observer_thought(
-        observer_thought_id=observer_thought.observer_thought_id,
-        organization_id=observer_cruise.organization_id,
+    # update the thought
+    await app.DATABASE.update_thought(
+        thought_id=thought.observer_thought_id,
+        organization_id=task_v2.organization_id,
         output=output_value_obj,
     )
 
@@ -875,35 +948,36 @@ async def _generate_loop_task(
     task_in_loop_label = f"task_in_loop_{_generate_random_string()}"
     context = skyvern_context.ensure_context()
     task_in_loop_metadata_prompt = prompt_engine.load_prompt(
-        "observer_generate_task_block",
+        "task_v2_generate_task_block",
         plan=plan,
         local_datetime=datetime.now(context.tz_info).isoformat(),
         is_link=is_loop_value_link,
         loop_values=loop_values,
     )
-    observer_thought_task_in_loop = await app.DATABASE.create_observer_thought(
-        observer_cruise_id=observer_cruise.observer_cruise_id,
-        organization_id=observer_cruise.organization_id,
+    thought_task_in_loop = await app.DATABASE.create_thought(
+        task_v2_id=task_v2.observer_cruise_id,
+        organization_id=task_v2.organization_id,
         workflow_run_id=workflow_run_id,
         workflow_id=workflow_id,
         workflow_permanent_id=workflow_permanent_id,
-        observer_thought_type=ObserverThoughtType.internal_plan,
-        observer_thought_scenario=ObserverThoughtScenario.generate_task_in_loop,
+        thought_type=ThoughtType.internal_plan,
+        thought_scenario=ThoughtScenario.generate_task_in_loop,
     )
     task_in_loop_metadata_response = await app.LLM_API_HANDLER(
         task_in_loop_metadata_prompt,
         screenshots=scraped_page.screenshots,
-        observer_thought=observer_thought_task_in_loop,
+        thought=thought_task_in_loop,
+        prompt_name="task_v2_generate_task_block",
     )
     LOG.info("Task in loop metadata response", task_in_loop_metadata_response=task_in_loop_metadata_response)
     navigation_goal = task_in_loop_metadata_response.get("navigation_goal")
     data_extraction_goal = task_in_loop_metadata_response.get("data_extraction_goal")
     data_extraction_schema = task_in_loop_metadata_response.get("data_schema")
-    thought = task_in_loop_metadata_response.get("thoughts")
-    await app.DATABASE.update_observer_thought(
-        observer_thought_id=observer_thought_task_in_loop.observer_thought_id,
-        organization_id=observer_cruise.organization_id,
-        thought=thought,
+    thought_content = task_in_loop_metadata_response.get("thoughts")
+    await app.DATABASE.update_thought(
+        thought_id=thought_task_in_loop.observer_thought_id,
+        organization_id=task_v2.organization_id,
+        thought=thought_content,
         output=task_in_loop_metadata_response,
     )
     if data_extraction_goal and navigation_goal:
@@ -967,7 +1041,7 @@ async def _generate_loop_task(
 
 
 async def _generate_extraction_task(
-    observer_cruise: ObserverTask,
+    task_v2: TaskV2,
     workflow_id: str,
     workflow_permanent_id: str,
     workflow_run_id: str,
@@ -980,7 +1054,7 @@ async def _generate_extraction_task(
     # extract the data
     context = skyvern_context.ensure_context()
     generate_extraction_task_prompt = prompt_engine.load_prompt(
-        "observer_generate_extraction_task",
+        "task_v2_generate_extraction_task",
         current_url=current_url,
         elements=element_tree_in_prompt,
         data_extraction_goal=data_extraction_goal,
@@ -988,7 +1062,8 @@ async def _generate_extraction_task(
     )
     generate_extraction_task_response = await app.LLM_API_HANDLER(
         generate_extraction_task_prompt,
-        observer_cruise=observer_cruise,
+        task_v2=task_v2,
+        prompt_name="task_v2_generate_extraction_task",
     )
     LOG.info("Data extraction response", data_extraction_response=generate_extraction_task_response)
 
@@ -1059,22 +1134,50 @@ async def _generate_navigation_task(
     )
 
 
+async def _generate_goto_url_task(
+    workflow_id: str,
+    url: str,
+) -> tuple[UrlBlock, list[BLOCK_YAML_TYPES], list[PARAMETER_YAML_TYPES]]:
+    LOG.info("Generating goto url task", url=url)
+    # create OutputParameter for the data_extraction block
+    label = f"goto_url_{_generate_random_string()}"
+
+    url_block_yaml = UrlBlockYAML(
+        label=label,
+        url=url,
+    )
+    output_parameter = await app.WORKFLOW_SERVICE.create_output_parameter_for_block(
+        workflow_id=workflow_id,
+        block_yaml=url_block_yaml,
+    )
+    # create UrlBlock
+    return (
+        UrlBlock(
+            label=label,
+            url=url,
+            output_parameter=output_parameter,
+        ),
+        [url_block_yaml],
+        [],
+    )
+
+
 def _generate_random_string(length: int = 5) -> str:
     # Use the current timestamp as the seed
     random.seed(os.urandom(16))
     return "".join(random.choices(RANDOM_STRING_POOL, k=length))
 
 
-async def get_observer_thought_timelines(
-    observer_cruise_id: str,
+async def get_thought_timelines(
+    task_v2_id: str,
     organization_id: str | None = None,
 ) -> list[WorkflowRunTimeline]:
-    observer_thoughts = await app.DATABASE.get_observer_thoughts(
-        observer_cruise_id,
+    thoughts = await app.DATABASE.get_thoughts(
+        task_v2_id,
         organization_id=organization_id,
-        observer_thought_types=[
-            ObserverThoughtType.plan,
-            ObserverThoughtType.user_goal_check,
+        thought_types=[
+            ThoughtType.plan,
+            ThoughtType.user_goal_check,
         ],
     )
     return [
@@ -1084,58 +1187,102 @@ async def get_observer_thought_timelines(
             created_at=thought.created_at,
             modified_at=thought.modified_at,
         )
-        for thought in observer_thoughts
+        for thought in thoughts
     ]
 
 
-async def get_observer_cruise(observer_cruise_id: str, organization_id: str | None = None) -> ObserverTask | None:
-    return await app.DATABASE.get_observer_cruise(observer_cruise_id, organization_id=organization_id)
+async def get_task_v2(task_v2_id: str, organization_id: str | None = None) -> TaskV2 | None:
+    return await app.DATABASE.get_task_v2(task_v2_id, organization_id=organization_id)
 
 
-async def mark_observer_task_as_failed(
-    observer_cruise_id: str,
+async def mark_task_v2_as_failed(
+    task_v2_id: str,
     workflow_run_id: str | None = None,
     failure_reason: str | None = None,
     organization_id: str | None = None,
-) -> ObserverTask:
-    observer_task = await app.DATABASE.update_observer_cruise(
-        observer_cruise_id,
+) -> TaskV2:
+    task_v2 = await app.DATABASE.update_task_v2(
+        task_v2_id,
         organization_id=organization_id,
-        status=ObserverTaskStatus.failed,
+        status=TaskV2Status.failed,
     )
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
             workflow_run_id, failure_reason=failure_reason or "Skyvern task 2.0 failed"
         )
-    await send_observer_task_webhook(observer_task)
-    return observer_task
+    await send_task_v2_webhook(task_v2)
+    return task_v2
 
 
-async def mark_observer_task_as_completed(
-    observer_cruise_id: str,
+async def mark_task_v2_as_completed(
+    task_v2_id: str,
     workflow_run_id: str | None = None,
     organization_id: str | None = None,
     summary: str | None = None,
     output: dict[str, Any] | None = None,
-) -> ObserverTask:
-    observer_task = await app.DATABASE.update_observer_cruise(
-        observer_cruise_id,
+) -> TaskV2:
+    task_v2 = await app.DATABASE.update_task_v2(
+        task_v2_id,
         organization_id=organization_id,
-        status=ObserverTaskStatus.completed,
+        status=TaskV2Status.completed,
         summary=summary,
         output=output,
     )
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(workflow_run_id)
 
-    await send_observer_task_webhook(observer_task)
-    return observer_task
+    # Track task v2 duration when completed
+    duration_seconds = (datetime.now(UTC) - task_v2.created_at.replace(tzinfo=UTC)).total_seconds()
+    LOG.info(
+        "Task v2 duration metrics",
+        task_v2_id=task_v2_id,
+        workflow_run_id=workflow_run_id,
+        duration_seconds=duration_seconds,
+        task_v2_status=TaskV2Status.completed,
+        organization_id=organization_id,
+    )
+
+    await send_task_v2_webhook(task_v2)
+    return task_v2
+
+
+async def mark_task_v2_as_canceled(
+    task_v2_id: str,
+    workflow_run_id: str | None = None,
+    organization_id: str | None = None,
+) -> TaskV2:
+    task_v2 = await app.DATABASE.update_task_v2(
+        task_v2_id,
+        organization_id=organization_id,
+        status=TaskV2Status.canceled,
+    )
+    if workflow_run_id:
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
+    await send_task_v2_webhook(task_v2)
+    return task_v2
+
+
+async def mark_task_v2_as_terminated(
+    task_v2_id: str,
+    workflow_run_id: str | None = None,
+    organization_id: str | None = None,
+    failure_reason: str | None = None,
+) -> TaskV2:
+    task_v2 = await app.DATABASE.update_task_v2(
+        task_v2_id,
+        organization_id=organization_id,
+        status=TaskV2Status.terminated,
+    )
+    if workflow_run_id:
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_terminated(workflow_run_id, failure_reason)
+    await send_task_v2_webhook(task_v2)
+    return task_v2
 
 
 def _get_extracted_data_from_block_result(
     block_result: BlockResult,
     task_type: str,
-    observer_cruise_id: str | None = None,
+    task_v2_id: str | None = None,
     workflow_run_id: str | None = None,
 ) -> Any | None:
     """Extract data from block result based on task type.
@@ -1143,7 +1290,7 @@ def _get_extracted_data_from_block_result(
     Args:
         block_result: The result from block execution
         task_type: Type of task ("extract" or "loop")
-        observer_cruise_id: Optional ID for logging
+        task_v2_id: Optional ID for logging
         workflow_run_id: Optional ID for logging
 
     Returns:
@@ -1168,7 +1315,7 @@ def _get_extracted_data_from_block_result(
                     LOG.warning(
                         "Inner loop output is not a list",
                         inner_loop_output=inner_loop_output,
-                        observer_cruise_id=observer_cruise_id,
+                        task_v2_id=task_v2_id,
                         workflow_run_id=workflow_run_id,
                         workflow_run_block_id=block_result.workflow_run_block_id,
                     )
@@ -1178,7 +1325,7 @@ def _get_extracted_data_from_block_result(
                         LOG.warning(
                             "inner output is not a dict",
                             inner_output=inner_output,
-                            observer_cruise_id=observer_cruise_id,
+                            task_v2_id=task_v2_id,
                             workflow_run_id=workflow_run_id,
                             workflow_run_block_id=block_result.workflow_run_block_id,
                         )
@@ -1188,7 +1335,7 @@ def _get_extracted_data_from_block_result(
                         LOG.warning(
                             "output_value is not a dict",
                             output_value=output_value,
-                            observer_cruise_id=observer_cruise_id,
+                            task_v2_id=task_v2_id,
                             workflow_run_id=workflow_run_id,
                             workflow_run_block_id=block_result.workflow_run_block_id,
                         )
@@ -1201,57 +1348,58 @@ def _get_extracted_data_from_block_result(
     return None
 
 
-async def _summarize_observer_task(
-    observer_task: ObserverTask,
+async def _summarize_task_v2(
+    task_v2: TaskV2,
     task_history: list[dict],
     context: SkyvernContext,
     screenshots: list[bytes] | None = None,
-) -> ObserverTask:
-    observer_thought = await app.DATABASE.create_observer_thought(
-        observer_cruise_id=observer_task.observer_cruise_id,
-        organization_id=observer_task.organization_id,
-        workflow_run_id=observer_task.workflow_run_id,
-        workflow_id=observer_task.workflow_id,
-        workflow_permanent_id=observer_task.workflow_permanent_id,
-        observer_thought_type=ObserverThoughtType.user_goal_check,
-        observer_thought_scenario=ObserverThoughtScenario.summarization,
+) -> TaskV2:
+    thought = await app.DATABASE.create_thought(
+        task_v2_id=task_v2.observer_cruise_id,
+        organization_id=task_v2.organization_id,
+        workflow_run_id=task_v2.workflow_run_id,
+        workflow_id=task_v2.workflow_id,
+        workflow_permanent_id=task_v2.workflow_permanent_id,
+        thought_type=ThoughtType.user_goal_check,
+        thought_scenario=ThoughtScenario.summarization,
     )
-    # summarize the observer cruise and format the output
-    observer_summary_prompt = prompt_engine.load_prompt(
-        "observer_summary",
-        user_goal=observer_task.prompt,
+    # summarize the task v2 and format the output
+    task_v2_summary_prompt = prompt_engine.load_prompt(
+        "task_v2_summary",
+        user_goal=task_v2.prompt,
         task_history=task_history,
         local_datetime=datetime.now(context.tz_info).isoformat(),
     )
-    observer_summary_resp = await app.LLM_API_HANDLER(
-        prompt=observer_summary_prompt,
+    task_v2_summary_resp = await app.LLM_API_HANDLER(
+        prompt=task_v2_summary_prompt,
         screenshots=screenshots,
-        observer_thought=observer_thought,
-    )
-    LOG.info("Observer summary response", observer_summary_resp=observer_summary_resp)
-
-    thought = observer_summary_resp.get("description")
-    summarized_output = observer_summary_resp.get("output")
-    await app.DATABASE.update_observer_thought(
-        observer_thought_id=observer_thought.observer_thought_id,
-        organization_id=observer_task.organization_id,
         thought=thought,
-        output=observer_summary_resp,
+        prompt_name="task_v2_summary",
+    )
+    LOG.info("Task v2 summary response", task_v2_summary_resp=task_v2_summary_resp)
+
+    summary_description = task_v2_summary_resp.get("description")
+    summarized_output = task_v2_summary_resp.get("output")
+    await app.DATABASE.update_thought(
+        thought_id=thought.observer_thought_id,
+        organization_id=task_v2.organization_id,
+        thought=summary_description,
+        output=task_v2_summary_resp,
     )
 
-    return await mark_observer_task_as_completed(
-        observer_cruise_id=observer_task.observer_cruise_id,
-        workflow_run_id=observer_task.workflow_run_id,
-        organization_id=observer_task.organization_id,
-        summary=thought,
+    return await mark_task_v2_as_completed(
+        task_v2_id=task_v2.observer_cruise_id,
+        workflow_run_id=task_v2.workflow_run_id,
+        organization_id=task_v2.organization_id,
+        summary=summary_description,
         output=summarized_output,
     )
 
 
-async def send_observer_task_webhook(observer_task: ObserverTask) -> None:
-    if not observer_task.webhook_callback_url:
+async def send_task_v2_webhook(task_v2: TaskV2) -> None:
+    if not task_v2.webhook_callback_url:
         return
-    organization_id = observer_task.organization_id
+    organization_id = task_v2.organization_id
     if not organization_id:
         return
     api_key = await app.DATABASE.get_valid_org_auth_token(
@@ -1260,38 +1408,38 @@ async def send_observer_task_webhook(observer_task: ObserverTask) -> None:
     )
     if not api_key:
         LOG.warning(
-            "No valid API key found for the organization of observer cruise",
-            observer_cruise_id=observer_task.observer_cruise_id,
+            "No valid API key found for the organization of task v2",
+            task_v2_id=task_v2.observer_cruise_id,
         )
         return
-    # build the observer cruise response
-    payload = observer_task.model_dump_json(by_alias=True)
+    # build the task v2 response
+    payload = task_v2.model_dump_json(by_alias=True)
     headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key.token)
     LOG.info(
-        "Sending observer cruise response to webhook callback url",
-        observer_cruise_id=observer_task.observer_cruise_id,
-        webhook_callback_url=observer_task.webhook_callback_url,
+        "Sending task v2 response to webhook callback url",
+        task_v2_id=task_v2.observer_cruise_id,
+        webhook_callback_url=task_v2.webhook_callback_url,
         payload=payload,
         headers=headers,
     )
     try:
         resp = await httpx.AsyncClient().post(
-            observer_task.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
+            task_v2.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
         )
         if resp.status_code == 200:
             LOG.info(
-                "Observer cruise webhook sent successfully",
-                observer_cruise_id=observer_task.observer_cruise_id,
+                "Task v2 webhook sent successfully",
+                task_v2_id=task_v2.observer_cruise_id,
                 resp_code=resp.status_code,
                 resp_text=resp.text,
             )
         else:
             LOG.info(
-                "Observer cruise webhook failed",
-                observer_cruise_id=observer_task.observer_cruise_id,
+                "Task v2 webhook failed",
+                task_v2_id=task_v2.observer_cruise_id,
                 resp=resp,
                 resp_code=resp.status_code,
                 resp_text=resp.text,
             )
     except Exception as e:
-        raise FailedToSendWebhook(observer_cruise_id=observer_task.observer_cruise_id) from e
+        raise FailedToSendWebhook(task_v2_id=task_v2.observer_cruise_id) from e

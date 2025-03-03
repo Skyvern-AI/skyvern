@@ -20,6 +20,7 @@ export type ParameterYAML =
   | WorkflowParameterYAML
   | BitwardenLoginCredentialParameterYAML
   | AWSSecretParameterYAML
+  | CredentialParameterYAML
   | ContextParameterYAML
   | OutputParameterYAML
   | BitwardenSensitiveInformationParameterYAML
@@ -82,6 +83,11 @@ export type OutputParameterYAML = ParameterYAMLBase & {
   parameter_type: "output";
 };
 
+export type CredentialParameterYAML = ParameterYAMLBase & {
+  parameter_type: "credential";
+  credential_id: string;
+};
+
 export type BlockYAML =
   | TaskBlockYAML
   | CodeBlockYAML
@@ -98,7 +104,9 @@ export type BlockYAML =
   | LoginBlockYAML
   | WaitBlockYAML
   | FileDownloadBlockYAML
-  | PDFParserBlockYAML;
+  | PDFParserBlockYAML
+  | Taskv2BlockYAML
+  | URLBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
@@ -124,6 +132,15 @@ export type TaskBlockYAML = BlockYAMLBase & {
   cache_actions: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
+};
+
+export type Taskv2BlockYAML = BlockYAMLBase & {
+  block_type: "task_v2";
+  url: string | null;
+  prompt: string;
+  totp_verification_url: string | null;
+  totp_identifier: string | null;
+  max_iterations: number | null;
 };
 
 export type ValidationBlockYAML = BlockYAMLBase & {
@@ -272,4 +289,9 @@ export type PDFParserBlockYAML = BlockYAMLBase & {
   block_type: "pdf_parser";
   file_url: string;
   json_schema: Record<string, unknown> | null;
+};
+
+export type URLBlockYAML = BlockYAMLBase & {
+  block_type: "goto_url";
+  url: string;
 };

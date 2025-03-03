@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useWorkflowParametersState } from "../useWorkflowParametersState";
 import { WorkflowParameterAddPanel } from "./WorkflowParameterAddPanel";
-import { ParametersState } from "../FlowRenderer";
+import { ParametersState } from "../types";
 import { WorkflowParameterEditPanel } from "./WorkflowParameterEditPanel";
 import { MixerVerticalIcon, PlusIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
@@ -79,7 +79,7 @@ function WorkflowParametersPanel() {
                 setOperationPanelState({
                   active: true,
                   operation: "add",
-                  type: "workflow",
+                  type: WorkflowEditorParameterTypes.Workflow,
                 });
               }}
             >
@@ -90,7 +90,7 @@ function WorkflowParametersPanel() {
                 setOperationPanelState({
                   active: true,
                   operation: "add",
-                  type: "credential",
+                  type: WorkflowEditorParameterTypes.Credential,
                 });
               }}
             >
@@ -101,7 +101,7 @@ function WorkflowParametersPanel() {
                 setOperationPanelState({
                   active: true,
                   operation: "add",
-                  type: "secret",
+                  type: WorkflowEditorParameterTypes.Secret,
                 });
               }}
             >

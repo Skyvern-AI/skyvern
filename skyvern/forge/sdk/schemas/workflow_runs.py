@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from skyvern.forge.sdk.schemas.observers import ObserverThought
+from skyvern.forge.sdk.schemas.task_v2 import Thought
 from skyvern.forge.sdk.workflow.models.block import BlockType
 from skyvern.webeye.actions.actions import Action
 
@@ -58,7 +58,7 @@ class WorkflowRunTimelineType(StrEnum):
 class WorkflowRunTimeline(BaseModel):
     type: WorkflowRunTimelineType
     block: WorkflowRunBlock | None = None
-    thought: ObserverThought | None = None
+    thought: Thought | None = None
     children: list[WorkflowRunTimeline] = []
     created_at: datetime
     modified_at: datetime

@@ -1,8 +1,12 @@
-import { RobotIcon } from "@/components/icons/RobotIcon";
+import { CompassIcon } from "@/components/icons/CompassIcon";
 import { NavLinkGroup } from "@/components/NavLinkGroup";
 import { useSidebarStore } from "@/store/SidebarStore";
 import { cn } from "@/util/utils";
-import { GearIcon, LightningBoltIcon } from "@radix-ui/react-icons";
+import {
+  CounterClockwiseClockIcon,
+  GearIcon,
+  LightningBoltIcon,
+} from "@radix-ui/react-icons";
 
 function SideNav() {
   const { collapsed } = useSidebarStore();
@@ -14,17 +18,22 @@ function SideNav() {
       })}
     >
       <NavLinkGroup
-        title={"Build"}
+        title="Build"
         links={[
           {
-            label: "Tasks",
-            to: "/tasks",
-            icon: <RobotIcon className="size-6" />,
+            label: "Discover",
+            to: "/discover",
+            icon: <CompassIcon className="size-6" />,
           },
           {
             label: "Workflows",
             to: "/workflows",
             icon: <LightningBoltIcon className="size-6" />,
+          },
+          {
+            label: "History",
+            to: "/history",
+            icon: <CounterClockwiseClockIcon className="size-6" />,
           },
         ]}
       />

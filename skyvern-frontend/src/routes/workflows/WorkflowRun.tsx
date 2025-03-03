@@ -126,7 +126,7 @@ function WorkflowRun() {
     });
   }
 
-  const isTaskv2Run = workflowRun && workflowRun.observer_task !== null;
+  const isTaskv2Run = workflowRun && workflowRun.task_v2 !== null;
 
   return (
     <div className="space-y-8">

@@ -14,6 +14,7 @@ LOG = structlog.get_logger()
 class AWSClientType(StrEnum):
     S3 = "s3"
     SECRETS_MANAGER = "secretsmanager"
+    ECS = "ecs"
 
 
 def execute_with_async_client(client_type: AWSClientType) -> Callable:
@@ -44,6 +45,30 @@ class AsyncAWSClient:
             LOG.exception("Failed to get secret.", secret_name=secret_name, error_code=error_code)
             return None
 
+    @execute_with_async_client(client_type=AWSClientType.SECRETS_MANAGER)
+    async def create_secret(self, secret_name: str, secret_value: str, client: AioBaseClient = None) -> None:
+        try:
+            await client.create_secret(Name=secret_name, SecretString=secret_value)
+        except Exception as e:
+            LOG.exception("Failed to create secret.", secret_name=secret_name)
+            raise e
+
+    @execute_with_async_client(client_type=AWSClientType.SECRETS_MANAGER)
+    async def set_secret(self, secret_name: str, secret_value: str, client: AioBaseClient = None) -> None:
+        try:
+            await client.put_secret_value(SecretId=secret_name, SecretString=secret_value)
+        except Exception as e:
+            LOG.exception("Failed to set secret.", secret_name=secret_name)
+            raise e
+
+    @execute_with_async_client(client_type=AWSClientType.SECRETS_MANAGER)
+    async def delete_secret(self, secret_name: str, client: AioBaseClient = None) -> None:
+        try:
+            await client.delete_secret(SecretId=secret_name)
+        except Exception as e:
+            LOG.exception("Failed to delete secret.", secret_name=secret_name)
+            raise e
+
     @execute_with_async_client(client_type=AWSClientType.S3)
     async def upload_file(self, uri: str, data: bytes, client: AioBaseClient = None) -> str | None:
         try:
@@ -66,10 +91,21 @@ class AsyncAWSClient:
             return None
 
     @execute_with_async_client(client_type=AWSClientType.S3)
-    async def upload_file_from_path(self, uri: str, file_path: str, client: AioBaseClient = None) -> None:
+    async def upload_file_from_path(
+        self, uri: str, file_path: str, client: AioBaseClient = None, metadata: dict | None = None
+    ) -> None:
         try:
             parsed_uri = S3Uri(uri)
-            await client.upload_file(file_path, parsed_uri.bucket, parsed_uri.key)
+            params: dict[str, Any] = {
+                "Filename": file_path,
+                "Bucket": parsed_uri.bucket,
+                "Key": parsed_uri.key,
+            }
+
+            if metadata:
+                params["ExtraArgs"] = {"Metadata": metadata}
+
+            await client.upload_file(**params)
         except Exception:
             LOG.exception("S3 upload failed.", uri=uri)
 
@@ -77,11 +113,39 @@ class AsyncAWSClient:
     async def download_file(self, uri: str, client: AioBaseClient = None, log_exception: bool = True) -> bytes | None:
         try:
             parsed_uri = S3Uri(uri)
+
+            # Get full object including body
             response = await client.get_object(Bucket=parsed_uri.bucket, Key=parsed_uri.key)
             return await response["Body"].read()
         except Exception:
             if log_exception:
                 LOG.exception("S3 download failed", uri=uri)
+            return None
+
+    @execute_with_async_client(client_type=AWSClientType.S3)
+    async def get_file_metadata(
+        self, uri: str, client: AioBaseClient = None, log_exception: bool = True
+    ) -> dict | None:
+        """
+        Retrieves only the metadata of a file without downloading its content.
+
+        Args:
+            uri: The S3 URI of the file
+            client: Optional S3 client to use
+            log_exception: Whether to log exceptions
+
+        Returns:
+            The metadata dictionary or None if the request fails
+        """
+        try:
+            parsed_uri = S3Uri(uri)
+
+            # Only get object metadata without the body
+            response = await client.head_object(Bucket=parsed_uri.bucket, Key=parsed_uri.key)
+            return response.get("Metadata", {})
+        except Exception:
+            if log_exception:
+                LOG.exception("S3 metadata retrieval failed", uri=uri)
             return None
 
     @execute_with_async_client(client_type=AWSClientType.S3)
@@ -113,6 +177,52 @@ class AsyncAWSClient:
                 for obj in page["Contents"]:
                     object_keys.append(obj["Key"])
         return object_keys
+
+    @execute_with_async_client(client_type=AWSClientType.ECS)
+    async def run_task(
+        self,
+        cluster: str,
+        launch_type: str,
+        task_definition: str,
+        subnets: list[str],
+        security_groups: list[str],
+        client: AioBaseClient = None,
+    ) -> dict:
+        return await client.run_task(
+            cluster=cluster,
+            launchType=launch_type,
+            taskDefinition=task_definition,
+            networkConfiguration={
+                "awsvpcConfiguration": {
+                    "subnets": subnets,
+                    "securityGroups": security_groups,
+                    "assignPublicIp": "DISABLED",
+                }
+            },
+        )
+
+    @execute_with_async_client(client_type=AWSClientType.ECS)
+    async def stop_task(self, cluster: str, task: str, client: AioBaseClient = None) -> dict:
+        response = await client.stop_task(cluster=cluster, task=task)
+        return response
+
+    @execute_with_async_client(client_type=AWSClientType.ECS)
+    async def describe_tasks(self, cluster: str, tasks: list[str], client: AioBaseClient = None) -> dict:
+        response = await client.describe_tasks(cluster=cluster, tasks=tasks)
+        return response
+
+    @execute_with_async_client(client_type=AWSClientType.ECS)
+    async def list_tasks(self, cluster: str, client: AioBaseClient = None) -> dict:
+        response = await client.list_tasks(cluster=cluster)
+        return response
+
+    @execute_with_async_client(client_type=AWSClientType.ECS)
+    async def describe_task_definition(self, task_definition: str, client: AioBaseClient = None) -> dict:
+        return await client.describe_task_definition(taskDefinition=task_definition)
+
+    @execute_with_async_client(client_type=AWSClientType.ECS)
+    async def deregister_task_definition(self, task_definition: str, client: AioBaseClient = None) -> dict:
+        return await client.deregister_task_definition(taskDefinition=task_definition)
 
 
 class S3Uri(object):

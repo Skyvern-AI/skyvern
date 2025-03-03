@@ -38,6 +38,10 @@ export const ProxyLocation = {
   ResidentialGB: "RESIDENTIAL_GB",
   ResidentialFR: "RESIDENTIAL_FR",
   ResidentialDE: "RESIDENTIAL_DE",
+  ResidentialNZ: "RESIDENTIAL_NZ",
+  ResidentialZA: "RESIDENTIAL_ZA",
+  ResidentialAR: "RESIDENTIAL_AR",
+  ResidentialISP: "RESIDENTIAL_ISP",
   None: "NONE",
 } as const;
 
@@ -80,6 +84,31 @@ export type StepApiResponse = {
   retry_index: number;
   status: Status;
   step_cost: number;
+};
+
+export type Task = {
+  task_id: string;
+  status: Status;
+  created_at: string; // ISO 8601
+  modified_at: string; // ISO 8601
+  extracted_information: Record<string, unknown> | string | null;
+  screenshot_url: string | null;
+  recording_url: string | null;
+  organization_id: string;
+  workflow_run_id: string | null;
+  order: number | null;
+  retry: number | null;
+  max_steps_per_run: number | null;
+  errors: Array<Record<string, unknown>>;
+  title: string | null;
+  url: string;
+  webhook_callback_url: string | null;
+  navigation_goal: string | null;
+  data_extraction_goal: string | null;
+  navigation_payload: Record<string, unknown> | string | null;
+  complete_criterion: string | null;
+  terminate_criterion: string | null;
+  application: string | null;
 };
 
 export type TaskApiResponse = {
@@ -147,6 +176,7 @@ export const ActionTypes = {
   terminate: "terminate",
   SolveCaptcha: "solve_captcha",
   extract: "extract",
+  ReloadPage: "reload_page",
 } as const;
 
 export type ActionType = (typeof ActionTypes)[keyof typeof ActionTypes];
@@ -163,6 +193,7 @@ export const ReadableActionTypes: {
   terminate: "Terminate",
   solve_captcha: "Solve Captcha",
   extract: "Extract Data",
+  reload_page: "Reload Page",
 };
 
 export type Option = {
@@ -200,6 +231,7 @@ export type WorkflowRunApiResponse = {
   created_at: string;
   modified_at: string;
   failure_reason: string | null;
+  workflow_title: string | null;
 };
 
 export type WorkflowRunStatusApiResponse = {
@@ -218,7 +250,8 @@ export type WorkflowRunStatusApiResponse = {
   downloaded_file_urls: Array<string> | null;
   total_steps: number | null;
   total_cost: number | null;
-  observer_task: ObserverTask | null;
+  task_v2: TaskV2 | null;
+  workflow_title: string | null;
 };
 
 export type TaskGenerationApiResponse = {
@@ -245,7 +278,7 @@ export type ActionsApiResponse = {
   response: string | null;
 };
 
-export type ObserverTask = {
+export type TaskV2 = {
   task_id: string;
   status: Status;
   workflow_run_id: string | null;
@@ -257,10 +290,30 @@ export type ObserverTask = {
   modified_at: string;
   output: Record<string, unknown> | null;
   summary: string | null;
+  webhook_callback_url: string | null;
+  totp_verification_url: string | null;
+  totp_identifier: string | null;
+  proxy_location: ProxyLocation | null;
 };
 
 export type Createv2TaskRequest = {
   user_prompt: string;
   webhook_callback_url?: string | null;
   proxy_location?: ProxyLocation | null;
+};
+
+export type PasswordCredentialApiResponse = {
+  username: string;
+};
+
+export type CreditCardCredentialApiResponse = {
+  last_four: string;
+  brand: string;
+};
+
+export type CredentialApiResponse = {
+  credential_id: string;
+  credential: PasswordCredentialApiResponse | CreditCardCredentialApiResponse;
+  credential_type: "password" | "credit_card";
+  name: string;
 };

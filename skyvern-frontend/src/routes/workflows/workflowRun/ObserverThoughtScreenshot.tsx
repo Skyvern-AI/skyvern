@@ -21,7 +21,7 @@ function ObserverThoughtScreenshot({ observerThoughtId, taskStatus }: Props) {
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client
-        .get(`${apiPathPrefix}/observer_thought/${observerThoughtId}/artifacts`)
+        .get(`${apiPathPrefix}/thought/${observerThoughtId}/artifacts`)
         .then((response) => response.data);
     },
     refetchInterval: (query) => {

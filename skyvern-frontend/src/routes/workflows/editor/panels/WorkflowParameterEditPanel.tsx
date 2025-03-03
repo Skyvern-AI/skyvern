@@ -1,7 +1,7 @@
 import { Cross2Icon } from "@radix-ui/react-icons";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
-import { useState } from "react";
+import { useState, useContext } from "react";
 import {
   WorkflowEditorParameterType,
   WorkflowParameterValueType,
@@ -15,13 +15,20 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
-import { ParametersState } from "../FlowRenderer";
 import { Checkbox } from "@/components/ui/checkbox";
 import { getDefaultValueForParameterType } from "../workflowEditorUtils";
 import { WorkflowParameterInput } from "../../WorkflowParameterInput";
 import { toast } from "@/components/ui/use-toast";
 import { SourceParameterKeySelector } from "../../components/SourceParameterKeySelector";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
+import CloudContext from "@/store/CloudContext";
+import { CredentialSelector } from "../../components/CredentialSelector";
+import { SwitchBar } from "@/components/SwitchBar";
+import {
+  parameterIsBitwardenCredential,
+  parameterIsSkyvernCredential,
+  ParametersState,
+} from "../types";
 
 type Props = {
   type: WorkflowEditorParameterType;
@@ -61,17 +68,25 @@ function WorkflowParameterEditPanel({
   onSave,
   initialValues,
 }: Props) {
+  const isCloud = useContext(CloudContext);
   const [key, setKey] = useState(initialValues.key);
+  const isBitwardenCredential =
+    initialValues.parameterType === "credential" &&
+    parameterIsBitwardenCredential(initialValues);
+  const isSkyvernCredential =
+    initialValues.parameterType === "credential" &&
+    parameterIsSkyvernCredential(initialValues);
+  const [credentialType, setCredentialType] = useState<"bitwarden" | "skyvern">(
+    isBitwardenCredential ? "bitwarden" : "skyvern",
+  );
   const [urlParameterKey, setUrlParameterKey] = useState(
-    initialValues.parameterType === "credential"
-      ? initialValues.urlParameterKey
-      : "",
+    isBitwardenCredential ? initialValues.urlParameterKey : "",
   );
   const [description, setDescription] = useState(
     initialValues.description ?? "",
   );
   const [collectionId, setCollectionId] = useState(
-    initialValues.parameterType === "credential" ||
+    isBitwardenCredential ||
       initialValues.parameterType === "secret" ||
       initialValues.parameterType === "creditCardData"
       ? initialValues.collectionId
@@ -121,6 +136,10 @@ function WorkflowParameterEditPanel({
     initialValues.parameterType === "creditCardData"
       ? initialValues.itemId
       : "",
+  );
+
+  const [credentialId, setCredentialId] = useState(
+    isSkyvernCredential ? initialValues.credentialId : "",
   );
 
   return (
@@ -229,6 +248,18 @@ function WorkflowParameterEditPanel({
             </>
           )}
           {type === "credential" && (
+            <SwitchBar
+              value={credentialType}
+              onChange={(value) => {
+                setCredentialType(value as "bitwarden" | "skyvern");
+              }}
+              options={[
+                { label: "Skyvern", value: "skyvern" },
+                { label: "Bitwarden", value: "bitwarden" },
+              ]}
+            />
+          )}
+          {type === "credential" && credentialType === "bitwarden" && (
             <>
               <div className="space-y-1">
                 <Label className="text-xs text-slate-300">
@@ -302,9 +333,31 @@ function WorkflowParameterEditPanel({
               </div>
             </>
           )}
+          {
+            // temporarily cloud only
+            type === "credential" &&
+              credentialType === "skyvern" &&
+              isCloud && (
+                <div className="space-y-1">
+                  <Label className="text-xs text-slate-300">Credential</Label>
+                  <CredentialSelector
+                    value={credentialId}
+                    onChange={(value) => setCredentialId(value)}
+                  />
+                </div>
+              )
+          }
           <div className="flex justify-end">
             <Button
               onClick={() => {
+                if (!key) {
+                  toast({
+                    variant: "destructive",
+                    title: "Failed to save parameter",
+                    description: "Key is required",
+                  });
+                  return;
+                }
                 if (type === "workflow") {
                   if (
                     parameterType === "json" &&
@@ -337,7 +390,7 @@ function WorkflowParameterEditPanel({
                   });
                 }
                 if (
-                  type === "credential" ||
+                  (type === "credential" && credentialType === "bitwarden") ||
                   type === "secret" ||
                   type === "creditCardData"
                 ) {
@@ -350,7 +403,7 @@ function WorkflowParameterEditPanel({
                     return;
                   }
                 }
-                if (type === "credential") {
+                if (type === "credential" && credentialType === "bitwarden") {
                   onSave({
                     key,
                     parameterType: "credential",
@@ -394,6 +447,22 @@ function WorkflowParameterEditPanel({
                     key,
                     parameterType: "context",
                     sourceParameterKey,
+                    description,
+                  });
+                }
+                if (type === "credential" && credentialType === "skyvern") {
+                  if (!credentialId) {
+                    toast({
+                      variant: "destructive",
+                      title: "Failed to save parameter",
+                      description: "Credential is required",
+                    });
+                    return;
+                  }
+                  onSave({
+                    key,
+                    parameterType: "credential",
+                    credentialId,
                     description,
                   });
                 }
