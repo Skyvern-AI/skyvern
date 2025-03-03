@@ -69,6 +69,15 @@ if settings.ENABLE_OPENAI:
         ),
     )
     LLMConfigRegistry.register_config(
+        "OPENAI_GPT4_5",
+        LLMConfig(
+            "gpt-4.5-preview",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "OPENAI_GPT4V",
         LLMConfig(
             "gpt-4-turbo",
