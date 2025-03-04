@@ -2122,7 +2122,8 @@ class TaskV2Block(Block):
     url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    max_iterations: int = 10
+    max_iterations: int = settings.MAX_ITERATIONS_PER_TASK_V2
+    max_steps: int = settings.MAX_STEPS_PER_TASK_V2
 
     def get_all_parameters(
         self,
@@ -2175,7 +2176,7 @@ class TaskV2Block(Block):
             organization=organization,
             task_v2_id=task_v2.observer_cruise_id,
             request_id=None,
-            max_iterations_override=self.max_iterations,
+            max_steps_override=self.max_steps,
             browser_session_id=browser_session_id,
         )
         result_dict = None

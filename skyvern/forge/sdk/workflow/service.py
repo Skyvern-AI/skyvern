@@ -1855,6 +1855,7 @@ class WorkflowService:
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 max_iterations=block_yaml.max_iterations,
+                max_steps=block_yaml.max_steps,
                 output_parameter=output_parameter,
             )
         elif block_yaml.block_type == BlockType.GOTO_URL:
