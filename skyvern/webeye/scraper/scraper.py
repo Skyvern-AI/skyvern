@@ -160,16 +160,17 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
 
 
 def clean_element_before_hashing(element: dict) -> dict:
-    element_copy = copy.deepcopy(element)
-    element_copy.pop("id", None)
-    element_copy.pop("rect", None)
-    element_copy.pop("frame_index", None)
-    if "attributes" in element_copy:
-        element_copy["attributes"].pop(SKYVERN_ID_ATTR, None)
-    if "children" in element_copy:
-        for idx, child in enumerate(element_copy["children"]):
-            element_copy["children"][idx] = clean_element_before_hashing(child)
-    return element_copy
+    def clean_nested(element: dict) -> dict:
+        element_cleaned = {key: value for key, value in element.items() if key not in {"id", "rect", "frame_index"}}
+        if "attributes" in element:
+            attributes_cleaned = {key: value for key, value in element["attributes"].items() if key != SKYVERN_ID_ATTR}
+            element_cleaned["attributes"] = attributes_cleaned
+        if "children" in element:
+            children_cleaned = [clean_nested(child) for child in element["children"]]
+            element_cleaned["children"] = children_cleaned
+        return element_cleaned
+
+    return clean_nested(element)
 
 
 def hash_element(element: dict) -> str:
