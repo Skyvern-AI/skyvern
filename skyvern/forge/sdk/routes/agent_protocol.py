@@ -1229,9 +1229,14 @@ async def create_task_v2(
     data: TaskV2Request,
     organization: Organization = Depends(org_auth_service.get_current_org),
     x_max_iterations_override: Annotated[int | str | None, Header()] = None,
+    x_max_steps_override: Annotated[int | str | None, Header()] = None,
 ) -> dict[str, Any]:
-    if x_max_iterations_override:
-        LOG.info("Overriding max iterations for task v2", max_iterations_override=x_max_iterations_override)
+    if x_max_iterations_override or x_max_steps_override:
+        LOG.info(
+            "Overriding max steps for task v2",
+            max_iterations_override=x_max_iterations_override,
+            max_steps_override=x_max_steps_override,
+        )
 
     try:
         task_v2 = await task_v2_service.initialize_task_v2(
@@ -1256,7 +1261,7 @@ async def create_task_v2(
         background_tasks=background_tasks,
         organization_id=organization.organization_id,
         task_v2_id=task_v2.observer_cruise_id,
-        max_iterations_override=x_max_iterations_override,
+        max_steps_override=x_max_steps_override or x_max_iterations_override,
         browser_session_id=data.browser_session_id,
     )
     return task_v2.model_dump(by_alias=True)

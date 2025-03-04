@@ -337,7 +337,8 @@ class TaskV2BlockYAML(BlockYAML):
     url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    max_iterations: int = 10
+    max_iterations: int = settings.MAX_ITERATIONS_PER_TASK_V2
+    max_steps: int = settings.MAX_STEPS_PER_TASK_V2
 
 
 PARAMETER_YAML_SUBCLASSES = (

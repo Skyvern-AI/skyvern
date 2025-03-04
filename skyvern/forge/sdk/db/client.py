@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Optional, Sequence
 
 import structlog
-from sqlalchemy import and_, delete, func, select, update
+from sqlalchemy import and_, delete, distinct, func, select, tuple_, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -341,6 +341,31 @@ class AgentDB:
                 return [convert_to_step(step, debug_enabled=self.debug_enabled) for step in steps]
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_total_unique_step_order_count_by_task_ids(
+        self,
+        task_ids: list[str],
+        organization_id: str | None = None,
+    ) -> int:
+        """
+        Get the total count of unique (step.task_id, step.order) pairs of StepModel for the given task ids
+        Basically translate this sql query into a SQLAlchemy query: select count(distinct(s.task_id, s.order)) from steps s
+        where s.task_id in task_ids
+        """
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(func.count(distinct(tuple_(StepModel.task_id, StepModel.order))))
+                    .where(StepModel.task_id.in_(task_ids))
+                    .where(StepModel.organization_id == organization_id)
+                )
+                return (await session.execute(query)).scalar()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
             raise
 
     async def get_task_step_models(self, task_id: str, organization_id: str | None = None) -> Sequence[StepModel]:

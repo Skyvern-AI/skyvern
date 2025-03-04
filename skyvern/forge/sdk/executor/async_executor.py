@@ -52,7 +52,7 @@ class AsyncExecutor(abc.ABC):
         background_tasks: BackgroundTasks | None,
         organization_id: str,
         task_v2_id: str,
-        max_iterations_override: int | str | None,
+        max_steps_override: int | str | None,
         browser_session_id: str | None,
         **kwargs: dict,
     ) -> None:
@@ -144,7 +144,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         background_tasks: BackgroundTasks | None,
         organization_id: str,
         task_v2_id: str,
-        max_iterations_override: int | str | None,
+        max_steps_override: int | str | None,
         browser_session_id: str | None,
         **kwargs: dict,
     ) -> None:
@@ -177,6 +177,6 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 task_v2_service.run_task_v2,
                 organization=organization,
                 task_v2_id=task_v2_id,
-                max_iterations_override=max_iterations_override,
+                max_steps_override=max_steps_override,
                 browser_session_id=browser_session_id,
             )

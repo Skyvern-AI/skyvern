@@ -19,7 +19,7 @@ import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow"
 import { NodeActionMenu } from "../NodeActionMenu";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
-import { MAX_ITERATIONS_DEFAULT, type Taskv2Node } from "./types";
+import { MAX_STEPS_DEFAULT, type Taskv2Node } from "./types";
 
 function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
   const { updateNodeData } = useReactFlow();
@@ -37,7 +37,7 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
     url: data.url,
     totpVerificationUrl: data.totpVerificationUrl,
     totpIdentifier: data.totpIdentifier,
-    maxIterations: data.maxIterations,
+    maxSteps: data.maxSteps,
   });
 
   function handleChange(key: string, value: unknown) {
@@ -131,20 +131,16 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
               <div className="space-y-4">
                 <div className="space-y-2">
                   <div className="flex gap-2">
-                    <Label className="text-xs text-slate-300">
-                      Max Iterations
-                    </Label>
-                    <HelpTooltip
-                      content={helpTooltips[type]["maxIterations"]}
-                    />
+                    <Label className="text-xs text-slate-300">Max Steps</Label>
+                    <HelpTooltip content={helpTooltips[type]["maxSteps"]} />
                   </div>
                   <Input
                     type="number"
                     placeholder="10"
                     className="nopan text-xs"
-                    value={data.maxIterations ?? MAX_ITERATIONS_DEFAULT}
+                    value={data.maxSteps ?? MAX_STEPS_DEFAULT}
                     onChange={(event) => {
-                      handleChange("maxIterations", Number(event.target.value));
+                      handleChange("maxSteps", Number(event.target.value));
                     }}
                   />
                 </div>

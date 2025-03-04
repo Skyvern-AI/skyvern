@@ -42,6 +42,7 @@ import {
   generateUniqueEmail,
 } from "../data/sampleTaskData";
 import { ExampleCasePill } from "./ExampleCasePill";
+import { MAX_STEPS_DEFAULT } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
 
 function createTemplateTaskFromTaskGenerationParameters(
   values: TaskGenerationApiResponse,
@@ -167,7 +168,7 @@ function PromptBox() {
         },
         {
           headers: {
-            "x-max-iterations-override": maxStepsOverride,
+            "x-max-steps-override": maxStepsOverride,
           },
         },
       );
@@ -402,6 +403,7 @@ function PromptBox() {
                     </div>
                     <Input
                       value={maxStepsOverride ?? ""}
+                      placeholder={`Default: ${MAX_STEPS_DEFAULT}`}
                       onChange={(event) => {
                         setMaxStepsOverride(event.target.value);
                       }}
