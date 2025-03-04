@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Optional, Sequence
 
 import structlog
-from sqlalchemy import and_, delete, distinct, func, select, update
+from sqlalchemy import and_, delete, distinct, func, select, tuple_, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -356,11 +356,11 @@ class AgentDB:
         try:
             async with self.Session() as session:
                 query = (
-                    select(func.count(distinct(StepModel.task_id, StepModel.order)))
+                    select(func.count(distinct(tuple_(StepModel.task_id, StepModel.order))))
                     .where(StepModel.task_id.in_(task_ids))
-                    .filter_by(organization_id=organization_id)
+                    .where(StepModel.organization_id == organization_id)
                 )
-                return (await session.scalars(query)).scalar()
+                return (await session.execute(query)).scalar()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
