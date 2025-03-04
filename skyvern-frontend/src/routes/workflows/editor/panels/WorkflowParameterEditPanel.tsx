@@ -1,11 +1,9 @@
-import { Cross2Icon } from "@radix-ui/react-icons";
-import { Label } from "@/components/ui/label";
+import { SwitchBar } from "@/components/SwitchBar";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
-import { useState, useContext } from "react";
-import {
-  WorkflowEditorParameterType,
-  WorkflowParameterValueType,
-} from "../../types/workflowTypes";
+import { Label } from "@/components/ui/label";
+import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import {
   Select,
   SelectContent,
@@ -14,21 +12,24 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
-import { getDefaultValueForParameterType } from "../workflowEditorUtils";
-import { WorkflowParameterInput } from "../../WorkflowParameterInput";
 import { toast } from "@/components/ui/use-toast";
-import { SourceParameterKeySelector } from "../../components/SourceParameterKeySelector";
-import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import CloudContext from "@/store/CloudContext";
+import { Cross2Icon } from "@radix-ui/react-icons";
+import { useContext, useState } from "react";
 import { CredentialSelector } from "../../components/CredentialSelector";
-import { SwitchBar } from "@/components/SwitchBar";
+import { SourceParameterKeySelector } from "../../components/SourceParameterKeySelector";
+import {
+  WorkflowEditorParameterType,
+  WorkflowParameterValueType,
+} from "../../types/workflowTypes";
+import { WorkflowParameterInput } from "../../WorkflowParameterInput";
 import {
   parameterIsBitwardenCredential,
   parameterIsSkyvernCredential,
   ParametersState,
 } from "../types";
+import { getDefaultValueForParameterType } from "../workflowEditorUtils";
+import { validateBitwardenLoginCredential } from "./util";
 
 type Props = {
   type: WorkflowEditorParameterType;
@@ -80,7 +81,7 @@ function WorkflowParameterEditPanel({
     isBitwardenCredential ? "bitwarden" : "skyvern",
   );
   const [urlParameterKey, setUrlParameterKey] = useState(
-    isBitwardenCredential ? initialValues.urlParameterKey : "",
+    isBitwardenCredential ? initialValues.urlParameterKey ?? "" : "",
   );
   const [description, setDescription] = useState(
     initialValues.description ?? "",
@@ -89,7 +90,7 @@ function WorkflowParameterEditPanel({
     isBitwardenCredential ||
       initialValues.parameterType === "secret" ||
       initialValues.parameterType === "creditCardData"
-      ? initialValues.collectionId
+      ? initialValues.collectionId ?? ""
       : "",
   );
   const [parameterType, setParameterType] =
@@ -141,6 +142,9 @@ function WorkflowParameterEditPanel({
   const [credentialId, setCredentialId] = useState(
     isSkyvernCredential ? initialValues.credentialId : "",
   );
+
+  const [bitwardenLoginCredentialItemId, setBitwardenLoginCredentialItemId] =
+    useState(isBitwardenCredential ? initialValues.itemId ?? "" : "");
 
   return (
     <ScrollArea>
@@ -277,6 +281,15 @@ function WorkflowParameterEditPanel({
                   onChange={(e) => setCollectionId(e.target.value)}
                 />
               </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Item ID</Label>
+                <Input
+                  value={bitwardenLoginCredentialItemId}
+                  onChange={(e) =>
+                    setBitwardenLoginCredentialItemId(e.target.value)
+                  }
+                />
+              </div>
             </>
           )}
           {type === "context" && (
@@ -389,11 +402,34 @@ function WorkflowParameterEditPanel({
                       : null,
                   });
                 }
-                if (
-                  (type === "credential" && credentialType === "bitwarden") ||
-                  type === "secret" ||
-                  type === "creditCardData"
-                ) {
+                if (type === "credential" && credentialType === "bitwarden") {
+                  const errorMessage = validateBitwardenLoginCredential(
+                    collectionId,
+                    bitwardenLoginCredentialItemId,
+                    urlParameterKey,
+                  );
+                  if (errorMessage) {
+                    toast({
+                      variant: "destructive",
+                      title: "Failed to save parameter",
+                      description: errorMessage,
+                    });
+                    return;
+                  }
+                  onSave({
+                    key,
+                    parameterType: "credential",
+                    itemId:
+                      bitwardenLoginCredentialItemId === ""
+                        ? null
+                        : bitwardenLoginCredentialItemId,
+                    urlParameterKey:
+                      urlParameterKey === "" ? null : urlParameterKey,
+                    collectionId: collectionId === "" ? null : collectionId,
+                    description,
+                  });
+                }
+                if (type === "secret" || type === "creditCardData") {
                   if (!collectionId) {
                     toast({
                       variant: "destructive",
@@ -402,15 +438,6 @@ function WorkflowParameterEditPanel({
                     });
                     return;
                   }
-                }
-                if (type === "credential" && credentialType === "bitwarden") {
-                  onSave({
-                    key,
-                    parameterType: "credential",
-                    urlParameterKey,
-                    collectionId,
-                    description,
-                  });
                 }
                 if (type === "secret") {
                   onSave({

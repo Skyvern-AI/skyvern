@@ -1505,6 +1505,7 @@ function convertParametersToParameterYAML(
           ...base,
           parameter_type: WorkflowParameterTypes.Bitwarden_Login_Credential,
           bitwarden_collection_id: parameter.bitwarden_collection_id,
+          bitwarden_item_id: parameter.bitwarden_item_id,
           url_parameter_key: parameter.url_parameter_key,
           bitwarden_client_id_aws_secret_key:
             parameter.bitwarden_client_id_aws_secret_key,
