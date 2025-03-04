@@ -131,6 +131,7 @@ function WorkflowEditor() {
                   key: parameter.key,
                   parameterType: WorkflowEditorParameterTypes.Credential,
                   collectionId: parameter.bitwarden_collection_id,
+                  itemId: parameter.bitwarden_item_id,
                   urlParameterKey: parameter.url_parameter_key,
                   description: parameter.description,
                 };

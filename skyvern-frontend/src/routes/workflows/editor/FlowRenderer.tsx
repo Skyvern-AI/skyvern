@@ -152,6 +152,7 @@ function convertToParametersYAML(
           key: parameter.key,
           description: parameter.description || null,
           bitwarden_collection_id: parameter.collectionId,
+          bitwarden_item_id: parameter.itemId,
           url_parameter_key: parameter.urlParameterKey,
           bitwarden_client_id_aws_secret_key:
             BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,

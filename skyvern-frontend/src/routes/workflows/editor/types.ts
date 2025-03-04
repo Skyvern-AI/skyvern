@@ -4,8 +4,9 @@ export type BitwardenLoginCredential = {
   key: string;
   description?: string | null;
   parameterType: "credential";
-  collectionId: string;
-  urlParameterKey: string;
+  collectionId: string | null;
+  itemId: string | null;
+  urlParameterKey: string | null;
 };
 
 export type SkyvernCredential = {
