@@ -122,12 +122,10 @@ def fix_unescaped_quotes_in_json(json_string: str) -> str:
     str: The JSON-like string with unescaped quotation marks within strings.
     """
     escape_char = "\\"
-    # Indices to add the escape character to. Since we're processing the string from left to right, we need to sort
-    # the indices in descending order to avoid index shifting.
-    indices_to_add_escape_char = []
     in_string = False
     escape = False
     json_structure_chars = {",", ":", "}", "]", "{", "["}
+    result = []
 
     i = 0
     while i < len(json_string):
@@ -146,23 +144,22 @@ def fix_unescaped_quotes_in_json(json_string: str) -> str:
                     in_string = False
                 else:
                     # If the next character is not a JSON structure character, the quote is part of the string
-                    # Update the indices to add the escape character with the current index
-                    indices_to_add_escape_char.append(i)
+                    # Add the escape character before the quote
+                    result.append(escape_char)
             else:
                 # Start of the JSON string
                 in_string = True
         else:
             escape = False
+
+        # Append the current character to the result
+        result.append(char)
         i += 1
 
-    # Sort the indices in descending order to avoid index shifting then add the escape character to the string
-    if indices_to_add_escape_char:
+    if result != list(json_string):
         LOG.warning("Unescaped quotes found in JSON string. Adding escape character to fix the issue.")
-    indices_to_add_escape_char.sort(reverse=True)
-    for index in indices_to_add_escape_char:
-        json_string = json_string[:index] + escape_char + json_string[index:]
 
-    return json_string
+    return "".join(result)
 
 
 def fix_and_parse_json_string(json_string: str) -> dict[str, Any]:
