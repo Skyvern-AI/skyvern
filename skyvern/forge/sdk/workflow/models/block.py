@@ -1651,9 +1651,7 @@ class SendEmailBlock(Block):
         self, workflow_run_context: WorkflowRunContext, workflow_run_id: str
     ) -> EmailMessage:
         msg = EmailMessage()
-        msg["Subject"] = (
-            self.subject.strip().replace("\n", "").replace("\r", "") + f" - Workflow Run ID: {workflow_run_id}"
-        )
+        msg["Subject"] = self.subject + f" - Workflow Run ID: {workflow_run_id}"
         msg["To"] = ", ".join(self.get_real_email_recipients(workflow_run_context))
         msg["BCC"] = self.sender  # BCC the sender so there is a record of the email being sent
         msg["From"] = self.sender
