@@ -8,6 +8,7 @@ import httpx
 import structlog
 from sqlalchemy.exc import OperationalError
 
+from skyvern.config import settings
 from skyvern.exceptions import FailedToSendWebhook, TaskTerminationError, TaskV2NotFound, UrlGenerationFailure
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -17,6 +18,7 @@ from skyvern.forge.sdk.core.hashing import generate_url_hash
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_runs import TaskRunType
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Metadata, TaskV2Status, ThoughtScenario, ThoughtType
@@ -215,7 +217,7 @@ async def run_task_v2(
     organization: Organization,
     task_v2_id: str,
     request_id: str | None = None,
-    max_iterations_override: str | int | None = None,
+    max_steps_override: str | int | None = None,
     browser_session_id: str | None = None,
 ) -> TaskV2:
     organization_id = organization.organization_id
@@ -243,7 +245,7 @@ async def run_task_v2(
             organization=organization,
             task_v2=task_v2,
             request_id=request_id,
-            max_iterations_override=max_iterations_override,
+            max_steps_override=max_steps_override,
             browser_session_id=browser_session_id,
         )
     except TaskTerminationError as e:
@@ -292,7 +294,7 @@ async def run_task_v2_helper(
     organization: Organization,
     task_v2: TaskV2,
     request_id: str | None = None,
-    max_iterations_override: str | int | None = None,
+    max_steps_override: str | int | None = None,
     browser_session_id: str | None = None,
 ) -> tuple[Workflow, WorkflowRun, TaskV2] | tuple[None, None, TaskV2]:
     organization_id = organization.organization_id
@@ -320,15 +322,15 @@ async def run_task_v2_helper(
         )
         return None, None, task_v2
 
-    int_max_iterations_override = None
-    if max_iterations_override:
+    int_max_steps_override = None
+    if max_steps_override:
         try:
-            int_max_iterations_override = int(max_iterations_override)
-            LOG.info("max_iterationss_override is set", max_iterations_override=int_max_iterations_override)
+            int_max_steps_override = int(max_steps_override)
+            LOG.info("max_steps_override is set", max_steps=int_max_steps_override)
         except ValueError:
             LOG.info(
-                "max_iterations_override isn't an integer, won't override",
-                max_iterations_override=max_iterations_override,
+                "max_steps_override isn't an integer, won't override",
+                max_steps_override=max_steps_override,
             )
 
     workflow_run_id = task_v2.workflow_run_id
@@ -375,8 +377,8 @@ async def run_task_v2_helper(
     yaml_blocks: list[BLOCK_YAML_TYPES] = []
     yaml_parameters: list[PARAMETER_YAML_TYPES] = []
 
-    max_iterations = int_max_iterations_override or DEFAULT_MAX_ITERATIONS
-    for i in range(max_iterations):
+    max_steps = int_max_steps_override or settings.MAX_STEPS_PER_TASK_V2
+    for i in range(DEFAULT_MAX_ITERATIONS):
         # validate the task execution
         await app.AGENT_FUNCTION.validate_task_execution(
             organization_id=organization_id,
@@ -704,10 +706,28 @@ async def run_task_v2_helper(
                     screenshots=completion_screenshots,
                 )
                 break
+
+        # total step number validation
+        workflow_run_tasks = await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
+        total_step_count = await app.DATABASE.get_total_step_count_by_task_ids(
+            task_ids=[task.task_id for task in workflow_run_tasks],
+            organization_id=organization_id,
+            statuses=[StepStatus.completed],
+        )
+        if total_step_count >= max_steps:
+            LOG.info("Task v2 failed - run out of steps", max_steps=max_steps, workflow_run_id=workflow_run_id)
+            await mark_task_v2_as_failed(
+                task_v2_id=task_v2_id,
+                workflow_run_id=workflow_run_id,
+                failure_reason=f'Reached the max number of {max_steps} steps. If you need more steps, update the "Max Steps Override" configuration when running the task. Or add/update the "x-max-steps-override" header with your desired number of steps in the API request.',
+                organization_id=organization_id,
+            )
+            return workflow, workflow_run, task_v2
     else:
         LOG.info(
             "Task v2 failed - run out of iterations",
-            max_iterations=max_iterations,
+            max_iterations=DEFAULT_MAX_ITERATIONS,
+            max_steps=max_steps,
             workflow_run_id=workflow_run_id,
         )
         task_v2 = await mark_task_v2_as_failed(

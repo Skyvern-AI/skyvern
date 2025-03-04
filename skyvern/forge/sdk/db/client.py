@@ -343,6 +343,26 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
+    async def get_total_step_count_by_task_ids(
+        self, task_ids: list[str], organization_id: str | None = None, statuses: list[StepStatus] | None = None
+    ) -> int:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(func.count())
+                    .where(StepModel.task_id.in_(task_ids))
+                    .filter_by(organization_id=organization_id)
+                )
+                if statuses:
+                    query = query.filter(StepModel.status.in_(statuses))
+                return (await session.scalars(query)).scalar()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def get_task_step_models(self, task_id: str, organization_id: str | None = None) -> Sequence[StepModel]:
         try:
             async with self.Session() as session:
