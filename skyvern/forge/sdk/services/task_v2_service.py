@@ -18,7 +18,6 @@ from skyvern.forge.sdk.core.hashing import generate_url_hash
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_runs import TaskRunType
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Metadata, TaskV2Status, ThoughtScenario, ThoughtType
@@ -709,10 +708,9 @@ async def run_task_v2_helper(
 
         # total step number validation
         workflow_run_tasks = await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
-        total_step_count = await app.DATABASE.get_total_step_count_by_task_ids(
+        total_step_count = await app.DATABASE.get_total_unique_step_order_count_by_task_ids(
             task_ids=[task.task_id for task in workflow_run_tasks],
             organization_id=organization_id,
-            statuses=[StepStatus.completed],
         )
         if total_step_count >= max_steps:
             LOG.info("Task v2 failed - run out of steps", max_steps=max_steps, workflow_run_id=workflow_run_id)
