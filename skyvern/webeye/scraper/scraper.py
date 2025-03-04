@@ -577,18 +577,24 @@ async def get_interactable_element_tree(
 
 class IncrementalScrapePage:
     def __init__(self, skyvern_frame: SkyvernFrame) -> None:
-        self.id_to_element_dict: dict[str, dict] = dict()
-        self.id_to_css_dict: dict[str, str] = dict()
-        self.elements: list[dict] = list()
-        self.element_tree: list[dict] = list()
-        self.element_tree_trimmed: list[dict] = list()
+        self.id_to_element_dict: dict[str, dict] = {}  # Using if element count is large
+        self.id_to_css_dict: dict[str, str] = {}  # Using if CSS mapping is needed frequently
+        self.elements: list[dict] = []  # Assuming smaller counts to fit in memory
+        self.element_tree: list[dict] = []
+        self.element_tree_trimmed: list[dict] = []
         self.skyvern_frame = skyvern_frame
 
     def check_id_in_page(self, element_id: str) -> bool:
-        css_selector = self.id_to_css_dict.get(element_id, "")
-        if css_selector:
-            return True
-        return False
+        """
+        Checks if a given element_id has an associated CSS selector in the id_to_css_dict.
+
+        Args:
+        element_id (str): The ID of the element to check.
+
+        Returns:
+        bool: True if a CSS selector exists for the element_id, False otherwise.
+        """
+        return element_id in self.id_to_css_dict  # Direct membership testing
 
     async def get_incremental_element_tree(
         self,
