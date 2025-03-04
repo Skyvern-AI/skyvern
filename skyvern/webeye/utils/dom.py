@@ -126,6 +126,7 @@ class SkyvernElement:
         self.__frame = frame
         self.locator = locator
         self.hash_value = hash_value
+        self._id_cache = static_element.get("id", "")
 
     def __repr__(self) -> str:
         return f"SkyvernElement({str(self.__static_element)})"
@@ -294,7 +295,7 @@ class SkyvernElement:
         return self.__static_element.get("tagName", "")
 
     def get_id(self) -> str:
-        return self.__static_element.get("id", "")
+        return self._id_cache
 
     def get_frame_id(self) -> str:
         return self.__static_element.get("frame", "")
