@@ -131,9 +131,7 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
               <div className="space-y-4">
                 <div className="space-y-2">
                   <div className="flex gap-2">
-                    <Label className="text-xs text-slate-300">
-                      Max Steps
-                    </Label>
+                    <Label className="text-xs text-slate-300">Max Steps</Label>
                     <HelpTooltip content={helpTooltips[type]["maxSteps"]} />
                   </div>
                   <Input
