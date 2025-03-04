@@ -41,8 +41,8 @@ export const helpTooltips = {
   task: baseHelpTooltipContent,
   taskv2: {
     ...baseHelpTooltipContent,
-    maxIterations:
-      "The maximum number of iterations this task will take to achieve its goal.",
+    maxSteps:
+      "The maximum number of steps this task will take to achieve its goal.",
   },
   navigation: baseHelpTooltipContent,
   extraction: {

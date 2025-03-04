@@ -1,14 +1,14 @@
 import { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
 
-export const MAX_ITERATIONS_DEFAULT = 10;
+export const MAX_STEPS_DEFAULT = 25;
 
 export type Taskv2NodeData = NodeBaseData & {
   prompt: string;
   url: string;
   totpVerificationUrl: string | null;
   totpIdentifier: string | null;
-  maxIterations: number | null;
+  maxSteps: number | null;
 };
 
 export type Taskv2Node = Node<Taskv2NodeData, "taskv2">;
@@ -21,7 +21,7 @@ export const taskv2NodeDefaultData: Taskv2NodeData = {
   url: "",
   totpIdentifier: null,
   totpVerificationUrl: null,
-  maxIterations: 10,
+  maxSteps: MAX_STEPS_DEFAULT,
 };
 
 export function isTaskV2Node(node: Node): node is Taskv2Node {
