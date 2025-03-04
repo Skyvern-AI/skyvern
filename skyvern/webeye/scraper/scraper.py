@@ -1,7 +1,7 @@
 import asyncio
 import copy
 import json
-from collections import defaultdict
+from collections import deque, defaultdict
 from enum import StrEnum
 from typing import Any, Awaitable, Callable, Self
 
@@ -688,8 +688,8 @@ class IncrementalScrapePage:
 
 def _should_keep_unique_id(element: dict) -> bool:
     # case where we shouldn't keep unique_id
-    # 1. not disable attr and no interactable
-    # 2. disable=false and intrecatable=false
+    # 1. not disabled attr and no interactable
+    # 2. disabled=false and interactable=false
 
     attributes = element.get("attributes", {})
     if "disabled" not in attributes and "aria-disabled" not in attributes:
@@ -703,9 +703,9 @@ def _should_keep_unique_id(element: dict) -> bool:
 
 
 def trim_element(element: dict) -> dict:
-    queue = [element]
+    queue = deque([element])
     while queue:
-        queue_ele = queue.pop(0)
+        queue_ele = queue.popleft()
         if "frame" in queue_ele:
             del queue_ele["frame"]
 
@@ -764,26 +764,16 @@ def trim_element_tree(elements: list[dict]) -> list[dict]:
 
 
 def _trimmed_base64_data(attributes: dict) -> dict:
-    new_attributes: dict = {}
-
-    for key in attributes:
-        if key in BASE64_INCLUDE_ATTRIBUTES and "data:" in attributes.get(key, ""):
-            continue
-        new_attributes[key] = attributes[key]
-
-    return new_attributes
+    return {
+        key: value for key, value in attributes.items() if key not in BASE64_INCLUDE_ATTRIBUTES or "data:" not in value
+    }
 
 
 def _trimmed_attributes(attributes: dict) -> dict:
-    new_attributes: dict = {}
+    def is_reserved_or_role(key, value):
+        return key in RESERVED_ATTRIBUTES or (key == "role" and value in ["listbox", "option"])
 
-    for key in attributes:
-        if key == "role" and attributes[key] in ["listbox", "option"]:
-            new_attributes[key] = attributes[key]
-        if key in RESERVED_ATTRIBUTES:
-            new_attributes[key] = attributes[key]
-
-    return new_attributes
+    return {key: value for key, value in attributes.items() if is_reserved_or_role(key, value)}
 
 
 def _remove_unique_id(element: dict) -> None:
