@@ -48,14 +48,14 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     case "login": {
       return <LockOpen1Icon className={className} />;
     }
-    case "navigation": {
+    case "navigation":
+    case "task_v2": {
       return <RobotIcon className={className} />;
     }
     case "send_email": {
       return <EnvelopeClosedIcon className={className} />;
     }
-    case "task":
-    case "task_v2": {
+    case "task": {
       return <ListBulletIcon className={className} />;
     }
     case "text_prompt": {

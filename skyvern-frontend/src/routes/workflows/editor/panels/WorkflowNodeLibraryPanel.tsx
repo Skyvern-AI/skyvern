@@ -13,6 +13,17 @@ const nodeLibraryItems: Array<{
   description: string;
 }> = [
   {
+    nodeType: "login",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Login}
+        className="size-6"
+      />
+    ),
+    title: "Login Block",
+    description: "Login to a website",
+  },
+  {
     nodeType: "navigation",
     icon: (
       <WorkflowBlockIcon
@@ -22,6 +33,17 @@ const nodeLibraryItems: Array<{
     ),
     title: "Navigation Block",
     description: "Navigate on the page",
+  },
+  {
+    nodeType: "taskv2",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Taskv2}
+        className="size-6"
+      />
+    ),
+    title: "Task v2 Block",
+    description: "Runs a Skyvern v2 Task",
   },
   {
     nodeType: "action",
@@ -67,17 +89,7 @@ const nodeLibraryItems: Array<{
     title: "Task Block",
     description: "Takes actions or extracts information",
   },
-  {
-    nodeType: "taskv2",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.Taskv2}
-        className="size-6"
-      />
-    ),
-    title: "Task v2 Block",
-    description: "Runs a Skyvern v2 Task",
-  },
+
   {
     nodeType: "url",
     icon: (
@@ -187,17 +199,6 @@ const nodeLibraryItems: Array<{
     ),
     title: "File Download Block",
     description: "Download a file",
-  },
-  {
-    nodeType: "login",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.Login}
-        className="size-6"
-      />
-    ),
-    title: "Login Block",
-    description: "Login to a website",
   },
   {
     nodeType: "wait",
