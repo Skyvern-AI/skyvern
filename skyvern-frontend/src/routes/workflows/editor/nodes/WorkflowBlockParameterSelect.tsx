@@ -23,7 +23,17 @@ function WorkflowBlockParameterSelect({ nodeId, onAdd }: Props) {
     edges,
     nodeId,
   );
-  const workflowParameterKeys = workflowParameters.map(
+  const credentialParameters = workflowParameters.filter(
+    (parameter) => parameter.parameterType === "credential",
+  );
+  const credentialParameterKeys = credentialParameters.map(
+    (parameter) => parameter.key,
+  );
+
+  const nonCredentialParameters = workflowParameters.filter(
+    (parameter) => parameter.parameterType !== "credential",
+  );
+  const nonCredentialParameterKeys = nonCredentialParameters.map(
     (parameter) => parameter.key,
   );
 
@@ -41,6 +51,10 @@ function WorkflowBlockParameterSelect({ nodeId, onAdd }: Props) {
             value: "parameters",
           },
           {
+            label: "Credentials",
+            value: "credentials",
+          },
+          {
             label: "Block Outputs",
             value: "outputs",
           },
@@ -48,9 +62,9 @@ function WorkflowBlockParameterSelect({ nodeId, onAdd }: Props) {
       />
       <ScrollArea>
         <ScrollAreaViewport className="max-h-96">
-          {content === "parameters" && (
+          {content === "credentials" && (
             <div className="space-y-2">
-              {workflowParameterKeys.map((parameterKey) => {
+              {credentialParameterKeys.map((parameterKey) => {
                 return (
                   <div
                     key={parameterKey}
@@ -64,7 +78,28 @@ function WorkflowBlockParameterSelect({ nodeId, onAdd }: Props) {
                   </div>
                 );
               })}
-              {workflowParameterKeys.length === 0 && (
+              {credentialParameterKeys.length === 0 && (
+                <div className="text-xs">No credentials</div>
+              )}
+            </div>
+          )}
+          {content === "parameters" && (
+            <div className="space-y-2">
+              {nonCredentialParameterKeys.map((parameterKey) => {
+                return (
+                  <div
+                    key={parameterKey}
+                    className="flex cursor-pointer justify-between rounded-md bg-slate-elevation1 px-3 py-2 text-xs hover:bg-slate-elevation2"
+                    onClick={() => {
+                      onAdd(parameterKey);
+                    }}
+                  >
+                    {parameterKey}
+                    <PlusIcon />
+                  </div>
+                );
+              })}
+              {nonCredentialParameterKeys.length === 0 && (
                 <div className="text-xs">No workflow parameters</div>
               )}
             </div>
