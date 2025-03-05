@@ -3,7 +3,15 @@ import { CredentialApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 
-function useCredentialsQuery() {
+type QueryReturnType = Array<CredentialApiResponse>;
+type UseQueryOptions = Omit<
+  Parameters<typeof useQuery<QueryReturnType>>[0],
+  "queryKey" | "queryFn"
+>;
+
+type Props = UseQueryOptions;
+
+function useCredentialsQuery(props: Props = {}) {
   const credentialGetter = useCredentialGetter();
 
   return useQuery<Array<CredentialApiResponse>>({
@@ -14,6 +22,7 @@ function useCredentialsQuery() {
       params.set("page_size", "25");
       return client.get("/credentials", { params }).then((res) => res.data);
     },
+    ...props,
   });
 }
 
