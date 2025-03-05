@@ -20,7 +20,7 @@ function SwitchBar({ options, value, onChange }: Props) {
           <div
             key={option.value}
             className={cn(
-              "cursor-pointer rounded-sm px-3 py-2 text-xs hover:bg-slate-700",
+              "cursor-pointer whitespace-nowrap rounded-sm px-3 py-2 text-xs hover:bg-slate-700",
               {
                 "bg-slate-700": selected,
               },

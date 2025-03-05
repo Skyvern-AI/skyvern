@@ -28,7 +28,7 @@ function WorkflowBlockInput(props: Props) {
               <PlusIcon className="size-4" />
             </div>
           </PopoverTrigger>
-          <PopoverContent>
+          <PopoverContent className="w-[22rem]">
             <WorkflowBlockParameterSelect
               nodeId={nodeId}
               onAdd={(parameterKey) => {
