@@ -257,7 +257,11 @@ function isElementStyleVisibilityVisible(element, style) {
 
   // TODO: support style.clipPath and style.clipRule?
   // if element is clipped with rect(0px, 0px, 0px, 0px), it means it's invisible on the page
-  if (style.clip === "rect(0px, 0px, 0px, 0px)") {
+  // FIXME: need a better algorithm to calculate the visible rect area, using (right-left)*(button-top) from rect(top, right, bottom, left)
+  if (
+    style.clip === "rect(0px, 0px, 0px, 0px)" ||
+    style.clip === "rect(1px, 1px, 1px, 1px)"
+  ) {
     return false;
   }
 
