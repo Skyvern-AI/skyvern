@@ -14,6 +14,7 @@ Production:`https://api.skyvern.com/api/v2/tasks/`
 | --- | --- | --- | --- | --- |
 | x-api-key | String | yes | [your-api-key-here] | Bearer token that gives your backend access to the Skyvern API. This will be manually provided by us |
 | x-max-iterations-override | Integer | no | 10 | The max number of iterations skyvern attempts to divide and conquer a complicated task. In each iteration, Skyvern does a "mini task" planning, mini task execution and validation. The default is 10. |
+| x-max-steps-override | Integer | no | 25 | The max number of steps skyvern can take. The default is 25. |
 
 ### Body
 
