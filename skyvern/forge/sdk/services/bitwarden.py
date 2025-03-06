@@ -33,6 +33,9 @@ from skyvern.forge.sdk.schemas.credentials import (
     PasswordCredential,
 )
 
+LOG = structlog.get_logger()
+BITWARDEN_SERVER_BASE_URL = f"{settings.BITWARDEN_SERVER}:{settings.BITWARDEN_SERVER_PORT or 8002}"
+
 
 class BitwardenItemType(IntEnum):
     LOGIN = 1
@@ -82,11 +85,6 @@ def get_list_response_item_from_bitwarden_item(item: dict) -> CredentialItem:
         )
     else:
         raise BitwardenGetItemError(f"Unsupported item type: {item['type']}")
-
-
-LOG = structlog.get_logger()
-
-BITWARDEN_SERVER_BASE_URL = f"http://localhost:{settings.BITWARDEN_SERVER_PORT or 8002}"
 
 
 def is_valid_email(email: str | None) -> bool:

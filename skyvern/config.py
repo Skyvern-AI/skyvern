@@ -157,6 +157,7 @@ class Settings(BaseSettings):
     SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD: str | None = None
     SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID: str | None = None
 
+    BITWARDEN_SERVER: str = "http://localhost"
     BITWARDEN_SERVER_PORT: int = 8002
 
     SVG_MAX_LENGTH: int = 100000
