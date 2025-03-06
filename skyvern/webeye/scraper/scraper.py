@@ -577,11 +577,11 @@ async def get_interactable_element_tree(
 
 class IncrementalScrapePage:
     def __init__(self, skyvern_frame: SkyvernFrame) -> None:
-        self.id_to_element_dict: dict[str, dict] = {}  # Using if element count is large
-        self.id_to_css_dict: dict[str, str] = {}  # Using if CSS mapping is needed frequently
-        self.elements: list[dict] = []  # Assuming smaller counts to fit in memory
-        self.element_tree: list[dict] = []
-        self.element_tree_trimmed: list[dict] = []
+        self.id_to_element_dict: dict[str, dict] = dict()
+        self.id_to_css_dict: dict[str, str] = dict()
+        self.elements: list[dict] = list()
+        self.element_tree: list[dict] = list()
+        self.element_tree_trimmed: list[dict] = list()
         self.skyvern_frame = skyvern_frame
 
     def check_id_in_page(self, element_id: str) -> bool:
