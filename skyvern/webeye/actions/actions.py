@@ -264,4 +264,4 @@ class ScrapeResult(BaseModel):
     1. JSON representation of what the user is seeing
     """
 
-    scraped_data: dict[str, Any] | list[dict[str, Any]]
+    scraped_data: dict[str, Any] | list | str | None
