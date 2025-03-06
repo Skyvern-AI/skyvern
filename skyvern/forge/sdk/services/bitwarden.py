@@ -724,10 +724,6 @@ class BitwardenService:
             )
 
     @staticmethod
-    async def _sync_using_server() -> None:
-        await aiohttp_post(f"{BITWARDEN_SERVER_BASE_URL}/sync")
-
-    @staticmethod
     async def _unlock_using_server(master_password: str) -> None:
         status_response = await aiohttp_get_json(f"{BITWARDEN_SERVER_BASE_URL}/status")
         status = status_response["data"]["template"]["status"]
@@ -821,7 +817,6 @@ class BitwardenService:
         try:
             master_password, bw_organization_id, _, _ = await BitwardenService._get_skyvern_auth_secrets()
 
-            await BitwardenService._sync_using_server()
             await BitwardenService._unlock_using_server(master_password)
             if isinstance(credential, PasswordCredential):
                 return await BitwardenService._create_login_item_using_server(
@@ -886,7 +881,6 @@ class BitwardenService:
         try:
             master_password, bw_organization_id, _, _ = await BitwardenService._get_skyvern_auth_secrets()
 
-            await BitwardenService._sync_using_server()
             await BitwardenService._unlock_using_server(master_password)
             return await BitwardenService._create_collection_using_server(bw_organization_id, name)
 
@@ -926,7 +920,6 @@ class BitwardenService:
     ) -> list[CredentialItem]:
         try:
             master_password, _, _, _ = await BitwardenService._get_skyvern_auth_secrets()
-            await BitwardenService._sync_using_server()
             await BitwardenService._unlock_using_server(master_password)
             return await BitwardenService._get_items_by_item_ids_using_server(item_ids)
         except Exception as e:
@@ -948,7 +941,6 @@ class BitwardenService:
     ) -> list[CredentialItem]:
         try:
             master_password, _, _, _ = await BitwardenService._get_skyvern_auth_secrets()
-            await BitwardenService._sync_using_server()
             await BitwardenService._unlock_using_server(master_password)
             return await BitwardenService._get_collection_items_using_server(collection_id)
         except Exception as e:
@@ -970,7 +962,6 @@ class BitwardenService:
     ) -> CredentialItem:
         try:
             master_password, _, _, _ = await BitwardenService._get_skyvern_auth_secrets()
-            await BitwardenService._sync_using_server()
             await BitwardenService._unlock_using_server(master_password)
             return await BitwardenService._get_credential_item_by_id_using_server(item_id)
         except Exception as e:
@@ -1020,7 +1011,6 @@ class BitwardenService:
     ) -> None:
         try:
             master_password, _, _, _ = await BitwardenService._get_skyvern_auth_secrets()
-            await BitwardenService._sync_using_server()
             await BitwardenService._unlock_using_server(master_password)
             await BitwardenService._delete_credential_item_using_server(item_id)
         except Exception as e:
