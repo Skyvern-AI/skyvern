@@ -132,6 +132,7 @@ class WorkflowParameterType(StrEnum):
     BOOLEAN = "boolean"
     JSON = "json"
     FILE_URL = "file_url"
+    CREDENTIAL_ID = "credential_id"
 
     def convert_value(self, value: Any) -> str | int | float | bool | dict | list | None:
         if value is None:
@@ -153,6 +154,8 @@ class WorkflowParameterType(StrEnum):
             elif self == WorkflowParameterType.JSON:
                 return json.loads(value)
             elif self == WorkflowParameterType.FILE_URL:
+                return value
+            elif self == WorkflowParameterType.CREDENTIAL_ID:
                 return value
         except Exception:
             raise InvalidWorkflowParameter(expected_parameter_type=self, value=str(value))
