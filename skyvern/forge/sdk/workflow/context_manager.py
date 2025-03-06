@@ -179,11 +179,21 @@ class WorkflowRunContext:
         organization: Organization,
     ) -> None:
         LOG.info(f"Fetching credential parameter value for credential: {parameter.credential_id}")
-        db_credential = await app.DATABASE.get_credential(
-            parameter.credential_id, organization_id=organization.organization_id
-        )
-        if db_credential is None:
+
+        credential_id = None
+        if parameter.credential_id:
+            if self.has_parameter(parameter.credential_id) and self.has_value(parameter.credential_id):
+                credential_id = self.values[parameter.credential_id]
+            else:
+                credential_id = parameter.credential_id
+
+        if credential_id is None:
+            LOG.error(f"Credential ID not found for credential: {parameter.credential_id}")
             raise CredentialParameterNotFoundError(parameter.credential_id)
+
+        db_credential = await app.DATABASE.get_credential(credential_id, organization_id=organization.organization_id)
+        if db_credential is None:
+            raise CredentialParameterNotFoundError(credential_id)
 
         bitwarden_credential = await BitwardenService.get_credential_item(db_credential.item_id)
 
