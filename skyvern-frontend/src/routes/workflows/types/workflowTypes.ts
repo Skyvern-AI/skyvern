@@ -103,6 +103,7 @@ export const WorkflowParameterValueType = {
   Boolean: "boolean",
   JSON: "json",
   FileURL: "file_url",
+  CredentialId: "credential_id",
 } as const;
 
 export type WorkflowParameterValueType =

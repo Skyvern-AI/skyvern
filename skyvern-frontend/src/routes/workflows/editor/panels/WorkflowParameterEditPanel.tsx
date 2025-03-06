@@ -16,7 +16,7 @@ import { toast } from "@/components/ui/use-toast";
 import CloudContext from "@/store/CloudContext";
 import { Cross2Icon } from "@radix-ui/react-icons";
 import { useContext, useState } from "react";
-import { CredentialSelector } from "../../components/CredentialSelector";
+import { CredentialParameterSourceSelector } from "../../components/CredentialParameterSourceSelector";
 import { SourceParameterKeySelector } from "../../components/SourceParameterKeySelector";
 import {
   WorkflowEditorParameterType,
@@ -44,6 +44,7 @@ const workflowParameterTypeOptions = [
   { label: "integer", value: WorkflowParameterValueType.Integer },
   { label: "boolean", value: WorkflowParameterValueType.Boolean },
   { label: "file", value: WorkflowParameterValueType.FileURL },
+  { label: "credential", value: WorkflowParameterValueType.CredentialId },
   { label: "JSON", value: WorkflowParameterValueType.JSON },
 ];
 
@@ -353,7 +354,7 @@ function WorkflowParameterEditPanel({
               isCloud && (
                 <div className="space-y-1">
                   <Label className="text-xs text-slate-300">Credential</Label>
-                  <CredentialSelector
+                  <CredentialParameterSourceSelector
                     value={credentialId}
                     onChange={(value) => setCredentialId(value)}
                   />

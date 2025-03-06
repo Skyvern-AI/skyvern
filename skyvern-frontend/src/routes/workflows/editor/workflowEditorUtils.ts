@@ -1438,6 +1438,9 @@ function getDefaultValueForParameterType(
     case "file_url": {
       return null;
     }
+    case "credential_id": {
+      return null;
+    }
   }
 }
 
