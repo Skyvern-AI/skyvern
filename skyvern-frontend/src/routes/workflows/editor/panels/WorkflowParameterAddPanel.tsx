@@ -1,11 +1,9 @@
-import { Cross2Icon } from "@radix-ui/react-icons";
-import { Label } from "@/components/ui/label";
+import { SwitchBar } from "@/components/SwitchBar";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
-import { useContext, useState } from "react";
-import {
-  WorkflowEditorParameterType,
-  WorkflowParameterValueType,
-} from "../../types/workflowTypes";
+import { Label } from "@/components/ui/label";
+import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import {
   Select,
   SelectContent,
@@ -14,17 +12,19 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Button } from "@/components/ui/button";
-import { ParametersState } from "../types";
-import { WorkflowParameterInput } from "../../WorkflowParameterInput";
-import { Checkbox } from "@/components/ui/checkbox";
-import { getDefaultValueForParameterType } from "../workflowEditorUtils";
 import { toast } from "@/components/ui/use-toast";
-import { SourceParameterKeySelector } from "../../components/SourceParameterKeySelector";
-import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import CloudContext from "@/store/CloudContext";
-import { CredentialSelector } from "../../components/CredentialSelector";
-import { SwitchBar } from "@/components/SwitchBar";
+import { Cross2Icon } from "@radix-ui/react-icons";
+import { useContext, useState } from "react";
+import { CredentialParameterSourceSelector } from "../../components/CredentialParameterSourceSelector";
+import { SourceParameterKeySelector } from "../../components/SourceParameterKeySelector";
+import {
+  WorkflowEditorParameterType,
+  WorkflowParameterValueType,
+} from "../../types/workflowTypes";
+import { WorkflowParameterInput } from "../../WorkflowParameterInput";
+import { ParametersState } from "../types";
+import { getDefaultValueForParameterType } from "../workflowEditorUtils";
 import { validateBitwardenLoginCredential } from "./util";
 
 type Props = {
@@ -39,6 +39,7 @@ const workflowParameterTypeOptions = [
   { label: "integer", value: WorkflowParameterValueType.Integer },
   { label: "boolean", value: WorkflowParameterValueType.Boolean },
   { label: "file", value: WorkflowParameterValueType.FileURL },
+  { label: "credential", value: WorkflowParameterValueType.CredentialId },
   { label: "JSON", value: WorkflowParameterValueType.JSON },
 ];
 
@@ -299,7 +300,7 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
               isCloud && (
                 <div className="space-y-1">
                   <Label className="text-xs text-slate-300">Credential</Label>
-                  <CredentialSelector
+                  <CredentialParameterSourceSelector
                     value={credentialId}
                     onChange={(value) => setCredentialId(value)}
                   />

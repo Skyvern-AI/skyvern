@@ -16,7 +16,7 @@ type Props = {
   onChange?: (value: string) => void;
 };
 
-function CredentialParameterSelector({ value, onChange }: Props) {
+function LoginBlockCredentialSelector({ value, onChange }: Props) {
   const [workflowParameters, setWorkflowParameters] =
     useWorkflowParametersState();
   const credentialParameters = workflowParameters.filter(
@@ -104,4 +104,4 @@ function CredentialParameterSelector({ value, onChange }: Props) {
   );
 }
 
-export { CredentialParameterSelector };
+export { LoginBlockCredentialSelector };

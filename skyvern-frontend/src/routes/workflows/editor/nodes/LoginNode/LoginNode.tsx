@@ -29,13 +29,12 @@ import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { errorMappingExampleValue } from "../types";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
-import { CredentialParameterSelector } from "./CredentialParameterSelector";
 import type { LoginNode } from "./types";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { AppNode } from "..";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
-
+import { LoginBlockCredentialSelector } from "./LoginBlockCredentialSelector";
 function LoginNode({ id, data }: NodeProps<LoginNode>) {
   const { updateNodeData } = useReactFlow();
   const { editable } = data;
@@ -152,7 +151,7 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
           </div>
           <div className="space-y-2">
             <Label className="text-xs text-slate-300">Credential</Label>
-            <CredentialParameterSelector
+            <LoginBlockCredentialSelector
               value={
                 data.parameterKeys.length > 0
                   ? data.parameterKeys[0]
