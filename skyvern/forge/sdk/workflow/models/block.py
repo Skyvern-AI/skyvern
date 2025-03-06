@@ -1186,7 +1186,7 @@ async def user_code():
         )
 
 
-DEFAULT_TEXT_PROMPT_LLM_KEY = settings.SECONDARY_LLM_KEY or settings.LLM_KEY
+DEFAULT_TEXT_PROMPT_LLM_KEY = settings.TEXT_ONLY_AGENT_LLM_KEY or settings.LLM_KEY
 
 
 class TextPromptBlock(Block):
