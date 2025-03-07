@@ -29,6 +29,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     Parameter,
     ParameterType,
     WorkflowParameter,
+    WorkflowParameterType,
 )
 
 if TYPE_CHECKING:
@@ -59,6 +60,11 @@ class WorkflowRunContext:
         # key is label name
         workflow_run_context = cls()
         for parameter, run_parameter in workflow_parameter_tuples:
+            if parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
+                await workflow_run_context.register_secret_workflow_parameter_value(
+                    parameter, run_parameter.value, organization
+                )
+                continue
             if parameter.key in workflow_run_context.parameters:
                 prev_value = workflow_run_context.parameters[parameter.key]
                 new_value = run_parameter.value
@@ -172,6 +178,46 @@ class WorkflowRunContext:
     @staticmethod
     def generate_random_secret_id() -> str:
         return f"secret_{uuid.uuid4()}"
+
+    async def register_secret_workflow_parameter_value(
+        self,
+        parameter: WorkflowParameter,
+        value: Any,
+        organization: Organization,
+    ) -> None:
+        credential_id = value
+
+        if not isinstance(credential_id, str):
+            raise ValueError(
+                f"Trying to register workflow parameter as a secret but it is not a string. Parameter key: {parameter.key}"
+            )
+
+        LOG.info(f"Fetching credential parameter value for credential: {credential_id}")
+
+        db_credential = await app.DATABASE.get_credential(credential_id, organization_id=organization.organization_id)
+        if db_credential is None:
+            raise CredentialParameterNotFoundError(credential_id)
+
+        bitwarden_credential = await BitwardenService.get_credential_item(db_credential.item_id)
+
+        credential_item = bitwarden_credential.credential
+
+        self.parameters[parameter.key] = parameter
+        self.values[parameter.key] = {}
+        credential_dict = credential_item.model_dump()
+        for key, value in credential_dict.items():
+            random_secret_id = self.generate_random_secret_id()
+            secret_id = f"{random_secret_id}_{key}"
+            self.secrets[secret_id] = value
+            self.values[parameter.key][key] = secret_id
+
+        if isinstance(credential_item, PasswordCredential) and credential_item.totp is not None:
+            random_secret_id = self.generate_random_secret_id()
+            totp_secret_id = f"{random_secret_id}_totp"
+            self.secrets[totp_secret_id] = BitwardenConstants.TOTP
+            totp_secret_value = self.totp_secret_value_key(totp_secret_id)
+            self.secrets[totp_secret_value] = credential_item.totp
+            self.values[parameter.key]["totp"] = totp_secret_id
 
     async def register_credential_parameter_value(
         self,
