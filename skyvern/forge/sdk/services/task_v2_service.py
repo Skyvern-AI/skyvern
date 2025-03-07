@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 import structlog
+from playwright.async_api import Page
 from sqlalchemy.exc import OperationalError
 
 from skyvern.config import settings
@@ -411,7 +412,15 @@ async def run_task_v2_helper(
         task_history_record: dict[str, Any] = {}
         context = skyvern_context.ensure_context()
 
-        if i == 0:
+        current_url: str | None = None
+        page: Page | None = None
+        browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id, workflow_run.parent_workflow_run_id)
+        if browser_state:
+            page = await browser_state.get_working_page()
+            if page:
+                current_url = await SkyvernFrame.get_url(page)
+
+        if i == 0 and current_url != url:
             # The first iteration is always a GOTO_URL task
             task_type = "goto_url"
             plan = f"Go to this website: {url}"
@@ -422,11 +431,12 @@ async def run_task_v2_helper(
             )
         else:
             try:
-                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                    workflow_run=workflow_run,
-                    url=url,
-                    browser_session_id=browser_session_id,
-                )
+                if browser_state is None:
+                    browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                        workflow_run=workflow_run,
+                        url=url,
+                        browser_session_id=browser_session_id,
+                    )
                 scraped_page = await scrape_website(
                     browser_state,
                     url,
@@ -434,15 +444,14 @@ async def run_task_v2_helper(
                     scrape_exclude=app.scrape_exclude,
                 )
                 element_tree_in_prompt: str = scraped_page.build_element_tree(ElementTreeFormat.HTML)
-                page = await browser_state.get_working_page()
+                if page is None:
+                    page = await browser_state.get_working_page()
             except Exception:
                 LOG.exception(
                     "Failed to get browser state or scrape website in task v2 iteration", iteration=i, url=url
                 )
                 continue
-            current_url = str(
-                await SkyvernFrame.evaluate(frame=page, expression="() => document.location.href") if page else url
-            )
+            current_url = current_url if current_url else str(await SkyvernFrame.get_url(frame=page) if page else url)
 
             task_v2_prompt = prompt_engine.load_prompt(
                 "task_v2",

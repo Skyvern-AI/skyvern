@@ -68,6 +68,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
 )
 from skyvern.webeye.browser_factory import BrowserState
+from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
@@ -2143,6 +2144,15 @@ class TaskV2Block(Block):
     ) -> BlockResult:
         from skyvern.forge.sdk.services import task_v2_service
         from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+
+        if not self.url:
+            browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+            if browser_state:
+                page = await browser_state.get_working_page()
+                if page:
+                    current_url = await SkyvernFrame.get_url(frame=page)
+                    if current_url != "about:blank":
+                        self.url = current_url
 
         if not organization_id:
             raise ValueError("Running TaskV2Block requires organization_id")

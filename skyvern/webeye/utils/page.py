@@ -47,6 +47,10 @@ class SkyvernFrame:
             raise TimeoutError("timeout to evaluate expression")
 
     @staticmethod
+    async def get_url(frame: Page | Frame) -> str:
+        return await SkyvernFrame.evaluate(frame=frame, expression="() => document.location.href")
+
+    @staticmethod
     async def take_screenshot(
         page: Page,
         full_page: bool = False,
