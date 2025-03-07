@@ -138,7 +138,9 @@ class ForgeAgent:
 
         task_url = task_block.url
         if task_url is None:
-            browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run.workflow_run_id)
+            browser_state = app.BROWSER_MANAGER.get_for_workflow_run(
+                workflow_run_id=workflow_run.workflow_run_id, parent_workflow_run_id=workflow_run.parent_workflow_run_id
+            )
             if browser_state is None:
                 raise MissingBrowserState(workflow_run_id=workflow_run.workflow_run_id)
 

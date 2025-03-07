@@ -136,7 +136,10 @@ class BrowserManager:
             workflow_run_id=workflow_run_id, parent_workflow_run_id=parent_workflow_run_id
         )
         if browser_state:
+            # always keep the browser state for the workflow run and the parent workflow run synced
             self.pages[workflow_run_id] = browser_state
+            if parent_workflow_run_id:
+                self.pages[parent_workflow_run_id] = browser_state
             return browser_state
 
         if browser_session_id:
@@ -194,11 +197,11 @@ class BrowserManager:
     def get_for_workflow_run(
         self, workflow_run_id: str, parent_workflow_run_id: str | None = None
     ) -> BrowserState | None:
-        if workflow_run_id in self.pages:
-            return self.pages[workflow_run_id]
-
         if parent_workflow_run_id and parent_workflow_run_id in self.pages:
             return self.pages[parent_workflow_run_id]
+
+        if workflow_run_id in self.pages:
+            return self.pages[workflow_run_id]
 
         return None
 
