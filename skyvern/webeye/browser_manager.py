@@ -132,13 +132,11 @@ class BrowserManager:
     ) -> BrowserState:
         parent_workflow_run_id = workflow_run.parent_workflow_run_id
         workflow_run_id = workflow_run.workflow_run_id
-        browser_state = self.get_for_workflow_run(workflow_run_id=workflow_run_id)
-        if parent_workflow_run_id:
-            browser_state = self.get_for_workflow_run(workflow_run_id=parent_workflow_run_id)
-            if browser_state:
-                self.pages[workflow_run_id] = browser_state
-
-        if browser_state is not None:
+        browser_state = self.get_for_workflow_run(
+            workflow_run_id=workflow_run_id, parent_workflow_run_id=parent_workflow_run_id
+        )
+        if browser_state:
+            self.pages[workflow_run_id] = browser_state
             return browser_state
 
         if browser_session_id:
@@ -193,9 +191,15 @@ class BrowserManager:
         )
         return browser_state
 
-    def get_for_workflow_run(self, workflow_run_id: str) -> BrowserState | None:
+    def get_for_workflow_run(
+        self, workflow_run_id: str, parent_workflow_run_id: str | None = None
+    ) -> BrowserState | None:
         if workflow_run_id in self.pages:
             return self.pages[workflow_run_id]
+
+        if parent_workflow_run_id and parent_workflow_run_id in self.pages:
+            return self.pages[parent_workflow_run_id]
+
         return None
 
     def set_video_artifact_for_task(self, task: Task, artifacts: list[VideoArtifact]) -> None:
