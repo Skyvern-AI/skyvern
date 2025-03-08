@@ -156,7 +156,7 @@ def fix_unescaped_quotes_in_json(json_string: str) -> str:
         result.append(char)
         i += 1
 
-    if result != list(json_string):
+    if len(result) != len(json_string):
         LOG.warning("Unescaped quotes found in JSON string. Adding escape character to fix the issue.")
 
     return "".join(result)
