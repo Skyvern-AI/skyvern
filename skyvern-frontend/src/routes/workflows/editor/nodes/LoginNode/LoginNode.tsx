@@ -165,16 +165,6 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
               }}
             />
           </div>
-          <div className="rounded-md bg-slate-800 p-2">
-            <div className="space-y-1 text-xs text-slate-400">
-              <div>Credentials need to be added with the help of our team.</div>
-              <div>
-                Reach out to{" "}
-                <span className="text-slate-200">support@skyvern.com</span> for
-                assistance.
-              </div>
-            </div>
-          </div>
         </div>
         <Separator />
         <Accordion type="single" collapsible>
