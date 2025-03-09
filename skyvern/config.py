@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     BLOCKED_HOSTS: list[str] = ["localhost"]
+    ALLOWED_HOSTS: list[str] = []
 
     # Secret key for JWT. Please generate your own secret key in production
     SECRET_KEY: str = "PLACEHOLDER"
