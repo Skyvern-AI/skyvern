@@ -144,5 +144,5 @@ class InsecureCodeDetected(SkyvernException):
 class CustomizedCodeException(SkyvernException):
     def __init__(self, exception: Exception) -> None:
         super().__init__(
-            f"Failed to execute code block. Reason: {exception.__class__.__name__}:{str(exception)}",
+            f"Failed to execute code block. Reason: {exception.__class__.__name__}: {str(exception)}",
         )
