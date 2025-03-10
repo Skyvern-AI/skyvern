@@ -770,10 +770,15 @@ def _trimmed_base64_data(attributes: dict) -> dict:
 
 
 def _trimmed_attributes(attributes: dict) -> dict:
-    def is_reserved_or_role(key, value):
-        return key in RESERVED_ATTRIBUTES or (key == "role" and value in ["listbox", "option"])
+   new_attributes: dict = {}
 
-    return {key: value for key, value in attributes.items() if is_reserved_or_role(key, value)}
+    for key in attributes:
+        if key == "role" and attributes[key] in ["listbox", "option"]:
+            new_attributes[key] = attributes[key]
+        if key in RESERVED_ATTRIBUTES:
+            new_attributes[key] = attributes[key]
+
+    return new_attributes
 
 
 def _remove_unique_id(element: dict) -> None:
