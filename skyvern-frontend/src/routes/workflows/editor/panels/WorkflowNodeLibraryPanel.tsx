@@ -6,6 +6,8 @@ import { AddNodeProps } from "../FlowRenderer";
 import { WorkflowBlockNode } from "../nodes";
 import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
 
+const enableCodeBlock = import.meta.env.VITE_ENABLE_CODE_BLOCK === "true";
+
 const nodeLibraryItems: Array<{
   nodeType: NonNullable<WorkflowBlockNode["type"]>;
   icon: JSX.Element;
@@ -134,16 +136,17 @@ const nodeLibraryItems: Array<{
     title: "For Loop Block",
     description: "Repeats nested elements",
   },
-  // temporarily removed
-  // {
-  //   nodeType: "codeBlock",
-  //   icon: <WorkflowBlockIcon
-  //   workflowBlockType={WorkflowBlockTypes.Code}
-  //   className="size-6"
-  // />,
-  //   title: "Code Block",
-  //   description: "Executes Python code",
-  // },
+  {
+    nodeType: "codeBlock",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Code}
+        className="size-6"
+      />
+    ),
+    title: "Code Block",
+    description: "Executes Python code",
+  },
   {
     nodeType: "fileParser",
     icon: (
@@ -255,6 +258,9 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
                   workflowPanelData?.disableLoop &&
                   item.nodeType === "loop"
                 ) {
+                  return null;
+                }
+                if (!enableCodeBlock && item.nodeType === "codeBlock") {
                   return null;
                 }
                 return (
