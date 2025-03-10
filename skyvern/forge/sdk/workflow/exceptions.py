@@ -132,3 +132,10 @@ class InvalidTemplateWorkflowPermanentId(SkyvernHTTPException):
             message=f"Invalid template workflow permanent id: {workflow_permanent_id}. Please make sure the workflow is a valid template.",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
+
+
+class InsecureCodeDetected(SkyvernException):
+    def __init__(self, msg: str) -> None:
+        super().__init__(
+            f"Insecure code detected. Reason: {msg}",
+        )
