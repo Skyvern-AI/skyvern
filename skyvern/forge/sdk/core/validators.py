@@ -29,8 +29,6 @@ def prepend_scheme_and_validate_url(url: str) -> str:
 
 
 def is_blocked_host(host: str) -> bool:
-    if host.lower() in (h.lower() for h in settings.ALLOWED_HOSTS):
-        return False
     try:
         ip = ipaddress.ip_address(host)
         # Check if the IP is private, link-local, loopback, or reserved

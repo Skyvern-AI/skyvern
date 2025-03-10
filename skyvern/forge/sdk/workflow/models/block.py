@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+import ast
 import asyncio
 import csv
 import json
@@ -13,13 +14,14 @@ from dataclasses import dataclass
 from email.message import EmailMessage
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Awaitable, Callable, Literal, Union
 from urllib.parse import quote
 
 import filetype
 import structlog
 from email_validator import EmailNotValidError, validate_email
 from jinja2 import Template
+from playwright.async_api import Page
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
@@ -55,6 +57,7 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToFormatJinjaStyleParameter,
+    InsecureCodeDetected,
     InvalidEmailClientConfiguration,
     InvalidFileType,
     NoIterableValueFound,
@@ -1107,6 +1110,50 @@ class CodeBlock(Block):
     code: str
     parameters: list[PARAMETER_TYPE] = []
 
+    @staticmethod
+    def is_safe_code(code: str) -> None:
+        tree = ast.parse(code)
+        for node in ast.walk(tree):
+            if hasattr(node, "attr") and str(node.attr).startswith("__"):
+                raise InsecureCodeDetected("Not allowed to access private methods or attributes")
+            if isinstance(node, ast.Import) or isinstance(node, ast.ImportFrom):
+                raise InsecureCodeDetected("Not allowed to import modules")
+
+    @staticmethod
+    def build_safe_vars() -> dict[str, Any]:
+        return {
+            "__builtins__": {},  # only allow several builtins due to security concerns
+            "locals": locals,
+            "print": print,
+            "len": len,
+            "range": range,
+            "str": str,
+            "int": int,
+            "dict": dict,
+            "list": list,
+            "tuple": tuple,
+            "set": set,
+            "bool": bool,
+            "asyncio": asyncio,
+        }
+
+    def generate_async_user_function(
+        self, code: str, page: Page, parameters: dict[str, Any] | None = None
+    ) -> Callable[[], Awaitable[dict[str, Any]]]:
+        code = textwrap.indent(code, "    ")
+        full_code = f"""
+async def wrapper():
+{code}
+    return locals()
+"""
+        runtime_variables: dict[str, Callable[[], Awaitable[dict[str, Any]]]] = {}
+        safe_vars = self.build_safe_vars()
+        if parameters:
+            safe_vars.update(parameters)
+        safe_vars["page"] = page
+        exec(full_code, safe_vars, runtime_variables)
+        return runtime_variables["wrapper"]
+
     def get_all_parameters(
         self,
         workflow_run_id: str,
@@ -1124,7 +1171,49 @@ class CodeBlock(Block):
         browser_session_id: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
-        raise DisabledBlockExecutionError("CodeBlock is disabled")
+        if not settings.ENABLE_CODE_BLOCK:
+            raise DisabledBlockExecutionError("CodeBlock is disabled")
+
+        # TODO: only support to use code block to manupilate the browser page
+        # support browser context in the future
+        browser_state: BrowserState | None = None
+        if browser_session_id and organization_id:
+            LOG.info(
+                "Getting browser state for workflow run from persistent sessions manager",
+                browser_session_id=browser_session_id,
+            )
+            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id)
+            if browser_state:
+                await app.PERSISTENT_SESSIONS_MANAGER.occupy_browser_session(
+                    browser_session_id,
+                    runnable_type="workflow_run",
+                    runnable_id=workflow_run_id,
+                    organization_id=organization_id,
+                )
+        else:
+            browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+
+        if not browser_state:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="No browser found to run the code block",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        page = await browser_state.get_working_page()
+        if not page:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="No page found to run the code block",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
         # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         try:
@@ -1141,11 +1230,6 @@ class CodeBlock(Block):
 
         # get all parameters into a dictionary
         parameter_values = {}
-        maybe_browser_state = await app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
-        if maybe_browser_state:
-            if page := await maybe_browser_state.get_working_page():
-                parameter_values["skyvern_page"] = page
-
         for parameter in self.parameters:
             value = workflow_run_context.get_value(parameter.key)
             secret_value = workflow_run_context.get_original_secret_value_or_none(value)
@@ -1154,32 +1238,28 @@ class CodeBlock(Block):
             else:
                 parameter_values[parameter.key] = value
 
-        # Import builtins and other modules that might be useful in the user code and add them to the parameter_values
-        import asyncio
-        import datetime
+        try:
+            self.is_safe_code(self.code)
+        except Exception as e:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=str(e),
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
 
-        parameter_values["__builtins__"] = __builtins__  # Include builtins for exec context
-        parameter_values["asyncio"] = asyncio
-        parameter_values["datetime"] = datetime
+        user_function = self.generate_async_user_function(self.code, page, parameter_values)
+        result = await user_function()
+        result = json.loads(
+            json.dumps(result, default=lambda value: f"Object '{type(value)}' is not JSON serializable")
+        )
 
-        local_variables: dict[str, Any] = {}
-        result_container: dict[str, Any] = {}
-        # Define the user_code function and return it
-        user_code = textwrap.indent(self.code, "    ")
-        full_code = f"""
-async def user_code():
-{user_code}
-    result_container['result'] = locals().get('result')
-"""
-
-        exec(full_code, {**parameter_values, "result_container": result_container}, local_variables)
-        # Await the returned user_code function
-        await local_variables["user_code"]()
-
-        result = {"result": result_container.get("result")}
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result)
         return await self.build_block_result(
             success=True,
+            failure_reason=None,
             output_parameter_value=result,
             status=BlockStatus.completed,
             workflow_run_block_id=workflow_run_block_id,

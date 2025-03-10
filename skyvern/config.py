@@ -40,7 +40,6 @@ class Settings(BaseSettings):
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     BLOCKED_HOSTS: list[str] = ["localhost"]
-    ALLOWED_HOSTS: list[str] = []
 
     # Secret key for JWT. Please generate your own secret key in production
     SECRET_KEY: str = "PLACEHOLDER"
@@ -164,6 +163,7 @@ class Settings(BaseSettings):
     SVG_MAX_LENGTH: int = 100000
 
     ENABLE_LOG_ARTIFACTS: bool = False
+    ENABLE_CODE_BLOCK: bool = False
 
     def is_cloud_environment(self) -> bool:
         """
