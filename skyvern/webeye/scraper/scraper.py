@@ -94,11 +94,16 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
     """
     if element is flagged as dropped, the html format is empty
     """
-    if element.get("isDropped", False):
-        return ""
-
     tag = element["tagName"]
     attributes: dict[str, Any] = copy.deepcopy(element.get("attributes", {}))
+
+    interactable = element.get("interactable", False)
+    if element.get("isDropped", False):
+        if not interactable:
+            return ""
+        else:
+            LOG.info("Element is interactable. Trimmed all attributes instead of dropping it", element=element)
+            attributes = {}
 
     if element.get("isCheckable", False) and tag != "input":
         tag = "input"
