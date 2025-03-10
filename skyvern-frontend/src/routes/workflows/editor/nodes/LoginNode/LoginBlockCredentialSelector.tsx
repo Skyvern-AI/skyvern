@@ -22,6 +22,11 @@ function LoginBlockCredentialSelector({ value, onChange }: Props) {
   const credentialParameters = workflowParameters.filter(
     (parameter) => parameter.parameterType === "credential",
   );
+  const credentialInputParameters = workflowParameters.filter(
+    (parameter) =>
+      parameter.parameterType === "workflow" &&
+      parameter.dataType === "credential_id",
+  );
   const isCloud = useContext(CloudContext);
   const { data: credentials = [], isLoading } = useCredentialsQuery({
     enabled: isCloud,
@@ -44,6 +49,14 @@ function LoginBlockCredentialSelector({ value, onChange }: Props) {
     type: "parameter",
   }));
 
+  const credentialInputParameterOptions = credentialInputParameters.map(
+    (parameter) => ({
+      label: parameter.key,
+      value: parameter.key,
+      type: "parameter",
+    }),
+  );
+
   const filteredCredentialParameterOptions = credentialParameterOptions.filter(
     (option) =>
       !credentialOptions.some(
@@ -51,7 +64,11 @@ function LoginBlockCredentialSelector({ value, onChange }: Props) {
       ),
   );
 
-  const options = [...credentialOptions, ...filteredCredentialParameterOptions];
+  const options = [
+    ...credentialOptions,
+    ...filteredCredentialParameterOptions,
+    ...credentialInputParameterOptions,
+  ];
 
   return (
     <Select
