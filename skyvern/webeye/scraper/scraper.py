@@ -770,7 +770,7 @@ def _trimmed_base64_data(attributes: dict) -> dict:
 
 
 def _trimmed_attributes(attributes: dict) -> dict:
-   new_attributes: dict = {}
+    new_attributes: dict = {}
 
     for key in attributes:
         if key == "role" and attributes[key] in ["listbox", "option"]:
