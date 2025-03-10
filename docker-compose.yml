@@ -30,8 +30,9 @@ services:
       - ./har:/data/har
       - ./log:/data/log
       - ./.streamlit:/app/.streamlit
-      # Uncomment if you want to connect to any local changes
+      # Uncomment the following two lines if you want to connect to any local changes
       # - ./skyvern:/app/skyvern
+      # - ./alembic:/app/alembic
     environment:
       - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
       - BROWSER_TYPE=chromium-headful
