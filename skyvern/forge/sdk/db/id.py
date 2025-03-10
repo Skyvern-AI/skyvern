@@ -223,7 +223,7 @@ def current_time_ms() -> int:
 
 
 def _mask_shift(value: int, mask_bits: int, shift_bits: int) -> int:
-    return (value & ((2**mask_bits) - 1)) << shift_bits
+    return (value & ((1 << mask_bits) - 1)) << shift_bits
 
 
 def _get_worker_hash() -> int:
