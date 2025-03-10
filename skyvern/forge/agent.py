@@ -257,6 +257,7 @@ class ForgeAgent:
         close_browser_on_completion: bool = True,
         task_block: BaseTaskBlock | None = None,
         browser_session_id: str | None = None,
+        ws_url: str | None = None,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
         workflow_run: WorkflowRun | None = None
         if task.workflow_run_id:
@@ -351,7 +352,7 @@ class ForgeAgent:
                 step,
                 browser_state,
                 detailed_output,
-            ) = await self.initialize_execution_state(task, step, workflow_run, browser_session_id)
+            ) = await self.initialize_execution_state(task, step, workflow_run, browser_session_id, ws_url)
 
             # mark step as completed and mark task as completed
             if (
@@ -517,8 +518,9 @@ class ForgeAgent:
                     next_step,
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
-                    browser_session_id=browser_session_id,
                     task_block=task_block,
+                    browser_session_id=browser_session_id,
+                    ws_url=ws_url,
                 )
             elif settings.execute_all_steps() and next_step:
                 return await self.execute_step(
@@ -527,8 +529,9 @@ class ForgeAgent:
                     next_step,
                     api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
-                    browser_session_id=browser_session_id,
                     task_block=task_block,
+                    browser_session_id=browser_session_id,
+                    ws_url=ws_url,
                 )
             else:
                 LOG.info(
@@ -1272,17 +1275,20 @@ class ForgeAgent:
         step: Step,
         workflow_run: WorkflowRun | None = None,
         browser_session_id: str | None = None,
+        ws_url: str | None = None,
     ) -> tuple[Step, BrowserState, DetailedAgentStepOutput]:
         if workflow_run:
             browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                 workflow_run=workflow_run,
                 url=task.url,
                 browser_session_id=browser_session_id,
+                ws_url=ws_url,
             )
         else:
             browser_state = await app.BROWSER_MANAGER.get_or_create_for_task(
                 task=task,
                 browser_session_id=browser_session_id,
+                ws_url=ws_url,
             )
         # Initialize video artifact for the task here, afterwards it'll only get updated
         if browser_state and browser_state.browser_artifacts:

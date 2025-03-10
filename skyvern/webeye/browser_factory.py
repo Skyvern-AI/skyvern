@@ -359,13 +359,14 @@ async def _create_cdp_connection_browser(
         har_path=browser_args["record_har_path"],
     )
 
-    remote_browser_url = settings.BROWSER_CDP_URL
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"{settings.BROWSER_CDP_URL}/json/version")
-            remote_browser_url = response.json().get("webSocketDebuggerUrl")
-    except Exception:
-        raise Exception("Failed to connect to CDP browser")
+    remote_browser_url = settings.BROWSER_CDP_WS_URL
+    if not remote_browser_url:
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"{settings.BROWSER_CDP_URL}/json/version")
+                remote_browser_url = response.json().get("webSocketDebuggerUrl")
+        except Exception:
+            raise Exception("Failed to connect to CDP browser")
 
     LOG.info("Connecting browser CDP connection", remote_browser_url=remote_browser_url)
     browser = await playwright.chromium.connect_over_cdp(remote_browser_url)
@@ -434,6 +435,7 @@ class BrowserState:
         task_id: str | None = None,
         workflow_run_id: str | None = None,
         organization_id: str | None = None,
+        ws_url: str | None = None,
     ) -> None:
         if self.browser_context is None:
             LOG.info("creating browser context")
@@ -448,6 +450,7 @@ class BrowserState:
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
+                ws_url=ws_url,
             )
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts
@@ -552,6 +555,7 @@ class BrowserState:
         task_id: str | None = None,
         workflow_run_id: str | None = None,
         organization_id: str | None = None,
+        ws_url: str | None = None,
     ) -> Page:
         page = await self.get_working_page()
         if page is not None:
@@ -564,6 +568,7 @@ class BrowserState:
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
+                ws_url=ws_url,
             )
         except Exception as e:
             error_message = str(e)
@@ -576,6 +581,7 @@ class BrowserState:
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
+                ws_url=ws_url,
             )
         await self.__assert_page()
 
@@ -587,6 +593,7 @@ class BrowserState:
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
+                ws_url=ws_url,
             )
             await self.__assert_page()
 

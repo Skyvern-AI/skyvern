@@ -201,6 +201,7 @@ class Block(BaseModel, abc.ABC):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        ws_url: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         pass
@@ -211,6 +212,7 @@ class Block(BaseModel, abc.ABC):
         parent_workflow_run_block_id: str | None = None,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        ws_url: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_block_id = None
@@ -289,6 +291,7 @@ class Block(BaseModel, abc.ABC):
                 workflow_run_block_id,
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
+                ws_url=ws_url,
                 **kwargs,
             )
         except Exception as e:
@@ -437,6 +440,7 @@ class BaseTaskBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        ws_url: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -530,8 +534,13 @@ class BaseTaskBlock(Block):
                 # the first task block will create the browser state and do the navigation
                 try:
                     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                        workflow_run=workflow_run, url=self.url, browser_session_id=browser_session_id
+                        workflow_run=workflow_run,
+                        url=self.url,
+                        browser_session_id=browser_session_id,
+                        ws_url=ws_url,
                     )
+                    if browser_state is None:
+                        raise MissingBrowserState(task_id=task.task_id, workflow_run_id=workflow_run_id)
                     # add screenshot artifact for the first task
                     screenshot = await browser_state.take_screenshot(full_page=True)
                     if screenshot:
@@ -999,6 +1008,7 @@ class ForLoopBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        ws_url: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -1122,6 +1132,7 @@ class CodeBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        ws_url: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         raise DisabledBlockExecutionError("CodeBlock is disabled")
@@ -1247,6 +1258,7 @@ class TextPromptBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        ws_url: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         # Validate block execution
@@ -1329,6 +1341,7 @@ class DownloadToS3Block(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        ws_url: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         # get workflow run context
@@ -1415,6 +1428,7 @@ class UploadToS3Block(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        ws_url: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         # get workflow run context
@@ -1745,6 +1759,7 @@ class SendEmailBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        ws_url: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -1847,6 +1862,7 @@ class FileParserBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        ws_url: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -1928,6 +1944,7 @@ class PDFParserBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        ws_url: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -2026,6 +2043,7 @@ class WaitBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        ws_url: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         # TODO: we need to support to interrupt the sleep when the workflow run failed/cancelled/terminated
@@ -2068,6 +2086,7 @@ class ValidationBlock(BaseTaskBlock):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        ws_url: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         task_order, _ = await self.get_task_order(workflow_run_id, 0)
@@ -2140,6 +2159,7 @@ class TaskV2Block(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
+        ws_url: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         from skyvern.forge.sdk.services import task_v2_service
@@ -2190,6 +2210,7 @@ class TaskV2Block(Block):
             request_id=None,
             max_steps_override=self.max_steps,
             browser_session_id=browser_session_id,
+            ws_url=ws_url,
         )
         result_dict = None
         if task_v2:
