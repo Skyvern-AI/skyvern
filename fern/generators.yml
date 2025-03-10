@@ -1,8 +1,9 @@
-api: 
-  path: openapi/skyvern_openapi.yml
-  overrides: openapi/openapi-overrides.yml
-  settings: 
-    use-title: false
+api:
+  specs:
+    - openapi: openapi/skyvern_openapi.yml
+      overrides: openapi/openapi-overrides.yml
+      settings:
+        title-as-schema-name: false
 groups:
   python-sdk:
     generators:
