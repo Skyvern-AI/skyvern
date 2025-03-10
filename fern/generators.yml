@@ -1,14 +1,14 @@
-api: 
+api:
   path: openapi/skyvern_openapi.yml
   overrides: openapi/openapi-overrides.yml
-  settings: 
+  settings:
     use-title: false
 groups:
   python-sdk:
     generators:
       - name: fernapi/fern-python-sdk
         smart-casing: true
-        version: 4.3.11
+        version: 4.3.16
         output:
           location: pypi
           package-name: skyvern
