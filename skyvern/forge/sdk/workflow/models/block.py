@@ -56,6 +56,7 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
+    CustomizedCodeException,
     FailedToFormatJinjaStyleParameter,
     InsecureCodeDetected,
     InvalidEmailClientConfiguration,
@@ -1251,7 +1252,19 @@ async def wrapper():
             )
 
         user_function = self.generate_async_user_function(self.code, page, parameter_values)
-        result = await user_function()
+        try:
+            result = await user_function()
+        except Exception as e:
+            exc = CustomizedCodeException(e)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=exc.message,
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
         result = json.loads(
             json.dumps(result, default=lambda value: f"Object '{type(value)}' is not JSON serializable")
         )
