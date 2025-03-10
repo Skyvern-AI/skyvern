@@ -112,6 +112,7 @@ class TaskV2Request(BaseModel):
     user_prompt: str
     url: str | None = None
     browser_session_id: str | None = None
+    ws_url: str | None = None
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
