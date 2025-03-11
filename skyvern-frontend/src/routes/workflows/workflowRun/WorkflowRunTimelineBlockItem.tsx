@@ -97,24 +97,32 @@ function WorkflowRunTimelineBlockItem({
       <div className="space-y-2">
         <div className="flex justify-between">
           <div className="flex gap-3">
-            <WorkflowBlockIcon
-              workflowBlockType={block.block_type}
-              className="size-6"
-            />
-            <span>{workflowBlockTitle[block.block_type]}</span>
+            <div className="rounded bg-slate-elevation5 p-2">
+              <WorkflowBlockIcon
+                workflowBlockType={block.block_type}
+                className="size-6"
+              />
+            </div>
+
+            <div className="flex flex-col gap-1">
+              <span className="text-sm">
+                {workflowBlockTitle[block.block_type]}
+              </span>
+              <span className="text-xs text-slate-400">{block.label}</span>
+            </div>
           </div>
           <div className="flex gap-2">
             {showFailureIndicator && (
-              <div className="bg-slate-elevation5 px-2 py-1">
+              <div className="self-start rounded bg-slate-elevation5 px-2 py-1">
                 <CrossCircledIcon className="size-4 text-destructive" />
               </div>
             )}
             {showSuccessIndicator && (
-              <div className="bg-slate-elevation5 px-2 py-1">
+              <div className="self-start rounded bg-slate-elevation5 px-2 py-1">
                 <CheckCircledIcon className="size-4 text-success" />
               </div>
             )}
-            <div className="flex items-center gap-1 rounded bg-slate-elevation5 px-2 py-1">
+            <div className="flex gap-1 self-start rounded bg-slate-elevation5 px-2 py-1">
               {showDiagnosticLink ? (
                 <Link to={`/tasks/${block.task_id}/diagnostics`}>
                   <div className="flex gap-1">
