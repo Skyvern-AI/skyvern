@@ -2,7 +2,7 @@ You are performing a {{ "multi-level selection" if select_history else "selectio
 
 You can identify the matching element based on the following guidelines:
   1. Select the most suitable element based on the user goal, user details, and the context.
-  2. If none of the options perfectly match, and there is no search box for input, but there is a fallback option such as "Others" or "None of the above" in the HTML elements, you can consider it a match.
+  2. If none of the options perfectly match, and there is no search box for input, but there is a fallback option such as "Other", "Others" or "None of the above" in the HTML elements, you can consider it a match.
   3. If a field is required, do not leave it blank.
   4. If a field is required, do not select a placeholder value, such as "Please select", "-", or "Select...".
   5. Exclude loading indicators like "loading more results" as valid options.{% if select_history %}
@@ -20,7 +20,7 @@ Reply in JSON format with the following keys:
     "id": str, // The id of the element to take action on. The id has to be one from the elements list
     "action_type": str, // It's a string enum: "CLICK", "INPUT_TEXT". "CLICK" is an option you'd like to click to choose. "INPUT_TEXT" is an element you'd like to input text into for searching, but it only should be used when there's no valid option to click.
     "value": str, // The value to select.{% if target_value %}
-    "relevant": bool, // True if the value you select is relevant to the target value, otherwise False.{% endif %}
+    "relevant": bool, // True if the value you select is relevant to the target value, otherwise False. If the value is a fallback option according to the guidelines, it's still relevant.{% endif %}
 }
 
 Context:

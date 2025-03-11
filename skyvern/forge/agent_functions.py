@@ -136,7 +136,7 @@ async def _convert_svg_to_string(
         skyvern_element = SkyvernElement(locator=locater, frame=skyvern_frame.get_frame(), static_element=element)
 
         _, blocked = await skyvern_frame.get_blocking_element_id(await skyvern_element.get_element_handler())
-        if blocked:
+        if not skyvern_element.is_interactable() and blocked:
             del element["children"]
             element["isDropped"] = True
             return

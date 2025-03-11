@@ -10,6 +10,7 @@ type Props = {
     to: string;
     newTab?: boolean;
     disabled?: boolean;
+    beta?: boolean;
     icon?: React.ReactNode;
   }>;
 };
@@ -75,7 +76,7 @@ function NavLinkGroup({ title, links }: Props) {
                       color: groupIsActive ? "#EA580C" : "#8D3710",
                     }}
                   >
-                    Training
+                    {link.beta ? "Beta" : "Training"}
                   </Badge>
                 )}
               </div>
