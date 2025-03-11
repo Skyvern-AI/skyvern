@@ -135,3 +135,11 @@ plugins = "sqlalchemy.ext.mypy.plugin"
 
 [tool.poetry.scripts]
 skyvern = "skyvern.cli.commands:app"
+
+[tool.codeflash]                                                                                                                                                                                                                                                                                                             
+# All paths are relative to this pyproject.toml's directory.                                                                                                                                                                                                                                                                 
+module-root = "skyvern"                                                                                                                                                                                                                                                                                                      
+tests-root = "tests"                                                                                                                                                                                                                                                                                                         
+test-framework = "pytest"                                                                                                                                                                                                                                                                                                    
+ignore-paths = ["skyvern/client"]                                                                                                                                                                                                                                                                                                         
+formatter-cmds = ["ruff check --exit-zero --fix $file", "ruff format $file"] 
