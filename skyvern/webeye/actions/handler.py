@@ -660,6 +660,7 @@ async def handle_input_text_action(
                     )
 
                 elif select_result.action_result.success:
+                    try_to_quit_dropdown = False
                     return [select_result.action_result]
 
                 else:
