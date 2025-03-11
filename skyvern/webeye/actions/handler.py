@@ -2336,7 +2336,8 @@ async def locate_dropdown_menu(
     step: Step,
     task: Task,
 ) -> SkyvernElement | None:
-    if not await current_anchor_element.is_visible():
+    # the anchor must exist in the DOM, but no need to be visible css style
+    if not await current_anchor_element.is_visible(must_visible_style=False):
         return None
 
     skyvern_frame = incremental_scraped.skyvern_frame
