@@ -61,8 +61,8 @@ def get_list_response_item_from_bitwarden_item(item: dict) -> CredentialItem:
         return CredentialItem(
             item_id=item["id"],
             credential=PasswordCredential(
-                username=login["username"],
-                password=login["password"],
+                username=login["username"] or "",
+                password=login["password"] or "",
                 totp=login["totp"],
             ),
             name=item["name"],
@@ -742,8 +742,8 @@ class BitwardenService:
             raise BitwardenGetItemError(f"Item with ID: {item_id} is not a login item")
 
         return PasswordCredential(
-            username=login["username"],
-            password=login["password"],
+            username=login["username"] or "",
+            password=login["password"] or "",
             totp=login["totp"],
         )
 
@@ -981,8 +981,8 @@ class BitwardenService:
                 credential_type=CredentialType.PASSWORD,
                 name=name,
                 credential=PasswordCredential(
-                    username=login_item["username"],
-                    password=login_item["password"],
+                    username=login_item["username"] or "",
+                    password=login_item["password"] or "",
                     totp=login_item["totp"],
                 ),
             )
