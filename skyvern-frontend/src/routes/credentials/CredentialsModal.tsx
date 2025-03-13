@@ -86,21 +86,64 @@ function CredentialsModal({ onCredentialCreated }: Props) {
   });
 
   const handleSave = () => {
+    const name =
+      type === CredentialModalTypes.PASSWORD
+        ? passwordCredentialValues.name.trim()
+        : creditCardCredentialValues.name.trim();
+    if (name === "") {
+      toast({
+        title: "Error",
+        description: "Name is required",
+        variant: "destructive",
+      });
+      return;
+    }
+
     if (type === CredentialModalTypes.PASSWORD) {
+      const username = passwordCredentialValues.username.trim();
+      const password = passwordCredentialValues.password.trim();
+      const totp = passwordCredentialValues.totp.trim();
+
+      if (username === "" || password === "") {
+        toast({
+          title: "Error",
+          description: "Username and password are required",
+          variant: "destructive",
+        });
+        return;
+      }
       createCredentialMutation.mutate({
-        name: passwordCredentialValues.name,
+        name,
         credential_type: "password",
         credential: {
-          username: passwordCredentialValues.username,
-          password: passwordCredentialValues.password,
-          totp:
-            passwordCredentialValues.totp === ""
-              ? null
-              : passwordCredentialValues.totp,
+          username,
+          password,
+          totp: totp === "" ? null : totp,
         },
       });
     } else if (type === CredentialModalTypes.CREDIT_CARD) {
-      const cardExpirationDate = creditCardCredentialValues.cardExpirationDate;
+      const cardNumber = creditCardCredentialValues.cardNumber.trim();
+      const cardCode = creditCardCredentialValues.cardCode.trim();
+      const cardExpirationDate =
+        creditCardCredentialValues.cardExpirationDate.trim();
+      const cardBrand = creditCardCredentialValues.cardBrand.trim();
+      const cardHolderName = creditCardCredentialValues.cardHolderName.trim();
+
+      if (
+        cardNumber === "" ||
+        cardCode === "" ||
+        cardExpirationDate === "" ||
+        cardBrand === "" ||
+        cardHolderName === ""
+      ) {
+        toast({
+          title: "Error",
+          description: "All credit card fields are required",
+          variant: "destructive",
+        });
+        return;
+      }
+
       const cardExpirationDateParts = cardExpirationDate.split("/");
       if (cardExpirationDateParts.length !== 2) {
         toast({
@@ -123,15 +166,15 @@ function CredentialsModal({ onCredentialCreated }: Props) {
       // remove all spaces from the card number
       const number = creditCardCredentialValues.cardNumber.replace(/\s/g, "");
       createCredentialMutation.mutate({
-        name: creditCardCredentialValues.name,
+        name,
         credential_type: "credit_card",
         credential: {
           card_number: number,
-          card_cvv: creditCardCredentialValues.cardCode,
+          card_cvv: cardCode,
           card_exp_month: cardExpirationMonth,
           card_exp_year: cardExpirationYear,
-          card_brand: creditCardCredentialValues.cardBrand,
-          card_holder_name: creditCardCredentialValues.cardHolderName,
+          card_brand: cardBrand,
+          card_holder_name: cardHolderName,
         },
       });
     }
