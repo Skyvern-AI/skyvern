@@ -30,6 +30,7 @@ class BrowserManager:
         task_id: str | None = None,
         workflow_run_id: str | None = None,
         organization_id: str | None = None,
+        ws_url: str | None = None,
     ) -> BrowserState:
         pw = await async_playwright().start()
         (
@@ -43,6 +44,7 @@ class BrowserManager:
             task_id=task_id,
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
+            ws_url=ws_url,
         )
         return BrowserState(
             pw=pw,
@@ -71,6 +73,7 @@ class BrowserManager:
         self,
         task: Task,
         browser_session_id: str | None = None,
+        ws_url: str | None = None,
     ) -> BrowserState:
         browser_state = self.get_for_task(task_id=task.task_id, workflow_run_id=task.workflow_run_id)
         if browser_state is not None:
@@ -120,7 +123,11 @@ class BrowserManager:
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.
         await browser_state.get_or_create_page(
-            url=task.url, proxy_location=task.proxy_location, task_id=task.task_id, organization_id=task.organization_id
+            url=task.url,
+            proxy_location=task.proxy_location,
+            task_id=task.task_id,
+            organization_id=task.organization_id,
+            ws_url=task.ws_url,
         )
         return browser_state
 
@@ -129,6 +136,7 @@ class BrowserManager:
         workflow_run: WorkflowRun,
         url: str | None = None,
         browser_session_id: str | None = None,
+        ws_url: str | None = None,
     ) -> BrowserState:
         parent_workflow_run_id = workflow_run.parent_workflow_run_id
         workflow_run_id = workflow_run.workflow_run_id
@@ -191,6 +199,7 @@ class BrowserManager:
             proxy_location=workflow_run.proxy_location,
             workflow_run_id=workflow_run.workflow_run_id,
             organization_id=workflow_run.organization_id,
+            ws_url=ws_url,
         )
         return browser_state
 

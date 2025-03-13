@@ -194,6 +194,7 @@ async def run_task(
         organization_id=current_org.organization_id,
         max_steps_override=x_max_steps_override,
         browser_session_id=task.browser_session_id,
+        ws_url=task.ws_url,
         api_key=x_api_key,
     )
     return CreateTaskResponse(task_id=created_task.task_id)
@@ -592,6 +593,7 @@ async def run_workflow(
         workflow_run_id=workflow_run.workflow_run_id,
         max_steps_override=x_max_steps_override,
         browser_session_id=workflow_request.browser_session_id,
+        ws_url=workflow_request.ws_url,
         api_key=x_api_key,
     )
     return RunWorkflowResponse(
