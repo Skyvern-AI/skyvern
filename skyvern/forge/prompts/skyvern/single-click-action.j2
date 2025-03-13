@@ -19,13 +19,6 @@ Reply in JSON format with the following keys:
     }]
 }
 
-The URL of the page you're on right now is `{{ current_url }}`.
-
-HTML elements from `{{ current_url }}`:
-```
-{{ elements }}
-```
-
 User instruction (user's intention or self questioning to help figure out what to click):
 ```
 {{ navigation_goal }}
@@ -40,6 +33,13 @@ Context of the big goal user wants to achieve:
 ```
 {{ user_context }}
 ```{% endif %}
+
+The URL of the page you're on right now is `{{ current_url }}`.
+
+HTML elements from `{{ current_url }}`:
+```
+{{ elements }}
+```
 
 Current datetime, ISO format:
 ```

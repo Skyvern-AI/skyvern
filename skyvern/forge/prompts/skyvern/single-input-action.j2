@@ -20,13 +20,6 @@ Reply in JSON format with the following keys:
     "need_verification_code": bool, // Whether a verification code is needed to proceed. True only if the code is available to user. If the code is not sent, return false {% endif %}
 }
 
-The URL of the page you're on right now is `{{ current_url }}`.
-
-HTML elements from `{{ current_url }}`:
-```
-{{ elements }}
-```
-
 User instruction:
 ```
 {{ navigation_goal }}
@@ -35,6 +28,13 @@ User instruction:
 User details:
 ```
 {{ navigation_payload_str }}
+```
+
+The URL of the page you're on right now is `{{ current_url }}`.
+
+HTML elements from `{{ current_url }}`:
+```
+{{ elements }}
 ```
 
 Current datetime, ISO format:
