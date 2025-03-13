@@ -1542,29 +1542,28 @@ class ForgeAgent:
                 actions_and_results.extend(window_step.output.actions_and_results)
 
         # exclude successful action from history
-        return json.dumps(
-            [
-                {
-                    "action": action.model_dump(
+        action_history = [
+            {
+                "action": action.model_dump(
+                    exclude_none=True,
+                    include={"action_type", "element_id", "status", "reasoning", "option", "download"},
+                ),
+                "results": [
+                    result.model_dump(
                         exclude_none=True,
-                        include={"action_type", "element_id", "status", "reasoning", "option", "download"},
-                    ),
-                    "results": [
-                        result.model_dump(
-                            exclude_none=True,
-                            include={
-                                "success",
-                                "exception_type",
-                                "exception_message",
-                            },
-                        )
-                        for result in results
-                    ],
-                }
-                for action, results in actions_and_results
-                if len(results) > 0
-            ]
-        )
+                        include={
+                            "success",
+                            "exception_type",
+                            "exception_message",
+                        },
+                    )
+                    for result in results
+                ],
+            }
+            for action, results in actions_and_results
+            if len(results) > 0
+        ]
+        return json.dumps(action_history) if action_history else ""
 
     async def get_extracted_information_for_task(self, task: Task) -> dict[str, Any] | list | str | None:
         """

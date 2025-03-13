@@ -42,13 +42,12 @@ Reply in JSON format with the following keys:
 }
 {% if action_history %}
 Consider the action history from the last step and the screenshot together, if actions from the last step don't yield positive impact, try other actions or other action combinations.
-{% endif %}
-Clickable elements from `{{ current_url }}`:
-```
-{{ elements }}
-```
 
-The URL of the page you're on right now is `{{ current_url }}`.
+Action history from previous steps: (note: even if the action history suggests goal is achieved, check the screenshot and the DOM elements to make sure the goal is achieved)
+```
+{{ action_history }}
+```
+{% endif %}
 {% if complete_criterion %}
 Complete criterion:
 ```
@@ -74,10 +73,14 @@ User details:
 ```
 {{ navigation_payload_str }}
 ```
-{% if action_history %}
-Action results from previous steps: (note: even if the action history suggests goal is achieved, check the screenshot and the DOM elements to make sure the goal is achieved)
-{{ action_history }}
-{% endif %}
+
+Clickable elements from `{{ current_url }}`:
+```
+{{ elements }}
+```
+
+The URL of the page you're on right now is `{{ current_url }}`.
+
 Current datetime, ISO format:
 ```
 {{ local_datetime }}
