@@ -42,11 +42,11 @@ export class Skyvern implements INodeType {
                 name: 'taskOperation',
                 type: 'options',
                 required: true,
-                default: 'create',
+                default: 'dispatch',
                 options: [
                     {
-                        name: 'Create a Task',
-                        value: 'create',
+                        name: 'Dispatch a Task',
+                        value: 'dispatch',
                     },
                     {
                         name: 'Get a Task',
@@ -61,7 +61,7 @@ export class Skyvern implements INodeType {
                 routing: {
                     request: {
                         baseURL: '={{$credentials.baseUrl}}',
-                        method: '={{ $value === "create" ? "POST" : "GET" }}' as IHttpRequestMethods,
+                        method: '={{ $value === "dispatch" ? "POST" : "GET" }}' as IHttpRequestMethods,
                         url: '={{"/api/" + ($parameter["taskOptions"]["version"] ? $parameter["taskOptions"]["version"] : "v2") + "/tasks"}}',
                     },
                     send: {
@@ -136,7 +136,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['task'],
-                        taskOperation: ['create'],
+                        taskOperation: ['dispatch'],
                     },
                 },
                 routing: {
