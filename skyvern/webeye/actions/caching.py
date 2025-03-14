@@ -229,6 +229,7 @@ async def personalize_action(
         ActionType.COMPLETE,
         ActionType.WAIT,
         ActionType.SOLVE_CAPTCHA,
+        ActionType.NULL_ACTION,
     ]:
         return [action]
     elif action.action_type == ActionType.TERMINATE:
