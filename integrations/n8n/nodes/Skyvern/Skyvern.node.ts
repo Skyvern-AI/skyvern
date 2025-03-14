@@ -1,4 +1,5 @@
-import { INodeType, INodeTypeDescription } from 'n8n-workflow';
+import { IDataObject, IExecuteSingleFunctions, IHttpRequestMethods, IHttpRequestOptions, INodeType, INodeTypeDescription } from 'n8n-workflow';
+const fetch = require('node-fetch');
 
 export class Skyvern implements INodeType {
     description: INodeTypeDescription = {
@@ -11,6 +12,12 @@ export class Skyvern implements INodeType {
         },
         inputs: ['main'],
         outputs: ['main'],
+        credentials: [
+            {
+                name: 'skyvernApi',
+                required: true,
+            },
+        ],
         properties: [
             {
                 displayName: 'Resource',
@@ -51,9 +58,55 @@ export class Skyvern implements INodeType {
                         resource: ['task'],
                     },
                 },
+                routing: {
+                    request: {
+                        baseURL: '={{$credentials.baseUrl}}',
+                        method: '={{ $value === "create" ? "POST" : "GET" }}' as IHttpRequestMethods,
+                        url: '={{"/api/" + ($parameter["taskOptions"]["version"] ? $parameter["taskOptions"]["version"] : "v2") + "/tasks"}}',
+                    },
+                    send: {
+                        preSend: [
+                            async function (this: IExecuteSingleFunctions, requestOptions: IHttpRequestOptions): Promise<IHttpRequestOptions>  {
+                                const taskOperation = this.getNodeParameter('taskOperation');
+                                if (taskOperation === "get") return requestOptions;
+
+                                const taskOptions: IDataObject = this.getNodeParameter('taskOptions') as IDataObject;
+                                if (taskOptions["version"] !== "v1") return requestOptions;
+
+                                // trigger the generate task v1 logic
+                                const credentials = await this.getCredentials('skyvernApi');
+                                const userPrompt = this.getNodeParameter('userPrompt');
+                                const response = await fetch(credentials['baseUrl'] + '/api/v1/generate/task', {
+                                    method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'application/json',
+                                        'x-api-key': credentials['apiKey'],
+                                    },
+                                    body: JSON.stringify({
+                                        prompt: userPrompt,
+                                    }),
+                                });
+                                if (!response.ok) {
+                                    throw new Error('Request to Skyvern API failed');
+                                }
+
+                                const data = await response.json();
+                                requestOptions.body = {
+                                    url: data.url,
+                                    navigation_goal: data.navigation_goal,
+                                    navigation_payload: data.navigation_payload,
+                                    data_extraction_goal: data.data_extraction_goal,
+                                    extracted_information_schema: data.extracted_information_schema,
+                                };
+                                return requestOptions;
+                            },
+                        ],
+                    },
+                },
             },
             {
                 displayName: 'User Prompt',
+                description: 'The prompt for Skyvern to execute',
                 name: 'userPrompt',
                 type: 'string',
                 required: true,
@@ -65,9 +118,17 @@ export class Skyvern implements INodeType {
                         taskOperation: ['create'],
                     },
                 },
+                routing: {
+                    request: {
+                        body: {
+                            user_prompt: '={{$value}}',
+                        },
+                    },
+                },
             },
             {
                 displayName: 'URL',
+                description: 'The URL to navigate to',
                 name: 'url',
                 type: 'string',
                 default: '',
@@ -78,9 +139,17 @@ export class Skyvern implements INodeType {
                         taskOperation: ['create'],
                     },
                 },
+                routing: {
+                    request: {
+                        body: {
+                            url: '={{$value ? $value : null}}',
+                        },
+                    },
+                },
             },
             {
                 displayName: 'Task ID',
+                description: 'The ID of the task',
                 name: 'taskId',
                 type: 'string',
                 required: true,
@@ -91,17 +160,23 @@ export class Skyvern implements INodeType {
                         taskOperation: ['get'],
                     },
                 },
+                routing: {
+                    request: {
+                        method: 'GET',
+                        url: '={{"/api/" + ($parameter["taskOptions"]["version"] ? $parameter["taskOptions"]["version"] : "v2") + "/tasks/" + $value}}',
+                    },
+                },
             },
             {
-                displayName: 'Task Version',
-                name: 'taskVersion',
+                displayName: 'Task Options',
+                name: 'taskOptions',
                 type: 'collection',
-                placeholder: 'Choose Version',
+                placeholder: 'Add Task Options',
                 default: {},
                 options: [
                     {
-                        displayName: 'Task Version',
-                        name: 'taskVersion',
+                        displayName: 'Version',
+                        name: 'version',
                         type: 'options',
                         default: 'v2',
                         options: [
