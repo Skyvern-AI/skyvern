@@ -1,18 +1,21 @@
+# yaml-language-server: $schema=https://schema.buildwithfern.dev/generators-yml.json
+
 api: 
-  path: openapi/skyvern_openapi.yml
-  overrides: openapi/openapi-overrides.yml
-  settings: 
-    use-title: false
+  specs:
+    - openapi: openapi/skyvern_openapi.json
+     #origin: https://api.skyvern.com/openapi.json
+      # settings: 
+      #   use-title: false
 groups:
   python-sdk:
     generators:
       - name: fernapi/fern-python-sdk
         smart-casing: true
-        version: 4.3.11
+        version: 4.3.17
         output:
           location: pypi
           package-name: skyvern
         github:
-          repository: fern-demo/skyvern-python-sdk
+          repository: Skyvern-AI/skyvern-python
         config:
           client_class_name: Skyvern
