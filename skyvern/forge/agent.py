@@ -1563,7 +1563,7 @@ class ForgeAgent:
             for action, results in actions_and_results
             if len(results) > 0
         ]
-        return json.dumps(action_history) if action_history else ""
+        return json.dumps(action_history)
 
     async def get_extracted_information_for_task(self, task: Task) -> dict[str, Any] | list | str | None:
         """
