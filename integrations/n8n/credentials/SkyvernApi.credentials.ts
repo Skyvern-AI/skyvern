@@ -23,14 +23,16 @@ export class SkyvernApi implements ICredentialType {
             name: 'baseUrl',
             type: 'string',
             default: 'https://api.skyvern.com',
+            placeholder: 'https://api.skyvern.com',
         },
 	];
 	authenticate: IAuthenticateGeneric = {
 		type: 'generic',
 		properties: {
-			qs: {
-				'api_key': '={{$credentials.apiKey}}'
-			}
+            headers: {
+                'x-api-key': '={{$credentials.apiKey}}',
+                'Content-Type': 'application/json',
+            }
 		},
 	};
 }
