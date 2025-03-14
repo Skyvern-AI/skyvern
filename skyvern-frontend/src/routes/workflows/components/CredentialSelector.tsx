@@ -1,7 +1,9 @@
 import {
+  CustomSelectItem,
   Select,
   SelectContent,
   SelectItem,
+  SelectItemText,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
@@ -49,19 +51,21 @@ function CredentialSelector({ value, onChange }: Props) {
         </SelectTrigger>
         <SelectContent>
           {credentials.map((credential) => (
-            <SelectItem
+            <CustomSelectItem
               key={credential.credential_id}
               value={credential.credential_id}
             >
               <div className="space-y-2">
-                <p className="text-sm font-medium">{credential.name}</p>
+                <p className="text-sm font-medium">
+                  <SelectItemText>{credential.name}</SelectItemText>
+                </p>
                 <p className="text-xs text-slate-400">
                   {credential.credential_type === "password"
                     ? "Password"
                     : "Credit Card"}
                 </p>
               </div>
-            </SelectItem>
+            </CustomSelectItem>
           ))}
           <SelectItem value="new">
             <div className="flex items-center gap-2">
