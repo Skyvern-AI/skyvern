@@ -87,7 +87,7 @@ export class Skyvern implements INodeType {
                                     }),
                                 });
                                 if (!response.ok) {
-                                    throw new Error('Request to Skyvern API failed');
+                                    throw new Error('Request to generate Task V1 failed');
                                 }
 
                                 const data = await response.json();
