@@ -2905,3 +2905,15 @@ class AgentDB:
             query = query.filter_by(cached=True).order_by(TaskRunModel.created_at.desc())
             task_run = (await session.scalars(query)).first()
             return TaskRun.model_validate(task_run) if task_run else None
+
+    async def get_task_run(
+        self,
+        run_id: str,
+        organization_id: str | None = None,
+    ) -> TaskRun | None:
+        async with self.Session() as session:
+            query = select(TaskRunModel).filter_by(run_id=run_id)
+            if organization_id:
+                query = query.filter_by(organization_id=organization_id)
+            task_run = (await session.scalars(query)).first()
+            return TaskRun.model_validate(task_run) if task_run else None
