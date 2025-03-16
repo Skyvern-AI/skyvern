@@ -93,6 +93,16 @@ jobs:
 
       # Finally, run pre-commit.
       - uses: pre-commit/action@v3.0.0
+        env:
+          ENABLE_OPENAI: "true"
+          OPENAI_API_KEY: "sk-dummy"
+          ENABLE_AZURE_GPT4O_MINI: "true"
+          AZURE_GPT4O_MINI_DEPLOYMENT: "dummy"
+          AZURE_GPT4O_MINI_API_KEY: "dummy"
+          AZURE_GPT4O_MINI_API_BASE: "dummy"
+          AZURE_GPT4O_MINI_API_VERSION: "dummy"
+          AWS_REGION: "us-east-1"
+          ENABLE_BEDROCK: "true"
   
   fe-lint-build:
     runs-on: ubuntu-latest
