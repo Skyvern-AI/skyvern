@@ -165,7 +165,7 @@ class Settings(BaseSettings):
     ENABLE_CODE_BLOCK: bool = False
 
     # SkyvernClient Settings
-    SKYVERN_BASE_URL: str = "http://api.skyvern.com"
+    SKYVERN_BASE_URL: str = "https://api.skyvern.com"
     SKYVERN_API_KEY: str = "PLACEHOLDER"
 
     def is_cloud_environment(self) -> bool:

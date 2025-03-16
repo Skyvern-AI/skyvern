@@ -1,8 +1,11 @@
 from enum import StrEnum
 
+import httpx
+
 from skyvern.config import settings
-from skyvern.forge.sdk.schemas.task_runs import TaskRun, TaskRunResponse, TaskRunStatus, TaskRunType
+from skyvern.forge.sdk.schemas.task_runs import TaskRunResponse
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatusResponse
 
 
 class RunEngine(StrEnum):
@@ -52,20 +55,13 @@ class SkyvernClient:
     ) -> TaskRunResponse:
         return TaskRunResponse()
 
-    async def _get_task_run(self, run_id: str) -> TaskRun:
-        return TaskRun()
-
-    async def _convert_task_run_to_task_run_response(self, task_run: TaskRun) -> TaskRunResponse:
-        if task_run.task_run_type == TaskRunType.task_v1:
-            return TaskRunResponse(
-                run_id=task_run.run_id,
-                engine=RunEngine.skyvern_v1,
-                status=TaskRunStatus.completed,
+    async def get_workflow_run(
+        self,
+        workflow_run_id: str,
+    ) -> WorkflowRunStatusResponse:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self.base_url}/api/v1/workflows/runs/{workflow_run_id}",
+                headers={"x-api-key": self.api_key},
             )
-        elif task_run.task_run_type == TaskRunType.task_v2:
-            return TaskRunResponse(
-                run_id=task_run.run_id,
-                engine=RunEngine.skyvern_v2,
-                status=TaskRunStatus.completed,
-            )
-        raise ValueError(f"Invalid task run type: {task_run.task_run_type}")
+            return WorkflowRunStatusResponse.model_validate(response.json())
