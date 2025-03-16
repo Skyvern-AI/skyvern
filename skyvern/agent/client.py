@@ -3,6 +3,7 @@ from enum import StrEnum
 import httpx
 
 from skyvern.config import settings
+from skyvern.exceptions import SkyvernClientException
 from skyvern.forge.sdk.schemas.task_runs import TaskRunResponse
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatusResponse
@@ -64,4 +65,9 @@ class SkyvernClient:
                 f"{self.base_url}/api/v1/workflows/runs/{workflow_run_id}",
                 headers={"x-api-key": self.api_key},
             )
+            if response.status_code != 200:
+                raise SkyvernClientException(
+                    f"Failed to get workflow run: {response.text}",
+                    status_code=response.status_code,
+                )
             return WorkflowRunStatusResponse.model_validate(response.json())
