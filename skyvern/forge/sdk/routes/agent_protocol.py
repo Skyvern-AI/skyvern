@@ -45,7 +45,7 @@ from skyvern.forge.sdk.schemas.organizations import (
     OrganizationUpdate,
 )
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration, TaskGenerationBase
-from skyvern.forge.sdk.schemas.task_runs import TaskRunType
+from skyvern.forge.sdk.schemas.task_runs import TaskRunResponse, TaskRunType
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import (
     CreateTaskResponse,
@@ -57,7 +57,7 @@ from skyvern.forge.sdk.schemas.tasks import (
     TaskStatus,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline
-from skyvern.forge.sdk.services import org_auth_service, task_v2_service
+from skyvern.forge.sdk.services import org_auth_service, task_run_service, task_v2_service
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
@@ -389,6 +389,23 @@ async def get_runs(
 
     runs = await app.DATABASE.get_all_runs(current_org.organization_id, page=page, page_size=page_size, status=status)
     return ORJSONResponse([run.model_dump() for run in runs])
+
+
+@base_router.get("/runs/{run_id}", response_model=TaskRunResponse)
+@base_router.get("/runs/{run_id}/", response_model=TaskRunResponse, include_in_schema=False)
+async def get_run(
+    run_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> TaskRunResponse:
+    task_run_response = await task_run_service.get_task_run_response(
+        run_id, organization_id=current_org.organization_id
+    )
+    if not task_run_response:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task run not found {run_id}",
+        )
+    return task_run_response
 
 
 @base_router.get("/tasks/{task_id}/steps", tags=["agent"], response_model=list[Step])
