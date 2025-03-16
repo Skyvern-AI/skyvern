@@ -48,10 +48,17 @@ class SkyvernClient:
         workflow_input: dict | None = None,
         webhook_url: str | None = None,
         proxy_location: ProxyLocation | None = None,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
     ) -> RunWorkflowResponse:
-        data = None
+        data = {
+            "webhook_callback_url": webhook_url,
+            "proxy_location": proxy_location,
+            "totp_identifier": totp_identifier,
+            "totp_url": totp_url,
+        }
         if workflow_input:
-            data = {"data": workflow_input}
+            data["data"] = workflow_input
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self.base_url}/api/v1/workflows/{workflow_id}/run",
