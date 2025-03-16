@@ -1,3 +1,3 @@
-from skyvern.agent.local import Agent
+from skyvern.agent.agent import SkyvernAgent
 
-__all__ = ["Agent"]
+__all__ = ["SkyvernAgent"]

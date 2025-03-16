@@ -15,7 +15,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.utils import migrate_db
 
 
-class Agent:
+class SkyvernAgent:
     def __init__(self) -> None:
         load_dotenv(".env")
         migrate_db()

@@ -48,8 +48,6 @@ class Settings(BaseSettings):
     SIGNATURE_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # one week
 
-    SKYVERN_API_KEY: str = "PLACEHOLDER"
-
     # Artifact storage settings
     ARTIFACT_STORAGE_PATH: str = f"{SKYVERN_DIR}/artifacts"
     GENERATE_PRESIGNED_URLS: bool = False
@@ -165,6 +163,10 @@ class Settings(BaseSettings):
 
     ENABLE_LOG_ARTIFACTS: bool = False
     ENABLE_CODE_BLOCK: bool = False
+
+    # SkyvernClient Settings
+    SKYVERN_BASE_URL: str = "http://api.skyvern.com"
+    SKYVERN_API_KEY: str = "PLACEHOLDER"
 
     def is_cloud_environment(self) -> bool:
         """
