@@ -674,7 +674,7 @@ async def get_workflow_runs_by_id(
     "/workflows/{workflow_id}/runs/{workflow_run_id}/",
     include_in_schema=False,
 )
-async def get_workflow_run(
+async def get_workflow_run_with_workflow_id(
     workflow_id: str,
     workflow_run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -721,7 +721,7 @@ async def get_workflow_run_timeline(
     response_model=WorkflowRunStatusResponse,
     include_in_schema=False,
 )
-async def get_workflow_run_by_run_id(
+async def get_workflow_run(
     workflow_run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> WorkflowRunStatusResponse:

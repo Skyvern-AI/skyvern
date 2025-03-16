@@ -7,7 +7,7 @@ from skyvern_langchain.schema import CreateTaskInput, GetTaskInput
 from skyvern_langchain.settings import settings
 
 from skyvern.client import AsyncSkyvern
-from skyvern.forge.sdk.schemas.observers import ObserverTaskRequest
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskRequest, TaskResponse
 
 
@@ -64,7 +64,7 @@ class RunTask(SkyvernTaskBaseTool):
         )
 
     async def _arun_task_v2(self, user_prompt: str, url: str | None = None) -> TaskResponse:
-        task_request = ObserverTaskRequest(url=url, user_prompt=user_prompt)
+        task_request = TaskV2Request(url=url, user_prompt=user_prompt)
         return await self.get_client().agent.run_observer_task_v_2(
             timeout_seconds=self.run_task_timeout_seconds,
             user_prompt=task_request.user_prompt,
@@ -106,7 +106,7 @@ class DispatchTask(SkyvernTaskBaseTool):
         )
 
     async def _arun_task_v2(self, user_prompt: str, url: str | None = None) -> Dict[str, Any | None]:
-        task_request = ObserverTaskRequest(url=url, user_prompt=user_prompt)
+        task_request = TaskV2Request(url=url, user_prompt=user_prompt)
         return await self.get_client().agent.observer_task_v_2(
             user_prompt=task_request.user_prompt,
             url=task_request.url,
