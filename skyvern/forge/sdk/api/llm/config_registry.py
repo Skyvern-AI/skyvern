@@ -5,7 +5,6 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     DuplicateLLMConfigError,
     InvalidLLMConfigError,
     MissingLLMProviderEnvVarsError,
-    NoProviderEnabledError,
 )
 from skyvern.forge.sdk.api.llm.models import LiteLLMParams, LLMConfig, LLMRouterConfig
 
@@ -55,7 +54,10 @@ if not any(
         settings.ENABLE_NOVITA,
     ]
 ):
-    raise NoProviderEnabledError()
+    LOG.warning(
+        "At least one LLM provider must be enabled. Run setup.sh and follow through the LLM provider setup, or "
+        "update the .env file (check out .env.example to see the required environment variables)."
+    )
 
 
 if settings.ENABLE_OPENAI:
