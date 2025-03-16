@@ -6,7 +6,7 @@ from skyvern.config import settings
 from skyvern.exceptions import SkyvernClientException
 from skyvern.forge.sdk.schemas.task_runs import TaskRunResponse
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatusResponse
+from skyvern.forge.sdk.workflow.models.workflow import RunWorkflowResponse, WorkflowRunStatusResponse
 
 
 class RunEngine(StrEnum):
@@ -45,10 +45,25 @@ class SkyvernClient:
     async def run_workflow(
         self,
         workflow_id: str,
+        workflow_input: dict | None = None,
         webhook_url: str | None = None,
         proxy_location: ProxyLocation | None = None,
-    ) -> TaskRunResponse:
-        return TaskRunResponse()
+    ) -> RunWorkflowResponse:
+        data = None
+        if workflow_input:
+            data = {"data": workflow_input}
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/api/v1/workflows/{workflow_id}/run",
+                headers={"x-api-key": self.api_key},
+                json=data,
+            )
+            if response.status_code != 200:
+                raise SkyvernClientException(
+                    f"Failed to run workflow: {response.text}",
+                    status_code=response.status_code,
+                )
+            return RunWorkflowResponse.model_validate(response.json())
 
     async def get_run(
         self,
