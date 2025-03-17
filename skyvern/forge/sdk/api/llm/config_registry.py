@@ -55,7 +55,7 @@ if not any(
     ]
 ):
     LOG.warning(
-        "At least one LLM provider must be enabled. Run setup.sh and follow through the LLM provider setup, or "
+        "To run skyvern locally, you need to enable at least one LLM provider. Run setup.sh and follow through the LLM provider setup, or "
         "update the .env file (check out .env.example to see the required environment variables)."
     )
 
