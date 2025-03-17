@@ -1,17 +1,18 @@
-import { IDataObject, IExecuteSingleFunctions, IHttpRequestMethods, IHttpRequestOptions, INodeType, INodeTypeDescription } from 'n8n-workflow';
+import { IDataObject, IExecuteSingleFunctions, IHttpRequestMethods, IHttpRequestOptions, INodeType, INodeTypeDescription, NodeConnectionType } from 'n8n-workflow';
 const fetch = require('node-fetch');
 
 export class Skyvern implements INodeType {
     description: INodeTypeDescription = {
         displayName: 'Skyvern',
         name: 'skyvern',
+        icon: 'file:skyvern.png',
         group: ['transform'],
         description: 'Node to interact with Skyvern',
         defaults: {
             name: 'Skyvern',
         },
-        inputs: ['main'],
-        outputs: ['main'],
+        inputs: [NodeConnectionType.Main],
+        outputs: [NodeConnectionType.Main],
         credentials: [
             {
                 name: 'skyvernApi',
