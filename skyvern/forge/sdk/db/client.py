@@ -1718,6 +1718,21 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
+    async def get_workflow_output_parameters_by_ids(self, output_parameter_ids: list[str]) -> list[OutputParameter]:
+        try:
+            async with self.Session() as session:
+                output_parameters = (
+                    await session.scalars(
+                        select(OutputParameterModel).filter(
+                            OutputParameterModel.output_parameter_id.in_(output_parameter_ids)
+                        )
+                    )
+                ).all()
+                return [convert_to_output_parameter(parameter) for parameter in output_parameters]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
     async def create_credential_parameter(
         self, workflow_id: str, key: str, credential_id: str, description: str | None = None
     ) -> CredentialParameter:

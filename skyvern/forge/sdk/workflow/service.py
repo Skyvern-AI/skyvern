@@ -929,7 +929,12 @@ class WorkflowService:
         workflow_run_output_parameters = await app.DATABASE.get_workflow_run_output_parameters(
             workflow_run_id=workflow_run_id
         )
-        output_parameters = await app.DATABASE.get_workflow_output_parameters(workflow_id=workflow_id)
+        output_parameters = await app.DATABASE.get_workflow_output_parameters_by_ids(
+            output_parameter_ids=[
+                workflow_run_output_parameter.output_parameter_id
+                for workflow_run_output_parameter in workflow_run_output_parameters
+            ]
+        )
 
         return [
             (output_parameter, workflow_run_output_parameter)
