@@ -920,6 +920,19 @@ function hasNgAttribute(element) {
   return false;
 }
 
+function isAngularMaterial(element) {
+  if (!element.attributes[Symbol.iterator]) {
+    return false;
+  }
+
+  for (let attr of element.attributes) {
+    if (attr.name.startsWith("mat")) {
+      return true;
+    }
+  }
+  return false;
+}
+
 const isAngularDropdown = (element) => {
   if (!hasNgAttribute(element)) {
     return false;
@@ -934,6 +947,20 @@ const isAngularDropdown = (element) => {
   }
 
   return false;
+};
+
+const isAngularMaterialDatePicker = (element) => {
+  if (!isAngularMaterial(element)) {
+    return false;
+  }
+
+  const tagName = element.tagName.toLowerCase();
+  if (tagName !== "input") return false;
+
+  return (
+    (element.closest("mat-datepicker") ||
+      element.closest("mat-formio-date")) !== null
+  );
 };
 
 function getPseudoContent(element, pseudo) {
@@ -1325,6 +1352,7 @@ async function buildElementObject(
       isDivComboboxDropdown(element) ||
       isDropdownButton(element) ||
       isAngularDropdown(element) ||
+      isAngularMaterialDatePicker(element) ||
       isSelect2Dropdown(element) ||
       isSelect2MultiChoice(element),
     isCheckable: isCheckableDiv(element),

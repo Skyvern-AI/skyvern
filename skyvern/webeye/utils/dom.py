@@ -13,6 +13,7 @@ from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     ElementIsNotLabel,
+    InteractWithDisabledElement,
     MissingElement,
     MissingElementDict,
     MissingElementInCSSMap,
@@ -579,6 +580,45 @@ class SkyvernElement:
         await page.mouse.move(dest_x, dest_y)
 
         return dest_x, dest_y
+
+    async def click(
+        self,
+        page: Page,
+        dom: DomUtil | None = None,
+        incremental_page: IncrementalScrapePage | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> None:
+        if await self.is_disabled(dynamic=True):
+            raise InteractWithDisabledElement(element_id=self.get_id())
+
+        try:
+            await self.get_locator().click(timeout=timeout)
+            return
+        except Exception:
+            LOG.info("Failed to click by playwright", exc_info=True, element_id=self.get_id())
+
+        if dom is not None:
+            # try to click on the blocking element
+            try:
+                await self.scroll_into_view(timeout=timeout)
+                blocking_element, _ = await self.find_blocking_element(dom=dom, incremental_page=incremental_page)
+                if blocking_element:
+                    LOG.debug("Find the blocking element", element_id=blocking_element.get_id())
+                    await blocking_element.get_locator().click(timeout=timeout)
+                    return
+            except Exception:
+                LOG.info("Failed to click on the blocking element", exc_info=True, element_id=self.get_id())
+
+        try:
+            await self.scroll_into_view(timeout=timeout)
+            await self.coordinate_click(page=page, timeout=timeout)
+            return
+        except Exception:
+            LOG.info("Failed to click by coordinate", exc_info=True, element_id=self.get_id())
+
+        await self.scroll_into_view(timeout=timeout)
+        await self.click_in_javascript()
+        return
 
     async def click_in_javascript(self) -> None:
         skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
