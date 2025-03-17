@@ -1,4 +1,4 @@
-import { IDataObject, IExecuteSingleFunctions, IHttpRequestMethods, IHttpRequestOptions, INodeType, INodeTypeDescription, NodeConnectionType } from 'n8n-workflow';
+import { IDataObject, IExecuteSingleFunctions, IHttpRequestMethods, IHttpRequestOptions, ILoadOptionsFunctions, INodePropertyOptions, INodeType, INodeTypeDescription, NodeConnectionType } from 'n8n-workflow';
 const fetch = require('node-fetch');
 
 export class Skyvern implements INodeType {
@@ -202,10 +202,14 @@ export class Skyvern implements INodeType {
                 },
             },
             {
-                displayName: 'Workflow ID',
-                description: 'The permanent ID of the workflow',
+                displayName: 'Workflow Title',
+                description: 'The title of the workflow',
                 name: 'workflowId',
-                type: 'string',
+                type: 'options',
+                typeOptions: {
+                    loadOptionsMethod: 'getWorkflows',
+                    loadOptionsDependsOn: ['resource'],
+                },
                 required: true,
                 default: '',
                 displayOptions: {
@@ -287,4 +291,30 @@ export class Skyvern implements INodeType {
         ],
         version: 1,
     };
+    
+    methods = {
+        loadOptions: {
+            async getWorkflows(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+                const resource = this.getCurrentNodeParameter('resource') as string;
+                if (resource !== 'workflow') return [];
+
+                const credentials = await this.getCredentials('skyvernApi');
+                const response = await fetch(credentials['baseUrl'] + '/api/v1/workflows?page_size=100', {
+                    headers: {
+                        'x-api-key': credentials['apiKey'],
+                    },
+                });
+                if (!response.ok) {
+                    throw new Error('Request to get workflows failed');
+                }
+                const data = await response.json();
+                const d =  data.map((workflow: any) => ({
+                    name: workflow.title,
+                    value: workflow.workflow_id,
+                }));
+                console.log(d)
+                return d;
+            },
+        },
+    }
 }
