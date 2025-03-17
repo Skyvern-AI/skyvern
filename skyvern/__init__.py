@@ -3,6 +3,7 @@ from ddtrace.filters import FilterRequestsOnUrl
 
 from skyvern.agent import SkyvernAgent, SkyvernClient
 from skyvern.forge.sdk.forge_log import setup_logger
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunResponse
 
 tracer.configure(
     settings={
@@ -13,4 +14,4 @@ tracer.configure(
 )
 setup_logger()
 
-__all__ = ["SkyvernAgent", "SkyvernClient"]
+__all__ = ["SkyvernAgent", "SkyvernClient", "WorkflowRunResponse"]
