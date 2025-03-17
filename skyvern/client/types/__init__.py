@@ -277,7 +277,7 @@ from .workflow_run_block_data_schema import WorkflowRunBlockDataSchema
 from .workflow_run_block_navigation_payload import WorkflowRunBlockNavigationPayload
 from .workflow_run_block_output import WorkflowRunBlockOutput
 from .workflow_run_status import WorkflowRunStatus
-from .workflow_run_status_response import WorkflowRunStatusResponse
+from .workflow_run_status_response import WorkflowRunResponse
 from .workflow_run_timeline import WorkflowRunTimeline
 from .workflow_run_timeline_type import WorkflowRunTimelineType
 from .workflow_status import WorkflowStatus
@@ -528,7 +528,7 @@ __all__ = [
     "WorkflowRunBlockNavigationPayload",
     "WorkflowRunBlockOutput",
     "WorkflowRunStatus",
-    "WorkflowRunStatusResponse",
+    "WorkflowRunResponse",
     "WorkflowRunTimeline",
     "WorkflowRunTimelineType",
     "WorkflowStatus",

@@ -70,8 +70,8 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     Workflow,
     WorkflowRequestBody,
     WorkflowRun,
+    WorkflowRunResponse,
     WorkflowRunStatus,
-    WorkflowRunStatusResponse,
     WorkflowStatus,
 )
 from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
@@ -714,17 +714,17 @@ async def get_workflow_run_timeline(
 
 @base_router.get(
     "/workflows/runs/{workflow_run_id}",
-    response_model=WorkflowRunStatusResponse,
+    response_model=WorkflowRunResponse,
 )
 @base_router.get(
     "/workflows/runs/{workflow_run_id}/",
-    response_model=WorkflowRunStatusResponse,
+    response_model=WorkflowRunResponse,
     include_in_schema=False,
 )
 async def get_workflow_run(
     workflow_run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> WorkflowRunStatusResponse:
+) -> WorkflowRunResponse:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
     return await app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id(
         workflow_run_id=workflow_run_id,

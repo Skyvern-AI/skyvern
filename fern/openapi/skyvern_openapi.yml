@@ -1164,7 +1164,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/WorkflowRunStatusResponse'
+                $ref: '#/components/schemas/WorkflowRunResponse'
         '422':
           description: Validation Error
           content:
@@ -4879,7 +4879,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/WorkflowRunStatusResponse'
+                $ref: '#/components/schemas/WorkflowRunResponse'
         '422':
           description: Validation Error
           content:
@@ -9373,7 +9373,7 @@ components:
         - timed_out
         - completed
       title: WorkflowRunStatus
-    WorkflowRunStatusResponse:
+    WorkflowRunResponse:
       properties:
         workflow_id:
           type: string
@@ -9464,7 +9464,7 @@ components:
         - created_at
         - modified_at
         - parameters
-      title: WorkflowRunStatusResponse
+      title: WorkflowRunResponse
     WorkflowRunTimeline:
       properties:
         type:
