@@ -1,4 +1,4 @@
-import { IDataObject, IExecuteSingleFunctions, IHttpRequestMethods, IHttpRequestOptions, ILoadOptionsFunctions, INodePropertyOptions, INodeType, INodeTypeDescription, NodeConnectionType } from 'n8n-workflow';
+import { IDataObject, IExecuteSingleFunctions, IHttpRequestMethods, IHttpRequestOptions, ILoadOptionsFunctions, INodePropertyOptions, INodeType, INodeTypeDescription, NodeConnectionType, ResourceMapperFields } from 'n8n-workflow';
 const fetch = require('node-fetch');
 
 export class Skyvern implements INodeType {
@@ -267,16 +267,55 @@ export class Skyvern implements INodeType {
                     },
                 },
             },
+            // {
+            //     displayName: 'Workflow Run Parameters',
+            //     name: 'workflowRunParameters',
+            //     type: 'json',
+            //     description: 'The json-formatted parameters to pass the workflow run to execute',
+            //     default: '{}',
+            //     displayOptions: {
+            //         show: {
+            //             resource: ['workflow'],
+            //             workflowOperation: ['dispatch'],
+            //         },
+            //     },
+            //     routing: {
+            //         request: {
+            //             url: '={{"/api/v1/workflows/" + $parameter["workflowId"] + "/run"}}',
+            //             body: {
+            //                 data: '={{ JSON.parse($value)}}',
+            //             },
+            //         },
+            //     },
+            // },
             {
                 displayName: 'Workflow Run Parameters',
                 name: 'workflowRunParameters',
-                type: 'json',
+                type: 'resourceMapper',
+                noDataExpression: true,
                 description: 'The json-formatted parameters to pass the workflow run to execute',
-                default: '{}',
+                required: true,
+                default: {
+                    mappingMode: 'defineBelow',
+                    value: null,
+                },
                 displayOptions: {
                     show: {
                         resource: ['workflow'],
                         workflowOperation: ['dispatch'],
+                    },
+                },
+                typeOptions: {
+                    loadOptionsDependsOn: ['workflowId'],
+                    resourceMapper: {
+                        resourceMapperMethod: 'getWorkflowRunParameters',
+                        mode: 'update',
+                        fieldWords: {
+                            singular: 'workflowRunParameter',
+                            plural: 'workflowRunParameters',
+                        },
+                        addAllFields: true,
+                        multiKeyMatch: true,
                     },
                 },
                 routing: {
@@ -287,7 +326,7 @@ export class Skyvern implements INodeType {
                         },
                     },
                 },
-            }
+            },
         ],
         version: 1,
     };
@@ -308,12 +347,36 @@ export class Skyvern implements INodeType {
                     throw new Error('Request to get workflows failed');
                 }
                 const data = await response.json();
-                const d =  data.map((workflow: any) => ({
+                return data.map((workflow: any) => ({
                     name: workflow.title,
                     value: workflow.workflow_id,
                 }));
-                console.log(d)
-                return d;
+            },
+        },
+        resourceMapping: {
+            async getWorkflowRunParameters(this: ILoadOptionsFunctions): Promise<ResourceMapperFields> {
+                return {
+                    fields: [
+                        {
+                            id: 'test',
+                            displayName: 'test',
+                            defaultMatch: true,
+                            canBeUsedToMatch: true,
+                            required: true,
+                            display: true,
+                            type: 'string',
+                        },
+                        {
+                            id: 'test2',
+                            displayName: 'test2',
+                            defaultMatch: true,
+                            canBeUsedToMatch: true,
+                            required: true,
+                            display: true,
+                            type: 'string',
+                        },
+                    ],
+                }
             },
         },
     }
