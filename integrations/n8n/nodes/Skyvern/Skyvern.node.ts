@@ -48,10 +48,12 @@ export class Skyvern implements INodeType {
                     {
                         name: 'Dispatch a Task',
                         value: 'dispatch',
+                        description: 'Dispatch a task to execute asynchronously',
                     },
                     {
                         name: 'Get a Task',
                         value: 'get',
+                        description: 'Get a task by ID',
                     },
                 ],
                 displayOptions: {
@@ -172,6 +174,7 @@ export class Skyvern implements INodeType {
                 displayName: 'Task Options',
                 name: 'taskOptions',
                 type: 'collection',
+                description: 'Optional Configuration for the task',
                 placeholder: 'Add Task Options',
                 default: {},
                 options: [
@@ -200,6 +203,7 @@ export class Skyvern implements INodeType {
             },
             {
                 displayName: 'Workflow ID',
+                description: 'The permanent ID of the workflow',
                 name: 'workflowId',
                 type: 'string',
                 required: true,
@@ -220,10 +224,12 @@ export class Skyvern implements INodeType {
                     {
                         name: 'Get a Workflow Run',
                         value: 'get',
+                        description: 'Get a workflow run by ID',
                     },
                     {
                         name: 'Dispatch a Workflow Run',
                         value: 'dispatch',
+                        description: 'Dispatch a workflow run to execute asynchronously',
                     },
                 ],
                 displayOptions: {
@@ -240,6 +246,7 @@ export class Skyvern implements INodeType {
             },
             {
                 displayName: 'Workflow Run ID',
+                description: 'The ID of the workflow run',
                 name: 'workflowRunId',
                 type: 'string',
                 required: true,
@@ -260,6 +267,7 @@ export class Skyvern implements INodeType {
                 displayName: 'Workflow Run Parameters',
                 name: 'workflowRunParameters',
                 type: 'json',
+                description: 'The json-formatted parameters to pass the workflow run to execute',
                 default: '',
                 displayOptions: {
                     show: {
