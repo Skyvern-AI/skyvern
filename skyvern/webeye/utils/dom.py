@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import structlog
 import typing
 from enum import StrEnum
-from playwright.async_api import ElementHandle, Frame, FrameLocator, Locator, Page, TimeoutError
 from random import uniform
+
+import structlog
+from playwright.async_api import ElementHandle, Frame, FrameLocator, Locator, Page, TimeoutError
 
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR
