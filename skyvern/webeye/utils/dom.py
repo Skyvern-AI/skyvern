@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import structlog
 import typing
 from enum import StrEnum
-from random import uniform
-
-import structlog
 from playwright.async_api import ElementHandle, Frame, FrameLocator, Locator, Page, TimeoutError
+from random import uniform
 
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR
@@ -127,6 +126,10 @@ class SkyvernElement:
         self.locator = locator
         self.hash_value = hash_value
         self._id_cache = static_element.get("id", "")
+        self._tag_name = static_element.get("tagName", "")
+        self._selectable = static_element.get("isSelectable", False)
+        self._frame_id = static_element.get("frame", "")
+        self._attributes = static_element.get("attributes", {})
 
     def __repr__(self) -> str:
         return f"SkyvernElement({str(self.__static_element)})"
@@ -289,19 +292,19 @@ class SkyvernElement:
         return self.__static_element
 
     def get_selectable(self) -> bool:
-        return self.__static_element.get("isSelectable", False)
+        return self._selectable
 
     def get_tag_name(self) -> str:
-        return self.__static_element.get("tagName", "")
+        return self._tag_name
 
     def get_id(self) -> str:
         return self._id_cache
 
     def get_frame_id(self) -> str:
-        return self.__static_element.get("frame", "")
+        return self._frame_id
 
     def get_attributes(self) -> typing.Dict:
-        return self.__static_element.get("attributes", {})
+        return self._attributes
 
     def get_options(self) -> typing.List[SkyvernOptionType]:
         options = self.__static_element.get("options", None)
