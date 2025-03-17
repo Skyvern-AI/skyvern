@@ -41,6 +41,8 @@ class TaskV2(BaseModel):
     totp_identifier: str | None = None
     proxy_location: ProxyLocation | None = None
     webhook_callback_url: str | None = None
+    extracted_information_schema: dict | list | str | None = None
+    error_code_mapping: dict | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -117,6 +119,8 @@ class TaskV2Request(BaseModel):
     totp_identifier: str | None = None
     proxy_location: ProxyLocation | None = None
     publish_workflow: bool = False
+    extracted_information_schema: dict | list | str | None = None
+    error_code_mapping: dict[str, str] | None = None
 
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
     @classmethod

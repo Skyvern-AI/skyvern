@@ -1395,6 +1395,7 @@ async def _summarize_task_v2(
         "task_v2_summary",
         user_goal=task_v2.prompt,
         task_history=task_history,
+        extracted_information_schema=task_v2.extracted_information_schema,
         local_datetime=datetime.now(context.tz_info).isoformat(),
     )
     task_v2_summary_resp = await app.LLM_API_HANDLER(
