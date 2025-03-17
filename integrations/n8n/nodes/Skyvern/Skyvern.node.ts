@@ -62,7 +62,7 @@ export class Skyvern implements INodeType {
                     request: {
                         baseURL: '={{$credentials.baseUrl}}',
                         method: '={{ $value === "dispatch" ? "POST" : "GET" }}' as IHttpRequestMethods,
-                        url: '={{"/api/" + ($parameter["taskOptions"]["version"] ? $parameter["taskOptions"]["version"] : "v2") + "/tasks"}}',
+                        url: '={{"/api/" + ($parameter["taskOptions"]["engine"] ? $parameter["taskOptions"]["engine"] : "v2") + "/tasks"}}',
                     },
                     send: {
                         preSend: [
@@ -71,7 +71,7 @@ export class Skyvern implements INodeType {
                                 if (taskOperation === "get") return requestOptions;
 
                                 const taskOptions: IDataObject = this.getNodeParameter('taskOptions') as IDataObject;
-                                if (taskOptions["version"] !== "v1") return requestOptions;
+                                if (taskOptions["engine"] !== "v1") return requestOptions;
 
                                 // trigger the generate task v1 logic
                                 const credentials = await this.getCredentials('skyvernApi');
@@ -163,7 +163,7 @@ export class Skyvern implements INodeType {
                 routing: {
                     request: {
                         method: 'GET',
-                        url: '={{"/api/" + ($parameter["taskOptions"]["version"] ? $parameter["taskOptions"]["version"] : "v2") + "/tasks/" + $value}}',
+                        url: '={{"/api/" + ($parameter["taskOptions"]["engine"] ? $parameter["taskOptions"]["engine"] : "v2") + "/tasks/" + $value}}',
                     },
                 },
             },
@@ -175,17 +175,17 @@ export class Skyvern implements INodeType {
                 default: {},
                 options: [
                     {
-                        displayName: 'Version',
-                        name: 'version',
+                        displayName: 'Engine',
+                        name: 'engine',
                         type: 'options',
                         default: 'v2',
                         options: [
                             {
-                                name: 'V1',
+                                name: 'TaskV1',
                                 value: 'v1',
                             },
                             {
-                                name: 'V2',
+                                name: 'TaskV2',
                                 value: 'v2',
                             },
                         ],
