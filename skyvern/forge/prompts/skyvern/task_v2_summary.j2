@@ -5,7 +5,7 @@ You want to present the response in a clear way so that user can clearly underst
 Reply in JSON format with the following keys:
 {
     "description": str, // Summarize what has been achieved and describe the information extracted related to the user goal if any. Be precise and concise.
-    "output": json, // Structured data related to the user goal if any.{% if extracted_information_schema %}Conform the data to the ideal schema for the output.{% endif %}
+    "output": json, // Structured data related to the user goal if any.{% if extracted_information_schema %} Use the data schema for the output field.{% endif %}
 }
 
 User goal:
