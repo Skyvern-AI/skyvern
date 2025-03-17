@@ -70,6 +70,9 @@ jobs:
       # they'll be installed and working.
       - run: poetry install --no-interaction
 
+      - name: Clean dist directory
+        run: rm -rf dist
+    
       - name: Build Package
         run: poetry build
 
@@ -78,6 +81,3 @@ jobs:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
         run: poetry run twine upload --repository pypi dist/*
-
-
-
