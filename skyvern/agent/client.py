@@ -1,4 +1,5 @@
 from enum import StrEnum
+from typing import Any
 
 import httpx
 
@@ -51,7 +52,7 @@ class SkyvernClient:
         totp_identifier: str | None = None,
         totp_url: str | None = None,
     ) -> RunWorkflowResponse:
-        data = {
+        data: dict[str, Any] = {
             "webhook_callback_url": webhook_url,
             "proxy_location": proxy_location,
             "totp_identifier": totp_identifier,
@@ -86,6 +87,7 @@ class SkyvernClient:
             response = await client.get(
                 f"{self.base_url}/api/v1/workflows/runs/{workflow_run_id}",
                 headers={"x-api-key": self.api_key},
+                timeout=60,
             )
             if response.status_code != 200:
                 raise SkyvernClientException(
