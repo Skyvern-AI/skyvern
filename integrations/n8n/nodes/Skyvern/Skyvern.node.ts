@@ -115,7 +115,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['task'],
-                        taskOperation: ['create'],
+                        taskOperation: ['dispatch'],
                     },
                 },
                 routing: {
