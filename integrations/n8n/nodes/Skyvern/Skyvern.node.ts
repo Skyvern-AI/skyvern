@@ -268,7 +268,7 @@ export class Skyvern implements INodeType {
                 name: 'workflowRunParameters',
                 type: 'json',
                 description: 'The json-formatted parameters to pass the workflow run to execute',
-                default: '',
+                default: '{}',
                 displayOptions: {
                     show: {
                         resource: ['workflow'],
