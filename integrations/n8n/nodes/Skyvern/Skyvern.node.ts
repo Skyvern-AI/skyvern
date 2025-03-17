@@ -198,7 +198,84 @@ export class Skyvern implements INodeType {
                     },
                 },
             },
-
+            {
+                displayName: 'Workflow ID',
+                name: 'workflowId',
+                type: 'string',
+                required: true,
+                default: '',
+                displayOptions: {
+                    show: {
+                        resource: ['workflow'],
+                    },
+                },
+            },
+            {
+                displayName: 'Workflow Operation',
+                name: 'workflowOperation',
+                type: 'options',
+                required: true,
+                default: 'get',
+                options: [
+                    {
+                        name: 'Get a Workflow Run',
+                        value: 'get',
+                    },
+                    {
+                        name: 'Dispatch a Workflow Run',
+                        value: 'dispatch',
+                    },
+                ],
+                displayOptions: {
+                    show: {
+                        resource: ['workflow'],
+                    },
+                },
+                routing: {
+                    request: {
+                        baseURL: '={{$credentials.baseUrl}}',
+                        method: '={{ $value === "dispatch" ? "POST" : "GET" }}' as IHttpRequestMethods,
+                    },
+                },
+            },
+            {
+                displayName: 'Workflow Run ID',
+                name: 'workflowRunId',
+                type: 'string',
+                required: true,
+                default: '',
+                displayOptions: {
+                    show: {
+                        resource: ['workflow'],
+                        workflowOperation: ['get'],
+                    },
+                },
+                routing: {
+                    request: {
+                        url: '={{"/api/v1/workflows/" + $parameter["workflowId"] + "/runs/" + $value}}',
+                    },
+                },
+            },
+            {
+                displayName: 'Workflow Run Parameters',
+                name: 'workflowRunParameters',
+                type: 'json',
+                default: '',
+                displayOptions: {
+                    show: {
+                        resource: ['workflow'],
+                        workflowOperation: ['dispatch'],
+                    },
+                },
+                routing: {
+                    request: {
+                        url: '={{"/api/v1/workflows/" + $parameter["workflowId"] + "/run"}}',
+                        body: {
+                            data: '={{ JSON.parse($value)}}',
+                        },
+                    },
+                },
+            }
         ],
         version: 1,
     };
