@@ -1,4 +1,4 @@
-import { IDataObject, IExecuteSingleFunctions, IHttpRequestMethods, IHttpRequestOptions, ILoadOptionsFunctions, INodePropertyOptions, INodeType, INodeTypeDescription, NodeConnectionType, ResourceMapperFields } from 'n8n-workflow';
+import { FieldType, IDataObject, IExecuteSingleFunctions, IHttpRequestMethods, IHttpRequestOptions, ILoadOptionsFunctions, INodePropertyOptions, INodeType, INodeTypeDescription, NodeConnectionType, ResourceMapperField, ResourceMapperFields } from 'n8n-workflow';
 const fetch = require('node-fetch');
 
 export class Skyvern implements INodeType {
@@ -267,27 +267,6 @@ export class Skyvern implements INodeType {
                     },
                 },
             },
-            // {
-            //     displayName: 'Workflow Run Parameters',
-            //     name: 'workflowRunParameters',
-            //     type: 'json',
-            //     description: 'The json-formatted parameters to pass the workflow run to execute',
-            //     default: '{}',
-            //     displayOptions: {
-            //         show: {
-            //             resource: ['workflow'],
-            //             workflowOperation: ['dispatch'],
-            //         },
-            //     },
-            //     routing: {
-            //         request: {
-            //             url: '={{"/api/v1/workflows/" + $parameter["workflowId"] + "/run"}}',
-            //             body: {
-            //                 data: '={{ JSON.parse($value)}}',
-            //             },
-            //         },
-            //     },
-            // },
             {
                 displayName: 'Workflow Run Parameters',
                 name: 'workflowRunParameters',
@@ -322,7 +301,7 @@ export class Skyvern implements INodeType {
                     request: {
                         url: '={{"/api/v1/workflows/" + $parameter["workflowId"] + "/run"}}',
                         body: {
-                            data: '={{ JSON.parse($value)}}',
+                            data: '={{$value["value"]}}',
                         },
                     },
                 },
@@ -349,33 +328,73 @@ export class Skyvern implements INodeType {
                 const data = await response.json();
                 return data.map((workflow: any) => ({
                     name: workflow.title,
-                    value: workflow.workflow_id,
+                    value: workflow.workflow_permanent_id,
                 }));
             },
         },
         resourceMapping: {
             async getWorkflowRunParameters(this: ILoadOptionsFunctions): Promise<ResourceMapperFields> {
+                const resource = this.getCurrentNodeParameter('resource') as string;
+                if (resource !== 'workflow') return { fields: [] };
+
+                const workflowOperation = this.getCurrentNodeParameter('workflowOperation') as string;
+                if (workflowOperation !== 'dispatch') return { fields: [] };
+               
+                const workflowId = this.getCurrentNodeParameter('workflowId') as string;
+                if (!workflowId) return { fields: [] };
+
+                const credentials = await this.getCredentials('skyvernApi');
+                const response = await fetch(credentials['baseUrl'] + '/api/v1/workflows/' + workflowId, {
+                    headers: {
+                        'x-api-key': credentials['apiKey'],
+                    },
+                });
+                if (!response.ok) {
+                    throw new Error('Request to get workflow failed');
+                }
+                const workflow = await response.json();
+                const parameters: any[] = workflow.workflow_definition.parameters;
+                const fields: ResourceMapperField[] = [];
+
+                const parameter_type_map: Record<string, string> = {
+                    'string': 'string',
+                    'integer': 'number',
+                    'float': 'number',
+                    'boolean': 'boolean',
+                    'json': 'json',
+                    'file_url': 'url',
+                    'credential_id': 'string',
+                }
+
+                parameters
+                    .filter((parameter: any) => parameter.parameter_type === 'workflow')
+                    .forEach((parameter: any) => {
+                        fields.push({
+                            id: parameter.key,
+                            displayName: parameter.key,
+                            defaultMatch: true,
+                            canBeUsedToMatch: false,
+                            required: parameter.default_value === null,
+                            display: true,
+                            type: parameter_type_map[parameter.workflow_parameter_type] as FieldType,
+                        });
+                    });
+
+                // HACK: If there are no parameters, add a empty field to avoid the resource mapper from crashing
+                if (fields.length === 0) {
+                    fields.push({
+                        id: 'NO_PARAMETERS',
+                        displayName: 'No Parameters',
+                        defaultMatch: false,
+                        canBeUsedToMatch: false,
+                        required: false,
+                        display: true,
+                        type: 'string',
+                    });
+                }
+
                 return {
-                    fields: [
-                        {
-                            id: 'test',
-                            displayName: 'test',
-                            defaultMatch: true,
-                            canBeUsedToMatch: true,
-                            required: true,
-                            display: true,
-                            type: 'string',
-                        },
-                        {
-                            id: 'test2',
-                            displayName: 'test2',
-                            defaultMatch: true,
-                            canBeUsedToMatch: true,
-                            required: true,
-                            display: true,
-                            type: 'string',
-                        },
-                    ],
+                    fields: fields,
                 }
             },
         },
