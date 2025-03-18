@@ -1133,6 +1133,8 @@ async def run_task_v2(
             proxy_location=data.proxy_location,
             publish_workflow=data.publish_workflow,
             create_task_run=True,
+            extracted_information_schema=data.extracted_information_schema,
+            error_code_mapping=data.error_code_mapping,
         )
     except LLMProviderError:
         LOG.error("LLM failure to initialize task v2", exc_info=True)
