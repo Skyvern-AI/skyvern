@@ -167,7 +167,15 @@ function PromptBox() {
           proxy_location: proxyLocation,
           totp_identifier: totpIdentifier,
           publish_workflow: publishWorkflow,
-          extracted_information_schema: dataSchema,
+          extracted_information_schema: dataSchema
+            ? (() => {
+                try {
+                  return JSON.parse(dataSchema);
+                } catch (e) {
+                  return dataSchema;
+                }
+              })()
+            : null,
         },
         {
           headers: {
@@ -425,8 +433,8 @@ function PromptBox() {
                         onChange={(value) => setDataSchema(value || null)}
                         language="json"
                         minHeight="100px"
-                        maxHeight="200px"
-                        fontSize={14}
+                        maxHeight="500px"
+                        fontSize={8}
                       />
                     </div>
                   </div>
