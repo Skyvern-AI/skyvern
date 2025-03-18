@@ -392,7 +392,7 @@ export class Skyvern implements INodeType {
                             displayName: parameter.key,
                             defaultMatch: true,
                             canBeUsedToMatch: false,
-                            required: parameter.default_value ? false : true,
+                            required: parameter.default_value === undefined || parameter.default_value === null,
                             display: true,
                             type: parameterType,
                             options: options,
