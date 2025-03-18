@@ -58,12 +58,13 @@ def get_bitwarden_item_type_code(item_type: BitwardenItemType) -> int:
 def get_list_response_item_from_bitwarden_item(item: dict) -> CredentialItem:
     if item["type"] == BitwardenItemType.LOGIN:
         login = item["login"]
+        totp = BitwardenService.extract_totp_secret(login.get("totp", ""))
         return CredentialItem(
             item_id=item["id"],
             credential=PasswordCredential(
                 username=login["username"] or "",
                 password=login["password"] or "",
-                totp=login["totp"],
+                totp=totp,
             ),
             name=item["name"],
             credential_type=CredentialType.PASSWORD,
@@ -295,10 +296,14 @@ class BitwardenService:
                     item = json.loads(item_result.stdout)
                 except json.JSONDecodeError:
                     raise BitwardenGetItemError(f"Failed to parse item JSON for item ID: {item_id}")
+
+                login = item["login"]
+                totp = BitwardenService.extract_totp_secret(login.get("totp", ""))
+
                 return {
-                    BitwardenConstants.USERNAME: item["login"]["username"],
-                    BitwardenConstants.PASSWORD: item["login"]["password"],
-                    BitwardenConstants.TOTP: item["login"]["totp"],
+                    BitwardenConstants.USERNAME: login.get("username", ""),
+                    BitwardenConstants.PASSWORD: login.get("password", ""),
+                    BitwardenConstants.TOTP: totp,
                 }
             elif not url:
                 # if item_id is not provided, we need a url to search for items
@@ -737,14 +742,14 @@ class BitwardenService:
             raise BitwardenGetItemError(f"Failed to get login item by ID: {item_id}")
 
         login = response["data"]["login"]
-
+        totp = BitwardenService.extract_totp_secret(login.get("totp", ""))
         if not login:
             raise BitwardenGetItemError(f"Item with ID: {item_id} is not a login item")
 
         return PasswordCredential(
             username=login["username"] or "",
             password=login["password"] or "",
-            totp=login["totp"],
+            totp=totp,
         )
 
     @staticmethod
