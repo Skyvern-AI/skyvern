@@ -370,7 +370,9 @@ class WorkflowService:
                         block_label=block.label,
                     )
                     if not block.continue_on_failure:
-                        failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed. failure reason: {block_result.failure_reason}"
+                        failure_reason = (
+                            f"{block.block_type} block failed. failure reason: {block_result.failure_reason}"
+                        )
                         await self.mark_workflow_run_as_failed(
                             workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                         )
@@ -406,7 +408,7 @@ class WorkflowService:
                     )
 
                     if not block.continue_on_failure:
-                        failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} terminated. Reason: {block_result.failure_reason}"
+                        failure_reason = f"{block.block_type} block terminated. Reason: {block_result.failure_reason}"
                         await self.mark_workflow_run_as_terminated(
                             workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                         )
@@ -442,7 +444,7 @@ class WorkflowService:
                     )
 
                     if not block.continue_on_failure:
-                        failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} timed out. Reason: {block_result.failure_reason}"
+                        failure_reason = f"{block.block_type} block timed out. Reason: {block_result.failure_reason}"
                         await self.mark_workflow_run_as_failed(
                             workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                         )
@@ -479,7 +481,7 @@ class WorkflowService:
                 if isinstance(e, SkyvernException):
                     exception_message = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
 
-                failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed. failure reason: {exception_message}"
+                failure_reason = f"{block.block_type} block failed. failure reason: {exception_message}"
                 await self.mark_workflow_run_as_failed(
                     workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                 )
