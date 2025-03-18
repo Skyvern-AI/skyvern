@@ -839,7 +839,7 @@ async def delete_workflow(
 
 
 @base_router.get("/workflows", response_model=list[Workflow])
-@base_router.get("/workflows/", response_model=list[Workflow])
+@base_router.get("/workflows/", response_model=list[Workflow], include_in_schema=False)
 async def get_workflows(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
