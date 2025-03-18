@@ -1163,7 +1163,7 @@ class ForgeAgent:
             step_id=step.step_id,
             workflow_run_id=task.workflow_run_id,
         )
-        scraped_page_refreshed = await scraped_page.refresh()
+        scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False)
 
         verification_prompt = prompt_engine.load_prompt(
             "check-user-goal",
