@@ -96,6 +96,8 @@ async def initialize_task_v2(
     publish_workflow: bool = False,
     parent_workflow_run_id: str | None = None,
     create_task_run: bool = False,
+    extracted_information_schema: dict | list | str | None = None,
+    error_code_mapping: dict | None = None,
 ) -> TaskV2:
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
@@ -104,6 +106,8 @@ async def initialize_task_v2(
         totp_identifier=totp_identifier,
         webhook_callback_url=webhook_callback_url,
         proxy_location=proxy_location,
+        extracted_information_schema=extracted_information_schema,
+        error_code_mapping=error_code_mapping,
     )
     # set task_v2_id in context
     context = skyvern_context.current()
