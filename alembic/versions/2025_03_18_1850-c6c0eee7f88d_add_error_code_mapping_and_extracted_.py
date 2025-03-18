@@ -1,8 +1,8 @@
 """add error_code_mapping and extracted_information_schema to task v2
 
-Revision ID: 31917e2735bf
+Revision ID: c6c0eee7f88d
 Revises: 268dcc995513
-Create Date: 2025-03-17 07:10:48.172165+00:00
+Create Date: 2025-03-18 18:50:28.930836+00:00
 
 """
 
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "31917e2735bf"
+revision: str = "c6c0eee7f88d"
 down_revision: Union[str, None] = "268dcc995513"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
