@@ -354,31 +354,52 @@ export class Skyvern implements INodeType {
                 }
                 const workflow = await response.json();
                 const parameters: any[] = workflow.workflow_definition.parameters;
-                const fields: ResourceMapperField[] = [];
 
-                const parameter_type_map: Record<string, string> = {
-                    'string': 'string',
-                    'integer': 'number',
-                    'float': 'number',
-                    'boolean': 'boolean',
-                    'json': 'json',
-                    'file_url': 'url',
-                    'credential_id': 'string',
-                }
+                const fields: ResourceMapperField[] = await Promise.all(
+                    parameters.filter((parameter: any) => parameter.parameter_type === 'workflow' || parameter.parameter_type === 'credential')
+                    .map(async (parameter: any) => {
+                        let options: INodePropertyOptions[] | undefined = undefined;
+                        let parameterType: FieldType | undefined = undefined;
+                        if (parameter.parameter_type === 'credential') {
+                            const response = await fetch(credentials['baseUrl'] + '/api/v1/credentials', {
+                                headers: {
+                                    'x-api-key': credentials['apiKey'],
+                                },
+                            });
+                            if (!response.ok) {
+                                throw new Error('Request to get credentials failed');
+                            }
+                            const data = await response.json();
+                            options = data.map((credential: any) => ({
+                                name: credential.name,
+                                value: credential.credential_id,
+                            }));
+                            parameterType = 'options';
+                        }else{
+                            const parameter_type_map: Record<string, string> = {
+                                'string': 'string',
+                                'integer': 'number',
+                                'float': 'number',
+                                'boolean': 'boolean',
+                                'json': 'json',
+                                'file_url': 'url',
+                            }
+                            parameterType = parameter_type_map[parameter.workflow_parameter_type] as FieldType;
+                        }
 
-                parameters
-                    .filter((parameter: any) => parameter.parameter_type === 'workflow')
-                    .forEach((parameter: any) => {
-                        fields.push({
+                        return {
                             id: parameter.key,
                             displayName: parameter.key,
                             defaultMatch: true,
                             canBeUsedToMatch: false,
-                            required: parameter.default_value === null,
+                            required: parameter.default_value ? false : true,
                             display: true,
-                            type: parameter_type_map[parameter.workflow_parameter_type] as FieldType,
-                        });
-                    });
+                            type: parameterType,
+                            options: options,
+                        };
+                    })
+                );
+
 
                 // HACK: If there are no parameters, add a empty field to avoid the resource mapper from crashing
                 if (fields.length === 0) {
