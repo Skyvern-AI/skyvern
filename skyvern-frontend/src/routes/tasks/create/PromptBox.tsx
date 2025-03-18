@@ -25,6 +25,7 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import {
   FileTextIcon,
   GearIcon,
@@ -153,6 +154,7 @@ function PromptBox() {
   const [totpIdentifier, setTotpIdentifier] = useState("");
   const [maxStepsOverride, setMaxStepsOverride] = useState<string | null>(null);
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
+  const [dataSchema, setDataSchema] = useState<string | null>(null);
 
   const startObserverCruiseMutation = useMutation({
     mutationFn: async (prompt: string) => {
@@ -165,6 +167,7 @@ function PromptBox() {
           proxy_location: proxyLocation,
           totp_identifier: totpIdentifier,
           publish_workflow: publishWorkflow,
+          extracted_information_schema: dataSchema,
         },
         {
           headers: {
@@ -408,6 +411,24 @@ function PromptBox() {
                         setMaxStepsOverride(event.target.value);
                       }}
                     />
+                  </div>
+                  <div className="flex gap-16">
+                    <div className="w-48 shrink-0">
+                      <div className="text-sm">Data Schema</div>
+                      <div className="text-xs text-slate-400">
+                        Specify the output data schema in JSON format
+                      </div>
+                    </div>
+                    <div className="flex-1">
+                      <CodeEditor
+                        value={dataSchema ?? ""}
+                        onChange={(value) => setDataSchema(value || null)}
+                        language="json"
+                        minHeight="100px"
+                        maxHeight="200px"
+                        fontSize={14}
+                      />
+                    </div>
                   </div>
                 </div>
               </div>
