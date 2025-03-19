@@ -202,8 +202,8 @@ export class Skyvern implements INodeType {
                 },
             },
             {
-                displayName: 'Workflow Title', // eslint-disable-line
-                description: 'The title of the workflow. Choose from the list of workflows.', // eslint-disable-line
+                displayName: 'Workflow Title or ID', // eslint-disable-line
+                description: 'The title of the workflow. Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code-examples/expressions/">expression</a>.',
                 name: 'workflowId',
                 type: 'options',
                 typeOptions: {
