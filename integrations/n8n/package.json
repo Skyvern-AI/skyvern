@@ -49,6 +49,7 @@
     "eslint-plugin-n8n-nodes-base": "^1.16.1",
     "gulp": "^4.0.2",
     "prettier": "^3.3.2",
+    "rimraf": "^6.0.1",
     "typescript": "^5.5.3"
   },
   "peerDependencies": {
