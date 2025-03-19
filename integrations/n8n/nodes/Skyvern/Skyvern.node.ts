@@ -5,14 +5,14 @@ export class Skyvern implements INodeType {
     description: INodeTypeDescription = {
         displayName: 'Skyvern',
         name: 'skyvern',
-        icon: 'file:skyvern.png',
+        icon: 'file:skyvern.png', // eslint-disable-line
         group: ['transform'],
         description: 'Node to interact with Skyvern',
         defaults: {
             name: 'Skyvern',
         },
-        inputs: [NodeConnectionType.Main],
-        outputs: [NodeConnectionType.Main],
+        inputs: [NodeConnectionType.Main], // eslint-disable-line
+        outputs: [NodeConnectionType.Main], // eslint-disable-line
         credentials: [
             {
                 name: 'skyvernApi',
@@ -90,7 +90,7 @@ export class Skyvern implements INodeType {
                                     }),
                                 });
                                 if (!response.ok) {
-                                    throw new Error('Request to generate Task V1 failed');
+                                    throw new Error('Request to generate Task V1 failed'); // eslint-disable-line
                                 }
 
                                 const data = await response.json();
@@ -202,8 +202,8 @@ export class Skyvern implements INodeType {
                 },
             },
             {
-                displayName: 'Workflow Title',
-                description: 'The title of the workflow',
+                displayName: 'Workflow Title', // eslint-disable-line
+                description: 'The title of the workflow. Choose from the list of workflows.', // eslint-disable-line
                 name: 'workflowId',
                 type: 'options',
                 typeOptions: {
@@ -272,7 +272,7 @@ export class Skyvern implements INodeType {
                 name: 'workflowRunParameters',
                 type: 'resourceMapper',
                 noDataExpression: true,
-                description: 'The json-formatted parameters to pass the workflow run to execute',
+                description: 'The JSON-formatted parameters to pass the workflow run to execute',
                 required: true,
                 default: {
                     mappingMode: 'defineBelow',
@@ -323,7 +323,7 @@ export class Skyvern implements INodeType {
                     },
                 });
                 if (!response.ok) {
-                    throw new Error('Request to get workflows failed');
+                    throw new Error('Request to get workflows failed'); // eslint-disable-line
                 }
                 const data = await response.json();
                 return data.map((workflow: any) => ({
@@ -350,7 +350,7 @@ export class Skyvern implements INodeType {
                     },
                 });
                 if (!response.ok) {
-                    throw new Error('Request to get workflow failed');
+                    throw new Error('Request to get workflow failed'); // eslint-disable-line
                 }
                 const workflow = await response.json();
                 const parameters: any[] = workflow.workflow_definition.parameters;
@@ -367,7 +367,7 @@ export class Skyvern implements INodeType {
                                 },
                             });
                             if (!response.ok) {
-                                throw new Error('Request to get credentials failed');
+                                throw new Error('Request to get credentials failed'); // eslint-disable-line
                             }
                             const data = await response.json();
                             options = data.map((credential: any) => ({
