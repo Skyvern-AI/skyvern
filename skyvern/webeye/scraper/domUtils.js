@@ -1311,16 +1311,6 @@ async function buildElementObject(
     attrs["required"] = true;
   }
 
-  if (
-    elementTagNameLower === "input" &&
-    (element.type === "radio" || element.type === "checkbox")
-  ) {
-    // if checkbox and radio don't have "checked" and "aria-checked", add a checked="false" to help LLM understand
-    if (!("checked" in attrs) && !("aria-checked" in attrs)) {
-      attrs["checked"] = false;
-    }
-  }
-
   if (elementTagNameLower === "input" || elementTagNameLower === "textarea") {
     if (element.type === "password") {
       attrs["value"] = element.value ? "*".repeat(element.value.length) : "";
