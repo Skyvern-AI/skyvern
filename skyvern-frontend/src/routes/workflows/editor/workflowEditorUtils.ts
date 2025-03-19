@@ -5,12 +5,12 @@ import { nanoid } from "nanoid";
 import {
   WorkflowBlockTypes,
   WorkflowParameterTypes,
+  WorkflowParameterValueType,
   type AWSSecretParameter,
   type OutputParameter,
   type Parameter,
   type WorkflowApiResponse,
   type WorkflowBlock,
-  type WorkflowParameterValueType,
   type WorkflowSettings,
 } from "../types/workflowTypes";
 import {
@@ -1960,6 +1960,31 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   return errors;
 }
 
+function getLabelForWorkflowParameterType(type: WorkflowParameterValueType) {
+  if (type === WorkflowParameterValueType.String) {
+    return "string";
+  }
+  if (type === WorkflowParameterValueType.Float) {
+    return "float";
+  }
+  if (type === WorkflowParameterValueType.Integer) {
+    return "integer";
+  }
+  if (type === WorkflowParameterValueType.Boolean) {
+    return "boolean";
+  }
+  if (type === WorkflowParameterValueType.FileURL) {
+    return "file_url";
+  }
+  if (type === WorkflowParameterValueType.JSON) {
+    return "json";
+  }
+  if (type === WorkflowParameterValueType.CredentialId) {
+    return "credential";
+  }
+  return type;
+}
+
 export {
   convert,
   convertEchoParameters,
@@ -1971,6 +1996,7 @@ export {
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,
   getElements,
+  getLabelForWorkflowParameterType,
   getWorkflowSettings,
   getOutputParameterKey,
   getPreviousNodeIds,

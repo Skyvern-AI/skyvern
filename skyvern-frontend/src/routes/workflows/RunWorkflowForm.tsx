@@ -25,7 +25,7 @@ import { z } from "zod";
 import { WorkflowParameter } from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { AxiosError } from "axios";
-
+import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
 type Props = {
   workflowParameters: Array<WorkflowParameter>;
   initialValues: Record<string, unknown>;
@@ -206,7 +206,9 @@ function RunWorkflowForm({
                             <div className="flex items-center gap-2 text-lg">
                               {parameter.key}
                               <span className="text-sm text-slate-400">
-                                {parameter.workflow_parameter_type}
+                                {getLabelForWorkflowParameterType(
+                                  parameter.workflow_parameter_type,
+                                )}
                               </span>
                             </div>
                             <h2 className="text-sm text-slate-400">

@@ -38,6 +38,7 @@ import {
   WorkflowApiResponse,
   WorkflowEditorParameterTypes,
   WorkflowParameterTypes,
+  WorkflowParameterValueType,
   WorkflowSettings,
 } from "../types/workflowTypes";
 import {
@@ -163,10 +164,11 @@ function convertToParametersYAML(
         };
       } else {
         return {
-          parameter_type: WorkflowParameterTypes.Credential,
+          parameter_type: WorkflowParameterTypes.Workflow,
+          workflow_parameter_type: WorkflowParameterValueType.CredentialId,
+          default_value: parameter.credentialId,
           key: parameter.key,
           description: parameter.description || null,
-          credential_id: parameter.credentialId,
         };
       }
     }

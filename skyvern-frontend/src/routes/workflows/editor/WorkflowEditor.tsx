@@ -11,6 +11,7 @@ import {
   isDisplayedInWorkflowEditor,
   WorkflowEditorParameterTypes,
   WorkflowParameterTypes,
+  WorkflowParameterValueType,
   WorkflowSettings,
 } from "../types/workflowTypes";
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
@@ -78,6 +79,17 @@ function WorkflowEditor() {
               if (
                 parameter.parameter_type === WorkflowParameterTypes.Workflow
               ) {
+                if (
+                  parameter.workflow_parameter_type ===
+                  WorkflowParameterValueType.CredentialId
+                ) {
+                  return {
+                    key: parameter.key,
+                    parameterType: WorkflowEditorParameterTypes.Credential,
+                    credentialId: parameter.default_value as string,
+                    description: parameter.description,
+                  };
+                }
                 return {
                   key: parameter.key,
                   parameterType: WorkflowEditorParameterTypes.Workflow,
