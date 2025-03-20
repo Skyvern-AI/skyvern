@@ -166,7 +166,7 @@ class LLMAPIHandlerFactory:
 
                 # TODO (suchintan): Properly support reasoning tokens
                 reasoning_tokens = response.get("usage", {}).get("reasoning_tokens", 0)
-                LOG.info("Reasoning tokens", reasoning_tokens=reasoning_tokens)
+                LOG.debug("Reasoning tokens", reasoning_tokens=reasoning_tokens)
 
                 completion_tokens = response.get("usage", {}).get("completion_tokens", 0) + reasoning_tokens
 

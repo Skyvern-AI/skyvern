@@ -346,6 +346,7 @@ class BaseTaskBlock(Block):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    complete_verification: bool = True
 
     def get_all_parameters(
         self,
@@ -601,6 +602,7 @@ class BaseTaskBlock(Block):
                     task_block=self,
                     browser_session_id=browser_session_id,
                     close_browser_on_completion=browser_session_id is None,
+                    complete_verification=self.complete_verification,
                 )
             except Exception as e:
                 # Make sure the task is marked as failed in the database before raising the exception
@@ -2227,6 +2229,22 @@ class TaskV2Block(Block):
     ) -> list[PARAMETER_TYPE]:
         return []
 
+    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+        self.prompt = self.format_block_parameter_template_from_workflow_run_context(self.prompt, workflow_run_context)
+        if self.url:
+            self.url = self.format_block_parameter_template_from_workflow_run_context(self.url, workflow_run_context)
+
+        if self.totp_identifier:
+            self.totp_identifier = self.format_block_parameter_template_from_workflow_run_context(
+                self.totp_identifier, workflow_run_context
+            )
+
+        if self.totp_verification_url:
+            self.totp_verification_url = self.format_block_parameter_template_from_workflow_run_context(
+                self.totp_verification_url, workflow_run_context
+            )
+            self.totp_verification_url = prepend_scheme_and_validate_url(self.totp_verification_url)
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -2237,6 +2255,19 @@ class TaskV2Block(Block):
     ) -> BlockResult:
         from skyvern.forge.sdk.services import task_v2_service
         from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception as e:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to format jinja template: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
 
         if not self.url:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)

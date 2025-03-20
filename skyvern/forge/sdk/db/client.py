@@ -1718,6 +1718,21 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
+    async def get_workflow_output_parameters_by_ids(self, output_parameter_ids: list[str]) -> list[OutputParameter]:
+        try:
+            async with self.Session() as session:
+                output_parameters = (
+                    await session.scalars(
+                        select(OutputParameterModel).filter(
+                            OutputParameterModel.output_parameter_id.in_(output_parameter_ids)
+                        )
+                    )
+                ).all()
+                return [convert_to_output_parameter(parameter) for parameter in output_parameters]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
     async def create_credential_parameter(
         self, workflow_id: str, key: str, credential_id: str, description: str | None = None
     ) -> CredentialParameter:
@@ -2236,6 +2251,8 @@ class AgentDB:
         totp_identifier: str | None = None,
         totp_verification_url: str | None = None,
         webhook_callback_url: str | None = None,
+        extracted_information_schema: dict | list | str | None = None,
+        error_code_mapping: dict | None = None,
     ) -> TaskV2:
         async with self.Session() as session:
             new_task_v2 = TaskV2Model(
@@ -2248,6 +2265,8 @@ class AgentDB:
                 totp_identifier=totp_identifier,
                 totp_verification_url=totp_verification_url,
                 webhook_callback_url=webhook_callback_url,
+                extracted_information_schema=extracted_information_schema,
+                error_code_mapping=error_code_mapping,
                 organization_id=organization_id,
             )
             session.add(new_task_v2)

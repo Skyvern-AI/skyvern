@@ -1,0 +1,21 @@
+{
+	"node": "n8n-nodes-skyvern",
+	"nodeVersion": "1.0",
+	"codexVersion": "1.0",
+	"categories": [
+		"Miscellaneous",
+        "Utility"
+	],
+	"resources": {
+		"credentialDocumentation": [
+			{
+				"url": ""
+			}
+		],
+		"primaryDocumentation": [
+			{
+				"url": ""
+			}
+		]
+	}
+}

@@ -70,8 +70,8 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     Workflow,
     WorkflowRequestBody,
     WorkflowRun,
+    WorkflowRunResponse,
     WorkflowRunStatus,
-    WorkflowRunStatusResponse,
     WorkflowStatus,
 )
 from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
@@ -714,17 +714,17 @@ async def get_workflow_run_timeline(
 
 @base_router.get(
     "/workflows/runs/{workflow_run_id}",
-    response_model=WorkflowRunStatusResponse,
+    response_model=WorkflowRunResponse,
 )
 @base_router.get(
     "/workflows/runs/{workflow_run_id}/",
-    response_model=WorkflowRunStatusResponse,
+    response_model=WorkflowRunResponse,
     include_in_schema=False,
 )
 async def get_workflow_run(
     workflow_run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> WorkflowRunStatusResponse:
+) -> WorkflowRunResponse:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
     return await app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id(
         workflow_run_id=workflow_run_id,
@@ -839,7 +839,7 @@ async def delete_workflow(
 
 
 @base_router.get("/workflows", response_model=list[Workflow])
-@base_router.get("/workflows/", response_model=list[Workflow])
+@base_router.get("/workflows/", response_model=list[Workflow], include_in_schema=False)
 async def get_workflows(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
@@ -1133,6 +1133,8 @@ async def run_task_v2(
             proxy_location=data.proxy_location,
             publish_workflow=data.publish_workflow,
             create_task_run=True,
+            extracted_information_schema=data.extracted_information_schema,
+            error_code_mapping=data.error_code_mapping,
         )
     except LLMProviderError:
         LOG.error("LLM failure to initialize task v2", exc_info=True)

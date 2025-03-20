@@ -1,5 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import { ProxyLocation } from "@/api/types";
+import { ProxyLocation, Status } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { SwitchBarNavigation } from "@/components/SwitchBarNavigation";
 import { Button } from "@/components/ui/button";
@@ -21,6 +21,7 @@ import { copyText } from "@/util/copyText";
 import { apiBaseUrl } from "@/util/env";
 import {
   CopyIcon,
+  FileIcon,
   Pencil2Icon,
   PlayIcon,
   ReloadIcon,
@@ -34,6 +35,9 @@ import { useWorkflowRunQuery } from "./hooks/useWorkflowRunQuery";
 import { WorkflowRunTimeline } from "./workflowRun/WorkflowRunTimeline";
 import { useWorkflowRunTimelineQuery } from "./hooks/useWorkflowRunTimelineQuery";
 import { findActiveItem } from "./workflowRun/workflowTimelineUtils";
+import { getAggregatedExtractedInformation } from "./workflowRun/workflowRunUtils";
+import { Label } from "@/components/ui/label";
+import { CodeEditor } from "./components/CodeEditor";
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -127,6 +131,13 @@ function WorkflowRun() {
   }
 
   const isTaskv2Run = workflowRun && workflowRun.task_v2 !== null;
+
+  const outputs = workflowRun?.outputs;
+  const aggregatedExtractedInformation = getAggregatedExtractedInformation(
+    outputs ?? {},
+  );
+
+  const fileUrls = workflowRun?.downloaded_file_urls ?? [];
 
   return (
     <div className="space-y-8">
@@ -229,6 +240,38 @@ function WorkflowRun() {
           )}
         </div>
       </header>
+      {workflowRunIsFinalized && workflowRun.status === Status.Completed && (
+        <div className="grid grid-cols-2 gap-4 rounded-lg bg-slate-elevation1 p-4">
+          <div className="space-y-4">
+            <Label>Extracted Information</Label>
+            <CodeEditor
+              language="json"
+              value={JSON.stringify(aggregatedExtractedInformation, null, 2)}
+              readOnly
+              maxHeight="250px"
+            />
+          </div>
+          <div className="space-y-4">
+            <Label>Downloaded Files</Label>
+            <div className="space-y-2">
+              {fileUrls.length > 0 ? (
+                fileUrls.map((url, index) => {
+                  return (
+                    <div key={url} title={url} className="flex gap-2">
+                      <FileIcon className="size-6" />
+                      <a href={url} className="underline underline-offset-4">
+                        <span>{`File ${index + 1}`}</span>
+                      </a>
+                    </div>
+                  );
+                })
+              ) : (
+                <div className="text-sm">No files downloaded</div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
       {workflowFailureReason}
       <SwitchBarNavigation
         options={[

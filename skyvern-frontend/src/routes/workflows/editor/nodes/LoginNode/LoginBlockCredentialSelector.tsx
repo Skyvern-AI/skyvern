@@ -35,12 +35,12 @@ function LoginBlockCredentialSelector({ value, onChange }: Props) {
       parameter.dataType === "credential_id",
   );
   const isCloud = useContext(CloudContext);
-  const { data: credentials = [], isLoading } = useCredentialsQuery({
+  const { data: credentials = [], isFetching } = useCredentialsQuery({
     enabled: isCloud,
   });
   const noneItemValue = useId();
 
-  if (isCloud && isLoading) {
+  if (isCloud && isFetching) {
     return <Skeleton className="h-8 w-full" />;
   }
 
@@ -135,6 +135,16 @@ function LoginBlockCredentialSelector({ value, onChange }: Props) {
       <CredentialsModal
         onCredentialCreated={(id) => {
           onChange?.(id);
+          setWorkflowParameters((prev) => {
+            return [
+              ...prev,
+              {
+                parameterType: "credential",
+                credentialId: id,
+                key: id,
+              },
+            ];
+          });
         }}
       />
     </>

@@ -79,8 +79,8 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRun,
     WorkflowRunOutputParameter,
     WorkflowRunParameter,
+    WorkflowRunResponse,
     WorkflowRunStatus,
-    WorkflowRunStatusResponse,
     WorkflowStatus,
 )
 from skyvern.forge.sdk.workflow.models.yaml import (
@@ -370,7 +370,9 @@ class WorkflowService:
                         block_label=block.label,
                     )
                     if not block.continue_on_failure:
-                        failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed. failure reason: {block_result.failure_reason}"
+                        failure_reason = (
+                            f"{block.block_type} block failed. failure reason: {block_result.failure_reason}"
+                        )
                         await self.mark_workflow_run_as_failed(
                             workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                         )
@@ -406,7 +408,7 @@ class WorkflowService:
                     )
 
                     if not block.continue_on_failure:
-                        failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} terminated. Reason: {block_result.failure_reason}"
+                        failure_reason = f"{block.block_type} block terminated. Reason: {block_result.failure_reason}"
                         await self.mark_workflow_run_as_terminated(
                             workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                         )
@@ -442,7 +444,7 @@ class WorkflowService:
                     )
 
                     if not block.continue_on_failure:
-                        failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} timed out. Reason: {block_result.failure_reason}"
+                        failure_reason = f"{block.block_type} block timed out. Reason: {block_result.failure_reason}"
                         await self.mark_workflow_run_as_failed(
                             workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                         )
@@ -479,7 +481,7 @@ class WorkflowService:
                 if isinstance(e, SkyvernException):
                     exception_message = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
 
-                failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed. failure reason: {exception_message}"
+                failure_reason = f"{block.block_type} block failed. failure reason: {exception_message}"
                 await self.mark_workflow_run_as_failed(
                     workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                 )
@@ -929,7 +931,12 @@ class WorkflowService:
         workflow_run_output_parameters = await app.DATABASE.get_workflow_run_output_parameters(
             workflow_run_id=workflow_run_id
         )
-        output_parameters = await app.DATABASE.get_workflow_output_parameters(workflow_id=workflow_id)
+        output_parameters = await app.DATABASE.get_workflow_output_parameters_by_ids(
+            output_parameter_ids=[
+                workflow_run_output_parameter.output_parameter_id
+                for workflow_run_output_parameter in workflow_run_output_parameters
+            ]
+        )
 
         return [
             (output_parameter, workflow_run_output_parameter)
@@ -949,7 +956,7 @@ class WorkflowService:
         workflow_run_id: str,
         organization_id: str,
         include_cost: bool = False,
-    ) -> WorkflowRunStatusResponse:
+    ) -> WorkflowRunResponse:
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         if workflow_run is None:
             LOG.error(f"Workflow run {workflow_run_id} not found")
@@ -968,7 +975,7 @@ class WorkflowService:
         workflow_run_id: str,
         organization_id: str,
         include_cost: bool = False,
-    ) -> WorkflowRunStatusResponse:
+    ) -> WorkflowRunResponse:
         workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id)
         if workflow is None:
             LOG.error(f"Workflow {workflow_permanent_id} not found")
@@ -1064,7 +1071,7 @@ class WorkflowService:
             # successful steps are the ones that have a status of completed and the total count of unique step.order
             successful_steps = [step for step in workflow_run_steps if step.status == StepStatus.completed]
             total_cost = 0.1 * (len(successful_steps) + len(text_prompt_blocks))
-        return WorkflowRunStatusResponse(
+        return WorkflowRunResponse(
             workflow_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run_id,
             status=workflow_run.status,
@@ -1588,6 +1595,7 @@ class WorkflowService:
                 cache_actions=block_yaml.cache_actions,
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
+                complete_verification=block_yaml.complete_verification,
             )
         elif block_yaml.block_type == BlockType.FOR_LOOP:
             loop_blocks = [
@@ -1740,6 +1748,8 @@ class WorkflowService:
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 cache_actions=block_yaml.cache_actions,
+                # DO NOT run complete verification for action block
+                complete_verification=False,
                 max_steps_per_run=1,
             )
 
@@ -1767,6 +1777,7 @@ class WorkflowService:
                 cache_actions=block_yaml.cache_actions,
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
+                complete_verification=block_yaml.complete_verification,
             )
 
         elif block_yaml.block_type == BlockType.EXTRACTION:
@@ -1787,6 +1798,7 @@ class WorkflowService:
                 max_retries=block_yaml.max_retries,
                 continue_on_failure=block_yaml.continue_on_failure,
                 cache_actions=block_yaml.cache_actions,
+                complete_verification=False,
             )
 
         elif block_yaml.block_type == BlockType.LOGIN:
@@ -1811,6 +1823,7 @@ class WorkflowService:
                 cache_actions=block_yaml.cache_actions,
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
+                complete_verification=block_yaml.complete_verification,
             )
 
         elif block_yaml.block_type == BlockType.WAIT:
@@ -1846,6 +1859,7 @@ class WorkflowService:
                 totp_identifier=block_yaml.totp_identifier,
                 cache_actions=block_yaml.cache_actions,
                 complete_on_download=True,
+                complete_verification=True,
             )
         elif block_yaml.block_type == BlockType.TaskV2:
             return TaskV2Block(
@@ -1863,6 +1877,7 @@ class WorkflowService:
                 label=block_yaml.label,
                 url=block_yaml.url,
                 output_parameter=output_parameter,
+                complete_verification=False,
             )
 
         raise ValueError(f"Invalid block type {block_yaml.block_type}")

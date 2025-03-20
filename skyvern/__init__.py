@@ -1,7 +1,6 @@
 from ddtrace import tracer
 from ddtrace.filters import FilterRequestsOnUrl
 
-from skyvern.agent import SkyvernAgent, SkyvernClient
 from skyvern.forge.sdk.forge_log import setup_logger
 
 tracer.configure(
@@ -13,4 +12,8 @@ tracer.configure(
 )
 setup_logger()
 
-__all__ = ["SkyvernAgent", "SkyvernClient"]
+
+from skyvern.agent import SkyvernAgent, SkyvernClient  # noqa: E402
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunResponse  # noqa: E402
+
+__all__ = ["SkyvernAgent", "SkyvernClient", "WorkflowRunResponse"]

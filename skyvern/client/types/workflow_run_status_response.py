@@ -10,7 +10,7 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
 
 
-class WorkflowRunStatusResponse(UniversalBaseModel):
+class WorkflowRunResponse(UniversalBaseModel):
     workflow_id: str
     workflow_run_id: str
     status: WorkflowRunStatus
