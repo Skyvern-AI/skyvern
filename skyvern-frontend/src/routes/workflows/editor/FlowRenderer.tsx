@@ -73,6 +73,7 @@ import {
   convertEchoParameters,
   createNode,
   defaultEdge,
+  descendants,
   generateNodeLabel,
   getAdditionalParametersForEmailBlock,
   getOutputParameterKey,
@@ -408,10 +409,20 @@ function FlowRenderer({
     if (!node || !isWorkflowBlockNode(node)) {
       return;
     }
+    const nodesToDelete = descendants(nodes, id);
     const deletedNodeLabel = node.data.label;
-    const newNodes = nodes.filter((node) => node.id !== id);
+    const newNodes = nodes.filter(
+      (node) => !nodesToDelete.includes(node) && node.id !== id,
+    );
     const newEdges = edges.flatMap((edge) => {
       if (edge.source === id) {
+        return [];
+      }
+      if (
+        nodesToDelete.some(
+          (node) => node.id === edge.source || node.id === edge.target,
+        )
+      ) {
         return [];
       }
       if (edge.target === id) {
