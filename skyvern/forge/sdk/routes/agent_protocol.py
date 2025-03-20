@@ -168,7 +168,7 @@ async def run_task(
     x_max_steps_override: Annotated[int | None, Header()] = None,
 ) -> CreateTaskResponse:
     analytics.capture("skyvern-oss-agent-task-create", data={"url": task.url})
-    await PermissionCheckerFactory.get_instance().check(current_org)
+    await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=task.browser_session_id)
 
     created_task = await app.agent.create_task(task, current_org.organization_id)
     url_hash = generate_url_hash(task.url)
@@ -574,6 +574,7 @@ async def run_workflow(
     analytics.capture("skyvern-oss-agent-workflow-execute")
     context = skyvern_context.ensure_context()
     request_id = context.request_id
+    await PermissionCheckerFactory.get_instance().check(current_org)
 
     if template:
         if workflow_id not in await app.STORAGE.retrieve_global_workflows():
@@ -1121,6 +1122,7 @@ async def run_task_v2(
             max_iterations_override=x_max_iterations_override,
             max_steps_override=x_max_steps_override,
         )
+    await PermissionCheckerFactory.get_instance().check(organization, browser_session_id=data.browser_session_id)
 
     try:
         task_v2 = await task_v2_service.initialize_task_v2(
