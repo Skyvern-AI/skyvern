@@ -1595,6 +1595,7 @@ class WorkflowService:
                 cache_actions=block_yaml.cache_actions,
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
+                complete_verification=block_yaml.complete_verification,
             )
         elif block_yaml.block_type == BlockType.FOR_LOOP:
             loop_blocks = [
@@ -1747,6 +1748,8 @@ class WorkflowService:
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 cache_actions=block_yaml.cache_actions,
+                # DO NOT run complete verification for action block
+                complete_verification=False,
                 max_steps_per_run=1,
             )
 
@@ -1774,6 +1777,7 @@ class WorkflowService:
                 cache_actions=block_yaml.cache_actions,
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
+                complete_verification=block_yaml.complete_verification,
             )
 
         elif block_yaml.block_type == BlockType.EXTRACTION:
@@ -1794,6 +1798,7 @@ class WorkflowService:
                 max_retries=block_yaml.max_retries,
                 continue_on_failure=block_yaml.continue_on_failure,
                 cache_actions=block_yaml.cache_actions,
+                complete_verification=False,
             )
 
         elif block_yaml.block_type == BlockType.LOGIN:
@@ -1818,6 +1823,7 @@ class WorkflowService:
                 cache_actions=block_yaml.cache_actions,
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
+                complete_verification=block_yaml.complete_verification,
             )
 
         elif block_yaml.block_type == BlockType.WAIT:
@@ -1853,6 +1859,7 @@ class WorkflowService:
                 totp_identifier=block_yaml.totp_identifier,
                 cache_actions=block_yaml.cache_actions,
                 complete_on_download=True,
+                complete_verification=False,
             )
         elif block_yaml.block_type == BlockType.TaskV2:
             return TaskV2Block(
@@ -1870,6 +1877,7 @@ class WorkflowService:
                 label=block_yaml.label,
                 url=block_yaml.url,
                 output_parameter=output_parameter,
+                complete_verification=False,
             )
 
         raise ValueError(f"Invalid block type {block_yaml.block_type}")

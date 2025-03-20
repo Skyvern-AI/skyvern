@@ -346,6 +346,7 @@ class BaseTaskBlock(Block):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    complete_verification: bool = True
 
     def get_all_parameters(
         self,
@@ -601,6 +602,7 @@ class BaseTaskBlock(Block):
                     task_block=self,
                     browser_session_id=browser_session_id,
                     close_browser_on_completion=browser_session_id is None,
+                    complete_verification=self.complete_verification,
                 )
             except Exception as e:
                 # Make sure the task is marked as failed in the database before raising the exception
