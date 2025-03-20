@@ -117,6 +117,8 @@ class StepModel(Base):
     )
     input_token_count = Column(Integer, default=0)
     output_token_count = Column(Integer, default=0)
+    reasoning_token_count = Column(Integer, default=0)
+    cached_token_count = Column(Integer, default=0)
     step_cost = Column(Numeric, default=0)
 
 
@@ -612,6 +614,8 @@ class ThoughtModel(Base):
     answer = Column(String, nullable=True)
     input_token_count = Column(Integer, nullable=True)
     output_token_count = Column(Integer, nullable=True)
+    reasoning_token_count = Column(Integer, nullable=True)
+    cached_token_count = Column(Integer, nullable=True)
     thought_cost = Column(Numeric, nullable=True)
 
     observer_thought_type = Column(String, nullable=True, default=ThoughtType.plan)

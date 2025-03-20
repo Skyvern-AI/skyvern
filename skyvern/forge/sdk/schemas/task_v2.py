@@ -92,6 +92,8 @@ class Thought(BaseModel):
     output: dict[str, Any] | None = None
     input_token_count: int | None = None
     output_token_count: int | None = None
+    reasoning_token_count: int | None = None
+    cached_token_count: int | None = None
     thought_cost: float | None = None
 
     created_at: datetime

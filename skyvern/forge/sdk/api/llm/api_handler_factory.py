@@ -169,6 +169,7 @@ class LLMAPIHandlerFactory:
                 LOG.debug("Reasoning tokens", reasoning_tokens=reasoning_tokens)
 
                 completion_tokens = response.get("usage", {}).get("completion_tokens", 0) + reasoning_tokens
+                cached_tokens = response.get("usage", {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
 
                 if step:
                     await app.DATABASE.update_step(
@@ -178,6 +179,8 @@ class LLMAPIHandlerFactory:
                         incremental_cost=llm_cost,
                         incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
                         incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
+                        incremental_reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
+                        incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     )
                 if thought:
                     await app.DATABASE.update_thought(
@@ -186,6 +189,8 @@ class LLMAPIHandlerFactory:
                         input_token_count=prompt_tokens if prompt_tokens > 0 else None,
                         output_token_count=completion_tokens if completion_tokens > 0 else None,
                         thought_cost=llm_cost,
+                        reasoning_token_count=reasoning_tokens if reasoning_tokens > 0 else None,
+                        cached_token_count=cached_tokens if cached_tokens > 0 else None,
                     )
             parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
             await app.ARTIFACT_MANAGER.create_llm_artifact(
@@ -348,6 +353,8 @@ class LLMAPIHandlerFactory:
                     llm_cost = 0
                 prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
                 completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
+                reasoning_tokens = response.get("usage", {}).get("reasoning_tokens", 0)
+                cached_tokens = response.get("usage", {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
                 if step:
                     await app.DATABASE.update_step(
                         task_id=step.task_id,
@@ -356,6 +363,8 @@ class LLMAPIHandlerFactory:
                         incremental_cost=llm_cost,
                         incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
                         incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
+                        incremental_reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
+                        incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     )
                 if thought:
                     await app.DATABASE.update_thought(
@@ -363,6 +372,8 @@ class LLMAPIHandlerFactory:
                         organization_id=thought.organization_id,
                         input_token_count=prompt_tokens if prompt_tokens > 0 else None,
                         output_token_count=completion_tokens if completion_tokens > 0 else None,
+                        reasoning_token_count=reasoning_tokens if reasoning_tokens > 0 else None,
+                        cached_token_count=cached_tokens if cached_tokens > 0 else None,
                         thought_cost=llm_cost,
                     )
             parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
