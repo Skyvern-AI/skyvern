@@ -209,6 +209,52 @@ class Block(BaseModel, abc.ABC):
     ) -> BlockResult:
         pass
 
+    async def _generate_workflow_run_block_description(
+        self, workflow_run_block_id: str, organization_id: str | None = None
+    ) -> None:
+        description = None
+        try:
+            block_data = self.model_dump(
+                exclude={
+                    "workflow_run_block_id",
+                    "organization_id",
+                    "task_id",
+                    "workflow_run_id",
+                    "parent_workflow_run_block_id",
+                    "label",
+                    "status",
+                    "output",
+                    "continue_on_failure",
+                    "failure_reason",
+                    "actions",
+                    "created_at",
+                    "modified_at",
+                },
+                exclude_none=True,
+            )
+            description_generation_prompt = prompt_engine.load_prompt(
+                "generate_workflow_run_block_description",
+                block=block_data,
+            )
+            json_response = await app.SECONDARY_LLM_API_HANDLER(
+                prompt=description_generation_prompt, prompt_name="generate-workflow-run-block-description"
+            )
+            description = json_response.get("summary")
+            LOG.info(
+                "Generated description for the workflow run block",
+                description=description,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+        except Exception as e:
+            LOG.exception("Failed to generate description for the workflow run block", error=e)
+
+        if description:
+            await app.DATABASE.update_workflow_run_block(
+                workflow_run_block_id=workflow_run_block_id,
+                description=description,
+                organization_id=organization_id,
+            )
+
     async def execute_safe(
         self,
         workflow_run_id: str,
@@ -229,48 +275,8 @@ class Block(BaseModel, abc.ABC):
             )
             workflow_run_block_id = workflow_run_block.workflow_run_block_id
 
-            description = None
-            try:
-                block_data = self.model_dump(
-                    exclude={
-                        "workflow_run_block_id",
-                        "organization_id",
-                        "task_id",
-                        "workflow_run_id",
-                        "parent_workflow_run_block_id",
-                        "label",
-                        "status",
-                        "output",
-                        "continue_on_failure",
-                        "failure_reason",
-                        "actions",
-                        "created_at",
-                        "modified_at",
-                    },
-                    exclude_none=True,
-                )
-                description_generation_prompt = prompt_engine.load_prompt(
-                    "generate_workflow_run_block_description",
-                    block=block_data,
-                )
-                json_response = await app.SECONDARY_LLM_API_HANDLER(
-                    prompt=description_generation_prompt, prompt_name="generate-workflow-run-block-description"
-                )
-                description = json_response.get("summary")
-                LOG.info(
-                    "Generated description for the workflow run block",
-                    description=description,
-                    workflow_run_block_id=workflow_run_block.workflow_run_block_id,
-                )
-            except Exception as e:
-                LOG.exception("Failed to generate description for the workflow run block", error=e)
-
-            if description:
-                workflow_run_block = await app.DATABASE.update_workflow_run_block(
-                    workflow_run_block_id=workflow_run_block.workflow_run_block_id,
-                    description=description,
-                    organization_id=organization_id,
-                )
+            # generate the description for the workflow run block asynchronously
+            asyncio.create_task(self._generate_workflow_run_block_description(workflow_run_block_id, organization_id))
 
             # create a screenshot
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
