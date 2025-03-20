@@ -132,13 +132,36 @@ function layoutUtil(
   };
 }
 
+export function descendants(nodes: Array<AppNode>, id: string): Array<AppNode> {
+  const children = nodes.filter((n) => n.parentId === id);
+  return children.concat(...children.map((c) => descendants(nodes, c.id)));
+}
+
+export function getLoopNodeWidth(node: AppNode, nodes: Array<AppNode>): number {
+  const maxNesting = maxNestingLevel(nodes);
+  const nestingLevel = getNestingLevel(node, nodes);
+  return 600 + (maxNesting - nestingLevel) * 50;
+}
+
+function maxNestingLevel(nodes: Array<AppNode>): number {
+  return Math.max(...nodes.map((node) => getNestingLevel(node, nodes)));
+}
+
+function getNestingLevel(node: AppNode, nodes: Array<AppNode>): number {
+  let level = 0;
+  let current = nodes.find((n) => n.id === node.parentId);
+  while (current) {
+    level++;
+    current = nodes.find((n) => n.id === current?.parentId);
+  }
+  return level;
+}
+
 function layout(
   nodes: Array<AppNode>,
   edges: Array<Edge>,
 ): { nodes: Array<AppNode>; edges: Array<Edge> } {
-  const loopNodes = nodes.filter(
-    (node) => node.type === "loop" && !node.parentId,
-  );
+  const loopNodes = nodes.filter((node) => node.type === "loop");
   const loopNodeChildren: Array<Array<AppNode>> = loopNodes.map(() => []);
 
   loopNodes.forEach((node, index) => {
@@ -151,7 +174,7 @@ function layout(
     const maxChildWidth = Math.max(
       ...childNodes.map((node) => node.measured?.width ?? 0),
     );
-    const loopNodeWidth = 600; // 600 px
+    const loopNodeWidth = getLoopNodeWidth(node, nodes);
     const layouted = layoutUtil(childNodes, childEdges, {
       marginx: (loopNodeWidth - maxChildWidth) / 2,
       marginy: 225,
@@ -1169,7 +1192,23 @@ function getOrderedChildrenBlocks(
   const children: Array<BlockYAML> = [];
   let currentNode: WorkflowBlockNode | undefined = firstChild;
   while (currentNode) {
-    children.push(getWorkflowBlock(currentNode));
+    if (currentNode.type === "loop") {
+      const loopChildren = getOrderedChildrenBlocks(
+        nodes,
+        edges,
+        currentNode.id,
+      );
+      children.push({
+        block_type: "for_loop",
+        label: currentNode.data.label,
+        continue_on_failure: currentNode.data.continueOnFailure,
+        loop_blocks: loopChildren,
+        loop_variable_reference: currentNode.data.loopVariableReference,
+        complete_if_empty: currentNode.data.completeIfEmpty,
+      });
+    } else {
+      children.push(getWorkflowBlock(currentNode));
+    }
     const nextId = edges.find(
       (edge) => edge.source === currentNode?.id,
     )?.target;
@@ -1991,12 +2030,14 @@ export {
   createNode,
   generateNodeData,
   generateNodeLabel,
+  getNestingLevel,
   getAdditionalParametersForEmailBlock,
   getAvailableOutputParameterKeys,
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,
   getElements,
   getLabelForWorkflowParameterType,
+  maxNestingLevel,
   getWorkflowSettings,
   getOutputParameterKey,
   getPreviousNodeIds,
