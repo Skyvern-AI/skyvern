@@ -141,6 +141,7 @@ class TaskBlockYAML(BlockYAML):
     cache_actions: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
+    complete_verification: bool = True
 
 
 class ForLoopBlockYAML(BlockYAML):
@@ -273,6 +274,7 @@ class NavigationBlockYAML(BlockYAML):
     cache_actions: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
+    complete_verification: bool = True
 
 
 class ExtractionBlockYAML(BlockYAML):
@@ -303,6 +305,7 @@ class LoginBlockYAML(BlockYAML):
     cache_actions: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
+    complete_verification: bool = True
 
 
 class WaitBlockYAML(BlockYAML):

@@ -1146,6 +1146,7 @@ async def _generate_navigation_task(
         navigation_goal=navigation_goal,
         totp_verification_url=totp_verification_url,
         totp_identifier=totp_identifier,
+        complete_verification=False,
     )
     output_parameter = await app.WORKFLOW_SERVICE.create_output_parameter_for_block(
         workflow_id=workflow_id,
@@ -1159,6 +1160,7 @@ async def _generate_navigation_task(
             totp_verification_url=totp_verification_url,
             totp_identifier=totp_identifier,
             output_parameter=output_parameter,
+            complete_verification=False,
         ),
         [navigation_block_yaml],
         [],
