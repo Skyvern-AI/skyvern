@@ -38,11 +38,11 @@ jobs:
           poetry add codeflash
       - name: create test dir
         run: |
-          mkdir -p tests
+          mkdir -p codeflash-tests
       - name: Run Codeflash to optimize code
         run: |
           poetry env use python
           poetry run codeflash
       - name: remove test dir
         run: |
-          rm -rf tests
+          rm -rf codeflash-tests
