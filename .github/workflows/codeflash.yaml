@@ -36,8 +36,13 @@ jobs:
           pip install poetry
           poetry install --all-extras
           poetry add codeflash
-
+      - name: create test dir
+        run: |
+          mkdir -p codeflash-tests
       - name: Run Codeflash to optimize code
         run: |
           poetry env use python
           poetry run codeflash
+      - name: remove test dir
+        run: |
+          rm -rf codeflash-tests
