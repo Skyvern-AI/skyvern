@@ -574,6 +574,7 @@ async def run_workflow(
     analytics.capture("skyvern-oss-agent-workflow-execute")
     context = skyvern_context.ensure_context()
     request_id = context.request_id
+    await PermissionCheckerFactory.get_instance().check(current_org)
 
     if template:
         if workflow_id not in await app.STORAGE.retrieve_global_workflows():
@@ -1121,6 +1122,7 @@ async def run_task_v2(
             max_iterations_override=x_max_iterations_override,
             max_steps_override=x_max_steps_override,
         )
+    await PermissionCheckerFactory.get_instance().check(organization)
 
     try:
         task_v2 = await task_v2_service.initialize_task_v2(

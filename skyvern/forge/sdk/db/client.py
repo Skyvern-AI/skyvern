@@ -2585,17 +2585,20 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def get_persistent_browser_session_by_id(self, session_id: str) -> Optional[PersistentBrowserSession]:
+    async def get_persistent_browser_session_by_id(
+        self, session_id: str, organization_id: str | None = None
+    ) -> Optional[PersistentBrowserSession]:
         """Get a specific persistent browser session."""
         try:
             async with self.Session() as session:
-                persistent_browser_session = (
-                    await session.scalars(
-                        select(PersistentBrowserSessionModel)
-                        .filter_by(persistent_browser_session_id=session_id)
-                        .filter_by(deleted_at=None)
-                    )
-                ).first()
+                query = (
+                    select(PersistentBrowserSessionModel)
+                    .filter_by(persistent_browser_session_id=session_id)
+                    .filter_by(deleted_at=None)
+                )
+                if organization_id:
+                    query = query.filter_by(organization_id=organization_id)
+                persistent_browser_session = (await session.scalars(query)).first()
                 if persistent_browser_session:
                     return PersistentBrowserSession.model_validate(persistent_browser_session)
                 raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
