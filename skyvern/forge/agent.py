@@ -1487,7 +1487,11 @@ class ForgeAgent:
                     reason=json_response.get("thought"), error_type=json_response.get("error")
                 )
 
-            action_type: str = json_response.get("action_type") or ""
+            inferred_actions: list[dict[str, Any]] = json_response.get("inferred_actions", [])
+            if not inferred_actions:
+                raise FailedToParseActionInstruction(reason=json_response.get("thought"), error_type="EMPTY_ACTION")
+
+            action_type: str = inferred_actions[0].get("action_type") or ""
             action_type = ActionType[action_type.upper()]
 
             if action_type == ActionType.CLICK:
