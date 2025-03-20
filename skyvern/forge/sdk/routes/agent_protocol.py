@@ -574,7 +574,10 @@ async def run_workflow(
     analytics.capture("skyvern-oss-agent-workflow-execute")
     context = skyvern_context.ensure_context()
     request_id = context.request_id
-    await PermissionCheckerFactory.get_instance().check(current_org)
+    await PermissionCheckerFactory.get_instance().check(
+        current_org,
+        browser_session_id=workflow_request.browser_session_id,
+    )
 
     if template:
         if workflow_id not in await app.STORAGE.retrieve_global_workflows():
