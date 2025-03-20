@@ -105,7 +105,14 @@ class AISuggestionType(str, Enum):
     DATA_SCHEMA = "data_schema"
 
 
-@base_router.post("/webhook", tags=["server"])
+@base_router.post(
+    "/webhook",
+    tags=["server"],
+    openapi_extra={
+        "x-fern-sdk-group-name": ["server"],
+        "x-fern-sdk-method-name": "webhook",
+    },
+)
 @base_router.post("/webhook/", tags=["server"], include_in_schema=False)
 async def webhook(
     request: Request,
@@ -143,7 +150,14 @@ async def webhook(
     return Response(content="webhook validation", status_code=200)
 
 
-@base_router.get("/heartbeat", tags=["server"])
+@base_router.get(
+    "/heartbeat",
+    tags=["server"],
+    openapi_extra={
+        "x-fern-sdk-group-name": ["server"],
+        "x-fern-sdk-method-name": "checkStatus",
+    },
+)
 @base_router.get("/heartbeat/", tags=["server"], include_in_schema=False)
 async def heartbeat() -> Response:
     """
@@ -152,7 +166,15 @@ async def heartbeat() -> Response:
     return Response(content="Server is running.", status_code=200)
 
 
-@base_router.post("/tasks", tags=["agent"], response_model=CreateTaskResponse)
+@base_router.post(
+    "/tasks",
+    tags=["agent"],
+    response_model=CreateTaskResponse,
+    openapi_extra={
+        "x-fern-sdk-group-name": ["agent"],
+        "x-fern-sdk-method-name": "createTask",
+    },
+)
 @base_router.post(
     "/tasks/",
     tags=["agent"],
