@@ -250,6 +250,11 @@ class EmptyScrapePage(SkyvernException):
         super().__init__("Failed to scrape the page, returned an NONE result")
 
 
+class ScrapingFailed(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("Scraping failed.")
+
+
 class WorkflowRunContextNotInitialized(SkyvernException):
     def __init__(self, workflow_run_id: str) -> None:
         super().__init__(f"WorkflowRunContext not initialized for workflow run {workflow_run_id}")
