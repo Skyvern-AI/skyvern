@@ -11,9 +11,16 @@ LOG = structlog.get_logger()
 totp_router = APIRouter()
 
 
-@totp_router.post("")
+@totp_router.post(
+    "",
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "send_totp_code",
+    },
+)
 @totp_router.post("/", include_in_schema=False)
-async def save_totp_code(
+async def send_totp_code(
     data: TOTPCodeCreate, curr_org: Organization = Depends(org_auth_service.get_current_org)
 ) -> TOTPCode:
     LOG.info(
