@@ -305,7 +305,7 @@ async def _convert_css_shape_to_string(
 
             _, blocked = await skyvern_frame.get_blocking_element_id(await skyvern_element.get_element_handler())
             if blocked:
-                LOG.info(
+                LOG.debug(
                     "element is blocked by another element, going to abort conversion",
                     task_id=task_id,
                     step_id=step_id,
