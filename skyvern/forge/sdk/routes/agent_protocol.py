@@ -20,7 +20,6 @@ from fastapi import (
     status,
 )
 from fastapi.responses import ORJSONResponse
-from pydantic import BaseModel
 from sqlalchemy.exc import OperationalError
 
 from skyvern import analytics
@@ -154,10 +153,10 @@ async def heartbeat() -> Response:
 
 @base_router.post(
     "/tasks",
-    tags=["api"],
+    tags=["agent"],
     response_model=CreateTaskResponse,
     openapi_extra={
-        "x-fern-sdk-group-name": "api",
+        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "run_task_v1",
     },
 )
@@ -552,13 +551,6 @@ async def get_step_artifacts(
                 step_id=step_id,
             )
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
-
-
-class ActionResultTmp(BaseModel):
-    action: dict[str, Any]
-    data: dict[str, Any] | list | str | None = None
-    exception_message: str | None = None
-    success: bool = True
 
 
 @base_router.get("/tasks/{task_id}/actions", response_model=list[Action])
@@ -1044,7 +1036,7 @@ async def generate_task(
         raise HTTPException(status_code=500, detail="Failed to generate task. Please try again later.")
 
 
-@base_router.put("/organizations/", include_in_schema=False, tags=["agent"])
+@base_router.put("/organizations/", include_in_schema=False, tags=["server"])
 @base_router.put("/organizations")
 async def update_organization(
     org_update: OrganizationUpdate,
@@ -1056,7 +1048,7 @@ async def update_organization(
     )
 
 
-@base_router.get("/organizations/", include_in_schema=False, tags=["agent"])
+@base_router.get("/organizations/", include_in_schema=False, tags=["server"])
 @base_router.get("/organizations")
 async def get_organizations(
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -1064,7 +1056,7 @@ async def get_organizations(
     return GetOrganizationsResponse(organizations=[current_org])
 
 
-@base_router.get("/organizations/{organization_id}/apikeys/", include_in_schema=False, tags=["agent"])
+@base_router.get("/organizations/{organization_id}/apikeys/", include_in_schema=False, tags=["server"])
 @base_router.get("/organizations/{organization_id}/apikeys", include_in_schema=False)
 async def get_api_keys(
     organization_id: str,
@@ -1095,7 +1087,7 @@ async def _validate_file_size(file: UploadFile) -> UploadFile:
     return file
 
 
-@base_router.post("/upload_file/", include_in_schema=False, tags=["agent"])
+@base_router.post("/upload_file/", include_in_schema=False, tags=["server"])
 @base_router.post("/upload_file")
 async def upload_file(
     file: UploadFile = Depends(_validate_file_size),
@@ -1202,13 +1194,13 @@ async def get_task_v2(
 @base_router.get(
     "/browser_sessions/{browser_session_id}",
     response_model=BrowserSessionResponse,
-    tags=["agent"],
+    tags=["browser"],
 )
 @base_router.get(
     "/browser_sessions/{browser_session_id}/",
     response_model=BrowserSessionResponse,
     include_in_schema=False,
-    tags=["agent"],
+    tags=["browser"],
 )
 async def get_browser_session(
     browser_session_id: str,
@@ -1227,13 +1219,13 @@ async def get_browser_session(
 @base_router.get(
     "/browser_sessions",
     response_model=list[BrowserSessionResponse],
-    tags=["agent"],
+    tags=["browser"],
 )
 @base_router.get(
     "/browser_sessions/",
     response_model=list[BrowserSessionResponse],
     include_in_schema=False,
-    tags=["agent"],
+    tags=["browser"],
 )
 async def get_browser_sessions(
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -1247,13 +1239,13 @@ async def get_browser_sessions(
 @base_router.post(
     "/browser_sessions",
     response_model=BrowserSessionResponse,
-    tags=["agent"],
+    tags=["browser"],
 )
 @base_router.post(
     "/browser_sessions/",
     response_model=BrowserSessionResponse,
     include_in_schema=False,
-    tags=["agent"],
+    tags=["browser"],
 )
 async def create_browser_session(
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -1264,12 +1256,12 @@ async def create_browser_session(
 
 @base_router.post(
     "/browser_sessions/{session_id}/close",
-    tags=["agent"],
+    tags=["browser"],
 )
 @base_router.post(
     "/browser_sessions/{session_id}/close/",
     include_in_schema=False,
-    tags=["agent"],
+    tags=["browser"],
 )
 async def close_browser_session(
     session_id: str,
