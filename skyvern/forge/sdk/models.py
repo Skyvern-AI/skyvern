@@ -52,8 +52,8 @@ class Step(BaseModel):
     organization_id: str | None = None
     input_token_count: int = 0
     output_token_count: int = 0
-    reasoning_token_count: int = 0
-    cached_token_count: int = 0
+    reasoning_token_count: int | None = None
+    cached_token_count: int | None = None
     step_cost: float = 0
 
     def validate_update(
