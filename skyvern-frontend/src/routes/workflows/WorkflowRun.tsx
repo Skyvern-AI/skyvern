@@ -38,6 +38,7 @@ import { findActiveItem } from "./workflowRun/workflowTimelineUtils";
 import { getAggregatedExtractedInformation } from "./workflowRun/workflowRunUtils";
 import { Label } from "@/components/ui/label";
 import { CodeEditor } from "./components/CodeEditor";
+import { cn } from "@/util/utils";
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -153,6 +154,8 @@ function WorkflowRun() {
     ? (workflowRun.downloaded_file_urls as string[])
     : [];
 
+  const showBoth = hasSomeExtractedInformation && hasFileUrls;
+
   const showOutputSection =
     workflowRunIsFinalized &&
     (hasSomeExtractedInformation || hasFileUrls) &&
@@ -260,35 +263,43 @@ function WorkflowRun() {
         </div>
       </header>
       {showOutputSection && (
-        <div className="grid grid-cols-2 gap-4 rounded-lg bg-slate-elevation1 p-4">
-          <div className="space-y-4">
-            <Label>Extracted Information</Label>
-            <CodeEditor
-              language="json"
-              value={JSON.stringify(aggregatedExtractedInformation, null, 2)}
-              readOnly
-              maxHeight="250px"
-            />
-          </div>
-          <div className="space-y-4">
-            <Label>Downloaded Files</Label>
-            <div className="space-y-2">
-              {fileUrls.length > 0 ? (
-                fileUrls.map((url, index) => {
-                  return (
-                    <div key={url} title={url} className="flex gap-2">
-                      <FileIcon className="size-6" />
-                      <a href={url} className="underline underline-offset-4">
-                        <span>{`File ${index + 1}`}</span>
-                      </a>
-                    </div>
-                  );
-                })
-              ) : (
-                <div className="text-sm">No files downloaded</div>
-              )}
+        <div
+          className={cn("grid gap-4 rounded-lg bg-slate-elevation1 p-4", {
+            "grid-cols-2": showBoth,
+          })}
+        >
+          {hasSomeExtractedInformation && (
+            <div className="space-y-4">
+              <Label>Extracted Information</Label>
+              <CodeEditor
+                language="json"
+                value={JSON.stringify(aggregatedExtractedInformation, null, 2)}
+                readOnly
+                maxHeight="250px"
+              />
             </div>
-          </div>
+          )}
+          {hasFileUrls && (
+            <div className="space-y-4">
+              <Label>Downloaded Files</Label>
+              <div className="space-y-2">
+                {fileUrls.length > 0 ? (
+                  fileUrls.map((url, index) => {
+                    return (
+                      <div key={url} title={url} className="flex gap-2">
+                        <FileIcon className="size-6" />
+                        <a href={url} className="underline underline-offset-4">
+                          <span>{`File ${index + 1}`}</span>
+                        </a>
+                      </div>
+                    );
+                  })
+                ) : (
+                  <div className="text-sm">No files downloaded</div>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       )}
       {workflowFailureReason}
