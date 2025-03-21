@@ -12,9 +12,6 @@ groups:
       - name: fernapi/fern-python-sdk
         smart-casing: true
         version: 4.3.17
-        output:
-          location: pypi
-          package-name: skyvern
         github:
           repository: Skyvern-AI/skyvern-python
         config:
