@@ -9,7 +9,7 @@ packages = [{ include = "skyvern" }, { include = "alembic" }]
 [tool.poetry.dependencies]
 python = "^3.11,<3.12"
 python-dotenv = "^1.0.0"
-openai = "<2.0"
+openai = "<1.68"
 sqlalchemy = {extras = ["mypy"], version = "^2.0.29"}
 aiohttp = "^3.8.5"
 python-multipart = "^0.0.6"
