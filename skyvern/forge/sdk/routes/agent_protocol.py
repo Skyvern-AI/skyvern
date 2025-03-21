@@ -221,6 +221,7 @@ async def run_task_v1(
 
 @base_router.get(
     "/tasks/{task_id}",
+    tags=["agent"],
     response_model=TaskResponse,
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
