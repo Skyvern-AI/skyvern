@@ -20,7 +20,6 @@ from fastapi import (
     status,
 )
 from fastapi.responses import ORJSONResponse
-from pydantic import BaseModel
 from sqlalchemy.exc import OperationalError
 
 from skyvern import analytics
@@ -105,8 +104,15 @@ class AISuggestionType(str, Enum):
     DATA_SCHEMA = "data_schema"
 
 
-@base_router.post("/webhook", tags=["server"])
-@base_router.post("/webhook/", tags=["server"], include_in_schema=False)
+@base_router.post(
+    "/webhook",
+    tags=["server"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "server",
+        "x-fern-sdk-method-name": "webhook",
+    },
+)
+@base_router.post("/webhook/", include_in_schema=False)
 async def webhook(
     request: Request,
     x_skyvern_signature: Annotated[str | None, Header()] = None,
@@ -143,8 +149,15 @@ async def webhook(
     return Response(content="webhook validation", status_code=200)
 
 
-@base_router.get("/heartbeat", tags=["server"])
-@base_router.get("/heartbeat/", tags=["server"], include_in_schema=False)
+@base_router.get(
+    "/heartbeat",
+    tags=["server"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "server",
+        "x-fern-sdk-method-name": "heartbeat",
+    },
+)
+@base_router.get("/heartbeat/", include_in_schema=False)
 async def heartbeat() -> Response:
     """
     Check if the server is running.
@@ -152,14 +165,21 @@ async def heartbeat() -> Response:
     return Response(content="Server is running.", status_code=200)
 
 
-@base_router.post("/tasks", tags=["agent"], response_model=CreateTaskResponse)
+@base_router.post(
+    "/tasks",
+    tags=["agent"],
+    response_model=CreateTaskResponse,
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "run_task_v1",
+    },
+)
 @base_router.post(
     "/tasks/",
-    tags=["agent"],
     response_model=CreateTaskResponse,
     include_in_schema=False,
 )
-async def run_task(
+async def run_task_v1(
     request: Request,
     background_tasks: BackgroundTasks,
     task: TaskRequest,
@@ -199,9 +219,16 @@ async def run_task(
     return CreateTaskResponse(task_id=created_task.task_id)
 
 
-@base_router.get("/tasks/{task_id}", response_model=TaskResponse)
+@base_router.get(
+    "/tasks/{task_id}",
+    response_model=TaskResponse,
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_task_v1",
+    },
+)
 @base_router.get("/tasks/{task_id}/", response_model=TaskResponse, include_in_schema=False)
-async def get_task(
+async def get_task_v1(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> TaskResponse:
@@ -239,7 +266,14 @@ async def get_task(
     )
 
 
-@base_router.post("/tasks/{task_id}/cancel")
+@base_router.post(
+    "/tasks/{task_id}/cancel",
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "cancel_task",
+    },
+)
 @base_router.post("/tasks/{task_id}/cancel/", include_in_schema=False)
 async def cancel_task(
     task_id: str,
@@ -260,7 +294,14 @@ async def cancel_task(
     await app.agent.execute_task_webhook(task=task, last_step=latest_step, api_key=x_api_key)
 
 
-@base_router.post("/workflows/runs/{workflow_run_id}/cancel")
+@base_router.post(
+    "/workflows/runs/{workflow_run_id}/cancel",
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "cancel_workflow_run",
+    },
+)
 @base_router.post("/workflows/runs/{workflow_run_id}/cancel/", include_in_schema=False)
 async def cancel_workflow_run(
     workflow_run_id: str,
@@ -297,10 +338,13 @@ async def cancel_workflow_run(
     "/tasks/{task_id}/retry_webhook",
     tags=["agent"],
     response_model=TaskResponse,
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "retry_webhook",
+    },
 )
 @base_router.post(
     "/tasks/{task_id}/retry_webhook/",
-    tags=["agent"],
     response_model=TaskResponse,
     include_in_schema=False,
 )
@@ -328,8 +372,20 @@ async def retry_webhook(
     return await app.agent.build_task_response(task=task_obj, last_step=latest_step)
 
 
-@base_router.get("/tasks", tags=["agent"], response_model=list[Task])
-@base_router.get("/tasks/", tags=["agent"], response_model=list[Task], include_in_schema=False)
+@base_router.get(
+    "/tasks",
+    tags=["agent"],
+    response_model=list[Task],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_tasks",
+    },
+)
+@base_router.get(
+    "/tasks/",
+    response_model=list[Task],
+    include_in_schema=False,
+)
 async def get_tasks(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
@@ -373,8 +429,20 @@ async def get_tasks(
     return ORJSONResponse([(await app.agent.build_task_response(task=task)).model_dump() for task in tasks])
 
 
-@base_router.get("/runs", response_model=list[WorkflowRun | Task])
-@base_router.get("/runs/", response_model=list[WorkflowRun | Task], include_in_schema=False)
+@base_router.get(
+    "/runs",
+    tags=["agent"],
+    response_model=list[WorkflowRun | Task],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_runs",
+    },
+)
+@base_router.get(
+    "/runs/",
+    response_model=list[WorkflowRun | Task],
+    include_in_schema=False,
+)
 async def get_runs(
     current_org: Organization = Depends(org_auth_service.get_current_org),
     page: int = Query(1, ge=1),
@@ -391,8 +459,20 @@ async def get_runs(
     return ORJSONResponse([run.model_dump() for run in runs])
 
 
-@base_router.get("/runs/{run_id}", response_model=TaskRunResponse)
-@base_router.get("/runs/{run_id}/", response_model=TaskRunResponse, include_in_schema=False)
+@base_router.get(
+    "/runs/{run_id}",
+    tags=["agent"],
+    response_model=TaskRunResponse,
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_run",
+    },
+)
+@base_router.get(
+    "/runs/{run_id}/",
+    response_model=TaskRunResponse,
+    include_in_schema=False,
+)
 async def get_run(
     run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -408,10 +488,17 @@ async def get_run(
     return task_run_response
 
 
-@base_router.get("/tasks/{task_id}/steps", tags=["agent"], response_model=list[Step])
+@base_router.get(
+    "/tasks/{task_id}/steps",
+    tags=["agent"],
+    response_model=list[Step],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_steps",
+    },
+)
 @base_router.get(
     "/tasks/{task_id}/steps/",
-    tags=["agent"],
     response_model=list[Step],
     include_in_schema=False,
 )
@@ -433,10 +520,13 @@ async def get_steps(
     "/{entity_type}/{entity_id}/artifacts",
     tags=["agent"],
     response_model=list[Artifact],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_artifacts",
+    },
 )
 @base_router.get(
     "/{entity_type}/{entity_id}/artifacts/",
-    tags=["agent"],
     response_model=list[Artifact],
     include_in_schema=False,
 )
@@ -494,10 +584,13 @@ async def get_artifacts(
     "/tasks/{task_id}/steps/{step_id}/artifacts",
     tags=["agent"],
     response_model=list[Artifact],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_step_artifacts",
+    },
 )
 @base_router.get(
     "/tasks/{task_id}/steps/{step_id}/artifacts/",
-    tags=["agent"],
     response_model=list[Artifact],
     include_in_schema=False,
 )
@@ -532,14 +625,15 @@ async def get_step_artifacts(
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
 
-class ActionResultTmp(BaseModel):
-    action: dict[str, Any]
-    data: dict[str, Any] | list | str | None = None
-    exception_message: str | None = None
-    success: bool = True
-
-
-@base_router.get("/tasks/{task_id}/actions", response_model=list[Action])
+@base_router.get(
+    "/tasks/{task_id}/actions",
+    response_model=list[Action],
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_actions",
+    },
+)
 @base_router.get(
     "/tasks/{task_id}/actions/",
     response_model=list[Action],
@@ -554,7 +648,15 @@ async def get_actions(
     return actions
 
 
-@base_router.post("/workflows/{workflow_id}/run", response_model=RunWorkflowResponse)
+@base_router.post(
+    "/workflows/{workflow_id}/run",
+    response_model=RunWorkflowResponse,
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "run_workflow",
+    },
+)
 @base_router.post(
     "/workflows/{workflow_id}/run/",
     response_model=RunWorkflowResponse,
@@ -624,6 +726,11 @@ async def run_workflow(
 @base_router.get(
     "/workflows/runs",
     response_model=list[WorkflowRun],
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_workflow_runs",
+    },
 )
 @base_router.get(
     "/workflows/runs/",
@@ -648,6 +755,11 @@ async def get_workflow_runs(
 @base_router.get(
     "/workflows/{workflow_id}/runs",
     response_model=list[WorkflowRun],
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_workflow_runs_by_id",
+    },
 )
 @base_router.get(
     "/workflows/{workflow_id}/runs/",
@@ -673,6 +785,11 @@ async def get_workflow_runs_by_id(
 
 @base_router.get(
     "/workflows/{workflow_id}/runs/{workflow_run_id}",
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_workflow_run_with_workflow_id",
+    },
 )
 @base_router.get(
     "/workflows/{workflow_id}/runs/{workflow_run_id}/",
@@ -702,6 +819,11 @@ async def get_workflow_run_with_workflow_id(
 
 @base_router.get(
     "/workflows/{workflow_id}/runs/{workflow_run_id}/timeline",
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_workflow_run_timeline",
+    },
 )
 @base_router.get(
     "/workflows/{workflow_id}/runs/{workflow_run_id}/timeline/",
@@ -719,6 +841,11 @@ async def get_workflow_run_timeline(
 @base_router.get(
     "/workflows/runs/{workflow_run_id}",
     response_model=WorkflowRunResponse,
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_workflow_run",
+    },
 )
 @base_router.get(
     "/workflows/runs/{workflow_run_id}/",
@@ -743,8 +870,11 @@ async def get_workflow_run(
             "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
             "required": True,
         },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "create_workflow",
     },
     response_model=Workflow,
+    tags=["agent"],
 )
 @base_router.post(
     "/workflows/",
@@ -787,8 +917,11 @@ async def create_workflow(
             "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
             "required": True,
         },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "update_workflow",
     },
     response_model=Workflow,
+    tags=["agent"],
 )
 @base_router.put(
     "/workflows/{workflow_permanent_id}/",
@@ -832,7 +965,14 @@ async def update_workflow(
         raise FailedToUpdateWorkflow(workflow_permanent_id, f"<{type(e).__name__}: {str(e)}>")
 
 
-@base_router.delete("/workflows/{workflow_permanent_id}")
+@base_router.delete(
+    "/workflows/{workflow_permanent_id}",
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "delete_workflow",
+    },
+)
 @base_router.delete("/workflows/{workflow_permanent_id}/", include_in_schema=False)
 async def delete_workflow(
     workflow_permanent_id: str,
@@ -842,8 +982,20 @@ async def delete_workflow(
     await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(workflow_permanent_id, current_org.organization_id)
 
 
-@base_router.get("/workflows", response_model=list[Workflow])
-@base_router.get("/workflows/", response_model=list[Workflow], include_in_schema=False)
+@base_router.get(
+    "/workflows",
+    response_model=list[Workflow],
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_workflows",
+    },
+)
+@base_router.get(
+    "/workflows/",
+    response_model=list[Workflow],
+    include_in_schema=False,
+)
 async def get_workflows(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
@@ -888,8 +1040,20 @@ async def get_workflows(
     )
 
 
-@base_router.get("/workflows/templates", response_model=list[Workflow])
-@base_router.get("/workflows/templates/", response_model=list[Workflow], include_in_schema=False)
+@base_router.get(
+    "/workflows/templates",
+    response_model=list[Workflow],
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_workflow_templates",
+    },
+)
+@base_router.get(
+    "/workflows/templates/",
+    response_model=list[Workflow],
+    include_in_schema=False,
+)
 async def get_workflow_templates() -> list[Workflow]:
     global_workflows_permanent_ids = await app.STORAGE.retrieve_global_workflows()
 
@@ -904,8 +1068,16 @@ async def get_workflow_templates() -> list[Workflow]:
     return workflows
 
 
-@base_router.get("/workflows/{workflow_permanent_id}", response_model=Workflow)
-@base_router.get("/workflows/{workflow_permanent_id}/", response_model=Workflow)
+@base_router.get(
+    "/workflows/{workflow_permanent_id}",
+    response_model=Workflow,
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_workflow",
+    },
+)
+@base_router.get("/workflows/{workflow_permanent_id}/", response_model=Workflow, include_in_schema=False)
 async def get_workflow(
     workflow_permanent_id: str,
     version: int | None = None,
@@ -924,8 +1096,16 @@ async def get_workflow(
     )
 
 
-@base_router.post("/suggest/{ai_suggestion_type}", include_in_schema=False)
-@base_router.post("/suggest/{ai_suggestion_type}/")
+@base_router.post(
+    "/suggest/{ai_suggestion_type}",
+    include_in_schema=False,
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "suggest",
+    },
+)
+@base_router.post("/suggest/{ai_suggestion_type}/", include_in_schema=False)
 async def suggest(
     ai_suggestion_type: AISuggestionType,
     data: AISuggestionRequest,
@@ -954,8 +1134,15 @@ async def suggest(
         raise HTTPException(status_code=400, detail="Failed to suggest data schema. Please try again later.")
 
 
-@base_router.post("/generate/task", include_in_schema=False)
-@base_router.post("/generate/task/")
+@base_router.post(
+    "/generate/task",
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "generate_task",
+    },
+)
+@base_router.post("/generate/task/", include_in_schema=False)
 async def generate_task(
     data: GenerateTaskRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -1015,8 +1202,18 @@ async def generate_task(
         raise HTTPException(status_code=500, detail="Failed to generate task. Please try again later.")
 
 
-@base_router.put("/organizations/", include_in_schema=False)
-@base_router.put("/organizations")
+@base_router.put(
+    "/organizations",
+    tags=["server"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "server",
+        "x-fern-sdk-method-name": "update_organization",
+    },
+)
+@base_router.put(
+    "/organizations",
+    include_in_schema=False,
+)
 async def update_organization(
     org_update: OrganizationUpdate,
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -1027,16 +1224,36 @@ async def update_organization(
     )
 
 
-@base_router.get("/organizations/", include_in_schema=False)
-@base_router.get("/organizations")
+@base_router.get(
+    "/organizations",
+    tags=["server"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "server",
+        "x-fern-sdk-method-name": "get_organizations",
+    },
+)
+@base_router.get(
+    "/organizations/",
+    include_in_schema=False,
+)
 async def get_organizations(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> GetOrganizationsResponse:
     return GetOrganizationsResponse(organizations=[current_org])
 
 
-@base_router.get("/organizations/{organization_id}/apikeys/", include_in_schema=False)
-@base_router.get("/organizations/{organization_id}/apikeys", include_in_schema=False)
+@base_router.get(
+    "/organizations/{organization_id}/apikeys/",
+    tags=["server"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "server",
+        "x-fern-sdk-method-name": "get_api_keys",
+    },
+)
+@base_router.get(
+    "/organizations/{organization_id}/apikeys",
+    include_in_schema=False,
+)
 async def get_api_keys(
     organization_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -1066,8 +1283,18 @@ async def _validate_file_size(file: UploadFile) -> UploadFile:
     return file
 
 
-@base_router.post("/upload_file/", include_in_schema=False)
-@base_router.post("/upload_file")
+@base_router.post(
+    "/upload_file",
+    tags=["server"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "server",
+        "x-fern-sdk-method-name": "upload_file",
+    },
+)
+@base_router.post(
+    "/upload_file/",
+    include_in_schema=False,
+)
 async def upload_file(
     file: UploadFile = Depends(_validate_file_size),
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -1109,8 +1336,18 @@ async def upload_file(
     )
 
 
-@v2_router.post("/tasks")
-@v2_router.post("/tasks/", include_in_schema=False)
+@v2_router.post(
+    "/tasks",
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "run_task_v2",
+    },
+)
+@v2_router.post(
+    "/tasks/",
+    include_in_schema=False,
+)
 async def run_task_v2(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -1158,8 +1395,18 @@ async def run_task_v2(
     return task_v2.model_dump(by_alias=True)
 
 
-@v2_router.get("/tasks/{task_id}")
-@v2_router.get("/tasks/{task_id}/", include_in_schema=False)
+@v2_router.get(
+    "/tasks/{task_id}",
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_task_v2",
+    },
+)
+@v2_router.get(
+    "/tasks/{task_id}/",
+    include_in_schema=False,
+)
 async def get_task_v2(
     task_id: str,
     organization: Organization = Depends(org_auth_service.get_current_org),
@@ -1173,6 +1420,11 @@ async def get_task_v2(
 @base_router.get(
     "/browser_sessions/{browser_session_id}",
     response_model=BrowserSessionResponse,
+    tags=["browser"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "browser",
+        "x-fern-sdk-method-name": "get_browser_session",
+    },
 )
 @base_router.get(
     "/browser_sessions/{browser_session_id}/",
@@ -1196,6 +1448,11 @@ async def get_browser_session(
 @base_router.get(
     "/browser_sessions",
     response_model=list[BrowserSessionResponse],
+    tags=["browser"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "browser",
+        "x-fern-sdk-method-name": "get_browser_sessions",
+    },
 )
 @base_router.get(
     "/browser_sessions/",
@@ -1214,6 +1471,11 @@ async def get_browser_sessions(
 @base_router.post(
     "/browser_sessions",
     response_model=BrowserSessionResponse,
+    tags=["browser"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "browser",
+        "x-fern-sdk-method-name": "create_browser_session",
+    },
 )
 @base_router.post(
     "/browser_sessions/",
@@ -1229,6 +1491,11 @@ async def create_browser_session(
 
 @base_router.post(
     "/browser_sessions/{session_id}/close",
+    tags=["browser"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "browser",
+        "x-fern-sdk-method-name": "close_browser_session",
+    },
 )
 @base_router.post(
     "/browser_sessions/{session_id}/close/",
