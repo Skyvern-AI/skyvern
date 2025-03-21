@@ -51,8 +51,11 @@ function WorkflowRun() {
     workflowPermanentId,
   });
 
-  const { data: workflowRun, isLoading: workflowRunIsLoading } =
-    useWorkflowRunQuery();
+  const {
+    data: workflowRun,
+    isLoading: workflowRunIsLoading,
+    isFetched,
+  } = useWorkflowRunQuery();
 
   const { data: workflowRunTimeline } = useWorkflowRunTimelineQuery();
 
@@ -137,7 +140,23 @@ function WorkflowRun() {
     outputs ?? {},
   );
 
-  const fileUrls = workflowRun?.downloaded_file_urls ?? [];
+  const hasSomeExtractedInformation = Object.values(
+    aggregatedExtractedInformation,
+  ).some((value) => value !== null);
+
+  const hasFileUrls =
+    isFetched &&
+    workflowRun &&
+    workflowRun.downloaded_file_urls &&
+    workflowRun.downloaded_file_urls.length > 0;
+  const fileUrls = hasFileUrls
+    ? (workflowRun.downloaded_file_urls as string[])
+    : [];
+
+  const showOutputSection =
+    workflowRunIsFinalized &&
+    (hasSomeExtractedInformation || hasFileUrls) &&
+    workflowRun.status === Status.Completed;
 
   return (
     <div className="space-y-8">
@@ -240,7 +259,7 @@ function WorkflowRun() {
           )}
         </div>
       </header>
-      {workflowRunIsFinalized && workflowRun.status === Status.Completed && (
+      {showOutputSection && (
         <div className="grid grid-cols-2 gap-4 rounded-lg bg-slate-elevation1 p-4">
           <div className="space-y-4">
             <Label>Extracted Information</Label>
