@@ -163,12 +163,15 @@ class LLMAPIHandlerFactory:
                     LOG.exception("Failed to calculate LLM cost", error=str(e))
                     llm_cost = 0
                 prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
-                reasoning_tokens = (
-                    response.get("usage", {}).get("completion_tokens_details", {}).get("reasoning_tokens", 0)
-                )
                 completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
-                cached_tokens = response.get("usage", {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
-
+                reasoning_tokens = 0
+                completion_token_detail = response.get("usage", {}).get("completion_tokens_details")
+                if completion_token_detail:
+                    reasoning_tokens = completion_token_detail.reasoning_tokens or 0
+                cached_tokens = 0
+                cached_token_detail = response.get("usage", {}).get("prompt_tokens_details")
+                if cached_token_detail:
+                    cached_tokens = cached_token_detail.cached_tokens or 0
                 if step:
                     await app.DATABASE.update_step(
                         task_id=step.task_id,
@@ -351,10 +354,14 @@ class LLMAPIHandlerFactory:
                     llm_cost = 0
                 prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
                 completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
-                reasoning_tokens = (
-                    response.get("usage", {}).get("completion_tokens_details", {}).get("reasoning_tokens", 0)
-                )
-                cached_tokens = response.get("usage", {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
+                reasoning_tokens = 0
+                completion_token_detail = response.get("usage", {}).get("completion_tokens_details")
+                if completion_token_detail:
+                    reasoning_tokens = completion_token_detail.reasoning_tokens or 0
+                cached_tokens = 0
+                cached_token_detail = response.get("usage", {}).get("prompt_tokens_details")
+                if cached_token_detail:
+                    cached_tokens = cached_token_detail.cached_tokens or 0
                 if step:
                     await app.DATABASE.update_step(
                         task_id=step.task_id,
