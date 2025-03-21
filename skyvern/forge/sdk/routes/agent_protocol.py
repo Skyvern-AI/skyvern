@@ -152,14 +152,22 @@ async def heartbeat() -> Response:
     return Response(content="Server is running.", status_code=200)
 
 
-@base_router.post("/tasks", tags=["agent"], response_model=CreateTaskResponse)
+@base_router.post(
+    "/tasks",
+    tags=["api"],
+    response_model=CreateTaskResponse,
+    openapi_extra={
+        "x-fern-sdk-group-name": "api",
+        "x-fern-sdk-method-name": "run_task_v1",
+    },
+)
 @base_router.post(
     "/tasks/",
     tags=["agent"],
     response_model=CreateTaskResponse,
     include_in_schema=False,
 )
-async def run_task(
+async def run_task_v1(
     request: Request,
     background_tasks: BackgroundTasks,
     task: TaskRequest,
@@ -199,9 +207,16 @@ async def run_task(
     return CreateTaskResponse(task_id=created_task.task_id)
 
 
-@base_router.get("/tasks/{task_id}", response_model=TaskResponse)
+@base_router.get(
+    "/tasks/{task_id}",
+    response_model=TaskResponse,
+    openapi_extra={
+        "x-fern-sdk-group-name": "api",
+        "x-fern-sdk-method-name": "get_task_v1",
+    },
+)
 @base_router.get("/tasks/{task_id}/", response_model=TaskResponse, include_in_schema=False)
-async def get_task(
+async def get_task_v1(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> TaskResponse:
@@ -239,7 +254,14 @@ async def get_task(
     )
 
 
-@base_router.post("/tasks/{task_id}/cancel")
+@base_router.post(
+    "/tasks/{task_id}/cancel",
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "api",
+        "x-fern-sdk-method-name": "cancel_task",
+    },
+)
 @base_router.post("/tasks/{task_id}/cancel/", include_in_schema=False)
 async def cancel_task(
     task_id: str,
@@ -554,7 +576,7 @@ async def get_actions(
     return actions
 
 
-@base_router.post("/workflows/{workflow_id}/run", response_model=RunWorkflowResponse)
+@base_router.post("/workflows/{workflow_id}/run", response_model=RunWorkflowResponse, tags=["agent"])
 @base_router.post(
     "/workflows/{workflow_id}/run/",
     response_model=RunWorkflowResponse,
@@ -624,6 +646,7 @@ async def run_workflow(
 @base_router.get(
     "/workflows/runs",
     response_model=list[WorkflowRun],
+    tags=["agent"],
 )
 @base_router.get(
     "/workflows/runs/",
@@ -648,6 +671,7 @@ async def get_workflow_runs(
 @base_router.get(
     "/workflows/{workflow_id}/runs",
     response_model=list[WorkflowRun],
+    tags=["agent"],
 )
 @base_router.get(
     "/workflows/{workflow_id}/runs/",
@@ -673,6 +697,7 @@ async def get_workflow_runs_by_id(
 
 @base_router.get(
     "/workflows/{workflow_id}/runs/{workflow_run_id}",
+    tags=["agent"],
 )
 @base_router.get(
     "/workflows/{workflow_id}/runs/{workflow_run_id}/",
@@ -702,6 +727,7 @@ async def get_workflow_run_with_workflow_id(
 
 @base_router.get(
     "/workflows/{workflow_id}/runs/{workflow_run_id}/timeline",
+    tags=["agent"],
 )
 @base_router.get(
     "/workflows/{workflow_id}/runs/{workflow_run_id}/timeline/",
@@ -719,6 +745,7 @@ async def get_workflow_run_timeline(
 @base_router.get(
     "/workflows/runs/{workflow_run_id}",
     response_model=WorkflowRunResponse,
+    tags=["agent"],
 )
 @base_router.get(
     "/workflows/runs/{workflow_run_id}/",
@@ -745,6 +772,7 @@ async def get_workflow_run(
         },
     },
     response_model=Workflow,
+    tags=["agent"],
 )
 @base_router.post(
     "/workflows/",
@@ -789,6 +817,7 @@ async def create_workflow(
         },
     },
     response_model=Workflow,
+    tags=["agent"],
 )
 @base_router.put(
     "/workflows/{workflow_permanent_id}/",
@@ -832,7 +861,7 @@ async def update_workflow(
         raise FailedToUpdateWorkflow(workflow_permanent_id, f"<{type(e).__name__}: {str(e)}>")
 
 
-@base_router.delete("/workflows/{workflow_permanent_id}")
+@base_router.delete("/workflows/{workflow_permanent_id}", tags=["agent"])
 @base_router.delete("/workflows/{workflow_permanent_id}/", include_in_schema=False)
 async def delete_workflow(
     workflow_permanent_id: str,
@@ -842,7 +871,7 @@ async def delete_workflow(
     await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(workflow_permanent_id, current_org.organization_id)
 
 
-@base_router.get("/workflows", response_model=list[Workflow])
+@base_router.get("/workflows", response_model=list[Workflow], tags=["agent"])
 @base_router.get("/workflows/", response_model=list[Workflow], include_in_schema=False)
 async def get_workflows(
     page: int = Query(1, ge=1),
@@ -888,7 +917,7 @@ async def get_workflows(
     )
 
 
-@base_router.get("/workflows/templates", response_model=list[Workflow])
+@base_router.get("/workflows/templates", response_model=list[Workflow], tags=["agent"])
 @base_router.get("/workflows/templates/", response_model=list[Workflow], include_in_schema=False)
 async def get_workflow_templates() -> list[Workflow]:
     global_workflows_permanent_ids = await app.STORAGE.retrieve_global_workflows()
@@ -904,7 +933,7 @@ async def get_workflow_templates() -> list[Workflow]:
     return workflows
 
 
-@base_router.get("/workflows/{workflow_permanent_id}", response_model=Workflow)
+@base_router.get("/workflows/{workflow_permanent_id}", response_model=Workflow, tags=["agent"])
 @base_router.get("/workflows/{workflow_permanent_id}/", response_model=Workflow)
 async def get_workflow(
     workflow_permanent_id: str,
@@ -924,8 +953,8 @@ async def get_workflow(
     )
 
 
-@base_router.post("/suggest/{ai_suggestion_type}", include_in_schema=False)
-@base_router.post("/suggest/{ai_suggestion_type}/")
+@base_router.post("/suggest/{ai_suggestion_type}", include_in_schema=False, tags=["agent"])
+@base_router.post("/suggest/{ai_suggestion_type}/", tags=["agent"])
 async def suggest(
     ai_suggestion_type: AISuggestionType,
     data: AISuggestionRequest,
@@ -954,7 +983,7 @@ async def suggest(
         raise HTTPException(status_code=400, detail="Failed to suggest data schema. Please try again later.")
 
 
-@base_router.post("/generate/task", include_in_schema=False)
+@base_router.post("/generate/task", include_in_schema=False, tags=["agent"])
 @base_router.post("/generate/task/")
 async def generate_task(
     data: GenerateTaskRequest,
@@ -1015,7 +1044,7 @@ async def generate_task(
         raise HTTPException(status_code=500, detail="Failed to generate task. Please try again later.")
 
 
-@base_router.put("/organizations/", include_in_schema=False)
+@base_router.put("/organizations/", include_in_schema=False, tags=["agent"])
 @base_router.put("/organizations")
 async def update_organization(
     org_update: OrganizationUpdate,
@@ -1027,7 +1056,7 @@ async def update_organization(
     )
 
 
-@base_router.get("/organizations/", include_in_schema=False)
+@base_router.get("/organizations/", include_in_schema=False, tags=["agent"])
 @base_router.get("/organizations")
 async def get_organizations(
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -1035,7 +1064,7 @@ async def get_organizations(
     return GetOrganizationsResponse(organizations=[current_org])
 
 
-@base_router.get("/organizations/{organization_id}/apikeys/", include_in_schema=False)
+@base_router.get("/organizations/{organization_id}/apikeys/", include_in_schema=False, tags=["agent"])
 @base_router.get("/organizations/{organization_id}/apikeys", include_in_schema=False)
 async def get_api_keys(
     organization_id: str,
@@ -1066,7 +1095,7 @@ async def _validate_file_size(file: UploadFile) -> UploadFile:
     return file
 
 
-@base_router.post("/upload_file/", include_in_schema=False)
+@base_router.post("/upload_file/", include_in_schema=False, tags=["agent"])
 @base_router.post("/upload_file")
 async def upload_file(
     file: UploadFile = Depends(_validate_file_size),
@@ -1109,8 +1138,8 @@ async def upload_file(
     )
 
 
-@v2_router.post("/tasks")
-@v2_router.post("/tasks/", include_in_schema=False)
+@v2_router.post("/tasks", tags=["agent"])
+@v2_router.post("/tasks/", include_in_schema=False, tags=["agent"])
 async def run_task_v2(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -1158,8 +1187,8 @@ async def run_task_v2(
     return task_v2.model_dump(by_alias=True)
 
 
-@v2_router.get("/tasks/{task_id}")
-@v2_router.get("/tasks/{task_id}/", include_in_schema=False)
+@v2_router.get("/tasks/{task_id}", tags=["agent"])
+@v2_router.get("/tasks/{task_id}/", include_in_schema=False, tags=["agent"])
 async def get_task_v2(
     task_id: str,
     organization: Organization = Depends(org_auth_service.get_current_org),
@@ -1173,11 +1202,13 @@ async def get_task_v2(
 @base_router.get(
     "/browser_sessions/{browser_session_id}",
     response_model=BrowserSessionResponse,
+    tags=["agent"],
 )
 @base_router.get(
     "/browser_sessions/{browser_session_id}/",
     response_model=BrowserSessionResponse,
     include_in_schema=False,
+    tags=["agent"],
 )
 async def get_browser_session(
     browser_session_id: str,
@@ -1196,11 +1227,13 @@ async def get_browser_session(
 @base_router.get(
     "/browser_sessions",
     response_model=list[BrowserSessionResponse],
+    tags=["agent"],
 )
 @base_router.get(
     "/browser_sessions/",
     response_model=list[BrowserSessionResponse],
     include_in_schema=False,
+    tags=["agent"],
 )
 async def get_browser_sessions(
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -1214,11 +1247,13 @@ async def get_browser_sessions(
 @base_router.post(
     "/browser_sessions",
     response_model=BrowserSessionResponse,
+    tags=["agent"],
 )
 @base_router.post(
     "/browser_sessions/",
     response_model=BrowserSessionResponse,
     include_in_schema=False,
+    tags=["agent"],
 )
 async def create_browser_session(
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -1229,10 +1264,12 @@ async def create_browser_session(
 
 @base_router.post(
     "/browser_sessions/{session_id}/close",
+    tags=["agent"],
 )
 @base_router.post(
     "/browser_sessions/{session_id}/close/",
     include_in_schema=False,
+    tags=["agent"],
 )
 async def close_browser_session(
     session_id: str,
