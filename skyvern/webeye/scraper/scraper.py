@@ -11,7 +11,7 @@ from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
 from skyvern.constants import BUILDING_ELEMENT_TREE_TIMEOUT_MS, SKYVERN_DIR, SKYVERN_ID_ATTR
-from skyvern.exceptions import FailedToTakeScreenshot, UnknownElementTreeFormat
+from skyvern.exceptions import FailedToTakeScreenshot, ScrapingFailed, UnknownElementTreeFormat
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.webeye.browser_factory import BrowserState
@@ -356,7 +356,7 @@ async def scrape_website(
             if isinstance(e, FailedToTakeScreenshot):
                 raise e
             else:
-                raise Exception("Scraping failed.")
+                raise ScrapingFailed() from e
         LOG.info("Scraping failed, will retry", num_retry=num_retry, url=url)
         return await scrape_website(
             browser_state,

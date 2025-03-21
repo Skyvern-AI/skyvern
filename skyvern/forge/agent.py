@@ -36,6 +36,7 @@ from skyvern.exceptions import (
     MissingBrowserState,
     MissingBrowserStatePage,
     NoTOTPVerificationCodeFound,
+    ScrapingFailed,
     SkyvernException,
     StepTerminationError,
     StepUnableToExecuteError,
@@ -678,7 +679,25 @@ class ForgeAgent:
                 close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
             )
             return step, detailed_output, None
-
+        except ScrapingFailed:
+            LOG.warning(
+                "Scraping failed, marking the task as failed",
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            await self.fail_task(
+                task,
+                step,
+                "Skyvern failed to load the website. This usually happens when the website is not properly designed, and crashes the browser as a result.",
+            )
+            await self.clean_up_task(
+                task=task,
+                last_step=step,
+                api_key=api_key,
+                close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                browser_session_id=browser_session_id,
+            )
+            return step, detailed_output, None
         except Exception as e:
             LOG.exception(
                 "Got an unexpected exception in step, marking task as failed",
@@ -1151,7 +1170,12 @@ class ForgeAgent:
                 output=detailed_agent_step_output.to_agent_step_output(),
             )
             return failed_step, detailed_agent_step_output.get_clean_detailed_output()
-        except (UnsupportedActionType, UnsupportedTaskType, FailedToParseActionInstruction):
+        except (
+            UnsupportedActionType,
+            UnsupportedTaskType,
+            FailedToParseActionInstruction,
+            ScrapingFailed,
+        ):
             raise
 
         except Exception as e:
@@ -1382,18 +1406,18 @@ class ForgeAgent:
                     scrape_type=scrape_type,
                 )
                 break
-            except FailedToTakeScreenshot as e:
+            except (FailedToTakeScreenshot, ScrapingFailed) as e:
                 if idx < len(SCRAPE_TYPE_ORDER) - 1:
                     continue
                 LOG.error(
-                    "Failed to take screenshot after two normal attempts and reload-page retry",
+                    f"{e.__class__.__name__} happened in two normal attempts and reload-page retry",
                     task_id=task.task_id,
                     step_id=step.step_id,
                 )
-                raise e
+                raise ScrapingFailed()
 
         if scraped_page is None:
-            raise EmptyScrapePage
+            raise EmptyScrapePage()
 
         await app.ARTIFACT_MANAGER.create_artifact(
             step=step,
