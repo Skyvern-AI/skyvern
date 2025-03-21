@@ -1,8 +1,9 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "FastAPI",
-    "version": "0.1.0"
+    "title": "Skyvern API",
+    "description": "API for Skyvern",
+    "version": "1.0.0"
   },
   "paths": {
     "/api/v1/webhook": {
@@ -67,7 +68,9 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "server",
+        "x-fern-sdk-method-name": "webhook"
       }
     },
     "/api/v1/heartbeat": {
@@ -89,7 +92,9 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "server",
+        "x-fern-sdk-method-name": "heartbeat"
       }
     },
     "/api/v1/tasks": {
@@ -97,8 +102,8 @@
         "tags": [
           "agent"
         ],
-        "summary": "Run Task",
-        "operationId": "run_task_api_v1_tasks_post",
+        "summary": "Run Task V1",
+        "operationId": "run_task_v1_api_v1_tasks_post",
         "parameters": [
           {
             "name": "x-api-key",
@@ -180,7 +185,9 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "run_task_v1"
       },
       "get": {
         "tags": [
@@ -349,13 +356,18 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_tasks"
       }
     },
     "/api/v1/tasks/{task_id}": {
       "get": {
-        "summary": "Get Task",
-        "operationId": "get_task_api_v1_tasks__task_id__get",
+        "tags": [
+          "agent"
+        ],
+        "summary": "Get Task V1",
+        "operationId": "get_task_v1_api_v1_tasks__task_id__get",
         "parameters": [
           {
             "name": "task_id",
@@ -420,11 +432,16 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_task_v1"
       }
     },
     "/api/v1/tasks/{task_id}/cancel": {
       "post": {
+        "tags": [
+          "agent"
+        ],
         "summary": "Cancel Task",
         "operationId": "cancel_task_api_v1_tasks__task_id__cancel_post",
         "parameters": [
@@ -491,11 +508,16 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "cancel_task"
       }
     },
     "/api/v1/workflows/runs/{workflow_run_id}/cancel": {
       "post": {
+        "tags": [
+          "agent"
+        ],
         "summary": "Cancel Workflow Run",
         "operationId": "cancel_workflow_run_api_v1_workflows_runs__workflow_run_id__cancel_post",
         "parameters": [
@@ -562,7 +584,9 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "cancel_workflow_run"
       }
     },
     "/api/v1/tasks/{task_id}/retry_webhook": {
@@ -636,11 +660,16 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "retry_webhook"
       }
     },
     "/api/v1/runs": {
       "get": {
+        "tags": [
+          "agent"
+        ],
         "summary": "Get Runs",
         "operationId": "get_runs_api_v1_runs_get",
         "parameters": [
@@ -750,7 +779,85 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_runs"
+      }
+    },
+    "/api/v1/runs/{run_id}": {
+      "get": {
+        "tags": [
+          "agent"
+        ],
+        "summary": "Get Run",
+        "operationId": "get_run_api_v1_runs__run_id__get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskRunResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_run"
       }
     },
     "/api/v1/tasks/{task_id}/steps": {
@@ -829,7 +936,9 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_steps"
       }
     },
     "/api/v1/{entity_type}/{entity_id}/artifacts": {
@@ -916,7 +1025,9 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_artifacts"
       }
     },
     "/api/v1/tasks/{task_id}/steps/{step_id}/artifacts": {
@@ -1004,11 +1115,16 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_step_artifacts"
       }
     },
     "/api/v1/tasks/{task_id}/actions": {
       "get": {
+        "tags": [
+          "agent"
+        ],
         "summary": "Get Actions",
         "operationId": "get_actions_api_v1_tasks__task_id__actions_get",
         "parameters": [
@@ -1079,11 +1195,16 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_actions"
       }
     },
     "/api/v1/workflows/{workflow_id}/run": {
       "post": {
+        "tags": [
+          "agent"
+        ],
         "summary": "Run Workflow",
         "operationId": "run_workflow_api_v1_workflows__workflow_id__run_post",
         "parameters": [
@@ -1202,11 +1323,16 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "run_workflow"
       }
     },
     "/api/v1/workflows/runs": {
       "get": {
+        "tags": [
+          "agent"
+        ],
         "summary": "Get Workflow Runs",
         "operationId": "get_workflow_runs_api_v1_workflows_runs_get",
         "parameters": [
@@ -1309,11 +1435,16 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_workflow_runs"
       }
     },
     "/api/v1/workflows/{workflow_id}/runs": {
       "get": {
+        "tags": [
+          "agent"
+        ],
         "summary": "Get Workflow Runs By Id",
         "operationId": "get_workflow_runs_by_id_api_v1_workflows__workflow_id__runs_get",
         "parameters": [
@@ -1425,13 +1556,18 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_workflow_runs_by_id"
       }
     },
     "/api/v1/workflows/{workflow_id}/runs/{workflow_run_id}": {
       "get": {
-        "summary": "Get Workflow Run",
-        "operationId": "get_workflow_run_api_v1_workflows__workflow_id__runs__workflow_run_id__get",
+        "tags": [
+          "agent"
+        ],
+        "summary": "Get Workflow Run With Workflow Id",
+        "operationId": "get_workflow_run_with_workflow_id_api_v1_workflows__workflow_id__runs__workflow_run_id__get",
         "parameters": [
           {
             "name": "workflow_id",
@@ -1491,7 +1627,7 @@
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "title": "Response Get Workflow Run Api V1 Workflows  Workflow Id  Runs  Workflow Run Id  Get"
+                  "title": "Response Get Workflow Run With Workflow Id Api V1 Workflows  Workflow Id  Runs  Workflow Run Id  Get"
                 }
               }
             }
@@ -1506,11 +1642,16 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_workflow_run_with_workflow_id"
       }
     },
     "/api/v1/workflows/{workflow_id}/runs/{workflow_run_id}/timeline": {
       "get": {
+        "tags": [
+          "agent"
+        ],
         "summary": "Get Workflow Run Timeline",
         "operationId": "get_workflow_run_timeline_api_v1_workflows__workflow_id__runs__workflow_run_id__timeline_get",
         "parameters": [
@@ -1603,13 +1744,18 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_workflow_run_timeline"
       }
     },
     "/api/v1/workflows/runs/{workflow_run_id}": {
       "get": {
-        "summary": "Get Workflow Run By Run Id",
-        "operationId": "get_workflow_run_by_run_id_api_v1_workflows_runs__workflow_run_id__get",
+        "tags": [
+          "agent"
+        ],
+        "summary": "Get Workflow Run",
+        "operationId": "get_workflow_run_api_v1_workflows_runs__workflow_run_id__get",
         "parameters": [
           {
             "name": "workflow_run_id",
@@ -1659,7 +1805,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/WorkflowRunStatusResponse"
+                  "$ref": "#/components/schemas/WorkflowRunResponse"
                 }
               }
             }
@@ -1674,11 +1820,16 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_workflow_run"
       }
     },
     "/api/v1/workflows": {
       "post": {
+        "tags": [
+          "agent"
+        ],
         "summary": "Create Workflow",
         "operationId": "create_workflow_api_v1_workflows_post",
         "parameters": [
@@ -2750,6 +2901,11 @@
                           }
                         ],
                         "title": "Terminate Criterion"
+                      },
+                      "complete_verification": {
+                        "default": true,
+                        "title": "Complete Verification",
+                        "type": "boolean"
                       }
                     },
                     "required": [
@@ -2903,6 +3059,11 @@
                           }
                         ],
                         "title": "Terminate Criterion"
+                      },
+                      "complete_verification": {
+                        "default": true,
+                        "title": "Complete Verification",
+                        "type": "boolean"
                       }
                     },
                     "required": [
@@ -3267,6 +3428,11 @@
                           }
                         ],
                         "title": "Terminate Criterion"
+                      },
+                      "complete_verification": {
+                        "default": true,
+                        "title": "Complete Verification",
+                        "type": "boolean"
                       }
                     },
                     "required": [
@@ -3886,9 +4052,14 @@
             }
           },
           "required": true
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "create_workflow"
       },
       "get": {
+        "tags": [
+          "agent"
+        ],
         "summary": "Get Workflows",
         "description": "Get all workflows with the latest version for the organization.",
         "operationId": "get_workflows_api_v1_workflows_get",
@@ -4013,11 +4184,16 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_workflows"
       }
     },
     "/api/v1/workflows/{workflow_permanent_id}": {
       "put": {
+        "tags": [
+          "agent"
+        ],
         "summary": "Update Workflow",
         "operationId": "update_workflow_api_v1_workflows__workflow_permanent_id__put",
         "parameters": [
@@ -5098,6 +5274,11 @@
                           }
                         ],
                         "title": "Terminate Criterion"
+                      },
+                      "complete_verification": {
+                        "default": true,
+                        "title": "Complete Verification",
+                        "type": "boolean"
                       }
                     },
                     "required": [
@@ -5251,6 +5432,11 @@
                           }
                         ],
                         "title": "Terminate Criterion"
+                      },
+                      "complete_verification": {
+                        "default": true,
+                        "title": "Complete Verification",
+                        "type": "boolean"
                       }
                     },
                     "required": [
@@ -5615,6 +5801,11 @@
                           }
                         ],
                         "title": "Terminate Criterion"
+                      },
+                      "complete_verification": {
+                        "default": true,
+                        "title": "Complete Verification",
+                        "type": "boolean"
                       }
                     },
                     "required": [
@@ -6234,9 +6425,14 @@
             }
           },
           "required": true
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "update_workflow"
       },
       "delete": {
+        "tags": [
+          "agent"
+        ],
         "summary": "Delete Workflow",
         "operationId": "delete_workflow_api_v1_workflows__workflow_permanent_id__delete",
         "parameters": [
@@ -6303,9 +6499,14 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "delete_workflow"
       },
       "get": {
+        "tags": [
+          "agent"
+        ],
         "summary": "Get Workflow",
         "operationId": "get_workflow_api_v1_workflows__workflow_permanent_id__get",
         "parameters": [
@@ -6398,140 +6599,16 @@
               }
             }
           }
-        }
-      }
-    },
-    "/api/v1/workflows/": {
-      "get": {
-        "summary": "Get Workflows",
-        "description": "Get all workflows with the latest version for the organization.",
-        "operationId": "get_workflows_api_v1_workflows__get",
-        "parameters": [
-          {
-            "name": "page",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "default": 1,
-              "title": "Page"
-            }
-          },
-          {
-            "name": "page_size",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "default": 10,
-              "title": "Page Size"
-            }
-          },
-          {
-            "name": "only_saved_tasks",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": false,
-              "title": "Only Saved Tasks"
-            }
-          },
-          {
-            "name": "only_workflows",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": false,
-              "title": "Only Workflows"
-            }
-          },
-          {
-            "name": "title",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "",
-              "title": "Title"
-            }
-          },
-          {
-            "name": "template",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": false,
-              "title": "Template"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/Workflow"
-                  },
-                  "title": "Response Get Workflows Api V1 Workflows  Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_workflow"
       }
     },
     "/api/v1/workflows/templates": {
       "get": {
+        "tags": [
+          "agent"
+        ],
         "summary": "Get Workflow Templates",
         "operationId": "get_workflow_templates_api_v1_workflows_templates_get",
         "responses": {
@@ -6549,190 +6626,18 @@
               }
             }
           }
-        }
-      }
-    },
-    "/api/v1/workflows/{workflow_permanent_id}/": {
-      "get": {
-        "summary": "Get Workflow",
-        "operationId": "get_workflow_api_v1_workflows__workflow_permanent_id___get",
-        "parameters": [
-          {
-            "name": "workflow_permanent_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Workflow Permanent Id"
-            }
-          },
-          {
-            "name": "version",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Version"
-            }
-          },
-          {
-            "name": "template",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": false,
-              "title": "Template"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Workflow"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/suggest/{ai_suggestion_type}/": {
-      "post": {
-        "summary": "Suggest",
-        "operationId": "suggest_api_v1_suggest__ai_suggestion_type___post",
-        "parameters": [
-          {
-            "name": "ai_suggestion_type",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/AISuggestionType"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AISuggestionRequest"
-              }
-            }
-          }
         },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AISuggestionBase"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_workflow_templates"
       }
     },
-    "/api/v1/generate/task/": {
+    "/api/v1/generate/task": {
       "post": {
+        "tags": [
+          "agent"
+        ],
         "summary": "Generate Task",
-        "operationId": "generate_task_api_v1_generate_task__post",
+        "operationId": "generate_task_api_v1_generate_task_post",
         "parameters": [
           {
             "name": "x-api-key",
@@ -6798,11 +6703,16 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "generate_task"
       }
     },
     "/api/v1/organizations": {
       "put": {
+        "tags": [
+          "server"
+        ],
         "summary": "Update Organization",
         "operationId": "update_organization_api_v1_organizations_put",
         "parameters": [
@@ -6870,9 +6780,14 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "server",
+        "x-fern-sdk-method-name": "update_organization"
       },
       "get": {
+        "tags": [
+          "server"
+        ],
         "summary": "Get Organizations",
         "operationId": "get_organizations_api_v1_organizations_get",
         "parameters": [
@@ -6930,11 +6845,92 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "server",
+        "x-fern-sdk-method-name": "get_organizations"
+      }
+    },
+    "/api/v1/organizations/{organization_id}/apikeys/": {
+      "get": {
+        "tags": [
+          "server"
+        ],
+        "summary": "Get Api Keys",
+        "operationId": "get_api_keys_api_v1_organizations__organization_id__apikeys__get",
+        "parameters": [
+          {
+            "name": "organization_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Organization Id"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetOrganizationAPIKeysResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-group-name": "server",
+        "x-fern-sdk-method-name": "get_api_keys"
       }
     },
     "/api/v1/upload_file": {
       "post": {
+        "tags": [
+          "server"
+        ],
         "summary": "Upload File",
         "operationId": "upload_file_api_v1_upload_file_post",
         "parameters": [
@@ -7002,11 +6998,16 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "server",
+        "x-fern-sdk-method-name": "upload_file"
       }
     },
     "/api/v1/browser_sessions/{browser_session_id}": {
       "get": {
+        "tags": [
+          "browser"
+        ],
         "summary": "Get Browser Session",
         "operationId": "get_browser_session_api_v1_browser_sessions__browser_session_id__get",
         "parameters": [
@@ -7073,11 +7074,16 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "browser",
+        "x-fern-sdk-method-name": "get_browser_session"
       }
     },
     "/api/v1/browser_sessions": {
       "get": {
+        "tags": [
+          "browser"
+        ],
         "summary": "Get Browser Sessions",
         "description": "Get all active browser sessions for the organization",
         "operationId": "get_browser_sessions_api_v1_browser_sessions_get",
@@ -7140,9 +7146,14 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "browser",
+        "x-fern-sdk-method-name": "get_browser_sessions"
       },
       "post": {
+        "tags": [
+          "browser"
+        ],
         "summary": "Create Browser Session",
         "operationId": "create_browser_session_api_v1_browser_sessions_post",
         "parameters": [
@@ -7200,11 +7211,16 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "browser",
+        "x-fern-sdk-method-name": "create_browser_session"
       }
     },
     "/api/v1/browser_sessions/{session_id}/close": {
       "post": {
+        "tags": [
+          "browser"
+        ],
         "summary": "Close Browser Session",
         "operationId": "close_browser_session_api_v1_browser_sessions__session_id__close_post",
         "parameters": [
@@ -7271,11 +7287,16 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "browser",
+        "x-fern-sdk-method-name": "close_browser_session"
       }
     },
     "/api/v2/tasks": {
       "post": {
+        "tags": [
+          "agent"
+        ],
         "summary": "Run Task V2",
         "operationId": "run_task_v2_api_v2_tasks_post",
         "parameters": [
@@ -7382,11 +7403,16 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "run_task_v2"
       }
     },
     "/api/v2/tasks/{task_id}": {
       "get": {
+        "tags": [
+          "agent"
+        ],
         "summary": "Get Task V2",
         "operationId": "get_task_v2_api_v2_tasks__task_id__get",
         "parameters": [
@@ -7454,7 +7480,9 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_task_v2"
       }
     },
     "/api/v1/totp": {
@@ -7512,164 +7540,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/TOTPCode"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/credentials": {
-      "get": {
-        "summary": "Get Credentials",
-        "operationId": "get_credentials_api_v1_credentials_get",
-        "parameters": [
-          {
-            "name": "page",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "default": 1,
-              "title": "Page"
-            }
-          },
-          {
-            "name": "page_size",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "default": 10,
-              "title": "Page Size"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/CredentialResponse"
-                  },
-                  "title": "Response Get Credentials Api V1 Credentials Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      },
-      "post": {
-        "summary": "Create Credential",
-        "operationId": "create_credential_api_v1_credentials_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CreateCredentialRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CredentialResponse"
                 }
               }
             }
@@ -7830,58 +7700,6 @@
   },
   "components": {
     "schemas": {
-      "AISuggestionBase": {
-        "properties": {
-          "output": {
-            "anyOf": [
-              {
-                "type": "object"
-              },
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Output"
-          }
-        },
-        "type": "object",
-        "title": "AISuggestionBase"
-      },
-      "AISuggestionRequest": {
-        "properties": {
-          "input": {
-            "type": "string",
-            "minLength": 1,
-            "title": "Input"
-          },
-          "context": {
-            "anyOf": [
-              {
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Context"
-          }
-        },
-        "type": "object",
-        "required": [
-          "input"
-        ],
-        "title": "AISuggestionRequest"
-      },
-      "AISuggestionType": {
-        "type": "string",
-        "enum": [
-          "data_schema"
-        ],
-        "title": "AISuggestionType"
-      },
       "AWSSecretParameter": {
         "properties": {
           "parameter_type": {
@@ -8493,6 +8311,11 @@
             "type": "boolean",
             "title": "Cache Actions",
             "default": false
+          },
+          "complete_verification": {
+            "type": "boolean",
+            "title": "Complete Verification",
+            "default": true
           }
         },
         "type": "object",
@@ -9879,6 +9702,11 @@
             "type": "boolean",
             "title": "Cache Actions",
             "default": false
+          },
+          "complete_verification": {
+            "type": "boolean",
+            "title": "Complete Verification",
+            "default": true
           }
         },
         "type": "object",
@@ -10109,6 +9937,11 @@
             "type": "boolean",
             "title": "Cache Actions",
             "default": false
+          },
+          "complete_verification": {
+            "type": "boolean",
+            "title": "Complete Verification",
+            "default": true
           }
         },
         "type": "object",
@@ -10394,6 +10227,22 @@
         ],
         "title": "GenerateTaskRequest"
       },
+      "GetOrganizationAPIKeysResponse": {
+        "properties": {
+          "api_keys": {
+            "items": {
+              "$ref": "#/components/schemas/OrganizationAuthToken"
+            },
+            "type": "array",
+            "title": "Api Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "api_keys"
+        ],
+        "title": "GetOrganizationAPIKeysResponse"
+      },
       "GetOrganizationsResponse": {
         "properties": {
           "organizations": {
@@ -10643,6 +10492,11 @@
             "type": "boolean",
             "title": "Cache Actions",
             "default": false
+          },
+          "complete_verification": {
+            "type": "boolean",
+            "title": "Complete Verification",
+            "default": true
           }
         },
         "type": "object",
@@ -10865,6 +10719,11 @@
             "type": "boolean",
             "title": "Cache Actions",
             "default": false
+          },
+          "complete_verification": {
+            "type": "boolean",
+            "title": "Complete Verification",
+            "default": true
           }
         },
         "type": "object",
@@ -11057,6 +10916,57 @@
         ],
         "title": "Organization"
       },
+      "OrganizationAuthToken": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "token_type": {
+            "$ref": "#/components/schemas/OrganizationAuthTokenType"
+          },
+          "token": {
+            "type": "string",
+            "title": "Token"
+          },
+          "valid": {
+            "type": "boolean",
+            "title": "Valid"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "organization_id",
+          "token_type",
+          "token",
+          "valid",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "OrganizationAuthToken"
+      },
+      "OrganizationAuthTokenType": {
+        "type": "string",
+        "enum": [
+          "api"
+        ],
+        "title": "OrganizationAuthTokenType"
+      },
       "OrganizationUpdate": {
         "properties": {
           "max_steps_per_run": {
@@ -11218,6 +11128,14 @@
           "NONE"
         ],
         "title": "ProxyLocation"
+      },
+      "RunEngine": {
+        "type": "string",
+        "enum": [
+          "skyvern-1.0",
+          "skyvern-2.0"
+        ],
+        "title": "RunEngine"
       },
       "RunWorkflowResponse": {
         "properties": {
@@ -11425,6 +11343,28 @@
             "type": "integer",
             "title": "Output Token Count",
             "default": 0
+          },
+          "reasoning_token_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Token Count"
+          },
+          "cached_token_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cached Token Count"
           },
           "step_cost": {
             "type": "number",
@@ -12455,6 +12395,11 @@
             "type": "boolean",
             "title": "Cache Actions",
             "default": false
+          },
+          "complete_verification": {
+            "type": "boolean",
+            "title": "Complete Verification",
+            "default": true
           }
         },
         "type": "object",
@@ -13030,6 +12975,185 @@
         ],
         "title": "TaskResponse"
       },
+      "TaskRunResponse": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "engine": {
+            "$ref": "#/components/schemas/RunEngine",
+            "default": "skyvern-1.0"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TaskRunStatus"
+          },
+          "goal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Goal"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "output": {
+            "anyOf": [
+              {
+                "type": "object"
+              },
+              {
+                "items": {
+
+                },
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output"
+          },
+          "failure_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Reason"
+          },
+          "webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Url"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
+          },
+          "totp_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Url"
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "max_steps": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "status",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "TaskRunResponse"
+      },
+      "TaskRunStatus": {
+        "type": "string",
+        "enum": [
+          "created",
+          "queued",
+          "running",
+          "timed_out",
+          "failed",
+          "terminated",
+          "completed",
+          "canceled"
+        ],
+        "title": "TaskRunStatus"
+      },
       "TaskStatus": {
         "type": "string",
         "enum": [
@@ -13202,6 +13326,37 @@
             ],
             "title": "Webhook Callback Url"
           },
+          "extracted_information_schema": {
+            "anyOf": [
+              {
+                "type": "object"
+              },
+              {
+                "items": {
+
+                },
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extracted Information Schema"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -13373,6 +13528,40 @@
             "type": "boolean",
             "title": "Publish Workflow",
             "default": false
+          },
+          "extracted_information_schema": {
+            "anyOf": [
+              {
+                "type": "object"
+              },
+              {
+                "items": {
+
+                },
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extracted Information Schema"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
           }
         },
         "type": "object",
@@ -13652,6 +13841,28 @@
               }
             ],
             "title": "Output Token Count"
+          },
+          "reasoning_token_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Token Count"
+          },
+          "cached_token_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cached Token Count"
           },
           "thought_cost": {
             "anyOf": [
@@ -13959,6 +14170,11 @@
             "type": "boolean",
             "title": "Cache Actions",
             "default": false
+          },
+          "complete_verification": {
+            "type": "boolean",
+            "title": "Complete Verification",
+            "default": true
           }
         },
         "type": "object",
@@ -14214,6 +14430,11 @@
             "type": "boolean",
             "title": "Cache Actions",
             "default": false
+          },
+          "complete_verification": {
+            "type": "boolean",
+            "title": "Complete Verification",
+            "default": true
           }
         },
         "type": "object",
@@ -15241,21 +15462,7 @@
         ],
         "title": "WorkflowRunBlock"
       },
-      "WorkflowRunStatus": {
-        "type": "string",
-        "enum": [
-          "created",
-          "queued",
-          "running",
-          "failed",
-          "terminated",
-          "canceled",
-          "timed_out",
-          "completed"
-        ],
-        "title": "WorkflowRunStatus"
-      },
-      "WorkflowRunStatusResponse": {
+      "WorkflowRunResponse": {
         "properties": {
           "workflow_id": {
             "type": "string",
@@ -15453,7 +15660,21 @@
           "modified_at",
           "parameters"
         ],
-        "title": "WorkflowRunStatusResponse"
+        "title": "WorkflowRunResponse"
+      },
+      "WorkflowRunStatus": {
+        "type": "string",
+        "enum": [
+          "created",
+          "queued",
+          "running",
+          "failed",
+          "terminated",
+          "canceled",
+          "timed_out",
+          "completed"
+        ],
+        "title": "WorkflowRunStatus"
       },
       "WorkflowRunTimeline": {
         "properties": {
@@ -15525,5 +15746,11 @@
         "title": "WorkflowStatus"
       }
     }
-  }
+  },
+  "servers": [
+    {
+      "url": "https://api.skyvern.com",
+      "x-fern-server-name": "Production"
+    }
+  ]
 }
