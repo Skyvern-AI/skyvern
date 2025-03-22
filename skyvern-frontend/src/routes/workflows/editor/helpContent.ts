@@ -81,6 +81,16 @@ export const helpTooltips = {
     ...baseHelpTooltipContent,
     path: "Since we're in beta this section isn't fully customizable yet, contact us if you'd like to integrate it into your workflow.",
   },
+  fileUpload: {
+    ...baseHelpTooltipContent,
+    path: "The path to upload the file to.",
+    storage_type: "The type of storage to upload the file to.",
+    s3_bucket: "The S3 bucket to upload the file to.",
+    aws_access_key_id: "The AWS access key ID to use to upload the file to S3.",
+    aws_secret_access_key:
+      "The AWS secret access key to use to upload the file to S3.",
+    region_name: "The AWS region",
+  },
   download: {
     ...baseHelpTooltipContent,
     url: "Since we're in beta this section isn't fully customizable yet, contact us if you'd like to integrate it into your workflow.",
@@ -136,6 +146,7 @@ export const placeholders = {
   loop: basePlaceholderContent,
   sendEmail: basePlaceholderContent,
   upload: basePlaceholderContent,
+  fileUpload: basePlaceholderContent,
   download: basePlaceholderContent,
   codeBlock: basePlaceholderContent,
   fileUrl: basePlaceholderContent,

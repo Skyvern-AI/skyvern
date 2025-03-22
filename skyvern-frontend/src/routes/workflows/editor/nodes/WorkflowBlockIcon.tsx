@@ -64,6 +64,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     case "upload_to_s3": {
       return <UploadIcon className={className} />;
     }
+    case "file_upload": {
+      return <UploadIcon className={className} />;
+    }
     case "validation": {
       return <CheckCircledIcon className={className} />;
     }
