@@ -106,3 +106,47 @@ services:
     depends_on:
       skyvern:
         condition: service_healthy
+
+  # Windows-specific configurations
+  skyvern-windows:
+    image: public.ecr.aws/skyvern/skyvern:latest
+    restart: on-failure
+    ports:
+      - 8000:8000
+    volumes:
+      - ./artifacts:/data/artifacts
+      - ./videos:/data/videos
+      - ./har:/data/har
+      - ./log:/data/log
+      - ./.streamlit:/app/.streamlit
+    environment:
+      - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
+      - BROWSER_TYPE=chromium-headful
+      - ENABLE_OPENAI=true
+      - LLM_KEY=OPENAI_GPT4O
+      - OPENAI_API_KEY=<your_openai_key>
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/app/.streamlit/secrets.toml"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  skyvern-ui-windows:
+    image: public.ecr.aws/skyvern/skyvern-ui:latest
+    restart: on-failure
+    ports:
+      - 8080:8080
+      - 9090:9090
+    volumes:
+      - ./artifacts:/data/artifacts
+      - ./videos:/data/videos
+      - ./har:/data/har
+      - ./.streamlit:/app/.streamlit
+    environment:
+      - VITE_WSS_BASE_URL=ws://localhost:8000/api/v1
+    depends_on:
+      skyvern-windows:
+        condition: service_healthy
