@@ -161,6 +161,7 @@ export type WorkflowBlock =
   | TextPromptBlock
   | CodeBlock
   | UploadToS3Block
+  | FileUploadBlock
   | DownloadToS3Block
   | SendEmailBlock
   | FileURLParserBlock
@@ -182,6 +183,7 @@ export const WorkflowBlockTypes = {
   TextPrompt: "text_prompt",
   DownloadToS3: "download_to_s3",
   UploadToS3: "upload_to_s3",
+  FileUpload: "file_upload",
   SendEmail: "send_email",
   FileURLParser: "file_url_parser",
   Validation: "validation",
@@ -212,6 +214,13 @@ export function isTaskVariantBlock(item: {
 
 export type WorkflowBlockType =
   (typeof WorkflowBlockTypes)[keyof typeof WorkflowBlockTypes];
+
+export const FileStorageTypes = {
+  S3: "s3",
+} as const;
+
+export type FileStorageType =
+  (typeof FileStorageTypes)[keyof typeof FileStorageTypes];
 
 export const WorkflowEditorParameterTypes = {
   Workflow: "workflow",
@@ -290,6 +299,16 @@ export type DownloadToS3Block = WorkflowBlockBase & {
 export type UploadToS3Block = WorkflowBlockBase & {
   block_type: "upload_to_s3";
   path: string;
+};
+
+export type FileUploadBlock = WorkflowBlockBase & {
+  block_type: "file_upload";
+  path: string;
+  storage_type: FileStorageType;
+  s3_bucket: string;
+  region_name: string;
+  aws_access_key_id: string;
+  aws_secret_access_key: string;
 };
 
 export type SendEmailBlock = WorkflowBlockBase & {

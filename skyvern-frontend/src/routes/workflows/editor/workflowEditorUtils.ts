@@ -483,6 +483,23 @@ function convertToNode(
       };
     }
 
+    case "file_upload": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "fileUpload",
+        data: {
+          ...commonData,
+          path: block.path,
+          storageType: block.storage_type,
+          s3Bucket: block.s3_bucket,
+          awsAccessKeyId: block.aws_access_key_id,
+          awsSecretAccessKey: block.aws_secret_access_key,
+          regionName: block.region_name,
+        },
+      };
+    }
+
     case "goto_url": {
       return {
         ...identifiers,
