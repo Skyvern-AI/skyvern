@@ -35,6 +35,7 @@ import {
   PDFParserBlockYAML,
   Taskv2BlockYAML,
   URLBlockYAML,
+  FileUploadBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -96,7 +97,7 @@ import {
 } from "./nodes/PDFParserNode/types";
 import { taskv2NodeDefaultData } from "./nodes/Taskv2Node/types";
 import { urlNodeDefaultData } from "./nodes/URLNode/types";
-
+import { fileUploadNodeDefaultData } from "./nodes/FileUploadNode/types";
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
 function layoutUtil(
@@ -479,6 +480,23 @@ function convertToNode(
         data: {
           ...commonData,
           path: block.path,
+        },
+      };
+    }
+
+    case "file_upload": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "fileUpload",
+        data: {
+          ...commonData,
+          path: block.path,
+          storageType: block.storage_type,
+          s3Bucket: block.s3_bucket,
+          awsAccessKeyId: block.aws_access_key_id,
+          awsSecretAccessKey: block.aws_secret_access_key,
+          regionName: block.region_name,
         },
       };
     }
@@ -902,6 +920,17 @@ function createNode(
         },
       };
     }
+    case "fileUpload": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "fileUpload",
+        data: {
+          ...fileUploadNodeDefaultData,
+          label,
+        },
+      };
+    }
   }
 }
 
@@ -1125,6 +1154,18 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         ...base,
         block_type: "upload_to_s3",
         path: node.data.path,
+      };
+    }
+    case "fileUpload": {
+      return {
+        ...base,
+        block_type: "file_upload",
+        path: node.data.path,
+        storage_type: node.data.storageType,
+        s3_bucket: node.data.s3Bucket,
+        aws_access_key_id: node.data.awsAccessKeyId,
+        aws_secret_access_key: node.data.awsSecretAccessKey,
+        region_name: node.data.regionName,
       };
     }
     case "fileParser": {
@@ -1810,6 +1851,19 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "upload_to_s3",
           path: block.path,
+        };
+        return blockYaml;
+      }
+      case "file_upload": {
+        const blockYaml: FileUploadBlockYAML = {
+          ...base,
+          block_type: "file_upload",
+          path: block.path,
+          storage_type: block.storage_type,
+          s3_bucket: block.s3_bucket,
+          aws_access_key_id: block.aws_access_key_id,
+          aws_secret_access_key: block.aws_secret_access_key,
+          region_name: block.region_name,
         };
         return blockYaml;
       }
