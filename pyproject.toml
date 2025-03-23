@@ -17,9 +17,7 @@ toml = "^0.10.2"
 jinja2 = "^3.1.2"
 uvicorn = {extras = ["standard"], version = "^0.24.0.post1"}
 litellm = "^1.63.12"
-selenium = "^4.13.0"
 playwright = "1.46.0"
-pre-commit = "^3.5.0"
 pillow = "^10.1.0"
 starlette-context = "^0.3.6"
 ddtrace = "^2.3.2"
@@ -57,7 +55,6 @@ pypdf = "^5.1.0"
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"
-pre-commit = "^3.3.3"
 mypy = "^1.4.1"
 flake8 = "^6.0.0"
 types-requests = "^2.31.0.2"
@@ -79,6 +76,7 @@ pypdf = "^5.0.1"
 twine = "^6.1.0"
 build = "^1.2.2.post1"
 pandas = "^2.2.3"
+pre-commit = "^4.2.0"
 
 
 [build-system]
