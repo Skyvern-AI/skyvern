@@ -119,13 +119,13 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
                 content={helpTooltips["fileUpload"]["aws_secret_access_key"]}
               />
             </div>
-            <WorkflowBlockInputTextarea
-              nodeId={id}
+            <Input
+              type="password"
+              value={inputs.awsSecretAccessKey}
+              className="nopan text-xs"
               onChange={(value) => {
                 handleChange("awsSecretAccessKey", value);
               }}
-              value={inputs.awsSecretAccessKey}
-              className="nopan text-xs"
             />
           </div>
           <div className="space-y-2">

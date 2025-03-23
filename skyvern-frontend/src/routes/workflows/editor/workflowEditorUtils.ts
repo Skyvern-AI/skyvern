@@ -1156,6 +1156,18 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         path: node.data.path,
       };
     }
+    case "fileUpload": {
+      return {
+        ...base,
+        block_type: "file_upload",
+        path: node.data.path,
+        storage_type: node.data.storageType,
+        s3_bucket: node.data.s3Bucket,
+        aws_access_key_id: node.data.awsAccessKeyId,
+        aws_secret_access_key: node.data.awsSecretAccessKey,
+        region_name: node.data.regionName,
+      };
+    }
     case "fileParser": {
       return {
         ...base,
