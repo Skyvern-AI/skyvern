@@ -26,7 +26,6 @@ class AsyncExecutor(abc.ABC):
         max_steps_override: int | None,
         api_key: str | None,
         browser_session_id: str | None,
-        ws_url: str | None,
         **kwargs: dict,
     ) -> None:
         pass
@@ -42,7 +41,6 @@ class AsyncExecutor(abc.ABC):
         max_steps_override: int | None,
         api_key: str | None,
         browser_session_id: str | None,
-        ws_url: str | None,
         **kwargs: dict,
     ) -> None:
         pass
@@ -56,7 +54,6 @@ class AsyncExecutor(abc.ABC):
         task_v2_id: str,
         max_steps_override: int | str | None,
         browser_session_id: str | None,
-        ws_url: str | None,
         **kwargs: dict,
     ) -> None:
         pass
@@ -72,7 +69,6 @@ class BackgroundTaskExecutor(AsyncExecutor):
         max_steps_override: int | None,
         api_key: str | None,
         browser_session_id: str | None,
-        ws_url: str | None,
         **kwargs: dict,
     ) -> None:
         LOG.info("Executing task using background task executor", task_id=task_id)
@@ -110,7 +106,6 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 api_key,
                 close_browser_on_completion=close_browser_on_completion,
                 browser_session_id=browser_session_id,
-                ws_url=ws_url,
             )
 
     async def execute_workflow(
@@ -123,7 +118,6 @@ class BackgroundTaskExecutor(AsyncExecutor):
         max_steps_override: int | None,
         api_key: str | None,
         browser_session_id: str | None,
-        ws_url: str | None,
         **kwargs: dict,
     ) -> None:
         LOG.info(
@@ -142,7 +136,6 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 api_key=api_key,
                 organization=organization,
                 browser_session_id=browser_session_id,
-                ws_url=ws_url,
             )
 
     async def execute_task_v2(
@@ -153,7 +146,6 @@ class BackgroundTaskExecutor(AsyncExecutor):
         task_v2_id: str,
         max_steps_override: int | str | None,
         browser_session_id: str | None,
-        ws_url: str | None,
         **kwargs: dict,
     ) -> None:
         LOG.info(
@@ -187,5 +179,4 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 task_v2_id=task_v2_id,
                 max_steps_override=max_steps_override,
                 browser_session_id=browser_session_id,
-                ws_url=ws_url,
             )

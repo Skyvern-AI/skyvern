@@ -219,7 +219,6 @@ async def run_task_v2(
     request_id: str | None = None,
     max_steps_override: str | int | None = None,
     browser_session_id: str | None = None,
-    ws_url: str | None = None,
 ) -> TaskV2:
     organization_id = organization.organization_id
     try:
@@ -248,7 +247,6 @@ async def run_task_v2(
             request_id=request_id,
             max_steps_override=max_steps_override,
             browser_session_id=browser_session_id,
-            ws_url=ws_url,
         )
     except TaskTerminationError as e:
         task_v2 = await mark_task_v2_as_terminated(
@@ -298,7 +296,6 @@ async def run_task_v2_helper(
     request_id: str | None = None,
     max_steps_override: str | int | None = None,
     browser_session_id: str | None = None,
-    ws_url: str | None = None,
 ) -> tuple[Workflow, WorkflowRun, TaskV2] | tuple[None, None, TaskV2]:
     organization_id = organization.organization_id
     task_v2_id = task_v2.observer_cruise_id
@@ -439,7 +436,6 @@ async def run_task_v2_helper(
                         workflow_run=workflow_run,
                         url=url,
                         browser_session_id=browser_session_id,
-                        ws_url=ws_url,
                     )
                 scraped_page = await scrape_website(
                     browser_state,
@@ -656,7 +652,6 @@ async def run_task_v2_helper(
                     workflow_run=workflow_run,
                     url=url,
                     browser_session_id=browser_session_id,
-                    ws_url=ws_url,
                 )
                 scraped_page = await scrape_website(
                     browser_state,

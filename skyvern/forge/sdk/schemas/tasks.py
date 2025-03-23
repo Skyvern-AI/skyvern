@@ -177,7 +177,6 @@ class TaskRequest(TaskBase):
     )
     totp_verification_url: str | None = None
     browser_session_id: str | None = None
-    ws_url: str | None = None
 
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
     @classmethod
