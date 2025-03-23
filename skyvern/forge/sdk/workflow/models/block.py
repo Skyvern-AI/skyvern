@@ -64,6 +64,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     NoIterableValueFound,
     NoValidEmailRecipient,
 )
+from skyvern.forge.sdk.workflow.models.constants import FileStorageType
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
@@ -85,6 +86,7 @@ class BlockType(StrEnum):
     TEXT_PROMPT = "text_prompt"
     DOWNLOAD_TO_S3 = "download_to_s3"
     UPLOAD_TO_S3 = "upload_to_s3"
+    FILE_UPLOAD = "file_upload"
     SEND_EMAIL = "send_email"
     FILE_URL_PARSER = "file_url_parser"
     VALIDATION = "validation"
@@ -1581,6 +1583,152 @@ class UploadToS3Block(Block):
         )
 
 
+class FileUploadBlock(Block):
+    block_type: Literal[BlockType.FILE_UPLOAD] = BlockType.FILE_UPLOAD
+
+    storage_type: FileStorageType = FileStorageType.S3
+    s3_bucket: str | None = None
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    region_name: str | None = None
+    path: str | None = None
+
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,
+    ) -> list[PARAMETER_TYPE]:
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        parameters = []
+
+        if self.path and workflow_run_context.has_parameter(self.path):
+            parameters.append(workflow_run_context.get_parameter(self.path))
+
+        if self.s3_bucket and workflow_run_context.has_parameter(self.s3_bucket):
+            parameters.append(workflow_run_context.get_parameter(self.s3_bucket))
+
+        if self.aws_access_key_id and workflow_run_context.has_parameter(self.aws_access_key_id):
+            parameters.append(workflow_run_context.get_parameter(self.aws_access_key_id))
+
+        if self.aws_secret_access_key and workflow_run_context.has_parameter(self.aws_secret_access_key):
+            parameters.append(workflow_run_context.get_parameter(self.aws_secret_access_key))
+
+        return parameters
+
+    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+        if self.path:
+            self.path = self.format_block_parameter_template_from_workflow_run_context(self.path, workflow_run_context)
+        if self.s3_bucket:
+            self.s3_bucket = self.format_block_parameter_template_from_workflow_run_context(
+                self.s3_bucket, workflow_run_context
+            )
+        if self.aws_access_key_id:
+            self.aws_access_key_id = self.format_block_parameter_template_from_workflow_run_context(
+                self.aws_access_key_id, workflow_run_context
+            )
+        if self.aws_secret_access_key:
+            self.aws_secret_access_key = self.format_block_parameter_template_from_workflow_run_context(
+                self.aws_secret_access_key, workflow_run_context
+            )
+
+    def _get_s3_uri(self, workflow_run_id: str, path: str) -> str:
+        s3_suffix = f"{workflow_run_id}/{uuid.uuid4()}_{Path(path).name}"
+        if not self.path:
+            return f"s3://{self.s3_bucket}/{s3_suffix}"
+        return f"s3://{self.s3_bucket}/{self.path}/{s3_suffix}"
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        # get workflow run context
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        # get all parameters into a dictionary
+        # data validate before uploading
+        missing_parameters = []
+        if not self.s3_bucket:
+            missing_parameters.append("s3_bucket")
+        if not self.aws_access_key_id:
+            missing_parameters.append("aws_access_key_id")
+        if not self.aws_secret_access_key:
+            missing_parameters.append("aws_secret_access_key")
+
+        if missing_parameters:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Required block values are missing in the FileUploadBlock (label: {self.label}): {', '.join(missing_parameters)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception as e:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to format jinja template: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        download_files_path = str(get_path_for_workflow_download_directory(workflow_run_id).absolute())
+
+        s3_uris = []
+        try:
+            client = AsyncAWSClient(
+                aws_access_key_id=self.aws_access_key_id,
+                aws_secret_access_key=self.aws_secret_access_key,
+                region_name=self.region_name,
+            )
+            # is the file path a file or a directory?
+            if os.path.isdir(download_files_path):
+                # get all files in the directory, if there are more than 25 files, we will not upload them
+                files = os.listdir(download_files_path)
+                if len(files) > MAX_UPLOAD_FILE_COUNT:
+                    raise ValueError("Too many files in the directory, not uploading")
+                for file in files:
+                    # if the file is a directory, we will not upload it
+                    if os.path.isdir(os.path.join(download_files_path, file)):
+                        LOG.warning("FileUploadBlock: Skipping directory", file=file)
+                        continue
+                    file_path = os.path.join(download_files_path, file)
+                    s3_uri = self._get_s3_uri(workflow_run_id, file_path)
+                    s3_uris.append(s3_uri)
+                    await client.upload_file_from_path(uri=s3_uri, file_path=file_path, raise_exception=True)
+            else:
+                s3_uri = self._get_s3_uri(workflow_run_id, download_files_path)
+                s3_uris.append(s3_uri)
+                await client.upload_file_from_path(uri=s3_uri, file_path=download_files_path, raise_exception=True)
+        except Exception as e:
+            LOG.exception("FileUploadBlock: Failed to upload file to S3", file_path=self.path)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to upload file to S3: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        LOG.info("FileUploadBlock: File(s) uploaded to S3", file_path=self.path)
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, s3_uris)
+        return await self.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value=s3_uris,
+            status=BlockStatus.completed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
+
 class SendEmailBlock(Block):
     block_type: Literal[BlockType.SEND_EMAIL] = BlockType.SEND_EMAIL
 
@@ -2348,5 +2496,6 @@ BlockSubclasses = Union[
     FileDownloadBlock,
     UrlBlock,
     TaskV2Block,
+    FileUploadBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
