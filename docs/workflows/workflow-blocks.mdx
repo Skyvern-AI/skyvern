@@ -188,12 +188,13 @@ Supported integrations:
     - Go to https://us-east-1.console.aws.amazon.com/iam/home
     - click "Create User" → do not check "Provide user access to the AWS Management Console" → input user name → click "Next"
     - At the the "Set Permissions" page, click "Attach policies directly" → pick the `skyvern-s3-access-policy` created in the previous step → click "Next" → click "Create user"
-    - After the user is created, go to the new IAM user page → go to the "Security credentials" tab → click "create access key" → on the "Access key best practices & alternatives" page, click "Application running on an AWS compute service" → click "Next" → click "Create access key" → you will see the "Access Key" and the "Secret access key" at then end of user creation.
-- Step 4. Create a FileUploadBlock at the end of your workflow
+    - After the user is created, go to the new IAM user page → go to the "Security credentials" tab → click "create access key" → on the "Access key best practices & alternatives" page, click "Application running on an AWS compute service" → click "Next" → click "Create access key" → you will see the "Access Key" and the "Secret access key" at the end of user creation.
+- Step 4. Create a FileUploadBlock
+    - Place this block after the file download has completed.
     - Copy the "Access Key" to the "AWS Access Key ID" field of the File Upload Block and "Secret access key".
-    - Copy the "Access Key" to the "AWS Secret Access Key" field in the File Upload Block
-    - Input your s3 bucket name and the AWS region of your bucket.    
-    - Input your AWS region
+    - Copy the "Access Key" to the "AWS Secret Access Key" field in the File Upload Block.
+    - Add your s3 bucket name.    
+    - Add your AWS region.
 
 
 ## SendEmailBlock
