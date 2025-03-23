@@ -64,7 +64,6 @@ from skyvern.forge.sdk.workflow.exceptions import (
     NoIterableValueFound,
     NoValidEmailRecipient,
 )
-from skyvern.forge.sdk.workflow.models.constants import FileStorageType
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
@@ -86,7 +85,6 @@ class BlockType(StrEnum):
     TEXT_PROMPT = "text_prompt"
     DOWNLOAD_TO_S3 = "download_to_s3"
     UPLOAD_TO_S3 = "upload_to_s3"
-    UPLOAD_FILES = "upload_files"
     SEND_EMAIL = "send_email"
     FILE_URL_PARSER = "file_url_parser"
     VALIDATION = "validation"
@@ -1581,16 +1579,6 @@ class UploadToS3Block(Block):
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
         )
-        
-
-class UploadBlock(UploadToS3Block):
-    block_type: Literal[BlockType.UPLOAD_FILES] = BlockType.UPLOAD_FILES
-
-    storage_type: FileStorageType = FileStorageType.S3
-    s3_bucket: str | None = None
-    aws_access_key_id: str | None = None
-    aws_secret_access_key: str | None = None
-    path: str | None = None
 
 
 class SendEmailBlock(Block):
