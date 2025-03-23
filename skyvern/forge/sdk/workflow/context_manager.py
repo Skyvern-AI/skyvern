@@ -298,6 +298,13 @@ class WorkflowRunContext:
             LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
             raise e
 
+        if not client_id:
+            raise ValueError("Bitwarden client ID not found")
+        if not client_secret:
+            raise ValueError("Bitwarden client secret not found")
+        if not master_password:
+            raise ValueError("Bitwarden master password not found")
+
         if (
             parameter.url_parameter_key
             and self.has_parameter(parameter.url_parameter_key)
@@ -395,6 +402,13 @@ class WorkflowRunContext:
             LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
             raise e
 
+        if not client_id:
+            raise ValueError("Bitwarden client ID not found")
+        if not client_secret:
+            raise ValueError("Bitwarden client secret not found")
+        if not master_password:
+            raise ValueError("Bitwarden master password not found")
+
         bitwarden_identity_key = parameter.bitwarden_identity_key
         if self.has_parameter(parameter.bitwarden_identity_key) and self.has_value(parameter.bitwarden_identity_key):
             bitwarden_identity_key = self.values[parameter.bitwarden_identity_key]
@@ -455,6 +469,13 @@ class WorkflowRunContext:
         except Exception as e:
             LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
             raise e
+
+        if not client_id:
+            raise ValueError("Bitwarden client ID not found")
+        if not client_secret:
+            raise ValueError("Bitwarden client secret not found")
+        if not master_password:
+            raise ValueError("Bitwarden master password not found")
 
         if self.has_parameter(parameter.bitwarden_item_id) and self.has_value(parameter.bitwarden_item_id):
             item_id = self.values[parameter.bitwarden_item_id]
