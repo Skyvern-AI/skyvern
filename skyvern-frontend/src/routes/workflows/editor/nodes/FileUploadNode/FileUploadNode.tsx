@@ -4,19 +4,39 @@ import { Label } from "@/components/ui/label";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
-import { Handle, NodeProps, Position } from "@xyflow/react";
+import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { helpTooltips } from "../../helpContent";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { type FileUploadNode } from "./types";
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { useState } from "react";
 
 function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
+  const { updateNodeData } = useReactFlow();
   const deleteNodeCallback = useDeleteNodeCallback();
   const [label, setLabel] = useNodeLabelChangeHandler({
     id,
     initialValue: data.label,
   });
+
+  const [inputs, setInputs] = useState({
+    storageType: data.storageType,
+    awsAccessKeyId: data.awsAccessKeyId,
+    awsSecretAccessKey: data.awsSecretAccessKey,
+    s3Bucket: data.s3Bucket,
+    regionName: data.regionName,
+    path: data.path,
+  });
+
+  function handleChange(key: string, value: unknown) {
+    if (!data.editable) {
+      return;
+    }
+    setInputs({ ...inputs, [key]: value });
+    updateNodeData(id, { [key]: value });
+  }
 
   return (
     <div>
@@ -49,7 +69,7 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
                 titleClassName="text-base"
                 inputClassName="text-base"
               />
-              <span className="text-xs text-slate-400">Upload Block</span>
+              <span className="text-xs text-slate-400">File Upload Block</span>
             </div>
           </div>
           <NodeActionMenu
@@ -61,6 +81,19 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
         <div className="space-y-4">
           <div className="space-y-2">
             <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">Storage Type</Label>
+              <HelpTooltip
+                content={helpTooltips["fileUpload"]["storage_type"]}
+              />
+            </div>
+            <Input
+              value={data.storageType}
+              className="nopan text-xs"
+              disabled
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
               <Label className="text-sm text-slate-400">
                 AWS Access Key ID
               </Label>
@@ -68,7 +101,14 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
                 content={helpTooltips["fileUpload"]["aws_access_key_id"]}
               />
             </div>
-            <Input value={data.awsAccessKeyId} className="nopan text-xs" />
+            <WorkflowBlockInputTextarea
+              nodeId={id}
+              onChange={(value) => {
+                handleChange("awsAccessKeyId", value);
+              }}
+              value={inputs.awsAccessKeyId}
+              className="nopan text-xs"
+            />
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
@@ -79,21 +119,60 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
                 content={helpTooltips["fileUpload"]["aws_secret_access_key"]}
               />
             </div>
-            <Input value={data.awsSecretAccessKey} className="nopan text-xs" />
+            <WorkflowBlockInputTextarea
+              nodeId={id}
+              onChange={(value) => {
+                handleChange("awsSecretAccessKey", value);
+              }}
+              value={inputs.awsSecretAccessKey}
+              className="nopan text-xs"
+            />
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
               <Label className="text-sm text-slate-400">S3 Bucket</Label>
               <HelpTooltip content={helpTooltips["fileUpload"]["s3_bucket"]} />
             </div>
-            <Input value={data.s3Bucket} className="nopan text-xs" />
+            <WorkflowBlockInputTextarea
+              nodeId={id}
+              onChange={(value) => {
+                handleChange("s3Bucket", value);
+              }}
+              value={inputs.s3Bucket}
+              className="nopan text-xs"
+            />
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">File Path</Label>
+              <Label className="text-sm text-slate-400">Region Name</Label>
+              <HelpTooltip
+                content={helpTooltips["fileUpload"]["region_name"]}
+              />
+            </div>
+            <WorkflowBlockInputTextarea
+              nodeId={id}
+              onChange={(value) => {
+                handleChange("regionName", value);
+              }}
+              value={inputs.regionName}
+              className="nopan text-xs"
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">
+                (Optional) Folder Path
+              </Label>
               <HelpTooltip content={helpTooltips["fileUpload"]["path"]} />
             </div>
-            <Input value={data.path} className="nopan text-xs" />
+            <WorkflowBlockInputTextarea
+              nodeId={id}
+              onChange={(value) => {
+                handleChange("path", value);
+              }}
+              value={inputs.path}
+              className="nopan text-xs"
+            />
           </div>
         </div>
       </div>

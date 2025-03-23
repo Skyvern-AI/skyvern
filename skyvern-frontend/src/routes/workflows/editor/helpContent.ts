@@ -83,8 +83,9 @@ export const helpTooltips = {
   },
   fileUpload: {
     ...baseHelpTooltipContent,
-    path: "The path to upload the file to.",
-    storage_type: "The type of storage to upload the file to.",
+    path: "The path of the folder to upload the files to.",
+    storage_type:
+      "The type of storage to upload the file to. Currently only S3 is supported. Please contact us if you'd like to integrate other storage types.",
     s3_bucket: "The S3 bucket to upload the file to.",
     aws_access_key_id: "The AWS access key ID to use to upload the file to S3.",
     aws_secret_access_key:

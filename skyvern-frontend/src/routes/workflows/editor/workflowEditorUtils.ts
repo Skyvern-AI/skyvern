@@ -35,6 +35,7 @@ import {
   PDFParserBlockYAML,
   Taskv2BlockYAML,
   URLBlockYAML,
+  FileUploadBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -96,7 +97,7 @@ import {
 } from "./nodes/PDFParserNode/types";
 import { taskv2NodeDefaultData } from "./nodes/Taskv2Node/types";
 import { urlNodeDefaultData } from "./nodes/URLNode/types";
-
+import { fileUploadNodeDefaultData } from "./nodes/FileUploadNode/types";
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
 function layoutUtil(
@@ -915,6 +916,17 @@ function createNode(
         type: "url",
         data: {
           ...urlNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "fileUpload": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "fileUpload",
+        data: {
+          ...fileUploadNodeDefaultData,
           label,
         },
       };
@@ -1827,6 +1839,19 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "upload_to_s3",
           path: block.path,
+        };
+        return blockYaml;
+      }
+      case "file_upload": {
+        const blockYaml: FileUploadBlockYAML = {
+          ...base,
+          block_type: "file_upload",
+          path: block.path,
+          storage_type: block.storage_type,
+          s3_bucket: block.s3_bucket,
+          aws_access_key_id: block.aws_access_key_id,
+          aws_secret_access_key: block.aws_secret_access_key,
+          region_name: block.region_name,
         };
         return blockYaml;
       }

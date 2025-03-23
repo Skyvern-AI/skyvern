@@ -215,13 +215,6 @@ export function isTaskVariantBlock(item: {
 export type WorkflowBlockType =
   (typeof WorkflowBlockTypes)[keyof typeof WorkflowBlockTypes];
 
-export const FileStorageTypes = {
-  S3: "s3",
-} as const;
-
-export type FileStorageType =
-  (typeof FileStorageTypes)[keyof typeof FileStorageTypes];
-
 export const WorkflowEditorParameterTypes = {
   Workflow: "workflow",
   Credential: "credential",
@@ -304,7 +297,7 @@ export type UploadToS3Block = WorkflowBlockBase & {
 export type FileUploadBlock = WorkflowBlockBase & {
   block_type: "file_upload";
   path: string;
-  storage_type: FileStorageType;
+  storage_type: string;
   s3_bucket: string;
   region_name: string;
   aws_access_key_id: string;

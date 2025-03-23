@@ -1,14 +1,10 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
 
-export enum FileStorageType {
-  S3 = "s3",
-}
-
 export type FileUploadNodeData = NodeBaseData & {
   path: string;
   editable: boolean;
-  storageType: FileStorageType;
+  storageType: string;
   s3Bucket: string;
   awsAccessKeyId: string;
   awsSecretAccessKey: string;
@@ -19,7 +15,7 @@ export type FileUploadNode = Node<FileUploadNodeData, "fileUpload">;
 
 export const fileUploadNodeDefaultData: FileUploadNodeData = {
   editable: true,
-  storageType: FileStorageType.S3,
+  storageType: "s3",
   label: "",
   path: "",
   s3Bucket: "",

@@ -189,8 +189,8 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Upload Block",
-    description: "Uploads files to where you want.",
+    title: "File Upload Block",
+    description: "Uploads downloaded files to where you want.",
   },
   {
     nodeType: "fileDownload",
