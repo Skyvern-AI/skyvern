@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     ADDITIONAL_MODULES: list[str] = []
 
     BROWSER_TYPE: str = "chromium-headful"
-    BROWSER_CDP_URL: str = "http://127.0.0.1:9222"
+    BROWSER_REMOTE_DEBUGGING_URL: str = "http://127.0.0.1:9222"
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = "./video"
     HAR_PATH: str | None = "./har"

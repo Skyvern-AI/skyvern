@@ -359,13 +359,16 @@ async def _create_cdp_connection_browser(
         har_path=browser_args["record_har_path"],
     )
 
-    remote_browser_url = settings.BROWSER_CDP_URL
+    remote_browser_url = None
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get(f"{settings.BROWSER_CDP_URL}/json/version")
+            response = await client.get(f"{settings.BROWSER_REMOTE_DEBUGGING_URL}/json/version")
             remote_browser_url = response.json().get("webSocketDebuggerUrl")
     except Exception:
         raise Exception("Failed to connect to CDP browser")
+
+    if not remote_browser_url:
+        raise Exception("Cannot find remote browser url")
 
     LOG.info("Connecting browser CDP connection", remote_browser_url=remote_browser_url)
     browser = await playwright.chromium.connect_over_cdp(remote_browser_url)
