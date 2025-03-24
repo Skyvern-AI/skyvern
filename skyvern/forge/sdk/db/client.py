@@ -69,7 +69,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrow
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.task_runs import TaskRun, TaskRunType
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
-from skyvern.forge.sdk.schemas.tasks import OrderBy, ProxyLocation, SortDirection, Task, TaskStatus
+from skyvern.forge.sdk.schemas.tasks import OrderBy, SortDirection, Task, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.block import BlockStatus, BlockType
@@ -91,6 +91,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
+from skyvern.schemas.runs import ProxyLocation
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.actions.models import AgentStepOutput
 

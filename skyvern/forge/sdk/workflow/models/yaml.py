@@ -4,11 +4,11 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, Field
 
 from skyvern.config import settings
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileType
 from skyvern.forge.sdk.workflow.models.constants import FileStorageType
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowStatus
+from skyvern.schemas.runs import ProxyLocation
 
 
 class ParameterYAML(BaseModel, abc.ABC):

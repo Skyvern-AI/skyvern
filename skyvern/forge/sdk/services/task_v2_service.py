@@ -22,7 +22,6 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_runs import TaskRunType
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Metadata, TaskV2Status, ThoughtScenario, ThoughtType
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.workflow.models.block import (
     BlockResult,
@@ -54,6 +53,7 @@ from skyvern.forge.sdk.workflow.models.yaml import (
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
 )
+from skyvern.schemas.runs import ProxyLocation
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
 from skyvern.webeye.utils.page import SkyvernFrame

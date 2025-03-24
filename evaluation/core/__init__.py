@@ -13,8 +13,9 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import create_folder_if_not_exist
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Request
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation, TaskRequest, TaskResponse, TaskStatus
+from skyvern.forge.sdk.schemas.tasks import TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunResponse, WorkflowRunStatus
+from skyvern.schemas.runs import ProxyLocation
 
 
 class TaskOutput(BaseModel):

@@ -26,7 +26,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation, get_tzinfo_from_proxy
+from skyvern.schemas.runs import ProxyLocation, get_tzinfo_from_proxy
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()

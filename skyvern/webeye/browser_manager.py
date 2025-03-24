@@ -7,8 +7,9 @@ from playwright.async_api import async_playwright
 
 from skyvern.exceptions import MissingBrowserState
 from skyvern.forge import app
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
+from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
+from skyvern.schemas.runs import ProxyLocation
 from skyvern.webeye.browser_factory import BrowserContextFactory, BrowserState, VideoArtifact
 
 LOG = structlog.get_logger()
