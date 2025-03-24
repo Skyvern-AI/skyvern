@@ -1,3 +1,4 @@
+import copy
 import uuid
 from typing import TYPE_CHECKING, Any, Self
 
@@ -584,7 +585,33 @@ class WorkflowRunContext:
             LOG.warning(f"Output parameter {parameter.output_parameter_id} already has a registered value, overwriting")
 
         self.values[parameter.key] = value
+        self.register_block_reference_variable_from_output_parameter(parameter, value)
+
         await self.set_parameter_values_for_output_parameter_dependent_blocks(parameter, value)
+
+    def register_block_reference_variable_from_output_parameter(
+        self,
+        parameter: OutputParameter,
+        value: dict[str, Any] | list | str | None,
+    ) -> None:
+        # output parameter key is formatted as `<block_label>_output`
+        if not parameter.key.endswith("_output"):
+            return
+        block_label = parameter.key.removesuffix("_output")
+
+        block_reference_value = copy.deepcopy(value)
+        if isinstance(block_reference_value, dict) and "extracted_information" in block_reference_value:
+            block_reference_value.update({"output": block_reference_value.get("extracted_information")})
+
+        if block_label in self.values:
+            current_value = self.values[block_label]
+            # only able to merge the value when the current value and the pending value are both dicts
+            if isinstance(current_value, dict) and isinstance(block_reference_value, dict):
+                block_reference_value.update(current_value)
+            else:
+                LOG.warning(f"Parameter {block_label} already has a value in workflow run context, overwriting")
+
+        self.values[block_label] = block_reference_value
 
     async def set_parameter_values_for_output_parameter_dependent_blocks(
         self,
