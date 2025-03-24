@@ -1,6 +1,6 @@
 import { Outlet } from "react-router-dom";
 
-function CredentialsPageLayout() {
+function PageLayout() {
   return (
     <div className="container mx-auto">
       <main>
@@ -10,4 +10,4 @@ function CredentialsPageLayout() {
   );
 }
 
-export { CredentialsPageLayout };
+export { PageLayout };
