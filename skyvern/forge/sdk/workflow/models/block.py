@@ -184,8 +184,18 @@ class Block(BaseModel, abc.ABC):
             return potential_template
         template = Template(potential_template)
 
+        block_reference_data: dict[str, Any] = workflow_run_context.get_block_metadata(self.label)
         template_data = workflow_run_context.values.copy()
-        template_data[self.label] = workflow_run_context.get_block_metadata(self.label)
+        if self.label in template_data:
+            current_value = template_data[self.label]
+            if isinstance(current_value, dict):
+                block_reference_data.update(current_value)
+            else:
+                LOG.warning(
+                    f"Parameter {self.label} has a registered reference value, going to overwrite it by block metadata"
+                )
+
+        template_data[self.label] = block_reference_data
         return template.render(template_data)
 
     @classmethod
