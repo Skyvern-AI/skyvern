@@ -1,0 +1,41 @@
+name: Version Bump on Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from release
+        id: get_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Update version in pyproject.toml
+        run: |
+          sed -i "s/version = \".*\"/version = \"${{ steps.get_version.outputs.version }}\"/" pyproject.toml
+
+      - name: Create Pull Request
+        id: create-pr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore: bump version to ${{ steps.get_version.outputs.version }}"
+          title: "chore: bump version to ${{ steps.get_version.outputs.version }}"
+          body: "Auto-generated PR to update version in pyproject.toml"
+          branch: "version-bump/${{ steps.get_version.outputs.version }}"
+          delete-branch: true
+
+      - name: Enable Pull Request Automerge
+        if: steps.create-pr.outputs.pull-request-number
+        run: |
+          gh pr merge --auto --merge "${{ steps.create-pr.outputs.pull-request-number }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} 

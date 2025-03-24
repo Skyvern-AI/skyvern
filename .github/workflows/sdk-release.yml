@@ -2,16 +2,49 @@ name: Build Skyvern SDK and publish to PyPI
 
 on:
   workflow_dispatch:
-  release:
-    types: [ published ]
+  push:
+    branches:
+      - main
+    paths:
+      - 'pyproject.toml'
 
 jobs:
+  check-version-change:
+    runs-on: ubuntu-latest
+    outputs:
+      version_changed: ${{ steps.check.outputs.version_changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check if version changed
+        id: check
+        run: |
+          # Get version from current pyproject.toml
+          CURRENT_VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+
+          # Get version from previous commit
+          git checkout HEAD^1
+          PREVIOUS_VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+
+          if [ "$CURRENT_VERSION" != "$PREVIOUS_VERSION" ]; then
+            echo "Version changed from $PREVIOUS_VERSION to $CURRENT_VERSION"
+            echo "version_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "Version remained at $CURRENT_VERSION"
+            echo "version_changed=false" >> $GITHUB_OUTPUT
+          fi
+
   run-ci:
+    needs: check-version-change
+    if: needs.check-version-change.outputs.version_changed == 'true'
     uses: ./.github/workflows/ci.yml
 
   build-sdk:
     runs-on: ubuntu-latest
-    needs: [ run-ci ]
+    needs: [check-version-change, run-ci]
+    if: needs.check-version-change.outputs.version_changed == 'true'
     steps:
       - name: Check out Git repository
         uses: actions/checkout@v4
