@@ -25,7 +25,7 @@ from skyvern.forge.sdk.db.models import (
 )
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskStatus
+from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.block import BlockStatus, BlockType
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -45,6 +45,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
+from skyvern.schemas.runs import ProxyLocation
 
 LOG = structlog.get_logger()
 

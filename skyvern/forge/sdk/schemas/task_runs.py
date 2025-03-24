@@ -3,7 +3,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation
+from skyvern.schemas.runs import ProxyLocation
 
 
 class TaskRunStatus(StrEnum):
