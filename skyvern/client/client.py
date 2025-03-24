@@ -6,9 +6,22 @@ import httpx
 from .core.client_wrapper import SyncClientWrapper
 from .server.client import ServerClient
 from .agent.client import AgentClient
+from .browser.client import BrowserClient
+import datetime as dt
+from .core.request_options import RequestOptions
+from .types.totp_code import TotpCode
+from .core.pydantic_utilities import parse_obj_as
+from .errors.unprocessable_entity_error import UnprocessableEntityError
+from .types.http_validation_error import HttpValidationError
+from json.decoder import JSONDecodeError
+from .core.api_error import ApiError
 from .core.client_wrapper import AsyncClientWrapper
 from .server.client import AsyncServerClient
 from .agent.client import AsyncAgentClient
+from .browser.client import AsyncBrowserClient
+
+# this is used as the default value for optional parameters
+OMIT = typing.cast(typing.Any, ...)
 
 
 class Skyvern:
@@ -29,6 +42,8 @@ class Skyvern:
 
 
 
+    api_key : typing.Optional[str]
+    authorization : typing.Optional[str]
     timeout : typing.Optional[float]
         The timeout to be used, in seconds, for requests. By default the timeout is 60 seconds, unless a custom httpx client is used, in which case this default is not enforced.
 
@@ -42,7 +57,10 @@ class Skyvern:
     --------
     from skyverndocs import Skyvern
 
-    client = Skyvern()
+    client = Skyvern(
+        api_key="YOUR_API_KEY",
+        authorization="YOUR_AUTHORIZATION",
+    )
     """
 
     def __init__(
@@ -50,6 +68,8 @@ class Skyvern:
         *,
         base_url: typing.Optional[str] = None,
         environment: SkyvernEnvironment = SkyvernEnvironment.PRODUCTION,
+        api_key: typing.Optional[str] = None,
+        authorization: typing.Optional[str] = None,
         timeout: typing.Optional[float] = None,
         follow_redirects: typing.Optional[bool] = True,
         httpx_client: typing.Optional[httpx.Client] = None,
@@ -57,6 +77,8 @@ class Skyvern:
         _defaulted_timeout = timeout if timeout is not None else 60 if httpx_client is None else None
         self._client_wrapper = SyncClientWrapper(
             base_url=_get_base_url(base_url=base_url, environment=environment),
+            api_key=api_key,
+            authorization=authorization,
             httpx_client=httpx_client
             if httpx_client is not None
             else httpx.Client(timeout=_defaulted_timeout, follow_redirects=follow_redirects)
@@ -66,6 +88,95 @@ class Skyvern:
         )
         self.server = ServerClient(client_wrapper=self._client_wrapper)
         self.agent = AgentClient(client_wrapper=self._client_wrapper)
+        self.browser = BrowserClient(client_wrapper=self._client_wrapper)
+
+    def save_totp_code_api_v1totp_post(
+        self,
+        *,
+        totp_identifier: str,
+        content: str,
+        task_id: typing.Optional[str] = OMIT,
+        workflow_id: typing.Optional[str] = OMIT,
+        source: typing.Optional[str] = OMIT,
+        expired_at: typing.Optional[dt.datetime] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> TotpCode:
+        """
+        Parameters
+        ----------
+        totp_identifier : str
+
+        content : str
+
+        task_id : typing.Optional[str]
+
+        workflow_id : typing.Optional[str]
+
+        source : typing.Optional[str]
+
+        expired_at : typing.Optional[dt.datetime]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TotpCode
+            Successful Response
+
+        Examples
+        --------
+        from skyverndocs import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
+        )
+        client.save_totp_code_api_v1totp_post(
+            totp_identifier="totp_identifier",
+            content="content",
+        )
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "api/v1/totp",
+            method="POST",
+            json={
+                "totp_identifier": totp_identifier,
+                "task_id": task_id,
+                "workflow_id": workflow_id,
+                "source": source,
+                "content": content,
+                "expired_at": expired_at,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    TotpCode,
+                    parse_obj_as(
+                        type_=TotpCode,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        HttpValidationError,
+                        parse_obj_as(
+                            type_=HttpValidationError,  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
 
 
 class AsyncSkyvern:
@@ -86,6 +197,8 @@ class AsyncSkyvern:
 
 
 
+    api_key : typing.Optional[str]
+    authorization : typing.Optional[str]
     timeout : typing.Optional[float]
         The timeout to be used, in seconds, for requests. By default the timeout is 60 seconds, unless a custom httpx client is used, in which case this default is not enforced.
 
@@ -99,7 +212,10 @@ class AsyncSkyvern:
     --------
     from skyverndocs import AsyncSkyvern
 
-    client = AsyncSkyvern()
+    client = AsyncSkyvern(
+        api_key="YOUR_API_KEY",
+        authorization="YOUR_AUTHORIZATION",
+    )
     """
 
     def __init__(
@@ -107,6 +223,8 @@ class AsyncSkyvern:
         *,
         base_url: typing.Optional[str] = None,
         environment: SkyvernEnvironment = SkyvernEnvironment.PRODUCTION,
+        api_key: typing.Optional[str] = None,
+        authorization: typing.Optional[str] = None,
         timeout: typing.Optional[float] = None,
         follow_redirects: typing.Optional[bool] = True,
         httpx_client: typing.Optional[httpx.AsyncClient] = None,
@@ -114,6 +232,8 @@ class AsyncSkyvern:
         _defaulted_timeout = timeout if timeout is not None else 60 if httpx_client is None else None
         self._client_wrapper = AsyncClientWrapper(
             base_url=_get_base_url(base_url=base_url, environment=environment),
+            api_key=api_key,
+            authorization=authorization,
             httpx_client=httpx_client
             if httpx_client is not None
             else httpx.AsyncClient(timeout=_defaulted_timeout, follow_redirects=follow_redirects)
@@ -123,6 +243,103 @@ class AsyncSkyvern:
         )
         self.server = AsyncServerClient(client_wrapper=self._client_wrapper)
         self.agent = AsyncAgentClient(client_wrapper=self._client_wrapper)
+        self.browser = AsyncBrowserClient(client_wrapper=self._client_wrapper)
+
+    async def save_totp_code_api_v1totp_post(
+        self,
+        *,
+        totp_identifier: str,
+        content: str,
+        task_id: typing.Optional[str] = OMIT,
+        workflow_id: typing.Optional[str] = OMIT,
+        source: typing.Optional[str] = OMIT,
+        expired_at: typing.Optional[dt.datetime] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> TotpCode:
+        """
+        Parameters
+        ----------
+        totp_identifier : str
+
+        content : str
+
+        task_id : typing.Optional[str]
+
+        workflow_id : typing.Optional[str]
+
+        source : typing.Optional[str]
+
+        expired_at : typing.Optional[dt.datetime]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TotpCode
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyverndocs import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
+        )
+
+
+        async def main() -> None:
+            await client.save_totp_code_api_v1totp_post(
+                totp_identifier="totp_identifier",
+                content="content",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "api/v1/totp",
+            method="POST",
+            json={
+                "totp_identifier": totp_identifier,
+                "task_id": task_id,
+                "workflow_id": workflow_id,
+                "source": source,
+                "content": content,
+                "expired_at": expired_at,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    TotpCode,
+                    parse_obj_as(
+                        type_=TotpCode,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        HttpValidationError,
+                        parse_obj_as(
+                            type_=HttpValidationError,  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
 
 
 def _get_base_url(*, base_url: typing.Optional[str] = None, environment: SkyvernEnvironment) -> str:

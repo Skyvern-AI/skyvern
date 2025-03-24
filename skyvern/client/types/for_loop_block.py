@@ -32,5 +32,4 @@ class ForLoopBlock(UniversalBaseModel):
 
 from .for_loop_block_loop_blocks_item import ForLoopBlockLoopBlocksItem  # noqa: E402
 
-update_forward_refs(ContextParameter, ForLoopBlock=ForLoopBlock)
 update_forward_refs(ForLoopBlock)

@@ -2,6 +2,6 @@
 
 import typing
 
-ObserverTaskOutput = typing.Union[
+TaskV2RequestExtractedInformationSchema = typing.Union[
     typing.Dict[str, typing.Optional[typing.Any]], typing.List[typing.Optional[typing.Any]], str
 ]

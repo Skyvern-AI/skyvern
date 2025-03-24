@@ -6,6 +6,7 @@ from .task_status import TaskStatus
 import datetime as dt
 import typing
 from .task_response_extracted_information import TaskResponseExtractedInformation
+from .file_info import FileInfo
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
 
@@ -21,6 +22,7 @@ class TaskResponse(UniversalBaseModel):
     screenshot_url: typing.Optional[str] = None
     recording_url: typing.Optional[str] = None
     browser_console_log_url: typing.Optional[str] = None
+    downloaded_files: typing.Optional[typing.List[FileInfo]] = None
     downloaded_file_urls: typing.Optional[typing.List[str]] = None
     failure_reason: typing.Optional[str] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None

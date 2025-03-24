@@ -15,8 +15,9 @@ class BitwardenLoginCredentialParameter(UniversalBaseModel):
     bitwarden_client_id_aws_secret_key: str
     bitwarden_client_secret_aws_secret_key: str
     bitwarden_master_password_aws_secret_key: str
-    url_parameter_key: str
+    url_parameter_key: typing.Optional[str] = None
     bitwarden_collection_id: typing.Optional[str] = None
+    bitwarden_item_id: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
     deleted_at: typing.Optional[dt.datetime] = None

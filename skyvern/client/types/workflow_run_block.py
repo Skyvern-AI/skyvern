@@ -3,7 +3,7 @@
 from ..core.pydantic_utilities import UniversalBaseModel
 import typing
 from .block_type import BlockType
-from .workflow_run_block_output import WorkflowRunBlockOutput
+from .output import Output
 from .workflow_run_block_navigation_payload import WorkflowRunBlockNavigationPayload
 from .workflow_run_block_data_schema import WorkflowRunBlockDataSchema
 from .action import Action
@@ -22,7 +22,7 @@ class WorkflowRunBlock(UniversalBaseModel):
     block_type: BlockType
     label: typing.Optional[str] = None
     status: typing.Optional[str] = None
-    output: typing.Optional[WorkflowRunBlockOutput] = None
+    output: typing.Optional[Output] = None
     continue_on_failure: typing.Optional[bool] = None
     failure_reason: typing.Optional[str] = None
     task_id: typing.Optional[str] = None

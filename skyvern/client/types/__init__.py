@@ -10,17 +10,14 @@ from .action_block_parameters_item import (
     ActionBlockParametersItem_BitwardenLoginCredential,
     ActionBlockParametersItem_BitwardenSensitiveInformation,
     ActionBlockParametersItem_Context,
+    ActionBlockParametersItem_Credential,
     ActionBlockParametersItem_Output,
     ActionBlockParametersItem_Workflow,
 )
 from .action_result import ActionResult
-from .action_result_data import ActionResultData
 from .action_status import ActionStatus
 from .action_type import ActionType
 from .agent_step_output import AgentStepOutput
-from .ai_suggestion_base import AiSuggestionBase
-from .ai_suggestion_base_output import AiSuggestionBaseOutput
-from .ai_suggestion_type import AiSuggestionType
 from .artifact import Artifact
 from .artifact_type import ArtifactType
 from .aws_secret_parameter import AwsSecretParameter
@@ -37,23 +34,20 @@ from .code_block_parameters_item import (
     CodeBlockParametersItem_BitwardenLoginCredential,
     CodeBlockParametersItem_BitwardenSensitiveInformation,
     CodeBlockParametersItem_Context,
+    CodeBlockParametersItem_Credential,
     CodeBlockParametersItem_Output,
     CodeBlockParametersItem_Workflow,
 )
 from .context_parameter import ContextParameter
-from .context_parameter_source import (
-    ContextParameterSource,
-    ContextParameterSource_AwsSecret,
-    ContextParameterSource_BitwardenCreditCardData,
-    ContextParameterSource_BitwardenLoginCredential,
-    ContextParameterSource_BitwardenSensitiveInformation,
-    ContextParameterSource_Context,
-    ContextParameterSource_Output,
-    ContextParameterSource_Workflow,
-)
-from .context_parameter_value import ContextParameterValue
+from .create_credential_request import CreateCredentialRequest
 from .create_task_response import CreateTaskResponse
-from .download_to_s_3_block import DownloadToS3Block
+from .credential import Credential
+from .credential_parameter import CredentialParameter
+from .credential_response import CredentialResponse
+from .credential_type import CredentialType
+from .credit_card_credential_response import CreditCardCredentialResponse
+from .data import Data
+from .download_to_s3block import DownloadToS3Block
 from .entity_type import EntityType
 from .extraction_block import ExtractionBlock
 from .extraction_block_data_schema import ExtractionBlockDataSchema
@@ -64,6 +58,7 @@ from .extraction_block_parameters_item import (
     ExtractionBlockParametersItem_BitwardenLoginCredential,
     ExtractionBlockParametersItem_BitwardenSensitiveInformation,
     ExtractionBlockParametersItem_Context,
+    ExtractionBlockParametersItem_Credential,
     ExtractionBlockParametersItem_Output,
     ExtractionBlockParametersItem_Workflow,
 )
@@ -76,9 +71,11 @@ from .file_download_block_parameters_item import (
     FileDownloadBlockParametersItem_BitwardenLoginCredential,
     FileDownloadBlockParametersItem_BitwardenSensitiveInformation,
     FileDownloadBlockParametersItem_Context,
+    FileDownloadBlockParametersItem_Credential,
     FileDownloadBlockParametersItem_Output,
     FileDownloadBlockParametersItem_Workflow,
 )
+from .file_info import FileInfo
 from .file_parser_block import FileParserBlock
 from .file_type import FileType
 from .for_loop_block import ForLoopBlock
@@ -110,6 +107,7 @@ from .for_loop_block_loop_over import (
     ForLoopBlockLoopOver_BitwardenLoginCredential,
     ForLoopBlockLoopOver_BitwardenSensitiveInformation,
     ForLoopBlockLoopOver_Context,
+    ForLoopBlockLoopOver_Credential,
     ForLoopBlockLoopOver_Output,
     ForLoopBlockLoopOver_Workflow,
 )
@@ -125,6 +123,7 @@ from .login_block_parameters_item import (
     LoginBlockParametersItem_BitwardenLoginCredential,
     LoginBlockParametersItem_BitwardenSensitiveInformation,
     LoginBlockParametersItem_Context,
+    LoginBlockParametersItem_Credential,
     LoginBlockParametersItem_Output,
     LoginBlockParametersItem_Workflow,
 )
@@ -137,26 +136,37 @@ from .navigation_block_parameters_item import (
     NavigationBlockParametersItem_BitwardenLoginCredential,
     NavigationBlockParametersItem_BitwardenSensitiveInformation,
     NavigationBlockParametersItem_Context,
+    NavigationBlockParametersItem_Credential,
     NavigationBlockParametersItem_Output,
     NavigationBlockParametersItem_Workflow,
 )
-from .observer_task import ObserverTask
-from .observer_task_output import ObserverTaskOutput
-from .observer_task_status import ObserverTaskStatus
-from .observer_thought import ObserverThought
-from .observer_thought_scenario import ObserverThoughtScenario
-from .observer_thought_type import ObserverThoughtType
+from .non_empty_credit_card_credential import NonEmptyCreditCardCredential
+from .non_empty_password_credential import NonEmptyPasswordCredential
 from .order_by import OrderBy
 from .organization import Organization
 from .organization_auth_token import OrganizationAuthToken
 from .organization_auth_token_type import OrganizationAuthTokenType
+from .output import Output
 from .output_parameter import OutputParameter
+from .password_credential_response import PasswordCredentialResponse
 from .pdf_parser_block import PdfParserBlock
 from .proxy_location import ProxyLocation
+from .run_engine import RunEngine
 from .run_workflow_response import RunWorkflowResponse
 from .select_option import SelectOption
 from .send_email_block import SendEmailBlock
 from .sort_direction import SortDirection
+from .source import (
+    Source,
+    Source_AwsSecret,
+    Source_BitwardenCreditCardData,
+    Source_BitwardenLoginCredential,
+    Source_BitwardenSensitiveInformation,
+    Source_Context,
+    Source_Credential,
+    Source_Output,
+    Source_Workflow,
+)
 from .step import Step
 from .step_status import StepStatus
 from .task import Task
@@ -172,6 +182,7 @@ from .task_block_parameters_item import (
     TaskBlockParametersItem_BitwardenLoginCredential,
     TaskBlockParametersItem_BitwardenSensitiveInformation,
     TaskBlockParametersItem_Context,
+    TaskBlockParametersItem_Credential,
     TaskBlockParametersItem_Output,
     TaskBlockParametersItem_Workflow,
 )
@@ -181,9 +192,14 @@ from .task_generation import TaskGeneration
 from .task_navigation_payload import TaskNavigationPayload
 from .task_response import TaskResponse
 from .task_response_extracted_information import TaskResponseExtractedInformation
+from .task_run_response import TaskRunResponse
+from .task_run_status import TaskRunStatus
 from .task_status import TaskStatus
 from .task_type import TaskType
-from .task_v_2_block import TaskV2Block
+from .task_v2 import TaskV2
+from .task_v2block import TaskV2Block
+from .task_v2extracted_information_schema import TaskV2ExtractedInformationSchema
+from .task_v2status import TaskV2Status
 from .text_prompt_block import TextPromptBlock
 from .text_prompt_block_parameters_item import (
     TextPromptBlockParametersItem,
@@ -192,11 +208,15 @@ from .text_prompt_block_parameters_item import (
     TextPromptBlockParametersItem_BitwardenLoginCredential,
     TextPromptBlockParametersItem_BitwardenSensitiveInformation,
     TextPromptBlockParametersItem_Context,
+    TextPromptBlockParametersItem_Credential,
     TextPromptBlockParametersItem_Output,
     TextPromptBlockParametersItem_Workflow,
 )
+from .thought import Thought
+from .thought_scenario import ThoughtScenario
+from .thought_type import ThoughtType
 from .totp_code import TotpCode
-from .upload_to_s_3_block import UploadToS3Block
+from .upload_to_s3block import UploadToS3Block
 from .url_block import UrlBlock
 from .url_block_data_schema import UrlBlockDataSchema
 from .url_block_parameters_item import (
@@ -206,6 +226,7 @@ from .url_block_parameters_item import (
     UrlBlockParametersItem_BitwardenLoginCredential,
     UrlBlockParametersItem_BitwardenSensitiveInformation,
     UrlBlockParametersItem_Context,
+    UrlBlockParametersItem_Credential,
     UrlBlockParametersItem_Output,
     UrlBlockParametersItem_Workflow,
 )
@@ -219,11 +240,13 @@ from .validation_block_parameters_item import (
     ValidationBlockParametersItem_BitwardenLoginCredential,
     ValidationBlockParametersItem_BitwardenSensitiveInformation,
     ValidationBlockParametersItem_Context,
+    ValidationBlockParametersItem_Credential,
     ValidationBlockParametersItem_Output,
     ValidationBlockParametersItem_Workflow,
 )
 from .validation_error import ValidationError
 from .validation_error_loc_item import ValidationErrorLocItem
+from .value import Value
 from .wait_block import WaitBlock
 from .wait_block_parameters_item import (
     WaitBlockParametersItem,
@@ -232,6 +255,7 @@ from .wait_block_parameters_item import (
     WaitBlockParametersItem_BitwardenLoginCredential,
     WaitBlockParametersItem_BitwardenSensitiveInformation,
     WaitBlockParametersItem_Context,
+    WaitBlockParametersItem_Credential,
     WaitBlockParametersItem_Output,
     WaitBlockParametersItem_Workflow,
 )
@@ -265,6 +289,7 @@ from .workflow_definition_parameters_item import (
     WorkflowDefinitionParametersItem_BitwardenLoginCredential,
     WorkflowDefinitionParametersItem_BitwardenSensitiveInformation,
     WorkflowDefinitionParametersItem_Context,
+    WorkflowDefinitionParametersItem_Credential,
     WorkflowDefinitionParametersItem_Output,
     WorkflowDefinitionParametersItem_Workflow,
 )
@@ -275,9 +300,8 @@ from .workflow_run import WorkflowRun
 from .workflow_run_block import WorkflowRunBlock
 from .workflow_run_block_data_schema import WorkflowRunBlockDataSchema
 from .workflow_run_block_navigation_payload import WorkflowRunBlockNavigationPayload
-from .workflow_run_block_output import WorkflowRunBlockOutput
+from .workflow_run_response import WorkflowRunResponse
 from .workflow_run_status import WorkflowRunStatus
-from .workflow_run_status_response import WorkflowRunResponse
 from .workflow_run_timeline import WorkflowRunTimeline
 from .workflow_run_timeline_type import WorkflowRunTimelineType
 from .workflow_status import WorkflowStatus
@@ -292,16 +316,13 @@ __all__ = [
     "ActionBlockParametersItem_BitwardenLoginCredential",
     "ActionBlockParametersItem_BitwardenSensitiveInformation",
     "ActionBlockParametersItem_Context",
+    "ActionBlockParametersItem_Credential",
     "ActionBlockParametersItem_Output",
     "ActionBlockParametersItem_Workflow",
     "ActionResult",
-    "ActionResultData",
     "ActionStatus",
     "ActionType",
     "AgentStepOutput",
-    "AiSuggestionBase",
-    "AiSuggestionBaseOutput",
-    "AiSuggestionType",
     "Artifact",
     "ArtifactType",
     "AwsSecretParameter",
@@ -317,19 +338,18 @@ __all__ = [
     "CodeBlockParametersItem_BitwardenLoginCredential",
     "CodeBlockParametersItem_BitwardenSensitiveInformation",
     "CodeBlockParametersItem_Context",
+    "CodeBlockParametersItem_Credential",
     "CodeBlockParametersItem_Output",
     "CodeBlockParametersItem_Workflow",
     "ContextParameter",
-    "ContextParameterSource",
-    "ContextParameterSource_AwsSecret",
-    "ContextParameterSource_BitwardenCreditCardData",
-    "ContextParameterSource_BitwardenLoginCredential",
-    "ContextParameterSource_BitwardenSensitiveInformation",
-    "ContextParameterSource_Context",
-    "ContextParameterSource_Output",
-    "ContextParameterSource_Workflow",
-    "ContextParameterValue",
+    "CreateCredentialRequest",
     "CreateTaskResponse",
+    "Credential",
+    "CredentialParameter",
+    "CredentialResponse",
+    "CredentialType",
+    "CreditCardCredentialResponse",
+    "Data",
     "DownloadToS3Block",
     "EntityType",
     "ExtractionBlock",
@@ -340,6 +360,7 @@ __all__ = [
     "ExtractionBlockParametersItem_BitwardenLoginCredential",
     "ExtractionBlockParametersItem_BitwardenSensitiveInformation",
     "ExtractionBlockParametersItem_Context",
+    "ExtractionBlockParametersItem_Credential",
     "ExtractionBlockParametersItem_Output",
     "ExtractionBlockParametersItem_Workflow",
     "FileDownloadBlock",
@@ -350,8 +371,10 @@ __all__ = [
     "FileDownloadBlockParametersItem_BitwardenLoginCredential",
     "FileDownloadBlockParametersItem_BitwardenSensitiveInformation",
     "FileDownloadBlockParametersItem_Context",
+    "FileDownloadBlockParametersItem_Credential",
     "FileDownloadBlockParametersItem_Output",
     "FileDownloadBlockParametersItem_Workflow",
+    "FileInfo",
     "FileParserBlock",
     "FileType",
     "ForLoopBlock",
@@ -380,6 +403,7 @@ __all__ = [
     "ForLoopBlockLoopOver_BitwardenLoginCredential",
     "ForLoopBlockLoopOver_BitwardenSensitiveInformation",
     "ForLoopBlockLoopOver_Context",
+    "ForLoopBlockLoopOver_Credential",
     "ForLoopBlockLoopOver_Output",
     "ForLoopBlockLoopOver_Workflow",
     "GetOrganizationApiKeysResponse",
@@ -393,6 +417,7 @@ __all__ = [
     "LoginBlockParametersItem_BitwardenLoginCredential",
     "LoginBlockParametersItem_BitwardenSensitiveInformation",
     "LoginBlockParametersItem_Context",
+    "LoginBlockParametersItem_Credential",
     "LoginBlockParametersItem_Output",
     "LoginBlockParametersItem_Workflow",
     "NavigationBlock",
@@ -403,25 +428,34 @@ __all__ = [
     "NavigationBlockParametersItem_BitwardenLoginCredential",
     "NavigationBlockParametersItem_BitwardenSensitiveInformation",
     "NavigationBlockParametersItem_Context",
+    "NavigationBlockParametersItem_Credential",
     "NavigationBlockParametersItem_Output",
     "NavigationBlockParametersItem_Workflow",
-    "ObserverTask",
-    "ObserverTaskOutput",
-    "ObserverTaskStatus",
-    "ObserverThought",
-    "ObserverThoughtScenario",
-    "ObserverThoughtType",
+    "NonEmptyCreditCardCredential",
+    "NonEmptyPasswordCredential",
     "OrderBy",
     "Organization",
     "OrganizationAuthToken",
     "OrganizationAuthTokenType",
+    "Output",
     "OutputParameter",
+    "PasswordCredentialResponse",
     "PdfParserBlock",
     "ProxyLocation",
+    "RunEngine",
     "RunWorkflowResponse",
     "SelectOption",
     "SendEmailBlock",
     "SortDirection",
+    "Source",
+    "Source_AwsSecret",
+    "Source_BitwardenCreditCardData",
+    "Source_BitwardenLoginCredential",
+    "Source_BitwardenSensitiveInformation",
+    "Source_Context",
+    "Source_Credential",
+    "Source_Output",
+    "Source_Workflow",
     "Step",
     "StepStatus",
     "Task",
@@ -436,6 +470,7 @@ __all__ = [
     "TaskBlockParametersItem_BitwardenLoginCredential",
     "TaskBlockParametersItem_BitwardenSensitiveInformation",
     "TaskBlockParametersItem_Context",
+    "TaskBlockParametersItem_Credential",
     "TaskBlockParametersItem_Output",
     "TaskBlockParametersItem_Workflow",
     "TaskExtractedInformation",
@@ -444,9 +479,14 @@ __all__ = [
     "TaskNavigationPayload",
     "TaskResponse",
     "TaskResponseExtractedInformation",
+    "TaskRunResponse",
+    "TaskRunStatus",
     "TaskStatus",
     "TaskType",
+    "TaskV2",
     "TaskV2Block",
+    "TaskV2ExtractedInformationSchema",
+    "TaskV2Status",
     "TextPromptBlock",
     "TextPromptBlockParametersItem",
     "TextPromptBlockParametersItem_AwsSecret",
@@ -454,8 +494,12 @@ __all__ = [
     "TextPromptBlockParametersItem_BitwardenLoginCredential",
     "TextPromptBlockParametersItem_BitwardenSensitiveInformation",
     "TextPromptBlockParametersItem_Context",
+    "TextPromptBlockParametersItem_Credential",
     "TextPromptBlockParametersItem_Output",
     "TextPromptBlockParametersItem_Workflow",
+    "Thought",
+    "ThoughtScenario",
+    "ThoughtType",
     "TotpCode",
     "UploadToS3Block",
     "UrlBlock",
@@ -466,6 +510,7 @@ __all__ = [
     "UrlBlockParametersItem_BitwardenLoginCredential",
     "UrlBlockParametersItem_BitwardenSensitiveInformation",
     "UrlBlockParametersItem_Context",
+    "UrlBlockParametersItem_Credential",
     "UrlBlockParametersItem_Output",
     "UrlBlockParametersItem_Workflow",
     "UserDefinedError",
@@ -477,10 +522,12 @@ __all__ = [
     "ValidationBlockParametersItem_BitwardenLoginCredential",
     "ValidationBlockParametersItem_BitwardenSensitiveInformation",
     "ValidationBlockParametersItem_Context",
+    "ValidationBlockParametersItem_Credential",
     "ValidationBlockParametersItem_Output",
     "ValidationBlockParametersItem_Workflow",
     "ValidationError",
     "ValidationErrorLocItem",
+    "Value",
     "WaitBlock",
     "WaitBlockParametersItem",
     "WaitBlockParametersItem_AwsSecret",
@@ -488,6 +535,7 @@ __all__ = [
     "WaitBlockParametersItem_BitwardenLoginCredential",
     "WaitBlockParametersItem_BitwardenSensitiveInformation",
     "WaitBlockParametersItem_Context",
+    "WaitBlockParametersItem_Credential",
     "WaitBlockParametersItem_Output",
     "WaitBlockParametersItem_Workflow",
     "Workflow",
@@ -517,6 +565,7 @@ __all__ = [
     "WorkflowDefinitionParametersItem_BitwardenLoginCredential",
     "WorkflowDefinitionParametersItem_BitwardenSensitiveInformation",
     "WorkflowDefinitionParametersItem_Context",
+    "WorkflowDefinitionParametersItem_Credential",
     "WorkflowDefinitionParametersItem_Output",
     "WorkflowDefinitionParametersItem_Workflow",
     "WorkflowParameter",
@@ -526,9 +575,8 @@ __all__ = [
     "WorkflowRunBlock",
     "WorkflowRunBlockDataSchema",
     "WorkflowRunBlockNavigationPayload",
-    "WorkflowRunBlockOutput",
-    "WorkflowRunStatus",
     "WorkflowRunResponse",
+    "WorkflowRunStatus",
     "WorkflowRunTimeline",
     "WorkflowRunTimelineType",
     "WorkflowStatus",

@@ -5,7 +5,7 @@ from ..core.pydantic_utilities import UniversalBaseModel
 from .workflow_run_timeline_type import WorkflowRunTimelineType
 import typing
 from .workflow_run_block import WorkflowRunBlock
-from .observer_thought import ObserverThought
+from .thought import Thought
 import datetime as dt
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
@@ -15,7 +15,7 @@ from ..core.pydantic_utilities import update_forward_refs
 class WorkflowRunTimeline(UniversalBaseModel):
     type: WorkflowRunTimelineType
     block: typing.Optional[WorkflowRunBlock] = None
-    thought: typing.Optional[ObserverThought] = None
+    thought: typing.Optional[Thought] = None
     children: typing.Optional[typing.List["WorkflowRunTimeline"]] = None
     created_at: dt.datetime
     modified_at: dt.datetime

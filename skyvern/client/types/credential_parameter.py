@@ -2,13 +2,20 @@
 
 from ..core.pydantic_utilities import UniversalBaseModel
 import typing
-from .ai_suggestion_base_output import AiSuggestionBaseOutput
+import datetime as dt
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
 
 
-class AiSuggestionBase(UniversalBaseModel):
-    output: typing.Optional[AiSuggestionBaseOutput] = None
+class CredentialParameter(UniversalBaseModel):
+    key: str
+    description: typing.Optional[str] = None
+    credential_parameter_id: str
+    workflow_id: str
+    credential_id: str
+    created_at: dt.datetime
+    modified_at: dt.datetime
+    deleted_at: typing.Optional[dt.datetime] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

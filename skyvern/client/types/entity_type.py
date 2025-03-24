@@ -2,6 +2,4 @@
 
 import typing
 
-EntityType = typing.Union[
-    typing.Literal["step", "task", "workflow_run", "workflow_run_block", "observer_thought"], typing.Any
-]
+EntityType = typing.Union[typing.Literal["step", "task", "workflow_run", "workflow_run_block", "thought"], typing.Any]

@@ -2,7 +2,7 @@
 
 import typing
 
-ObserverTaskStatus = typing.Union[
+TaskV2Status = typing.Union[
     typing.Literal["created", "queued", "running", "failed", "terminated", "canceled", "timed_out", "completed"],
     typing.Any,
 ]

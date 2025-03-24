@@ -2,7 +2,7 @@
 
 from ..core.pydantic_utilities import UniversalBaseModel
 import typing
-from .action_result_data import ActionResultData
+from .data import Data
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
 
@@ -12,7 +12,7 @@ class ActionResult(UniversalBaseModel):
     stop_execution_on_failure: typing.Optional[bool] = None
     exception_type: typing.Optional[str] = None
     exception_message: typing.Optional[str] = None
-    data: typing.Optional[ActionResultData] = None
+    data: typing.Optional[Data] = None
     step_retry_number: typing.Optional[int] = None
     step_order: typing.Optional[int] = None
     download_triggered: typing.Optional[bool] = None

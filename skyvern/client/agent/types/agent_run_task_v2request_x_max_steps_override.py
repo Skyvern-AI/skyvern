@@ -2,4 +2,4 @@
 
 import typing
 
-AiSuggestionType = typing.Literal["data_schema"]
+AgentRunTaskV2RequestXMaxStepsOverride = typing.Union[int, str]

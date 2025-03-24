@@ -21,6 +21,7 @@ class WorkflowRun(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     failure_reason: typing.Optional[str] = None
     parent_workflow_run_id: typing.Optional[str] = None
+    workflow_title: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
 
