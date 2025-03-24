@@ -9,6 +9,12 @@ class SkyvernException(Exception):
         super().__init__(message)
 
 
+class SkyvernClientException(SkyvernException):
+    def __init__(self, message: str | None = None, status_code: int | None = None):
+        self.status_code = status_code
+        super().__init__(message)
+
+
 class SkyvernHTTPException(SkyvernException):
     def __init__(self, message: str | None = None, status_code: int = status.HTTP_400_BAD_REQUEST):
         self.status_code = status_code
@@ -242,6 +248,11 @@ class FailedToTakeScreenshot(SkyvernException):
 class EmptyScrapePage(SkyvernException):
     def __init__(self) -> None:
         super().__init__("Failed to scrape the page, returned an NONE result")
+
+
+class ScrapingFailed(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("Scraping failed.")
 
 
 class WorkflowRunContextNotInitialized(SkyvernException):

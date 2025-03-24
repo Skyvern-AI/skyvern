@@ -37,7 +37,7 @@ BITWARDEN_SENSITIVE_INFORMATION_PARAMETER_PREFIX = "bsi"
 CREDENTIAL_PARAMETER_PREFIX = "cp"
 CREDENTIAL_PREFIX = "cred"
 ORGANIZATION_BITWARDEN_COLLECTION_PREFIX = "obc"
-TASK_V2_ID = "oc"
+TASK_V2_ID = "tsk_v2"
 THOUGHT_ID = "ot"
 ORGANIZATION_AUTH_TOKEN_PREFIX = "oat"
 ORG_PREFIX = "o"
@@ -223,7 +223,7 @@ def current_time_ms() -> int:
 
 
 def _mask_shift(value: int, mask_bits: int, shift_bits: int) -> int:
-    return (value & ((2**mask_bits) - 1)) << shift_bits
+    return (value & ((1 << mask_bits) - 1)) << shift_bits
 
 
 def _get_worker_hash() -> int:

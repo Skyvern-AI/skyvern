@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from skyvern_llamaindex.settings import settings
 
 from skyvern.client import AsyncSkyvern
-from skyvern.forge.sdk.schemas.observers import ObserverTaskRequest
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskRequest, TaskResponse
 
 
@@ -153,7 +153,7 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         return await self.client.agent.get_task(task_id=task_id)
 
     async def run_task_v2(self, user_prompt: str, url: Optional[str] = None) -> Dict[str, Any | None]:
-        task_request = ObserverTaskRequest(url=url, user_prompt=user_prompt)
+        task_request = TaskV2Request(url=url, user_prompt=user_prompt)
         return await self.client.agent.run_observer_task_v_2(
             timeout_seconds=self.run_task_timeout_seconds,
             user_prompt=task_request.user_prompt,
@@ -162,7 +162,7 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         )
 
     async def dispatch_task_v2(self, user_prompt: str, url: Optional[str] = None) -> Dict[str, Any | None]:
-        task_request = ObserverTaskRequest(url=url, user_prompt=user_prompt)
+        task_request = TaskV2Request(url=url, user_prompt=user_prompt)
         return await self.client.agent.observer_task_v_2(
             user_prompt=task_request.user_prompt,
             url=task_request.url,

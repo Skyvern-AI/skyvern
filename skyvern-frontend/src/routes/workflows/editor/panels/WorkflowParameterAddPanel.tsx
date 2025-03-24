@@ -39,7 +39,6 @@ const workflowParameterTypeOptions = [
   { label: "integer", value: WorkflowParameterValueType.Integer },
   { label: "boolean", value: WorkflowParameterValueType.Boolean },
   { label: "file", value: WorkflowParameterValueType.FileURL },
-  { label: "credential", value: WorkflowParameterValueType.CredentialId },
   { label: "JSON", value: WorkflowParameterValueType.JSON },
 ];
 

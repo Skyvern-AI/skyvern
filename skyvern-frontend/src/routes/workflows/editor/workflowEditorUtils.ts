@@ -5,12 +5,12 @@ import { nanoid } from "nanoid";
 import {
   WorkflowBlockTypes,
   WorkflowParameterTypes,
+  WorkflowParameterValueType,
   type AWSSecretParameter,
   type OutputParameter,
   type Parameter,
   type WorkflowApiResponse,
   type WorkflowBlock,
-  type WorkflowParameterValueType,
   type WorkflowSettings,
 } from "../types/workflowTypes";
 import {
@@ -35,6 +35,7 @@ import {
   PDFParserBlockYAML,
   Taskv2BlockYAML,
   URLBlockYAML,
+  FileUploadBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -96,7 +97,7 @@ import {
 } from "./nodes/PDFParserNode/types";
 import { taskv2NodeDefaultData } from "./nodes/Taskv2Node/types";
 import { urlNodeDefaultData } from "./nodes/URLNode/types";
-
+import { fileUploadNodeDefaultData } from "./nodes/FileUploadNode/types";
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
 function layoutUtil(
@@ -132,13 +133,36 @@ function layoutUtil(
   };
 }
 
+export function descendants(nodes: Array<AppNode>, id: string): Array<AppNode> {
+  const children = nodes.filter((n) => n.parentId === id);
+  return children.concat(...children.map((c) => descendants(nodes, c.id)));
+}
+
+export function getLoopNodeWidth(node: AppNode, nodes: Array<AppNode>): number {
+  const maxNesting = maxNestingLevel(nodes);
+  const nestingLevel = getNestingLevel(node, nodes);
+  return 600 + (maxNesting - nestingLevel) * 50;
+}
+
+function maxNestingLevel(nodes: Array<AppNode>): number {
+  return Math.max(...nodes.map((node) => getNestingLevel(node, nodes)));
+}
+
+function getNestingLevel(node: AppNode, nodes: Array<AppNode>): number {
+  let level = 0;
+  let current = nodes.find((n) => n.id === node.parentId);
+  while (current) {
+    level++;
+    current = nodes.find((n) => n.id === current?.parentId);
+  }
+  return level;
+}
+
 function layout(
   nodes: Array<AppNode>,
   edges: Array<Edge>,
 ): { nodes: Array<AppNode>; edges: Array<Edge> } {
-  const loopNodes = nodes.filter(
-    (node) => node.type === "loop" && !node.parentId,
-  );
+  const loopNodes = nodes.filter((node) => node.type === "loop");
   const loopNodeChildren: Array<Array<AppNode>> = loopNodes.map(() => []);
 
   loopNodes.forEach((node, index) => {
@@ -151,7 +175,7 @@ function layout(
     const maxChildWidth = Math.max(
       ...childNodes.map((node) => node.measured?.width ?? 0),
     );
-    const loopNodeWidth = 600; // 600 px
+    const loopNodeWidth = getLoopNodeWidth(node, nodes);
     const layouted = layoutUtil(childNodes, childEdges, {
       marginx: (loopNodeWidth - maxChildWidth) / 2,
       marginy: 225,
@@ -456,6 +480,23 @@ function convertToNode(
         data: {
           ...commonData,
           path: block.path,
+        },
+      };
+    }
+
+    case "file_upload": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "fileUpload",
+        data: {
+          ...commonData,
+          path: block.path,
+          storageType: block.storage_type,
+          s3Bucket: block.s3_bucket,
+          awsAccessKeyId: block.aws_access_key_id,
+          awsSecretAccessKey: block.aws_secret_access_key,
+          regionName: block.region_name,
         },
       };
     }
@@ -879,6 +920,17 @@ function createNode(
         },
       };
     }
+    case "fileUpload": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "fileUpload",
+        data: {
+          ...fileUploadNodeDefaultData,
+          label,
+        },
+      };
+    }
   }
 }
 
@@ -1104,6 +1156,18 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         path: node.data.path,
       };
     }
+    case "fileUpload": {
+      return {
+        ...base,
+        block_type: "file_upload",
+        path: node.data.path,
+        storage_type: node.data.storageType,
+        s3_bucket: node.data.s3Bucket,
+        aws_access_key_id: node.data.awsAccessKeyId,
+        aws_secret_access_key: node.data.awsSecretAccessKey,
+        region_name: node.data.regionName,
+      };
+    }
     case "fileParser": {
       return {
         ...base,
@@ -1169,7 +1233,23 @@ function getOrderedChildrenBlocks(
   const children: Array<BlockYAML> = [];
   let currentNode: WorkflowBlockNode | undefined = firstChild;
   while (currentNode) {
-    children.push(getWorkflowBlock(currentNode));
+    if (currentNode.type === "loop") {
+      const loopChildren = getOrderedChildrenBlocks(
+        nodes,
+        edges,
+        currentNode.id,
+      );
+      children.push({
+        block_type: "for_loop",
+        label: currentNode.data.label,
+        continue_on_failure: currentNode.data.continueOnFailure,
+        loop_blocks: loopChildren,
+        loop_variable_reference: currentNode.data.loopVariableReference,
+        complete_if_empty: currentNode.data.completeIfEmpty,
+      });
+    } else {
+      children.push(getWorkflowBlock(currentNode));
+    }
     const nextId = edges.find(
       (edge) => edge.source === currentNode?.id,
     )?.target;
@@ -1774,6 +1854,19 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "file_upload": {
+        const blockYaml: FileUploadBlockYAML = {
+          ...base,
+          block_type: "file_upload",
+          path: block.path,
+          storage_type: block.storage_type,
+          s3_bucket: block.s3_bucket,
+          aws_access_key_id: block.aws_access_key_id,
+          aws_secret_access_key: block.aws_secret_access_key,
+          region_name: block.region_name,
+        };
+        return blockYaml;
+      }
       case "file_url_parser": {
         const blockYaml: FileUrlParserBlockYAML = {
           ...base,
@@ -1960,17 +2053,45 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   return errors;
 }
 
+function getLabelForWorkflowParameterType(type: WorkflowParameterValueType) {
+  if (type === WorkflowParameterValueType.String) {
+    return "string";
+  }
+  if (type === WorkflowParameterValueType.Float) {
+    return "float";
+  }
+  if (type === WorkflowParameterValueType.Integer) {
+    return "integer";
+  }
+  if (type === WorkflowParameterValueType.Boolean) {
+    return "boolean";
+  }
+  if (type === WorkflowParameterValueType.FileURL) {
+    return "file_url";
+  }
+  if (type === WorkflowParameterValueType.JSON) {
+    return "json";
+  }
+  if (type === WorkflowParameterValueType.CredentialId) {
+    return "credential";
+  }
+  return type;
+}
+
 export {
   convert,
   convertEchoParameters,
   createNode,
   generateNodeData,
   generateNodeLabel,
+  getNestingLevel,
   getAdditionalParametersForEmailBlock,
   getAvailableOutputParameterKeys,
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,
   getElements,
+  getLabelForWorkflowParameterType,
+  maxNestingLevel,
   getWorkflowSettings,
   getOutputParameterKey,
   getPreviousNodeIds,

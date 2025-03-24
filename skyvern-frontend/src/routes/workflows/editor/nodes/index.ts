@@ -13,6 +13,8 @@ import type { FileParserNode } from "./FileParserNode/types";
 import { FileParserNode as FileParserNodeComponent } from "./FileParserNode/FileParserNode";
 import type { UploadNode } from "./UploadNode/types";
 import { UploadNode as UploadNodeComponent } from "./UploadNode/UploadNode";
+import type { FileUploadNode } from "./FileUploadNode/types";
+import { FileUploadNode as FileUploadNodeComponent } from "./FileUploadNode/FileUploadNode";
 import type { DownloadNode } from "./DownloadNode/types";
 import { DownloadNode as DownloadNodeComponent } from "./DownloadNode/DownloadNode";
 import type { NodeAdderNode } from "./NodeAdderNode/types";
@@ -50,6 +52,7 @@ export type WorkflowBlockNode =
   | CodeBlockNode
   | FileParserNode
   | UploadNode
+  | FileUploadNode
   | DownloadNode
   | ValidationNode
   | ActionNode
@@ -80,6 +83,7 @@ export const nodeTypes = {
   codeBlock: memo(CodeBlockNodeComponent),
   fileParser: memo(FileParserNodeComponent),
   upload: memo(UploadNodeComponent),
+  fileUpload: memo(FileUploadNodeComponent),
   download: memo(DownloadNodeComponent),
   nodeAdder: memo(NodeAdderNodeComponent),
   start: memo(StartNodeComponent),

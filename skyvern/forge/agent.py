@@ -36,6 +36,7 @@ from skyvern.exceptions import (
     MissingBrowserState,
     MissingBrowserStatePage,
     NoTOTPVerificationCodeFound,
+    ScrapingFailed,
     SkyvernException,
     StepTerminationError,
     StepUnableToExecuteError,
@@ -257,6 +258,7 @@ class ForgeAgent:
         close_browser_on_completion: bool = True,
         task_block: BaseTaskBlock | None = None,
         browser_session_id: str | None = None,
+        complete_verification: bool = True,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
         workflow_run: WorkflowRun | None = None
         if task.workflow_run_id:
@@ -383,7 +385,12 @@ class ForgeAgent:
                 await self.register_async_operations(organization, task, page)
 
             step, detailed_output = await self.agent_step(
-                task, step, browser_state, organization=organization, task_block=task_block
+                task,
+                step,
+                browser_state,
+                organization=organization,
+                task_block=task_block,
+                complete_verification=complete_verification,
             )
             await app.AGENT_FUNCTION.post_step_execution(task, step)
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)
@@ -519,6 +526,7 @@ class ForgeAgent:
                     close_browser_on_completion=close_browser_on_completion,
                     browser_session_id=browser_session_id,
                     task_block=task_block,
+                    complete_verification=complete_verification,
                 )
             elif settings.execute_all_steps() and next_step:
                 return await self.execute_step(
@@ -529,6 +537,7 @@ class ForgeAgent:
                     close_browser_on_completion=close_browser_on_completion,
                     browser_session_id=browser_session_id,
                     task_block=task_block,
+                    complete_verification=complete_verification,
                 )
             else:
                 LOG.info(
@@ -670,7 +679,25 @@ class ForgeAgent:
                 close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
             )
             return step, detailed_output, None
-
+        except ScrapingFailed:
+            LOG.warning(
+                "Scraping failed, marking the task as failed",
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            await self.fail_task(
+                task,
+                step,
+                "Skyvern failed to load the website. This usually happens when the website is not properly designed, and crashes the browser as a result.",
+            )
+            await self.clean_up_task(
+                task=task,
+                last_step=step,
+                api_key=api_key,
+                close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                browser_session_id=browser_session_id,
+            )
+            return step, detailed_output, None
         except Exception as e:
             LOG.exception(
                 "Got an unexpected exception in step, marking task as failed",
@@ -743,6 +770,7 @@ class ForgeAgent:
         browser_state: BrowserState,
         organization: Organization | None = None,
         task_block: BaseTaskBlock | None = None,
+        complete_verification: bool = True,
     ) -> tuple[Step, DetailedAgentStepOutput]:
         detailed_agent_step_output = DetailedAgentStepOutput(
             scraped_page=None,
@@ -1072,7 +1100,13 @@ class ForgeAgent:
                         break
 
             task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
-            if not has_decisive_action and not task_completes_on_download and not isinstance(task_block, ActionBlock):
+            if (
+                not has_decisive_action
+                and not task_completes_on_download
+                and not isinstance(task_block, ActionBlock)
+                and complete_verification
+                and (task.navigation_goal or task.complete_criterion)
+            ):
                 disable_user_goal_check = app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                     "DISABLE_USER_GOAL_CHECK",
                     task.task_id,
@@ -1136,7 +1170,12 @@ class ForgeAgent:
                 output=detailed_agent_step_output.to_agent_step_output(),
             )
             return failed_step, detailed_agent_step_output.get_clean_detailed_output()
-        except (UnsupportedActionType, UnsupportedTaskType, FailedToParseActionInstruction):
+        except (
+            UnsupportedActionType,
+            UnsupportedTaskType,
+            FailedToParseActionInstruction,
+            ScrapingFailed,
+        ):
             raise
 
         except Exception as e:
@@ -1163,7 +1202,7 @@ class ForgeAgent:
             step_id=step.step_id,
             workflow_run_id=task.workflow_run_id,
         )
-        scraped_page_refreshed = await scraped_page.refresh()
+        scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False)
 
         verification_prompt = prompt_engine.load_prompt(
             "check-user-goal",
@@ -1367,18 +1406,18 @@ class ForgeAgent:
                     scrape_type=scrape_type,
                 )
                 break
-            except FailedToTakeScreenshot as e:
+            except (FailedToTakeScreenshot, ScrapingFailed) as e:
                 if idx < len(SCRAPE_TYPE_ORDER) - 1:
                     continue
                 LOG.error(
-                    "Failed to take screenshot after two normal attempts and reload-page retry",
+                    f"{e.__class__.__name__} happened in two normal attempts and reload-page retry",
                     task_id=task.task_id,
                     step_id=step.step_id,
                 )
-                raise e
+                raise ScrapingFailed()
 
         if scraped_page is None:
-            raise EmptyScrapePage
+            raise EmptyScrapePage()
 
         await app.ARTIFACT_MANAGER.create_artifact(
             step=step,
@@ -1472,7 +1511,11 @@ class ForgeAgent:
                     reason=json_response.get("thought"), error_type=json_response.get("error")
                 )
 
-            action_type: str = json_response.get("action_type") or ""
+            inferred_actions: list[dict[str, Any]] = json_response.get("inferred_actions", [])
+            if not inferred_actions:
+                raise FailedToParseActionInstruction(reason=json_response.get("thought"), error_type="EMPTY_ACTION")
+
+            action_type: str = inferred_actions[0].get("action_type") or ""
             action_type = ActionType[action_type.upper()]
 
             if action_type == ActionType.CLICK:
@@ -1542,29 +1585,28 @@ class ForgeAgent:
                 actions_and_results.extend(window_step.output.actions_and_results)
 
         # exclude successful action from history
-        return json.dumps(
-            [
-                {
-                    "action": action.model_dump(
+        action_history = [
+            {
+                "action": action.model_dump(
+                    exclude_none=True,
+                    include={"action_type", "element_id", "status", "reasoning", "option", "download"},
+                ),
+                "results": [
+                    result.model_dump(
                         exclude_none=True,
-                        include={"action_type", "element_id", "status", "reasoning", "option", "download"},
-                    ),
-                    "results": [
-                        result.model_dump(
-                            exclude_none=True,
-                            include={
-                                "success",
-                                "exception_type",
-                                "exception_message",
-                            },
-                        )
-                        for result in results
-                    ],
-                }
-                for action, results in actions_and_results
-                if len(results) > 0
-            ]
-        )
+                        include={
+                            "success",
+                            "exception_type",
+                            "exception_message",
+                        },
+                    )
+                    for result in results
+                ],
+            }
+            for action, results in actions_and_results
+            if len(results) > 0
+        ]
+        return json.dumps(action_history)
 
     async def get_extracted_information_for_task(self, task: Task) -> dict[str, Any] | list | str | None:
         """

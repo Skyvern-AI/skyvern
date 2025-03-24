@@ -317,3 +317,36 @@ export type CredentialApiResponse = {
   credential_type: "password" | "credit_card";
   name: string;
 };
+
+export function isPasswordCredential(
+  credential: PasswordCredentialApiResponse | CreditCardCredentialApiResponse,
+): credential is PasswordCredentialApiResponse {
+  return "username" in credential;
+}
+
+export function isCreditCardCredential(
+  credential: PasswordCredentialApiResponse | CreditCardCredentialApiResponse,
+): credential is CreditCardCredentialApiResponse {
+  return "last_four" in credential;
+}
+
+export type CreateCredentialRequest = {
+  name: string;
+  credential_type: "password" | "credit_card";
+  credential: PasswordCredential | CreditCardCredential;
+};
+
+export type PasswordCredential = {
+  username: string;
+  password: string;
+  totp: string | null;
+};
+
+export type CreditCardCredential = {
+  card_number: string;
+  card_cvv: string;
+  card_exp_month: string;
+  card_exp_year: string;
+  card_brand: string;
+  card_holder_name: string;
+};

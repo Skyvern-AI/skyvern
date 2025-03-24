@@ -365,10 +365,14 @@ async def _create_cdp_connection_browser(
             response = await client.get(f"{settings.BROWSER_REMOTE_DEBUGGING_URL}/json/version")
             remote_browser_url = response.json().get("webSocketDebuggerUrl")
     except Exception:
-        raise Exception("Failed to connect to CDP browser")
+        raise Exception(
+            f"Cannot find the webSocketDebuggerUrl from the browser remote debugging {settings.BROWSER_REMOTE_DEBUGGING_URL}"
+        )
 
     if not remote_browser_url:
-        raise Exception("Cannot find remote browser url")
+        raise Exception(
+            f"Cannot find the webSocketDebuggerUrl from the browser remote debugging {settings.BROWSER_REMOTE_DEBUGGING_URL}"
+        )
 
     LOG.info("Connecting browser CDP connection", remote_browser_url=remote_browser_url)
     browser = await playwright.chromium.connect_over_cdp(remote_browser_url)
@@ -580,7 +584,7 @@ class BrowserState:
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
             )
-        await self.__assert_page()
+        page = await self.__assert_page()
 
         if not await BrowserContextFactory.validate_browser_context(await self.get_working_page()):
             await self.close_current_open_page()
@@ -591,8 +595,7 @@ class BrowserState:
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
             )
-            await self.__assert_page()
-
+            page = await self.__assert_page()
         return page
 
     async def close_current_open_page(self) -> None:

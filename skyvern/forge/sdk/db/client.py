@@ -492,6 +492,8 @@ class AgentDB:
         incremental_cost: float | None = None,
         incremental_input_tokens: int | None = None,
         incremental_output_tokens: int | None = None,
+        incremental_reasoning_tokens: int | None = None,
+        incremental_cached_tokens: int | None = None,
     ) -> Step:
         try:
             async with self.Session() as session:
@@ -517,6 +519,10 @@ class AgentDB:
                         step.input_token_count = incremental_input_tokens + (step.input_token_count or 0)
                     if incremental_output_tokens is not None:
                         step.output_token_count = incremental_output_tokens + (step.output_token_count or 0)
+                    if incremental_reasoning_tokens is not None:
+                        step.reasoning_token_count = incremental_reasoning_tokens + (step.reasoning_token_count or 0)
+                    if incremental_cached_tokens is not None:
+                        step.cached_token_count = incremental_cached_tokens + (step.cached_token_count or 0)
 
                     await session.commit()
                     updated_step = await self.get_step(task_id, step_id, organization_id)
@@ -1718,6 +1724,21 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
+    async def get_workflow_output_parameters_by_ids(self, output_parameter_ids: list[str]) -> list[OutputParameter]:
+        try:
+            async with self.Session() as session:
+                output_parameters = (
+                    await session.scalars(
+                        select(OutputParameterModel).filter(
+                            OutputParameterModel.output_parameter_id.in_(output_parameter_ids)
+                        )
+                    )
+                ).all()
+                return [convert_to_output_parameter(parameter) for parameter in output_parameters]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
     async def create_credential_parameter(
         self, workflow_id: str, key: str, credential_id: str, description: str | None = None
     ) -> CredentialParameter:
@@ -2236,6 +2257,8 @@ class AgentDB:
         totp_identifier: str | None = None,
         totp_verification_url: str | None = None,
         webhook_callback_url: str | None = None,
+        extracted_information_schema: dict | list | str | None = None,
+        error_code_mapping: dict | None = None,
     ) -> TaskV2:
         async with self.Session() as session:
             new_task_v2 = TaskV2Model(
@@ -2248,6 +2271,8 @@ class AgentDB:
                 totp_identifier=totp_identifier,
                 totp_verification_url=totp_verification_url,
                 webhook_callback_url=webhook_callback_url,
+                extracted_information_schema=extracted_information_schema,
+                error_code_mapping=error_code_mapping,
                 organization_id=organization_id,
             )
             session.add(new_task_v2)
@@ -2271,6 +2296,8 @@ class AgentDB:
         output: dict[str, Any] | None = None,
         input_token_count: int | None = None,
         output_token_count: int | None = None,
+        reasoning_token_count: int | None = None,
+        cached_token_count: int | None = None,
         thought_cost: float | None = None,
         organization_id: str | None = None,
     ) -> Thought:
@@ -2290,6 +2317,8 @@ class AgentDB:
                 output=output,
                 input_token_count=input_token_count,
                 output_token_count=output_token_count,
+                reasoning_token_count=reasoning_token_count,
+                cached_token_count=cached_token_count,
                 thought_cost=thought_cost,
                 organization_id=organization_id,
             )
@@ -2311,6 +2340,8 @@ class AgentDB:
         output: dict[str, Any] | None = None,
         input_token_count: int | None = None,
         output_token_count: int | None = None,
+        reasoning_token_count: int | None = None,
+        cached_token_count: int | None = None,
         thought_cost: float | None = None,
         organization_id: str | None = None,
     ) -> Thought:
@@ -2343,6 +2374,10 @@ class AgentDB:
                     thought_obj.input_token_count = input_token_count
                 if output_token_count:
                     thought_obj.output_token_count = output_token_count
+                if reasoning_token_count:
+                    thought_obj.reasoning_token_count = reasoning_token_count
+                if cached_token_count:
+                    thought_obj.cached_token_count = cached_token_count
                 if thought_cost:
                     thought_obj.thought_cost = thought_cost
                 await session.commit()
@@ -2566,17 +2601,20 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def get_persistent_browser_session_by_id(self, session_id: str) -> Optional[PersistentBrowserSession]:
+    async def get_persistent_browser_session_by_id(
+        self, session_id: str, organization_id: str | None = None
+    ) -> Optional[PersistentBrowserSession]:
         """Get a specific persistent browser session."""
         try:
             async with self.Session() as session:
-                persistent_browser_session = (
-                    await session.scalars(
-                        select(PersistentBrowserSessionModel)
-                        .filter_by(persistent_browser_session_id=session_id)
-                        .filter_by(deleted_at=None)
-                    )
-                ).first()
+                query = (
+                    select(PersistentBrowserSessionModel)
+                    .filter_by(persistent_browser_session_id=session_id)
+                    .filter_by(deleted_at=None)
+                )
+                if organization_id:
+                    query = query.filter_by(organization_id=organization_id)
+                persistent_browser_session = (await session.scalars(query)).first()
                 if persistent_browser_session:
                     return PersistentBrowserSession.model_validate(persistent_browser_session)
                 raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
@@ -2903,5 +2941,17 @@ class AgentDB:
             if organization_id:
                 query = query.filter_by(organization_id=organization_id)
             query = query.filter_by(cached=True).order_by(TaskRunModel.created_at.desc())
+            task_run = (await session.scalars(query)).first()
+            return TaskRun.model_validate(task_run) if task_run else None
+
+    async def get_task_run(
+        self,
+        run_id: str,
+        organization_id: str | None = None,
+    ) -> TaskRun | None:
+        async with self.Session() as session:
+            query = select(TaskRunModel).filter_by(run_id=run_id)
+            if organization_id:
+                query = query.filter_by(organization_id=organization_id)
             task_run = (await session.scalars(query)).first()
             return TaskRun.model_validate(task_run) if task_run else None

@@ -117,6 +117,8 @@ class StepModel(Base):
     )
     input_token_count = Column(Integer, default=0)
     output_token_count = Column(Integer, default=0)
+    reasoning_token_count = Column(Integer, default=0)
+    cached_token_count = Column(Integer, default=0)
     step_cost = Column(Numeric, default=0)
 
 
@@ -588,6 +590,8 @@ class TaskV2Model(Base):
     totp_verification_url = Column(String, nullable=True)
     totp_identifier = Column(String, nullable=True)
     proxy_location = Column(String, nullable=True)
+    extracted_information_schema = Column(JSON, nullable=True)
+    error_code_mapping = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -610,6 +614,8 @@ class ThoughtModel(Base):
     answer = Column(String, nullable=True)
     input_token_count = Column(Integer, nullable=True)
     output_token_count = Column(Integer, nullable=True)
+    reasoning_token_count = Column(Integer, nullable=True)
+    cached_token_count = Column(Integer, nullable=True)
     thought_cost = Column(Numeric, nullable=True)
 
     observer_thought_type = Column(String, nullable=True, default=ThoughtType.plan)

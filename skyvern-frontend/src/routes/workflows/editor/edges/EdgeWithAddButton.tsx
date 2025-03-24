@@ -56,7 +56,6 @@ function EdgeWithAddButton({
             size="icon"
             className="h-4 w-4 rounded-full transition-all hover:scale-150"
             onClick={() => {
-              const disableLoop = Boolean(sourceNode?.parentId);
               setWorkflowPanelState({
                 active: true,
                 content: "nodeLibrary",
@@ -64,7 +63,6 @@ function EdgeWithAddButton({
                   previous: source,
                   next: target,
                   parent: sourceNode?.parentId,
-                  disableLoop,
                 },
               });
             }}

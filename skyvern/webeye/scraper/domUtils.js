@@ -733,7 +733,8 @@ function isInteractable(element, hoverStylesMap) {
     tagName === "i" ||
     tagName === "li" ||
     tagName === "p" ||
-    tagName === "td"
+    tagName === "td" ||
+    tagName === "svg"
   ) {
     const elementCursor = getElementComputedStyle(element)?.cursor;
     if (elementCursor === "pointer") {
@@ -804,21 +805,6 @@ function isDatePickerSelector(element) {
   if (
     tagName === "button" &&
     element.getAttribute("data-testid")?.includes("date")
-  ) {
-    return true;
-  }
-  return false;
-}
-
-function isCheckableDiv(element) {
-  const tagName = element.tagName.toLowerCase();
-  if (tagName !== "div") {
-    return false;
-  }
-  if (
-    element.className &&
-    element.className.toString().includes("checkbox") &&
-    element.childElementCount === 0
   ) {
     return true;
   }
@@ -919,6 +905,19 @@ function hasNgAttribute(element) {
   return false;
 }
 
+function isAngularMaterial(element) {
+  if (!element.attributes[Symbol.iterator]) {
+    return false;
+  }
+
+  for (let attr of element.attributes) {
+    if (attr.name.startsWith("mat")) {
+      return true;
+    }
+  }
+  return false;
+}
+
 const isAngularDropdown = (element) => {
   if (!hasNgAttribute(element)) {
     return false;
@@ -933,6 +932,20 @@ const isAngularDropdown = (element) => {
   }
 
   return false;
+};
+
+const isAngularMaterialDatePicker = (element) => {
+  if (!isAngularMaterial(element)) {
+    return false;
+  }
+
+  const tagName = element.tagName.toLowerCase();
+  if (tagName !== "input") return false;
+
+  return (
+    (element.closest("mat-datepicker") ||
+      element.closest("mat-formio-date")) !== null
+  );
 };
 
 function getPseudoContent(element, pseudo) {
@@ -1283,16 +1296,6 @@ async function buildElementObject(
     attrs["required"] = true;
   }
 
-  if (
-    elementTagNameLower === "input" &&
-    (element.type === "radio" || element.type === "checkbox")
-  ) {
-    // if checkbox and radio don't have "checked" and "aria-checked", add a checked="false" to help LLM understand
-    if (!("checked" in attrs) && !("aria-checked" in attrs)) {
-      attrs["checked"] = false;
-    }
-  }
-
   if (elementTagNameLower === "input" || elementTagNameLower === "textarea") {
     if (element.type === "password") {
       attrs["value"] = element.value ? "*".repeat(element.value.length) : "";
@@ -1324,9 +1327,9 @@ async function buildElementObject(
       isDivComboboxDropdown(element) ||
       isDropdownButton(element) ||
       isAngularDropdown(element) ||
+      isAngularMaterialDatePicker(element) ||
       isSelect2Dropdown(element) ||
       isSelect2MultiChoice(element),
-    isCheckable: isCheckableDiv(element),
   };
 
   let isInShadowRoot = element.getRootNode() instanceof ShadowRoot;

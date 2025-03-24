@@ -30,7 +30,7 @@ from ..types.run_workflow_response import RunWorkflowResponse
 from ..types.workflow_run_status import WorkflowRunStatus
 from ..types.workflow_run import WorkflowRun
 from ..types.workflow_run_timeline import WorkflowRunTimeline
-from ..types.workflow_run_status_response import WorkflowRunStatusResponse
+from ..types.workflow_run_status_response import WorkflowRunResponse
 from ..types.workflow import Workflow
 from ..types.ai_suggestion_base import AiSuggestionBase
 from ..types.task_generation import TaskGeneration
@@ -1658,7 +1658,7 @@ class AgentClient:
         api_key: typing.Optional[str] = None,
         authorization: typing.Optional[str] = None,
         request_options: typing.Optional[RequestOptions] = None,
-    ) -> WorkflowRunStatusResponse:
+    ) -> WorkflowRunResponse:
         """
         Parameters
         ----------
@@ -1673,7 +1673,7 @@ class AgentClient:
 
         Returns
         -------
-        WorkflowRunStatusResponse
+        WorkflowRunResponse
             Successful Response
 
         Examples
@@ -1697,9 +1697,9 @@ class AgentClient:
         try:
             if 200 <= _response.status_code < 300:
                 return typing.cast(
-                    WorkflowRunStatusResponse,
+                    WorkflowRunResponse,
                     parse_obj_as(
-                        type_=WorkflowRunStatusResponse,  # type: ignore
+                        type_=WorkflowRunResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -3457,7 +3457,7 @@ class AgentClient:
 
     def get_eval_workflow_run_by_run_id(
         self, workflow_run_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> WorkflowRunStatusResponse:
+    ) -> WorkflowRunResponse:
         """
         Parameters
         ----------
@@ -3468,7 +3468,7 @@ class AgentClient:
 
         Returns
         -------
-        WorkflowRunStatusResponse
+        WorkflowRunResponse
             Successful Response
 
         Examples
@@ -3488,9 +3488,9 @@ class AgentClient:
         try:
             if 200 <= _response.status_code < 300:
                 return typing.cast(
-                    WorkflowRunStatusResponse,
+                    WorkflowRunResponse,
                     parse_obj_as(
-                        type_=WorkflowRunStatusResponse,  # type: ignore
+                        type_=WorkflowRunResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -5741,7 +5741,7 @@ class AsyncAgentClient:
         api_key: typing.Optional[str] = None,
         authorization: typing.Optional[str] = None,
         request_options: typing.Optional[RequestOptions] = None,
-    ) -> WorkflowRunStatusResponse:
+    ) -> WorkflowRunResponse:
         """
         Parameters
         ----------
@@ -5756,7 +5756,7 @@ class AsyncAgentClient:
 
         Returns
         -------
-        WorkflowRunStatusResponse
+        WorkflowRunResponse
             Successful Response
 
         Examples
@@ -5788,9 +5788,9 @@ class AsyncAgentClient:
         try:
             if 200 <= _response.status_code < 300:
                 return typing.cast(
-                    WorkflowRunStatusResponse,
+                    WorkflowRunResponse,
                     parse_obj_as(
-                        type_=WorkflowRunStatusResponse,  # type: ignore
+                        type_=WorkflowRunResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -7739,7 +7739,7 @@ class AsyncAgentClient:
 
     async def get_eval_workflow_run_by_run_id(
         self, workflow_run_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> WorkflowRunStatusResponse:
+    ) -> WorkflowRunResponse:
         """
         Parameters
         ----------
@@ -7750,7 +7750,7 @@ class AsyncAgentClient:
 
         Returns
         -------
-        WorkflowRunStatusResponse
+        WorkflowRunResponse
             Successful Response
 
         Examples
@@ -7778,9 +7778,9 @@ class AsyncAgentClient:
         try:
             if 200 <= _response.status_code < 300:
                 return typing.cast(
-                    WorkflowRunStatusResponse,
+                    WorkflowRunResponse,
                     parse_obj_as(
-                        type_=WorkflowRunStatusResponse,  # type: ignore
+                        type_=WorkflowRunResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )

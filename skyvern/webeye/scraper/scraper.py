@@ -11,7 +11,7 @@ from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
 from skyvern.constants import BUILDING_ELEMENT_TREE_TIMEOUT_MS, SKYVERN_DIR, SKYVERN_ID_ATTR
-from skyvern.exceptions import FailedToTakeScreenshot, UnknownElementTreeFormat
+from skyvern.exceptions import FailedToTakeScreenshot, ScrapingFailed, UnknownElementTreeFormat
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.webeye.browser_factory import BrowserState
@@ -94,15 +94,16 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
     """
     if element is flagged as dropped, the html format is empty
     """
-    if element.get("isDropped", False):
-        return ""
-
     tag = element["tagName"]
     attributes: dict[str, Any] = copy.deepcopy(element.get("attributes", {}))
 
-    if element.get("isCheckable", False) and tag != "input":
-        tag = "input"
-        attributes["type"] = "checkbox"
+    interactable = element.get("interactable", False)
+    if element.get("isDropped", False):
+        if not interactable:
+            return ""
+        else:
+            LOG.info("Element is interactable. Trimmed all attributes instead of dropping it", element=element)
+            attributes = {}
 
     context = skyvern_context.ensure_context()
 
@@ -267,12 +268,13 @@ class ScrapedPage(BaseModel):
 
         raise UnknownElementTreeFormat(fmt=fmt)
 
-    async def refresh(self) -> Self:
+    async def refresh(self, draw_boxes: bool = True) -> Self:
         refreshed_page = await scrape_website(
             browser_state=self._browser_state,
             url=self.url,
             cleanup_element_tree=self._clean_up_func,
             scrape_exclude=self._scrape_exclude,
+            draw_boxes=draw_boxes,
         )
         self.elements = refreshed_page.elements
         self.id_to_css_dict = refreshed_page.id_to_css_dict
@@ -305,6 +307,7 @@ async def scrape_website(
     num_retry: int = 0,
     scrape_exclude: ScrapeExcludeFunc | None = None,
     take_screenshots: bool = True,
+    draw_boxes: bool = True,
 ) -> ScrapedPage:
     """
     ************************************************************************************************
@@ -335,6 +338,7 @@ async def scrape_website(
             cleanup_element_tree=cleanup_element_tree,
             scrape_exclude=scrape_exclude,
             take_screenshots=take_screenshots,
+            draw_boxes=draw_boxes,
         )
     except Exception as e:
         # NOTE: MAX_SCRAPING_RETRIES is set to 0 in both staging and production
@@ -348,7 +352,7 @@ async def scrape_website(
             if isinstance(e, FailedToTakeScreenshot):
                 raise e
             else:
-                raise Exception("Scraping failed.")
+                raise ScrapingFailed() from e
         LOG.info("Scraping failed, will retry", num_retry=num_retry, url=url)
         return await scrape_website(
             browser_state,
@@ -356,6 +360,8 @@ async def scrape_website(
             cleanup_element_tree,
             num_retry=num_retry,
             scrape_exclude=scrape_exclude,
+            take_screenshots=take_screenshots,
+            draw_boxes=draw_boxes,
         )
 
 
@@ -404,6 +410,7 @@ async def scrape_web_unsafe(
     cleanup_element_tree: CleanupElementTreeFunc,
     scrape_exclude: ScrapeExcludeFunc | None = None,
     take_screenshots: bool = True,
+    draw_boxes: bool = True,
 ) -> ScrapedPage:
     """
     Asynchronous function that performs web scraping without any built-in error handling. This function is intended
@@ -430,7 +437,7 @@ async def scrape_web_unsafe(
 
     screenshots = []
     if take_screenshots:
-        screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=url, draw_boxes=True)
+        screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=url, draw_boxes=draw_boxes)
 
     elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
     element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))

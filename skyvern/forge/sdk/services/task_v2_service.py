@@ -96,6 +96,8 @@ async def initialize_task_v2(
     publish_workflow: bool = False,
     parent_workflow_run_id: str | None = None,
     create_task_run: bool = False,
+    extracted_information_schema: dict | list | str | None = None,
+    error_code_mapping: dict | None = None,
 ) -> TaskV2:
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
@@ -104,6 +106,8 @@ async def initialize_task_v2(
         totp_identifier=totp_identifier,
         webhook_callback_url=webhook_callback_url,
         proxy_location=proxy_location,
+        extracted_information_schema=extracted_information_schema,
+        error_code_mapping=error_code_mapping,
     )
     # set task_v2_id in context
     context = skyvern_context.current()
@@ -1142,6 +1146,7 @@ async def _generate_navigation_task(
         navigation_goal=navigation_goal,
         totp_verification_url=totp_verification_url,
         totp_identifier=totp_identifier,
+        complete_verification=False,
     )
     output_parameter = await app.WORKFLOW_SERVICE.create_output_parameter_for_block(
         workflow_id=workflow_id,
@@ -1155,6 +1160,7 @@ async def _generate_navigation_task(
             totp_verification_url=totp_verification_url,
             totp_identifier=totp_identifier,
             output_parameter=output_parameter,
+            complete_verification=False,
         ),
         [navigation_block_yaml],
         [],
@@ -1395,6 +1401,7 @@ async def _summarize_task_v2(
         "task_v2_summary",
         user_goal=task_v2.prompt,
         task_history=task_history,
+        extracted_information_schema=task_v2.extracted_information_schema,
         local_datetime=datetime.now(context.tz_info).isoformat(),
     )
     task_v2_summary_resp = await app.LLM_API_HANDLER(

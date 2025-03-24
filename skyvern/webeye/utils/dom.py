@@ -13,6 +13,7 @@ from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     ElementIsNotLabel,
+    InteractWithDisabledElement,
     MissingElement,
     MissingElementDict,
     MissingElementInCSSMap,
@@ -126,6 +127,11 @@ class SkyvernElement:
         self.__frame = frame
         self.locator = locator
         self.hash_value = hash_value
+        self._id_cache = static_element.get("id", "")
+        self._tag_name = static_element.get("tagName", "")
+        self._selectable = static_element.get("isSelectable", False)
+        self._frame_id = static_element.get("frame", "")
+        self._attributes = static_element.get("attributes", {})
 
     def __repr__(self) -> str:
         return f"SkyvernElement({str(self.__static_element)})"
@@ -266,9 +272,11 @@ class SkyvernElement:
     async def is_selectable(self) -> bool:
         return self.get_selectable() or self.get_tag_name() in SELECTABLE_ELEMENT
 
-    async def is_visible(self) -> bool:
+    async def is_visible(self, must_visible_style: bool = True) -> bool:
         if not await self.get_locator().count():
             return False
+        if not must_visible_style:
+            return True
         skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
         return await skyvern_frame.get_element_visible(await self.get_element_handler())
 
@@ -288,19 +296,19 @@ class SkyvernElement:
         return self.__static_element
 
     def get_selectable(self) -> bool:
-        return self.__static_element.get("isSelectable", False)
+        return self._selectable
 
     def get_tag_name(self) -> str:
-        return self.__static_element.get("tagName", "")
+        return self._tag_name
 
     def get_id(self) -> str:
-        return self.__static_element.get("id", "")
+        return self._id_cache
 
     def get_frame_id(self) -> str:
-        return self.__static_element.get("frame", "")
+        return self._frame_id
 
     def get_attributes(self) -> typing.Dict:
-        return self.__static_element.get("attributes", {})
+        return self._attributes
 
     def get_options(self) -> typing.List[SkyvernOptionType]:
         options = self.__static_element.get("options", None)
@@ -577,6 +585,45 @@ class SkyvernElement:
         await page.mouse.move(dest_x, dest_y)
 
         return dest_x, dest_y
+
+    async def click(
+        self,
+        page: Page,
+        dom: DomUtil | None = None,
+        incremental_page: IncrementalScrapePage | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> None:
+        if await self.is_disabled(dynamic=True):
+            raise InteractWithDisabledElement(element_id=self.get_id())
+
+        try:
+            await self.get_locator().click(timeout=timeout)
+            return
+        except Exception:
+            LOG.info("Failed to click by playwright", exc_info=True, element_id=self.get_id())
+
+        if dom is not None:
+            # try to click on the blocking element
+            try:
+                await self.scroll_into_view(timeout=timeout)
+                blocking_element, _ = await self.find_blocking_element(dom=dom, incremental_page=incremental_page)
+                if blocking_element:
+                    LOG.debug("Find the blocking element", element_id=blocking_element.get_id())
+                    await blocking_element.get_locator().click(timeout=timeout)
+                    return
+            except Exception:
+                LOG.info("Failed to click on the blocking element", exc_info=True, element_id=self.get_id())
+
+        try:
+            await self.scroll_into_view(timeout=timeout)
+            await self.coordinate_click(page=page, timeout=timeout)
+            return
+        except Exception:
+            LOG.info("Failed to click by coordinate", exc_info=True, element_id=self.get_id())
+
+        await self.scroll_into_view(timeout=timeout)
+        await self.click_in_javascript()
+        return
 
     async def click_in_javascript(self) -> None:
         skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())

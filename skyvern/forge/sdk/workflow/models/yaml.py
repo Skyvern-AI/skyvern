@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from skyvern.config import settings
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileType
+from skyvern.forge.sdk.workflow.models.constants import FileStorageType
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowStatus
 
@@ -141,6 +142,7 @@ class TaskBlockYAML(BlockYAML):
     cache_actions: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
+    complete_verification: bool = True
 
 
 class ForLoopBlockYAML(BlockYAML):
@@ -196,6 +198,17 @@ class DownloadToS3BlockYAML(BlockYAML):
 class UploadToS3BlockYAML(BlockYAML):
     block_type: Literal[BlockType.UPLOAD_TO_S3] = BlockType.UPLOAD_TO_S3  # type: ignore
 
+    path: str | None = None
+
+
+class FileUploadBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.FILE_UPLOAD] = BlockType.FILE_UPLOAD  # type: ignore
+
+    storage_type: FileStorageType = FileStorageType.S3
+    s3_bucket: str | None = None
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    region_name: str | None = None
     path: str | None = None
 
 
@@ -273,6 +286,7 @@ class NavigationBlockYAML(BlockYAML):
     cache_actions: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
+    complete_verification: bool = True
 
 
 class ExtractionBlockYAML(BlockYAML):
@@ -303,6 +317,7 @@ class LoginBlockYAML(BlockYAML):
     cache_actions: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
+    complete_verification: bool = True
 
 
 class WaitBlockYAML(BlockYAML):
@@ -360,6 +375,7 @@ BLOCK_YAML_SUBCLASSES = (
     | TextPromptBlockYAML
     | DownloadToS3BlockYAML
     | UploadToS3BlockYAML
+    | FileUploadBlockYAML
     | SendEmailBlockYAML
     | FileParserBlockYAML
     | ValidationBlockYAML

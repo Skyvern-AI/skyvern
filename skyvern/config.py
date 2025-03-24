@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     TEMP_PATH: str = "./temp"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
-    BROWSER_LOADING_TIMEOUT_MS: int = 120000
+    BROWSER_LOADING_TIMEOUT_MS: int = 90000
     OPTION_LOADING_TIMEOUT_MS: int = 600000
     MAX_STEPS_PER_RUN: int = 10
     MAX_STEPS_PER_TASK_V2: int = 25
@@ -48,8 +48,6 @@ class Settings(BaseSettings):
     # Algorithm used to sign the JWT
     SIGNATURE_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # one week
-
-    SKYVERN_API_KEY: str = "PLACEHOLDER"
 
     # Artifact storage settings
     ARTIFACT_STORAGE_PATH: str = f"{SKYVERN_DIR}/artifacts"
@@ -100,7 +98,7 @@ class Settings(BaseSettings):
     SECONDARY_LLM_KEY: str | None = None
     SELECT_AGENT_LLM_KEY: str | None = None
     SINGLE_CLICK_AGENT_LLM_KEY: str | None = None
-    TEXT_ONLY_AGENT_LLM_KEY: str | None = None
+    PROMPT_BLOCK_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
@@ -165,6 +163,11 @@ class Settings(BaseSettings):
     SVG_MAX_LENGTH: int = 100000
 
     ENABLE_LOG_ARTIFACTS: bool = False
+    ENABLE_CODE_BLOCK: bool = False
+
+    # SkyvernClient Settings
+    SKYVERN_BASE_URL: str = "https://api.skyvern.com"
+    SKYVERN_API_KEY: str = "PLACEHOLDER"
 
     def is_cloud_environment(self) -> bool:
         """

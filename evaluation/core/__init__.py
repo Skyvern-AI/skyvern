@@ -14,7 +14,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import create_folder_if_not_exist
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation, TaskRequest, TaskResponse, TaskStatus
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus, WorkflowRunStatusResponse
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunResponse, WorkflowRunStatus
 
 
 class TaskOutput(BaseModel):
@@ -70,7 +70,7 @@ class SkyvernClient:
         assert response.status_code == 200, f"Expected to get task response status 200, but got {response.status_code}"
         return TaskResponse(**response.json())
 
-    async def get_workflow_run(self, workflow_pid: str, workflow_run_id: str) -> WorkflowRunStatusResponse:
+    async def get_workflow_run(self, workflow_pid: str, workflow_run_id: str) -> WorkflowRunResponse:
         url = f"{self.base_url}/workflows/{workflow_pid}/runs/{workflow_run_id}"
         headers = {"x-api-key": self.credentials}
         async with httpx.AsyncClient() as client:
@@ -78,7 +78,7 @@ class SkyvernClient:
             assert response.status_code == 200, (
                 f"Expected to get workflow run response status 200, but got {response.status_code}"
             )
-            return WorkflowRunStatusResponse(**response.json())
+            return WorkflowRunResponse(**response.json())
 
 
 class Evaluator:

@@ -660,6 +660,7 @@ async def handle_input_text_action(
                     )
 
                 elif select_result.action_result.success:
+                    try_to_quit_dropdown = False
                     return [select_result.action_result]
 
                 else:
@@ -1100,22 +1101,9 @@ async def handle_select_option_action(
         await incremental_scraped.start_listen_dom_increment()
         await skyvern_element.scroll_into_view()
 
-        try:
-            await skyvern_element.get_locator().click(timeout=timeout)
-        except Exception:
-            LOG.info(
-                "fail to open dropdown by clicking, try to press ArrowDown to open",
-                exc_info=True,
-                element_id=skyvern_element.get_id(),
-                task_id=task.task_id,
-                step_id=step.step_id,
-            )
-            await skyvern_element.scroll_into_view()
-            await skyvern_element.press_key("ArrowDown")
-
+        await skyvern_element.click(page=page, dom=dom, timeout=timeout)
         # wait 5s for options to load
         await asyncio.sleep(5)
-        is_open = True
 
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(task=task, step=step, check_filter_funcs=[dom.check_id_in_dom]),
@@ -1139,6 +1127,7 @@ async def handle_select_option_action(
         if len(incremental_element) == 0:
             raise NoIncrementalElementFoundForCustomSelection(element_id=skyvern_element.get_id())
 
+        is_open = True
         # TODO: support sequetially select from dropdown by value, just support single select now
         result = await sequentially_select_from_dropdown(
             action=action,
@@ -2221,7 +2210,7 @@ async def select_from_dropdown(
             return single_select_result
 
         await selected_element.scroll_into_view()
-        await selected_element.get_locator().click(timeout=timeout)
+        await selected_element.click(page=page, timeout=timeout)
         single_select_result.action_result = ActionSuccess()
         return single_select_result
     except (MissingElement, MissingElementDict, MissingElementInCSSMap, MultipleElementsFound):
@@ -2335,7 +2324,8 @@ async def locate_dropdown_menu(
     step: Step,
     task: Task,
 ) -> SkyvernElement | None:
-    if not await current_anchor_element.is_visible():
+    # the anchor must exist in the DOM, but no need to be visible css style
+    if not await current_anchor_element.is_visible(must_visible_style=False):
         return None
 
     skyvern_frame = incremental_scraped.skyvern_frame

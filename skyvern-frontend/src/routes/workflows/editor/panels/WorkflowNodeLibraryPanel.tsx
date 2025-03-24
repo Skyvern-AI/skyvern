@@ -6,6 +6,8 @@ import { AddNodeProps } from "../FlowRenderer";
 import { WorkflowBlockNode } from "../nodes";
 import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
 
+const enableCodeBlock = import.meta.env.VITE_ENABLE_CODE_BLOCK === "true";
+
 const nodeLibraryItems: Array<{
   nodeType: NonNullable<WorkflowBlockNode["type"]>;
   icon: JSX.Element;
@@ -43,7 +45,7 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "Task v2 Block",
-    description: "Runs a Skyvern v2 Task",
+    description: "Runs a Skyvern 2.0 Task",
   },
   {
     nodeType: "action",
@@ -134,16 +136,17 @@ const nodeLibraryItems: Array<{
     title: "For Loop Block",
     description: "Repeats nested elements",
   },
-  // temporarily removed
-  // {
-  //   nodeType: "codeBlock",
-  //   icon: <WorkflowBlockIcon
-  //   workflowBlockType={WorkflowBlockTypes.Code}
-  //   className="size-6"
-  // />,
-  //   title: "Code Block",
-  //   description: "Executes Python code",
-  // },
+  {
+    nodeType: "codeBlock",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Code}
+        className="size-6"
+      />
+    ),
+    title: "Code Block",
+    description: "Executes Python code",
+  },
   {
     nodeType: "fileParser",
     icon: (
@@ -178,17 +181,17 @@ const nodeLibraryItems: Array<{
   //   title: "Download Block",
   //   description: "Downloads a file from S3",
   // },
-  // {
-  //   nodeType: "upload",
-  //   icon: (
-  //     <WorkflowBlockIcon
-  //       workflowBlockType={WorkflowBlockTypes.UploadToS3}
-  //       className="size-6"
-  //     />
-  //   ),
-  //   title: "Upload Block",
-  //   description: "Uploads a file to S3",
-  // },
+  {
+    nodeType: "fileUpload",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.FileUpload}
+        className="size-6"
+      />
+    ),
+    title: "File Upload Block",
+    description: "Uploads downloaded files to where you want.",
+  },
   {
     nodeType: "fileDownload",
     icon: (
@@ -255,6 +258,9 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
                   workflowPanelData?.disableLoop &&
                   item.nodeType === "loop"
                 ) {
+                  return null;
+                }
+                if (!enableCodeBlock && item.nodeType === "codeBlock") {
                   return null;
                 }
                 return (

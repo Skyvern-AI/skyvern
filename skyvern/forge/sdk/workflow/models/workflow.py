@@ -130,7 +130,7 @@ class WorkflowRunOutputParameter(BaseModel):
     created_at: datetime
 
 
-class WorkflowRunStatusResponse(BaseModel):
+class WorkflowRunResponse(BaseModel):
     workflow_id: str
     workflow_run_id: str
     status: WorkflowRunStatus
