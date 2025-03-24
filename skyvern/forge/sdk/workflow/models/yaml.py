@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from skyvern.config import settings
 from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileType
+from skyvern.forge.sdk.workflow.models.constants import FileStorageType
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowStatus
 
@@ -200,6 +201,17 @@ class UploadToS3BlockYAML(BlockYAML):
     path: str | None = None
 
 
+class FileUploadBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.FILE_UPLOAD] = BlockType.FILE_UPLOAD  # type: ignore
+
+    storage_type: FileStorageType = FileStorageType.S3
+    s3_bucket: str | None = None
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    region_name: str | None = None
+    path: str | None = None
+
+
 class SendEmailBlockYAML(BlockYAML):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -363,6 +375,7 @@ BLOCK_YAML_SUBCLASSES = (
     | TextPromptBlockYAML
     | DownloadToS3BlockYAML
     | UploadToS3BlockYAML
+    | FileUploadBlockYAML
     | SendEmailBlockYAML
     | FileParserBlockYAML
     | ValidationBlockYAML

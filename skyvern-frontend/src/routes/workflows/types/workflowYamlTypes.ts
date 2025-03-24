@@ -95,6 +95,7 @@ export type BlockYAML =
   | TextPromptBlockYAML
   | DownloadToS3BlockYAML
   | UploadToS3BlockYAML
+  | FileUploadBlockYAML
   | SendEmailBlockYAML
   | FileUrlParserBlockYAML
   | ForLoopBlockYAML
@@ -255,6 +256,16 @@ export type DownloadToS3BlockYAML = BlockYAMLBase & {
 export type UploadToS3BlockYAML = BlockYAMLBase & {
   block_type: "upload_to_s3";
   path?: string | null;
+};
+
+export type FileUploadBlockYAML = BlockYAMLBase & {
+  block_type: "file_upload";
+  path?: string | null;
+  storage_type: string;
+  s3_bucket: string;
+  region_name: string;
+  aws_access_key_id: string;
+  aws_secret_access_key: string;
 };
 
 export type SendEmailBlockYAML = BlockYAMLBase & {

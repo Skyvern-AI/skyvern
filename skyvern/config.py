@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     ADDITIONAL_MODULES: list[str] = []
 
     BROWSER_TYPE: str = "chromium-headful"
+    BROWSER_REMOTE_DEBUGGING_URL: str = "http://127.0.0.1:9222"
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = "./video"
     HAR_PATH: str | None = "./har"
@@ -17,7 +18,7 @@ class Settings(BaseSettings):
     TEMP_PATH: str = "./temp"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
-    BROWSER_LOADING_TIMEOUT_MS: int = 120000
+    BROWSER_LOADING_TIMEOUT_MS: int = 90000
     OPTION_LOADING_TIMEOUT_MS: int = 600000
     MAX_STEPS_PER_RUN: int = 10
     MAX_STEPS_PER_TASK_V2: int = 25

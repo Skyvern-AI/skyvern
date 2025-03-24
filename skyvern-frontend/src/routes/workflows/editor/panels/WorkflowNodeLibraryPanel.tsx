@@ -45,7 +45,7 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "Task v2 Block",
-    description: "Runs a Skyvern v2 Task",
+    description: "Runs a Skyvern 2.0 Task",
   },
   {
     nodeType: "action",
@@ -181,17 +181,17 @@ const nodeLibraryItems: Array<{
   //   title: "Download Block",
   //   description: "Downloads a file from S3",
   // },
-  // {
-  //   nodeType: "upload",
-  //   icon: (
-  //     <WorkflowBlockIcon
-  //       workflowBlockType={WorkflowBlockTypes.UploadToS3}
-  //       className="size-6"
-  //     />
-  //   ),
-  //   title: "Upload Block",
-  //   description: "Uploads a file to S3",
-  // },
+  {
+    nodeType: "fileUpload",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.FileUpload}
+        className="size-6"
+      />
+    ),
+    title: "File Upload Block",
+    description: "Uploads downloaded files to where you want.",
+  },
   {
     nodeType: "fileDownload",
     icon: (

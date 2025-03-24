@@ -45,6 +45,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ExtractionBlock,
     FileDownloadBlock,
     FileParserBlock,
+    FileUploadBlock,
     ForLoopBlock,
     LoginBlock,
     NavigationBlock,
@@ -1668,6 +1669,18 @@ class WorkflowService:
                 path=block_yaml.path,
                 continue_on_failure=block_yaml.continue_on_failure,
             )
+        elif block_yaml.block_type == BlockType.FILE_UPLOAD:
+            return FileUploadBlock(
+                label=block_yaml.label,
+                output_parameter=output_parameter,
+                storage_type=block_yaml.storage_type,
+                s3_bucket=block_yaml.s3_bucket,
+                aws_access_key_id=block_yaml.aws_access_key_id,
+                aws_secret_access_key=block_yaml.aws_secret_access_key,
+                region_name=block_yaml.region_name,
+                path=block_yaml.path,
+                continue_on_failure=block_yaml.continue_on_failure,
+            )
         elif block_yaml.block_type == BlockType.SEND_EMAIL:
             return SendEmailBlock(
                 label=block_yaml.label,
@@ -1859,7 +1872,7 @@ class WorkflowService:
                 totp_identifier=block_yaml.totp_identifier,
                 cache_actions=block_yaml.cache_actions,
                 complete_on_download=True,
-                complete_verification=False,
+                complete_verification=True,
             )
         elif block_yaml.block_type == BlockType.TaskV2:
             return TaskV2Block(

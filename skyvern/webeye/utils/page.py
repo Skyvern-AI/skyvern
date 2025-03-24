@@ -69,6 +69,7 @@ class SkyvernFrame:
                     path=file_path,
                     full_page=full_page,
                     timeout=timeout,
+                    animations="disabled",
                 )
             else:
                 screenshot = await page.screenshot(

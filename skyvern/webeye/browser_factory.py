@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
 import aiofiles
+import httpx
 import structlog
 from playwright.async_api import BrowserContext, ConsoleMessage, Download, Error, Page, Playwright
 from pydantic import BaseModel, PrivateAttr
@@ -349,8 +350,55 @@ async def _create_headful_chromium(
     return browser_context, browser_artifacts, None
 
 
+async def _create_cdp_connection_browser(
+    playwright: Playwright, proxy_location: ProxyLocation | None = None, **kwargs: dict
+) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+    browser_args = BrowserContextFactory.build_browser_args()
+
+    browser_artifacts = BrowserContextFactory.build_browser_artifacts(
+        har_path=browser_args["record_har_path"],
+    )
+
+    remote_browser_url = None
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{settings.BROWSER_REMOTE_DEBUGGING_URL}/json/version")
+            remote_browser_url = response.json().get("webSocketDebuggerUrl")
+    except Exception:
+        raise Exception(
+            f"Cannot find the webSocketDebuggerUrl from the browser remote debugging {settings.BROWSER_REMOTE_DEBUGGING_URL}"
+        )
+
+    if not remote_browser_url:
+        raise Exception(
+            f"Cannot find the webSocketDebuggerUrl from the browser remote debugging {settings.BROWSER_REMOTE_DEBUGGING_URL}"
+        )
+
+    LOG.info("Connecting browser CDP connection", remote_browser_url=remote_browser_url)
+    browser = await playwright.chromium.connect_over_cdp(remote_browser_url)
+
+    contexts = browser.contexts
+    browser_context = None
+
+    if contexts:
+        # Use the first existing context if available
+        LOG.info("Using existing browser context")
+        browser_context = contexts[0]
+    else:
+        browser_context = await browser.new_context(
+            record_video_dir=browser_args["record_video_dir"],
+            viewport=browser_args["viewport"],
+        )
+    LOG.info(
+        "Launched browser CDP connection",
+        remote_browser_url=remote_browser_url,
+    )
+    return browser_context, browser_artifacts, None
+
+
 BrowserContextFactory.register_type("chromium-headless", _create_headless_chromium)
 BrowserContextFactory.register_type("chromium-headful", _create_headful_chromium)
+BrowserContextFactory.register_type("cdp-connect", _create_cdp_connection_browser)
 
 
 class BrowserState:
@@ -536,7 +584,7 @@ class BrowserState:
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
             )
-        await self.__assert_page()
+        page = await self.__assert_page()
 
         if not await BrowserContextFactory.validate_browser_context(await self.get_working_page()):
             await self.close_current_open_page()
@@ -547,8 +595,7 @@ class BrowserState:
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
             )
-            await self.__assert_page()
-
+            page = await self.__assert_page()
         return page
 
     async def close_current_open_page(self) -> None:
