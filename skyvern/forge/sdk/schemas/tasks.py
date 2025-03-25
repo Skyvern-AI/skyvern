@@ -7,10 +7,10 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from skyvern.exceptions import InvalidTaskStatusTransition, TaskAlreadyCanceled, TaskAlreadyTimeout
-from skyvern.forge.sdk.core.validators import validate_url
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.utils.url_validators import validate_url
 
 
 class TaskBase(BaseModel):

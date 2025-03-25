@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, field_validator
 
-from skyvern.forge.sdk.core.validators import validate_url
+from skyvern.utils.url_validators import validate_url
 
 
 class ProxyLocation(StrEnum):
