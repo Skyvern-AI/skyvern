@@ -18,7 +18,7 @@ from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.exceptions import NotFoundError
-from skyvern.forge.sdk.routes.agent_protocol import base_router, v2_router
+from skyvern.forge.sdk.routes.agent_protocol import base_router, official_api_router, v2_router
 from skyvern.forge.sdk.routes.streaming import websocket_router
 from skyvern.forge.sdk.routes.totp import totp_router
 
@@ -66,6 +66,7 @@ def get_agent_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    app.include_router(official_api_router, prefix="/v1")
     app.include_router(base_router, prefix="/api/v1")
     app.include_router(v2_router, prefix="/api/v2")
     app.include_router(websocket_router, prefix="/api/v1/stream")

@@ -53,7 +53,7 @@ from skyvern.forge.sdk.schemas.tasks import (
     TaskStatus,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline
-from skyvern.forge.sdk.services import org_auth_service, task_run_service, task_v2_service
+from skyvern.forge.sdk.services import org_auth_service, task_run_service
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
@@ -71,12 +71,12 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowStatus,
 )
 from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
-from skyvern.schemas.runs import RunEngine, TaskRunRequest, TaskRunResponse, TaskRunStatus
-from skyvern.services import task_v1_service
+from skyvern.schemas.runs import RunEngine, TaskRunRequest, TaskRunResponse
+from skyvern.services import task_v1_service, task_v2_service
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.schemas import BrowserSessionResponse
 
-official_router = APIRouter()
+official_api_router = APIRouter()
 base_router = APIRouter()
 v2_router = APIRouter()
 
@@ -1497,8 +1497,15 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
     return final_workflow_run_block_timeline
 
 
-@official_router.post("/tasks")
-@official_router.post("/tasks/", include_in_schema=False)
+@official_api_router.post(
+    "/tasks",
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "run_task",
+    },
+)
+@official_api_router.post("/tasks/", include_in_schema=False)
 async def run_task(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -1506,6 +1513,9 @@ async def run_task(
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> TaskRunResponse:
+    analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
+    await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
+
     if run_request.engine == RunEngine.skyvern_v1:
         # create task v1
         # if there's no url, call task generation first to generate the url, data schema if any
@@ -1566,10 +1576,49 @@ async def run_task(
         )
     if run_request.engine == RunEngine.skyvern_v2:
         # create task v2
-        raise NotImplementedError("Skyvern v2 is not implemented")
-    return TaskRunResponse(
-        run_id="run_id",
-        status=TaskRunStatus.queued,
-        created_at=datetime.datetime.now(datetime.UTC),
-        updated_at=datetime.datetime.now(datetime.UTC),
-    )
+        try:
+            task_v2 = await task_v2_service.initialize_task_v2(
+                organization=current_org,
+                user_prompt=run_request.goal,
+                user_url=run_request.url,
+                totp_identifier=run_request.totp_identifier,
+                totp_verification_url=run_request.totp_url,
+                webhook_callback_url=run_request.webhook_url,
+                proxy_location=run_request.proxy_location,
+                publish_workflow=run_request.publish_workflow,
+                extracted_information_schema=run_request.data_extraction_schema,
+                error_code_mapping=run_request.error_code_mapping,
+                create_task_run=True,
+            )
+        except LLMProviderError:
+            LOG.error("LLM failure to initialize task v2", exc_info=True)
+            raise HTTPException(
+                status_code=500, detail="Skyvern LLM failure to initialize task v2. Please try again later."
+            )
+        await AsyncExecutorFactory.get_executor().execute_task_v2(
+            request=request,
+            background_tasks=background_tasks,
+            organization_id=current_org.organization_id,
+            task_v2_id=task_v2.observer_cruise_id,
+            max_steps_override=run_request.max_steps,
+            browser_session_id=run_request.browser_session_id,
+        )
+        return TaskRunResponse(
+            run_id=task_v2.observer_cruise_id,
+            title=run_request.title,
+            status=str(task_v2.status),
+            engine=RunEngine.skyvern_v2,
+            goal=task_v2.prompt,
+            url=task_v2.url,
+            output=task_v2.output,
+            failure_reason=task_v2.failure_reason,
+            webhook_url=task_v2.webhook_callback_url,
+            totp_identifier=task_v2.totp_identifier,
+            totp_url=task_v2.totp_verification_url,
+            proxy_location=task_v2.proxy_location,
+            error_code_mapping=task_v2.error_code_mapping,
+            data_extraction_schema=task_v2.extracted_information_schema,
+            created_at=task_v2.created_at,
+            modified_at=task_v2.modified_at,
+        )
+    raise HTTPException(status_code=400, detail=f"Invalid agent engine: {run_request.engine}")

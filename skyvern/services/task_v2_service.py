@@ -95,9 +95,9 @@ async def initialize_task_v2(
     webhook_callback_url: str | None = None,
     publish_workflow: bool = False,
     parent_workflow_run_id: str | None = None,
-    create_task_run: bool = False,
     extracted_information_schema: dict | list | str | None = None,
     error_code_mapping: dict | None = None,
+    create_task_run: bool = False,
 ) -> TaskV2:
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
