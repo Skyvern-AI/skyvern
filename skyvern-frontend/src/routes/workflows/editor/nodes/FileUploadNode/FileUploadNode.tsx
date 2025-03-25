@@ -123,8 +123,8 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
               type="password"
               value={inputs.awsSecretAccessKey}
               className="nopan text-xs"
-              onChange={(value) => {
-                handleChange("awsSecretAccessKey", value);
+              onChange={(event) => {
+                handleChange("awsSecretAccessKey", event.target.value);
               }}
             />
           </div>
