@@ -106,9 +106,9 @@ function WorkflowPostRunParameters() {
           {Object.entries(parameters).map(([key, value]) => {
             return (
               <div key={key} className="flex gap-16">
-                <div className="w-80">
-                  <h1 className="text-lg">{key}</h1>
-                </div>
+                <span className="w-80 truncate text-lg" title={key}>
+                  {key}
+                </span>
                 {typeof value === "string" ||
                 typeof value === "number" ||
                 typeof value === "boolean" ? (
