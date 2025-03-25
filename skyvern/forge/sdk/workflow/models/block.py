@@ -30,7 +30,6 @@ from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, MAX_UPLOAD_FILE_COUNT
 from skyvern.exceptions import (
     ContextParameterValueNotFound,
-    DisabledBlockExecutionError,
     MissingBrowserState,
     MissingBrowserStatePage,
     SkyvernException,
@@ -1192,8 +1191,7 @@ async def wrapper():
         browser_session_id: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
-        if not settings.ENABLE_CODE_BLOCK:
-            raise DisabledBlockExecutionError("CodeBlock is disabled")
+        await app.AGENT_FUNCTION.validate_code_block(organization_id=organization_id)
 
         # TODO: only support to use code block to manupilate the browser page
         # support browser context in the future

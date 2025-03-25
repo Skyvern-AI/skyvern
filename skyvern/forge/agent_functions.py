@@ -9,7 +9,7 @@ from playwright.async_api import Frame, Page
 
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR
-from skyvern.exceptions import StepUnableToExecuteError, TaskAlreadyTimeout
+from skyvern.exceptions import DisabledBlockExecutionError, StepUnableToExecuteError, TaskAlreadyTimeout
 from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.prompts import prompt_engine
@@ -503,3 +503,7 @@ class AgentFunction:
             return element_tree
 
         return cleanup_element_tree_func
+
+    async def validate_code_block(self, organization_id: str | None = None) -> None:
+        if not settings.ENABLE_CODE_BLOCK:
+            raise DisabledBlockExecutionError("CodeBlock is disabled")
