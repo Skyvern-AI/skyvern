@@ -2165,7 +2165,7 @@ function waitForNextFrame() {
   });
 }
 
-function sleep(ms) {
+function asyncSleepFor(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -2311,7 +2311,7 @@ async function stopGlobalIncrementalObserver() {
     (await window.globalParsedElementCounter.get()) <
     window.globalOneTimeIncrementElements.length
   ) {
-    await sleep(100);
+    await asyncSleepFor(100);
   }
   window.globalOneTimeIncrementElements = [];
   window.globalDomDepthMap = new Map();
@@ -2322,7 +2322,7 @@ async function getIncrementElements() {
     (await window.globalParsedElementCounter.get()) <
     window.globalOneTimeIncrementElements.length
   ) {
-    await sleep(100);
+    await asyncSleepFor(100);
   }
 
   // cleanup the chidren tree, remove the duplicated element
