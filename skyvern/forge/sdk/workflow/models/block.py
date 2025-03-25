@@ -1698,9 +1698,17 @@ class FileUploadBlock(Block):
 
         s3_uris = []
         try:
+            workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+            actual_aws_access_key_id = (
+                workflow_run_context.get_original_secret_value_or_none(self.aws_access_key_id) or self.aws_access_key_id
+            )
+            actual_aws_secret_access_key = (
+                workflow_run_context.get_original_secret_value_or_none(self.aws_secret_access_key)
+                or self.aws_secret_access_key
+            )
             client = AsyncAWSClient(
-                aws_access_key_id=self.aws_access_key_id,
-                aws_secret_access_key=self.aws_secret_access_key,
+                aws_access_key_id=actual_aws_access_key_id,
+                aws_secret_access_key=actual_aws_secret_access_key,
                 region_name=self.region_name,
             )
             # is the file path a file or a directory?
