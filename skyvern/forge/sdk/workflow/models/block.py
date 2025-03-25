@@ -2417,8 +2417,8 @@ class TaskV2Block(Block):
         browser_session_id: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
-        from skyvern.forge.sdk.services import task_v2_service
         from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+        from skyvern.services import task_v2_service
 
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         try:
@@ -2452,7 +2452,7 @@ class TaskV2Block(Block):
         if not workflow_run:
             raise ValueError(f"WorkflowRun not found {workflow_run_id} when running TaskV2Block")
         task_v2 = await task_v2_service.initialize_task_v2(
-            organization,
+            organization=organization,
             user_prompt=self.prompt,
             user_url=self.url,
             parent_workflow_run_id=workflow_run_id,

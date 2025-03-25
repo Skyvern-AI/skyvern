@@ -2,7 +2,9 @@ from datetime import datetime
 from enum import StrEnum
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+from skyvern.forge.sdk.core.validators import validate_url
 
 
 class ProxyLocation(StrEnum):
@@ -113,6 +115,15 @@ class TaskRunRequest(BaseModel):
     totp_identifier: str | None = None
     totp_url: str | None = None
     browser_session_id: str | None = None
+    publish_workflow: bool = False
+
+    @field_validator("url", "webhook_url", "totp_url")
+    @classmethod
+    def validate_urls(cls, url: str | None) -> str | None:
+        if url is None:
+            return None
+
+        return validate_url(url)
 
 
 class TaskRunResponse(BaseModel):

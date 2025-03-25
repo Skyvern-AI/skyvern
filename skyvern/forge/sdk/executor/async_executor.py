@@ -9,8 +9,8 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
-from skyvern.forge.sdk.services import task_v2_service
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.services import task_v2_service
 
 LOG = structlog.get_logger()
 
