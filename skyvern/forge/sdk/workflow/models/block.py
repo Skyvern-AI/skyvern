@@ -49,7 +49,6 @@ from skyvern.forge.sdk.api.files import (
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.core.validators import prepend_scheme_and_validate_url
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
@@ -72,6 +71,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
     WorkflowParameter,
 )
+from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 

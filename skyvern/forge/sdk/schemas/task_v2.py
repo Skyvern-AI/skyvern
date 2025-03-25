@@ -4,8 +4,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from skyvern.forge.sdk.core.validators import validate_url
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.utils.url_validators import validate_url
 
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
 
