@@ -1,18 +1,11 @@
-from enum import StrEnum
 from typing import Any
 
 import httpx
 
 from skyvern.config import settings
 from skyvern.exceptions import SkyvernClientException
-from skyvern.forge.sdk.schemas.task_runs import TaskRunResponse
 from skyvern.forge.sdk.workflow.models.workflow import RunWorkflowResponse, WorkflowRunResponse
-from skyvern.schemas.runs import ProxyLocation
-
-
-class RunEngine(StrEnum):
-    skyvern_v1 = "skyvern-1.0"
-    skyvern_v2 = "skyvern-2.0"
+from skyvern.schemas.runs import ProxyLocation, RunEngine, TaskRunResponse
 
 
 class SkyvernClient:
