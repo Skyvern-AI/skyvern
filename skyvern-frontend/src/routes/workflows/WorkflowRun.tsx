@@ -39,6 +39,7 @@ import { getAggregatedExtractedInformation } from "./workflowRun/workflowRunUtil
 import { Label } from "@/components/ui/label";
 import { CodeEditor } from "./components/CodeEditor";
 import { cn } from "@/util/utils";
+import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -282,22 +283,27 @@ function WorkflowRun() {
           {hasFileUrls && (
             <div className="space-y-4">
               <Label>Downloaded Files</Label>
-              <div className="space-y-2">
-                {fileUrls.length > 0 ? (
-                  fileUrls.map((url, index) => {
-                    return (
-                      <div key={url} title={url} className="flex gap-2">
-                        <FileIcon className="size-6" />
-                        <a href={url} className="underline underline-offset-4">
-                          <span>{`File ${index + 1}`}</span>
-                        </a>
-                      </div>
-                    );
-                  })
-                ) : (
-                  <div className="text-sm">No files downloaded</div>
-                )}
-              </div>
+              <ScrollArea>
+                <ScrollAreaViewport className="max-h-[250px] space-y-2">
+                  {fileUrls.length > 0 ? (
+                    fileUrls.map((url, index) => {
+                      return (
+                        <div key={url} title={url} className="flex gap-2">
+                          <FileIcon className="size-6" />
+                          <a
+                            href={url}
+                            className="underline underline-offset-4"
+                          >
+                            <span>{`File ${index + 1}`}</span>
+                          </a>
+                        </div>
+                      );
+                    })
+                  ) : (
+                    <div className="text-sm">No files downloaded</div>
+                  )}
+                </ScrollAreaViewport>
+              </ScrollArea>
             </div>
           )}
         </div>
