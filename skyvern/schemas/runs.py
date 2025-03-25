@@ -1,5 +1,8 @@
+from datetime import datetime
 from enum import StrEnum
 from zoneinfo import ZoneInfo
+
+from pydantic import BaseModel
 
 
 class ProxyLocation(StrEnum):
@@ -79,3 +82,54 @@ def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
         return ZoneInfo("America/New_York")
 
     return None
+
+
+class RunEngine(StrEnum):
+    skyvern_v1 = "skyvern-1.0"
+    skyvern_v2 = "skyvern-2.0"
+
+
+class TaskRunStatus(StrEnum):
+    created = "created"
+    queued = "queued"
+    running = "running"
+    timed_out = "timed_out"
+    failed = "failed"
+    terminated = "terminated"
+    completed = "completed"
+    canceled = "canceled"
+
+
+class TaskRunRequest(BaseModel):
+    goal: str
+    url: str | None = None
+    title: str | None = None
+    engine: RunEngine = RunEngine.skyvern_v1
+    proxy_location: ProxyLocation | None = None
+    data_extraction_schema: dict | list | str | None = None
+    error_code_mapping: dict[str, str] | None = None
+    max_steps: int | None = None
+    webhook_url: str | None = None
+    totp_identifier: str | None = None
+    totp_url: str | None = None
+    browser_session_id: str | None = None
+
+
+class TaskRunResponse(BaseModel):
+    run_id: str
+    engine: RunEngine = RunEngine.skyvern_v1
+    status: TaskRunStatus
+    goal: str | None = None
+    url: str | None = None
+    output: dict | list | str | None = None
+    failure_reason: str | None = None
+    webhook_url: str | None = None
+    totp_identifier: str | None = None
+    totp_url: str | None = None
+    proxy_location: ProxyLocation | None = None
+    error_code_mapping: dict[str, str] | None = None
+    data_extraction_schema: dict | list | str | None = None
+    title: str | None = None
+    max_steps: int | None = None
+    created_at: datetime
+    modified_at: datetime
