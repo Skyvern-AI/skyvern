@@ -647,31 +647,31 @@ async def handle_input_text_action(
                     target_value=text,
                 )
 
-                if select_result is None or select_result.dropdown_menu is None:
-                    try_to_quit_dropdown = False
+                if select_result is not None:
+                    if select_result.action_result and select_result.action_result.success:
+                        try_to_quit_dropdown = False
+                        return [select_result.action_result]
 
-                elif select_result.action_result is None:
-                    LOG.info(
-                        "It might not be a selectable auto-completion input, exit the custom selection mode",
-                        task_id=task.task_id,
-                        step_id=step.step_id,
-                        element_id=skyvern_element.get_id(),
-                        action=action,
-                    )
+                    if select_result.dropdown_menu is None:
+                        try_to_quit_dropdown = False
 
-                elif select_result.action_result.success:
-                    try_to_quit_dropdown = False
-                    return [select_result.action_result]
-
-                else:
-                    LOG.warning(
-                        "Custom selection returned an error, continue to input text",
-                        task_id=task.task_id,
-                        step_id=step.step_id,
-                        element_id=skyvern_element.get_id(),
-                        action=action,
-                        err_msg=select_result.action_result.exception_message,
-                    )
+                    if select_result.action_result is None:
+                        LOG.info(
+                            "It might not be a selectable auto-completion input, exit the custom selection mode",
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            element_id=skyvern_element.get_id(),
+                            action=action,
+                        )
+                    else:
+                        LOG.warning(
+                            "Custom selection returned an error, continue to input text",
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            element_id=skyvern_element.get_id(),
+                            action=action,
+                            err_msg=select_result.action_result.exception_message,
+                        )
 
             except Exception:
                 LOG.warning(
@@ -1938,6 +1938,31 @@ async def sequentially_select_from_dropdown(
             step_id=step.step_id,
         )
         return None
+
+    # if it's a <input> date picker, try to input the current date directly first
+    if (
+        input_or_select_context.is_date_related
+        and skyvern_element.get_tag_name() == InteractiveElement.INPUT
+        and action.option.label
+    ):
+        LOG.info(
+            "It's a <input> date picker, going to input the current date directly",
+            step_id=step.step_id,
+            task_id=task.task_id,
+        )
+        try:
+            await skyvern_element.input_sequentially(action.option.label)
+            result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
+            result.action_result = ActionSuccess()
+            return result
+        except Exception:
+            LOG.warning(
+                "Failed to input the current date directly, trigger the selection mode",
+                exc_info=True,
+                step_id=step.step_id,
+                task_id=task.task_id,
+            )
+            await skyvern_element.input_clear()
 
     # TODO: only suport the third-level dropdown selection now
     MAX_SELECT_DEPTH = 3
