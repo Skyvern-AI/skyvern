@@ -8,7 +8,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import CloudContext from "@/store/CloudContext";
-import { useContext, useId } from "react";
+import { useContext } from "react";
 import { useWorkflowParametersState } from "../../useWorkflowParametersState";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 import { PlusIcon } from "@radix-ui/react-icons";
@@ -16,14 +16,20 @@ import {
   CredentialModalTypes,
   useCredentialModalState,
 } from "@/routes/credentials/useCredentialModalState";
+import { useNodes } from "@xyflow/react";
+import { AppNode } from "..";
+import { isLoginNode } from "./types";
+import { parameterIsSkyvernCredential } from "../../types";
 
 type Props = {
+  nodeId: string;
   value?: string;
   onChange?: (value: string) => void;
 };
 
-function LoginBlockCredentialSelector({ value, onChange }: Props) {
+function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
   const { setIsOpen, setType } = useCredentialModalState();
+  const nodes = useNodes<AppNode>();
   const [workflowParameters, setWorkflowParameters] =
     useWorkflowParametersState();
   const credentialParameters = workflowParameters.filter(
@@ -38,7 +44,6 @@ function LoginBlockCredentialSelector({ value, onChange }: Props) {
   const { data: credentials = [], isFetching } = useCredentialsQuery({
     enabled: isCloud,
   });
-  const noneItemValue = useId();
 
   if (isCloud && isFetching) {
     return <Skeleton className="h-8 w-full" />;
@@ -81,38 +86,66 @@ function LoginBlockCredentialSelector({ value, onChange }: Props) {
     <>
       <Select
         value={value}
-        onValueChange={(value) => {
-          if (value === "new") {
+        onValueChange={(newValue) => {
+          if (newValue === "new") {
             setIsOpen(true);
             setType(CredentialModalTypes.PASSWORD);
             return;
           }
-          const option = options.find((option) => option.value === value);
+
+          let newParameters = [...workflowParameters];
+
+          const loginNodes = nodes
+            .filter((node) => node.id !== nodeId)
+            .filter(isLoginNode);
+
+          const thereIsAParameterWithThisValue = workflowParameters.some(
+            (parameter) =>
+              parameter.parameterType === "credential" &&
+              parameterIsSkyvernCredential(parameter) &&
+              parameter.credentialId === value,
+          );
+
+          const isUsedInOtherLoginNodes =
+            value &&
+            loginNodes.some((node) => node.data.parameterKeys.includes(value));
+
+          const deleteOldParameter =
+            thereIsAParameterWithThisValue && !isUsedInOtherLoginNodes;
+
+          if (deleteOldParameter) {
+            newParameters = newParameters.filter(
+              (parameter) => parameter.key !== value,
+            );
+          }
+
+          const option = options.find((option) => option.value === newValue);
           if (option?.type === "credential") {
             const existingCredential = workflowParameters.find((parameter) => {
               return (
                 parameter.parameterType === "credential" &&
                 "credentialId" in parameter &&
-                parameter.credentialId === value &&
-                parameter.key === value
+                parameter.credentialId === newValue &&
+                parameter.key === newValue
               );
             });
             if (!existingCredential) {
-              setWorkflowParameters((prev) => [
-                ...prev,
+              newParameters = [
+                ...newParameters,
                 {
                   parameterType: "credential",
-                  credentialId: value,
-                  key: value,
+                  credentialId: newValue,
+                  key: newValue,
                 },
-              ]);
+              ];
             }
+          } else if (deleteOldParameter) {
+            newParameters = newParameters.filter(
+              (parameter) => parameter.key !== value,
+            );
           }
-          if (value === noneItemValue) {
-            onChange?.("");
-          } else {
-            onChange?.(value);
-          }
+          onChange?.(newValue);
+          setWorkflowParameters(newParameters);
         }}
       >
         <SelectTrigger className="w-full">

@@ -152,6 +152,7 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
           <div className="space-y-2">
             <Label className="text-xs text-slate-300">Credential</Label>
             <LoginBlockCredentialSelector
+              nodeId={id}
               value={
                 data.parameterKeys.length > 0
                   ? data.parameterKeys[0]
