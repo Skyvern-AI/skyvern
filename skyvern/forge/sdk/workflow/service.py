@@ -1960,6 +1960,7 @@ class WorkflowService:
             if block.parent_workflow_run_block_id:
                 if block.parent_workflow_run_block_id in block_map:
                     block_map[block.parent_workflow_run_block_id].children.append(workflow_run_timeline)
+                    block_map[block.workflow_run_block_id] = workflow_run_timeline
                 else:
                     # put the block back to the queue
                     workflow_run_blocks.append(block)
