@@ -1962,7 +1962,7 @@ function safeWindowScroll(x, y) {
   }
 }
 
-async function scrollToTop(
+async function safeScrollToTop(
   draw_boxes,
   frame = "main.frame",
   frame_index = undefined,
