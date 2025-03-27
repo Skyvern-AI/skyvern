@@ -105,6 +105,12 @@ def _remove_skyvern_attributes(element: Dict) -> Dict:
     return element_copied
 
 
+def _mark_element_as_dropped(element: dict) -> None:
+    if "children" in element:
+        del element["children"]
+    element["isDropped"] = True
+
+
 async def _convert_svg_to_string(
     skyvern_frame: SkyvernFrame,
     element: Dict,
@@ -124,21 +130,18 @@ async def _convert_svg_to_string(
     try:
         locater = skyvern_frame.get_frame().locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
         if await locater.count() == 0:
-            del element["children"]
-            element["isDropped"] = True
+            _mark_element_as_dropped(element)
             return
 
         if not await locater.is_visible(timeout=settings.BROWSER_ACTION_TIMEOUT_MS):
-            del element["children"]
-            element["isDropped"] = True
+            _mark_element_as_dropped(element)
             return
 
         skyvern_element = SkyvernElement(locator=locater, frame=skyvern_frame.get_frame(), static_element=element)
 
         _, blocked = await skyvern_frame.get_blocking_element_id(await skyvern_element.get_element_handler())
         if not skyvern_element.is_interactable() and blocked:
-            del element["children"]
-            element["isDropped"] = True
+            _mark_element_as_dropped(element)
             return
     except Exception:
         LOG.warning(
@@ -180,8 +183,7 @@ async def _convert_svg_to_string(
                 length=len(svg_html),
                 key=svg_key,
             )
-            del element["children"]
-            element["isDropped"] = True
+            _mark_element_as_dropped(element)
             return
 
         LOG.debug("call LLM to convert SVG to string shape", element_id=element_id)
@@ -235,8 +237,7 @@ async def _convert_svg_to_string(
                 key=svg_key,
                 length=len(svg_html),
             )
-            del element["children"]
-            element["isDropped"] = True
+            _mark_element_as_dropped(element)
             return
 
     element["attributes"] = dict()
@@ -244,7 +245,8 @@ async def _convert_svg_to_string(
         # refresh the cache expiration
         await app.CACHE.set(svg_key, svg_shape)
         element["attributes"]["alt"] = svg_shape
-    del element["children"]
+    if "children" in element:
+        del element["children"]
     return
 
 
