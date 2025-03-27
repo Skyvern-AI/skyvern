@@ -98,13 +98,12 @@ function WorkflowRunTimeline({
                 return (
                   <WorkflowRunTimelineBlockItem
                     key={timelineItem.block.workflow_run_block_id}
-                    subBlocks={timelineItem.children
-                      .filter((item) => item.type === "block")
-                      .map((item) => item.block)}
+                    subItems={timelineItem.children}
                     activeItem={activeItem}
                     block={timelineItem.block}
                     onActionClick={onActionItemSelected}
                     onBlockItemClick={onBlockItemSelected}
+                    onThoughtCardClick={onObserverThoughtCardSelected}
                   />
                 );
               }
