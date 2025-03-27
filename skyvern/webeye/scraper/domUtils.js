@@ -1959,9 +1959,9 @@ function removeBoundingBoxes() {
 
 function safeWindowScroll(x, y) {
   if (typeof window.scroll === "function") {
-    window.scroll(x, y, { behavior: "instant" });
+    window.scroll({ left: x, top: y, behavior: "instant" });
   } else if (typeof window.scrollTo === "function") {
-    window.scrollTo(x, y, { behavior: "instant" });
+    window.scrollTo({ left: x, top: y, behavior: "instant" });
   } else {
     console.error("window.scroll and window.scrollTo are both not supported");
   }
