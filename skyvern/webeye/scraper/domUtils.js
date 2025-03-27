@@ -1952,13 +1952,23 @@ function removeBoundingBoxes() {
   }
 }
 
+function safeWindowScroll(x, y) {
+  if (typeof window.scroll === "function") {
+    window.scroll(x, y, { behavior: "instant" });
+  } else if (typeof window.scrollTo === "function") {
+    window.scrollTo(x, y, { behavior: "instant" });
+  } else {
+    console.error("window.scroll and window.scrollTo are both not supported");
+  }
+}
+
 async function scrollToTop(
   draw_boxes,
   frame = "main.frame",
   frame_index = undefined,
 ) {
   removeBoundingBoxes();
-  window.scroll({ left: 0, top: 0, behavior: "instant" });
+  safeWindowScroll(0, 0);
   if (draw_boxes) {
     await buildElementsAndDrawBoundingBoxes(frame, frame_index);
   }
@@ -1970,7 +1980,7 @@ function getScrollXY() {
 }
 
 function scrollToXY(x, y) {
-  window.scroll({ left: x, top: y, behavior: "instant" });
+  safeWindowScroll(x, y);
 }
 
 async function scrollToNextPage(
