@@ -1882,12 +1882,17 @@ function createHintMarkersForGroups(groups) {
     } catch (e) {
       // Ensure trustedTypes is available
       if (typeof trustedTypes !== "undefined") {
-        const escapeHTMLPolicy = trustedTypes.createPolicy("default", {
-          createHTML: (string) => string,
-        });
-        hintMarker.element.innerHTML = escapeHTMLPolicy.createHTML(
-          hintMarker.hintString.toUpperCase(),
-        );
+        try {
+          const escapeHTMLPolicy = trustedTypes.createPolicy("hint-policy", {
+            createHTML: (string) => string,
+          });
+          hintMarker.element.innerHTML = escapeHTMLPolicy.createHTML(
+            hintMarker.hintString.toUpperCase(),
+          );
+        } catch (policyError) {
+          console.warn("Could not create trusted types policy:", policyError);
+          // Skip updating the hint marker if policy creation fails
+        }
       } else {
         console.error("trustedTypes is not supported in this environment.");
       }
