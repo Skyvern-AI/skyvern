@@ -204,7 +204,7 @@ class SkyvernFrame:
         :param page: Page instance to take the screenshot from.
         :return: Screenshot of the page.
         """
-        js_script = "async ([draw_boxes, frame, frame_index]) => await scrollToTop(draw_boxes, frame, frame_index)"
+        js_script = "async ([draw_boxes, frame, frame_index]) => await safeScrollToTop(draw_boxes, frame, frame_index)"
         scroll_y_px = await self.evaluate(
             frame=self.frame,
             expression=js_script,
