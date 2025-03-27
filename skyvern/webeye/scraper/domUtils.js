@@ -1993,11 +1993,15 @@ async function scrollToNextPage(
 }
 
 function isWindowScrollable() {
+  const documentBody = document.body;
+  const documentElement = document.documentElement;
+  if (!documentBody || !documentElement) {
+    return false;
+  }
+
   // Check if the body's overflow style is set to hidden
-  const bodyOverflow = getElementComputedStyle(document.body)?.overflow;
-  const htmlOverflow = getElementComputedStyle(
-    document.documentElement,
-  )?.overflow;
+  const bodyOverflow = getElementComputedStyle(documentBody)?.overflow;
+  const htmlOverflow = getElementComputedStyle(documentElement)?.overflow;
 
   // Check if the document height is greater than the window height
   const isScrollable =
