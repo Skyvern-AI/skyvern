@@ -8,8 +8,12 @@ import { workflowBlockTitle } from "../editor/nodes/types";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
 import {
   isAction,
+  isBlockItem,
+  isObserverThought,
+  isThoughtItem,
   isWorkflowRunBlock,
   WorkflowRunBlock,
+  WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
 import { ActionCard } from "./ActionCard";
 import {
@@ -21,21 +25,24 @@ import { isTaskVariantBlock } from "../types/workflowTypes";
 import { Link } from "react-router-dom";
 import { useCallback } from "react";
 import { Status } from "@/api/types";
-
+import { ThoughtCard } from "./ThoughtCard";
+import { ObserverThought } from "../types/workflowRunTypes";
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
   block: WorkflowRunBlock;
-  subBlocks: Array<WorkflowRunBlock>;
+  subItems: Array<WorkflowRunTimelineItem>;
   onBlockItemClick: (block: WorkflowRunBlock) => void;
   onActionClick: (action: ActionItem) => void;
+  onThoughtCardClick: (thought: ObserverThought) => void;
 };
 
 function WorkflowRunTimelineBlockItem({
   activeItem,
   block,
-  subBlocks,
+  subItems,
   onBlockItemClick,
   onActionClick,
+  onThoughtCardClick,
 }: Props) {
   const actions = block.actions ?? [];
 
@@ -164,17 +171,33 @@ function WorkflowRunTimelineBlockItem({
           />
         );
       })}
-      {subBlocks.map((block) => {
-        return (
-          <WorkflowRunTimelineBlockItem
-            key={block.workflow_run_block_id}
-            block={block}
-            activeItem={activeItem}
-            onActionClick={onActionClick}
-            onBlockItemClick={onBlockItemClick}
-            subBlocks={[]}
-          />
-        );
+      {subItems.map((item) => {
+        if (isBlockItem(item)) {
+          return (
+            <WorkflowRunTimelineBlockItem
+              key={item.block.workflow_run_block_id}
+              subItems={item.children}
+              activeItem={activeItem}
+              block={item.block}
+              onActionClick={onActionClick}
+              onBlockItemClick={onBlockItemClick}
+              onThoughtCardClick={onThoughtCardClick}
+            />
+          );
+        }
+        if (isThoughtItem(item)) {
+          return (
+            <ThoughtCard
+              key={item.thought.thought_id}
+              active={
+                isObserverThought(activeItem) &&
+                activeItem.thought_id === item.thought.thought_id
+              }
+              onClick={onThoughtCardClick}
+              thought={item.thought}
+            />
+          );
+        }
       })}
     </div>
   );
