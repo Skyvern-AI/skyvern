@@ -989,6 +989,10 @@ class ForgeAgent:
 
                 self.async_operation_pool.run_operation(task.task_id, AgentPhase.action)
                 current_page = await browser_state.must_get_working_page()
+                if isinstance(action, CompleteAction) and not complete_verification:
+                    # Do not verify the complete action when complete_verification is False
+                    # set verified to True will skip the completion verification
+                    action.verified = True
                 results = await ActionHandler.handle_action(scraped_page, task, step, current_page, action)
                 detailed_agent_step_output.actions_and_results[action_idx] = (
                     action,
