@@ -6,7 +6,7 @@ import typing
 import datetime as dt
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
-from .context_parameter_value import ContextParameterValue
+from .value import Value
 from .workflow_parameter_type import WorkflowParameterType
 from .workflow_parameter_default_value import WorkflowParameterDefaultValue
 from ..core.pydantic_utilities import update_forward_refs
@@ -67,8 +67,9 @@ class TaskBlockParametersItem_BitwardenLoginCredential(UniversalBaseModel):
     bitwarden_client_id_aws_secret_key: str
     bitwarden_client_secret_aws_secret_key: str
     bitwarden_master_password_aws_secret_key: str
-    url_parameter_key: str
+    url_parameter_key: typing.Optional[str] = None
     bitwarden_collection_id: typing.Optional[str] = None
+    bitwarden_item_id: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
     deleted_at: typing.Optional[dt.datetime] = None
@@ -113,8 +114,8 @@ class TaskBlockParametersItem_Context(UniversalBaseModel):
     parameter_type: typing.Literal["context"] = "context"
     key: str
     description: typing.Optional[str] = None
-    source: "ContextParameterSource"
-    value: typing.Optional[ContextParameterValue] = None
+    source: "Source"
+    value: typing.Optional[Value] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -127,7 +128,28 @@ class TaskBlockParametersItem_Context(UniversalBaseModel):
 
 
 from .context_parameter import ContextParameter  # noqa: E402
-from .context_parameter_source import ContextParameterSource  # noqa: E402
+from .source import Source  # noqa: E402
+
+
+class TaskBlockParametersItem_Credential(UniversalBaseModel):
+    parameter_type: typing.Literal["credential"] = "credential"
+    key: str
+    description: typing.Optional[str] = None
+    credential_parameter_id: str
+    workflow_id: str
+    credential_id: str
+    created_at: dt.datetime
+    modified_at: dt.datetime
+    deleted_at: typing.Optional[dt.datetime] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
 
 
 class TaskBlockParametersItem_Output(UniversalBaseModel):
@@ -178,8 +200,8 @@ TaskBlockParametersItem = typing.Union[
     TaskBlockParametersItem_BitwardenLoginCredential,
     TaskBlockParametersItem_BitwardenSensitiveInformation,
     TaskBlockParametersItem_Context,
+    TaskBlockParametersItem_Credential,
     TaskBlockParametersItem_Output,
     TaskBlockParametersItem_Workflow,
 ]
-update_forward_refs(ContextParameter, TaskBlockParametersItem_Context=TaskBlockParametersItem_Context)
 update_forward_refs(TaskBlockParametersItem_Context)

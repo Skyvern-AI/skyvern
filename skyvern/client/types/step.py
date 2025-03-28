@@ -22,6 +22,8 @@ class Step(UniversalBaseModel):
     organization_id: typing.Optional[str] = None
     input_token_count: typing.Optional[int] = None
     output_token_count: typing.Optional[int] = None
+    reasoning_token_count: typing.Optional[int] = None
+    cached_token_count: typing.Optional[int] = None
     step_cost: typing.Optional[float] = None
 
     if IS_PYDANTIC_V2:

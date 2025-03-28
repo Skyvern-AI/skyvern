@@ -11,6 +11,7 @@ BlockType = typing.Union[
         "text_prompt",
         "download_to_s3",
         "upload_to_s3",
+        "file_upload",
         "send_email",
         "file_url_parser",
         "validation",

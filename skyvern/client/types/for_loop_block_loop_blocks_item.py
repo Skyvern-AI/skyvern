@@ -14,6 +14,9 @@ from .extraction_block_data_schema import ExtractionBlockDataSchema
 from .extraction_block_parameters_item import ExtractionBlockParametersItem
 from .file_download_block_data_schema import FileDownloadBlockDataSchema
 from .file_download_block_parameters_item import FileDownloadBlockParametersItem
+from .file_storage_type import FileStorageType
+import typing_extensions
+from ..core.serialization import FieldMetadata
 from .file_type import FileType
 from .for_loop_block_loop_over import ForLoopBlockLoopOver
 from .url_block_data_schema import UrlBlockDataSchema
@@ -54,6 +57,7 @@ class ForLoopBlockLoopBlocksItem_Action(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    complete_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -122,6 +126,7 @@ class ForLoopBlockLoopBlocksItem_Extraction(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    complete_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -155,6 +160,29 @@ class ForLoopBlockLoopBlocksItem_FileDownload(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    complete_verification: typing.Optional[bool] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class ForLoopBlockLoopBlocksItem_FileUpload(UniversalBaseModel):
+    block_type: typing.Literal["file_upload"] = "file_upload"
+    label: str
+    output_parameter: OutputParameter
+    continue_on_failure: typing.Optional[bool] = None
+    storage_type: typing.Optional[FileStorageType] = None
+    s3bucket: typing_extensions.Annotated[typing.Optional[str], FieldMetadata(alias="s3_bucket")] = None
+    aws_access_key_id: typing.Optional[str] = None
+    aws_secret_access_key: typing.Optional[str] = None
+    region_name: typing.Optional[str] = None
+    path: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -229,6 +257,7 @@ class ForLoopBlockLoopBlocksItem_GotoUrl(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    complete_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -262,6 +291,7 @@ class ForLoopBlockLoopBlocksItem_Login(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    complete_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -295,6 +325,7 @@ class ForLoopBlockLoopBlocksItem_Navigation(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    complete_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -371,6 +402,7 @@ class ForLoopBlockLoopBlocksItem_Task(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    complete_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -392,6 +424,7 @@ class ForLoopBlockLoopBlocksItem_TaskV2(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     max_iterations: typing.Optional[int] = None
+    max_steps: typing.Optional[int] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -462,6 +495,7 @@ class ForLoopBlockLoopBlocksItem_Validation(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    complete_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -497,6 +531,7 @@ ForLoopBlockLoopBlocksItem = typing.Union[
     ForLoopBlockLoopBlocksItem_DownloadToS3,
     ForLoopBlockLoopBlocksItem_Extraction,
     ForLoopBlockLoopBlocksItem_FileDownload,
+    ForLoopBlockLoopBlocksItem_FileUpload,
     ForLoopBlockLoopBlocksItem_FileUrlParser,
     ForLoopBlockLoopBlocksItem_ForLoop,
     ForLoopBlockLoopBlocksItem_GotoUrl,
@@ -511,17 +546,4 @@ ForLoopBlockLoopBlocksItem = typing.Union[
     ForLoopBlockLoopBlocksItem_Validation,
     ForLoopBlockLoopBlocksItem_Wait,
 ]
-update_forward_refs(ContextParameter, ForLoopBlockLoopBlocksItem_Action=ForLoopBlockLoopBlocksItem_Action)
-update_forward_refs(ContextParameter, ForLoopBlockLoopBlocksItem_Code=ForLoopBlockLoopBlocksItem_Code)
-update_forward_refs(ContextParameter, ForLoopBlockLoopBlocksItem_Extraction=ForLoopBlockLoopBlocksItem_Extraction)
-update_forward_refs(ContextParameter, ForLoopBlockLoopBlocksItem_FileDownload=ForLoopBlockLoopBlocksItem_FileDownload)
-update_forward_refs(ContextParameter, ForLoopBlockLoopBlocksItem_ForLoop=ForLoopBlockLoopBlocksItem_ForLoop)
-update_forward_refs(ForLoopBlock, ForLoopBlockLoopBlocksItem_ForLoop=ForLoopBlockLoopBlocksItem_ForLoop)
 update_forward_refs(ForLoopBlockLoopBlocksItem_ForLoop)
-update_forward_refs(ContextParameter, ForLoopBlockLoopBlocksItem_GotoUrl=ForLoopBlockLoopBlocksItem_GotoUrl)
-update_forward_refs(ContextParameter, ForLoopBlockLoopBlocksItem_Login=ForLoopBlockLoopBlocksItem_Login)
-update_forward_refs(ContextParameter, ForLoopBlockLoopBlocksItem_Navigation=ForLoopBlockLoopBlocksItem_Navigation)
-update_forward_refs(ContextParameter, ForLoopBlockLoopBlocksItem_Task=ForLoopBlockLoopBlocksItem_Task)
-update_forward_refs(ContextParameter, ForLoopBlockLoopBlocksItem_TextPrompt=ForLoopBlockLoopBlocksItem_TextPrompt)
-update_forward_refs(ContextParameter, ForLoopBlockLoopBlocksItem_Validation=ForLoopBlockLoopBlocksItem_Validation)
-update_forward_refs(ContextParameter, ForLoopBlockLoopBlocksItem_Wait=ForLoopBlockLoopBlocksItem_Wait)

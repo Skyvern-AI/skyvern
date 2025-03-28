@@ -5,7 +5,8 @@ from .workflow_run_status import WorkflowRunStatus
 import typing
 from .proxy_location import ProxyLocation
 import datetime as dt
-from .observer_task import ObserverTask
+from .file_info import FileInfo
+from .task_v2 import TaskV2
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
 
@@ -24,11 +25,13 @@ class WorkflowRunResponse(UniversalBaseModel):
     parameters: typing.Dict[str, typing.Optional[typing.Any]]
     screenshot_urls: typing.Optional[typing.List[str]] = None
     recording_url: typing.Optional[str] = None
+    downloaded_files: typing.Optional[typing.List[FileInfo]] = None
     downloaded_file_urls: typing.Optional[typing.List[str]] = None
     outputs: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     total_steps: typing.Optional[int] = None
     total_cost: typing.Optional[float] = None
-    observer_task: typing.Optional[ObserverTask] = None
+    task_v2: typing.Optional[TaskV2] = None
+    workflow_title: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

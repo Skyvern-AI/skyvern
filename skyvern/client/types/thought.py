@@ -2,14 +2,14 @@
 
 from ..core.pydantic_utilities import UniversalBaseModel
 import typing
-from .observer_thought_type import ObserverThoughtType
-from .observer_thought_scenario import ObserverThoughtScenario
+from .thought_type import ThoughtType
+from .thought_scenario import ThoughtScenario
 import datetime as dt
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
 
 
-class ObserverThought(UniversalBaseModel):
+class Thought(UniversalBaseModel):
     thought_id: str
     task_id: str
     organization_id: typing.Optional[str] = None
@@ -21,11 +21,13 @@ class ObserverThought(UniversalBaseModel):
     observation: typing.Optional[str] = None
     thought: typing.Optional[str] = None
     answer: typing.Optional[str] = None
-    thought_type: typing.Optional[ObserverThoughtType] = None
-    thought_scenario: typing.Optional[ObserverThoughtScenario] = None
+    thought_type: typing.Optional[ThoughtType] = None
+    thought_scenario: typing.Optional[ThoughtScenario] = None
     output: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     input_token_count: typing.Optional[int] = None
     output_token_count: typing.Optional[int] = None
+    reasoning_token_count: typing.Optional[int] = None
+    cached_token_count: typing.Optional[int] = None
     thought_cost: typing.Optional[float] = None
     created_at: dt.datetime
     modified_at: dt.datetime

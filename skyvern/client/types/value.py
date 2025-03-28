@@ -2,6 +2,6 @@
 
 import typing
 
-ContextParameterValue = typing.Union[
+Value = typing.Union[
     str, int, float, bool, typing.Dict[str, typing.Optional[typing.Any]], typing.List[typing.Optional[typing.Any]]
 ]

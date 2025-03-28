@@ -2,7 +2,7 @@
 
 import typing
 
-ObserverThoughtScenario = typing.Union[
+ThoughtScenario = typing.Union[
     typing.Literal[
         "generate_plan",
         "user_goal_check",

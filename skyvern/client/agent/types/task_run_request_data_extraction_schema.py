@@ -2,6 +2,6 @@
 
 import typing
 
-ActionResultData = typing.Union[
+TaskRunRequestDataExtractionSchema = typing.Union[
     typing.Dict[str, typing.Optional[typing.Any]], typing.List[typing.Optional[typing.Any]], str
 ]

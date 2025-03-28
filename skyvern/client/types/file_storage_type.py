@@ -2,4 +2,4 @@
 
 import typing
 
-AiSuggestionType = typing.Literal["data_schema"]
+FileStorageType = typing.Literal["s3"]

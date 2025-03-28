@@ -39,6 +39,7 @@ class Action(UniversalBaseModel):
     text: typing.Optional[str] = None
     option: typing.Optional[SelectOption] = None
     is_checked: typing.Optional[bool] = None
+    verified: typing.Optional[bool] = None
     created_at: typing.Optional[dt.datetime] = None
     modified_at: typing.Optional[dt.datetime] = None
 

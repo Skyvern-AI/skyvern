@@ -2,6 +2,6 @@
 
 import typing
 
-WorkflowRunBlockOutput = typing.Union[
+TaskV2ExtractedInformationSchema = typing.Union[
     typing.Dict[str, typing.Optional[typing.Any]], typing.List[typing.Optional[typing.Any]], str
 ]
