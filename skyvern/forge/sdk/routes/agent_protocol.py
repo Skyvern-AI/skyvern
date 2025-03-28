@@ -1355,9 +1355,9 @@ async def get_task_v2(
 @base_router.get(
     "/browser_sessions/{browser_session_id}",
     response_model=BrowserSessionResponse,
-    tags=["browser"],
+    tags=["session"],
     openapi_extra={
-        "x-fern-sdk-group-name": "browser",
+        "x-fern-sdk-group-name": "session",
         "x-fern-sdk-method-name": "get_browser_session",
     },
 )
@@ -1383,9 +1383,9 @@ async def get_browser_session(
 @base_router.get(
     "/browser_sessions",
     response_model=list[BrowserSessionResponse],
-    tags=["browser"],
+    tags=["session"],
     openapi_extra={
-        "x-fern-sdk-group-name": "browser",
+        "x-fern-sdk-group-name": "session",
         "x-fern-sdk-method-name": "get_browser_sessions",
     },
 )
@@ -1406,9 +1406,9 @@ async def get_browser_sessions(
 @base_router.post(
     "/browser_sessions",
     response_model=BrowserSessionResponse,
-    tags=["browser"],
+    tags=["session"],
     openapi_extra={
-        "x-fern-sdk-group-name": "browser",
+        "x-fern-sdk-group-name": "session",
         "x-fern-sdk-method-name": "create_browser_session",
     },
 )
@@ -1426,9 +1426,9 @@ async def create_browser_session(
 
 @base_router.post(
     "/browser_sessions/{session_id}/close",
-    tags=["browser"],
+    tags=["session"],
     openapi_extra={
-        "x-fern-sdk-group-name": "browser",
+        "x-fern-sdk-group-name": "session",
         "x-fern-sdk-method-name": "close_browser_session",
     },
 )
