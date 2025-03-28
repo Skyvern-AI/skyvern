@@ -70,7 +70,9 @@ from .types import (
     FileDownloadBlockParametersItem_Workflow,
     FileInfo,
     FileParserBlock,
+    FileStorageType,
     FileType,
+    FileUploadBlock,
     ForLoopBlock,
     ForLoopBlockLoopBlocksItem,
     ForLoopBlockLoopBlocksItem_Action,
@@ -78,6 +80,7 @@ from .types import (
     ForLoopBlockLoopBlocksItem_DownloadToS3,
     ForLoopBlockLoopBlocksItem_Extraction,
     ForLoopBlockLoopBlocksItem_FileDownload,
+    ForLoopBlockLoopBlocksItem_FileUpload,
     ForLoopBlockLoopBlocksItem_FileUrlParser,
     ForLoopBlockLoopBlocksItem_ForLoop,
     ForLoopBlockLoopBlocksItem_GotoUrl,
@@ -174,6 +177,7 @@ from .types import (
     TaskResponse,
     TaskResponseExtractedInformation,
     TaskRunResponse,
+    TaskRunResponseDataExtractionSchema,
     TaskRunStatus,
     TaskStatus,
     TaskType,
@@ -240,6 +244,7 @@ from .types import (
     WorkflowDefinitionBlocksItem_DownloadToS3,
     WorkflowDefinitionBlocksItem_Extraction,
     WorkflowDefinitionBlocksItem_FileDownload,
+    WorkflowDefinitionBlocksItem_FileUpload,
     WorkflowDefinitionBlocksItem_FileUrlParser,
     WorkflowDefinitionBlocksItem_ForLoop,
     WorkflowDefinitionBlocksItem_GotoUrl,
@@ -276,13 +281,14 @@ from .types import (
     WorkflowStatus,
 )
 from .errors import UnprocessableEntityError
-from . import agent, browser, server
+from . import agent, server, session
 from .agent import (
     AgentGetRunsResponseItem,
     AgentRunTaskV2RequestXMaxIterationsOverride,
     AgentRunTaskV2RequestXMaxStepsOverride,
     TaskRequestExtractedInformationSchema,
     TaskRequestNavigationPayload,
+    TaskRunRequestDataExtractionSchema,
     TaskV2RequestExtractedInformationSchema,
 )
 from .client import AsyncSkyvern, Skyvern
@@ -363,7 +369,9 @@ __all__ = [
     "FileDownloadBlockParametersItem_Workflow",
     "FileInfo",
     "FileParserBlock",
+    "FileStorageType",
     "FileType",
+    "FileUploadBlock",
     "ForLoopBlock",
     "ForLoopBlockLoopBlocksItem",
     "ForLoopBlockLoopBlocksItem_Action",
@@ -371,6 +379,7 @@ __all__ = [
     "ForLoopBlockLoopBlocksItem_DownloadToS3",
     "ForLoopBlockLoopBlocksItem_Extraction",
     "ForLoopBlockLoopBlocksItem_FileDownload",
+    "ForLoopBlockLoopBlocksItem_FileUpload",
     "ForLoopBlockLoopBlocksItem_FileUrlParser",
     "ForLoopBlockLoopBlocksItem_ForLoop",
     "ForLoopBlockLoopBlocksItem_GotoUrl",
@@ -470,7 +479,9 @@ __all__ = [
     "TaskRequestNavigationPayload",
     "TaskResponse",
     "TaskResponseExtractedInformation",
+    "TaskRunRequestDataExtractionSchema",
     "TaskRunResponse",
+    "TaskRunResponseDataExtractionSchema",
     "TaskRunStatus",
     "TaskStatus",
     "TaskType",
@@ -539,6 +550,7 @@ __all__ = [
     "WorkflowDefinitionBlocksItem_DownloadToS3",
     "WorkflowDefinitionBlocksItem_Extraction",
     "WorkflowDefinitionBlocksItem_FileDownload",
+    "WorkflowDefinitionBlocksItem_FileUpload",
     "WorkflowDefinitionBlocksItem_FileUrlParser",
     "WorkflowDefinitionBlocksItem_ForLoop",
     "WorkflowDefinitionBlocksItem_GotoUrl",
@@ -575,6 +587,6 @@ __all__ = [
     "WorkflowStatus",
     "__version__",
     "agent",
-    "browser",
     "server",
+    "session",
 ]

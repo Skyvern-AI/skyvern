@@ -47,7 +47,7 @@ class ServerClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -104,7 +104,7 @@ class ServerClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -145,7 +145,7 @@ class ServerClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -200,7 +200,7 @@ class ServerClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -262,7 +262,7 @@ class ServerClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -320,7 +320,7 @@ class ServerClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -393,7 +393,7 @@ class AsyncServerClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -460,7 +460,7 @@ class AsyncServerClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -511,7 +511,7 @@ class AsyncServerClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -574,7 +574,7 @@ class AsyncServerClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -644,7 +644,7 @@ class AsyncServerClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -710,7 +710,7 @@ class AsyncServerClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",

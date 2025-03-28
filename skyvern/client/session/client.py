@@ -13,7 +13,7 @@ from ..core.api_error import ApiError
 from ..core.client_wrapper import AsyncClientWrapper
 
 
-class BrowserClient:
+class SessionClient:
     def __init__(self, *, client_wrapper: SyncClientWrapper):
         self._client_wrapper = client_wrapper
 
@@ -35,13 +35,13 @@ class BrowserClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
             authorization="YOUR_AUTHORIZATION",
         )
-        client.browser.get_browser_session(
+        client.session.get_browser_session(
             browser_session_id="browser_session_id",
         )
         """
@@ -92,13 +92,13 @@ class BrowserClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
             authorization="YOUR_AUTHORIZATION",
         )
-        client.browser.get_browser_sessions()
+        client.session.get_browser_sessions()
         """
         _response = self._client_wrapper.httpx_client.request(
             "api/v1/browser_sessions",
@@ -145,13 +145,13 @@ class BrowserClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
             authorization="YOUR_AUTHORIZATION",
         )
-        client.browser.create_browser_session()
+        client.session.create_browser_session()
         """
         _response = self._client_wrapper.httpx_client.request(
             "api/v1/browser_sessions",
@@ -200,13 +200,13 @@ class BrowserClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
             authorization="YOUR_AUTHORIZATION",
         )
-        client.browser.close_browser_session(
+        client.session.close_browser_session(
             session_id="session_id",
         )
         """
@@ -240,7 +240,7 @@ class BrowserClient:
         raise ApiError(status_code=_response.status_code, body=_response_json)
 
 
-class AsyncBrowserClient:
+class AsyncSessionClient:
     def __init__(self, *, client_wrapper: AsyncClientWrapper):
         self._client_wrapper = client_wrapper
 
@@ -264,7 +264,7 @@ class AsyncBrowserClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -273,7 +273,7 @@ class AsyncBrowserClient:
 
 
         async def main() -> None:
-            await client.browser.get_browser_session(
+            await client.session.get_browser_session(
                 browser_session_id="browser_session_id",
             )
 
@@ -329,7 +329,7 @@ class AsyncBrowserClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -338,7 +338,7 @@ class AsyncBrowserClient:
 
 
         async def main() -> None:
-            await client.browser.get_browser_sessions()
+            await client.session.get_browser_sessions()
 
 
         asyncio.run(main())
@@ -390,7 +390,7 @@ class AsyncBrowserClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -399,7 +399,7 @@ class AsyncBrowserClient:
 
 
         async def main() -> None:
-            await client.browser.create_browser_session()
+            await client.session.create_browser_session()
 
 
         asyncio.run(main())
@@ -453,7 +453,7 @@ class AsyncBrowserClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -462,7 +462,7 @@ class AsyncBrowserClient:
 
 
         async def main() -> None:
-            await client.browser.close_browser_session(
+            await client.session.close_browser_session(
                 session_id="session_id",
             )
 

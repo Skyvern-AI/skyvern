@@ -77,7 +77,9 @@ from .file_download_block_parameters_item import (
 )
 from .file_info import FileInfo
 from .file_parser_block import FileParserBlock
+from .file_storage_type import FileStorageType
 from .file_type import FileType
+from .file_upload_block import FileUploadBlock
 from .for_loop_block import ForLoopBlock
 from .for_loop_block_loop_blocks_item import (
     ForLoopBlockLoopBlocksItem,
@@ -86,6 +88,7 @@ from .for_loop_block_loop_blocks_item import (
     ForLoopBlockLoopBlocksItem_DownloadToS3,
     ForLoopBlockLoopBlocksItem_Extraction,
     ForLoopBlockLoopBlocksItem_FileDownload,
+    ForLoopBlockLoopBlocksItem_FileUpload,
     ForLoopBlockLoopBlocksItem_FileUrlParser,
     ForLoopBlockLoopBlocksItem_ForLoop,
     ForLoopBlockLoopBlocksItem_GotoUrl,
@@ -193,6 +196,7 @@ from .task_navigation_payload import TaskNavigationPayload
 from .task_response import TaskResponse
 from .task_response_extracted_information import TaskResponseExtractedInformation
 from .task_run_response import TaskRunResponse
+from .task_run_response_data_extraction_schema import TaskRunResponseDataExtractionSchema
 from .task_run_status import TaskRunStatus
 from .task_status import TaskStatus
 from .task_type import TaskType
@@ -268,6 +272,7 @@ from .workflow_definition_blocks_item import (
     WorkflowDefinitionBlocksItem_DownloadToS3,
     WorkflowDefinitionBlocksItem_Extraction,
     WorkflowDefinitionBlocksItem_FileDownload,
+    WorkflowDefinitionBlocksItem_FileUpload,
     WorkflowDefinitionBlocksItem_FileUrlParser,
     WorkflowDefinitionBlocksItem_ForLoop,
     WorkflowDefinitionBlocksItem_GotoUrl,
@@ -376,7 +381,9 @@ __all__ = [
     "FileDownloadBlockParametersItem_Workflow",
     "FileInfo",
     "FileParserBlock",
+    "FileStorageType",
     "FileType",
+    "FileUploadBlock",
     "ForLoopBlock",
     "ForLoopBlockLoopBlocksItem",
     "ForLoopBlockLoopBlocksItem_Action",
@@ -384,6 +391,7 @@ __all__ = [
     "ForLoopBlockLoopBlocksItem_DownloadToS3",
     "ForLoopBlockLoopBlocksItem_Extraction",
     "ForLoopBlockLoopBlocksItem_FileDownload",
+    "ForLoopBlockLoopBlocksItem_FileUpload",
     "ForLoopBlockLoopBlocksItem_FileUrlParser",
     "ForLoopBlockLoopBlocksItem_ForLoop",
     "ForLoopBlockLoopBlocksItem_GotoUrl",
@@ -480,6 +488,7 @@ __all__ = [
     "TaskResponse",
     "TaskResponseExtractedInformation",
     "TaskRunResponse",
+    "TaskRunResponseDataExtractionSchema",
     "TaskRunStatus",
     "TaskStatus",
     "TaskType",
@@ -546,6 +555,7 @@ __all__ = [
     "WorkflowDefinitionBlocksItem_DownloadToS3",
     "WorkflowDefinitionBlocksItem_Extraction",
     "WorkflowDefinitionBlocksItem_FileDownload",
+    "WorkflowDefinitionBlocksItem_FileUpload",
     "WorkflowDefinitionBlocksItem_FileUrlParser",
     "WorkflowDefinitionBlocksItem_ForLoop",
     "WorkflowDefinitionBlocksItem_GotoUrl",

@@ -5,6 +5,7 @@ from .agent_run_task_v2request_x_max_iterations_override import AgentRunTaskV2Re
 from .agent_run_task_v2request_x_max_steps_override import AgentRunTaskV2RequestXMaxStepsOverride
 from .task_request_extracted_information_schema import TaskRequestExtractedInformationSchema
 from .task_request_navigation_payload import TaskRequestNavigationPayload
+from .task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
 from .task_v2request_extracted_information_schema import TaskV2RequestExtractedInformationSchema
 
 __all__ = [
@@ -13,5 +14,6 @@ __all__ = [
     "AgentRunTaskV2RequestXMaxStepsOverride",
     "TaskRequestExtractedInformationSchema",
     "TaskRequestNavigationPayload",
+    "TaskRunRequestDataExtractionSchema",
     "TaskV2RequestExtractedInformationSchema",
 ]

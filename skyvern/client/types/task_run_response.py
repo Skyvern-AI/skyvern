@@ -6,6 +6,7 @@ from .run_engine import RunEngine
 from .task_run_status import TaskRunStatus
 from .output import Output
 from .proxy_location import ProxyLocation
+from .task_run_response_data_extraction_schema import TaskRunResponseDataExtractionSchema
 import datetime as dt
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
@@ -24,6 +25,7 @@ class TaskRunResponse(UniversalBaseModel):
     totp_url: typing.Optional[str] = None
     proxy_location: typing.Optional[ProxyLocation] = None
     error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
+    data_extraction_schema: typing.Optional[TaskRunResponseDataExtractionSchema] = None
     title: typing.Optional[str] = None
     max_steps: typing.Optional[int] = None
     created_at: dt.datetime

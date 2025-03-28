@@ -6,6 +6,83 @@
     "version": "1.0.0"
   },
   "paths": {
+    "/v1/tasks": {
+      "post": {
+        "tags": [
+          "agent"
+        ],
+        "summary": "Run Task",
+        "operationId": "run_task_v1_tasks_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskRunRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskRunResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "run_task"
+      }
+    },
     "/api/v1/webhook": {
       "post": {
         "tags": [
@@ -2650,12 +2727,102 @@
                     "title": "FileParserBlockYAML",
                     "type": "object"
                   },
+                  "FileStorageType": {
+                    "enum": [
+                      "s3"
+                    ],
+                    "title": "FileStorageType",
+                    "type": "string"
+                  },
                   "FileType": {
                     "enum": [
                       "csv"
                     ],
                     "title": "FileType",
                     "type": "string"
+                  },
+                  "FileUploadBlockYAML": {
+                    "properties": {
+                      "block_type": {
+                        "const": "file_upload",
+                        "default": "file_upload",
+                        "title": "Block Type",
+                        "type": "string"
+                      },
+                      "label": {
+                        "title": "Label",
+                        "type": "string"
+                      },
+                      "continue_on_failure": {
+                        "default": false,
+                        "title": "Continue On Failure",
+                        "type": "boolean"
+                      },
+                      "storage_type": {
+                        "$ref": "#/$defs/FileStorageType",
+                        "default": "s3"
+                      },
+                      "s3_bucket": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "S3 Bucket"
+                      },
+                      "aws_access_key_id": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Aws Access Key Id"
+                      },
+                      "aws_secret_access_key": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Aws Secret Access Key"
+                      },
+                      "region_name": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Region Name"
+                      },
+                      "path": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Path"
+                      }
+                    },
+                    "required": [
+                      "label"
+                    ],
+                    "title": "FileUploadBlockYAML",
+                    "type": "object"
                   },
                   "ForLoopBlockYAML": {
                     "properties": {
@@ -2694,6 +2861,9 @@
                             },
                             {
                               "$ref": "#/$defs/UploadToS3BlockYAML"
+                            },
+                            {
+                              "$ref": "#/$defs/FileUploadBlockYAML"
                             },
                             {
                               "$ref": "#/$defs/SendEmailBlockYAML"
@@ -3795,6 +3965,7 @@
                               "download_to_s3": "#/$defs/DownloadToS3BlockYAML",
                               "extraction": "#/$defs/ExtractionBlockYAML",
                               "file_download": "#/$defs/FileDownloadBlockYAML",
+                              "file_upload": "#/$defs/FileUploadBlockYAML",
                               "file_url_parser": "#/$defs/FileParserBlockYAML",
                               "for_loop": "#/$defs/ForLoopBlockYAML",
                               "goto_url": "#/$defs/UrlBlockYAML",
@@ -3829,6 +4000,9 @@
                             },
                             {
                               "$ref": "#/$defs/UploadToS3BlockYAML"
+                            },
+                            {
+                              "$ref": "#/$defs/FileUploadBlockYAML"
                             },
                             {
                               "$ref": "#/$defs/SendEmailBlockYAML"
@@ -5023,12 +5197,102 @@
                     "title": "FileParserBlockYAML",
                     "type": "object"
                   },
+                  "FileStorageType": {
+                    "enum": [
+                      "s3"
+                    ],
+                    "title": "FileStorageType",
+                    "type": "string"
+                  },
                   "FileType": {
                     "enum": [
                       "csv"
                     ],
                     "title": "FileType",
                     "type": "string"
+                  },
+                  "FileUploadBlockYAML": {
+                    "properties": {
+                      "block_type": {
+                        "const": "file_upload",
+                        "default": "file_upload",
+                        "title": "Block Type",
+                        "type": "string"
+                      },
+                      "label": {
+                        "title": "Label",
+                        "type": "string"
+                      },
+                      "continue_on_failure": {
+                        "default": false,
+                        "title": "Continue On Failure",
+                        "type": "boolean"
+                      },
+                      "storage_type": {
+                        "$ref": "#/$defs/FileStorageType",
+                        "default": "s3"
+                      },
+                      "s3_bucket": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "S3 Bucket"
+                      },
+                      "aws_access_key_id": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Aws Access Key Id"
+                      },
+                      "aws_secret_access_key": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Aws Secret Access Key"
+                      },
+                      "region_name": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Region Name"
+                      },
+                      "path": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Path"
+                      }
+                    },
+                    "required": [
+                      "label"
+                    ],
+                    "title": "FileUploadBlockYAML",
+                    "type": "object"
                   },
                   "ForLoopBlockYAML": {
                     "properties": {
@@ -5067,6 +5331,9 @@
                             },
                             {
                               "$ref": "#/$defs/UploadToS3BlockYAML"
+                            },
+                            {
+                              "$ref": "#/$defs/FileUploadBlockYAML"
                             },
                             {
                               "$ref": "#/$defs/SendEmailBlockYAML"
@@ -6168,6 +6435,7 @@
                               "download_to_s3": "#/$defs/DownloadToS3BlockYAML",
                               "extraction": "#/$defs/ExtractionBlockYAML",
                               "file_download": "#/$defs/FileDownloadBlockYAML",
+                              "file_upload": "#/$defs/FileUploadBlockYAML",
                               "file_url_parser": "#/$defs/FileParserBlockYAML",
                               "for_loop": "#/$defs/ForLoopBlockYAML",
                               "goto_url": "#/$defs/UrlBlockYAML",
@@ -6202,6 +6470,9 @@
                             },
                             {
                               "$ref": "#/$defs/UploadToS3BlockYAML"
+                            },
+                            {
+                              "$ref": "#/$defs/FileUploadBlockYAML"
                             },
                             {
                               "$ref": "#/$defs/SendEmailBlockYAML"
@@ -7006,7 +7277,7 @@
     "/api/v1/browser_sessions/{browser_session_id}": {
       "get": {
         "tags": [
-          "browser"
+          "session"
         ],
         "summary": "Get Browser Session",
         "operationId": "get_browser_session_api_v1_browser_sessions__browser_session_id__get",
@@ -7075,14 +7346,14 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "browser",
+        "x-fern-sdk-group-name": "session",
         "x-fern-sdk-method-name": "get_browser_session"
       }
     },
     "/api/v1/browser_sessions": {
       "get": {
         "tags": [
-          "browser"
+          "session"
         ],
         "summary": "Get Browser Sessions",
         "description": "Get all active browser sessions for the organization",
@@ -7147,12 +7418,12 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "browser",
+        "x-fern-sdk-group-name": "session",
         "x-fern-sdk-method-name": "get_browser_sessions"
       },
       "post": {
         "tags": [
-          "browser"
+          "session"
         ],
         "summary": "Create Browser Session",
         "operationId": "create_browser_session_api_v1_browser_sessions_post",
@@ -7212,14 +7483,14 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "browser",
+        "x-fern-sdk-group-name": "session",
         "x-fern-sdk-method-name": "create_browser_session"
       }
     },
     "/api/v1/browser_sessions/{session_id}/close": {
       "post": {
         "tags": [
-          "browser"
+          "session"
         ],
         "summary": "Close Browser Session",
         "operationId": "close_browser_session_api_v1_browser_sessions__session_id__close_post",
@@ -7288,7 +7559,7 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "browser",
+        "x-fern-sdk-group-name": "session",
         "x-fern-sdk-method-name": "close_browser_session"
       }
     },
@@ -7487,8 +7758,11 @@
     },
     "/api/v1/totp": {
       "post": {
-        "summary": "Save Totp Code",
-        "operationId": "save_totp_code_api_v1_totp_post",
+        "tags": [
+          "agent"
+        ],
+        "summary": "Send Totp Code",
+        "operationId": "send_totp_code_api_v1_totp_post",
         "parameters": [
           {
             "name": "x-api-key",
@@ -7554,7 +7828,9 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "send_totp_code"
       }
     }
   },
@@ -8874,6 +9150,7 @@
           "text_prompt",
           "download_to_s3",
           "upload_to_s3",
+          "file_upload",
           "send_email",
           "file_url_parser",
           "validation",
@@ -9887,12 +10164,106 @@
         ],
         "title": "FileParserBlock"
       },
+      "FileStorageType": {
+        "type": "string",
+        "enum": [
+          "s3"
+        ],
+        "title": "FileStorageType"
+      },
       "FileType": {
         "type": "string",
         "enum": [
           "csv"
         ],
         "title": "FileType"
+      },
+      "FileUploadBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "block_type": {
+            "type": "string",
+            "const": "file_upload",
+            "title": "Block Type",
+            "default": "file_upload"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "storage_type": {
+            "$ref": "#/components/schemas/FileStorageType",
+            "default": "s3"
+          },
+          "s3_bucket": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "S3 Bucket"
+          },
+          "aws_access_key_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aws Access Key Id"
+          },
+          "aws_secret_access_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aws Secret Access Key"
+          },
+          "region_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region Name"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter"
+        ],
+        "title": "FileUploadBlock"
       },
       "ForLoopBlock": {
         "properties": {
@@ -9970,6 +10341,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/TaskV2Block"
+                },
+                {
+                  "$ref": "#/components/schemas/FileUploadBlock"
                 }
               ],
               "discriminator": {
@@ -9980,6 +10354,7 @@
                   "download_to_s3": "#/components/schemas/DownloadToS3Block",
                   "extraction": "#/components/schemas/ExtractionBlock",
                   "file_download": "#/components/schemas/FileDownloadBlock",
+                  "file_upload": "#/components/schemas/FileUploadBlock",
                   "file_url_parser": "#/components/schemas/FileParserBlock",
                   "for_loop": "#/components/schemas/ForLoopBlock",
                   "goto_url": "#/components/schemas/UrlBlock",
@@ -12835,6 +13210,149 @@
         ],
         "title": "TaskResponse"
       },
+      "TaskRunRequest": {
+        "properties": {
+          "goal": {
+            "type": "string",
+            "title": "Goal"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "engine": {
+            "$ref": "#/components/schemas/RunEngine",
+            "default": "skyvern-1.0"
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "data_extraction_schema": {
+            "anyOf": [
+              {
+                "type": "object"
+              },
+              {
+                "items": {
+
+                },
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Extraction Schema"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
+          },
+          "max_steps": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps"
+          },
+          "webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Url"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
+          },
+          "totp_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Url"
+          },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id"
+          },
+          "publish_workflow": {
+            "type": "boolean",
+            "title": "Publish Workflow",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "goal"
+        ],
+        "title": "TaskRunRequest"
+      },
       "TaskRunResponse": {
         "properties": {
           "run_id": {
@@ -12957,6 +13475,26 @@
               }
             ],
             "title": "Error Code Mapping"
+          },
+          "data_extraction_schema": {
+            "anyOf": [
+              {
+                "type": "object"
+              },
+              {
+                "items": {
+
+                },
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Extraction Schema"
           },
           "title": {
             "anyOf": [
@@ -14648,6 +15186,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/TaskV2Block"
+                },
+                {
+                  "$ref": "#/components/schemas/FileUploadBlock"
                 }
               ],
               "discriminator": {
@@ -14658,6 +15199,7 @@
                   "download_to_s3": "#/components/schemas/DownloadToS3Block",
                   "extraction": "#/components/schemas/ExtractionBlock",
                   "file_download": "#/components/schemas/FileDownloadBlock",
+                  "file_upload": "#/components/schemas/FileUploadBlock",
                   "file_url_parser": "#/components/schemas/FileParserBlock",
                   "for_loop": "#/components/schemas/ForLoopBlock",
                   "goto_url": "#/components/schemas/UrlBlock",
@@ -15611,6 +16153,14 @@
     {
       "url": "https://api.skyvern.com",
       "x-fern-server-name": "Production"
+    },
+    {
+      "url": "https://api-staging.skyvern.com",
+      "x-fern-server-name": "Staging"
+    },
+    {
+      "url": "http://localhost:8000",
+      "x-fern-server-name": "Development"
     }
   ]
 }

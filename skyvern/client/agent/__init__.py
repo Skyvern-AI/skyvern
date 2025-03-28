@@ -6,6 +6,7 @@ from .types import (
     AgentRunTaskV2RequestXMaxStepsOverride,
     TaskRequestExtractedInformationSchema,
     TaskRequestNavigationPayload,
+    TaskRunRequestDataExtractionSchema,
     TaskV2RequestExtractedInformationSchema,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "AgentRunTaskV2RequestXMaxStepsOverride",
     "TaskRequestExtractedInformationSchema",
     "TaskRequestNavigationPayload",
+    "TaskRunRequestDataExtractionSchema",
     "TaskV2RequestExtractedInformationSchema",
 ]

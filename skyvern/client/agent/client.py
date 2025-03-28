@@ -2,27 +2,29 @@
 
 import typing
 from ..core.client_wrapper import SyncClientWrapper
-from ..types.task_status import TaskStatus
-from ..types.order_by import OrderBy
-from ..types.sort_direction import SortDirection
+from ..types.run_engine import RunEngine
+from ..types.proxy_location import ProxyLocation
+from .types.task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
 from ..core.request_options import RequestOptions
-from ..types.task import Task
+from ..types.task_run_response import TaskRunResponse
+from ..core.serialization import convert_and_respect_annotation_metadata
 from ..core.pydantic_utilities import parse_obj_as
 from ..errors.unprocessable_entity_error import UnprocessableEntityError
 from ..types.http_validation_error import HttpValidationError
 from json.decoder import JSONDecodeError
 from ..core.api_error import ApiError
+from ..types.task_status import TaskStatus
+from ..types.order_by import OrderBy
+from ..types.sort_direction import SortDirection
+from ..types.task import Task
 from .types.task_request_navigation_payload import TaskRequestNavigationPayload
-from ..types.proxy_location import ProxyLocation
 from .types.task_request_extracted_information_schema import TaskRequestExtractedInformationSchema
 from ..types.task_type import TaskType
 from ..types.create_task_response import CreateTaskResponse
-from ..core.serialization import convert_and_respect_annotation_metadata
 from ..types.task_response import TaskResponse
 from ..core.jsonable_encoder import jsonable_encoder
 from ..types.workflow_run_status import WorkflowRunStatus
 from .types.agent_get_runs_response_item import AgentGetRunsResponseItem
-from ..types.task_run_response import TaskRunResponse
 from ..types.step import Step
 from ..types.entity_type import EntityType
 from ..types.artifact import Artifact
@@ -36,6 +38,8 @@ from ..types.task_generation import TaskGeneration
 from .types.agent_run_task_v2request_x_max_iterations_override import AgentRunTaskV2RequestXMaxIterationsOverride
 from .types.agent_run_task_v2request_x_max_steps_override import AgentRunTaskV2RequestXMaxStepsOverride
 from .types.task_v2request_extracted_information_schema import TaskV2RequestExtractedInformationSchema
+import datetime as dt
+from ..types.totp_code import TotpCode
 from ..core.client_wrapper import AsyncClientWrapper
 
 # this is used as the default value for optional parameters
@@ -45,6 +49,123 @@ OMIT = typing.cast(typing.Any, ...)
 class AgentClient:
     def __init__(self, *, client_wrapper: SyncClientWrapper):
         self._client_wrapper = client_wrapper
+
+    def run_task(
+        self,
+        *,
+        goal: str,
+        url: typing.Optional[str] = OMIT,
+        title: typing.Optional[str] = OMIT,
+        engine: typing.Optional[RunEngine] = OMIT,
+        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        data_extraction_schema: typing.Optional[TaskRunRequestDataExtractionSchema] = OMIT,
+        error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        max_steps: typing.Optional[int] = OMIT,
+        webhook_url: typing.Optional[str] = OMIT,
+        totp_identifier: typing.Optional[str] = OMIT,
+        totp_url: typing.Optional[str] = OMIT,
+        browser_session_id: typing.Optional[str] = OMIT,
+        publish_workflow: typing.Optional[bool] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> TaskRunResponse:
+        """
+        Parameters
+        ----------
+        goal : str
+
+        url : typing.Optional[str]
+
+        title : typing.Optional[str]
+
+        engine : typing.Optional[RunEngine]
+
+        proxy_location : typing.Optional[ProxyLocation]
+
+        data_extraction_schema : typing.Optional[TaskRunRequestDataExtractionSchema]
+
+        error_code_mapping : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+
+        max_steps : typing.Optional[int]
+
+        webhook_url : typing.Optional[str]
+
+        totp_identifier : typing.Optional[str]
+
+        totp_url : typing.Optional[str]
+
+        browser_session_id : typing.Optional[str]
+
+        publish_workflow : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TaskRunResponse
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
+        )
+        client.agent.run_task(
+            goal="goal",
+        )
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "v1/tasks",
+            method="POST",
+            json={
+                "goal": goal,
+                "url": url,
+                "title": title,
+                "engine": engine,
+                "proxy_location": proxy_location,
+                "data_extraction_schema": convert_and_respect_annotation_metadata(
+                    object_=data_extraction_schema, annotation=TaskRunRequestDataExtractionSchema, direction="write"
+                ),
+                "error_code_mapping": error_code_mapping,
+                "max_steps": max_steps,
+                "webhook_url": webhook_url,
+                "totp_identifier": totp_identifier,
+                "totp_url": totp_url,
+                "browser_session_id": browser_session_id,
+                "publish_workflow": publish_workflow,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    TaskRunResponse,
+                    parse_obj_as(
+                        type_=TaskRunResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        HttpValidationError,
+                        parse_obj_as(
+                            type_=HttpValidationError,  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
 
     def get_tasks(
         self,
@@ -99,7 +220,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -228,7 +349,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -312,7 +433,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -369,7 +490,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -426,7 +547,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -481,7 +602,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -547,7 +668,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -605,7 +726,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -664,7 +785,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -736,7 +857,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -801,7 +922,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -859,7 +980,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -946,7 +1067,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -1029,7 +1150,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -1101,7 +1222,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -1165,7 +1286,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -1235,7 +1356,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -1297,7 +1418,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -1374,7 +1495,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -1433,7 +1554,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -1497,7 +1618,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -1558,7 +1679,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -1615,7 +1736,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -1670,7 +1791,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -1713,7 +1834,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -1813,7 +1934,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -1894,7 +2015,7 @@ class AgentClient:
 
         Examples
         --------
-        from skyverndocs import Skyvern
+        from skyvern import Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
@@ -1933,10 +2054,223 @@ class AgentClient:
             raise ApiError(status_code=_response.status_code, body=_response.text)
         raise ApiError(status_code=_response.status_code, body=_response_json)
 
+    def send_totp_code(
+        self,
+        *,
+        totp_identifier: str,
+        content: str,
+        task_id: typing.Optional[str] = OMIT,
+        workflow_id: typing.Optional[str] = OMIT,
+        source: typing.Optional[str] = OMIT,
+        expired_at: typing.Optional[dt.datetime] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> TotpCode:
+        """
+        Parameters
+        ----------
+        totp_identifier : str
+
+        content : str
+
+        task_id : typing.Optional[str]
+
+        workflow_id : typing.Optional[str]
+
+        source : typing.Optional[str]
+
+        expired_at : typing.Optional[dt.datetime]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TotpCode
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
+        )
+        client.agent.send_totp_code(
+            totp_identifier="totp_identifier",
+            content="content",
+        )
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "api/v1/totp",
+            method="POST",
+            json={
+                "totp_identifier": totp_identifier,
+                "task_id": task_id,
+                "workflow_id": workflow_id,
+                "source": source,
+                "content": content,
+                "expired_at": expired_at,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    TotpCode,
+                    parse_obj_as(
+                        type_=TotpCode,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        HttpValidationError,
+                        parse_obj_as(
+                            type_=HttpValidationError,  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
 
 class AsyncAgentClient:
     def __init__(self, *, client_wrapper: AsyncClientWrapper):
         self._client_wrapper = client_wrapper
+
+    async def run_task(
+        self,
+        *,
+        goal: str,
+        url: typing.Optional[str] = OMIT,
+        title: typing.Optional[str] = OMIT,
+        engine: typing.Optional[RunEngine] = OMIT,
+        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        data_extraction_schema: typing.Optional[TaskRunRequestDataExtractionSchema] = OMIT,
+        error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        max_steps: typing.Optional[int] = OMIT,
+        webhook_url: typing.Optional[str] = OMIT,
+        totp_identifier: typing.Optional[str] = OMIT,
+        totp_url: typing.Optional[str] = OMIT,
+        browser_session_id: typing.Optional[str] = OMIT,
+        publish_workflow: typing.Optional[bool] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> TaskRunResponse:
+        """
+        Parameters
+        ----------
+        goal : str
+
+        url : typing.Optional[str]
+
+        title : typing.Optional[str]
+
+        engine : typing.Optional[RunEngine]
+
+        proxy_location : typing.Optional[ProxyLocation]
+
+        data_extraction_schema : typing.Optional[TaskRunRequestDataExtractionSchema]
+
+        error_code_mapping : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+
+        max_steps : typing.Optional[int]
+
+        webhook_url : typing.Optional[str]
+
+        totp_identifier : typing.Optional[str]
+
+        totp_url : typing.Optional[str]
+
+        browser_session_id : typing.Optional[str]
+
+        publish_workflow : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TaskRunResponse
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
+        )
+
+
+        async def main() -> None:
+            await client.agent.run_task(
+                goal="goal",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "v1/tasks",
+            method="POST",
+            json={
+                "goal": goal,
+                "url": url,
+                "title": title,
+                "engine": engine,
+                "proxy_location": proxy_location,
+                "data_extraction_schema": convert_and_respect_annotation_metadata(
+                    object_=data_extraction_schema, annotation=TaskRunRequestDataExtractionSchema, direction="write"
+                ),
+                "error_code_mapping": error_code_mapping,
+                "max_steps": max_steps,
+                "webhook_url": webhook_url,
+                "totp_identifier": totp_identifier,
+                "totp_url": totp_url,
+                "browser_session_id": browser_session_id,
+                "publish_workflow": publish_workflow,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    TaskRunResponse,
+                    parse_obj_as(
+                        type_=TaskRunResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        HttpValidationError,
+                        parse_obj_as(
+                            type_=HttpValidationError,  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
 
     async def get_tasks(
         self,
@@ -1993,7 +2327,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -2130,7 +2464,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -2224,7 +2558,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -2289,7 +2623,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -2354,7 +2688,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -2419,7 +2753,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -2493,7 +2827,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -2559,7 +2893,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -2628,7 +2962,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -2708,7 +3042,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -2781,7 +3115,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -2847,7 +3181,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -2942,7 +3276,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -3033,7 +3367,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -3113,7 +3447,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -3185,7 +3519,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -3263,7 +3597,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -3333,7 +3667,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -3418,7 +3752,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -3485,7 +3819,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -3557,7 +3891,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -3626,7 +3960,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -3691,7 +4025,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -3754,7 +4088,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -3807,7 +4141,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -3915,7 +4249,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -4004,7 +4338,7 @@ class AsyncAgentClient:
         --------
         import asyncio
 
-        from skyverndocs import AsyncSkyvern
+        from skyvern import AsyncSkyvern
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -4031,6 +4365,102 @@ class AsyncAgentClient:
                     typing.Dict[str, typing.Optional[typing.Any]],
                     parse_obj_as(
                         type_=typing.Dict[str, typing.Optional[typing.Any]],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        HttpValidationError,
+                        parse_obj_as(
+                            type_=HttpValidationError,  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
+    async def send_totp_code(
+        self,
+        *,
+        totp_identifier: str,
+        content: str,
+        task_id: typing.Optional[str] = OMIT,
+        workflow_id: typing.Optional[str] = OMIT,
+        source: typing.Optional[str] = OMIT,
+        expired_at: typing.Optional[dt.datetime] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> TotpCode:
+        """
+        Parameters
+        ----------
+        totp_identifier : str
+
+        content : str
+
+        task_id : typing.Optional[str]
+
+        workflow_id : typing.Optional[str]
+
+        source : typing.Optional[str]
+
+        expired_at : typing.Optional[dt.datetime]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TotpCode
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
+        )
+
+
+        async def main() -> None:
+            await client.agent.send_totp_code(
+                totp_identifier="totp_identifier",
+                content="content",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "api/v1/totp",
+            method="POST",
+            json={
+                "totp_identifier": totp_identifier,
+                "task_id": task_id,
+                "workflow_id": workflow_id,
+                "source": source,
+                "content": content,
+                "expired_at": expired_at,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    TotpCode,
+                    parse_obj_as(
+                        type_=TotpCode,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
