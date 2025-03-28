@@ -1559,8 +1559,6 @@ async def run_task(
             run_id=task_v1_response.task_id,
             title=task_v1_response.title,
             status=str(task_v1_response.status),
-            created_at=task_v1_response.created_at,
-            updated_at=task_v1_response.modified_at,
             engine=RunEngine.skyvern_v1,
             goal=task_v1_response.navigation_goal,
             url=task_v1_response.url,
@@ -1573,6 +1571,8 @@ async def run_task(
             totp_url=task_v1_response.totp_verification_url,
             webhook_url=task_v1_response.webhook_callback_url,
             max_steps=task_v1_response.max_steps_per_run,
+            created_at=task_v1_response.created_at,
+            modified_at=task_v1_response.modified_at,
         )
     if run_request.engine == RunEngine.skyvern_v2:
         # create task v2
