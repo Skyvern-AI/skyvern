@@ -1,6 +1,5 @@
 from typing import Any, Dict, Literal, Type
 
-from httpx import AsyncClient
 from langchain.tools import BaseTool
 from pydantic import BaseModel, Field
 from skyvern_langchain.schema import CreateTaskInput, GetTaskInput
@@ -18,13 +17,7 @@ class SkyvernTaskBaseTool(BaseTool):
     run_task_timeout_seconds: int = Field(default=settings.run_task_timeout_seconds)
 
     def get_client(self) -> AsyncSkyvern:
-        httpx_client = AsyncClient(
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": self.api_key,
-            },
-        )
-        return AsyncSkyvern(base_url=self.base_url, httpx_client=httpx_client)
+        return AsyncSkyvern(base_url=self.base_url, api_key=self.api_key)
 
     def _run(self, *args: Any, **kwargs: Any) -> None:
         raise NotImplementedError("skyvern task tool does not support sync")

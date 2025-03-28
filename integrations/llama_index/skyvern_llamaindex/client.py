@@ -1,6 +1,5 @@
 from typing import Any, Dict, List, Literal, Optional
 
-from httpx import AsyncClient
 from llama_index.core.tools import FunctionTool
 from llama_index.core.tools.tool_spec.base import SPEC_FUNCTION_TYPE, BaseToolSpec
 from pydantic import BaseModel
@@ -55,15 +54,9 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         engine: Literal["TaskV1", "TaskV2"] = settings.engine,
         run_task_timeout_seconds: int = settings.run_task_timeout_seconds,
     ):
-        httpx_client = AsyncClient(
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": api_key,
-            },
-        )
         self.engine = engine
         self.run_task_timeout_seconds = run_task_timeout_seconds
-        self.client = AsyncSkyvern(base_url=base_url, httpx_client=httpx_client)
+        self.client = AsyncSkyvern(base_url=base_url, api_key=api_key)
 
     async def run_task(self, user_prompt: str, url: Optional[str] = None) -> TaskResponse | Dict[str, Any | None]:
         """

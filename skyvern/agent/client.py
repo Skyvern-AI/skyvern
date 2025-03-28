@@ -2,6 +2,7 @@ from typing import Any
 
 import httpx
 
+from skyvern.client.client import AsyncSkyvern
 from skyvern.config import settings
 from skyvern.exceptions import SkyvernClientException
 from skyvern.forge.sdk.workflow.models.workflow import RunWorkflowResponse, WorkflowRunResponse
@@ -16,6 +17,7 @@ class SkyvernClient:
     ) -> None:
         self.base_url = base_url
         self.api_key = api_key
+        self.client = AsyncSkyvern(base_url=base_url, api_key=api_key)
 
     async def run_task(
         self,
