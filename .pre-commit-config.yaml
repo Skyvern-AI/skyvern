@@ -33,7 +33,8 @@ repos:
         language_version: python3.11
         exclude: |
           (?x)(
-            ^skyvern/client/.*
+            ^skyvern/client/.*|
+            ^skyvern/__init__.py
           )
 
   - repo: https://github.com/pre-commit/pygrep-hooks
