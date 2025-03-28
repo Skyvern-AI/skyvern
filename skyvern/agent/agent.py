@@ -2,6 +2,8 @@ import asyncio
 
 from dotenv import load_dotenv
 
+from skyvern.agent.client import SkyvernClient
+from skyvern.agent.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
 from skyvern.forge import app
 from skyvern.forge.sdk.core import security, skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -11,14 +13,26 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Request, TaskV2Statu
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.runs import ProxyLocation, RunEngine, TaskRunResponse
 from skyvern.services import task_v2_service
 from skyvern.utils import migrate_db
 
 
 class SkyvernAgent:
-    def __init__(self) -> None:
-        load_dotenv(".env")
-        migrate_db()
+    def __init__(
+        self,
+        base_url: str | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        self._local_mode = True
+        if base_url is None and api_key is None:
+            load_dotenv(".env")
+            migrate_db()
+        elif base_url and api_key:
+            self.client = SkyvernClient(base_url=base_url, api_key=api_key)
+            self._local_mode = False
+        else:
+            raise ValueError("base_url and api_key must be both provided")
 
     async def _get_organization(self) -> Organization:
         organization = await app.DATABASE.get_organization_by_domain("skyvern.local")
@@ -103,7 +117,10 @@ class SkyvernAgent:
         asyncio.create_task(self._run_task(organization, created_task))
         return CreateTaskResponse(task_id=created_task.task_id)
 
-    async def get_task(
+    async def get_task(self, run_id: str) -> TaskRunResponse:
+        return await self.client.get_task(run_id)
+
+    async def get_task_v1(
         self,
         task_id: str,
     ) -> TaskResponse | None:
@@ -138,20 +155,68 @@ class SkyvernAgent:
             task=task, last_step=latest_step, failure_reason=failure_reason, need_browser_log=True
         )
 
-    async def run_task(
+    async def run_local_task(
         self,
-        task_request: TaskRequest,
-        timeout_seconds: int = 600,
-    ) -> TaskResponse:
-        created_task = await self.create_task(task_request)
+        goal: str,
+        engine: RunEngine = RunEngine.skyvern_v1,
+        url: str | None = None,
+        webhook_url: str | None = None,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+        title: str | None = None,
+        error_code_mapping: dict[str, str] | None = None,
+        proxy_location: ProxyLocation | None = None,
+        max_steps: int | None = None,
+        wait_for_completion: bool = True,
+        timeout_seconds: int = DEFAULT_AGENT_TIMEOUT,
+    ) -> TaskRunResponse:
+        if engine == RunEngine.skyvern_v1:
+            task_request = TaskRequest(
+                navigation_goal=goal,
+                url=url,
+                webhook_callback_url=webhook_url,
+                proxy_location=proxy_location,
+                title=title,
+                error_code_mapping=error_code_mapping,
+                totp_identifier=totp_identifier,
+                totp_verification_url=totp_url,
+            )
 
-        async with asyncio.timeout(timeout_seconds):
-            while True:
-                task_response = await self.get_task(created_task.task_id)
-                assert task_response is not None
-                if task_response.status.is_final():
-                    return task_response
-                await asyncio.sleep(1)
+            if wait_for_completion:
+                organization = await self._get_organization()
+                created_task = await app.agent.create_task(task_request, organization.organization_id)
+                skyvern_context.set(
+                    SkyvernContext(
+                        organization_id=organization.organization_id,
+                        task_id=created_task.task_id,
+                        max_steps_override=max_steps,
+                    )
+                )
+                try:
+                    await self._run_task(organization, created_task)
+                    return await self.get_task(run_id=created_task.task_id)
+                except Exception:
+                    # TODO: better error handling and logging
+                    return await self.get_task(run_id=created_task.task_id)
+                finally:
+                    skyvern_context.reset()
+            else:
+                # TODO: use the real get_run interface
+                task_v1_id = await self.create_task(task_request)
+                task_run = await self.get_task(run_id=task_v1_id)
+                return task_run
+
+        elif engine == RunEngine.skyvern_v2:
+            task_request = TaskV2Request(
+                user_prompt=goal,
+                url=url,
+                webhook_callback_url=webhook_url,
+            )
+            task_v2 = await self.observer_task_v_2(task_request)
+            return TaskRunResponse(
+                run_id=task_v2.observer_cruise_id,
+                status=TaskStatus.running,
+            )
 
     async def observer_task_v_2(self, task_request: TaskV2Request) -> TaskV2:
         organization = await self._get_organization()
@@ -187,3 +252,43 @@ class SkyvernAgent:
                 if refreshed_task_v2.status.is_final():
                     return refreshed_task_v2
                 await asyncio.sleep(1)
+
+    async def run_task(
+        self,
+        goal: str,
+        engine: RunEngine = RunEngine.skyvern_v1,
+        url: str | None = None,
+        webhook_url: str | None = None,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+        title: str | None = None,
+        error_code_mapping: dict[str, str] | None = None,
+        proxy_location: ProxyLocation | None = None,
+        max_steps: int | None = None,
+        wait_for_completion: bool = True,
+        timeout: float = DEFAULT_AGENT_TIMEOUT,
+    ) -> TaskRunResponse:
+        if self._local_mode:
+            raise ValueError("Local mode is not supported for this method")
+
+        task_run = await self.client.run_task(
+            goal=goal,
+            engine=engine,
+            url=url,
+            webhook_url=webhook_url,
+            totp_identifier=totp_identifier,
+            totp_url=totp_url,
+            title=title,
+            error_code_mapping=error_code_mapping,
+            proxy_location=proxy_location,
+            max_steps=max_steps,
+        )
+
+        if wait_for_completion:
+            async with asyncio.timeout(timeout):
+                while True:
+                    task_run = await self.client.get_task(task_run.run_id)
+                    if task_run.status.is_final():
+                        return task_run
+                    await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
+        return task_run
