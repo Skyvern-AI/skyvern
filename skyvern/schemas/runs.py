@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import StrEnum
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from skyvern.utils.url_validators import validate_url
 
@@ -127,6 +127,8 @@ class TaskRunRequest(BaseModel):
 
 
 class TaskRunResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     run_id: str
     engine: RunEngine = RunEngine.skyvern_v1
     status: TaskRunStatus

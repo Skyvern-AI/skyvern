@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, List
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
@@ -30,6 +30,8 @@ class WorkflowRequestBody(BaseModel):
 
 
 class RunWorkflowResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     workflow_id: str
     workflow_run_id: str
 
@@ -131,6 +133,8 @@ class WorkflowRunOutputParameter(BaseModel):
 
 
 class WorkflowRunResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     workflow_id: str
     workflow_run_id: str
     status: WorkflowRunStatus
