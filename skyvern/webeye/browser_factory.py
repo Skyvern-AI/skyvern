@@ -210,7 +210,7 @@ class BrowserContextFactory:
                 f"--disable-extensions-except={joined_paths}",
                 f"--load-extension={joined_paths}",
             ])
-        LOG.info("Extensions added to browser args", extensions=joined_paths)
+            LOG.info("Extensions added to browser args", extensions=joined_paths)
 
         if proxy_location:
             if tz_info := get_tzinfo_from_proxy(proxy_location=proxy_location):
