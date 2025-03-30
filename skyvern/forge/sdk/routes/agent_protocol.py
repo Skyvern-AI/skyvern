@@ -41,7 +41,6 @@ from skyvern.forge.sdk.schemas.organizations import (
     OrganizationUpdate,
 )
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration
-from skyvern.forge.sdk.schemas.task_runs import TaskRunType
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import (
     CreateTaskResponse,
@@ -53,7 +52,7 @@ from skyvern.forge.sdk.schemas.tasks import (
     TaskStatus,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline
-from skyvern.forge.sdk.services import org_auth_service, task_run_service
+from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
@@ -71,8 +70,8 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowStatus,
 )
 from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
-from skyvern.schemas.runs import RunEngine, TaskRunRequest, TaskRunResponse
-from skyvern.services import task_v1_service, task_v2_service
+from skyvern.schemas.runs import RunEngine, RunResponseType, RunType, TaskRunRequest, TaskRunResponse
+from skyvern.services import run_service, task_v1_service, task_v2_service
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.schemas import BrowserSessionResponse
 
@@ -459,16 +458,15 @@ async def get_runs(
 async def get_run(
     run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> TaskRunResponse:
-    task_run_response = await task_run_service.get_task_run_response(
-        run_id, organization_id=current_org.organization_id
-    )
-    if not task_run_response:
+) -> RunResponseType:
+    # TODO: figure out if the repsonse will be successfully transformed into TaskRun and WorkflowRun
+    run_response = await run_service.get_run_response(run_id, organization_id=current_org.organization_id)
+    if not run_response:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Task run not found {run_id}",
         )
-    return task_run_response
+    return run_response
 
 
 @base_router.get(
@@ -683,7 +681,7 @@ async def run_workflow(
         version=version,
     )
     await app.DATABASE.create_task_run(
-        task_run_type=TaskRunType.workflow_run,
+        task_run_type=RunType.workflow_run,
         organization_id=current_org.organization_id,
         run_id=workflow_run.workflow_run_id,
         title=workflow.title,

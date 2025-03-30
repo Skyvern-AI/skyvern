@@ -1,24 +1,19 @@
 from skyvern.forge import app
-from skyvern.forge.sdk.schemas.task_runs import TaskRun, TaskRunType
-from skyvern.schemas.runs import RunEngine, TaskRunResponse
+from skyvern.schemas.runs import RunEngine, RunResponseType, RunType, TaskRunResponse, WorkflowRunResponse
 
 
-async def get_task_run(run_id: str, organization_id: str | None = None) -> TaskRun | None:
-    return await app.DATABASE.get_task_run(run_id, organization_id=organization_id)
-
-
-async def get_task_run_response(run_id: str, organization_id: str | None = None) -> TaskRunResponse | None:
-    task_run = await get_task_run(run_id, organization_id=organization_id)
-    if not task_run:
+async def get_run_response(run_id: str, organization_id: str | None = None) -> RunResponseType | None:
+    run = await app.DATABASE.get_run(run_id, organization_id=organization_id)
+    if not run:
         return None
 
-    if task_run.task_run_type == TaskRunType.task_v1:
+    if run.task_run_type == RunType.task_v1:
         # fetch task v1 from db and transform to task run response
-        task_v1 = await app.DATABASE.get_task(task_run.task_v1_id, organization_id=organization_id)
+        task_v1 = await app.DATABASE.get_task(run.task_v1_id, organization_id=organization_id)
         if not task_v1:
             return None
         return TaskRunResponse(
-            run_id=task_run.run_id,
+            run_id=run.run_id,
             engine=RunEngine.skyvern_v1,
             status=task_v1.status,
             goal=task_v1.navigation_goal,
@@ -32,12 +27,12 @@ async def get_task_run_response(run_id: str, organization_id: str | None = None)
             created_at=task_v1.created_at,
             modified_at=task_v1.modified_at,
         )
-    elif task_run.task_run_type == TaskRunType.task_v2:
-        task_v2 = await app.DATABASE.get_task_v2(task_run.task_v2_id, organization_id=organization_id)
+    elif run.task_run_type == RunType.task_v2:
+        task_v2 = await app.DATABASE.get_task_v2(run.task_v2_id, organization_id=organization_id)
         if not task_v2:
             return None
         return TaskRunResponse(
-            run_id=task_run.run_id,
+            run_id=run.run_id,
             engine=RunEngine.skyvern_v2,
             status=task_v2.status,
             goal=task_v2.prompt,
@@ -51,4 +46,7 @@ async def get_task_run_response(run_id: str, organization_id: str | None = None)
             created_at=task_v2.created_at,
             modified_at=task_v2.modified_at,
         )
-    raise ValueError(f"Invalid task run type: {task_run.task_run_type}")
+    elif run.task_run_type == RunType.workflow_run:
+        # TODO: add workflow_run -> workflow run response transformation code
+        return WorkflowRunResponse()
+    raise ValueError(f"Invalid task run type: {run.task_run_type}")

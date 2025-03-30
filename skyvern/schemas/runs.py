@@ -1,8 +1,9 @@
 from datetime import datetime
 from enum import StrEnum
+from typing import Annotated, Any, Union
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from skyvern.utils.url_validators import validate_url
 
@@ -86,12 +87,18 @@ def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
     return None
 
 
+class RunType(StrEnum):
+    task_v1 = "task_v1"
+    task_v2 = "task_v2"
+    workflow_run = "workflow_run"
+
+
 class RunEngine(StrEnum):
     skyvern_v1 = "skyvern-1.0"
     skyvern_v2 = "skyvern-2.0"
 
 
-class TaskRunStatus(StrEnum):
+class RunStatus(StrEnum):
     created = "created"
     queued = "queued"
     running = "running"
@@ -101,12 +108,15 @@ class TaskRunStatus(StrEnum):
     completed = "completed"
     canceled = "canceled"
 
+    def is_final(self) -> bool:
+        return self in [self.failed, self.terminated, self.canceled, self.timed_out, self.completed]
+
 
 class TaskRunRequest(BaseModel):
     goal: str
     url: str | None = None
     title: str | None = None
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine = RunEngine.skyvern_v2
     proxy_location: ProxyLocation | None = None
     data_extraction_schema: dict | list | str | None = None
     error_code_mapping: dict[str, str] | None = None
@@ -126,23 +136,34 @@ class TaskRunRequest(BaseModel):
         return validate_url(url)
 
 
-class TaskRunResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
+class RunResponse(BaseModel):
     run_id: str
-    engine: RunEngine = RunEngine.skyvern_v1
-    status: TaskRunStatus
-    goal: str | None = None
-    url: str | None = None
+    run_type: RunType
+    status: RunStatus
     output: dict | list | str | None = None
     failure_reason: str | None = None
     webhook_url: str | None = None
     totp_identifier: str | None = None
     totp_url: str | None = None
     proxy_location: ProxyLocation | None = None
-    error_code_mapping: dict[str, str] | None = None
-    data_extraction_schema: dict | list | str | None = None
     title: str | None = None
     max_steps: int | None = None
     created_at: datetime
     modified_at: datetime
+
+
+class TaskRunResponse(RunResponse):
+    engine: RunEngine
+    goal: str | None = None
+    url: str | None = None
+    error_code_mapping: dict[str, str] | None = None
+    data_extraction_schema: dict | list | str | None = None
+
+
+class WorkflowRunResponse(RunResponse):
+    parameters: dict[str, Any] | None = None
+
+
+# TODO: how to do this correctly?
+RunResponseclasses = Union[TaskRunResponse, WorkflowRunResponse]
+RunResponseType = Annotated[RunResponseclasses, Field(discriminator="run_type")]

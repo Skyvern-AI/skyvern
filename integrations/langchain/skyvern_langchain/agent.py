@@ -50,9 +50,7 @@ class RunTask(SkyvernTaskBaseTool):
 
     async def _arun_task_v2(self, user_prompt: str, url: str | None = None) -> TaskV2:
         task_request = TaskV2Request(user_prompt=user_prompt, url=url)
-        return await self.agent.run_observer_task_v_2(
-            task_request=task_request, timeout_seconds=self.run_task_timeout_seconds
-        )
+        return await self.agent.run_task_v2(task_request=task_request, timeout_seconds=self.run_task_timeout_seconds)
 
 
 class DispatchTask(SkyvernTaskBaseTool):
@@ -76,7 +74,7 @@ class DispatchTask(SkyvernTaskBaseTool):
 
     async def _arun_task_v2(self, user_prompt: str, url: str | None = None) -> TaskV2:
         task_request = TaskV2Request(user_prompt=user_prompt, url=url)
-        return await self.agent.observer_task_v_2(task_request=task_request)
+        return await self.agent.run_local_task_v2(task_request=task_request)
 
 
 class GetTask(SkyvernTaskBaseTool):
@@ -94,4 +92,4 @@ class GetTask(SkyvernTaskBaseTool):
         return await self.agent.get_task(task_id=task_id)
 
     async def _arun_task_v2(self, task_id: str) -> TaskV2 | None:
-        return await self.agent.get_observer_task_v_2(task_id=task_id)
+        return await self.agent.get_task_v2(task_id=task_id)

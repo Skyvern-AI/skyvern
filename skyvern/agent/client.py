@@ -16,7 +16,7 @@ class SkyvernClient:
 
     async def run_task(
         self,
-        goal: str,
+        prompt: str,
         url: str | None = None,
         title: str | None = None,
         engine: RunEngine = RunEngine.skyvern_v1,
@@ -28,7 +28,7 @@ class SkyvernClient:
         max_steps: int | None = None,
     ) -> TaskRunResponse:
         task_run_obj = await self.client.agent.run_task(
-            goal=goal,
+            goal=prompt,
             url=url,
             title=title,
             engine=engine,

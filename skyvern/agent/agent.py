@@ -1,4 +1,5 @@
 import asyncio
+from typing import cast
 
 from dotenv import load_dotenv
 
@@ -10,11 +11,11 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Request, TaskV2Status
-from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskRequest, TaskResponse, TaskStatus
+from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskRequest, TaskStatus
 from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.schemas.runs import ProxyLocation, RunEngine, TaskRunResponse
-from skyvern.services import task_v2_service
+from skyvern.schemas.runs import ProxyLocation, RunEngine, RunResponseType, TaskRunResponse
+from skyvern.services import run_service, task_v2_service
 from skyvern.utils import migrate_db
 
 
@@ -99,7 +100,7 @@ class SkyvernAgent:
             task_v2_id=task_v2.observer_cruise_id,
         )
 
-    async def create_task(
+    async def _run_task_async(
         self,
         task_request: TaskRequest,
     ) -> CreateTaskResponse:
@@ -116,44 +117,6 @@ class SkyvernAgent:
 
         asyncio.create_task(self._run_task(organization, created_task))
         return CreateTaskResponse(task_id=created_task.task_id)
-
-    async def get_task(self, run_id: str) -> TaskRunResponse:
-        return await self.client.get_task(run_id)
-
-    async def get_task_v1(
-        self,
-        task_id: str,
-    ) -> TaskResponse | None:
-        organization = await self._get_organization()
-        task = await app.DATABASE.get_task(task_id, organization.organization_id)
-
-        if task is None:
-            return None
-
-        latest_step = await app.DATABASE.get_latest_step(task_id, organization_id=organization.organization_id)
-        if not latest_step:
-            return await app.agent.build_task_response(task=task)
-
-        failure_reason: str | None = None
-        if task.status == TaskStatus.failed and (task.failure_reason):
-            failure_reason = ""
-            if task.failure_reason:
-                failure_reason += task.failure_reason or ""
-            if latest_step.output is not None and latest_step.output.actions_and_results is not None:
-                action_results_string: list[str] = []
-                for action, results in latest_step.output.actions_and_results:
-                    if len(results) == 0:
-                        continue
-                    if results[-1].success:
-                        continue
-                    action_results_string.append(f"{action.action_type} action failed.")
-
-                if len(action_results_string) > 0:
-                    failure_reason += "(Exceptions: " + str(action_results_string) + ")"
-
-        return await app.agent.build_task_response(
-            task=task, last_step=latest_step, failure_reason=failure_reason, need_browser_log=True
-        )
 
     async def run_local_task(
         self,
@@ -194,17 +157,19 @@ class SkyvernAgent:
                 )
                 try:
                     await self._run_task(organization, created_task)
-                    return await self.get_task(run_id=created_task.task_id)
+                    run_obj = await self.get_run(run_id=created_task.task_id)
+                    return cast(TaskRunResponse, run_obj)
                 except Exception:
                     # TODO: better error handling and logging
-                    return await self.get_task(run_id=created_task.task_id)
+                    run_obj = await self.get_run(run_id=created_task.task_id)
+                    return cast(TaskRunResponse, run_obj)
                 finally:
                     skyvern_context.reset()
             else:
                 # TODO: use the real get_run interface
-                task_v1_id = await self.create_task(task_request)
-                task_run = await self.get_task(run_id=task_v1_id)
-                return task_run
+                create_task_resp = await self._run_task_async(task_request)
+                run_obj = await self.get_run(run_id=create_task_resp.task_id)
+                return cast(TaskRunResponse, run_obj)
 
         elif engine == RunEngine.skyvern_v2:
             task_request = TaskV2Request(
@@ -212,13 +177,13 @@ class SkyvernAgent:
                 url=url,
                 webhook_callback_url=webhook_url,
             )
-            task_v2 = await self.observer_task_v_2(task_request)
+            task_v2 = await self.run_local_task_v2(task_request)
             return TaskRunResponse(
                 run_id=task_v2.observer_cruise_id,
                 status=TaskStatus.running,
             )
 
-    async def observer_task_v_2(self, task_request: TaskV2Request) -> TaskV2:
+    async def run_local_task_v2(self, task_request: TaskV2Request) -> TaskV2:
         organization = await self._get_organization()
 
         task_v2 = await task_v2_service.initialize_task_v2(
@@ -238,24 +203,32 @@ class SkyvernAgent:
         asyncio.create_task(self._run_task_v2(organization, task_v2))
         return task_v2
 
-    async def get_observer_task_v_2(self, task_id: str) -> TaskV2 | None:
+    async def get_task_v2(self, task_id: str) -> TaskV2 | None:
         organization = await self._get_organization()
         return await app.DATABASE.get_task_v2(task_id, organization.organization_id)
 
-    async def run_observer_task_v_2(self, task_request: TaskV2Request, timeout_seconds: int = 600) -> TaskV2:
-        task_v2 = await self.observer_task_v_2(task_request)
+    async def run_task_v2(self, task_request: TaskV2Request, timeout_seconds: int = 600) -> TaskV2:
+        task_v2 = await self.run_local_task_v2(task_request)
 
         async with asyncio.timeout(timeout_seconds):
             while True:
-                refreshed_task_v2 = await self.get_observer_task_v_2(task_v2.observer_cruise_id)
+                refreshed_task_v2 = await self.get_task_v2(task_v2.observer_cruise_id)
                 assert refreshed_task_v2 is not None
                 if refreshed_task_v2.status.is_final():
                     return refreshed_task_v2
                 await asyncio.sleep(1)
 
+    ######################### Official Interfaces Below #######################
+
+    async def get_run(self, run_id: str) -> RunResponseType | None:
+        if self._local_mode:
+            organization = await self._get_organization()
+            return await run_service.get_run_response(run_id, organization_id=organization.organization_id)
+        return await self.client.get_task(run_id)
+
     async def run_task(
         self,
-        goal: str,
+        prompt: str,
         engine: RunEngine = RunEngine.skyvern_v1,
         url: str | None = None,
         webhook_url: str | None = None,
@@ -267,12 +240,13 @@ class SkyvernAgent:
         max_steps: int | None = None,
         wait_for_completion: bool = True,
         timeout: float = DEFAULT_AGENT_TIMEOUT,
+        browser_session_id: str | None = None,
     ) -> TaskRunResponse:
         if self._local_mode:
             raise ValueError("Local mode is not supported for this method")
 
         task_run = await self.client.run_task(
-            goal=goal,
+            prompt=prompt,
             engine=engine,
             url=url,
             webhook_url=webhook_url,

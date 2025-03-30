@@ -58,7 +58,7 @@ class RunTask(SkyvernTaskBaseTool):
 
     async def _arun_task_v2(self, user_prompt: str, url: str | None = None) -> TaskResponse:
         task_request = TaskV2Request(url=url, user_prompt=user_prompt)
-        return await self.get_client().agent.run_observer_task_v_2(
+        return await self.get_client().agent.run_task_v2(
             timeout_seconds=self.run_task_timeout_seconds,
             user_prompt=task_request.user_prompt,
             url=task_request.url,
@@ -100,7 +100,7 @@ class DispatchTask(SkyvernTaskBaseTool):
 
     async def _arun_task_v2(self, user_prompt: str, url: str | None = None) -> Dict[str, Any | None]:
         task_request = TaskV2Request(url=url, user_prompt=user_prompt)
-        return await self.get_client().agent.observer_task_v_2(
+        return await self.get_client().agent.run_local_task_v2(
             user_prompt=task_request.user_prompt,
             url=task_request.url,
             browser_session_id=task_request.browser_session_id,
@@ -122,4 +122,4 @@ class GetTask(SkyvernTaskBaseTool):
         return await self.get_client().agent.get_task(task_id=task_id)
 
     async def _arun_task_v2(self, task_id: str) -> Dict[str, Any | None]:
-        return await self.get_client().agent.get_observer_task_v_2(task_id=task_id)
+        return await self.get_client().agent.get_task_v2(task_id=task_id)
