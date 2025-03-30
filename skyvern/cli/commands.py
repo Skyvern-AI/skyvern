@@ -8,6 +8,8 @@ import typer
 from skyvern.utils import migrate_db
 
 app = typer.Typer()
+run_app = typer.Typer()
+app.add_typer(run_app, name="run")
 
 
 def command_exists(command: str) -> bool:
@@ -125,3 +127,8 @@ def init(
 @app.command(name="migrate")
 def migrate() -> None:
     migrate_db()
+
+
+@run_app.command(name="mcp")
+def run_mcp() -> None:
+    pass
