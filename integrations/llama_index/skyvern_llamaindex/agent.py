@@ -104,7 +104,7 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         if url is not None:
             task_request.url = url
 
-        return await self.agent.run_task(task_request=task_request, timeout_seconds=self.run_task_timeout_seconds)
+        return await self.agent.run_task_v1(task_request=task_request, timeout_seconds=self.run_task_timeout_seconds)
 
     async def dispatch_task_v1(self, user_prompt: str, url: Optional[str] = None) -> CreateTaskResponse:
         task_generation = await self._generate_v1_task_request(user_prompt=user_prompt)
@@ -112,7 +112,7 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         if url is not None:
             task_request.url = url
 
-        return await self.agent.create_task(task_request=task_request)
+        return await self.agent.create_task_v1(task_request=task_request)
 
     async def get_task_v1(self, task_id: str) -> TaskResponse | None:
         return await self.agent.get_task(task_id=task_id)
