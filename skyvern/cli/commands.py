@@ -1,11 +1,13 @@
+from typing import Optional
+
 import shutil
 import subprocess
 import time
-from typing import Optional
-
+import os
+import json
 import typer
 
-from skyvern.utils import migrate_db
+from skyvern.utils import migrate_db, detect_os, get_windows_appdata_roaming
 
 app = typer.Typer()
 run_app = typer.Typer()
@@ -131,4 +133,41 @@ def migrate() -> None:
 
 @run_app.command(name="mcp")
 def run_mcp() -> None:
-    pass
+    host_system = detect_os()    
+    path_to_server = os.path.join(os.path.abspath("./skyvern/mcp"), "server.py")
+    path_to_env = input("Enter the full path to your configured python environment: ")
+    path_claude_config = "Claude/claude_desktop_config.json"    
+
+    # Setup command & args for Claude Desktop
+    env_vars = ""
+    for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]:
+        if key not in os.environ:
+            env_vars += f"{key}=" + input(f"Enter your {key}: ") + " "
+
+    if host_system == "wsl":
+        path_claude_config = os.path.join(get_windows_appdata_roaming(), path_claude_config)
+        env_vars += f'ENABLE_OPENAI=true LOG_LEVEL=CRITICAL ARTIFACT_STORAGE_PATH={os.path.join(os.path.abspath("./"), "artifacts")} BROWSER_TYPE=chromium-headless'
+        claude_command = "wsl.exe"
+        claude_args = ["bash", "-c", f"{env_vars} {path_to_env} {path_to_server}"]
+    elif host_system in ["linux", "darwin"]:
+        path_claude_config = os.path.join(os.path.abspath('~/'), path_claude_config)
+        env_vars += f'ENABLE_OPENAI=true LOG_LEVEL=CRITICAL ARTIFACT_STORAGE_PATH={os.path.join(os.path.abspath("./"), "artifacts")}'
+        claude_command = path_to_env
+        claude_args = [path_to_server]
+    else:
+        raise Exception(f"Unsupported host system: {host_system}")
+
+    if not os.path.exists(path_claude_config):
+        with open(path_claude_config, "w") as f:
+            json.dump({ "mcpServers" : {} }, f, indent=2)
+
+    with open(path_claude_config, "r") as f:
+        claude_config = json.load(f)
+        _ = claude_config["mcpServers"].pop("Skyvern", None)
+        claude_config["mcpServers"]["Skyvern"] = {
+            "command" : claude_command,
+            "args" : claude_args
+        }
+    
+    with open(path_claude_config, "w") as f:
+        json.dump(claude_config, f, indent=2)
