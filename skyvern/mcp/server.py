@@ -35,6 +35,5 @@ async def skyvern_v1(user_goal: str, url: str) -> dict:
         return {"status": "Task execution failed or returned no result"}
     return res.model_dump()["extracted_information"]
 
-
 if __name__ == "__main__":
     mcp.run(transport="stdio")
