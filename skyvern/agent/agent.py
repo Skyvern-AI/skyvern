@@ -1,10 +1,13 @@
 import asyncio
+import os
+import subprocess
 from typing import cast
 
 from dotenv import load_dotenv
 
 from skyvern.agent.client import SkyvernClient
 from skyvern.agent.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.core import security, skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -24,11 +27,46 @@ class SkyvernAgent:
         self,
         base_url: str | None = None,
         api_key: str | None = None,
+        cdp_url: str | None = None,
+        browser_path: str | None = None,
+        browser_type: str | None = None,
     ) -> None:
+        # _local_mode = True means the agent will be running in the local environment
+        # _local_mode = False means the agent runs in a remote skyvern service
         self._local_mode = True
         if base_url is None and api_key is None:
+            # TODO: run at the root whereveer the code is initiated
             load_dotenv(".env")
             migrate_db()
+            # TODO: will this change the already imported settings?
+            # TODO: maybe refresh the settings
+
+        self.cdp_url = cdp_url
+        if browser_path:
+            # TODO validate browser_path
+            # Supported Browsers: Google Chrome, Brave Browser, Microsoft Edge, Firefox
+            if "Chrome" in browser_path or "Brave" in browser_path or "Edge" in browser_path:
+                result = subprocess.Popen(
+                    ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "--remote-debugging-port=9222"]
+                )
+                if result.returncode != 0:
+                    raise Exception(f"Failed to open browser. browser_path: {browser_path}")
+
+                self.cdp_url = "http://127.0.0.1:9222"
+                settings.BROWSER_TYPE = "cdp-connect"
+                settings.BROWSER_REMOTE_DEBUGGING_URL = self.cdp_url
+            else:
+                raise ValueError(
+                    f"Unsupported browser or invalid path: {browser_path}. "
+                    "Here's a list of supported browsers Skyvern can connect to: Google Chrome, Brave Browser, Microsoft Edge, Firefox."
+                )
+        elif base_url is None and api_key is None:
+            if not browser_type:
+                if "BROWSER_TYPE" not in os.environ:
+                    raise Exception("browser type is missing")
+                browser_type = os.environ["BROWSER_TYPE"]
+
+            settings.BROWSER_TYPE = browser_type
         elif base_url and api_key:
             self.client = SkyvernClient(base_url=base_url, api_key=api_key)
             self._local_mode = False
