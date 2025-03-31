@@ -133,7 +133,6 @@ class SkyvernAgent:
             status=TaskV2Status.queued,
             organization_id=organization.organization_id,
         )
-
         assert task_v2.workflow_run_id
         await app.DATABASE.update_workflow_run(
             workflow_run_id=task_v2.workflow_run_id,
@@ -295,28 +294,23 @@ class SkyvernAgent:
                     proxy_location=proxy_location,
                 )
 
-                if wait_for_completion:
-                    created_task = await app.agent.create_task(task_request, organization.organization_id)
-                    url_hash = generate_url_hash(task_request.url)
-                    await app.DATABASE.create_task_run(
-                        task_run_type=RunType.task_v1,
-                        organization_id=organization.organization_id,
-                        run_id=created_task.task_id,
-                        title=task_request.title,
-                        url=task_request.url,
-                        url_hash=url_hash,
-                    )
-                    try:
-                        await self._run_task(organization, created_task)
-                        run_obj = await self.get_run(run_id=created_task.task_id)
-                        return cast(TaskRunResponse, run_obj)
-                    except Exception:
-                        # TODO: better error handling and logging
-                        run_obj = await self.get_run(run_id=created_task.task_id)
-                        return cast(TaskRunResponse, run_obj)
-                else:
-                    create_task_resp = await self.create_task_v1(task_request)
-                    run_obj = await self.get_run(run_id=create_task_resp.task_id)
+                created_task = await app.agent.create_task(task_request, organization.organization_id)
+                url_hash = generate_url_hash(task_request.url)
+                await app.DATABASE.create_task_run(
+                    task_run_type=RunType.task_v1,
+                    organization_id=organization.organization_id,
+                    run_id=created_task.task_id,
+                    title=task_request.title,
+                    url=task_request.url,
+                    url_hash=url_hash,
+                )
+                try:
+                    await self._run_task(organization, created_task)
+                    run_obj = await self.get_run(run_id=created_task.task_id)
+                    return cast(TaskRunResponse, run_obj)
+                except Exception:
+                    # TODO: better error handling and logging
+                    run_obj = await self.get_run(run_id=created_task.task_id)
                     return cast(TaskRunResponse, run_obj)
             elif engine == RunEngine.skyvern_v2:
                 # initialize task v2
@@ -336,14 +330,9 @@ class SkyvernAgent:
                     create_task_run=True,
                 )
 
-                if wait_for_completion:
-                    await self._run_task_v2(organization, task_v2)
-                    run_obj = await self.get_run(run_id=task_v2.observer_cruise_id)
-                    return cast(TaskRunResponse, run_obj)
-                else:
-                    asyncio.create_task(self._run_task_v2(organization, task_v2))
-                    run_obj = await self.get_run(run_id=task_v2.observer_cruise_id)
-                    return cast(TaskRunResponse, run_obj)
+                await self._run_task_v2(organization, task_v2)
+                run_obj = await self.get_run(run_id=task_v2.observer_cruise_id)
+                return cast(TaskRunResponse, run_obj)
             else:
                 raise ValueError("Local mode is not supported for this method")
 
