@@ -1,13 +1,16 @@
-from typing import Optional
-
+import json
+import os
 import shutil
 import subprocess
 import time
-import os
-import json
-import typer
+from typing import Optional
 
-from skyvern.utils import migrate_db, detect_os, get_windows_appdata_roaming
+import typer
+from dotenv import load_dotenv
+
+from skyvern.utils import detect_os, get_windows_appdata_roaming, migrate_db
+
+load_dotenv()
 
 app = typer.Typer()
 run_app = typer.Typer()
@@ -133,25 +136,44 @@ def migrate() -> None:
 
 @run_app.command(name="mcp")
 def run_mcp() -> None:
-    host_system = detect_os()    
+    host_system = detect_os()
     path_to_server = os.path.join(os.path.abspath("./skyvern/mcp"), "server.py")
-    path_to_env = input("Enter the full path to your configured python environment: ")
-    path_claude_config = "Claude/claude_desktop_config.json"    
+
+    # Try to get the python environment path using "which python"
+    python_path = shutil.which("python")
+    if python_path:
+        path_to_env = python_path
+    else:
+        path_to_env = typer.prompt("Enter the full path to your configured python environment")
+
+    path_claude_config = "Claude/claude_desktop_config.json"
 
     # Setup command & args for Claude Desktop
     env_vars = ""
     for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]:
-        if key not in os.environ:
-            env_vars += f"{key}=" + input(f"Enter your {key}: ") + " "
+        value = os.getenv(key)
+        if value is None:
+            value = typer.prompt(f"Enter your {key}")
+        env_vars += f"{key}={value} "
 
     if host_system == "wsl":
-        path_claude_config = os.path.join(get_windows_appdata_roaming(), path_claude_config)
-        env_vars += f'ENABLE_OPENAI=true LOG_LEVEL=CRITICAL ARTIFACT_STORAGE_PATH={os.path.join(os.path.abspath("./"), "artifacts")} BROWSER_TYPE=chromium-headless'
+        roaming_path = get_windows_appdata_roaming()
+        if roaming_path is None:
+            raise RuntimeError("Could not locate Windows AppData\\Roaming path from WSL")
+        path_claude_config = os.path.join(str(roaming_path), path_claude_config)
+        env_vars += (
+            f"ENABLE_OPENAI=true LOG_LEVEL=CRITICAL "
+            f"ARTIFACT_STORAGE_PATH={os.path.join(os.path.abspath('./'), 'artifacts')} "
+            f"BROWSER_TYPE=chromium-headless"
+        )
         claude_command = "wsl.exe"
         claude_args = ["bash", "-c", f"{env_vars} {path_to_env} {path_to_server}"]
     elif host_system in ["linux", "darwin"]:
-        path_claude_config = os.path.join(os.path.abspath('~/'), path_claude_config)
-        env_vars += f'ENABLE_OPENAI=true LOG_LEVEL=CRITICAL ARTIFACT_STORAGE_PATH={os.path.join(os.path.abspath("./"), "artifacts")}'
+        path_claude_config = os.path.join(os.path.abspath("~/"), path_claude_config)
+        env_vars += (
+            f"ENABLE_OPENAI=true LOG_LEVEL=CRITICAL "
+            f"ARTIFACT_STORAGE_PATH={os.path.join(os.path.abspath('./'), 'artifacts')}"
+        )
         claude_command = path_to_env
         claude_args = [path_to_server]
     else:
@@ -159,15 +181,14 @@ def run_mcp() -> None:
 
     if not os.path.exists(path_claude_config):
         with open(path_claude_config, "w") as f:
-            json.dump({ "mcpServers" : {} }, f, indent=2)
+            json.dump({"mcpServers": {}}, f, indent=2)
 
     with open(path_claude_config, "r") as f:
         claude_config = json.load(f)
-        _ = claude_config["mcpServers"].pop("Skyvern", None)
-        claude_config["mcpServers"]["Skyvern"] = {
-            "command" : claude_command,
-            "args" : claude_args
-        }
-    
+        claude_config["mcpServers"].pop("Skyvern", None)
+        claude_config["mcpServers"]["Skyvern"] = {"command": claude_command, "args": claude_args}
+
     with open(path_claude_config, "w") as f:
         json.dump(claude_config, f, indent=2)
+
+    print("Done! Do a hard restart of Claude Desktop to update your active configuration.")
