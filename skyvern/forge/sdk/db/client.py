@@ -2945,7 +2945,7 @@ class AgentDB:
             task_run = (await session.scalars(query)).first()
             return Run.model_validate(task_run) if task_run else None
 
-    async def get_task_run(
+    async def get_run(
         self,
         run_id: str,
         organization_id: str | None = None,
