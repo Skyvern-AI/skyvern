@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict
 from skyvern.schemas.runs import RunType
 
 
-class TaskRun(BaseModel):
+class Run(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     task_run_id: str
