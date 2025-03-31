@@ -1,7 +1,13 @@
 import asyncio
+import os
+import subprocess
+from typing import Any
 
 from dotenv import load_dotenv
 
+from skyvern.agent.client import SkyvernClient
+from skyvern.agent.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.core import security, skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -11,14 +17,58 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Request, TaskV2Statu
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.services import task_v2_service
+from skyvern.schemas.runs import ProxyLocation, RunEngine, RunResponse, TaskRunResponse
+from skyvern.services import run_service, task_v2_service
 from skyvern.utils import migrate_db
 
 
 class SkyvernAgent:
-    def __init__(self) -> None:
-        load_dotenv(".env")
-        migrate_db()
+    def __init__(
+        self,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        cdp_url: str | None = None,
+        browser_path: str | None = None,
+        browser_type: str | None = None,
+    ) -> None:
+        self.skyvern_client: SkyvernClient | None = None
+        if base_url is None and api_key is None:
+            # TODO: run at the root wherever the code is initiated
+            load_dotenv(".env")
+            migrate_db()
+            # TODO: will this change the already imported settings?
+            # TODO: maybe refresh the settings
+
+        self.cdp_url = cdp_url
+        if browser_path:
+            # TODO validate browser_path
+            # Supported Browsers: Google Chrome, Brave Browser, Microsoft Edge, Firefox
+            if "Chrome" in browser_path or "Brave" in browser_path or "Edge" in browser_path:
+                result = subprocess.Popen(
+                    ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "--remote-debugging-port=9222"]
+                )
+                if result.returncode != 0:
+                    raise Exception(f"Failed to open browser. browser_path: {browser_path}")
+
+                self.cdp_url = "http://127.0.0.1:9222"
+                settings.BROWSER_TYPE = "cdp-connect"
+                settings.BROWSER_REMOTE_DEBUGGING_URL = self.cdp_url
+            else:
+                raise ValueError(
+                    f"Unsupported browser or invalid path: {browser_path}. "
+                    "Here's a list of supported browsers Skyvern can connect to: Google Chrome, Brave Browser, Microsoft Edge, Firefox."
+                )
+        elif base_url is None and api_key is None:
+            if not browser_type:
+                if "BROWSER_TYPE" not in os.environ:
+                    raise Exception("browser type is missing")
+                browser_type = os.environ["BROWSER_TYPE"]
+
+            settings.BROWSER_TYPE = browser_type
+        elif base_url and api_key:
+            self.client = SkyvernClient(base_url=base_url, api_key=api_key)
+        else:
+            raise ValueError("base_url and api_key must be both provided")
 
     async def _get_organization(self) -> Organization:
         organization = await app.DATABASE.get_organization_by_domain("skyvern.local")
@@ -138,7 +188,7 @@ class SkyvernAgent:
             task=task, last_step=latest_step, failure_reason=failure_reason, need_browser_log=True
         )
 
-    async def run_task(
+    async def run_task_v1(
         self,
         task_request: TaskRequest,
         timeout_seconds: int = 600,
@@ -187,3 +237,69 @@ class SkyvernAgent:
                 if refreshed_task_v2.status.is_final():
                     return refreshed_task_v2
                 await asyncio.sleep(1)
+
+    ############### officially supported interfaces ###############
+    async def get_run(self, run_id: str) -> RunResponse | None:
+        if not self.client:
+            organization = await self._get_organization()
+            return await run_service.get_run_response(run_id, organization_id=organization.organization_id)
+
+        return await self.client.get_run(run_id)
+
+    async def run_task(
+        self,
+        prompt: str,
+        engine: RunEngine = RunEngine.skyvern_v1,
+        url: str | None = None,
+        webhook_url: str | None = None,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+        title: str | None = None,
+        error_code_mapping: dict[str, str] | None = None,
+        proxy_location: ProxyLocation | None = None,
+        max_steps: int | None = None,
+        wait_for_completion: bool = True,
+        timeout: float = DEFAULT_AGENT_TIMEOUT,
+        browser_session_id: str | None = None,
+    ) -> TaskRunResponse:
+        if not self.client:
+            raise ValueError("Local mode is not supported for this method")
+
+        task_run = await self.client.run_task(
+            prompt=prompt,
+            engine=engine,
+            url=url,
+            webhook_url=webhook_url,
+            totp_identifier=totp_identifier,
+            totp_url=totp_url,
+            title=title,
+            error_code_mapping=error_code_mapping,
+            proxy_location=proxy_location,
+            max_steps=max_steps,
+        )
+
+        if wait_for_completion:
+            async with asyncio.timeout(timeout):
+                while True:
+                    task_run = await self.client.get_run(task_run.run_id)
+                    if task_run.status.is_final():
+                        return task_run
+                    await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
+        return task_run
+
+    async def run_workflow(
+        self,
+        workflow_id: str,
+        parameters: dict[str, Any],
+        webhook_url: str | None = None,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+        title: str | None = None,
+        error_code_mapping: dict[str, str] | None = None,
+        proxy_location: ProxyLocation | None = None,
+        max_steps: int | None = None,
+        wait_for_completion: bool = True,
+        timeout: float = DEFAULT_AGENT_TIMEOUT,
+        browser_session_id: str | None = None,
+    ) -> None:
+        raise NotImplementedError("Running workflows is currently not supported with skyvern SDK.")

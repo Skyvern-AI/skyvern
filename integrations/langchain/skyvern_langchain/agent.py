@@ -46,7 +46,7 @@ class RunTask(SkyvernTaskBaseTool):
         if url is not None:
             task_request.url = url
 
-        return await self.agent.run_task(task_request=task_request, timeout_seconds=self.run_task_timeout_seconds)
+        return await self.agent.run_task_v1(task_request=task_request, timeout_seconds=self.run_task_timeout_seconds)
 
     async def _arun_task_v2(self, user_prompt: str, url: str | None = None) -> TaskV2:
         task_request = TaskV2Request(user_prompt=user_prompt, url=url)
