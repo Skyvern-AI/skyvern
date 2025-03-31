@@ -1,7 +1,7 @@
 import asyncio
 import os
 import subprocess
-from typing import cast
+from typing import Any, cast
 
 from dotenv import load_dotenv
 
@@ -304,3 +304,20 @@ class SkyvernAgent:
                         return task_run
                     await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
         return task_run
+
+    async def run_workflow(
+        self,
+        workflow_id: str,
+        parameters: dict[str, Any],
+        webhook_url: str | None = None,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+        title: str | None = None,
+        error_code_mapping: dict[str, str] | None = None,
+        proxy_location: ProxyLocation | None = None,
+        max_steps: int | None = None,
+        wait_for_completion: bool = True,
+        timeout: float = DEFAULT_AGENT_TIMEOUT,
+        browser_session_id: str | None = None,
+    ) -> None:
+        raise NotImplementedError("Running workflows is currently not supported with skyvern SDK.")
