@@ -101,16 +101,16 @@ class PersistentSessionsManager:
             await self.database.mark_persistent_browser_session_deleted(session_id, organization_id)
             self._browser_sessions.pop(session_id, None)
 
-    async def close_session(self, organization_id: str, session_id: str) -> None:
+    async def close_session(self, organization_id: str, browser_session_id: str) -> None:
         """Close a specific browser session."""
-        browser_session = self._browser_sessions.get(session_id)
+        browser_session = self._browser_sessions.get(browser_session_id)
         if browser_session:
             LOG.info(
                 "Closing browser session",
                 organization_id=organization_id,
-                session_id=session_id,
+                session_id=browser_session_id,
             )
-            self._browser_sessions.pop(session_id, None)
+            self._browser_sessions.pop(browser_session_id, None)
 
             try:
                 await browser_session.browser_state.close()
@@ -118,23 +118,23 @@ class PersistentSessionsManager:
                 LOG.info(
                     "Browser context already closed",
                     organization_id=organization_id,
-                    session_id=session_id,
+                    session_id=browser_session_id,
                 )
             except Exception:
                 LOG.warning(
                     "Error while closing browser session",
                     organization_id=organization_id,
-                    session_id=session_id,
+                    session_id=browser_session_id,
                     exc_info=True,
                 )
         else:
             LOG.info(
                 "Browser session not found in memory, marking as deleted in database",
                 organization_id=organization_id,
-                session_id=session_id,
+                session_id=browser_session_id,
             )
 
-        await self.database.mark_persistent_browser_session_deleted(session_id, organization_id)
+        await self.database.mark_persistent_browser_session_deleted(browser_session_id, organization_id)
 
     async def close_all_sessions(self, organization_id: str) -> None:
         """Close all browser sessions for an organization."""

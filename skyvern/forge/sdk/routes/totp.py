@@ -1,25 +1,25 @@
 import structlog
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import Depends, HTTPException
 
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.routes.routers import legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCode, TOTPCodeCreate
 from skyvern.forge.sdk.services import org_auth_service
 
 LOG = structlog.get_logger()
-totp_router = APIRouter()
 
 
-@totp_router.post(
-    "",
+@legacy_base_router.post(
+    "/totp",
     tags=["agent"],
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "send_totp_code",
     },
 )
-@totp_router.post("/", include_in_schema=False)
+@legacy_base_router.post("/totp/", include_in_schema=False)
 async def send_totp_code(
     data: TOTPCodeCreate, curr_org: Organization = Depends(org_auth_service.get_current_org)
 ) -> TOTPCode:
