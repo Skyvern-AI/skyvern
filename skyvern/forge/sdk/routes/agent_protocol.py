@@ -41,7 +41,6 @@ from skyvern.forge.sdk.schemas.organizations import (
     OrganizationUpdate,
 )
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration
-from skyvern.forge.sdk.schemas.task_runs import TaskRunType
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import (
     CreateTaskResponse,
@@ -71,7 +70,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowStatus,
 )
 from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
-from skyvern.schemas.runs import RunEngine, TaskRunRequest, TaskRunResponse
+from skyvern.schemas.runs import RunEngine, RunResponse, RunType, TaskRunRequest
 from skyvern.services import task_v1_service, task_v2_service
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.schemas import BrowserSessionResponse
@@ -445,7 +444,7 @@ async def get_runs(
 @base_router.get(
     "/runs/{run_id}",
     tags=["agent"],
-    response_model=TaskRunResponse,
+    response_model=RunResponse,
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_run",
@@ -453,13 +452,13 @@ async def get_runs(
 )
 @base_router.get(
     "/runs/{run_id}/",
-    response_model=TaskRunResponse,
+    response_model=RunResponse,
     include_in_schema=False,
 )
 async def get_run(
     run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> TaskRunResponse:
+) -> RunResponse:
     task_run_response = await task_run_service.get_task_run_response(
         run_id, organization_id=current_org.organization_id
     )
@@ -683,7 +682,7 @@ async def run_workflow(
         version=version,
     )
     await app.DATABASE.create_task_run(
-        task_run_type=TaskRunType.workflow_run,
+        task_run_type=RunType.workflow_run,
         organization_id=current_org.organization_id,
         run_id=workflow_run.workflow_run_id,
         title=workflow.title,
@@ -1512,7 +1511,7 @@ async def run_task(
     run_request: TaskRunRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
-) -> TaskRunResponse:
+) -> RunResponse:
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
 
@@ -1555,7 +1554,7 @@ async def run_task(
             background_tasks=background_tasks,
         )
         # build the task run response
-        return TaskRunResponse(
+        return RunResponse(
             run_id=task_v1_response.task_id,
             title=task_v1_response.title,
             status=str(task_v1_response.status),
@@ -1603,7 +1602,7 @@ async def run_task(
             max_steps_override=run_request.max_steps,
             browser_session_id=run_request.browser_session_id,
         )
-        return TaskRunResponse(
+        return RunResponse(
             run_id=task_v2.observer_cruise_id,
             title=run_request.title,
             status=str(task_v2.status),

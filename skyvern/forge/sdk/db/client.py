@@ -66,8 +66,8 @@ from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.schemas.runs import TaskRun
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
-from skyvern.forge.sdk.schemas.task_runs import TaskRun, TaskRunType
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
 from skyvern.forge.sdk.schemas.tasks import OrderBy, SortDirection, Task, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
@@ -91,7 +91,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.runs import ProxyLocation, RunType
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.actions.models import AgentStepOutput
 
@@ -2783,7 +2783,7 @@ class AgentDB:
 
     async def create_task_run(
         self,
-        task_run_type: TaskRunType,
+        task_run_type: RunType,
         organization_id: str,
         run_id: str,
         title: str | None = None,
@@ -2931,7 +2931,7 @@ class AgentDB:
             raise NotFoundError(f"TaskRun {run_id} not found")
 
     async def get_cached_task_run(
-        self, task_run_type: TaskRunType, url_hash: str | None = None, organization_id: str | None = None
+        self, task_run_type: RunType, url_hash: str | None = None, organization_id: str | None = None
     ) -> TaskRun | None:
         async with self.Session() as session:
             query = select(TaskRunModel)

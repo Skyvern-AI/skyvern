@@ -5,7 +5,7 @@ import httpx
 from skyvern.config import settings
 from skyvern.exceptions import SkyvernClientException
 from skyvern.forge.sdk.workflow.models.workflow import RunWorkflowResponse, WorkflowRunResponse
-from skyvern.schemas.runs import ProxyLocation, RunEngine, TaskRunResponse
+from skyvern.schemas.runs import ProxyLocation, RunEngine, RunResponse
 
 
 class SkyvernClient:
@@ -29,11 +29,11 @@ class SkyvernClient:
         error_code_mapping: dict[str, str] | None = None,
         proxy_location: ProxyLocation | None = None,
         max_steps: int | None = None,
-    ) -> TaskRunResponse:
+    ) -> RunResponse:
         if engine == RunEngine.skyvern_v1:
-            return TaskRunResponse()
+            return RunResponse()
         elif engine == RunEngine.skyvern_v2:
-            return TaskRunResponse()
+            return RunResponse()
         raise ValueError(f"Invalid engine: {engine}")
 
     async def run_workflow(
@@ -69,8 +69,8 @@ class SkyvernClient:
     async def get_run(
         self,
         run_id: str,
-    ) -> TaskRunResponse:
-        return TaskRunResponse()
+    ) -> RunResponse:
+        return RunResponse()
 
     async def get_workflow_run(
         self,

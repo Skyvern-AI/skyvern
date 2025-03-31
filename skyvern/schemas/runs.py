@@ -86,6 +86,12 @@ def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
     return None
 
 
+class RunType(StrEnum):
+    task_v1 = "task_v1"
+    task_v2 = "task_v2"
+    workflow_run = "workflow_run"
+
+
 class RunEngine(StrEnum):
     skyvern_v1 = "skyvern-1.0"
     skyvern_v2 = "skyvern-2.0"
@@ -101,12 +107,15 @@ class TaskRunStatus(StrEnum):
     completed = "completed"
     canceled = "canceled"
 
+    def is_final(self) -> bool:
+        return self in [self.failed, self.terminated, self.canceled, self.timed_out, self.completed]
+
 
 class TaskRunRequest(BaseModel):
     goal: str
     url: str | None = None
     title: str | None = None
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine = RunEngine.skyvern_v2
     proxy_location: ProxyLocation | None = None
     data_extraction_schema: dict | list | str | None = None
     error_code_mapping: dict[str, str] | None = None
@@ -126,7 +135,7 @@ class TaskRunRequest(BaseModel):
         return validate_url(url)
 
 
-class TaskRunResponse(BaseModel):
+class RunResponse(BaseModel):
     run_id: str
     engine: RunEngine = RunEngine.skyvern_v1
     status: TaskRunStatus
