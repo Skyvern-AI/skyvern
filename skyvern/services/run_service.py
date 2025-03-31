@@ -37,13 +37,15 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
         task_v2 = await app.DATABASE.get_task_v2(run.run_id, organization_id=organization_id)
         if not task_v2:
             return None
+        workflow_run = None
+        if task_v2.workflow_run_id:
+            workflow_run = await app.DATABASE.get_workflow_run(task_v2.workflow_run_id, organization_id=organization_id)
         return TaskRunResponse(
             run_id=run.run_id,
             run_type=run.task_run_type,
             status=task_v2.status,
             output=task_v2.output,
-            # TODO: add failure reason
-            # failure_reason=task_v2.failure_reason,
+            failure_reason=workflow_run.failure_reason if workflow_run else None,
             created_at=task_v2.created_at,
             modified_at=task_v2.modified_at,
             run_request=TaskRunRequest(
