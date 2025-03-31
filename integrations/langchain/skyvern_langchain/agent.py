@@ -12,6 +12,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.schemas.task_generations import TaskGenerationBase
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskRequest, TaskResponse
+from skyvern.schemas.runs import RunEngine, TaskRunResponse
 
 
 class SkyvernTaskBaseTool(BaseTool):
@@ -34,25 +35,11 @@ class RunTask(SkyvernTaskBaseTool):
     description: str = """Use Skyvern agent to run a task. This function won't return until the task is finished."""
     args_schema: Type[BaseModel] = CreateTaskInput
 
-    async def _arun(self, user_prompt: str, url: str | None = None) -> TaskResponse | TaskV2:
+    async def _arun(self, user_prompt: str, url: str | None = None) -> TaskRunResponse:
         if self.engine == "TaskV1":
-            return await self._arun_task_v1(user_prompt=user_prompt, url=url)
+            return await self.agent.run_task(prompt=user_prompt, url=url, engine=RunEngine.skyvern_v1)
         else:
-            return await self._arun_task_v2(user_prompt=user_prompt, url=url)
-
-    async def _arun_task_v1(self, user_prompt: str, url: str | None = None) -> TaskResponse:
-        task_generation = await self._generate_v1_task_request(user_prompt=user_prompt)
-        task_request = TaskRequest.model_validate(task_generation, from_attributes=True)
-        if url is not None:
-            task_request.url = url
-
-        return await self.agent.run_task_v1(task_request=task_request, timeout_seconds=self.run_task_timeout_seconds)
-
-    async def _arun_task_v2(self, user_prompt: str, url: str | None = None) -> TaskV2:
-        task_request = TaskV2Request(user_prompt=user_prompt, url=url)
-        return await self.agent.run_observer_task_v_2(
-            task_request=task_request, timeout_seconds=self.run_task_timeout_seconds
-        )
+            return await self.agent.run_task(prompt=user_prompt, url=url, engine=RunEngine.skyvern_v2)
 
 
 class DispatchTask(SkyvernTaskBaseTool):
