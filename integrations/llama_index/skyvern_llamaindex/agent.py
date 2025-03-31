@@ -112,7 +112,7 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         if url is not None:
             task_request.url = url
 
-        return await self.agent.create_task(task_request=task_request)
+        return await self.agent.create_task_v1(task_request=task_request)
 
     async def get_task_v1(self, task_id: str) -> TaskResponse | None:
         return await self.agent.get_task(task_id=task_id)

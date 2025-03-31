@@ -1,7 +1,7 @@
 import asyncio
 import os
 import subprocess
-from typing import Any
+from typing import Any, cast
 
 from dotenv import load_dotenv
 
@@ -10,6 +10,7 @@ from skyvern.agent.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AG
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.core import security, skyvern_context
+from skyvern.forge.sdk.core.hashing import generate_url_hash
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -17,8 +18,8 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Request, TaskV2Statu
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.schemas.runs import ProxyLocation, RunEngine, RunResponse, TaskRunResponse
-from skyvern.services import run_service, task_v2_service
+from skyvern.schemas.runs import ProxyLocation, RunEngine, RunResponse, RunType, TaskRunResponse
+from skyvern.services import run_service, task_v1_service, task_v2_service
 from skyvern.utils import migrate_db
 
 
@@ -91,7 +92,7 @@ class SkyvernAgent:
             )
         return organization
 
-    async def _run_task(self, organization: Organization, task: Task) -> None:
+    async def _run_task(self, organization: Organization, task: Task, max_steps: int | None = None) -> None:
         org_auth_token = await app.DATABASE.get_valid_org_auth_token(
             organization_id=organization.organization_id,
             token_type=OrganizationAuthTokenType.api,
@@ -108,13 +109,23 @@ class SkyvernAgent:
             status=TaskStatus.running,
             organization_id=organization.organization_id,
         )
+        try:
+            skyvern_context.set(
+                SkyvernContext(
+                    organization_id=organization.organization_id,
+                    task_id=task.task_id,
+                    max_steps_override=max_steps,
+                )
+            )
 
-        step, _, _ = await app.agent.execute_step(
-            organization=organization,
-            task=updated_task,
-            step=step,
-            api_key=org_auth_token.token if org_auth_token else None,
-        )
+            step, _, _ = await app.agent.execute_step(
+                organization=organization,
+                task=updated_task,
+                step=step,
+                api_key=org_auth_token.token if org_auth_token else None,
+            )
+        finally:
+            skyvern_context.reset()
 
     async def _run_task_v2(self, organization: Organization, task_v2: TaskV2) -> None:
         # mark task v2 as queued
@@ -135,22 +146,15 @@ class SkyvernAgent:
             task_v2_id=task_v2.observer_cruise_id,
         )
 
-    async def create_task(
+    async def create_task_v1(
         self,
         task_request: TaskRequest,
     ) -> CreateTaskResponse:
         organization = await self._get_organization()
 
         created_task = await app.agent.create_task(task_request, organization.organization_id)
-        skyvern_context.set(
-            SkyvernContext(
-                organization_id=organization.organization_id,
-                task_id=created_task.task_id,
-                max_steps_override=created_task.max_steps_per_run,
-            )
-        )
 
-        asyncio.create_task(self._run_task(organization, created_task))
+        asyncio.create_task(self._run_task(organization, created_task, max_steps=task_request.max_steps_per_run))
         return CreateTaskResponse(task_id=created_task.task_id)
 
     async def get_task(
@@ -193,7 +197,7 @@ class SkyvernAgent:
         task_request: TaskRequest,
         timeout_seconds: int = 600,
     ) -> TaskResponse:
-        created_task = await self.create_task(task_request)
+        created_task = await self.create_task_v1(task_request)
 
         async with asyncio.timeout(timeout_seconds):
             while True:
@@ -256,6 +260,7 @@ class SkyvernAgent:
         totp_url: str | None = None,
         title: str | None = None,
         error_code_mapping: dict[str, str] | None = None,
+        data_extraction_schema: dict[str, Any] | None = None,
         proxy_location: ProxyLocation | None = None,
         max_steps: int | None = None,
         wait_for_completion: bool = True,
@@ -263,7 +268,85 @@ class SkyvernAgent:
         browser_session_id: str | None = None,
     ) -> TaskRunResponse:
         if not self.client:
-            raise ValueError("Local mode is not supported for this method")
+            if engine == RunEngine.skyvern_v1:
+                data_extraction_goal = None
+                data_extraction_schema = data_extraction_schema
+                navigation_goal = prompt
+                navigation_payload = None
+                organization = await self._get_organization()
+                if not url:
+                    task_generation = await task_v1_service.generate_task(
+                        user_prompt=prompt,
+                        organization=organization,
+                    )
+                    url = task_generation.url
+                    navigation_goal = task_generation.navigation_goal or prompt
+                    navigation_payload = task_generation.navigation_payload
+                    data_extraction_goal = task_generation.data_extraction_goal
+                    data_extraction_schema = data_extraction_schema or task_generation.extracted_information_schema
+
+                task_request = TaskRequest(
+                    title=title,
+                    url=url,
+                    navigation_goal=navigation_goal,
+                    navigation_payload=navigation_payload,
+                    data_extraction_goal=data_extraction_goal,
+                    extracted_information_schema=data_extraction_schema,
+                    error_code_mapping=error_code_mapping,
+                    proxy_location=proxy_location,
+                )
+
+                if wait_for_completion:
+                    created_task = await app.agent.create_task(task_request, organization.organization_id)
+                    url_hash = generate_url_hash(task_request.url)
+                    await app.DATABASE.create_task_run(
+                        task_run_type=RunType.task_v1,
+                        organization_id=organization.organization_id,
+                        run_id=created_task.task_id,
+                        title=task_request.title,
+                        url=task_request.url,
+                        url_hash=url_hash,
+                    )
+                    try:
+                        await self._run_task(organization, created_task)
+                        run_obj = await self.get_run(run_id=created_task.task_id)
+                        return cast(TaskRunResponse, run_obj)
+                    except Exception:
+                        # TODO: better error handling and logging
+                        run_obj = await self.get_run(run_id=created_task.task_id)
+                        return cast(TaskRunResponse, run_obj)
+                else:
+                    create_task_resp = await self.create_task_v1(task_request)
+                    run_obj = await self.get_run(run_id=create_task_resp.task_id)
+                    return cast(TaskRunResponse, run_obj)
+            elif engine == RunEngine.skyvern_v2:
+                # initialize task v2
+                organization = await self._get_organization()
+
+                task_v2 = await task_v2_service.initialize_task_v2(
+                    organization=organization,
+                    user_prompt=prompt,
+                    user_url=url,
+                    totp_identifier=totp_identifier,
+                    totp_verification_url=totp_url,
+                    webhook_callback_url=webhook_url,
+                    proxy_location=proxy_location,
+                    publish_workflow=False,
+                    extracted_information_schema=data_extraction_schema,
+                    error_code_mapping=error_code_mapping,
+                    create_task_run=True,
+                )
+
+                if wait_for_completion:
+                    await self._run_task_v2(organization, task_v2)
+                    run_obj = await self.get_run(run_id=task_v2.observer_cruise_id)
+                    return cast(TaskRunResponse, run_obj)
+                else:
+                    asyncio.create_task(self._run_task_v2(organization, task_v2))
+                    run_obj = await self.get_run(run_id=task_v2.observer_cruise_id)
+                    return cast(TaskRunResponse, run_obj)
+            else:
+                raise ValueError("Local mode is not supported for this method")
 
         task_run = await self.client.run_task(
             prompt=prompt,

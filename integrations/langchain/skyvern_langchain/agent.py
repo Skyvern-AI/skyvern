@@ -72,7 +72,7 @@ class DispatchTask(SkyvernTaskBaseTool):
         if url is not None:
             task_request.url = url
 
-        return await self.agent.create_task(task_request=task_request)
+        return await self.agent.create_task_v1(task_request=task_request)
 
     async def _arun_task_v2(self, user_prompt: str, url: str | None = None) -> TaskV2:
         task_request = TaskV2Request(user_prompt=user_prompt, url=url)
