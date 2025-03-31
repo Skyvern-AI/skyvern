@@ -1,9 +1,9 @@
 from skyvern.forge import app
-from skyvern.forge.sdk.schemas.runs import TaskRun
+from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.schemas.runs import RunEngine, RunResponse, RunType
 
 
-async def get_task_run(run_id: str, organization_id: str | None = None) -> TaskRun | None:
+async def get_task_run(run_id: str, organization_id: str | None = None) -> Run | None:
     return await app.DATABASE.get_task_run(run_id, organization_id=organization_id)
 
 
