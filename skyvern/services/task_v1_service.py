@@ -12,8 +12,8 @@ from skyvern.forge.sdk.core.hashing import generate_url_hash
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration, TaskGenerationBase
-from skyvern.forge.sdk.schemas.task_runs import TaskRunType
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest
+from skyvern.schemas.runs import RunType
 
 LOG = structlog.get_logger()
 
@@ -84,7 +84,7 @@ async def run_task(
     created_task = await app.agent.create_task(task, organization.organization_id)
     url_hash = generate_url_hash(task.url)
     await app.DATABASE.create_task_run(
-        task_run_type=TaskRunType.task_v1,
+        task_run_type=RunType.task_v1,
         organization_id=organization.organization_id,
         run_id=created_task.task_id,
         title=task.title,

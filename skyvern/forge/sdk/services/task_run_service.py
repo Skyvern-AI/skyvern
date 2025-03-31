@@ -1,23 +1,23 @@
 from skyvern.forge import app
-from skyvern.forge.sdk.schemas.task_runs import TaskRun, TaskRunType
-from skyvern.schemas.runs import RunEngine, TaskRunResponse
+from skyvern.forge.sdk.schemas.runs import TaskRun
+from skyvern.schemas.runs import RunEngine, RunResponse, RunType
 
 
 async def get_task_run(run_id: str, organization_id: str | None = None) -> TaskRun | None:
     return await app.DATABASE.get_task_run(run_id, organization_id=organization_id)
 
 
-async def get_task_run_response(run_id: str, organization_id: str | None = None) -> TaskRunResponse | None:
+async def get_task_run_response(run_id: str, organization_id: str | None = None) -> RunResponse | None:
     task_run = await get_task_run(run_id, organization_id=organization_id)
     if not task_run:
         return None
 
-    if task_run.task_run_type == TaskRunType.task_v1:
+    if task_run.task_run_type == RunType.task_v1:
         # fetch task v1 from db and transform to task run response
         task_v1 = await app.DATABASE.get_task(task_run.task_v1_id, organization_id=organization_id)
         if not task_v1:
             return None
-        return TaskRunResponse(
+        return RunResponse(
             run_id=task_run.run_id,
             engine=RunEngine.skyvern_v1,
             status=task_v1.status,
@@ -32,11 +32,11 @@ async def get_task_run_response(run_id: str, organization_id: str | None = None)
             created_at=task_v1.created_at,
             modified_at=task_v1.modified_at,
         )
-    elif task_run.task_run_type == TaskRunType.task_v2:
+    elif task_run.task_run_type == RunType.task_v2:
         task_v2 = await app.DATABASE.get_task_v2(task_run.task_v2_id, organization_id=organization_id)
         if not task_v2:
             return None
-        return TaskRunResponse(
+        return RunResponse(
             run_id=task_run.run_id,
             engine=RunEngine.skyvern_v2,
             status=task_v2.status,

@@ -13,6 +13,7 @@ tracer.configure(
 setup_logger()
 
 
+from skyvern.forge import app  # noqa: E402, F401
 from skyvern.agent import SkyvernAgent, SkyvernClient  # noqa: E402
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunResponse  # noqa: E402
 

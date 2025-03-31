@@ -1,20 +1,15 @@
 from datetime import datetime
-from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
-
-class TaskRunType(StrEnum):
-    task_v1 = "task_v1"
-    task_v2 = "task_v2"
-    workflow_run = "workflow_run"
+from skyvern.schemas.runs import RunType
 
 
 class TaskRun(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     task_run_id: str
-    task_run_type: TaskRunType
+    task_run_type: RunType
     run_id: str
     organization_id: str | None = None
     title: str | None = None
