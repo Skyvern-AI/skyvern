@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
 import aiofiles
-import httpx
 import structlog
 from playwright.async_api import BrowserContext, ConsoleMessage, Download, Page, Playwright
 from pydantic import BaseModel, PrivateAttr
@@ -359,21 +358,7 @@ async def _create_cdp_connection_browser(
         har_path=browser_args["record_har_path"],
     )
 
-    remote_browser_url = None
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"{settings.BROWSER_REMOTE_DEBUGGING_URL}/json/version")
-            remote_browser_url = response.json().get("webSocketDebuggerUrl")
-    except Exception:
-        raise Exception(
-            f"Cannot find the webSocketDebuggerUrl from the browser remote debugging {settings.BROWSER_REMOTE_DEBUGGING_URL}"
-        )
-
-    if not remote_browser_url:
-        raise Exception(
-            f"Cannot find the webSocketDebuggerUrl from the browser remote debugging {settings.BROWSER_REMOTE_DEBUGGING_URL}"
-        )
-
+    remote_browser_url = settings.BROWSER_REMOTE_DEBUGGING_URL
     LOG.info("Connecting browser CDP connection", remote_browser_url=remote_browser_url)
     browser = await playwright.chromium.connect_over_cdp(remote_browser_url)
 
