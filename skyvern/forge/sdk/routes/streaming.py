@@ -3,21 +3,21 @@ import base64
 from datetime import datetime
 
 import structlog
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 from websockets.exceptions import ConnectionClosedOK
 
 from skyvern.forge import app
+from skyvern.forge.sdk.routes.routers import legacy_base_router
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.org_auth_service import get_current_org
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 
 LOG = structlog.get_logger()
-websocket_router = APIRouter()
 STREAMING_TIMEOUT = 300
 
 
-@websocket_router.websocket("/tasks/{task_id}")
+@legacy_base_router.websocket("/stream/tasks/{task_id}")
 async def task_stream(
     websocket: WebSocket,
     task_id: str,
@@ -119,7 +119,7 @@ async def task_stream(
     return
 
 
-@websocket_router.websocket("/workflow_runs/{workflow_run_id}")
+@legacy_base_router.websocket("/stream/workflow_runs/{workflow_run_id}")
 async def workflow_run_streaming(
     websocket: WebSocket,
     workflow_run_id: str,
