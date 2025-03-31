@@ -17,6 +17,7 @@ class ParameterType(StrEnum):
     BITWARDEN_SENSITIVE_INFORMATION = "bitwarden_sensitive_information"
     BITWARDEN_CREDIT_CARD_DATA = "bitwarden_credit_card_data"
     OUTPUT = "output"
+    CREDENTIAL = "credential"
 
 
 class Parameter(BaseModel, abc.ABC):
@@ -55,10 +56,26 @@ class BitwardenLoginCredentialParameter(Parameter):
     bitwarden_client_secret_aws_secret_key: str
     bitwarden_master_password_aws_secret_key: str
     # url to request the login credentials from bitwarden
-    url_parameter_key: str
+    url_parameter_key: str | None = None
     # bitwarden collection id to filter the login credentials from,
     # if not provided, no filtering will be done
     bitwarden_collection_id: str | None = None
+    # bitwarden item id to request the login credential
+    bitwarden_item_id: str | None = None
+
+    created_at: datetime
+    modified_at: datetime
+    deleted_at: datetime | None = None
+
+
+class CredentialParameter(Parameter):
+    model_config = ConfigDict(from_attributes=True)
+    parameter_type: Literal[ParameterType.CREDENTIAL] = ParameterType.CREDENTIAL
+
+    credential_parameter_id: str
+    workflow_id: str
+
+    credential_id: str
 
     created_at: datetime
     modified_at: datetime
@@ -115,6 +132,7 @@ class WorkflowParameterType(StrEnum):
     BOOLEAN = "boolean"
     JSON = "json"
     FILE_URL = "file_url"
+    CREDENTIAL_ID = "credential_id"
 
     def convert_value(self, value: Any) -> str | int | float | bool | dict | list | None:
         if value is None:
@@ -130,12 +148,14 @@ class WorkflowParameterType(StrEnum):
                 if isinstance(value, bool):
                     return value
                 lower_case = str(value).lower()
-                if lower_case in ["true", "false", "1", "0"]:
+                if lower_case not in ["true", "false", "1", "0"]:
                     raise InvalidWorkflowParameter(expected_parameter_type=self, value=str(value))
                 return lower_case in ["true", "1"]
             elif self == WorkflowParameterType.JSON:
                 return json.loads(value)
             elif self == WorkflowParameterType.FILE_URL:
+                return value
+            elif self == WorkflowParameterType.CREDENTIAL_ID:
                 return value
         except Exception:
             raise InvalidWorkflowParameter(expected_parameter_type=self, value=str(value))
@@ -182,5 +202,6 @@ ParameterSubclasses = Union[
     BitwardenSensitiveInformationParameter,
     BitwardenCreditCardDataParameter,
     OutputParameter,
+    CredentialParameter,
 ]
 PARAMETER_TYPE = Annotated[ParameterSubclasses, Field(discriminator="parameter_type")]

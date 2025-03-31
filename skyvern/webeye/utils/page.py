@@ -47,6 +47,10 @@ class SkyvernFrame:
             raise TimeoutError("timeout to evaluate expression")
 
     @staticmethod
+    async def get_url(frame: Page | Frame) -> str:
+        return await SkyvernFrame.evaluate(frame=frame, expression="() => document.location.href")
+
+    @staticmethod
     async def take_screenshot(
         page: Page,
         full_page: bool = False,
@@ -65,6 +69,7 @@ class SkyvernFrame:
                     path=file_path,
                     full_page=full_page,
                     timeout=timeout,
+                    animations="disabled",
                 )
             else:
                 screenshot = await page.screenshot(
@@ -95,12 +100,16 @@ class SkyvernFrame:
         max_number: int = settings.MAX_NUM_SCREENSHOTS,
     ) -> List[bytes]:
         skyvern_page = await SkyvernFrame.create_instance(frame=page)
+
+        # page is the main frame and the index must be 0
         assert isinstance(skyvern_page.frame, Page)
+        frame = "main.frame"
+        frame_index = 0
 
         screenshots: List[bytes] = []
         if await skyvern_page.is_window_scrollable():
             scroll_y_px_old = -30.0
-            scroll_y_px = await skyvern_page.scroll_to_top(draw_boxes=draw_boxes)
+            scroll_y_px = await skyvern_page.scroll_to_top(draw_boxes=draw_boxes, frame=frame, frame_index=frame_index)
             # Checking max number of screenshots to prevent infinite loop
             # We are checking the difference between the old and new scroll_y_px to determine if we have reached the end of the
             # page. If the difference is less than 25, we assume we have reached the end of the page.
@@ -109,7 +118,9 @@ class SkyvernFrame:
                 screenshots.append(screenshot)
                 scroll_y_px_old = scroll_y_px
                 LOG.debug("Scrolling to next page", url=url, num_screenshots=len(screenshots))
-                scroll_y_px = await skyvern_page.scroll_to_next_page(draw_boxes=draw_boxes)
+                scroll_y_px = await skyvern_page.scroll_to_next_page(
+                    draw_boxes=draw_boxes, frame=frame, frame_index=frame_index
+                )
                 LOG.debug(
                     "Scrolled to next page",
                     scroll_y_px=scroll_y_px,
@@ -117,13 +128,13 @@ class SkyvernFrame:
                 )
             if draw_boxes:
                 await skyvern_page.remove_bounding_boxes()
-            await skyvern_page.scroll_to_top(draw_boxes=False)
+            await skyvern_page.scroll_to_top(draw_boxes=False, frame=frame, frame_index=frame_index)
             # wait until animation ends, which is triggered by scrolling
             LOG.debug("Waiting for 2 seconds until animation ends.")
             await asyncio.sleep(2)
         else:
             if draw_boxes:
-                await skyvern_page.build_elements_and_draw_bounding_boxes()
+                await skyvern_page.build_elements_and_draw_bounding_boxes(frame=frame, frame_index=frame_index)
 
             LOG.debug("Page is not scrollable", url=url, num_screenshots=len(screenshots))
             screenshot = await SkyvernFrame.take_screenshot(page=skyvern_page.frame, full_page=False)
@@ -167,7 +178,7 @@ class SkyvernFrame:
         return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
 
     async def parse_element_from_html(self, frame: str, element: ElementHandle, interactable: bool) -> Dict:
-        js_script = "([frame, element, interactable]) => buildElementObject(frame, element, interactable)"
+        js_script = "async ([frame, element, interactable]) => await buildElementObject(frame, element, interactable)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=[frame, element, interactable])
 
     async def get_element_scrollable(self, element: ElementHandle) -> bool:
@@ -186,29 +197,35 @@ class SkyvernFrame:
         js_script = "(element) => getBlockElementUniqueID(element)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
 
-    async def scroll_to_top(self, draw_boxes: bool) -> float:
+    async def scroll_to_top(self, draw_boxes: bool, frame: str, frame_index: int) -> float:
         """
         Scroll to the top of the page and take a screenshot.
         :param drow_boxes: If True, draw bounding boxes around the elements.
         :param page: Page instance to take the screenshot from.
         :return: Screenshot of the page.
         """
-        js_script = f"() => scrollToTop({str(draw_boxes).lower()})"
+        js_script = "async ([draw_boxes, frame, frame_index]) => await safeScrollToTop(draw_boxes, frame, frame_index)"
         scroll_y_px = await self.evaluate(
-            frame=self.frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+            frame=self.frame,
+            expression=js_script,
+            timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS,
+            arg=[draw_boxes, frame, frame_index],
         )
         return scroll_y_px
 
-    async def scroll_to_next_page(self, draw_boxes: bool) -> float:
+    async def scroll_to_next_page(self, draw_boxes: bool, frame: str, frame_index: int) -> float:
         """
         Scroll to the next page and take a screenshot.
         :param drow_boxes: If True, draw bounding boxes around the elements.
         :param page: Page instance to take the screenshot from.
         :return: Screenshot of the page.
         """
-        js_script = f"() => scrollToNextPage({str(draw_boxes).lower()})"
+        js_script = "async ([draw_boxes, frame, frame_index]) => await scrollToNextPage(draw_boxes, frame, frame_index)"
         scroll_y_px = await self.evaluate(
-            frame=self.frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+            frame=self.frame,
+            expression=js_script,
+            timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS,
+            arg=[draw_boxes, frame, frame_index],
         )
         return scroll_y_px
 
@@ -220,9 +237,14 @@ class SkyvernFrame:
         js_script = "() => removeBoundingBoxes()"
         await self.evaluate(frame=self.frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS)
 
-    async def build_elements_and_draw_bounding_boxes(self) -> None:
-        js_script = "() => buildElementsAndDrawBoundingBoxes()"
-        await self.evaluate(frame=self.frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS)
+    async def build_elements_and_draw_bounding_boxes(self, frame: str, frame_index: int) -> None:
+        js_script = "async ([frame, frame_index]) => await buildElementsAndDrawBoundingBoxes(frame, frame_index)"
+        await self.evaluate(
+            frame=self.frame,
+            expression=js_script,
+            timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS,
+            arg=[frame, frame_index],
+        )
 
     async def is_window_scrollable(self) -> bool:
         js_script = "() => isWindowScrollable()"

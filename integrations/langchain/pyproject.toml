@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "skyvern-langchain"
+version = "0.1.6"
+description = ""
+authors = ["lawyzheng <lawy@skyvern.com>"]
+packages = [{ include = "skyvern_langchain" }]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11,<3.12"
+skyvern = "^0.1.56"
+langchain = "^0.3.19"
+
+
+[tool.poetry.group.dev.dependencies]
+twine = "^6.1.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

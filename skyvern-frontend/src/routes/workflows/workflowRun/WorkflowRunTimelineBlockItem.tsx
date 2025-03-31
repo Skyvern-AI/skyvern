@@ -8,8 +8,12 @@ import { workflowBlockTitle } from "../editor/nodes/types";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
 import {
   isAction,
+  isBlockItem,
+  isObserverThought,
+  isThoughtItem,
   isWorkflowRunBlock,
   WorkflowRunBlock,
+  WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
 import { ActionCard } from "./ActionCard";
 import {
@@ -21,21 +25,24 @@ import { isTaskVariantBlock } from "../types/workflowTypes";
 import { Link } from "react-router-dom";
 import { useCallback } from "react";
 import { Status } from "@/api/types";
-
+import { ThoughtCard } from "./ThoughtCard";
+import { ObserverThought } from "../types/workflowRunTypes";
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
   block: WorkflowRunBlock;
-  subBlocks: Array<WorkflowRunBlock>;
+  subItems: Array<WorkflowRunTimelineItem>;
   onBlockItemClick: (block: WorkflowRunBlock) => void;
   onActionClick: (action: ActionItem) => void;
+  onThoughtCardClick: (thought: ObserverThought) => void;
 };
 
 function WorkflowRunTimelineBlockItem({
   activeItem,
   block,
-  subBlocks,
+  subItems,
   onBlockItemClick,
   onActionClick,
+  onThoughtCardClick,
 }: Props) {
   const actions = block.actions ?? [];
 
@@ -97,24 +104,32 @@ function WorkflowRunTimelineBlockItem({
       <div className="space-y-2">
         <div className="flex justify-between">
           <div className="flex gap-3">
-            <WorkflowBlockIcon
-              workflowBlockType={block.block_type}
-              className="size-6"
-            />
-            <span>{workflowBlockTitle[block.block_type]}</span>
+            <div className="rounded bg-slate-elevation5 p-2">
+              <WorkflowBlockIcon
+                workflowBlockType={block.block_type}
+                className="size-6"
+              />
+            </div>
+
+            <div className="flex flex-col gap-1">
+              <span className="text-sm">
+                {workflowBlockTitle[block.block_type]}
+              </span>
+              <span className="text-xs text-slate-400">{block.label}</span>
+            </div>
           </div>
           <div className="flex gap-2">
             {showFailureIndicator && (
-              <div className="bg-slate-elevation5 px-2 py-1">
+              <div className="self-start rounded bg-slate-elevation5 px-2 py-1">
                 <CrossCircledIcon className="size-4 text-destructive" />
               </div>
             )}
             {showSuccessIndicator && (
-              <div className="bg-slate-elevation5 px-2 py-1">
+              <div className="self-start rounded bg-slate-elevation5 px-2 py-1">
                 <CheckCircledIcon className="size-4 text-success" />
               </div>
             )}
-            <div className="flex items-center gap-1 rounded bg-slate-elevation5 px-2 py-1">
+            <div className="flex gap-1 self-start rounded bg-slate-elevation5 px-2 py-1">
               {showDiagnosticLink ? (
                 <Link to={`/tasks/${block.task_id}/diagnostics`}>
                   <div className="flex gap-1">
@@ -156,17 +171,33 @@ function WorkflowRunTimelineBlockItem({
           />
         );
       })}
-      {subBlocks.map((block) => {
-        return (
-          <WorkflowRunTimelineBlockItem
-            key={block.workflow_run_block_id}
-            block={block}
-            activeItem={activeItem}
-            onActionClick={onActionClick}
-            onBlockItemClick={onBlockItemClick}
-            subBlocks={[]}
-          />
-        );
+      {subItems.map((item) => {
+        if (isBlockItem(item)) {
+          return (
+            <WorkflowRunTimelineBlockItem
+              key={item.block.workflow_run_block_id}
+              subItems={item.children}
+              activeItem={activeItem}
+              block={item.block}
+              onActionClick={onActionClick}
+              onBlockItemClick={onBlockItemClick}
+              onThoughtCardClick={onThoughtCardClick}
+            />
+          );
+        }
+        if (isThoughtItem(item)) {
+          return (
+            <ThoughtCard
+              key={item.thought.thought_id}
+              active={
+                isObserverThought(activeItem) &&
+                activeItem.thought_id === item.thought.thought_id
+              }
+              onClick={onThoughtCardClick}
+              thought={item.thought}
+            />
+          );
+        }
       })}
     </div>
   );

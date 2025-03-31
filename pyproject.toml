@@ -1,25 +1,23 @@
 [tool.poetry]
 name = "skyvern"
-version = "0.1.0"
+version = "0.1.64"
 description = ""
 authors = ["Skyvern AI <info@skyvern.com>"]
 readme = "README.md"
-packages = [{ include = "skyvern" }]
+packages = [{ include = "skyvern" }, { include = "alembic" }]
 
 [tool.poetry.dependencies]
 python = "^3.11,<3.12"
 python-dotenv = "^1.0.0"
-openai = "<2.0"
+openai = "<1.68"
 sqlalchemy = {extras = ["mypy"], version = "^2.0.29"}
 aiohttp = "^3.8.5"
 python-multipart = "^0.0.6"
 toml = "^0.10.2"
 jinja2 = "^3.1.2"
 uvicorn = {extras = ["standard"], version = "^0.24.0.post1"}
-litellm = "1.59.1"
-selenium = "^4.13.0"
+litellm = "^1.63.12"
 playwright = "1.46.0"
-pre-commit = "^3.5.0"
 pillow = "^10.1.0"
 starlette-context = "^0.3.6"
 ddtrace = "^2.3.2"
@@ -35,7 +33,7 @@ commentjson = "^0.9.0"
 asyncache = "^0.3.1"
 orjson = "^3.9.10"
 structlog = "^23.2.0"
-typer = "^0.9.0"
+typer = ">=0.9.0,<1.0"
 types-toml = "^0.10.8.7"
 httpx = {version = "^0.27.0", extras = ["socks"]}
 filetype = "^1.2.0"
@@ -57,7 +55,6 @@ pypdf = "^5.1.0"
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"
-pre-commit = "^3.3.3"
 mypy = "^1.4.1"
 flake8 = "^6.0.0"
 types-requests = "^2.31.0.2"
@@ -76,6 +73,10 @@ snoop = "^0.4.3"
 rich = {extras = ["jupyter"], version = "^13.7.0"}
 fpdf = "^1.7.2"
 pypdf = "^5.0.1"
+twine = "^6.1.0"
+build = "^1.2.2.post1"
+pandas = "^2.2.3"
+pre-commit = "^4.2.0"
 
 
 [build-system]
@@ -129,3 +130,14 @@ skip = ["webeye/actions/__init__.py", "forge/sdk/__init__.py"]
 
 [tool.mypy]
 plugins = "sqlalchemy.ext.mypy.plugin"
+
+[tool.poetry.scripts]
+skyvern = "skyvern.cli.commands:app"
+
+[tool.codeflash]                                                                                                                                                                                                                                                                                                             
+# All paths are relative to this pyproject.toml's directory.                                                                                                                                                                                                                                                                 
+module-root = "skyvern"                                                                                                                                                                                                                                                                                                      
+tests-root = "codeflash-tests"                                                                                                                                                                                                                                                                                                         
+test-framework = "pytest"                                                                                                                                                                                                                                                                                                    
+ignore-paths = ["skyvern/client"]                                                                                                                                                                                                                                                                                                         
+formatter-cmds = ["ruff check --exit-zero --fix $file", "ruff format $file"] 

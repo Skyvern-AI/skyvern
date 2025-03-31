@@ -5,7 +5,7 @@ from litellm import AllowedFailsPolicy
 
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.observers import ObserverTask, ObserverThought
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
 
@@ -36,7 +36,10 @@ class LLMConfigBase:
 @dataclass(frozen=True)
 class LLMConfig(LLMConfigBase):
     litellm_params: Optional[LiteLLMParams] = field(default=None)
-    max_output_tokens: int = SettingsManager.get_settings().LLM_CONFIG_MAX_TOKENS
+    max_tokens: int | None = SettingsManager.get_settings().LLM_CONFIG_MAX_TOKENS
+    max_completion_tokens: int | None = None
+    temperature: float | None = SettingsManager.get_settings().LLM_CONFIG_TEMPERATURE
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -72,7 +75,10 @@ class LLMRouterConfig(LLMConfigBase):
     allowed_fails: int | None = None
     allowed_fails_policy: AllowedFailsPolicy | None = None
     cooldown_time: float | None = None
-    max_output_tokens: int = SettingsManager.get_settings().LLM_CONFIG_MAX_TOKENS
+    max_tokens: int | None = SettingsManager.get_settings().LLM_CONFIG_MAX_TOKENS
+    max_completion_tokens: int | None = None
+    reasoning_effort: str | None = None
+    temperature: float | None = SettingsManager.get_settings().LLM_CONFIG_TEMPERATURE
 
 
 class LLMAPIHandler(Protocol):
@@ -81,9 +87,22 @@ class LLMAPIHandler(Protocol):
         prompt: str,
         prompt_name: str,
         step: Step | None = None,
-        observer_cruise: ObserverTask | None = None,
-        observer_thought: ObserverThought | None = None,
+        task_v2: TaskV2 | None = None,
+        thought: Thought | None = None,
         ai_suggestion: AISuggestion | None = None,
         screenshots: list[bytes] | None = None,
         parameters: dict[str, Any] | None = None,
     ) -> Awaitable[dict[str, Any]]: ...
+
+
+async def dummy_llm_api_handler(
+    prompt: str,
+    prompt_name: str,
+    step: Step | None = None,
+    task_v2: TaskV2 | None = None,
+    thought: Thought | None = None,
+    ai_suggestion: AISuggestion | None = None,
+    screenshots: list[bytes] | None = None,
+    parameters: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    raise NotImplementedError("Your LLM provider is not configured. Please configure it in the .env file.")

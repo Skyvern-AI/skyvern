@@ -9,11 +9,12 @@ from playwright.async_api import Frame, Page
 
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR
-from skyvern.exceptions import StepUnableToExecuteError, TaskAlreadyTimeout
+from skyvern.exceptions import DisabledBlockExecutionError, StepUnableToExecuteError, TaskAlreadyTimeout
 from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
@@ -41,7 +42,7 @@ def _should_css_shape_convert(element: Dict) -> bool:
         return False
 
     tag_name = element.get("tagName")
-    if tag_name not in ["a", "span", "i"]:
+    if tag_name not in ["a", "span", "i", "button"]:
         return False
 
     # should be without children
@@ -53,7 +54,7 @@ def _should_css_shape_convert(element: Dict) -> bool:
         return False
 
     # if <span> and <i>  we try to convert the shape
-    if tag_name in ["span", "i"]:
+    if tag_name in ["span", "i", "button"]:
         return True
 
     # if <a>, it should be no text, no href/target attribute
@@ -104,6 +105,12 @@ def _remove_skyvern_attributes(element: Dict) -> Dict:
     return element_copied
 
 
+def _mark_element_as_dropped(element: dict) -> None:
+    if "children" in element:
+        del element["children"]
+    element["isDropped"] = True
+
+
 async def _convert_svg_to_string(
     skyvern_frame: SkyvernFrame,
     element: Dict,
@@ -123,21 +130,18 @@ async def _convert_svg_to_string(
     try:
         locater = skyvern_frame.get_frame().locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
         if await locater.count() == 0:
-            del element["children"]
-            element["isDropped"] = True
+            _mark_element_as_dropped(element)
             return
 
         if not await locater.is_visible(timeout=settings.BROWSER_ACTION_TIMEOUT_MS):
-            del element["children"]
-            element["isDropped"] = True
+            _mark_element_as_dropped(element)
             return
 
         skyvern_element = SkyvernElement(locator=locater, frame=skyvern_frame.get_frame(), static_element=element)
 
         _, blocked = await skyvern_frame.get_blocking_element_id(await skyvern_element.get_element_handler())
-        if blocked:
-            del element["children"]
-            element["isDropped"] = True
+        if not skyvern_element.is_interactable() and blocked:
+            _mark_element_as_dropped(element)
             return
     except Exception:
         LOG.warning(
@@ -179,8 +183,7 @@ async def _convert_svg_to_string(
                 length=len(svg_html),
                 key=svg_key,
             )
-            del element["children"]
-            element["isDropped"] = True
+            _mark_element_as_dropped(element)
             return
 
         LOG.debug("call LLM to convert SVG to string shape", element_id=element_id)
@@ -234,8 +237,7 @@ async def _convert_svg_to_string(
                 key=svg_key,
                 length=len(svg_html),
             )
-            del element["children"]
-            element["isDropped"] = True
+            _mark_element_as_dropped(element)
             return
 
     element["attributes"] = dict()
@@ -243,12 +245,13 @@ async def _convert_svg_to_string(
         # refresh the cache expiration
         await app.CACHE.set(svg_key, svg_shape)
         element["attributes"]["alt"] = svg_shape
-    del element["children"]
+    if "children" in element:
+        del element["children"]
     return
 
 
 async def _convert_css_shape_to_string(
-    frame: Page | Frame,
+    skyvern_frame: SkyvernFrame,
     element: Dict,
     task: Task | None = None,
     step: Step | None = None,
@@ -279,28 +282,18 @@ async def _convert_css_shape_to_string(
     if css_shape:
         LOG.debug("CSS shape loaded from cache", element_id=element_id, key=shape_key, shape=css_shape)
     else:
-        # FIXME: support element in iframe
-        locater = frame.locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
-        if await locater.count() == 0:
-            LOG.info(
-                "No locater found to convert css shape",
-                task_id=task_id,
-                step_id=step_id,
-                element_id=element_id,
-            )
-            return None
-
-        if await locater.count() > 1:
-            LOG.info(
-                "multiple locaters found to convert css shape",
-                task_id=task_id,
-                step_id=step_id,
-                element_id=element_id,
-            )
-            return None
-
         try:
-            LOG.debug("call LLM to convert css shape to string shape", element_id=element_id)
+            locater = skyvern_frame.get_frame().locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
+            if await locater.count() == 0:
+                LOG.info(
+                    "No locater found to convert css shape",
+                    task_id=task_id,
+                    step_id=step_id,
+                    element_id=element_id,
+                    key=shape_key,
+                )
+                return None
+
             if not await locater.is_visible(timeout=settings.BROWSER_ACTION_TIMEOUT_MS):
                 LOG.info(
                     "element is not visible on the page, going to abort conversion",
@@ -309,9 +302,22 @@ async def _convert_css_shape_to_string(
                     element_id=element_id,
                     key=shape_key,
                 )
+
+            skyvern_element = SkyvernElement(locator=locater, frame=skyvern_frame.get_frame(), static_element=element)
+
+            _, blocked = await skyvern_frame.get_blocking_element_id(await skyvern_element.get_element_handler())
+            if blocked:
+                LOG.debug(
+                    "element is blocked by another element, going to abort conversion",
+                    task_id=task_id,
+                    step_id=step_id,
+                    element_id=element_id,
+                    key=shape_key,
+                )
                 return None
 
-            screenshot = await locater.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
+            LOG.debug("call LLM to convert css shape to string shape", element_id=element_id)
+            screenshot = await locater.screenshot(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
             prompt = prompt_engine.load_prompt("css-shape-convert")
 
             # TODO: we don't retry the css shape conversion today
@@ -421,6 +427,11 @@ class AgentFunction:
     ) -> None:
         return
 
+    async def validate_task_execution(
+        self, organization_id: str | None = None, task_id: str | None = None, task_version: str | None = None
+    ) -> None:
+        return
+
     async def prepare_step_execution(
         self,
         organization: Organization | None,
@@ -431,6 +442,9 @@ class AgentFunction:
         """
         Get prepared for the step execution. It's called at the first beginning when step running.
         """
+        return
+
+    async def post_step_execution(self, task: Task, step: Step) -> None:
         return
 
     async def generate_async_operations(
@@ -455,18 +469,29 @@ class AgentFunction:
             :param elements: List of elements to remove xpaths from.
             :return: List of elements without xpaths.
             """
+            context = skyvern_context.ensure_context()
+            # page won't be in the context.frame_index_map, so the index is going to be 0
             skyvern_frame = await SkyvernFrame.create_instance(frame=frame)
+            current_frame_index = context.frame_index_map.get(frame, 0)
+
             queue = []
             for element in element_tree:
                 queue.append(element)
             while queue:
                 queue_ele = queue.pop(0)
+                if queue_ele.get("frame_index") != current_frame_index:
+                    new_frame = next(
+                        (k for k, v in context.frame_index_map.items() if v == queue_ele.get("frame_index")), frame
+                    )
+                    skyvern_frame = await SkyvernFrame.create_instance(frame=new_frame)
+                    current_frame_index = queue_ele.get("frame_index", 0)
+
                 _remove_rect(queue_ele)
                 await _convert_svg_to_string(skyvern_frame, queue_ele, task, step)
 
                 if _should_css_shape_convert(element=queue_ele):
                     await _convert_css_shape_to_string(
-                        frame=frame,
+                        skyvern_frame=skyvern_frame,
                         element=queue_ele,
                         task=task,
                         step=step,
@@ -480,3 +505,7 @@ class AgentFunction:
             return element_tree
 
         return cleanup_element_tree_func
+
+    async def validate_code_block(self, organization_id: str | None = None) -> None:
+        if not settings.ENABLE_CODE_BLOCK:
+            raise DisabledBlockExecutionError("CodeBlock is disabled")

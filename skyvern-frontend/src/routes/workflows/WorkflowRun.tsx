@@ -1,5 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import { ProxyLocation } from "@/api/types";
+import { ProxyLocation, Status } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { SwitchBarNavigation } from "@/components/SwitchBarNavigation";
 import { Button } from "@/components/ui/button";
@@ -21,6 +21,7 @@ import { copyText } from "@/util/copyText";
 import { apiBaseUrl } from "@/util/env";
 import {
   CopyIcon,
+  FileIcon,
   Pencil2Icon,
   PlayIcon,
   ReloadIcon,
@@ -34,6 +35,11 @@ import { useWorkflowRunQuery } from "./hooks/useWorkflowRunQuery";
 import { WorkflowRunTimeline } from "./workflowRun/WorkflowRunTimeline";
 import { useWorkflowRunTimelineQuery } from "./hooks/useWorkflowRunTimelineQuery";
 import { findActiveItem } from "./workflowRun/workflowTimelineUtils";
+import { getAggregatedExtractedInformation } from "./workflowRun/workflowRunUtils";
+import { Label } from "@/components/ui/label";
+import { CodeEditor } from "./components/CodeEditor";
+import { cn } from "@/util/utils";
+import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -47,8 +53,11 @@ function WorkflowRun() {
     workflowPermanentId,
   });
 
-  const { data: workflowRun, isLoading: workflowRunIsLoading } =
-    useWorkflowRunQuery();
+  const {
+    data: workflowRun,
+    isLoading: workflowRunIsLoading,
+    isFetched,
+  } = useWorkflowRunQuery();
 
   const { data: workflowRunTimeline } = useWorkflowRunTimelineQuery();
 
@@ -126,7 +135,35 @@ function WorkflowRun() {
     });
   }
 
-  const isTaskv2Run = workflowRun && workflowRun.observer_task !== null;
+  const isTaskv2Run = workflowRun && workflowRun.task_v2 !== null;
+
+  const outputs = workflowRun?.outputs;
+  const aggregatedExtractedInformation = getAggregatedExtractedInformation(
+    outputs ?? {},
+  );
+
+  const hasSomeExtractedInformation = Object.values(
+    aggregatedExtractedInformation,
+  ).some((value) => value !== null);
+
+  const hasTaskv2Output = Boolean(isTaskv2Run && workflowRun.task_v2?.output);
+
+  const hasFileUrls =
+    isFetched &&
+    workflowRun &&
+    workflowRun.downloaded_file_urls &&
+    workflowRun.downloaded_file_urls.length > 0;
+  const fileUrls = hasFileUrls
+    ? (workflowRun.downloaded_file_urls as string[])
+    : [];
+
+  const showBoth =
+    (hasSomeExtractedInformation || hasTaskv2Output) && hasFileUrls;
+
+  const showOutputSection =
+    workflowRunIsFinalized &&
+    (hasSomeExtractedInformation || hasFileUrls || hasTaskv2Output) &&
+    workflowRun.status === Status.Completed;
 
   return (
     <div className="space-y-8">
@@ -229,6 +266,57 @@ function WorkflowRun() {
           )}
         </div>
       </header>
+      {showOutputSection && (
+        <div
+          className={cn("grid gap-4 rounded-lg bg-slate-elevation1 p-4", {
+            "grid-cols-2": showBoth,
+          })}
+        >
+          {(hasSomeExtractedInformation || hasTaskv2Output) && (
+            <div className="space-y-4">
+              <Label>
+                {hasTaskv2Output ? "Output" : "Extracted Information"}
+              </Label>
+              <CodeEditor
+                language="json"
+                value={
+                  hasTaskv2Output
+                    ? JSON.stringify(workflowRun.task_v2?.output, null, 2)
+                    : JSON.stringify(aggregatedExtractedInformation, null, 2)
+                }
+                readOnly
+                maxHeight="250px"
+              />
+            </div>
+          )}
+          {hasFileUrls && (
+            <div className="space-y-4">
+              <Label>Downloaded Files</Label>
+              <ScrollArea>
+                <ScrollAreaViewport className="max-h-[250px] space-y-2">
+                  {fileUrls.length > 0 ? (
+                    fileUrls.map((url, index) => {
+                      return (
+                        <div key={url} title={url} className="flex gap-2">
+                          <FileIcon className="size-6" />
+                          <a
+                            href={url}
+                            className="underline underline-offset-4"
+                          >
+                            <span>{`File ${index + 1}`}</span>
+                          </a>
+                        </div>
+                      );
+                    })
+                  ) : (
+                    <div className="text-sm">No files downloaded</div>
+                  )}
+                </ScrollAreaViewport>
+              </ScrollArea>
+            </div>
+          )}
+        </div>
+      )}
       {workflowFailureReason}
       <SwitchBarNavigation
         options={[

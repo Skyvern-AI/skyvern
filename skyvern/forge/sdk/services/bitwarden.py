@@ -2,9 +2,9 @@ import asyncio
 import json
 import os
 import re
-import subprocess
 import urllib.parse
-from enum import StrEnum
+from enum import IntEnum, StrEnum
+from typing import Tuple
 
 import structlog
 import tldextract
@@ -13,14 +13,79 @@ from pydantic import BaseModel
 from skyvern.config import settings
 from skyvern.exceptions import (
     BitwardenAccessDeniedError,
+    BitwardenCreateCollectionError,
+    BitwardenCreateCreditCardItemError,
+    BitwardenCreateLoginItemError,
+    BitwardenGetItemError,
     BitwardenListItemsError,
     BitwardenLoginError,
     BitwardenLogoutError,
+    BitwardenSecretError,
     BitwardenSyncError,
     BitwardenUnlockError,
 )
+from skyvern.forge.sdk.api.aws import aws_client
+from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_delete, aiohttp_get_json, aiohttp_post
+from skyvern.forge.sdk.schemas.credentials import (
+    CredentialItem,
+    CredentialType,
+    CreditCardCredential,
+    PasswordCredential,
+)
 
 LOG = structlog.get_logger()
+BITWARDEN_SERVER_BASE_URL = f"{settings.BITWARDEN_SERVER}:{settings.BITWARDEN_SERVER_PORT or 8002}"
+
+
+class BitwardenItemType(IntEnum):
+    LOGIN = 1
+    SECURE_NOTE = 2
+    CREDIT_CARD = 3
+    IDENTITY = 4
+
+
+def get_bitwarden_item_type_code(item_type: BitwardenItemType) -> int:
+    if item_type == BitwardenItemType.LOGIN:
+        return 1
+    elif item_type == BitwardenItemType.SECURE_NOTE:
+        return 2
+    elif item_type == BitwardenItemType.CREDIT_CARD:
+        return 3
+    elif item_type == BitwardenItemType.IDENTITY:
+        return 4
+
+
+def get_list_response_item_from_bitwarden_item(item: dict) -> CredentialItem:
+    if item["type"] == BitwardenItemType.LOGIN:
+        login = item["login"]
+        totp = BitwardenService.extract_totp_secret(login.get("totp", ""))
+        return CredentialItem(
+            item_id=item["id"],
+            credential=PasswordCredential(
+                username=login["username"] or "",
+                password=login["password"] or "",
+                totp=totp,
+            ),
+            name=item["name"],
+            credential_type=CredentialType.PASSWORD,
+        )
+    elif item["type"] == BitwardenItemType.CREDIT_CARD:
+        card = item["card"]
+        return CredentialItem(
+            item_id=item["id"],
+            credential=CreditCardCredential(
+                card_holder_name=card["cardholderName"],
+                card_number=card["number"],
+                card_exp_month=card["expMonth"],
+                card_exp_year=card["expYear"],
+                card_cvv=card["code"],
+                card_brand=card["brand"],
+            ),
+            name=item["name"],
+            credential_type=CredentialType.CREDIT_CARD,
+        )
+    else:
+        raise BitwardenGetItemError(f"Unsupported item type: {item['type']}")
 
 
 def is_valid_email(email: str | None) -> bool:
@@ -40,7 +105,7 @@ class BitwardenConstants(StrEnum):
     URL = "BW_URL"
     BW_COLLECTION_ID = "BW_COLLECTION_ID"
     IDENTITY_KEY = "BW_IDENTITY_KEY"
-    ITEM_ID = "BW_ITEM_ID"
+    BW_ITEM_ID = "BW_ITEM_ID"
 
     USERNAME = "BW_USERNAME"
     PASSWORD = "BW_PASSWORD"
@@ -53,17 +118,28 @@ class BitwardenConstants(StrEnum):
     CREDIT_CARD_CVV = "BW_CREDIT_CARD_CVV"
     CREDIT_CARD_BRAND = "BW_CREDIT_CARD_BRAND"
 
+    SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID = "SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID"
+    SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD = "SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD"
+    SKYVERN_AUTH_BITWARDEN_CLIENT_ID = "SKYVERN_AUTH_BITWARDEN_CLIENT_ID"
+    SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET = "SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET"
+
 
 class BitwardenQueryResult(BaseModel):
     credential: dict[str, str]
     uris: list[str]
 
 
+class RunCommandResult(BaseModel):
+    stdout: str
+    stderr: str
+    returncode: int
+
+
 class BitwardenService:
     @staticmethod
-    def run_command(
+    async def run_command(
         command: list[str], additional_env: dict[str, str] | None = None, timeout: int = 60
-    ) -> subprocess.CompletedProcess:
+    ) -> RunCommandResult:
         """
         Run a CLI command with the specified additional environment variables and return the result.
         """
@@ -74,9 +150,21 @@ class BitwardenService:
             env.update(additional_env)  # Update with any additional environment variables
 
         try:
-            return subprocess.run(command, capture_output=True, text=True, env=env, timeout=timeout)
-        except subprocess.TimeoutExpired as e:
-            LOG.error(f"Bitwarden command timed out after {timeout} seconds", stdout=e.stdout, stderr=e.stderr)
+            async with asyncio.timeout(timeout):
+                shell_subprocess = await asyncio.create_subprocess_shell(
+                    " ".join(command),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                )
+                stdout, stderr = await shell_subprocess.communicate()
+                return RunCommandResult(
+                    stdout=stdout.decode(),
+                    stderr=stderr.decode(),
+                    returncode=shell_subprocess.returncode,
+                )
+        except asyncio.TimeoutError as e:
+            LOG.error(f"Bitwarden command timed out after {timeout} seconds", exc_info=True)
             raise e
 
     @staticmethod
@@ -101,8 +189,9 @@ class BitwardenService:
         master_password: str,
         bw_organization_id: str | None,
         bw_collection_ids: list[str] | None,
-        url: str,
+        url: str | None = None,
         collection_id: str | None = None,
+        item_id: str | None = None,
         max_retries: int = settings.BITWARDEN_MAX_RETRIES,
         timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
     ) -> dict[str, str]:
@@ -126,6 +215,7 @@ class BitwardenService:
                         bw_collection_ids=bw_collection_ids,
                         url=url,
                         collection_id=collection_id,
+                        item_id=item_id,
                         timeout=timeout,
                     )
             except BitwardenAccessDeniedError as e:
@@ -182,17 +272,42 @@ class BitwardenService:
         master_password: str,
         bw_organization_id: str | None,
         bw_collection_ids: list[str] | None,
-        url: str,
+        url: str | None = None,
         collection_id: str | None = None,
+        item_id: str | None = None,
         timeout: int = 60,
     ) -> dict[str, str]:
         """
         Get the secret value from the Bitwarden CLI.
         """
         try:
-            BitwardenService.login(client_id, client_secret)
-            BitwardenService.sync()
-            session_key = BitwardenService.unlock(master_password)
+            await BitwardenService.login(client_id, client_secret)
+            await BitwardenService.sync()
+            session_key = await BitwardenService.unlock(master_password)
+
+            if item_id:  # if item_id provided, get single item by item id
+                command = ["bw", "get", "item", item_id, "--session", session_key]
+                item_result = await BitwardenService.run_command(command)
+                if item_result.stderr:
+                    raise BitwardenGetItemError(
+                        f"Failed to get the bitwarden item {item_id}. Error: {item_result.stderr}"
+                    )
+                try:
+                    item = json.loads(item_result.stdout)
+                except json.JSONDecodeError:
+                    raise BitwardenGetItemError(f"Failed to parse item JSON for item ID: {item_id}")
+
+                login = item["login"]
+                totp = BitwardenService.extract_totp_secret(login.get("totp", ""))
+
+                return {
+                    BitwardenConstants.USERNAME: login.get("username", ""),
+                    BitwardenConstants.PASSWORD: login.get("password", ""),
+                    BitwardenConstants.TOTP: totp,
+                }
+            elif not url:
+                # if item_id is not provided, we need a url to search for items
+                raise BitwardenGetItemError("No url or item ID provided")
 
             # Extract the domain from the URL and search for items in Bitwarden with that domain
             extract_url = tldextract.extract(url)
@@ -218,7 +333,7 @@ class BitwardenService:
             else:
                 LOG.error("No collection ID or organization ID provided -- this is required")
                 raise BitwardenListItemsError("No collection ID or organization ID provided -- this is required")
-            items_result = BitwardenService.run_command(list_command, timeout=timeout)
+            items_result = await BitwardenService.run_command(list_command, timeout=timeout)
 
             if items_result.stderr and "Event post failed" not in items_result.stderr:
                 raise BitwardenListItemsError(items_result.stderr)
@@ -281,7 +396,7 @@ class BitwardenService:
             return bitwarden_result[0].credential
         finally:
             # Step 4: Log out
-            BitwardenService.logout()
+            await BitwardenService.logout()
 
     @staticmethod
     async def get_sensitive_information_from_identity(
@@ -354,9 +469,9 @@ class BitwardenService:
         Get the sensitive information from the Bitwarden CLI.
         """
         try:
-            BitwardenService.login(client_id, client_secret)
-            BitwardenService.sync()
-            session_key = BitwardenService.unlock(master_password)
+            await BitwardenService.login(client_id, client_secret)
+            await BitwardenService.sync()
+            session_key = await BitwardenService.unlock(master_password)
 
             if not bw_organization_id and not collection_id:
                 raise BitwardenAccessDeniedError()
@@ -375,7 +490,7 @@ class BitwardenService:
             ]
             if bw_organization_id:
                 list_command.extend(["--organizationid", bw_organization_id])
-            items_result = BitwardenService.run_command(list_command)
+            items_result = await BitwardenService.run_command(list_command)
 
             # Parse the items and extract sensitive information
             try:
@@ -416,10 +531,10 @@ class BitwardenService:
 
         finally:
             # Step 4: Log out
-            BitwardenService.logout()
+            await BitwardenService.logout()
 
     @staticmethod
-    def login(client_id: str, client_secret: str) -> None:
+    async def login(client_id: str, client_secret: str) -> None:
         """
         Log in to the Bitwarden CLI.
         """
@@ -428,7 +543,7 @@ class BitwardenService:
             "BW_CLIENTSECRET": client_secret,
         }
         login_command = ["bw", "login", "--apikey"]
-        login_result = BitwardenService.run_command(login_command, env)
+        login_result = await BitwardenService.run_command(login_command, env)
 
         # Validate the login result
         if login_result.stdout and "You are logged in!" not in login_result.stdout:
@@ -440,7 +555,7 @@ class BitwardenService:
         LOG.info("Bitwarden login successful")
 
     @staticmethod
-    def unlock(master_password: str) -> str:
+    async def unlock(master_password: str) -> str:
         """
         Unlock the Bitwarden CLI.
         """
@@ -448,7 +563,7 @@ class BitwardenService:
             "BW_PASSWORD": master_password,
         }
         unlock_command = ["bw", "unlock", "--passwordenv", "BW_PASSWORD"]
-        unlock_result = BitwardenService.run_command(unlock_command, env)
+        unlock_result = await BitwardenService.run_command(unlock_command, env)
 
         # Validate the unlock result
         if unlock_result.stdout and "Your vault is now unlocked!" not in unlock_result.stdout:
@@ -460,32 +575,32 @@ class BitwardenService:
         try:
             session_key = BitwardenService._extract_session_key(unlock_result.stdout)
         except Exception as e:
-            raise BitwardenUnlockError(f"Unable to extract session key: {str(e)}")
+            raise BitwardenUnlockError(f"Unable to extract session key: {str(e)}. stderr: {unlock_result.stderr}")
 
         if not session_key:
-            raise BitwardenUnlockError("Session key is empty.")
+            raise BitwardenUnlockError(f"Session key is empty. stderr: {unlock_result.stderr}")
 
         return session_key
 
     @staticmethod
-    def sync() -> None:
+    async def sync() -> None:
         """
         Sync the Bitwarden CLI.
         """
         sync_command = ["bw", "sync"]
         LOG.info("Bitwarden CLI sync started")
-        sync_result = BitwardenService.run_command(sync_command)
+        sync_result = await BitwardenService.run_command(sync_command)
         LOG.info("Bitwarden CLI sync completed")
         if sync_result.stderr:
             raise BitwardenSyncError(sync_result.stderr)
 
     @staticmethod
-    def logout() -> None:
+    async def logout() -> None:
         """
         Log out of the Bitwarden CLI.
         """
         logout_command = ["bw", "logout"]
-        logout_result = BitwardenService.run_command(logout_command)
+        logout_result = await BitwardenService.run_command(logout_command)
         if logout_result.stderr and "You are not logged in." not in logout_result.stderr:
             raise BitwardenLogoutError(logout_result.stderr)
 
@@ -503,9 +618,9 @@ class BitwardenService:
         Get the credit card data from the Bitwarden CLI.
         """
         try:
-            BitwardenService.login(client_id, client_secret)
-            BitwardenService.sync()
-            session_key = BitwardenService.unlock(master_password)
+            await BitwardenService.login(client_id, client_secret)
+            await BitwardenService.sync()
+            session_key = await BitwardenService.unlock(master_password)
 
             # Step 3: Get the item
             get_command = [
@@ -522,7 +637,7 @@ class BitwardenService:
                 LOG.error("No collection ID or organization ID provided -- this is required")
                 raise BitwardenAccessDeniedError()
 
-            item_result = BitwardenService.run_command(get_command)
+            item_result = await BitwardenService.run_command(get_command)
 
             # Parse the item and extract credit card data
             try:
@@ -563,7 +678,7 @@ class BitwardenService:
             return mapped_credit_card_data
         finally:
             # Step 4: Log out
-            BitwardenService.logout()
+            await BitwardenService.logout()
 
     @staticmethod
     async def get_credit_card_data(
@@ -612,3 +727,300 @@ class BitwardenService:
                 remaining_retries=remaining_retries,
                 fail_reasons=fail_reasons + [f"{type(e).__name__}: {str(e)}"],
             )
+
+    @staticmethod
+    async def _unlock_using_server(master_password: str) -> None:
+        status_response = await aiohttp_get_json(f"{BITWARDEN_SERVER_BASE_URL}/status")
+        status = status_response["data"]["template"]["status"]
+        if status != "unlocked":
+            await aiohttp_post(f"{BITWARDEN_SERVER_BASE_URL}/unlock", data={"password": master_password})
+
+    @staticmethod
+    async def _get_login_item_by_id_using_server(item_id: str) -> PasswordCredential:
+        response = await aiohttp_get_json(f"{BITWARDEN_SERVER_BASE_URL}/object/item/{item_id}")
+        if not response or response.get("success") is False:
+            raise BitwardenGetItemError(f"Failed to get login item by ID: {item_id}")
+
+        login = response["data"]["login"]
+        totp = BitwardenService.extract_totp_secret(login.get("totp", ""))
+        if not login:
+            raise BitwardenGetItemError(f"Item with ID: {item_id} is not a login item")
+
+        return PasswordCredential(
+            username=login["username"] or "",
+            password=login["password"] or "",
+            totp=totp,
+        )
+
+    @staticmethod
+    async def _create_login_item_using_server(
+        bw_organization_id: str,
+        collection_id: str,
+        name: str,
+        credential: PasswordCredential,
+    ) -> str:
+        item_template = await aiohttp_get_json(f"{BITWARDEN_SERVER_BASE_URL}/object/template/item")
+        login_template = await aiohttp_get_json(f"{BITWARDEN_SERVER_BASE_URL}/object/template/item.login")
+
+        item_template = item_template["data"]["template"]
+        login_template = login_template["data"]["template"]
+
+        login_template["username"] = credential.username
+        login_template["password"] = credential.password
+        login_template["totp"] = credential.totp
+
+        item_template["type"] = get_bitwarden_item_type_code(BitwardenItemType.LOGIN)
+        item_template["name"] = name
+        item_template["login"] = login_template
+        item_template["collectionIds"] = [collection_id]
+        item_template["organizationId"] = bw_organization_id
+
+        response = await aiohttp_post(f"{BITWARDEN_SERVER_BASE_URL}/object/item", data=item_template)
+        if not response or response.get("success") is False:
+            raise BitwardenCreateLoginItemError("Failed to create login item")
+
+        return response["data"]["id"]
+
+    @staticmethod
+    async def _create_credit_card_item_using_server(
+        bw_organization_id: str,
+        collection_id: str,
+        name: str,
+        credential: CreditCardCredential,
+    ) -> str:
+        item_template = await aiohttp_get_json(f"{BITWARDEN_SERVER_BASE_URL}/object/template/item")
+        credit_card_template = await aiohttp_get_json(f"{BITWARDEN_SERVER_BASE_URL}/object/template/item.card")
+
+        item_template = item_template["data"]["template"]
+        credit_card_template = credit_card_template["data"]["template"]
+
+        credit_card_template["cardholderName"] = credential.card_holder_name
+        credit_card_template["number"] = credential.card_number
+        credit_card_template["expMonth"] = credential.card_exp_month
+        credit_card_template["expYear"] = credential.card_exp_year
+        credit_card_template["code"] = credential.card_cvv
+        credit_card_template["brand"] = credential.card_brand
+
+        item_template["type"] = get_bitwarden_item_type_code(BitwardenItemType.CREDIT_CARD)
+        item_template["name"] = name
+        item_template["card"] = credit_card_template
+        item_template["collectionIds"] = [collection_id]
+        item_template["organizationId"] = bw_organization_id
+
+        response = await aiohttp_post(f"{BITWARDEN_SERVER_BASE_URL}/object/item", data=item_template)
+        if not response or response.get("success") is False:
+            raise BitwardenCreateCreditCardItemError("Failed to create credit card item")
+
+        return response["data"]["id"]
+
+    @staticmethod
+    async def create_credential_item(
+        collection_id: str,
+        name: str,
+        credential: PasswordCredential | CreditCardCredential,
+    ) -> str:
+        try:
+            master_password, bw_organization_id, _, _ = await BitwardenService._get_skyvern_auth_secrets()
+
+            await BitwardenService._unlock_using_server(master_password)
+            if isinstance(credential, PasswordCredential):
+                return await BitwardenService._create_login_item_using_server(
+                    bw_organization_id=bw_organization_id,
+                    collection_id=collection_id,
+                    name=name,
+                    credential=credential,
+                )
+            else:
+                return await BitwardenService._create_credit_card_item_using_server(
+                    bw_organization_id=bw_organization_id,
+                    collection_id=collection_id,
+                    name=name,
+                    credential=credential,
+                )
+        except Exception as e:
+            raise e
+
+    @staticmethod
+    async def _get_skyvern_auth_master_password() -> str:
+        master_password = settings.SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD
+        if not master_password:
+            master_password = await aws_client.get_secret(BitwardenConstants.SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD)
+        if not master_password:
+            raise BitwardenSecretError("Skyvern auth master password is not set")
+        return master_password
+
+    @staticmethod
+    async def _get_skyvern_auth_organization_id() -> str:
+        bw_organization_id = settings.SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID
+        if not bw_organization_id:
+            bw_organization_id = await aws_client.get_secret(BitwardenConstants.SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID)
+        if not bw_organization_id:
+            raise BitwardenSecretError("Skyvern auth organization ID is not set")
+        return bw_organization_id
+
+    @staticmethod
+    async def _get_skyvern_auth_client_id() -> str:
+        client_id = settings.SKYVERN_AUTH_BITWARDEN_CLIENT_ID
+        if not client_id:
+            client_id = await aws_client.get_secret(BitwardenConstants.SKYVERN_AUTH_BITWARDEN_CLIENT_ID)
+        if not client_id:
+            raise BitwardenSecretError("Skyvern auth client ID is not set")
+        return client_id
+
+    @staticmethod
+    async def _get_skyvern_auth_client_secret() -> str:
+        client_secret = settings.SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET
+        if not client_secret:
+            client_secret = await aws_client.get_secret(BitwardenConstants.SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET)
+        if not client_secret:
+            raise BitwardenSecretError("Skyvern auth client secret is not set")
+        return client_secret
+
+    @staticmethod
+    async def create_collection(
+        name: str,
+    ) -> str:
+        """
+        Create a collection in Bitwarden and return the collection ID.
+        """
+        try:
+            master_password, bw_organization_id, _, _ = await BitwardenService._get_skyvern_auth_secrets()
+
+            await BitwardenService._unlock_using_server(master_password)
+            return await BitwardenService._create_collection_using_server(bw_organization_id, name)
+
+        except Exception as e:
+            raise e
+
+    @staticmethod
+    async def _create_collection_using_server(bw_organization_id: str, name: str) -> str:
+        collection_template_response = await aiohttp_get_json(f"{BITWARDEN_SERVER_BASE_URL}/object/template/collection")
+        collection_template = collection_template_response["data"]["template"]
+
+        collection_template["name"] = name
+        collection_template["organizationId"] = bw_organization_id
+
+        response = await aiohttp_post(
+            f"{BITWARDEN_SERVER_BASE_URL}/object/org-collection?organizationId={bw_organization_id}",
+            data=collection_template,
+        )
+        if not response or response.get("success") is False:
+            raise BitwardenCreateCollectionError("Failed to create collection")
+
+        return response["data"]["id"]
+
+    @staticmethod
+    async def _get_skyvern_auth_secrets() -> Tuple[str, str, str, str]:
+        master_password, bw_organization_id, client_id, client_secret = await asyncio.gather(
+            BitwardenService._get_skyvern_auth_master_password(),
+            BitwardenService._get_skyvern_auth_organization_id(),
+            BitwardenService._get_skyvern_auth_client_id(),
+            BitwardenService._get_skyvern_auth_client_secret(),
+        )
+        return master_password, bw_organization_id, client_id, client_secret
+
+    @staticmethod
+    async def get_items_by_item_ids(
+        item_ids: list[str],
+    ) -> list[CredentialItem]:
+        try:
+            master_password, _, _, _ = await BitwardenService._get_skyvern_auth_secrets()
+            await BitwardenService._unlock_using_server(master_password)
+            return await BitwardenService._get_items_by_item_ids_using_server(item_ids)
+        except Exception as e:
+            raise e
+
+    @staticmethod
+    async def _get_items_by_item_ids_using_server(item_ids: list[str]) -> list[CredentialItem]:
+        responses = await asyncio.gather(
+            *[aiohttp_get_json(f"{BITWARDEN_SERVER_BASE_URL}/object/item/{item_id}") for item_id in item_ids]
+        )
+        if not responses or any(response.get("success") is False for response in responses):
+            raise BitwardenGetItemError("Failed to get collection items")
+
+        return [get_list_response_item_from_bitwarden_item(response["data"]) for response in responses]
+
+    @staticmethod
+    async def get_collection_items(
+        collection_id: str,
+    ) -> list[CredentialItem]:
+        try:
+            master_password, _, _, _ = await BitwardenService._get_skyvern_auth_secrets()
+            await BitwardenService._unlock_using_server(master_password)
+            return await BitwardenService._get_collection_items_using_server(collection_id)
+        except Exception as e:
+            raise e
+
+    @staticmethod
+    async def _get_collection_items_using_server(collection_id: str) -> list[CredentialItem]:
+        response = await aiohttp_get_json(f"{BITWARDEN_SERVER_BASE_URL}/list/object/items?collectionId={collection_id}")
+        if not response or response.get("success") is False:
+            raise BitwardenGetItemError("Failed to get collection items")
+
+        items = response["data"]["data"]
+        items = map(lambda item: get_list_response_item_from_bitwarden_item(item), items)
+        return list(items)
+
+    @staticmethod
+    async def get_credential_item(
+        item_id: str,
+    ) -> CredentialItem:
+        try:
+            master_password, _, _, _ = await BitwardenService._get_skyvern_auth_secrets()
+            await BitwardenService._unlock_using_server(master_password)
+            return await BitwardenService._get_credential_item_by_id_using_server(item_id)
+        except Exception as e:
+            raise e
+
+    @staticmethod
+    async def _get_credential_item_by_id_using_server(item_id: str) -> CredentialItem:
+        response = await aiohttp_get_json(f"{BITWARDEN_SERVER_BASE_URL}/object/item/{item_id}")
+        if not response or response.get("success") is False:
+            raise BitwardenGetItemError(f"Failed to get credential item by ID: {item_id}")
+
+        if response["data"]["type"] == BitwardenItemType.LOGIN:
+            login_item = response["data"]["login"]
+            name = response["data"]["name"]
+            return CredentialItem(
+                item_id=item_id,
+                credential_type=CredentialType.PASSWORD,
+                name=name,
+                credential=PasswordCredential(
+                    username=login_item["username"] or "",
+                    password=login_item["password"] or "",
+                    totp=login_item["totp"],
+                ),
+            )
+        elif response["data"]["type"] == BitwardenItemType.CREDIT_CARD:
+            credit_card_item = response["data"]["card"]
+            name = response["data"]["name"]
+            return CredentialItem(
+                item_id=item_id,
+                credential_type=CredentialType.CREDIT_CARD,
+                name=name,
+                credential=CreditCardCredential(
+                    card_holder_name=credit_card_item["cardholderName"],
+                    card_number=credit_card_item["number"],
+                    card_exp_month=credit_card_item["expMonth"],
+                    card_exp_year=credit_card_item["expYear"],
+                    card_cvv=credit_card_item["code"],
+                    card_brand=credit_card_item["brand"],
+                ),
+            )
+        else:
+            raise BitwardenGetItemError(f"Unsupported item type: {response['data']['type']}")
+
+    @staticmethod
+    async def delete_credential_item(
+        item_id: str,
+    ) -> None:
+        try:
+            master_password, _, _, _ = await BitwardenService._get_skyvern_auth_secrets()
+            await BitwardenService._unlock_using_server(master_password)
+            await BitwardenService._delete_credential_item_using_server(item_id)
+        except Exception as e:
+            raise e
+
+    @staticmethod
+    async def _delete_credential_item_using_server(item_id: str) -> None:
+        await aiohttp_delete(f"{BITWARDEN_SERVER_BASE_URL}/object/item/{item_id}")

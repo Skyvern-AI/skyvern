@@ -47,6 +47,7 @@ import {
   BitwardenSensitiveInformationParameterYAML,
   BlockYAML,
   ContextParameterYAML,
+  CredentialParameterYAML,
   ParameterYAML,
   WorkflowCreateYAMLRequest,
   WorkflowParameterYAML,
@@ -72,6 +73,7 @@ import {
   convertEchoParameters,
   createNode,
   defaultEdge,
+  descendants,
   generateNodeLabel,
   getAdditionalParametersForEmailBlock,
   getOutputParameterKey,
@@ -82,6 +84,7 @@ import {
   nodeAdderNode,
   startNode,
 } from "./workflowEditorUtils";
+import { parameterIsBitwardenCredential, ParametersState } from "./types";
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -91,6 +94,7 @@ function convertToParametersYAML(
   | ContextParameterYAML
   | BitwardenSensitiveInformationParameterYAML
   | BitwardenCreditCardDataParameterYAML
+  | CredentialParameterYAML
 > {
   return parameters.map((parameter) => {
     if (parameter.parameterType === WorkflowEditorParameterTypes.Workflow) {
@@ -144,59 +148,33 @@ function convertToParametersYAML(
           BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
       };
     } else {
-      return {
-        parameter_type: WorkflowParameterTypes.Bitwarden_Login_Credential,
-        key: parameter.key,
-        description: parameter.description || null,
-        bitwarden_collection_id: parameter.collectionId,
-        url_parameter_key: parameter.urlParameterKey,
-        bitwarden_client_id_aws_secret_key: BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
-        bitwarden_client_secret_aws_secret_key:
-          BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
-        bitwarden_master_password_aws_secret_key:
-          BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
-      };
+      if (parameterIsBitwardenCredential(parameter)) {
+        return {
+          parameter_type: WorkflowParameterTypes.Bitwarden_Login_Credential,
+          key: parameter.key,
+          description: parameter.description || null,
+          bitwarden_collection_id: parameter.collectionId,
+          bitwarden_item_id: parameter.itemId,
+          url_parameter_key: parameter.urlParameterKey,
+          bitwarden_client_id_aws_secret_key:
+            BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
+          bitwarden_client_secret_aws_secret_key:
+            BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
+          bitwarden_master_password_aws_secret_key:
+            BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
+        };
+      } else {
+        return {
+          parameter_type: WorkflowParameterTypes.Workflow,
+          workflow_parameter_type: WorkflowParameterValueType.CredentialId,
+          default_value: parameter.credentialId,
+          key: parameter.key,
+          description: parameter.description || null,
+        };
+      }
     }
   });
 }
-
-export type ParametersState = Array<
-  | {
-      key: string;
-      parameterType: "workflow";
-      dataType: WorkflowParameterValueType;
-      description?: string | null;
-      defaultValue: unknown;
-    }
-  | {
-      key: string;
-      parameterType: "credential";
-      collectionId: string;
-      urlParameterKey: string;
-      description?: string | null;
-    }
-  | {
-      key: string;
-      parameterType: "context";
-      sourceParameterKey: string;
-      description?: string | null;
-    }
-  | {
-      key: string;
-      parameterType: "secret";
-      identityKey: string;
-      identityFields: Array<string>;
-      collectionId: string;
-      description?: string | null;
-    }
-  | {
-      key: string;
-      parameterType: "creditCardData";
-      itemId: string;
-      collectionId: string;
-      description?: string | null;
-    }
->;
 
 type Props = {
   initialTitle: string;
@@ -393,7 +371,14 @@ function FlowRenderer({
       const startNodeId = nanoid();
       const adderNodeId = nanoid();
       newNodes.push(
-        startNode(startNodeId, { withWorkflowSettings: false }, id),
+        startNode(
+          startNodeId,
+          {
+            withWorkflowSettings: false,
+            editable: true,
+          },
+          id,
+        ),
       );
       newNodes.push(nodeAdderNode(adderNodeId, id));
       newEdges.push(defaultEdge(startNodeId, adderNodeId));
@@ -424,10 +409,20 @@ function FlowRenderer({
     if (!node || !isWorkflowBlockNode(node)) {
       return;
     }
+    const nodesToDelete = descendants(nodes, id);
     const deletedNodeLabel = node.data.label;
-    const newNodes = nodes.filter((node) => node.id !== id);
+    const newNodes = nodes.filter(
+      (node) => !nodesToDelete.includes(node) && node.id !== id,
+    );
     const newEdges = edges.flatMap((edge) => {
       if (edge.source === id) {
+        return [];
+      }
+      if (
+        nodesToDelete.some(
+          (node) => node.id === edge.source || node.id === edge.target,
+        )
+      ) {
         return [];
       }
       if (edge.target === id) {
@@ -596,6 +591,7 @@ function FlowRenderer({
             <Panel position="top-center" className="h-20">
               <WorkflowHeader
                 title={title}
+                saving={saveWorkflowMutation.isPending}
                 onTitleChange={(newTitle) => {
                   setTitle(newTitle);
                   setHasChanges(true);

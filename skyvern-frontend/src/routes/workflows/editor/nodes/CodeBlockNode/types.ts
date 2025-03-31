@@ -10,6 +10,6 @@ export type CodeBlockNode = Node<CodeBlockNodeData, "codeBlock">;
 export const codeBlockNodeDefaultData: CodeBlockNodeData = {
   editable: true,
   label: "",
-  code: `# To assign a value to the output of this block,\n# assign the value to the variable 'result'\n# The final value of 'result' will be used as the output of this block\n\nresult = 5`,
+  code: `# This feature is currently in private beta. Please reach out to founders@skyvern.com to get access\n# All variables will be assigned to the output of this block.\n# Like 'x = 5', 'x' will be assigned to the output of this block.\n\n`,
   continueOnFailure: false,
 } as const;

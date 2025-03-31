@@ -10,7 +10,7 @@ from typing import Any, Awaitable, Callable, Protocol
 
 import aiofiles
 import structlog
-from playwright.async_api import BrowserContext, ConsoleMessage, Download, Error, Page, Playwright
+from playwright.async_api import BrowserContext, ConsoleMessage, Download, Page, Playwright
 from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
@@ -25,7 +25,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation, get_tzinfo_from_proxy
+from skyvern.schemas.runs import ProxyLocation, get_tzinfo_from_proxy
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -369,8 +369,41 @@ async def _create_headful_chromium(
     return browser_context, browser_artifacts, None
 
 
+async def _create_cdp_connection_browser(
+    playwright: Playwright, proxy_location: ProxyLocation | None = None, **kwargs: dict
+) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+    browser_args = BrowserContextFactory.build_browser_args()
+
+    browser_artifacts = BrowserContextFactory.build_browser_artifacts(
+        har_path=browser_args["record_har_path"],
+    )
+
+    remote_browser_url = settings.BROWSER_REMOTE_DEBUGGING_URL
+    LOG.info("Connecting browser CDP connection", remote_browser_url=remote_browser_url)
+    browser = await playwright.chromium.connect_over_cdp(remote_browser_url)
+
+    contexts = browser.contexts
+    browser_context = None
+
+    if contexts:
+        # Use the first existing context if available
+        LOG.info("Using existing browser context")
+        browser_context = contexts[0]
+    else:
+        browser_context = await browser.new_context(
+            record_video_dir=browser_args["record_video_dir"],
+            viewport=browser_args["viewport"],
+        )
+    LOG.info(
+        "Launched browser CDP connection",
+        remote_browser_url=remote_browser_url,
+    )
+    return browser_context, browser_artifacts, None
+
+
 BrowserContextFactory.register_type("chromium-headless", _create_headless_chromium)
 BrowserContextFactory.register_type("chromium-headful", _create_headful_chromium)
+BrowserContextFactory.register_type("cdp-connect", _create_cdp_connection_browser)
 
 
 class BrowserState:
@@ -442,40 +475,41 @@ class BrowserState:
                 await self.navigate_to_url(page=page, url=url)
 
     async def navigate_to_url(self, page: Page, url: str, retry_times: int = NAVIGATION_MAX_RETRY_TIME) -> None:
-        navigation_error: Exception = FailedToNavigateToUrl(url=url, error_message="")
-        for retry_time in range(retry_times):
-            LOG.info(f"Trying to navigate to {url} and waiting for 5 seconds.", url=url, retry_time=retry_time)
-            try:
-                start_time = time.time()
-                await page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-                end_time = time.time()
-                LOG.info(
-                    "Page loading time",
-                    loading_time=end_time - start_time,
-                    url=url,
-                )
-                await asyncio.sleep(5)
-                LOG.info(f"Successfully went to {url}", url=url, retry_time=retry_time)
-                return
+        try:
+            for retry_time in range(retry_times):
+                LOG.info(f"Trying to navigate to {url} and waiting for 5 seconds.", url=url, retry_time=retry_time)
+                try:
+                    start_time = time.time()
+                    await page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+                    end_time = time.time()
+                    LOG.info(
+                        "Page loading time",
+                        loading_time=end_time - start_time,
+                        url=url,
+                    )
+                    await asyncio.sleep(5)
+                    LOG.info(f"Successfully went to {url}", url=url, retry_time=retry_time)
+                    return
 
-            except Exception as e:
-                navigation_error = e
-                LOG.warning(
-                    f"Error while navigating to url: {str(navigation_error)}",
-                    exc_info=True,
-                    url=url,
-                    retry_time=retry_time,
-                )
-                # Wait for 5 seconds before retrying
-                await asyncio.sleep(5)
-        else:
+                except Exception as e:
+                    if retry_time >= retry_times - 1:
+                        raise FailedToNavigateToUrl(url=url, error_message=str(e))
+
+                    LOG.warning(
+                        f"Error while navigating to url: {str(e)}",
+                        exc_info=True,
+                        url=url,
+                        retry_time=retry_time,
+                    )
+                    # Wait for 5 seconds before retrying
+                    await asyncio.sleep(5)
+
+        except Exception as e:
             LOG.exception(
-                f"Failed to navigate to {url} after {retry_times} retries: {str(navigation_error)}",
+                f"Failed to navigate to {url} after {retry_times} retries: {str(e)}",
                 url=url,
             )
-            if isinstance(navigation_error, Error):
-                raise FailedToNavigateToUrl(url=url, error_message=str(navigation_error))
-            raise navigation_error
+            raise e
 
     async def get_working_page(self) -> Page | None:
         # HACK: currently, assuming the last page is always the working page.
@@ -500,14 +534,28 @@ class BrowserState:
             return
         if len(self.browser_artifacts.video_artifacts) > index:
             if self.browser_artifacts.video_artifacts[index].video_path is None:
-                self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
+                try:
+                    async with asyncio.timeout(settings.BROWSER_ACTION_TIMEOUT_MS / 1000):
+                        if page.video:
+                            self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
+                except asyncio.TimeoutError:
+                    LOG.info("Timeout to get the page video, skip the exception")
+                except Exception:
+                    LOG.exception("Error while getting the page video", exc_info=True)
             return
 
         target_lenght = index + 1
         self.browser_artifacts.video_artifacts.extend(
             [VideoArtifact()] * (target_lenght - len(self.browser_artifacts.video_artifacts))
         )
-        self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
+        try:
+            async with asyncio.timeout(settings.BROWSER_ACTION_TIMEOUT_MS / 1000):
+                if page.video:
+                    self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
+        except asyncio.TimeoutError:
+            LOG.info("Timeout to get the page video, skip the exception")
+        except Exception:
+            LOG.exception("Error while getting the page video", exc_info=True)
         return
 
     async def get_or_create_page(
@@ -534,7 +582,9 @@ class BrowserState:
             error_message = str(e)
             if "net::ERR" not in error_message:
                 raise e
-            await self.close_current_open_page()
+            if not await self.close_current_open_page():
+                LOG.warning("Failed to close the current open page")
+                raise e
             await self.check_and_fix_state(
                 url=url,
                 proxy_location=proxy_location,
@@ -542,10 +592,12 @@ class BrowserState:
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
             )
-        await self.__assert_page()
+        page = await self.__assert_page()
 
         if not await BrowserContextFactory.validate_browser_context(await self.get_working_page()):
-            await self.close_current_open_page()
+            if not await self.close_current_open_page():
+                LOG.warning("Failed to close the current open page, going to skip the browser context validation")
+                return page
             await self.check_and_fix_state(
                 url=url,
                 proxy_location=proxy_location,
@@ -553,16 +605,21 @@ class BrowserState:
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
             )
-            await self.__assert_page()
-
+            page = await self.__assert_page()
         return page
 
-    async def close_current_open_page(self) -> None:
-        await self._close_all_other_pages()
-        if self.browser_context is not None:
-            await self.browser_context.close()
-        self.browser_context = None
-        await self.set_working_page(None)
+    async def close_current_open_page(self) -> bool:
+        try:
+            async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+                await self._close_all_other_pages()
+                if self.browser_context is not None:
+                    await self.browser_context.close()
+                self.browser_context = None
+                await self.set_working_page(None)
+                return True
+        except Exception:
+            LOG.warning("Error while closing the current open page", exc_info=True)
+            return False
 
     async def stop_page_loading(self) -> None:
         page = await self.__assert_page()

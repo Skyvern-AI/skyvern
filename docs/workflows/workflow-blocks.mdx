@@ -149,18 +149,53 @@ Inputs:
 1. **Prompt *(required):*** Write a natural language prompt to be sent to the LLM to generate a text response
 2. **JSON Schema *(optional):*** Craft a JSON input that structures the LLM output for use in another programming task
 
-## DownloadToS3Block / UploadToS3Block
+## FileUploadBlock
 
-Persists files inside S3
+Persists files inside custom destinations.
+Supported integrations:
+- AWS S3
 
 ```
-- block_type: upload_to_s3
+- block_type: file_upload
   label: upload_downloaded_files_to_s3
-  path: SKYVERN_DOWNLOAD_DIRECTORY
+  storage_type: s3
+	aws_access_key_id: YOUR_AWS_ACCESS_KEY_ID
+	aws_secret_access_key: YOUR_AWS_SECRET_ACCESS_KEY
+	s3_bucket: YOUR_S3_BUCKET
+	region_name: us-east-1
 ```
 
+### How to set up FileUploadBlock with AWS
+- Step 1. Create your bucket. (let’s say `YOUR-BUCKET-NAME` is the name)
+- Step 2. Create a limited IAM policy that only has GetObject and PutObject permissions to this s3 bucket, named `skyvern-s3-access-policy` (any name works):
+    ```json
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "SkyvernS3Access",
+                "Effect": "Allow",
+                "Action": [
+                    "s3:PutObject",
+                    "s3:GetObject"
+                ],
+                "Resource": "arn:aws:s3:::YOUR-BUCKET-NAME/*"
+            }
+        ]
+    }
+    ```
+- Step 3. Create an AWS IAM user for skyvern
+    - Go to https://us-east-1.console.aws.amazon.com/iam/home
+    - click "Create User" → do not check "Provide user access to the AWS Management Console" → input user name → click "Next"
+    - At the the "Set Permissions" page, click "Attach policies directly" → pick the `skyvern-s3-access-policy` created in the previous step → click "Next" → click "Create user"
+    - After the user is created, go to the new IAM user page → go to the "Security credentials" tab → click "create access key" → on the "Access key best practices & alternatives" page, click "Application running on an AWS compute service" → click "Next" → click "Create access key" → you will see the "Access Key" and the "Secret access key" at the end of user creation.
+- Step 4. Create a FileUploadBlock
+    - Place this block after the file download has completed.
+    - Copy the "Access Key" to the "AWS Access Key ID" field of the File Upload Block and "Secret access key".
+    - Copy the "Access Key" to the "AWS Secret Access Key" field in the File Upload Block.
+    - Add your s3 bucket name.    
+    - Add your AWS region.
 
-* Since we’re in beta, this feature is unavailable right now, [contact us](https://meetings.hubspot.com/skyvern/demo?uuid=7c83865f-1a92-4c44-9e52-1ba0dbc04f7a) if you would like to use it.
 
 ## SendEmailBlock
 

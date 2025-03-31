@@ -20,6 +20,7 @@ export type ParameterYAML =
   | WorkflowParameterYAML
   | BitwardenLoginCredentialParameterYAML
   | AWSSecretParameterYAML
+  | CredentialParameterYAML
   | ContextParameterYAML
   | OutputParameterYAML
   | BitwardenSensitiveInformationParameterYAML
@@ -39,8 +40,9 @@ export type WorkflowParameterYAML = ParameterYAMLBase & {
 
 export type BitwardenLoginCredentialParameterYAML = ParameterYAMLBase & {
   parameter_type: "bitwarden_login_credential";
-  bitwarden_collection_id: string;
-  url_parameter_key: string;
+  bitwarden_collection_id: string | null;
+  bitwarden_item_id: string | null;
+  url_parameter_key: string | null;
   bitwarden_client_id_aws_secret_key: string;
   bitwarden_client_secret_aws_secret_key: string;
   bitwarden_master_password_aws_secret_key: string;
@@ -82,12 +84,18 @@ export type OutputParameterYAML = ParameterYAMLBase & {
   parameter_type: "output";
 };
 
+export type CredentialParameterYAML = ParameterYAMLBase & {
+  parameter_type: "credential";
+  credential_id: string;
+};
+
 export type BlockYAML =
   | TaskBlockYAML
   | CodeBlockYAML
   | TextPromptBlockYAML
   | DownloadToS3BlockYAML
   | UploadToS3BlockYAML
+  | FileUploadBlockYAML
   | SendEmailBlockYAML
   | FileUrlParserBlockYAML
   | ForLoopBlockYAML
@@ -134,7 +142,7 @@ export type Taskv2BlockYAML = BlockYAMLBase & {
   prompt: string;
   totp_verification_url: string | null;
   totp_identifier: string | null;
-  max_iterations: number | null;
+  max_steps: number | null;
 };
 
 export type ValidationBlockYAML = BlockYAMLBase & {
@@ -248,6 +256,16 @@ export type DownloadToS3BlockYAML = BlockYAMLBase & {
 export type UploadToS3BlockYAML = BlockYAMLBase & {
   block_type: "upload_to_s3";
   path?: string | null;
+};
+
+export type FileUploadBlockYAML = BlockYAMLBase & {
+  block_type: "file_upload";
+  path?: string | null;
+  storage_type: string;
+  s3_bucket: string;
+  region_name: string;
+  aws_access_key_id: string;
+  aws_secret_access_key: string;
 };
 
 export type SendEmailBlockYAML = BlockYAMLBase & {

@@ -1,5 +1,5 @@
 import { createContext } from "react";
-import { ParametersState } from "./FlowRenderer";
+import { ParametersState } from "./types";
 
 type WorkflowParametersState = [
   ParametersState,

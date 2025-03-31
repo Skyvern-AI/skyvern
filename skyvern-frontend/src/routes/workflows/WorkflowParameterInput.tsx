@@ -5,6 +5,7 @@ import { CodeEditor } from "./components/CodeEditor";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { Label } from "@/components/ui/label";
 import { WorkflowParameterValueType } from "./types/workflowTypes";
+import { CredentialSelector } from "./components/CredentialSelector";
 
 type Props = {
   type: WorkflowParameterValueType;
@@ -76,6 +77,16 @@ function WorkflowParameterInput({ type, value, onChange }: Props) {
     return (
       <FileUpload
         value={value as FileInputValue}
+        onChange={(value) => onChange(value)}
+      />
+    );
+  }
+
+  if (type === "credential_id") {
+    const credentialId = value as string | null;
+    return (
+      <CredentialSelector
+        value={credentialId ?? ""}
         onChange={(value) => onChange(value)}
       />
     );

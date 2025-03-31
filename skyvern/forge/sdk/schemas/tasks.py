@@ -3,76 +3,14 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field, field_validator
 
 from skyvern.exceptions import InvalidTaskStatusTransition, TaskAlreadyCanceled, TaskAlreadyTimeout
-from skyvern.forge.sdk.core.validators import validate_url
 from skyvern.forge.sdk.db.enums import TaskType
-
-
-class ProxyLocation(StrEnum):
-    US_CA = "US-CA"
-    US_NY = "US-NY"
-    US_TX = "US-TX"
-    US_FL = "US-FL"
-    US_WA = "US-WA"
-    RESIDENTIAL = "RESIDENTIAL"
-    RESIDENTIAL_ES = "RESIDENTIAL_ES"
-    RESIDENTIAL_IE = "RESIDENTIAL_IE"
-    RESIDENTIAL_GB = "RESIDENTIAL_GB"
-    RESIDENTIAL_IN = "RESIDENTIAL_IN"
-    RESIDENTIAL_JP = "RESIDENTIAL_JP"
-    RESIDENTIAL_FR = "RESIDENTIAL_FR"
-    RESIDENTIAL_DE = "RESIDENTIAL_DE"
-    NONE = "NONE"
-
-
-def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
-    if proxy_location == ProxyLocation.NONE:
-        return None
-
-    if proxy_location == ProxyLocation.US_CA:
-        return ZoneInfo("America/Los_Angeles")
-
-    if proxy_location == ProxyLocation.US_NY:
-        return ZoneInfo("America/New_York")
-
-    if proxy_location == ProxyLocation.US_TX:
-        return ZoneInfo("America/Chicago")
-
-    if proxy_location == ProxyLocation.US_FL:
-        return ZoneInfo("America/New_York")
-
-    if proxy_location == ProxyLocation.US_WA:
-        return ZoneInfo("America/New_York")
-
-    if proxy_location == ProxyLocation.RESIDENTIAL:
-        return ZoneInfo("America/New_York")
-
-    if proxy_location == ProxyLocation.RESIDENTIAL_ES:
-        return ZoneInfo("Europe/Madrid")
-
-    if proxy_location == ProxyLocation.RESIDENTIAL_IE:
-        return ZoneInfo("Europe/Dublin")
-
-    if proxy_location == ProxyLocation.RESIDENTIAL_GB:
-        return ZoneInfo("Europe/London")
-
-    if proxy_location == ProxyLocation.RESIDENTIAL_IN:
-        return ZoneInfo("Asia/Kolkata")
-
-    if proxy_location == ProxyLocation.RESIDENTIAL_JP:
-        return ZoneInfo("Asia/Tokyo")
-
-    if proxy_location == ProxyLocation.RESIDENTIAL_FR:
-        return ZoneInfo("Europe/Paris")
-
-    if proxy_location == ProxyLocation.RESIDENTIAL_DE:
-        return ZoneInfo("Europe/Berlin")
-
-    return None
+from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.schemas.runs import ProxyLocation
+from skyvern.utils.url_validators import validate_url
 
 
 class TaskBase(BaseModel):
@@ -306,7 +244,7 @@ class Task(TaskBase):
         screenshot_url: str | None = None,
         recording_url: str | None = None,
         browser_console_log_url: str | None = None,
-        downloaded_file_urls: list[str] | None = None,
+        downloaded_files: list[FileInfo] | None = None,
         failure_reason: str | None = None,
     ) -> TaskResponse:
         return TaskResponse(
@@ -321,7 +259,8 @@ class Task(TaskBase):
             screenshot_url=screenshot_url,
             recording_url=recording_url,
             browser_console_log_url=browser_console_log_url,
-            downloaded_file_urls=downloaded_file_urls,
+            downloaded_files=downloaded_files,
+            downloaded_file_urls=[file.url for file in downloaded_files] if downloaded_files else None,
             errors=self.errors,
             max_steps_per_run=self.max_steps_per_run,
             workflow_run_id=self.workflow_run_id,
@@ -339,6 +278,7 @@ class TaskResponse(BaseModel):
     screenshot_url: str | None = None
     recording_url: str | None = None
     browser_console_log_url: str | None = None
+    downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None
     failure_reason: str | None = None
     errors: list[dict[str, Any]] = []
@@ -352,15 +292,22 @@ class TaskOutput(BaseModel):
     extracted_information: list | dict[str, Any] | str | None = None
     failure_reason: str | None = None
     errors: list[dict[str, Any]] = []
+    downloaded_files: list[FileInfo] | None = None
+    downloaded_file_urls: list[str] | None = None  # For backward compatibility
 
     @staticmethod
-    def from_task(task: Task) -> TaskOutput:
+    def from_task(task: Task, downloaded_files: list[FileInfo] | None = None) -> TaskOutput:
+        # For backward compatibility, extract just the URLs from FileInfo objects
+        downloaded_file_urls = [file_info.url for file_info in downloaded_files] if downloaded_files else None
+
         return TaskOutput(
             task_id=task.task_id,
             status=task.status,
             extracted_information=task.extracted_information,
             failure_reason=task.failure_reason,
             errors=task.errors,
+            downloaded_files=downloaded_files,
+            downloaded_file_urls=downloaded_file_urls,
         )
 
 

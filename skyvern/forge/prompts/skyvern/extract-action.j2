@@ -15,7 +15,7 @@ Reply in JSON format with the following keys:
     "actions": array // An array of actions. Here's the format of each action:
     [{
         "reasoning": str, // The reasoning behind the action. This reasoning must be user information agnostic. Mention why you chose the action type, and why you chose the element id. Keep the reasoning short and to the point.
-        "user_detail_query": str, // Think of this value as a Jeopardy question. Ask the user for the details you need for executing this action. Ask the question even if the details are disclosed in user goal or user details. If it's a text field, ask for the text. If it's a file upload, ask for the file. If it's a dropdown, ask for the relevant information. If you are clicking on something specific, ask about what to click on. If you're downloading a file and you have multiple options, ask the user which one to download. Otherwise, use null. Examples are: "What product ID should I input into the search bar?", "What file should I upload?", "What is the previous insurance provider of the user?", "Which invoice should I download?", "Does the user have any pets?". If the action doesn't require any user details, use null.
+        "user_detail_query": str, // Think of this value as a Jeopardy question and the intention behind the action. Ask the user for the details you need for executing this action. Ask the question even if the details are disclosed in user goal or user details. If it's a text field, ask for the text. If it's a file upload, ask for the file. If it's a dropdown, ask for the relevant information. If you are clicking on something specific, ask about what the intention is behind the click and what to click on. If you're downloading a file and you have multiple options, ask the user which one to download. Examples are: "What product ID should I input into the search bar?", "What file should I upload?", "What is the previous insurance provider of the user?", "Which invoice should I download?", "Does the user have any pets?". If the action doesn't require any user details, describe the intention behind the action.
         "user_detail_answer": str, // The answer to the `user_detail_query`. The source of this answer can be user goal or user details.
         "confidence_float": float, // The confidence of the action. Pick a number between 0.0 and 1.0. 0.0 means no confidence, 1.0 means full confidence
         "action_type": str, // It's a string enum: "CLICK", "INPUT_TEXT", "UPLOAD_FILE", "SELECT_OPTION", "WAIT", "SOLVE_CAPTCHA", "COMPLETE", "TERMINATE". "CLICK" is an element you'd like to click. "INPUT_TEXT" is an element you'd like to input text into. "UPLOAD_FILE" is an element you'd like to upload a file into. "SELECT_OPTION" is an element you'd like to select an option from. "WAIT" action should be used if there are no actions to take and there is some indication on screen that waiting could yield more actions. "WAIT" should not be used if there are actions to take. "SOLVE_CAPTCHA" should be used if there's a captcha to solve on the screen. "COMPLETE" is used when the {{"complete criterion has been met" if complete_criterion else "user goal has been achieved"}} AND if there's any data extraction goal, you should be able to get data from the page. Never return a COMPLETE action unless the {{ "complete criterion is met" if complete_criterion else "user goal is achieved" }}. "TERMINATE" is used to terminate the whole task with a failure when it doesn't seem like the user goal can be achieved. Do not use "TERMINATE" if waiting could lead the user towards the goal. Only return "TERMINATE" if you are on a page where the user goal cannot be achieved. All other actions are ignored when "TERMINATE" is returned.
@@ -38,17 +38,14 @@ Reply in JSON format with the following keys:
 {% endif %}
     }],{% if verification_code_check %}
     "verification_code_reasoning": str, // Let's think step by step. Describe what you see and think if a verification code is needed for login or any verification step. Explain why you believe a verification code is needed or not. Has the code been sent and is code available somewhere (email, phone or 2FA device)?
-    "need_verification_code": bool, // Whether a verification code is needed to proceed. True only if the code is available to user. If the code is not sent, return false {% endif %}
+    "need_verification_code": bool, // Whether a verification code must be entered on this page now. True only if the code is available to user. If the code is not sent, return false {% endif %}
 }
-{% if action_history %}
-Consider the action history from the last step and the screenshot together, if actions from the last step don't yield positive impact, try other actions or other action combinations.
-{% endif %}
-Clickable elements from `{{ current_url }}`:
-```
-{{ elements }}
-```
 
-The URL of the page you're on right now is `{{ current_url }}`.
+Consider the action history from the last step and the screenshot together, if actions from the last step don't yield positive impact, try other actions or other action combinations.
+Action history from previous steps: (note: even if the action history suggests goal is achieved, check the screenshot and the DOM elements to make sure the goal is achieved)
+```
+{{ action_history }}
+```
 {% if complete_criterion %}
 Complete criterion:
 ```
@@ -74,10 +71,14 @@ User details:
 ```
 {{ navigation_payload_str }}
 ```
-{% if action_history %}
-Action results from previous steps: (note: even if the action history suggests goal is achieved, check the screenshot and the DOM elements to make sure the goal is achieved)
-{{ action_history }}
-{% endif %}
+
+Clickable elements from `{{ current_url }}`:
+```
+{{ elements }}
+```
+
+The URL of the page you're on right now is `{{ current_url }}`.
+
 Current datetime, ISO format:
 ```
 {{ local_datetime }}

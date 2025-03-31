@@ -111,15 +111,12 @@ function ScrollableActionList({
 
   return (
     <div className="h-[40rem] w-1/3 rounded border bg-slate-elevation1">
-      <div className="grid grid-cols-3 gap-2 p-4">
-        <div className="flex h-8 items-center justify-center rounded-sm bg-slate-700 px-3 text-xs text-gray-50">
-          Steps: {taskDetails.steps}
-        </div>
+      <div className="grid grid-cols-2 gap-2 p-4">
         <div className="flex h-8 items-center justify-center rounded-sm bg-slate-700 px-3 text-xs text-gray-50">
           Actions: {taskDetails.actions}
         </div>
         <div className="flex h-8 items-center justify-center rounded-sm bg-slate-700 px-3 text-xs text-gray-50">
-          Cost: {taskDetails.cost}
+          Steps: {taskDetails.steps}
         </div>
       </div>
       <Separator />

@@ -1,4 +1,8 @@
+import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
+import { statusIsFinalized, statusIsNotFinalized } from "@/routes/tasks/types";
+import { cn } from "@/util/utils";
+import { DotFilledIcon } from "@radix-ui/react-icons";
 import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import {
@@ -9,21 +13,12 @@ import {
   ObserverThought,
   WorkflowRunBlock,
 } from "../types/workflowRunTypes";
+import { ThoughtCard } from "./ThoughtCard";
 import {
   ActionItem,
   WorkflowRunOverviewActiveElement,
 } from "./WorkflowRunOverview";
-import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
-import { statusIsFinalized, statusIsNotFinalized } from "@/routes/tasks/types";
-import { cn } from "@/util/utils";
-import { ThoughtCard } from "./ThoughtCard";
 import { WorkflowRunTimelineBlockItem } from "./WorkflowRunTimelineBlockItem";
-import { DotFilledIcon } from "@radix-ui/react-icons";
-
-const formatter = Intl.NumberFormat("en-US", {
-  style: "currency",
-  currency: "USD",
-});
 
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
@@ -67,19 +62,16 @@ function WorkflowRunTimeline({
 
   return (
     <div className="min-w-0 space-y-4 rounded bg-slate-elevation1 p-4">
-      <div className="grid grid-cols-3 gap-2">
+      <div className="grid grid-cols-2 gap-2">
         <div className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs">
           Actions: {numberOfActions}
         </div>
         <div className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs">
           Steps: {workflowRun.total_steps ?? 0}
         </div>
-        <div className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs">
-          Cost: {formatter.format(workflowRun.total_cost ?? 0)}
-        </div>
       </div>
       <ScrollArea>
-        <ScrollAreaViewport className="max-h-[37rem]">
+        <ScrollAreaViewport className="h-[37rem] max-h-[37rem]">
           <div className="space-y-4">
             {workflowRunIsNotFinalized && (
               <div
@@ -106,13 +98,12 @@ function WorkflowRunTimeline({
                 return (
                   <WorkflowRunTimelineBlockItem
                     key={timelineItem.block.workflow_run_block_id}
-                    subBlocks={timelineItem.children
-                      .filter((item) => item.type === "block")
-                      .map((item) => item.block)}
+                    subItems={timelineItem.children}
                     activeItem={activeItem}
                     block={timelineItem.block}
                     onActionClick={onActionItemSelected}
                     onBlockItemClick={onBlockItemSelected}
+                    onThoughtCardClick={onObserverThoughtCardSelected}
                   />
                 );
               }

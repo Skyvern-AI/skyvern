@@ -1,8 +1,9 @@
 import { Navigate, Outlet, createBrowserRouter } from "react-router-dom";
+import { PageLayout } from "./components/PageLayout";
+import { DiscoverPage } from "./routes/discover/DiscoverPage";
+import { HistoryPage } from "./routes/history/HistoryPage";
 import { RootLayout } from "./routes/root/RootLayout";
 import { Settings } from "./routes/settings/Settings";
-import { SettingsPageLayout } from "./routes/settings/SettingsPageLayout";
-import { TasksPageLayout } from "./routes/tasks/TasksPageLayout";
 import { CreateNewTaskFormPage } from "./routes/tasks/create/CreateNewTaskFormPage";
 import { RetryTask } from "./routes/tasks/create/retry/RetryTask";
 import { StepArtifactsLayout } from "./routes/tasks/detail/StepArtifactsLayout";
@@ -17,10 +18,10 @@ import { WorkflowRunParameters } from "./routes/workflows/WorkflowRunParameters"
 import { Workflows } from "./routes/workflows/Workflows";
 import { WorkflowsPageLayout } from "./routes/workflows/WorkflowsPageLayout";
 import { WorkflowEditor } from "./routes/workflows/editor/WorkflowEditor";
-import { WorkflowRunOutput } from "./routes/workflows/workflowRun/WorkflowRunOutput";
 import { WorkflowPostRunParameters } from "./routes/workflows/workflowRun/WorkflowPostRunParameters";
-import { WorkflowRunRecording } from "./routes/workflows/workflowRun/WorkflowRunRecording";
+import { WorkflowRunOutput } from "./routes/workflows/workflowRun/WorkflowRunOutput";
 import { WorkflowRunOverview } from "./routes/workflows/workflowRun/WorkflowRunOverview";
+import { WorkflowRunRecording } from "./routes/workflows/workflowRun/WorkflowRunRecording";
 
 const router = createBrowserRouter([
   {
@@ -29,11 +30,11 @@ const router = createBrowserRouter([
     children: [
       {
         index: true,
-        element: <Navigate to="/tasks" />,
+        element: <Navigate to="/discover" />,
       },
       {
         path: "tasks",
-        element: <TasksPageLayout />,
+        element: <PageLayout />,
         children: [
           {
             index: true,
@@ -145,8 +146,28 @@ const router = createBrowserRouter([
         ],
       },
       {
+        path: "discover",
+        element: <PageLayout />,
+        children: [
+          {
+            index: true,
+            element: <DiscoverPage />,
+          },
+        ],
+      },
+      {
+        path: "history",
+        element: <PageLayout />,
+        children: [
+          {
+            index: true,
+            element: <HistoryPage />,
+          },
+        ],
+      },
+      {
         path: "settings",
-        element: <SettingsPageLayout />,
+        element: <PageLayout />,
         children: [
           {
             index: true,

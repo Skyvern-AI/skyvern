@@ -4,10 +4,11 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, Field
 
 from skyvern.config import settings
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileType
+from skyvern.forge.sdk.workflow.models.constants import FileStorageType
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowStatus
+from skyvern.schemas.runs import ProxyLocation
 
 
 class ParameterYAML(BaseModel, abc.ABC):
@@ -37,10 +38,17 @@ class BitwardenLoginCredentialParameterYAML(ParameterYAML):
     bitwarden_client_secret_aws_secret_key: str
     bitwarden_master_password_aws_secret_key: str
     # parameter key for the url to request the login credentials from bitwarden
-    url_parameter_key: str
+    url_parameter_key: str | None = None
     # bitwarden collection id to filter the login credentials from,
     # if not provided, no filtering will be done
     bitwarden_collection_id: str | None = None
+    # bitwarden item id to request the login credential
+    bitwarden_item_id: str | None = None
+
+
+class CredentialParameterYAML(ParameterYAML):
+    parameter_type: Literal[ParameterType.CREDENTIAL] = ParameterType.CREDENTIAL  # type: ignore
+    credential_id: str
 
 
 class BitwardenSensitiveInformationParameterYAML(ParameterYAML):
@@ -134,6 +142,7 @@ class TaskBlockYAML(BlockYAML):
     cache_actions: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
+    complete_verification: bool = True
 
 
 class ForLoopBlockYAML(BlockYAML):
@@ -189,6 +198,17 @@ class DownloadToS3BlockYAML(BlockYAML):
 class UploadToS3BlockYAML(BlockYAML):
     block_type: Literal[BlockType.UPLOAD_TO_S3] = BlockType.UPLOAD_TO_S3  # type: ignore
 
+    path: str | None = None
+
+
+class FileUploadBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.FILE_UPLOAD] = BlockType.FILE_UPLOAD  # type: ignore
+
+    storage_type: FileStorageType = FileStorageType.S3
+    s3_bucket: str | None = None
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    region_name: str | None = None
     path: str | None = None
 
 
@@ -266,6 +286,7 @@ class NavigationBlockYAML(BlockYAML):
     cache_actions: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
+    complete_verification: bool = True
 
 
 class ExtractionBlockYAML(BlockYAML):
@@ -296,6 +317,7 @@ class LoginBlockYAML(BlockYAML):
     cache_actions: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
+    complete_verification: bool = True
 
 
 class WaitBlockYAML(BlockYAML):
@@ -330,7 +352,8 @@ class TaskV2BlockYAML(BlockYAML):
     url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    max_iterations: int = 10
+    max_iterations: int = settings.MAX_ITERATIONS_PER_TASK_V2
+    max_steps: int = settings.MAX_STEPS_PER_TASK_V2
 
 
 PARAMETER_YAML_SUBCLASSES = (
@@ -341,6 +364,7 @@ PARAMETER_YAML_SUBCLASSES = (
     | WorkflowParameterYAML
     | ContextParameterYAML
     | OutputParameterYAML
+    | CredentialParameterYAML
 )
 PARAMETER_YAML_TYPES = Annotated[PARAMETER_YAML_SUBCLASSES, Field(discriminator="parameter_type")]
 
@@ -351,6 +375,7 @@ BLOCK_YAML_SUBCLASSES = (
     | TextPromptBlockYAML
     | DownloadToS3BlockYAML
     | UploadToS3BlockYAML
+    | FileUploadBlockYAML
     | SendEmailBlockYAML
     | FileParserBlockYAML
     | ValidationBlockYAML

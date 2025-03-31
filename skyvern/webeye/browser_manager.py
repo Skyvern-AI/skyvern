@@ -7,8 +7,9 @@ from playwright.async_api import async_playwright
 
 from skyvern.exceptions import MissingBrowserState
 from skyvern.forge import app
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
+from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
+from skyvern.schemas.runs import ProxyLocation
 from skyvern.webeye.browser_factory import BrowserContextFactory, BrowserState, VideoArtifact
 
 LOG = structlog.get_logger()
@@ -81,7 +82,9 @@ class BrowserManager:
                 "Getting browser state for task from persistent sessions manager",
                 browser_session_id=browser_session_id,
             )
-            browser_state = app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id)
+            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                browser_session_id, organization_id=task.organization_id
+            )
             if browser_state is None:
                 LOG.warning(
                     "Browser state not found in persistent sessions manager",
@@ -130,16 +133,27 @@ class BrowserManager:
         url: str | None = None,
         browser_session_id: str | None = None,
     ) -> BrowserState:
-        browser_state = self.get_for_workflow_run(workflow_run_id=workflow_run.workflow_run_id)
-        if browser_state is not None:
+        parent_workflow_run_id = workflow_run.parent_workflow_run_id
+        workflow_run_id = workflow_run.workflow_run_id
+        browser_state = self.get_for_workflow_run(
+            workflow_run_id=workflow_run_id, parent_workflow_run_id=parent_workflow_run_id
+        )
+        if browser_state:
+            # always keep the browser state for the workflow run and the parent workflow run synced
+            self.pages[workflow_run_id] = browser_state
+            if parent_workflow_run_id:
+                self.pages[parent_workflow_run_id] = browser_state
             return browser_state
 
         if browser_session_id:
+            # TODO: what if there's a parent workflow run?
             LOG.info(
                 "Getting browser state for workflow run from persistent sessions manager",
                 browser_session_id=browser_session_id,
             )
-            browser_state = app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id)
+            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                browser_session_id, organization_id=workflow_run.organization_id
+            )
             if browser_state is None:
                 LOG.warning(
                     "Browser state not found in persistent sessions manager", browser_session_id=browser_session_id
@@ -171,7 +185,9 @@ class BrowserManager:
                 organization_id=workflow_run.organization_id,
             )
 
-        self.pages[workflow_run.workflow_run_id] = browser_state
+        self.pages[workflow_run_id] = browser_state
+        if parent_workflow_run_id:
+            self.pages[parent_workflow_run_id] = browser_state
 
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.
@@ -183,9 +199,15 @@ class BrowserManager:
         )
         return browser_state
 
-    def get_for_workflow_run(self, workflow_run_id: str) -> BrowserState | None:
+    def get_for_workflow_run(
+        self, workflow_run_id: str, parent_workflow_run_id: str | None = None
+    ) -> BrowserState | None:
+        if parent_workflow_run_id and parent_workflow_run_id in self.pages:
+            return self.pages[parent_workflow_run_id]
+
         if workflow_run_id in self.pages:
             return self.pages[workflow_run_id]
+
         return None
 
     def set_video_artifact_for_task(self, task: Task, artifacts: list[VideoArtifact]) -> None:

@@ -5,7 +5,6 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     DuplicateLLMConfigError,
     InvalidLLMConfigError,
     MissingLLMProviderEnvVarsError,
-    NoProviderEnabledError,
 )
 from skyvern.forge.sdk.api.llm.models import LiteLLMParams, LLMConfig, LLMRouterConfig
 
@@ -55,7 +54,10 @@ if not any(
         settings.ENABLE_NOVITA,
     ]
 ):
-    raise NoProviderEnabledError()
+    LOG.warning(
+        "To run skyvern locally, you need to enable at least one LLM provider. Run setup.sh and follow through the LLM provider setup, or "
+        "update the .env file (check out .env.example to see the required environment variables)."
+    )
 
 
 if settings.ENABLE_OPENAI:
@@ -65,6 +67,15 @@ if settings.ENABLE_OPENAI:
             "gpt-4-turbo",
             ["OPENAI_API_KEY"],
             supports_vision=False,
+            add_assistant_prefix=False,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_GPT4_5",
+        LLMConfig(
+            "gpt-4.5-preview",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
             add_assistant_prefix=False,
         ),
     )
@@ -80,7 +91,19 @@ if settings.ENABLE_OPENAI:
     LLMConfigRegistry.register_config(
         "OPENAI_GPT4O",
         LLMConfig(
-            "gpt-4o", ["OPENAI_API_KEY"], supports_vision=True, add_assistant_prefix=False, max_output_tokens=16384
+            "gpt-4o", ["OPENAI_API_KEY"], supports_vision=True, add_assistant_prefix=False, max_completion_tokens=16384
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_O3_MINI",
+        LLMConfig(
+            "o3-mini",
+            ["OPENAI_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            max_completion_tokens=16384,
+            temperature=None,  # Temperature isn't supported in the O-model series
+            reasoning_effort="high",
         ),
     )
     LLMConfigRegistry.register_config(
@@ -90,7 +113,7 @@ if settings.ENABLE_OPENAI:
             ["OPENAI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
-            max_output_tokens=16384,
+            max_completion_tokens=16384,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -100,7 +123,7 @@ if settings.ENABLE_OPENAI:
             ["OPENAI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
-            max_output_tokens=16384,
+            max_completion_tokens=16384,
         ),
     )
 
@@ -149,7 +172,17 @@ if settings.ENABLE_ANTHROPIC:
             ["ANTHROPIC_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=True,
-            max_output_tokens=8192,
+            max_completion_tokens=8192,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE3.7_SONNET",
+        LLMConfig(
+            "anthropic/claude-3-7-sonnet-latest",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+            max_completion_tokens=8192,
         ),
     )
 
@@ -267,7 +300,52 @@ if settings.ENABLE_AZURE_GPT4O_MINI:
         ),
     )
 
+if settings.ENABLE_AZURE_O3_MINI:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_O3_MINI",
+        LLMConfig(
+            f"azure/{settings.AZURE_O3_MINI_DEPLOYMENT}",
+            [
+                "AZURE_O3_MINI_DEPLOYMENT",
+                "AZURE_O3_MINI_API_KEY",
+                "AZURE_O3_MINI_API_BASE",
+                "AZURE_O3_MINI_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_O3_MINI_API_BASE,
+                api_key=settings.AZURE_O3_MINI_API_KEY,
+                api_version=settings.AZURE_O3_MINI_API_VERSION,
+                model_info={"model_name": "azure/o3-mini"},
+            ),
+            supports_vision=False,
+            add_assistant_prefix=False,
+            max_completion_tokens=16384,
+            temperature=None,  # Temperature isn't supported in the O-model series
+            reasoning_effort="low",
+        ),
+    )
+
 if settings.ENABLE_GEMINI:
+    LLMConfigRegistry.register_config(
+        "GEMINI_FLASH_2_0",
+        LLMConfig(
+            "gemini/gemini-2.0-flash-001",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=8192,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "GEMINI_FLASH_2_0_LITE",
+        LLMConfig(
+            "gemini/gemini-2.0-flash-lite-preview-02-05",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=8192,
+        ),
+    )
     LLMConfigRegistry.register_config(
         "GEMINI_PRO",
         LLMConfig(
@@ -275,7 +353,7 @@ if settings.ENABLE_GEMINI:
             ["GEMINI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
-            max_output_tokens=8192,
+            max_completion_tokens=8192,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -285,7 +363,7 @@ if settings.ENABLE_GEMINI:
             ["GEMINI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
-            max_output_tokens=8192,
+            max_completion_tokens=8192,
         ),
     )
 

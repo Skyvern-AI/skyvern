@@ -12,20 +12,14 @@ Reply in JSON format with the following keys:
         "user_detail_query": str, // Think of this value as a Jeopardy question. Ask the user for the details you need for executing this action. Ask the question even if the details are disclosed in user instruction or user details. If you are clicking on something specific, ask about what to click on. If you're downloading a file and you have multiple options, ask the user which one to download. Otherwise, use null. Examples are: "What is the previous insurance provider of the user?", "Which invoice should I download?", "Does the user have any pets?". If the action doesn't require any user details, use null.
         "user_detail_answer": str, // The answer to the `user_detail_query`. The source of this answer can be user instruction or user details.
         "confidence_float": float, // The confidence of the action. Pick a number between 0.0 and 1.0. 0.0 means no confidence, 1.0 means full confidence
-        "action_type": str, // It's a string enum: "CLICK". "CLICK" is an element you'd like to click.
+        "action_type": str, // It's a string enum: "CLICK". "CLICK" type means there's an element you'd like to click.
         "id": str, // The id of the element to take action on. The id has to be one from the elements list.
         "download": bool, // If true, the browser will trigger a download by clicking the element. If false, the browser will click the element without triggering a download.
+        "file_url": str, // The url of the file to upload if applicable. This field can be present for CLICK only if the click is to upload the file. It should be null otherwise.
     }]
 }
 
-The URL of the page you're on right now is `{{ current_url }}`.
-
-HTML elements from `{{ current_url }}`:
-```
-{{ elements }}
-```
-
-User instruction:
+User instruction (user's intention or self questioning to help figure out what to click):
 ```
 {{ navigation_goal }}
 ```
@@ -33,6 +27,18 @@ User instruction:
 User details:
 ```
 {{ navigation_payload_str }}
+```{% if user_context %}
+
+Context of the big goal user wants to achieve:
+```
+{{ user_context }}
+```{% endif %}
+
+The URL of the page you're on right now is `{{ current_url }}`.
+
+HTML elements from `{{ current_url }}`:
+```
+{{ elements }}
 ```
 
 Current datetime, ISO format:

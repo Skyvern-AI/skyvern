@@ -21,10 +21,15 @@ import type { LoopNode } from "./types";
 import { useState } from "react";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { Checkbox } from "@/components/ui/checkbox";
+import { getLoopNodeWidth } from "../../workflowEditorUtils";
 
 function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const { updateNodeData } = useReactFlow();
   const nodes = useNodes<AppNode>();
+  const node = nodes.find((n) => n.id === id);
+  if (!node) {
+    throw new Error("Node not found"); // not possible
+  }
   const [label, setLabel] = useNodeLabelChangeHandler({
     id,
     initialValue: data.label,
@@ -55,6 +60,15 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
     (furthestDownChild?.position.y ?? 0) +
     24;
 
+  const loopNodeWidth = getLoopNodeWidth(node, nodes);
+  function handleChange(key: string, value: unknown) {
+    if (!data.editable) {
+      return;
+    }
+    setInputs({ ...inputs, [key]: value });
+    updateNodeData(id, { [key]: value });
+  }
+
   return (
     <div>
       <Handle
@@ -70,8 +84,9 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
         className="opacity-0"
       />
       <div
-        className="w-[600px] rounded-xl border-2 border-dashed border-slate-600 p-2"
+        className="rounded-xl border-2 border-dashed border-slate-600 p-2"
         style={{
+          width: loopNodeWidth,
           height: childrenHeightExtent,
         }}
       >
@@ -118,11 +133,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                 nodeId={id}
                 value={inputs.loopVariableReference}
                 onChange={(value) => {
-                  setInputs({
-                    ...inputs,
-                    loopVariableReference: value,
-                  });
-                  updateNodeData(id, { loopVariableReference: value });
+                  handleChange("loopVariableReference", value);
                 }}
               />
             </div>
@@ -139,9 +150,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                     checked={data.completeIfEmpty}
                     disabled={!data.editable}
                     onCheckedChange={(checked) => {
-                      updateNodeData(id, {
-                        completeIfEmpty: checked,
-                      });
+                      handleChange("completeIfEmpty", checked);
                     }}
                   />
                 </div>

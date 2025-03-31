@@ -6,12 +6,25 @@ import { AddNodeProps } from "../FlowRenderer";
 import { WorkflowBlockNode } from "../nodes";
 import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
 
+const enableCodeBlock = import.meta.env.VITE_ENABLE_CODE_BLOCK === "true";
+
 const nodeLibraryItems: Array<{
   nodeType: NonNullable<WorkflowBlockNode["type"]>;
   icon: JSX.Element;
   title: string;
   description: string;
 }> = [
+  {
+    nodeType: "login",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Login}
+        className="size-6"
+      />
+    ),
+    title: "Login Block",
+    description: "Login to a website",
+  },
   {
     nodeType: "navigation",
     icon: (
@@ -22,6 +35,17 @@ const nodeLibraryItems: Array<{
     ),
     title: "Navigation Block",
     description: "Navigate on the page",
+  },
+  {
+    nodeType: "taskv2",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Taskv2}
+        className="size-6"
+      />
+    ),
+    title: "Task v2 Block",
+    description: "Runs a Skyvern 2.0 Task",
   },
   {
     nodeType: "action",
@@ -67,17 +91,7 @@ const nodeLibraryItems: Array<{
     title: "Task Block",
     description: "Takes actions or extracts information",
   },
-  {
-    nodeType: "taskv2",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.Taskv2}
-        className="size-6"
-      />
-    ),
-    title: "Task v2 Block",
-    description: "Runs a Skyvern v2 Task",
-  },
+
   {
     nodeType: "url",
     icon: (
@@ -122,16 +136,17 @@ const nodeLibraryItems: Array<{
     title: "For Loop Block",
     description: "Repeats nested elements",
   },
-  // temporarily removed
-  // {
-  //   nodeType: "codeBlock",
-  //   icon: <WorkflowBlockIcon
-  //   workflowBlockType={WorkflowBlockTypes.Code}
-  //   className="size-6"
-  // />,
-  //   title: "Code Block",
-  //   description: "Executes Python code",
-  // },
+  {
+    nodeType: "codeBlock",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Code}
+        className="size-6"
+      />
+    ),
+    title: "Code Block",
+    description: "Executes Python code",
+  },
   {
     nodeType: "fileParser",
     icon: (
@@ -167,15 +182,15 @@ const nodeLibraryItems: Array<{
   //   description: "Downloads a file from S3",
   // },
   {
-    nodeType: "upload",
+    nodeType: "fileUpload",
     icon: (
       <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.UploadToS3}
+        workflowBlockType={WorkflowBlockTypes.FileUpload}
         className="size-6"
       />
     ),
-    title: "Upload Block",
-    description: "Uploads a file to S3",
+    title: "File Upload Block",
+    description: "Uploads downloaded files to where you want.",
   },
   {
     nodeType: "fileDownload",
@@ -187,17 +202,6 @@ const nodeLibraryItems: Array<{
     ),
     title: "File Download Block",
     description: "Download a file",
-  },
-  {
-    nodeType: "login",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.Login}
-        className="size-6"
-      />
-    ),
-    title: "Login Block",
-    description: "Login to a website",
   },
   {
     nodeType: "wait",
@@ -254,6 +258,9 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
                   workflowPanelData?.disableLoop &&
                   item.nodeType === "loop"
                 ) {
+                  return null;
+                }
+                if (!enableCodeBlock && item.nodeType === "codeBlock") {
                   return null;
                 }
                 return (

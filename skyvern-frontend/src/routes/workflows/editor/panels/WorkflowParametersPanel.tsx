@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useWorkflowParametersState } from "../useWorkflowParametersState";
 import { WorkflowParameterAddPanel } from "./WorkflowParameterAddPanel";
-import { ParametersState } from "../FlowRenderer";
+import { ParametersState } from "../types";
 import { WorkflowParameterEditPanel } from "./WorkflowParameterEditPanel";
 import { MixerVerticalIcon, PlusIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
@@ -31,6 +31,7 @@ import {
   WorkflowEditorParameterType,
   WorkflowEditorParameterTypes,
 } from "../../types/workflowTypes";
+import { getLabelForWorkflowParameterType } from "../workflowEditorUtils";
 
 const WORKFLOW_EDIT_PANEL_WIDTH = 20 * 16;
 const WORKFLOW_EDIT_PANEL_GAP = 1 * 16;
@@ -79,7 +80,7 @@ function WorkflowParametersPanel() {
                 setOperationPanelState({
                   active: true,
                   operation: "add",
-                  type: "workflow",
+                  type: WorkflowEditorParameterTypes.Workflow,
                 });
               }}
             >
@@ -90,7 +91,7 @@ function WorkflowParametersPanel() {
                 setOperationPanelState({
                   active: true,
                   operation: "add",
-                  type: "credential",
+                  type: WorkflowEditorParameterTypes.Credential,
                 });
               }}
             >
@@ -101,7 +102,7 @@ function WorkflowParametersPanel() {
                 setOperationPanelState({
                   active: true,
                   operation: "add",
-                  type: "secret",
+                  type: WorkflowEditorParameterTypes.Secret,
                 });
               }}
             >
@@ -134,7 +135,7 @@ function WorkflowParametersPanel() {
                       <span className="text-sm">{parameter.key}</span>
                       {parameter.parameterType === "workflow" ? (
                         <span className="text-sm text-slate-400">
-                          {parameter.dataType}
+                          {getLabelForWorkflowParameterType(parameter.dataType)}
                         </span>
                       ) : (
                         <span className="text-sm text-slate-400">

@@ -25,7 +25,7 @@ from skyvern.forge.sdk.db.models import (
 )
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task, TaskStatus
+from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.block import BlockStatus, BlockType
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -45,6 +45,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
+from skyvern.schemas.runs import ProxyLocation
 
 LOG = structlog.get_logger()
 
@@ -108,6 +109,8 @@ def convert_to_step(step_model: StepModel, debug_enabled: bool = False) -> Step:
         organization_id=step_model.organization_id,
         input_token_count=step_model.input_token_count,
         output_token_count=step_model.output_token_count,
+        reasoning_token_count=step_model.reasoning_token_count,
+        cached_token_count=step_model.cached_token_count,
         step_cost=step_model.step_cost,
     )
 
@@ -192,7 +195,9 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
     )
 
 
-def convert_to_workflow_run(workflow_run_model: WorkflowRunModel, debug_enabled: bool = False) -> WorkflowRun:
+def convert_to_workflow_run(
+    workflow_run_model: WorkflowRunModel, workflow_title: str | None = None, debug_enabled: bool = False
+) -> WorkflowRun:
     if debug_enabled:
         LOG.debug(
             "Converting WorkflowRunModel to WorkflowRun",
@@ -215,6 +220,7 @@ def convert_to_workflow_run(workflow_run_model: WorkflowRunModel, debug_enabled:
         totp_identifier=workflow_run_model.totp_identifier,
         created_at=workflow_run_model.created_at,
         modified_at=workflow_run_model.modified_at,
+        workflow_title=workflow_title,
     )
 
 
@@ -283,6 +289,7 @@ def convert_to_bitwarden_login_credential_parameter(
         bitwarden_client_secret_aws_secret_key=bitwarden_login_credential_parameter_model.bitwarden_client_secret_aws_secret_key,
         bitwarden_master_password_aws_secret_key=bitwarden_login_credential_parameter_model.bitwarden_master_password_aws_secret_key,
         bitwarden_collection_id=bitwarden_login_credential_parameter_model.bitwarden_collection_id,
+        bitwarden_item_id=bitwarden_login_credential_parameter_model.bitwarden_item_id,
         url_parameter_key=bitwarden_login_credential_parameter_model.url_parameter_key,
         created_at=bitwarden_login_credential_parameter_model.created_at,
         modified_at=bitwarden_login_credential_parameter_model.modified_at,

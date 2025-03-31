@@ -12,20 +12,7 @@ import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuer
 import { Status } from "@/api/types";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { isTaskVariantBlock } from "../types/workflowTypes";
-
-function getAggregatedExtractedInformation(outputs: Record<string, unknown>) {
-  const extractedInformation: Record<string, unknown> = {};
-  Object.entries(outputs).forEach(([id, output]) => {
-    if (
-      typeof output === "object" &&
-      output !== null &&
-      "extracted_information" in output
-    ) {
-      extractedInformation[id] = output.extracted_information;
-    }
-  });
-  return extractedInformation;
-}
+import { getAggregatedExtractedInformation } from "./workflowRunUtils";
 
 function formatExtractedInformation(outputs: Record<string, unknown>) {
   const aggregateExtractedInformation =
@@ -77,7 +64,7 @@ function WorkflowRunOutput() {
     ? formatExtractedInformation(outputs)
     : outputs;
   const fileUrls = workflowRun?.downloaded_file_urls ?? [];
-  const observerOutput = workflowRun?.observer_task?.output;
+  const observerOutput = workflowRun?.task_v2?.output;
 
   return (
     <div className="space-y-5">

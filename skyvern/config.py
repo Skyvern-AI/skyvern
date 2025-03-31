@@ -10,16 +10,19 @@ class Settings(BaseSettings):
     ADDITIONAL_MODULES: list[str] = []
 
     BROWSER_TYPE: str = "chromium-headful"
+    BROWSER_REMOTE_DEBUGGING_URL: str = "http://127.0.0.1:9222"
     MAX_SCRAPING_RETRIES: int = 0
-    VIDEO_PATH: str | None = None
+    VIDEO_PATH: str | None = "./video"
     HAR_PATH: str | None = "./har"
     LOG_PATH: str = "./log"
     TEMP_PATH: str = "./temp"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
-    BROWSER_LOADING_TIMEOUT_MS: int = 120000
+    BROWSER_LOADING_TIMEOUT_MS: int = 90000
     OPTION_LOADING_TIMEOUT_MS: int = 600000
     MAX_STEPS_PER_RUN: int = 10
+    MAX_STEPS_PER_TASK_V2: int = 25
+    MAX_ITERATIONS_PER_TASK_V2: int = 10
     MAX_NUM_SCREENSHOTS: int = 10
     # Ratio should be between 0 and 1.
     # If the task has been running for more steps than this ratio of the max steps per run, then we'll log a warning.
@@ -38,14 +41,13 @@ class Settings(BaseSettings):
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     BLOCKED_HOSTS: list[str] = ["localhost"]
+    ALLOWED_HOSTS: list[str] = []
 
     # Secret key for JWT. Please generate your own secret key in production
     SECRET_KEY: str = "PLACEHOLDER"
     # Algorithm used to sign the JWT
     SIGNATURE_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # one week
-
-    SKYVERN_API_KEY: str = "PLACEHOLDER"
 
     # Artifact storage settings
     ARTIFACT_STORAGE_PATH: str = f"{SKYVERN_DIR}/artifacts"
@@ -98,6 +100,9 @@ class Settings(BaseSettings):
     # ACTIVE LLM PROVIDER
     LLM_KEY: str = "OPENAI_GPT4O"
     SECONDARY_LLM_KEY: str | None = None
+    SELECT_AGENT_LLM_KEY: str | None = None
+    SINGLE_CLICK_AGENT_LLM_KEY: str | None = None
+    PROMPT_BLOCK_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
@@ -107,6 +112,7 @@ class Settings(BaseSettings):
     ENABLE_ANTHROPIC: bool = False
     ENABLE_AZURE: bool = False
     ENABLE_AZURE_GPT4O_MINI: bool = False
+    ENABLE_AZURE_O3_MINI: bool = False
     ENABLE_BEDROCK: bool = False
     ENABLE_GEMINI: bool = False
     # OPENAI
@@ -125,6 +131,12 @@ class Settings(BaseSettings):
     AZURE_GPT4O_MINI_API_BASE: str | None = None
     AZURE_GPT4O_MINI_API_VERSION: str | None = None
 
+    # AZURE o3 mini
+    AZURE_O3_MINI_DEPLOYMENT: str | None = None
+    AZURE_O3_MINI_API_KEY: str | None = None
+    AZURE_O3_MINI_API_BASE: str | None = None
+    AZURE_O3_MINI_API_VERSION: str | None = None
+
     # GEMINI
     GEMINI_API_KEY: str | None = None
 
@@ -136,16 +148,30 @@ class Settings(BaseSettings):
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
-    VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 5
+    VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 15
 
     # Bitwarden Settings
     BITWARDEN_CLIENT_ID: str | None = None
     BITWARDEN_CLIENT_SECRET: str | None = None
     BITWARDEN_MASTER_PASSWORD: str | None = None
 
+    # Skyvern Auth Bitwarden Settings
+    SKYVERN_AUTH_BITWARDEN_CLIENT_ID: str | None = None
+    SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET: str | None = None
+    SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD: str | None = None
+    SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID: str | None = None
+
+    BITWARDEN_SERVER: str = "http://localhost"
+    BITWARDEN_SERVER_PORT: int = 8002
+
     SVG_MAX_LENGTH: int = 100000
 
     ENABLE_LOG_ARTIFACTS: bool = False
+    ENABLE_CODE_BLOCK: bool = False
+
+    # SkyvernClient Settings
+    SKYVERN_BASE_URL: str = "https://api.skyvern.com"
+    SKYVERN_API_KEY: str = "PLACEHOLDER"
 
     def is_cloud_environment(self) -> bool:
         """

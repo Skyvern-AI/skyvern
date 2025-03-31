@@ -23,8 +23,9 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.tasks import ProxyLocation, Task
+from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
@@ -44,6 +45,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ExtractionBlock,
     FileDownloadBlock,
     FileParserBlock,
+    FileUploadBlock,
     ForLoopBlock,
     LoginBlock,
     NavigationBlock,
@@ -60,7 +62,11 @@ from skyvern.forge.sdk.workflow.models.block import (
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
+    BitwardenCreditCardDataParameter,
+    BitwardenLoginCredentialParameter,
+    BitwardenSensitiveInformationParameter,
     ContextParameter,
+    CredentialParameter,
     OutputParameter,
     Parameter,
     ParameterType,
@@ -74,8 +80,8 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRun,
     WorkflowRunOutputParameter,
     WorkflowRunParameter,
+    WorkflowRunResponse,
     WorkflowRunStatus,
-    WorkflowRunStatusResponse,
     WorkflowStatus,
 )
 from skyvern.forge.sdk.workflow.models.yaml import (
@@ -84,6 +90,7 @@ from skyvern.forge.sdk.workflow.models.yaml import (
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
 )
+from skyvern.schemas.runs import ProxyLocation
 from skyvern.webeye.browser_factory import BrowserState
 
 LOG = structlog.get_logger()
@@ -219,15 +226,57 @@ class WorkflowService:
             for parameter in workflow.workflow_definition.parameters
             if isinstance(parameter, ContextParameter)
         ]
+
+        secret_parameters = [
+            parameter
+            for parameter in workflow.workflow_definition.parameters
+            if isinstance(
+                parameter,
+                (
+                    AWSSecretParameter,
+                    BitwardenLoginCredentialParameter,
+                    BitwardenCreditCardDataParameter,
+                    BitwardenSensitiveInformationParameter,
+                    CredentialParameter,
+                ),
+            )
+        ]
+
         # Get all <workflow parameter, workflow run parameter> tuples
         wp_wps_tuples = await self.get_workflow_run_parameter_tuples(workflow_run_id=workflow_run.workflow_run_id)
         workflow_output_parameters = await self.get_workflow_output_parameters(workflow_id=workflow.workflow_id)
-        app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
-            workflow_run_id,
-            wp_wps_tuples,
-            workflow_output_parameters,
-            context_parameters,
-        )
+        try:
+            await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
+                organization,
+                workflow_run_id,
+                wp_wps_tuples,
+                workflow_output_parameters,
+                context_parameters,
+                secret_parameters,
+            )
+        except Exception as e:
+            LOG.exception(
+                f"Error while initializing workflow run context for workflow run {workflow_run.workflow_run_id}",
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
+
+            exception_message = f"Unexpected error: {str(e)}"
+            if isinstance(e, SkyvernException):
+                exception_message = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
+
+            failure_reason = f"Failed to initialize workflow run context. failure reason: {exception_message}"
+            await self.mark_workflow_run_as_failed(
+                workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
+            )
+            await self.clean_up_workflow(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                api_key=api_key,
+                browser_session_id=browser_session_id,
+                close_browser_on_completion=browser_session_id is None,
+            )
+            return workflow_run
+
         # Execute workflow blocks
         blocks = workflow.workflow_definition.blocks
         blocks_cnt = len(blocks)
@@ -323,7 +372,9 @@ class WorkflowService:
                         block_label=block.label,
                     )
                     if not block.continue_on_failure:
-                        failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed. failure reason: {block_result.failure_reason}"
+                        failure_reason = (
+                            f"{block.block_type} block failed. failure reason: {block_result.failure_reason}"
+                        )
                         await self.mark_workflow_run_as_failed(
                             workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                         )
@@ -359,7 +410,7 @@ class WorkflowService:
                     )
 
                     if not block.continue_on_failure:
-                        failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} terminated. Reason: {block_result.failure_reason}"
+                        failure_reason = f"{block.block_type} block terminated. Reason: {block_result.failure_reason}"
                         await self.mark_workflow_run_as_terminated(
                             workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                         )
@@ -395,7 +446,7 @@ class WorkflowService:
                     )
 
                     if not block.continue_on_failure:
-                        failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} timed out. Reason: {block_result.failure_reason}"
+                        failure_reason = f"{block.block_type} block timed out. Reason: {block_result.failure_reason}"
                         await self.mark_workflow_run_as_failed(
                             workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                         )
@@ -432,7 +483,7 @@ class WorkflowService:
                 if isinstance(e, SkyvernException):
                     exception_message = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
 
-                failure_reason = f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed. failure reason: {exception_message}"
+                failure_reason = f"{block.block_type} block failed. failure reason: {exception_message}"
                 await self.mark_workflow_run_as_failed(
                     workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
                 )
@@ -471,13 +522,13 @@ class WorkflowService:
         )
 
         # Track workflow run duration when completed
-        duration_seconds = (datetime.now(UTC) - workflow_run.created_at).total_seconds()
+        duration_seconds = (datetime.now(UTC) - workflow_run.created_at.replace(tzinfo=UTC)).total_seconds()
         LOG.info(
             "Workflow run duration metrics",
             workflow_run_id=workflow_run_id,
             workflow_id=workflow_run.workflow_id,
             duration_seconds=duration_seconds,
-            status=WorkflowRunStatus.completed,
+            workflow_run_status=WorkflowRunStatus.completed,
             organization_id=organization_id,
         )
 
@@ -757,20 +808,36 @@ class WorkflowService:
         bitwarden_client_id_aws_secret_key: str,
         bitwarden_client_secret_aws_secret_key: str,
         bitwarden_master_password_aws_secret_key: str,
-        url_parameter_key: str,
         key: str,
+        url_parameter_key: str | None = None,
         description: str | None = None,
         bitwarden_collection_id: str | None = None,
+        bitwarden_item_id: str | None = None,
     ) -> Parameter:
         return await app.DATABASE.create_bitwarden_login_credential_parameter(
             workflow_id=workflow_id,
             bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
             bitwarden_client_secret_aws_secret_key=bitwarden_client_secret_aws_secret_key,
             bitwarden_master_password_aws_secret_key=bitwarden_master_password_aws_secret_key,
-            url_parameter_key=url_parameter_key,
             key=key,
+            url_parameter_key=url_parameter_key,
             description=description,
             bitwarden_collection_id=bitwarden_collection_id,
+            bitwarden_item_id=bitwarden_item_id,
+        )
+
+    async def create_credential_parameter(
+        self,
+        workflow_id: str,
+        key: str,
+        credential_id: str,
+        description: str | None = None,
+    ) -> CredentialParameter:
+        return await app.DATABASE.create_credential_parameter(
+            workflow_id=workflow_id,
+            key=key,
+            credential_id=credential_id,
+            description=description,
         )
 
     async def create_bitwarden_sensitive_information_parameter(
@@ -866,7 +933,12 @@ class WorkflowService:
         workflow_run_output_parameters = await app.DATABASE.get_workflow_run_output_parameters(
             workflow_run_id=workflow_run_id
         )
-        output_parameters = await app.DATABASE.get_workflow_output_parameters(workflow_id=workflow_id)
+        output_parameters = await app.DATABASE.get_workflow_output_parameters_by_ids(
+            output_parameter_ids=[
+                workflow_run_output_parameter.output_parameter_id
+                for workflow_run_output_parameter in workflow_run_output_parameters
+            ]
+        )
 
         return [
             (output_parameter, workflow_run_output_parameter)
@@ -886,7 +958,7 @@ class WorkflowService:
         workflow_run_id: str,
         organization_id: str,
         include_cost: bool = False,
-    ) -> WorkflowRunStatusResponse:
+    ) -> WorkflowRunResponse:
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         if workflow_run is None:
             LOG.error(f"Workflow run {workflow_run_id} not found")
@@ -905,7 +977,7 @@ class WorkflowService:
         workflow_run_id: str,
         organization_id: str,
         include_cost: bool = False,
-    ) -> WorkflowRunStatusResponse:
+    ) -> WorkflowRunResponse:
         workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id)
         if workflow is None:
             LOG.error(f"Workflow {workflow_permanent_id} not found")
@@ -941,14 +1013,17 @@ class WorkflowService:
         if recording_artifact:
             recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
+        downloaded_files: list[FileInfo] | None = None
         downloaded_file_urls: list[str] | None = None
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                downloaded_file_urls = await app.STORAGE.get_downloaded_files(
+                downloaded_files = await app.STORAGE.get_downloaded_files(
                     organization_id=workflow_run.organization_id,
                     task_id=None,
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
+                if downloaded_files:
+                    downloaded_file_urls = [file_info.url for file_info in downloaded_files]
         except asyncio.TimeoutError:
             LOG.warning(
                 "Timeout to get downloaded files",
@@ -970,8 +1045,18 @@ class WorkflowService:
         )
 
         outputs = None
+        EXTRACTED_INFORMATION_KEY = "extracted_information"
         if output_parameter_tuples:
             outputs = {output_parameter.key: output.value for output_parameter, output in output_parameter_tuples}
+            extracted_information = {
+                output_parameter.key: output.value[EXTRACTED_INFORMATION_KEY]
+                for output_parameter, output in output_parameter_tuples
+                if output.value is not None
+                and isinstance(output.value, dict)
+                and EXTRACTED_INFORMATION_KEY in output.value
+                and output.value[EXTRACTED_INFORMATION_KEY] is not None
+            }
+            outputs[EXTRACTED_INFORMATION_KEY] = extracted_information
 
         total_steps = None
         total_cost = None
@@ -988,7 +1073,7 @@ class WorkflowService:
             # successful steps are the ones that have a status of completed and the total count of unique step.order
             successful_steps = [step for step in workflow_run_steps if step.status == StepStatus.completed]
             total_cost = 0.1 * (len(successful_steps) + len(text_prompt_blocks))
-        return WorkflowRunStatusResponse(
+        return WorkflowRunResponse(
             workflow_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run_id,
             status=workflow_run.status,
@@ -1002,10 +1087,12 @@ class WorkflowService:
             parameters=parameters_with_value,
             screenshot_urls=screenshot_urls,
             recording_url=recording_url,
+            downloaded_files=downloaded_files,
             downloaded_file_urls=downloaded_file_urls,
             outputs=outputs,
             total_steps=total_steps,
             total_cost=total_cost,
+            workflow_title=workflow.title,
         )
 
     async def clean_up_workflow(
@@ -1023,8 +1110,8 @@ class WorkflowService:
         browser_state = await app.BROWSER_MANAGER.cleanup_for_workflow_run(
             workflow_run.workflow_run_id,
             all_workflow_task_ids,
-            close_browser_on_completion,
-            browser_session_id,
+            close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+            browser_session_id=browser_session_id,
             organization_id=workflow_run.organization_id,
         )
         if browser_state:
@@ -1313,12 +1400,25 @@ class WorkflowService:
                         key=parameter.key,
                         description=parameter.description,
                     )
+                elif parameter.parameter_type == ParameterType.CREDENTIAL:
+                    parameters[parameter.key] = await self.create_credential_parameter(
+                        workflow_id=workflow.workflow_id,
+                        key=parameter.key,
+                        description=parameter.description,
+                        credential_id=parameter.credential_id,
+                    )
                 elif parameter.parameter_type == ParameterType.BITWARDEN_LOGIN_CREDENTIAL:
-                    if not parameter.bitwarden_collection_id:
+                    if not parameter.bitwarden_collection_id and not parameter.bitwarden_item_id:
                         raise WorkflowParameterMissingRequiredValue(
                             workflow_parameter_type=ParameterType.BITWARDEN_LOGIN_CREDENTIAL,
                             workflow_parameter_key=parameter.key,
-                            required_value="bitwarden_collection_id",
+                            required_value="bitwarden_collection_id or bitwarden_item_id",
+                        )
+                    if parameter.bitwarden_collection_id and not parameter.url_parameter_key:
+                        raise WorkflowParameterMissingRequiredValue(
+                            workflow_parameter_type=ParameterType.BITWARDEN_LOGIN_CREDENTIAL,
+                            workflow_parameter_key=parameter.key,
+                            required_value="url_parameter_key",
                         )
                     parameters[parameter.key] = await self.create_bitwarden_login_credential_parameter(
                         workflow_id=workflow.workflow_id,
@@ -1329,6 +1429,7 @@ class WorkflowService:
                         key=parameter.key,
                         description=parameter.description,
                         bitwarden_collection_id=parameter.bitwarden_collection_id,
+                        bitwarden_item_id=parameter.bitwarden_item_id,
                     )
                 elif parameter.parameter_type == ParameterType.BITWARDEN_SENSITIVE_INFORMATION:
                     parameters[parameter.key] = await self.create_bitwarden_sensitive_information_parameter(
@@ -1351,7 +1452,7 @@ class WorkflowService:
                         bitwarden_master_password_aws_secret_key=parameter.bitwarden_master_password_aws_secret_key,
                         # TODO: remove "# type: ignore" after ensuring bitwarden_collection_id is always set
                         bitwarden_collection_id=parameter.bitwarden_collection_id,  # type: ignore
-                        bitwarden_item_id=parameter.bitwarden_item_id,
+                        bitwarden_item_id=parameter.bitwarden_item_id,  # type: ignore
                         key=parameter.key,
                         description=parameter.description,
                     )
@@ -1496,6 +1597,7 @@ class WorkflowService:
                 cache_actions=block_yaml.cache_actions,
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
+                complete_verification=block_yaml.complete_verification,
             )
         elif block_yaml.block_type == BlockType.FOR_LOOP:
             loop_blocks = [
@@ -1565,6 +1667,18 @@ class WorkflowService:
             return UploadToS3Block(
                 label=block_yaml.label,
                 output_parameter=output_parameter,
+                path=block_yaml.path,
+                continue_on_failure=block_yaml.continue_on_failure,
+            )
+        elif block_yaml.block_type == BlockType.FILE_UPLOAD:
+            return FileUploadBlock(
+                label=block_yaml.label,
+                output_parameter=output_parameter,
+                storage_type=block_yaml.storage_type,
+                s3_bucket=block_yaml.s3_bucket,
+                aws_access_key_id=block_yaml.aws_access_key_id,
+                aws_secret_access_key=block_yaml.aws_secret_access_key,
+                region_name=block_yaml.region_name,
                 path=block_yaml.path,
                 continue_on_failure=block_yaml.continue_on_failure,
             )
@@ -1648,6 +1762,8 @@ class WorkflowService:
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 cache_actions=block_yaml.cache_actions,
+                # DO NOT run complete verification for action block
+                complete_verification=False,
                 max_steps_per_run=1,
             )
 
@@ -1675,6 +1791,7 @@ class WorkflowService:
                 cache_actions=block_yaml.cache_actions,
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
+                complete_verification=block_yaml.complete_verification,
             )
 
         elif block_yaml.block_type == BlockType.EXTRACTION:
@@ -1695,6 +1812,7 @@ class WorkflowService:
                 max_retries=block_yaml.max_retries,
                 continue_on_failure=block_yaml.continue_on_failure,
                 cache_actions=block_yaml.cache_actions,
+                complete_verification=False,
             )
 
         elif block_yaml.block_type == BlockType.LOGIN:
@@ -1719,6 +1837,7 @@ class WorkflowService:
                 cache_actions=block_yaml.cache_actions,
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
+                complete_verification=block_yaml.complete_verification,
             )
 
         elif block_yaml.block_type == BlockType.WAIT:
@@ -1754,6 +1873,7 @@ class WorkflowService:
                 totp_identifier=block_yaml.totp_identifier,
                 cache_actions=block_yaml.cache_actions,
                 complete_on_download=True,
+                complete_verification=True,
             )
         elif block_yaml.block_type == BlockType.TaskV2:
             return TaskV2Block(
@@ -1763,6 +1883,7 @@ class WorkflowService:
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 max_iterations=block_yaml.max_iterations,
+                max_steps=block_yaml.max_steps,
                 output_parameter=output_parameter,
             )
         elif block_yaml.block_type == BlockType.GOTO_URL:
@@ -1770,6 +1891,7 @@ class WorkflowService:
                 label=block_yaml.label,
                 url=block_yaml.url,
                 output_parameter=output_parameter,
+                complete_verification=False,
             )
 
         raise ValueError(f"Invalid block type {block_yaml.block_type}")
@@ -1838,6 +1960,7 @@ class WorkflowService:
             if block.parent_workflow_run_block_id:
                 if block.parent_workflow_run_block_id in block_map:
                     block_map[block.parent_workflow_run_block_id].children.append(workflow_run_timeline)
+                    block_map[block.workflow_run_block_id] = workflow_run_timeline
                 else:
                     # put the block back to the queue
                     workflow_run_blocks.append(block)

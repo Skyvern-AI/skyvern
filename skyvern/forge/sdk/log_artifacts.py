@@ -21,6 +21,8 @@ def primary_key_from_log_entity_type(log_entity_type: LogEntityType) -> str:
         return "workflow_run_id"
     elif log_entity_type == LogEntityType.WORKFLOW_RUN_BLOCK:
         return "workflow_run_block_id"
+    elif log_entity_type == LogEntityType.TASK_V2:
+        return "task_v2_id"
     else:
         raise ValueError(f"Invalid log entity type: {log_entity_type}")
 

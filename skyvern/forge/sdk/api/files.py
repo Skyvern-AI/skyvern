@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import mimetypes
 import os
@@ -6,15 +7,15 @@ import shutil
 import tempfile
 import zipfile
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import aiohttp
 import structlog
 from multidict import CIMultiDictProxy
 
 from skyvern.config import settings
-from skyvern.constants import REPO_ROOT_DIR
-from skyvern.exceptions import DownloadFileMaxSizeExceeded
+from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, BROWSER_DOWNLOADING_SUFFIX, REPO_ROOT_DIR
+from skyvern.exceptions import DownloadFileMaxSizeExceeded, DownloadFileMaxWaitingTime
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 
 LOG = structlog.get_logger()
@@ -70,6 +71,15 @@ async def download_file(url: str, max_size_mb: int | None = None) -> str:
             LOG.info("Downloading Skyvern file from S3", url=url)
             client = AsyncAWSClient()
             return await download_from_s3(client, url)
+
+        # Check if URL is a file:// URI
+        # we only support to download local files when the environment is local
+        # and the file is in the skyvern downloads directory
+        if url.startswith("file://") and settings.ENV == "local":
+            file_path = parse_uri_to_path(url)
+            if file_path.startswith(f"{REPO_ROOT_DIR}/downloads"):
+                LOG.info("Downloading file from local file system", url=url)
+                return file_path
 
         async with aiohttp.ClientSession(raise_for_status=True) as session:
             LOG.info("Starting to download file", url=url)
@@ -158,6 +168,34 @@ def list_files_in_directory(directory: Path, recursive: bool = False) -> list[st
     return listed_files
 
 
+def list_downloading_files_in_directory(
+    directory: Path, downloading_suffix: str = BROWSER_DOWNLOADING_SUFFIX
+) -> list[Path]:
+    # check if there's any file is still downloading
+    downloading_files: list[Path] = []
+    for file in list_files_in_directory(directory):
+        path = Path(file)
+        if path.suffix == downloading_suffix:
+            downloading_files.append(path)
+    return downloading_files
+
+
+async def wait_for_download_finished(downloading_files: list[Path], timeout: float = BROWSER_DOWNLOAD_TIMEOUT) -> None:
+    cur_downloading_files = downloading_files
+    try:
+        async with asyncio.timeout(timeout):
+            while len(cur_downloading_files) > 0:
+                new_downloading_files: list[Path] = []
+                for path in cur_downloading_files:
+                    if not path.exists():
+                        continue
+                    new_downloading_files.append(path)
+                cur_downloading_files = new_downloading_files
+                await asyncio.sleep(1)
+    except asyncio.TimeoutError:
+        raise DownloadFileMaxWaitingTime(downloading_files=cur_downloading_files)
+
+
 def get_number_of_files_in_directory(directory: Path, recursive: bool = False) -> int:
     return len(list_files_in_directory(directory, recursive))
 
@@ -244,3 +282,11 @@ def clean_up_dir(dir: str) -> None:
 
 def clean_up_skyvern_temp_dir() -> None:
     return clean_up_dir(get_skyvern_temp_dir())
+
+
+def parse_uri_to_path(uri: str) -> str:
+    parsed_uri = urlparse(uri)
+    if parsed_uri.scheme != "file":
+        raise ValueError(f"Invalid URI scheme: {parsed_uri.scheme} expected: file")
+    path = parsed_uri.netloc + parsed_uri.path
+    return unquote(path)

@@ -1,13 +1,8 @@
 import { Button } from "@/components/ui/button";
-import { ImportWorkflowButton } from "./ImportWorkflowButton";
-import { useNavigate } from "react-router-dom";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { getClient } from "@/api/AxiosClient";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
-import { stringify as convertToYAML } from "yaml";
-import { WorkflowApiResponse } from "./types/workflowTypes";
 import { PlusIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
+import { ImportWorkflowButton } from "./ImportWorkflowButton";
+import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
@@ -19,30 +14,7 @@ const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
 };
 
 function WorkflowsPageBanner() {
-  const navigate = useNavigate();
-  const credentialGetter = useCredentialGetter();
-  const queryClient = useQueryClient();
-
-  const createNewWorkflowMutation = useMutation({
-    mutationFn: async () => {
-      const client = await getClient(credentialGetter);
-      const yaml = convertToYAML(emptyWorkflowRequest);
-      return client.post<
-        typeof emptyWorkflowRequest,
-        { data: WorkflowApiResponse }
-      >("/workflows", yaml, {
-        headers: {
-          "Content-Type": "text/plain",
-        },
-      });
-    },
-    onSuccess: (response) => {
-      queryClient.invalidateQueries({
-        queryKey: ["workflows"],
-      });
-      navigate(`/workflows/${response.data.workflow_permanent_id}/edit`);
-    },
-  });
+  const createNewWorkflowMutation = useCreateWorkflowMutation();
 
   return (
     <div className="space-y-8 bg-slate-elevation1 p-12">
@@ -54,7 +26,7 @@ function WorkflowsPageBanner() {
         <Button
           disabled={createNewWorkflowMutation.isPending}
           onClick={() => {
-            createNewWorkflowMutation.mutate();
+            createNewWorkflowMutation.mutate(emptyWorkflowRequest);
           }}
         >
           {createNewWorkflowMutation.isPending ? (
