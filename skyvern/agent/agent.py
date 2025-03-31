@@ -45,7 +45,7 @@ class SkyvernAgent:
             # TODO validate browser_path
             # Supported Browsers: Google Chrome, Brave Browser, Microsoft Edge, Firefox
             if "Chrome" in browser_path or "Brave" in browser_path or "Edge" in browser_path:
-                result = subprocess.Popen(
+                result = subprocess.run(
                     ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "--remote-debugging-port=9222"]
                 )
                 if result.returncode != 0:
