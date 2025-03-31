@@ -4,12 +4,12 @@ import typing
 
 ProxyLocation = typing.Union[
     typing.Literal[
+        "RESIDENTIAL",
         "US-CA",
         "US-NY",
         "US-TX",
         "US-FL",
         "US-WA",
-        "RESIDENTIAL",
         "RESIDENTIAL_ES",
         "RESIDENTIAL_IE",
         "RESIDENTIAL_GB",
