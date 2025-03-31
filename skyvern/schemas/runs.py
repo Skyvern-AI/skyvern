@@ -97,7 +97,7 @@ class RunEngine(StrEnum):
     skyvern_v2 = "skyvern-2.0"
 
 
-class TaskRunStatus(StrEnum):
+class RunStatus(StrEnum):
     created = "created"
     queued = "queued"
     running = "running"
@@ -138,7 +138,7 @@ class TaskRunRequest(BaseModel):
 class RunResponse(BaseModel):
     run_id: str
     engine: RunEngine = RunEngine.skyvern_v1
-    status: TaskRunStatus
+    status: RunStatus
     goal: str | None = None
     url: str | None = None
     output: dict | list | str | None = None
