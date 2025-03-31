@@ -1,8 +1,9 @@
 from datetime import datetime
 from enum import StrEnum
+from typing import Annotated, Any, Literal, Union
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from skyvern.utils.url_validators import validate_url
 
@@ -112,7 +113,7 @@ class RunStatus(StrEnum):
 
 
 class TaskRunRequest(BaseModel):
-    goal: str
+    prompt: str
     url: str | None = None
     title: str | None = None
     engine: RunEngine = RunEngine.skyvern_v2
@@ -135,21 +136,40 @@ class TaskRunRequest(BaseModel):
         return validate_url(url)
 
 
-class RunResponse(BaseModel):
+class WorkflowRunRequest(BaseModel):
+    title: str | None = None
+    parameters: dict[str, Any] | None = None
+    proxy_location: ProxyLocation | None = None
+    webhook_url: str | None = None
+    totp_url: str | None = None
+    totp_identifier: str | None = None
+    browser_session_id: str | None = None
+
+    @field_validator("webhook_url", "totp_url")
+    @classmethod
+    def validate_urls(cls, url: str | None) -> str | None:
+        if url is None:
+            return None
+        return validate_url(url)
+
+
+class BaseRunResponse(BaseModel):
     run_id: str
-    engine: RunEngine = RunEngine.skyvern_v1
     status: RunStatus
-    goal: str | None = None
-    url: str | None = None
     output: dict | list | str | None = None
     failure_reason: str | None = None
-    webhook_url: str | None = None
-    totp_identifier: str | None = None
-    totp_url: str | None = None
-    proxy_location: ProxyLocation | None = None
-    error_code_mapping: dict[str, str] | None = None
-    data_extraction_schema: dict | list | str | None = None
-    title: str | None = None
-    max_steps: int | None = None
     created_at: datetime
     modified_at: datetime
+
+
+class TaskRunResponse(BaseRunResponse):
+    run_type: Literal[RunType.task_v1, RunType.task_v2]
+    run_request: TaskRunRequest | None = None
+
+
+class WorkflowRunResponse(BaseRunResponse):
+    run_type: Literal[RunType.workflow_run]
+    run_request: WorkflowRunRequest | None = None
+
+
+RunResponse = Annotated[Union[TaskRunResponse, WorkflowRunResponse], Field(discriminator="run_type")]
