@@ -6,6 +6,7 @@ import time
 from typing import Optional
 
 import typer
+from click import Choice
 from dotenv import load_dotenv
 
 from skyvern.utils import detect_os, get_windows_appdata_roaming, migrate_db
@@ -134,21 +135,130 @@ def migrate() -> None:
     migrate_db()
 
 
-@run_app.command(name="mcp")
-def run_mcp() -> None:
-    host_system = detect_os()
-    path_to_server = os.path.join(os.path.abspath("./skyvern/mcp"), "server.py")
+def get_claude_config_path(host_system: str) -> str:
+    """Get the Claude Desktop config file path for the current OS."""
+    if host_system == "wsl":
+        roaming_path = get_windows_appdata_roaming()
+        if roaming_path is None:
+            raise RuntimeError("Could not locate Windows AppData\\Roaming path from WSL")
+        return os.path.join(str(roaming_path), "Claude", "claude_desktop_config.json")
+    
+    base_paths = {
+        "darwin": "~/Library/Application Support/Claude",
+        "linux": ["~/.config/Claude", "~/.local/share/Claude", "~/Claude"]
+    }
+    
+    if host_system == "darwin":
+        base_path = os.path.expanduser(base_paths["darwin"])
+        return os.path.join(base_path, "claude_desktop_config.json")
+    
+    if host_system == "linux":
+        for path in base_paths["linux"]:
+            full_path = os.path.expanduser(path)
+            if os.path.exists(full_path):
+                return os.path.join(full_path, "claude_desktop_config.json")
+    
+    raise Exception(f"Unsupported host system: {host_system}")
 
-    # Try to get the python environment path using "which python"
-    python_path = shutil.which("python")
-    if python_path:
-        path_to_env = python_path
-    else:
-        path_to_env = typer.prompt("Enter the full path to your configured python environment")
 
-    path_claude_config = "Claude/claude_desktop_config.json"
+def get_claude_command_config(host_system: str, path_to_env: str, path_to_server: str, env_vars: str) -> tuple[str, list]:
+    """Get the command and arguments for Claude Desktop configuration."""
+    base_env_vars = f"{env_vars} ENABLE_OPENAI=true LOG_LEVEL=CRITICAL"
+    artifacts_path = os.path.join(os.path.abspath('./'), 'artifacts')
+    
+    if host_system == "wsl":
+        env_vars = f"{base_env_vars} ARTIFACT_STORAGE_PATH={artifacts_path} BROWSER_TYPE=chromium-headless"
+        return "wsl.exe", ["bash", "-c", f"{env_vars} {path_to_env} {path_to_server}"]
+    
+    if host_system in ["linux", "darwin"]:
+        env_vars = f"{base_env_vars} ARTIFACT_STORAGE_PATH={artifacts_path}"
+        return path_to_env, [path_to_server]
+    
+    raise Exception(f"Unsupported host system: {host_system}")
 
-    # Setup command & args for Claude Desktop
+
+def is_claude_desktop_installed(host_system: str) -> bool:
+    """Check if Claude Desktop is installed by looking for its config directory."""
+    try:
+        config_path = os.path.dirname(get_claude_config_path(host_system))
+        return os.path.exists(config_path)
+    except Exception:
+        return False
+
+
+def get_cursor_config_path(host_system: str) -> str:
+    """Get the Cursor config file path for the current OS."""
+    if host_system == "wsl":
+        roaming_path = get_windows_appdata_roaming()
+        if roaming_path is None:
+            raise RuntimeError("Could not locate Windows AppData\\Roaming path from WSL")
+        return os.path.join(str(roaming_path), ".cursor", "mcp.json")
+    
+    # For both darwin and linux, use ~/.cursor/mcp.json
+    return os.path.expanduser("~/.cursor/mcp.json")
+
+
+def is_cursor_installed(host_system: str) -> bool:
+    """Check if Cursor is installed by looking for its config directory."""
+    try:
+        config_dir = os.path.expanduser("~/.cursor")
+        return os.path.exists(config_dir)
+    except Exception:
+        return False
+
+
+def setup_cursor_mcp(host_system: str, path_to_env: str, path_to_server: str, env_vars: str) -> None:
+    """Set up Cursor MCP configuration."""
+    if not is_cursor_installed(host_system):
+        print("Cursor is not installed. Skipping Cursor MCP setup.")
+        return
+
+    try:
+        path_cursor_config = get_cursor_config_path(host_system)
+    except Exception as e:
+        print(f"Error setting up Cursor: {e}")
+        return
+
+    # Get command configuration
+    try:
+        command, args = get_claude_command_config(host_system, path_to_env, path_to_server, env_vars)
+    except Exception as e:
+        print(f"Error configuring Cursor command: {e}")
+        return
+
+    # Create or update Cursor config file
+    os.makedirs(os.path.dirname(path_cursor_config), exist_ok=True)
+    config = {"Skyvern": {"command": command, "args": args}}
+    
+    if os.path.exists(path_cursor_config):
+        try:
+            with open(path_cursor_config, "r") as f:
+                existing_config = json.load(f)
+                existing_config.update(config)
+                config = existing_config
+        except json.JSONDecodeError:
+            pass  # Use default config if file is corrupted
+
+    with open(path_cursor_config, "w") as f:
+        json.dump(config, f, indent=2)
+
+    print("Cursor MCP configuration updated successfully.")
+
+
+def setup_claude_desktop(host_system: str, path_to_env: str, path_to_server: str) -> None:
+    """Set up Claude Desktop configuration for Skyvern MCP."""
+    if not is_claude_desktop_installed(host_system):
+        print("Claude Desktop is not installed. Skipping MCP setup.")
+        return
+
+    # Get config file path
+    try:
+        path_claude_config = get_claude_config_path(host_system)
+    except Exception as e:
+        print(f"Error setting up Claude Desktop: {e}")
+        return
+
+    # Setup environment variables
     env_vars = ""
     for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]:
         value = os.getenv(key)
@@ -156,29 +266,17 @@ def run_mcp() -> None:
             value = typer.prompt(f"Enter your {key}")
         env_vars += f"{key}={value} "
 
-    if host_system == "wsl":
-        roaming_path = get_windows_appdata_roaming()
-        if roaming_path is None:
-            raise RuntimeError("Could not locate Windows AppData\\Roaming path from WSL")
-        path_claude_config = os.path.join(str(roaming_path), path_claude_config)
-        env_vars += (
-            f"ENABLE_OPENAI=true LOG_LEVEL=CRITICAL "
-            f"ARTIFACT_STORAGE_PATH={os.path.join(os.path.abspath('./'), 'artifacts')} "
-            f"BROWSER_TYPE=chromium-headless"
+    # Get command configuration
+    try:
+        claude_command, claude_args = get_claude_command_config(
+            host_system, path_to_env, path_to_server, env_vars
         )
-        claude_command = "wsl.exe"
-        claude_args = ["bash", "-c", f"{env_vars} {path_to_env} {path_to_server}"]
-    elif host_system in ["linux", "darwin"]:
-        path_claude_config = os.path.join(os.path.abspath("~/"), path_claude_config)
-        env_vars += (
-            f"ENABLE_OPENAI=true LOG_LEVEL=CRITICAL "
-            f"ARTIFACT_STORAGE_PATH={os.path.join(os.path.abspath('./'), 'artifacts')}"
-        )
-        claude_command = path_to_env
-        claude_args = [path_to_server]
-    else:
-        raise Exception(f"Unsupported host system: {host_system}")
+    except Exception as e:
+        print(f"Error configuring Claude Desktop command: {e}")
+        return
 
+    # Create or update Claude config file
+    os.makedirs(os.path.dirname(path_claude_config), exist_ok=True)
     if not os.path.exists(path_claude_config):
         with open(path_claude_config, "w") as f:
             json.dump({"mcpServers": {}}, f, indent=2)
@@ -191,4 +289,159 @@ def run_mcp() -> None:
     with open(path_claude_config, "w") as f:
         json.dump(claude_config, f, indent=2)
 
-    print("Done! Do a hard restart of Claude Desktop to update your active configuration.")
+    print("Claude Desktop configuration updated successfully.")
+
+
+def get_mcp_server_url(deployment_type: str, host: str = None) -> str:
+    """Get the MCP server URL based on deployment type."""
+    if deployment_type == "cloud":
+        return "https://api.skyvern.com/mcp"
+    elif deployment_type == "self-hosted":
+        if not host:
+            raise ValueError("Host is required for self-hosted deployment")
+        return f"{host.rstrip('/')}/mcp"
+    elif deployment_type == "local":
+        return os.path.join(os.path.abspath("./skyvern/mcp"), "server.py")
+    else:
+        raise ValueError(f"Invalid deployment type: {deployment_type}")
+
+
+def setup_mcp_config(host_system: str, deployment_type: str, host: str = None) -> tuple[str, str]:
+    """Set up MCP configuration based on deployment type."""
+    if deployment_type == "local":
+        # For local deployment, we need Python environment
+        python_path = shutil.which("python")
+        if python_path:
+            path_to_env = python_path
+        else:
+            path_to_env = typer.prompt("Enter the full path to your configured python environment")
+        return path_to_env, get_mcp_server_url(deployment_type)
+    else:
+        # For cloud and self-hosted, we use curl
+        curl_path = shutil.which("curl")
+        if not curl_path:
+            raise RuntimeError("curl is required but not found in PATH")
+        return curl_path, get_mcp_server_url(deployment_type, host)
+
+
+def get_command_config(host_system: str, command: str, target: str, env_vars: str) -> tuple[str, list]:
+    """Get the command and arguments for MCP configuration."""
+    base_env_vars = f"{env_vars} ENABLE_OPENAI=true LOG_LEVEL=CRITICAL"
+    artifacts_path = os.path.join(os.path.abspath('./'), 'artifacts')
+    
+    if host_system == "wsl":
+        env_vars = f"{base_env_vars} ARTIFACT_STORAGE_PATH={artifacts_path} BROWSER_TYPE=chromium-headless"
+        if target.startswith("http"):
+            return command, ["-X", "POST", target]
+        return "wsl.exe", ["bash", "-c", f"{env_vars} {command} {target}"]
+    
+    if host_system in ["linux", "darwin"]:
+        env_vars = f"{base_env_vars} ARTIFACT_STORAGE_PATH={artifacts_path}"
+        if target.startswith("http"):
+            return command, ["-X", "POST", target]
+        return command, [target]
+    
+    raise Exception(f"Unsupported host system: {host_system}")
+
+
+@run_app.command(name="mcp")
+def run_mcp() -> None:
+    """Configure MCP for different Skyvern deployments."""
+    host_system = detect_os()
+
+    # Prompt for deployment type
+    deployment_types = ["local", "cloud", "self-hosted"]
+    deployment_type = typer.prompt(
+        "Select Skyvern deployment type",
+        type=Choice(deployment_types),
+        default="local"
+    )
+
+    # Get host for self-hosted deployment
+    host = None
+    if deployment_type == "self-hosted":
+        host = typer.prompt("Enter the self-hosted Skyvern URL (e.g., https://skyvern.yourdomain.com)")
+
+    try:
+        command, target = setup_mcp_config(host_system, deployment_type, host)
+    except Exception as e:
+        print(f"Error setting up MCP configuration: {e}")
+        return
+
+    # Setup environment variables
+    env_vars = ""
+    for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]:
+        value = os.getenv(key)
+        if value is None:
+            value = typer.prompt(f"Enter your {key}")
+        env_vars += f"{key}={value} "
+
+    # Configure both Claude Desktop and Cursor
+    success = False
+    success |= setup_claude_desktop_config(host_system, command, target, env_vars)
+    success |= setup_cursor_config(host_system, command, target, env_vars)
+
+    if not success:
+        print("Neither Claude Desktop nor Cursor is installed. Please install at least one of them.")
+
+
+def setup_claude_desktop_config(host_system: str, command: str, target: str, env_vars: str) -> bool:
+    """Set up Claude Desktop configuration with given command and args."""
+    if not is_claude_desktop_installed(host_system):
+        return False
+
+    try:
+        claude_command, claude_args = get_command_config(host_system, command, target, env_vars)
+        path_claude_config = get_claude_config_path(host_system)
+        
+        os.makedirs(os.path.dirname(path_claude_config), exist_ok=True)
+        if not os.path.exists(path_claude_config):
+            with open(path_claude_config, "w") as f:
+                json.dump({"mcpServers": {}}, f, indent=2)
+
+        with open(path_claude_config, "r") as f:
+            claude_config = json.load(f)
+            claude_config["mcpServers"].pop("Skyvern", None)
+            claude_config["mcpServers"]["Skyvern"] = {"command": claude_command, "args": claude_args}
+
+        with open(path_claude_config, "w") as f:
+            json.dump(claude_config, f, indent=2)
+
+        print("Claude Desktop configuration updated successfully.")
+        return True
+
+    except Exception as e:
+        print(f"Error configuring Claude Desktop: {e}")
+        return False
+
+
+def setup_cursor_config(host_system: str, command: str, target: str, env_vars: str) -> bool:
+    """Set up Cursor configuration with given command and args."""
+    if not is_cursor_installed(host_system):
+        return False
+
+    try:
+        cursor_command, cursor_args = get_command_config(host_system, command, target, env_vars)
+        path_cursor_config = get_cursor_config_path(host_system)
+
+        os.makedirs(os.path.dirname(path_cursor_config), exist_ok=True)
+        config = {"Skyvern": {"command": cursor_command, "args": cursor_args}}
+        
+        if os.path.exists(path_cursor_config):
+            try:
+                with open(path_cursor_config, "r") as f:
+                    existing_config = json.load(f)
+                    existing_config.update(config)
+                    config = existing_config
+            except json.JSONDecodeError:
+                pass
+
+        with open(path_cursor_config, "w") as f:
+            json.dump(config, f, indent=2)
+
+        print(f"Cursor configuration updated successfully at {path_cursor_config}")
+        return True
+
+    except Exception as e:
+        print(f"Error configuring Cursor: {e}")
+        return False
