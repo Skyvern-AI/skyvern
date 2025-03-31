@@ -1,5 +1,4 @@
 import asyncio
-import os
 import subprocess
 from typing import Any, cast
 
@@ -32,7 +31,7 @@ class SkyvernAgent:
         browser_path: str | None = None,
         browser_type: str | None = None,
     ) -> None:
-        self.skyvern_client: SkyvernClient | None = None
+        self.client: SkyvernClient | None = None
         if base_url is None and api_key is None:
             # TODO: run at the root wherever the code is initiated
             load_dotenv(".env")
@@ -61,9 +60,9 @@ class SkyvernAgent:
                 )
         elif base_url is None and api_key is None:
             if not browser_type:
-                if "BROWSER_TYPE" not in os.environ:
-                    raise Exception("browser type is missing")
-                browser_type = os.environ["BROWSER_TYPE"]
+                # if "BROWSER_TYPE" not in os.environ:
+                #     raise Exception("browser type is missing")
+                browser_type = "chromium-headful"
 
             settings.BROWSER_TYPE = browser_type
         elif base_url and api_key:
@@ -253,7 +252,7 @@ class SkyvernAgent:
     async def run_task(
         self,
         prompt: str,
-        engine: RunEngine = RunEngine.skyvern_v1,
+        engine: RunEngine = RunEngine.skyvern_v2,
         url: str | None = None,
         webhook_url: str | None = None,
         totp_identifier: str | None = None,

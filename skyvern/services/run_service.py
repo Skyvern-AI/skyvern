@@ -9,7 +9,7 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
 
     if run.task_run_type == RunType.task_v1:
         # fetch task v1 from db and transform to task run response
-        task_v1 = await app.DATABASE.get_task(run.task_v1_id, organization_id=organization_id)
+        task_v1 = await app.DATABASE.get_task(run.run_id, organization_id=organization_id)
         if not task_v1:
             return None
         return TaskRunResponse(
@@ -34,7 +34,7 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
             ),
         )
     elif run.task_run_type == RunType.task_v2:
-        task_v2 = await app.DATABASE.get_task_v2(run.task_v2_id, organization_id=organization_id)
+        task_v2 = await app.DATABASE.get_task_v2(run.run_id, organization_id=organization_id)
         if not task_v2:
             return None
         return TaskRunResponse(
@@ -42,7 +42,8 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
             run_type=run.task_run_type,
             status=task_v2.status,
             output=task_v2.output,
-            failure_reason=task_v2.failure_reason,
+            # TODO: add failure reason
+            # failure_reason=task_v2.failure_reason,
             created_at=task_v2.created_at,
             modified_at=task_v2.modified_at,
             run_request=TaskRunRequest(
@@ -53,7 +54,7 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
                 totp_identifier=task_v2.totp_identifier,
                 totp_url=task_v2.totp_verification_url,
                 proxy_location=task_v2.proxy_location,
-                data_extraction_schema=task_v2.data_extraction_schema,
+                data_extraction_schema=task_v2.extracted_information_schema,
                 error_code_mapping=task_v2.error_code_mapping,
             ),
         )

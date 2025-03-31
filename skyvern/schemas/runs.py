@@ -122,7 +122,7 @@ class TaskRunRequest(BaseModel):
     engine: RunEngine = Field(
         default=RunEngine.skyvern_v2, description="The Skyvern engine version to use for this task"
     )
-    proxy_location: ProxyLocation = Field(
+    proxy_location: ProxyLocation | None = Field(
         default=ProxyLocation.RESIDENTIAL, description="Geographic Proxy location to route the browser traffic through"
     )
     data_extraction_schema: dict | list | str | None = Field(
