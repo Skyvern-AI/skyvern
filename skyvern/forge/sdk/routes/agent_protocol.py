@@ -437,11 +437,17 @@ async def get_runs(
 
 @base_router.get(
     "/runs/{run_id}",
-    tags=["agent"],
+    tags=["Agent"],
     response_model=RunResponse,
+    description="Get a task or a workflow run by id",
+    summary="Get a task or a workflow run by id",
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_run",
+    },
+    responses={
+        200: {"description": "Successfully got run"},
+        404: {"description": "Run not found"},
     },
 )
 @base_router.get(
@@ -976,7 +982,7 @@ async def update_workflow(
 )
 @legacy_base_router.delete("/workflows/{workflow_id}/", include_in_schema=False)
 @base_router.post(
-    "/workflows/{workflow_id}",
+    "/workflows/{workflow_id}/delete",
     tags=["Agent"],
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
@@ -986,6 +992,7 @@ async def update_workflow(
     summary="Delete a workflow",
     responses={200: {"description": "Successfully deleted workflow"}},
 )
+@base_router.post("/workflows/{workflow_id}/delete/", include_in_schema=False)
 async def delete_workflow(
     workflow_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -1431,7 +1438,7 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
 
 
 @base_router.post(
-    "/tasks/run",
+    "/run/tasks",
     tags=["Agent"],
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
@@ -1444,7 +1451,7 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
         400: {"description": "Invalid agent engine"},
     },
 )
-@base_router.post("/tasks/run/", include_in_schema=False)
+@base_router.post("/run/tasks/", include_in_schema=False)
 async def run_task(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -1572,7 +1579,7 @@ async def run_task(
 
 
 @base_router.post(
-    "/workflows/run",
+    "/run/workflows",
     tags=["Agent"],
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
@@ -1585,7 +1592,7 @@ async def run_task(
         400: {"description": "Invalid workflow run request"},
     },
 )
-@base_router.post("/workflows/run/", include_in_schema=False)
+@base_router.post("/run/workflows/", include_in_schema=False)
 async def run_workflow(
     request: Request,
     background_tasks: BackgroundTasks,
