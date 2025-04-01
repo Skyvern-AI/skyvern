@@ -350,16 +350,11 @@ def run_mcp() -> None:
     host_system = detect_os()
 
     # Prompt for deployment type
-    deployment_types = ["local", "cloud", "self-hosted"]
+    deployment_types = ["local", "cloud"]
     deployment_type = typer.prompt("Select Skyvern deployment type", type=Choice(deployment_types), default="local")
 
-    # Get host for self-hosted deployment
-    host = ""
-    if deployment_type == "self-hosted":
-        host = typer.prompt("Enter the self-hosted Skyvern URL (e.g., https://skyvern.yourdomain.com)")
-
     try:
-        command, target = setup_mcp_config(host_system, deployment_type, host)
+        command, target = setup_mcp_config(host_system, deployment_type)
     except Exception as e:
         print(f"Error setting up MCP configuration: {e}")
         return
