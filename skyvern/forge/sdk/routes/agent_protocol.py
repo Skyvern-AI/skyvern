@@ -838,6 +838,26 @@ async def get_workflow_run(
     response_model=Workflow,
     include_in_schema=False,
 )
+@base_router.post(
+    "/workflows",
+    response_model=Workflow,
+    tags=["Agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "create_workflow",
+    },
+    description="Create a new workflow",
+    summary="Create a new workflow",
+    responses={
+        200: {"description": "Successfully created workflow"},
+        422: {"description": "Invalid workflow definition"},
+    },
+)
+@base_router.post(
+    "/workflows/",
+    response_model=Workflow,
+    include_in_schema=False,
+)
 async def create_workflow(
     request: Request,
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -862,7 +882,7 @@ async def create_workflow(
 
 
 @legacy_base_router.put(
-    "/workflows/{workflow_permanent_id}",
+    "/workflows/{workflow_id}",
     openapi_extra={
         "requestBody": {
             "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
@@ -875,7 +895,37 @@ async def create_workflow(
     tags=["agent"],
 )
 @legacy_base_router.put(
-    "/workflows/{workflow_permanent_id}/",
+    "/workflows/{workflow_id}/",
+    openapi_extra={
+        "requestBody": {
+            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
+            "required": True,
+        },
+    },
+    response_model=Workflow,
+    include_in_schema=False,
+)
+@base_router.post(
+    "/workflows/{workflow_id}",
+    response_model=Workflow,
+    tags=["Agent"],
+    openapi_extra={
+        "requestBody": {
+            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
+            "required": True,
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "update_workflow",
+    },
+    description="Update a workflow definition",
+    summary="Update a workflow definition",
+    responses={
+        200: {"description": "Successfully updated workflow"},
+        422: {"description": "Invalid workflow definition"},
+    },
+)
+@base_router.post(
+    "/workflows/{workflow_id}/",
     openapi_extra={
         "requestBody": {
             "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
@@ -886,7 +936,7 @@ async def create_workflow(
     include_in_schema=False,
 )
 async def update_workflow(
-    workflow_permanent_id: str,
+    workflow_id: str,
     request: Request,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Workflow:
@@ -903,34 +953,45 @@ async def update_workflow(
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_create_request,
-            workflow_permanent_id=workflow_permanent_id,
+            workflow_permanent_id=workflow_id,
         )
     except WorkflowParameterMissingRequiredValue as e:
         raise e
     except Exception as e:
         LOG.exception(
             "Failed to update workflow",
-            workflow_permanent_id=workflow_permanent_id,
+            workflow_permanent_id=workflow_id,
             organization_id=current_org.organization_id,
         )
-        raise FailedToUpdateWorkflow(workflow_permanent_id, f"<{type(e).__name__}: {str(e)}>")
+        raise FailedToUpdateWorkflow(workflow_id, f"<{type(e).__name__}: {str(e)}>")
 
 
 @legacy_base_router.delete(
-    "/workflows/{workflow_permanent_id}",
+    "/workflows/{workflow_id}",
     tags=["agent"],
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "delete_workflow",
     },
 )
-@legacy_base_router.delete("/workflows/{workflow_permanent_id}/", include_in_schema=False)
+@legacy_base_router.delete("/workflows/{workflow_id}/", include_in_schema=False)
+@base_router.post(
+    "/workflows/{workflow_id}",
+    tags=["Agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "delete_workflow",
+    },
+    description="Delete a workflow",
+    summary="Delete a workflow",
+    responses={200: {"description": "Successfully deleted workflow"}},
+)
 async def delete_workflow(
-    workflow_permanent_id: str,
+    workflow_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> None:
     analytics.capture("skyvern-oss-agent-workflow-delete")
-    await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(workflow_permanent_id, current_org.organization_id)
+    await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(workflow_id, current_org.organization_id)
 
 
 @legacy_base_router.get(
