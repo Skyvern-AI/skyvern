@@ -1,9 +1,17 @@
+import os
+
 from mcp.server.fastmcp import FastMCP
 
 from skyvern.agent import SkyvernAgent
 
 mcp = FastMCP("Skyvern")
-skyvern_agent = SkyvernAgent()
+
+if "SKYVERN_MCP_CLOUD_URL" in os.environ and "SKYVERN_MCP_API_KEY" in os.environ:
+    skyvern_agent = SkyvernAgent(
+        base_url=os.environ.get("SKYVERN_MCP_CLOUD_URL"), api_key=os.environ.get("SKYVERN_MCP_API_KEY")
+    )
+else:
+    skyvern_agent = SkyvernAgent()
 
 
 @mcp.tool()

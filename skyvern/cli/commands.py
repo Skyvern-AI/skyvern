@@ -294,13 +294,7 @@ def setup_claude_desktop(host_system: str, path_to_env: str, path_to_server: str
 
 def get_mcp_server_url(deployment_type: str, host: str = "") -> str:
     """Get the MCP server URL based on deployment type."""
-    if deployment_type == "cloud":
-        return "https://api.skyvern.com/mcp"
-    elif deployment_type == "self-hosted":
-        if host == "":
-            raise ValueError("Host is required for self-hosted deployment")
-        return f"{host.rstrip('/')}/mcp"
-    elif deployment_type == "local":
+    if deployment_type in ["local", "cloud"]:
         return os.path.join(os.path.abspath("./skyvern/mcp"), "server.py")
     else:
         raise ValueError(f"Invalid deployment type: {deployment_type}")
@@ -308,7 +302,7 @@ def get_mcp_server_url(deployment_type: str, host: str = "") -> str:
 
 def setup_mcp_config(host_system: str, deployment_type: str, host: str = "") -> tuple[str, str]:
     """Set up MCP configuration based on deployment type."""
-    if deployment_type == "local":
+    if deployment_type in ["local", "cloud"]:
         # For local deployment, we need Python environment
         python_path = shutil.which("python")
         if python_path:
@@ -317,11 +311,7 @@ def setup_mcp_config(host_system: str, deployment_type: str, host: str = "") -> 
             path_to_env = typer.prompt("Enter the full path to your configured python environment")
         return path_to_env, get_mcp_server_url(deployment_type)
     else:
-        # For cloud and self-hosted, we use curl
-        curl_path = shutil.which("curl")
-        if not curl_path:
-            raise RuntimeError("curl is required but not found in PATH")
-        return curl_path, get_mcp_server_url(deployment_type, host)
+        raise NotImplementedError()
 
 
 def get_command_config(host_system: str, command: str, target: str, env_vars: str) -> tuple[str, list]:
@@ -331,8 +321,6 @@ def get_command_config(host_system: str, command: str, target: str, env_vars: st
 
     if host_system == "wsl":
         env_vars = f"{base_env_vars} ARTIFACT_STORAGE_PATH={artifacts_path} BROWSER_TYPE=chromium-headless"
-        if target.startswith("http"):
-            return command, ["-X", "POST", target]
         return "wsl.exe", ["bash", "-c", f"{env_vars} {command} {target}"]
 
     if host_system in ["linux", "darwin"]:
@@ -359,8 +347,16 @@ def run_mcp() -> None:
         print(f"Error setting up MCP configuration: {e}")
         return
 
-    # Setup environment variables
+    # Cloud deployment variables
     env_vars = ""
+    if deployment_type == "cloud":
+        for key in ["SKYVERN_MCP_CLOUD_URL", "SKYVERN_MCP_API_KEY"]:
+            value = os.getenv(key)
+            if value is None:
+                value = typer.prompt(f"Enter your {key}")
+            env_vars += f"{key}={value} "
+
+    # Setup environment variables
     for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]:
         value = os.getenv(key)
         if value is None:
