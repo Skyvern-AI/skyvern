@@ -5,12 +5,10 @@ from .environment import SkyvernEnvironment
 import httpx
 from .core.client_wrapper import SyncClientWrapper
 from .agent.client import AgentClient
-from .server.client import ServerClient
-from .session.client import SessionClient
+from .browser_session.client import BrowserSessionClient
 from .core.client_wrapper import AsyncClientWrapper
 from .agent.client import AsyncAgentClient
-from .server.client import AsyncServerClient
-from .session.client import AsyncSessionClient
+from .browser_session.client import AsyncBrowserSessionClient
 
 
 class Skyvern:
@@ -76,8 +74,7 @@ class Skyvern:
             timeout=_defaulted_timeout,
         )
         self.agent = AgentClient(client_wrapper=self._client_wrapper)
-        self.server = ServerClient(client_wrapper=self._client_wrapper)
-        self.session = SessionClient(client_wrapper=self._client_wrapper)
+        self.browser_session = BrowserSessionClient(client_wrapper=self._client_wrapper)
 
 
 class AsyncSkyvern:
@@ -143,8 +140,7 @@ class AsyncSkyvern:
             timeout=_defaulted_timeout,
         )
         self.agent = AsyncAgentClient(client_wrapper=self._client_wrapper)
-        self.server = AsyncServerClient(client_wrapper=self._client_wrapper)
-        self.session = AsyncSessionClient(client_wrapper=self._client_wrapper)
+        self.browser_session = AsyncBrowserSessionClient(client_wrapper=self._client_wrapper)
 
 
 def _get_base_url(*, base_url: typing.Optional[str] = None, environment: SkyvernEnvironment) -> str:

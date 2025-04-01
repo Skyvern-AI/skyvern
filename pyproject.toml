@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "skyvern"
-version = "0.1.64"
+version = "0.1.68"
 description = ""
 authors = ["Skyvern AI <info@skyvern.com>"]
 readme = "README.md"
@@ -33,7 +33,7 @@ commentjson = "^0.9.0"
 asyncache = "^0.3.1"
 orjson = "^3.9.10"
 structlog = "^23.2.0"
-typer = "^0.9.0"
+typer = ">=0.9.0,<1.0"
 types-toml = "^0.10.8.7"
 httpx = {version = "^0.27.0", extras = ["socks"]}
 filetype = "^1.2.0"
