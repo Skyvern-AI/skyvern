@@ -11,7 +11,7 @@ services:
       - PGDATA=/var/lib/postgresql/data/pgdata
       - POSTGRES_USER=skyvern
       - POSTGRES_PASSWORD=skyvern
-      - POSTGRES_POSTGRES_DB=skyvern
+      - POSTGRES_DB=skyvern
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U skyvern"]
       interval: 5s

@@ -29,7 +29,7 @@ class SkyvernClient:
         publish_workflow: bool = False,
     ) -> TaskRunResponse:
         task_run_obj = await self.client.agent.run_task(
-            goal=prompt,
+            prompt=prompt,
             url=url,
             title=title,
             engine=engine,
@@ -42,7 +42,7 @@ class SkyvernClient:
             browser_session_id=browser_session_id,
             publish_workflow=publish_workflow,
         )
-        return TaskRunResponse.model_validate(task_run_obj)
+        return TaskRunResponse.model_validate(task_run_obj.dict())
 
     async def run_workflow(
         self,
@@ -65,7 +65,7 @@ class SkyvernClient:
             browser_session_id=browser_session_id,
             template=template,
         )
-        return WorkflowRunResponse.model_validate(workflow_run_obj)
+        return WorkflowRunResponse.model_validate(workflow_run_obj.dict())
 
     async def get_run(
         self,
@@ -73,7 +73,7 @@ class SkyvernClient:
     ) -> RunResponse:
         run_obj = await self.client.agent.get_run(run_id=run_id)
         if run_obj.run_type in [RunType.task_v1, RunType.task_v2]:
-            return TaskRunResponse.model_validate(run_obj)
+            return TaskRunResponse.model_validate(run_obj.dict())
         elif run_obj.run_type == RunType.workflow_run:
-            return WorkflowRunResponse.model_validate(run_obj)
+            return WorkflowRunResponse.model_validate(run_obj.dict())
         raise ValueError(f"Invalid run type: {run_obj.run_type}")
