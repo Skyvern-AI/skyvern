@@ -1475,7 +1475,7 @@ async def run_task(
         try:
             task_v2 = await task_v2_service.initialize_task_v2(
                 organization=current_org,
-                user_prompt=run_request.goal,
+                user_prompt=run_request.prompt,
                 user_url=run_request.url,
                 totp_identifier=run_request.totp_identifier,
                 totp_verification_url=run_request.totp_url,
@@ -1504,7 +1504,7 @@ async def run_task(
             run_type=RunType.task_v2,
             status=str(task_v2.status),
             output=task_v2.output,
-            failure_reason=task_v2.failure_reason,
+            failure_reason=None,
             created_at=task_v2.created_at,
             modified_at=task_v2.modified_at,
             run_request=TaskRunRequest(

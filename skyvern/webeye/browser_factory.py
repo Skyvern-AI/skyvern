@@ -437,7 +437,13 @@ class BrowserState:
         pages = self.browser_context.pages
         for page in pages:
             if page != cur_page:
-                await page.close()
+                try:
+                    async with asyncio.timeout(2):
+                        await page.close()
+                except asyncio.TimeoutError:
+                    LOG.warning("Timeout to close the page. Skip closing the page", url=page.url)
+                except Exception:
+                    LOG.exception("Error while closing the page", url=page.url)
 
     async def check_and_fix_state(
         self,
