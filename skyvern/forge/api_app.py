@@ -1,24 +1,29 @@
 import uuid
 from datetime import datetime
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 import structlog
 from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
+from fastapi_mcp import add_mcp_server
 from pydantic import ValidationError
 from starlette.requests import HTTPConnection, Request
 from starlette_context.middleware import RawContextMiddleware
 from starlette_context.plugins.base import Plugin
 
+from skyvern.agent import SkyvernAgent
 from skyvern.config import settings
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
+from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
+from skyvern.forge.sdk.schemas.task_generations import TaskGenerationBase
+from skyvern.forge.sdk.schemas.tasks import TaskRequest
 
 LOG = structlog.get_logger()
 
@@ -129,3 +134,38 @@ def get_agent_app() -> FastAPI:
 
 
 app = get_agent_app()
+
+# Register MCP server
+mcp_server = add_mcp_server(
+    app,
+    mount_path="/mcp",
+    name="Skyvern-MCP",
+    description="MCP server for Skyvern",
+    describe_all_responses=False,  # False by default. Include all possible response schemas in tool descriptions, instead of just the successful response.
+    describe_full_response_schema=False,  # False by default. Include full JSON schema in tool descriptions, instead of just an LLM-friendly response example.
+)
+
+
+async def _skyvern_run_task_v1(user_prompt: str, url: str) -> Any | None:
+    skyvern_agent = SkyvernAgent()
+    llm_prompt = prompt_engine.load_prompt("generate-task", user_prompt=user_prompt)
+    llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt, prompt_name="generate-task")
+    task_generation = TaskGenerationBase.model_validate(llm_response)
+    task_request = TaskRequest.model_validate(task_generation, from_attributes=True)
+    if url is not None:
+        task_request.url = url
+    return await skyvern_agent.run_task(prompt=user_prompt, url=url)
+
+
+@mcp_server.tool()
+async def skyvern_v1(user_goal: str, url: str) -> dict:
+    """Browse the internet using a browser to achieve a user goal.
+
+    Args:
+        user_goal: brief description of what the user wants to accomplish
+        url: the target website for the user goal
+    """
+    res = await _skyvern_run_task_v1(user_goal, url)
+    if res is None:
+        return {"status": "Task execution failed or returned no result"}
+    return res.model_dump()["extracted_information"]
