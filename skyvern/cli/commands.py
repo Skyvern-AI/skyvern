@@ -1,27 +1,23 @@
 import asyncio
-from pathlib import Path
-from skyvern.forge import app
-from skyvern.forge.sdk.core import security
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
-
-from dotenv import load_dotenv, set_key
 import json
 import os
 import shutil
 import subprocess
 import time
-from typing import Optional
 import uuid
+from pathlib import Path
+from typing import Optional
 
 import typer
 import uvicorn
 from click import Choice
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 from mcp.server.fastmcp import FastMCP
 
 from skyvern.agent import SkyvernAgent
 from skyvern.config import settings
+from skyvern.forge import app
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.utils import detect_os, get_windows_appdata_roaming, migrate_db
 
 mcp = FastMCP("Skyvern")
@@ -46,9 +42,9 @@ async def skyvern_run_task(prompt: str, url: str) -> str:
 
 load_dotenv()
 
-app = typer.Typer()
+typer_app = typer.Typer()
 run_app = typer.Typer()
-app.add_typer(run_app, name="run")
+typer_app.add_typer(run_app, name="run")
 
 
 def command_exists(command: str) -> bool:
@@ -408,7 +404,7 @@ async def _setup_local_organization() -> str:
     return org_auth_token.token if org_auth_token else ""
 
 
-@app.command(name="init")
+@typer_app.command(name="init")
 def init() -> None:
     setup_postgresql()
     api_key = asyncio.run(_setup_local_organization())
@@ -441,7 +437,7 @@ def init() -> None:
     print(".env file has been initialized.")
 
 
-@app.command(name="migrate")
+@typer_app.command(name="migrate")
 def migrate() -> None:
     migrate_db()
 

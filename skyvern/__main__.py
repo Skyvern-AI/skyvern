@@ -1,4 +1,4 @@
-from skyvern.cli.commands import app
+from skyvern.cli.commands import typer_app
 
 if __name__ == "__main__":
-    app()
+    typer_app()  # type: ignore
