@@ -268,20 +268,18 @@ class SkyvernAgent:
         if not self.client:
             if engine == RunEngine.skyvern_v1:
                 data_extraction_goal = None
-                data_extraction_schema = data_extraction_schema
                 navigation_goal = prompt
                 navigation_payload = None
                 organization = await self._get_organization()
-                if not url:
-                    task_generation = await task_v1_service.generate_task(
-                        user_prompt=prompt,
-                        organization=organization,
-                    )
-                    url = task_generation.url
-                    navigation_goal = task_generation.navigation_goal or prompt
-                    navigation_payload = task_generation.navigation_payload
-                    data_extraction_goal = task_generation.data_extraction_goal
-                    data_extraction_schema = data_extraction_schema or task_generation.extracted_information_schema
+                task_generation = await task_v1_service.generate_task(
+                    user_prompt=prompt,
+                    organization=organization,
+                )
+                url = url or task_generation.url
+                navigation_goal = task_generation.navigation_goal or prompt
+                navigation_payload = task_generation.navigation_payload
+                data_extraction_goal = task_generation.data_extraction_goal
+                data_extraction_schema = data_extraction_schema or task_generation.extracted_information_schema
 
                 task_request = TaskRequest(
                     title=title,
