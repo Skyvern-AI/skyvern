@@ -66,7 +66,11 @@ class SkyvernAgent:
 
             settings.BROWSER_TYPE = browser_type
         elif base_url and api_key:
-            self.client = SkyvernClient(base_url=base_url, api_key=api_key)
+            self.client = SkyvernClient(
+                base_url=base_url,
+                api_key=api_key,
+                extra_headers={"X-User-Agent": "skyvern-mcp"},
+            )
         else:
             raise ValueError("base_url and api_key must be both provided")
 

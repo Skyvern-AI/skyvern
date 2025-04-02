@@ -179,6 +179,7 @@ async def run_task_v1(
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
+    x_user_agent: Annotated[str | None, Header()] = None,
 ) -> CreateTaskResponse:
     analytics.capture("skyvern-oss-agent-task-create", data={"url": task.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=task.browser_session_id)
@@ -652,6 +653,7 @@ async def run_workflow_legacy(
     template: bool = Query(False),
     x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
+    x_user_agent: Annotated[str | None, Header()] = None,
 ) -> RunWorkflowResponse:
     analytics.capture("skyvern-oss-agent-workflow-execute")
     context = skyvern_context.ensure_context()
@@ -1458,6 +1460,7 @@ async def run_task(
     run_request: TaskRunRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
+    x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TaskRunResponse:
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
@@ -1600,6 +1603,7 @@ async def run_workflow(
     template: bool = Query(False),
     x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
+    x_user_agent: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
     analytics.capture("skyvern-oss-run-workflow")
     await PermissionCheckerFactory.get_instance().check(
