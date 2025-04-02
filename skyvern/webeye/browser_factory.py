@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 import time
 import uuid
 from datetime import datetime
@@ -352,6 +353,16 @@ async def _create_headful_chromium(
 async def _create_cdp_connection_browser(
     playwright: Playwright, proxy_location: ProxyLocation | None = None, **kwargs: dict
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+    browser_type = settings.BROWSER_TYPE
+    browser_path = settings.CHROME_EXECUTABLE_PATH
+
+    if browser_type == "cdp-connect" and browser_path:
+        browser_process = subprocess.Popen(
+            [browser_path, "--remote-debugging-port=9222"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        if browser_process.poll() is not None:
+            raise Exception(f"Failed to open browser. browser_path: {browser_path}")
+
     browser_args = BrowserContextFactory.build_browser_args()
 
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(
