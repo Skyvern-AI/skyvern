@@ -140,10 +140,12 @@ def setup_postgresql() -> None:
         run_command("docker exec postgresql-container createdb -U postgres skyvern -O skyvern")
         print("Database and user created successfully.")
 
+
 def update_or_add_env_var(key: str, value: str) -> None:
     """Update or add environment variable in .env file."""
-    from dotenv import load_dotenv, set_key
     from pathlib import Path
+
+    from dotenv import load_dotenv, set_key
 
     env_path = Path(".env")
     if not env_path.exists():
@@ -153,7 +155,7 @@ def update_or_add_env_var(key: str, value: str) -> None:
             "ENV": "local",
             "ENABLE_OPENAI": "false",
             "OPENAI_API_KEY": "",
-            "ENABLE_ANTHROPIC": "false", 
+            "ENABLE_ANTHROPIC": "false",
             "ANTHROPIC_API_KEY": "",
             "ENABLE_AZURE": "false",
             "AZURE_DEPLOYMENT": "",
@@ -180,14 +182,13 @@ def update_or_add_env_var(key: str, value: str) -> None:
             "DATABASE_STRING": "postgresql+psycopg://skyvern@localhost/skyvern",
             "PORT": "8000",
             "ANALYTICS_ID": "anonymous",
-            "ENABLE_LOG_ARTIFACTS": "false"
+            "ENABLE_LOG_ARTIFACTS": "false",
         }
         for key, value in defaults.items():
             set_key(env_path, key, value)
 
     load_dotenv(env_path)
     set_key(env_path, key, value)
-
 
 
 def setup_llm_providers() -> None:
@@ -222,7 +223,14 @@ def setup_llm_providers() -> None:
         else:
             update_or_add_env_var("ANTHROPIC_API_KEY", anthropic_api_key)
             update_or_add_env_var("ENABLE_ANTHROPIC", "true")
-            model_options.extend(["ANTHROPIC_CLAUDE3_OPUS", "ANTHROPIC_CLAUDE3_HAIKU", "ANTHROPIC_CLAUDE3.5_SONNET", "ANTHROPIC_CLAUDE3.7_SONNET"])
+            model_options.extend(
+                [
+                    "ANTHROPIC_CLAUDE3_OPUS",
+                    "ANTHROPIC_CLAUDE3_HAIKU",
+                    "ANTHROPIC_CLAUDE3.5_SONNET",
+                    "ANTHROPIC_CLAUDE3.7_SONNET",
+                ]
+            )
     else:
         update_or_add_env_var("ENABLE_ANTHROPIC", "false")
 
@@ -273,30 +281,34 @@ def setup_llm_providers() -> None:
         else:
             update_or_add_env_var("NOVITA_API_KEY", novita_api_key)
             update_or_add_env_var("ENABLE_NOVITA", "true")
-            model_options.extend([
-                "NOVITA_DEEPSEEK_R1",
-                "NOVITA_DEEPSEEK_V3", 
-                "NOVITA_LLAMA_3_3_70B",
-                "NOVITA_LLAMA_3_2_1B",
-                "NOVITA_LLAMA_3_2_3B",
-                "NOVITA_LLAMA_3_2_11B_VISION",
-                "NOVITA_LLAMA_3_1_8B",
-                "NOVITA_LLAMA_3_1_70B",
-                "NOVITA_LLAMA_3_1_405B",
-                "NOVITA_LLAMA_3_8B",
-                "NOVITA_LLAMA_3_70B"
-            ])
+            model_options.extend(
+                [
+                    "NOVITA_DEEPSEEK_R1",
+                    "NOVITA_DEEPSEEK_V3",
+                    "NOVITA_LLAMA_3_3_70B",
+                    "NOVITA_LLAMA_3_2_1B",
+                    "NOVITA_LLAMA_3_2_3B",
+                    "NOVITA_LLAMA_3_2_11B_VISION",
+                    "NOVITA_LLAMA_3_1_8B",
+                    "NOVITA_LLAMA_3_1_70B",
+                    "NOVITA_LLAMA_3_1_405B",
+                    "NOVITA_LLAMA_3_8B",
+                    "NOVITA_LLAMA_3_70B",
+                ]
+            )
     else:
         update_or_add_env_var("ENABLE_NOVITA", "false")
 
     # Model Selection
     if not model_options:
-        print("No LLM providers enabled. You won't be able to run Skyvern unless you enable at least one provider. You can re-run this script to enable providers or manually update the .env file.")
+        print(
+            "No LLM providers enabled. You won't be able to run Skyvern unless you enable at least one provider. You can re-run this script to enable providers or manually update the .env file."
+        )
     else:
         print("Available LLM models based on your selections:")
         for i, model in enumerate(model_options, 1):
             print(f"{i}. {model}")
-        
+
         while True:
             try:
                 model_choice = int(input(f"Choose a model by number (e.g., 1 for {model_options[0]}): "))
@@ -305,7 +317,7 @@ def setup_llm_providers() -> None:
                 print(f"Please enter a number between 1 and {len(model_options)}")
             except ValueError:
                 print("Please enter a valid number")
-        
+
         chosen_model = model_options[model_choice - 1]
         print(f"Chosen LLM Model: {chosen_model}")
         update_or_add_env_var("LLM_KEY", chosen_model)
@@ -319,11 +331,7 @@ def get_default_chrome_location(host_system: str) -> str:
         return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     elif host_system == "linux":
         # Common Linux locations
-        chrome_paths = [
-            "/usr/bin/google-chrome",
-            "/usr/bin/chromium",
-            "/usr/bin/chromium-browser"
-        ]
+        chrome_paths = ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
         for path in chrome_paths:
             if os.path.exists(path):
                 return path
@@ -333,11 +341,12 @@ def get_default_chrome_location(host_system: str) -> str:
     else:
         return "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
 
+
 def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
     """Configure browser settings for Skyvern."""
     print("\nConfiguring web browser for scraping...")
     browser_types = ["chromium-headless", "chromium-headful", "cdp-connect"]
-    
+
     for i, browser_type in enumerate(browser_types, 1):
         print(f"{i}. {browser_type}")
         if browser_type == "chromium-headless":
@@ -347,7 +356,7 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
         elif browser_type == "cdp-connect":
             print("   - Connects to an existing Chrome instance")
             print("   - Requires Chrome to be running with remote debugging enabled")
-    
+
     while True:
         try:
             choice = int(input("\nChoose browser type (1-3): "))
@@ -360,7 +369,7 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
 
     browser_location = None
     remote_debugging_url = None
-    
+
     if selected_browser == "cdp-connect":
         host_system = detect_os()
         default_location = get_default_chrome_location(host_system)
@@ -368,7 +377,7 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
         browser_location = input("Enter Chrome executable location (press Enter to use default): ").strip()
         if not browser_location:
             browser_location = default_location
-        
+
         if not os.path.exists(browser_location):
             print(f"Warning: Chrome not found at {browser_location}. Please verify the location is correct.")
 
@@ -380,6 +389,7 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
             remote_debugging_url = "http://localhost:9222"
 
     return selected_browser, browser_location, remote_debugging_url
+
 
 async def _setup_local_organization() -> str:
     """
@@ -445,7 +455,7 @@ def init(
     analytics_id = input("Please enter your email for analytics (press enter to skip): ")
     if not analytics_id:
         analytics_id = str(uuid.uuid4())
-    
+
     update_or_add_env_var("ANALYTICS_ID", analytics_id)
     print(".env file has been initialized.")
     # Generate .env file
@@ -767,6 +777,7 @@ def setup_cursor_config(host_system: str, command: str, target: str, env_vars: s
 def run_server() -> None:
     load_dotenv()
     from skyvern.config import settings
+
     port = settings.PORT
     browser_type = settings.BROWSER_TYPE
     browser_path = settings.CHROME_EXECUTABLE_PATH
