@@ -8,10 +8,12 @@ class SkyvernClient:
         self,
         base_url: str = settings.SKYVERN_BASE_URL,
         api_key: str = settings.SKYVERN_API_KEY,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         self.base_url = base_url
         self.api_key = api_key
         self.client = AsyncSkyvern(base_url=base_url, api_key=api_key)
+        self.extra_headers = extra_headers
 
     async def run_task(
         self,
