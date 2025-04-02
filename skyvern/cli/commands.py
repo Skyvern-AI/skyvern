@@ -1,10 +1,18 @@
 import asyncio
+from pathlib import Path
+from skyvern.forge import app
+from skyvern.forge.sdk.core import security
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
+
+from dotenv import load_dotenv, set_key
 import json
 import os
 import shutil
 import subprocess
 import time
 from typing import Optional
+import uuid
 
 import typer
 import uvicorn
@@ -14,7 +22,6 @@ from mcp.server.fastmcp import FastMCP
 
 from skyvern.agent import SkyvernAgent
 from skyvern.config import settings
-from skyvern.schemas.runs import RunEngine
 from skyvern.utils import detect_os, get_windows_appdata_roaming, migrate_db
 
 mcp = FastMCP("Skyvern")
@@ -33,7 +40,7 @@ async def skyvern_run_task(prompt: str, url: str) -> str:
         prompt: brief description of what the user wants to accomplish
         url: the target website for the user goal
     """
-    res = await skyvern_agent.run_task(prompt=prompt, url=url, engine=RunEngine.skyvern_v1)
+    res = await skyvern_agent.run_task(prompt=prompt, url=url)
     return res.model_dump()["output"]
 
 
@@ -143,9 +150,6 @@ def setup_postgresql() -> None:
 
 def update_or_add_env_var(key: str, value: str) -> None:
     """Update or add environment variable in .env file."""
-    from pathlib import Path
-
-    from dotenv import load_dotenv, set_key
 
     env_path = Path(".env")
     if not env_path.exists():
@@ -395,29 +399,8 @@ async def _setup_local_organization() -> str:
     """
     Returns the API key for the local organization generated
     """
-    from skyvern.forge import app
-    from skyvern.forge.sdk.core import security
-    from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-    from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
+    organization = await skyvern_agent.get_organization()
 
-    organization = await app.DATABASE.get_organization_by_domain("skyvern.local")
-    if not organization:
-        organization = await app.DATABASE.create_organization(
-            organization_name="Skyvern-local",
-            domain="skyvern.local",
-            max_steps_per_run=10,
-            max_retries_per_step=3,
-        )
-        api_key = security.create_access_token(
-            organization.organization_id,
-            expires_delta=API_KEY_LIFETIME,
-        )
-        # generate OrganizationAutoToken
-        await app.DATABASE.create_org_auth_token(
-            organization_id=organization.organization_id,
-            token=api_key,
-            token_type=OrganizationAuthTokenType.api,
-        )
     org_auth_token = await app.DATABASE.get_valid_org_auth_token(
         organization_id=organization.organization_id,
         token_type=OrganizationAuthTokenType.api,
@@ -426,10 +409,7 @@ async def _setup_local_organization() -> str:
 
 
 @app.command(name="init")
-def init(
-    openai_api_key: str = typer.Option(..., help="The OpenAI API key"),
-    log_level: str = typer.Option("INFO", help="The log level"),
-) -> None:
+def init() -> None:
     setup_postgresql()
     api_key = asyncio.run(_setup_local_organization())
 
@@ -457,16 +437,8 @@ def init(
         analytics_id = str(uuid.uuid4())
 
     update_or_add_env_var("ANALYTICS_ID", analytics_id)
+    update_or_add_env_var("SKYVERN_API_KEY", api_key)
     print(".env file has been initialized.")
-    # Generate .env file
-    with open(".env", "w") as env_file:
-        env_file.write("LITELLM_LOG=ERROR\n")
-        env_file.write("ENABLE_OPENAI=true\n")
-        env_file.write(f"OPENAI_API_KEY={openai_api_key}\n")
-        env_file.write(f"LOG_LEVEL={log_level}\n")
-        env_file.write("ARTIFACT_STORAGE_PATH=./artifacts\n")
-        env_file.write(f"SKYVERN_API_KEY={api_key}\n")
-    print(".env file created with the parameters provided.")
 
 
 @app.command(name="migrate")
