@@ -364,7 +364,7 @@ async def _create_cdp_connection_browser(
         time.sleep(1)
         if browser_process.poll() is not None:
             raise Exception(
-                f"Failed to open browser. browser_path: {browser_path}, returncode: {browser_process.returncode}, error: {browser_process.stderr.read().decode()}"
+                f"Failed to open browser. browser_path: {browser_path}, returncode: {browser_process.returncode}, error: {browser_process.stderr.read().decode() if browser_process.stderr else 'No error output'}"
             )
 
     browser_args = BrowserContextFactory.build_browser_args()
