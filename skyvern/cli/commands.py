@@ -171,7 +171,7 @@ async def _setup_local_organization() -> str:
         organization_id=organization.organization_id,
         token_type=OrganizationAuthTokenType.api,
     )
-    return org_auth_token.token
+    return org_auth_token.token if org_auth_token else ""
 
 
 @app.command(name="init")
