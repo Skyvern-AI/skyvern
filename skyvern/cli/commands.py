@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import shutil
@@ -6,10 +7,34 @@ import time
 from typing import Optional
 
 import typer
+import uvicorn
 from click import Choice
 from dotenv import load_dotenv
+from mcp.server.fastmcp import FastMCP
 
+from skyvern.agent import SkyvernAgent
+from skyvern.config import settings
+from skyvern.schemas.runs import RunEngine
 from skyvern.utils import detect_os, get_windows_appdata_roaming, migrate_db
+
+mcp = FastMCP("Skyvern")
+skyvern_agent = SkyvernAgent(
+    base_url=settings.SKYVERN_BASE_URL,
+    api_key=settings.SKYVERN_API_KEY,
+)
+
+
+@mcp.tool()
+async def skyvern_run_task(prompt: str, url: str) -> str:
+    """Browse the internet using a browser to achieve a user goal.
+
+    Args:
+        prompt: brief description of what the user wants to accomplish
+        url: the target website for the user goal
+    """
+    res = await skyvern_agent.run_task(prompt=prompt, url=url, engine=RunEngine.skyvern_v1)
+    return res.model_dump()["output"]
+
 
 load_dotenv()
 
@@ -115,18 +140,54 @@ def setup_postgresql() -> None:
         print("Database and user created successfully.")
 
 
+async def _setup_local_organization() -> str:
+    """
+    Returns the API key for the local organization generated
+    """
+    from skyvern.forge import app
+    from skyvern.forge.sdk.core import security
+    from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+    from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
+
+    organization = await app.DATABASE.get_organization_by_domain("skyvern.local")
+    if not organization:
+        organization = await app.DATABASE.create_organization(
+            organization_name="Skyvern-local",
+            domain="skyvern.local",
+            max_steps_per_run=10,
+            max_retries_per_step=3,
+        )
+        api_key = security.create_access_token(
+            organization.organization_id,
+            expires_delta=API_KEY_LIFETIME,
+        )
+        # generate OrganizationAutoToken
+        await app.DATABASE.create_org_auth_token(
+            organization_id=organization.organization_id,
+            token=api_key,
+            token_type=OrganizationAuthTokenType.api,
+        )
+    org_auth_token = await app.DATABASE.get_valid_org_auth_token(
+        organization_id=organization.organization_id,
+        token_type=OrganizationAuthTokenType.api,
+    )
+    return org_auth_token.token
+
+
 @app.command(name="init")
 def init(
     openai_api_key: str = typer.Option(..., help="The OpenAI API key"),
-    log_level: str = typer.Option("CRITICAL", help="The log level"),
+    log_level: str = typer.Option("INFO", help="The log level"),
 ) -> None:
     setup_postgresql()
+    api_key = asyncio.run(_setup_local_organization())
     # Generate .env file
     with open(".env", "w") as env_file:
         env_file.write("ENABLE_OPENAI=true\n")
         env_file.write(f"OPENAI_API_KEY={openai_api_key}\n")
         env_file.write(f"LOG_LEVEL={log_level}\n")
         env_file.write("ARTIFACT_STORAGE_PATH=./artifacts\n")
+        env_file.write(f"SKYVERN_API_KEY={api_key}\n")
     print(".env file created with the parameters provided.")
 
 
@@ -332,8 +393,8 @@ def get_command_config(host_system: str, command: str, target: str, env_vars: st
     raise Exception(f"Unsupported host system: {host_system}")
 
 
-@run_app.command(name="mcp")
-def run_mcp() -> None:
+@run_app.command(name="setupmcp")
+def setup_mcp() -> None:
     """Configure MCP for different Skyvern deployments."""
     host_system = detect_os()
 
@@ -432,3 +493,20 @@ def setup_cursor_config(host_system: str, command: str, target: str, env_vars: s
     except Exception as e:
         print(f"Error configuring Cursor: {e}")
         return False
+
+
+@run_app.command(name="server")
+def run_server() -> None:
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(
+        "skyvern.forge.api_app:app",
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+    )
+
+
+@run_app.command(name="mcp")
+def run_mcp() -> None:
+    """Run the MCP server."""
+    mcp.run(transport="stdio")
