@@ -13,7 +13,12 @@ class SkyvernClient:
         self.base_url = base_url
         self.api_key = api_key
         self.client = AsyncSkyvern(base_url=base_url, api_key=api_key)
-        self.extra_headers = extra_headers
+        self.extra_headers = extra_headers or {}
+        self.user_agent = None
+        if "X-User-Agent" in self.extra_headers:
+            self.user_agent = self.extra_headers["X-User-Agent"]
+        elif "x-user-agent" in self.extra_headers:
+            self.user_agent = self.extra_headers["x-user-agent"]
 
     async def run_task(
         self,
@@ -43,6 +48,7 @@ class SkyvernClient:
             max_steps=max_steps,
             browser_session_id=browser_session_id,
             publish_workflow=publish_workflow,
+            user_agent=self.user_agent,
         )
         return TaskRunResponse.model_validate(task_run_obj.dict())
 
@@ -66,6 +72,7 @@ class SkyvernClient:
             totp_url=totp_url,
             browser_session_id=browser_session_id,
             template=template,
+            user_agent=self.user_agent,
         )
         return WorkflowRunResponse.model_validate(workflow_run_obj.dict())
 
