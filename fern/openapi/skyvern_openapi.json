@@ -2605,6 +2605,22 @@
             }
           },
           {
+            "name": "x-user-agent",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Agent"
+            }
+          },
+          {
             "name": "authorization",
             "in": "header",
             "required": false,
@@ -2709,6 +2725,22 @@
                 }
               ],
               "title": "X-Max-Steps-Override"
+            }
+          },
+          {
+            "name": "x-user-agent",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Agent"
             }
           },
           {

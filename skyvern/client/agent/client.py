@@ -269,6 +269,7 @@ class AgentClient:
         self,
         *,
         prompt: str,
+        user_agent: typing.Optional[str] = None,
         url: typing.Optional[str] = OMIT,
         title: typing.Optional[str] = OMIT,
         engine: typing.Optional[RunEngine] = OMIT,
@@ -290,6 +291,8 @@ class AgentClient:
         ----------
         prompt : str
             The goal or task description for Skyvern to accomplish
+
+        user_agent : typing.Optional[str]
 
         url : typing.Optional[str]
             The starting URL for the task. If not provided, Skyvern will attempt to determine an appropriate URL
@@ -367,6 +370,9 @@ class AgentClient:
                 "browser_session_id": browser_session_id,
                 "publish_workflow": publish_workflow,
             },
+            headers={
+                "x-user-agent": str(user_agent) if user_agent is not None else None,
+            },
             request_options=request_options,
             omit=OMIT,
         )
@@ -410,6 +416,7 @@ class AgentClient:
         workflow_id: str,
         template: typing.Optional[bool] = None,
         max_steps_override: typing.Optional[int] = None,
+        user_agent: typing.Optional[str] = None,
         title: typing.Optional[str] = OMIT,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
@@ -430,6 +437,8 @@ class AgentClient:
         template : typing.Optional[bool]
 
         max_steps_override : typing.Optional[int]
+
+        user_agent : typing.Optional[str]
 
         title : typing.Optional[str]
             Optional title for this workflow run
@@ -490,6 +499,7 @@ class AgentClient:
             },
             headers={
                 "x-max-steps-override": str(max_steps_override) if max_steps_override is not None else None,
+                "x-user-agent": str(user_agent) if user_agent is not None else None,
             },
             request_options=request_options,
             omit=OMIT,
@@ -870,6 +880,7 @@ class AsyncAgentClient:
         self,
         *,
         prompt: str,
+        user_agent: typing.Optional[str] = None,
         url: typing.Optional[str] = OMIT,
         title: typing.Optional[str] = OMIT,
         engine: typing.Optional[RunEngine] = OMIT,
@@ -891,6 +902,8 @@ class AsyncAgentClient:
         ----------
         prompt : str
             The goal or task description for Skyvern to accomplish
+
+        user_agent : typing.Optional[str]
 
         url : typing.Optional[str]
             The starting URL for the task. If not provided, Skyvern will attempt to determine an appropriate URL
@@ -976,6 +989,9 @@ class AsyncAgentClient:
                 "browser_session_id": browser_session_id,
                 "publish_workflow": publish_workflow,
             },
+            headers={
+                "x-user-agent": str(user_agent) if user_agent is not None else None,
+            },
             request_options=request_options,
             omit=OMIT,
         )
@@ -1019,6 +1035,7 @@ class AsyncAgentClient:
         workflow_id: str,
         template: typing.Optional[bool] = None,
         max_steps_override: typing.Optional[int] = None,
+        user_agent: typing.Optional[str] = None,
         title: typing.Optional[str] = OMIT,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
@@ -1039,6 +1056,8 @@ class AsyncAgentClient:
         template : typing.Optional[bool]
 
         max_steps_override : typing.Optional[int]
+
+        user_agent : typing.Optional[str]
 
         title : typing.Optional[str]
             Optional title for this workflow run
@@ -1107,6 +1126,7 @@ class AsyncAgentClient:
             },
             headers={
                 "x-max-steps-override": str(max_steps_override) if max_steps_override is not None else None,
+                "x-user-agent": str(user_agent) if user_agent is not None else None,
             },
             request_options=request_options,
             omit=OMIT,
