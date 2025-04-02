@@ -223,19 +223,13 @@ def get_claude_config_path(host_system: str) -> str:
     raise Exception(f"Unsupported host system: {host_system}")
 
 
-def get_claude_command_config(
-    host_system: str, path_to_env: str, path_to_server: str, env_vars: str
-) -> tuple[str, list]:
+def get_claude_command_config(host_system: str, path_to_env: str, path_to_server: str) -> tuple[str, list]:
     """Get the command and arguments for Claude Desktop configuration."""
-    base_env_vars = f"{env_vars} ENABLE_OPENAI=true LOG_LEVEL=CRITICAL"
-    artifacts_path = os.path.join(os.path.abspath("./"), "artifacts")
-
     if host_system == "wsl":
-        env_vars = f"{base_env_vars} ARTIFACT_STORAGE_PATH={artifacts_path} BROWSER_TYPE=chromium-headless"
-        return "wsl.exe", ["bash", "-c", f"{env_vars} {path_to_env} {path_to_server}"]
+        return "wsl.exe", ["bash", "-c", f"{path_to_env} {path_to_server}"]
 
     if host_system in ["linux", "darwin"]:
-        env_vars = f"{base_env_vars} ARTIFACT_STORAGE_PATH={artifacts_path}"
+        # env_vars = f"{base_env_vars} ARTIFACT_STORAGE_PATH={artifacts_path}"
         return path_to_env, [path_to_server]
 
     raise Exception(f"Unsupported host system: {host_system}")
@@ -262,6 +256,11 @@ def get_cursor_config_path(host_system: str) -> str:
     return os.path.expanduser("~/.cursor/mcp.json")
 
 
+def get_windsurf_config_path(host_system: str) -> str:
+    """Get the Windsurf config file path for the current OS."""
+    return os.path.expanduser("~/.codeium/windsurf/mcp_config.json")
+
+
 def is_cursor_installed(host_system: str) -> bool:
     """Check if Cursor is installed by looking for its config directory."""
     try:
@@ -271,7 +270,16 @@ def is_cursor_installed(host_system: str) -> bool:
         return False
 
 
-def setup_cursor_mcp(host_system: str, path_to_env: str, path_to_server: str, env_vars: str) -> None:
+def is_windsurf_installed(host_system: str) -> bool:
+    """Check if Cursor is installed by looking for its config directory."""
+    try:
+        config_dir = os.path.expanduser("~/.codeium/windsurf")
+        return os.path.exists(config_dir)
+    except Exception:
+        return False
+
+
+def setup_cursor_mcp(host_system: str, path_to_env: str, path_to_server: str) -> None:
     """Set up Cursor MCP configuration."""
     if not is_cursor_installed(host_system):
         print("Cursor is not installed. Skipping Cursor MCP setup.")
@@ -285,7 +293,7 @@ def setup_cursor_mcp(host_system: str, path_to_env: str, path_to_server: str, en
 
     # Get command configuration
     try:
-        command, args = get_claude_command_config(host_system, path_to_env, path_to_server, env_vars)
+        command, args = get_claude_command_config(host_system, path_to_env, path_to_server)
     except Exception as e:
         print(f"Error configuring Cursor command: {e}")
         return
@@ -309,63 +317,19 @@ def setup_cursor_mcp(host_system: str, path_to_env: str, path_to_server: str, en
     print("Cursor MCP configuration updated successfully.")
 
 
-def setup_claude_desktop(host_system: str, path_to_env: str, path_to_server: str) -> None:
-    """Set up Claude Desktop configuration for Skyvern MCP."""
-    if not is_claude_desktop_installed(host_system):
-        print("Claude Desktop is not installed. Skipping MCP setup.")
-        return
-
-    # Get config file path
-    try:
-        path_claude_config = get_claude_config_path(host_system)
-    except Exception as e:
-        print(f"Error setting up Claude Desktop: {e}")
-        return
-
-    # Setup environment variables
-    env_vars = ""
-    for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]:
-        value = os.getenv(key)
-        if value is None:
-            value = typer.prompt(f"Enter your {key}")
-        env_vars += f"{key}={value} "
-
-    # Get command configuration
-    try:
-        claude_command, claude_args = get_claude_command_config(host_system, path_to_env, path_to_server, env_vars)
-    except Exception as e:
-        print(f"Error configuring Claude Desktop command: {e}")
-        return
-
-    # Create or update Claude config file
-    os.makedirs(os.path.dirname(path_claude_config), exist_ok=True)
-    if not os.path.exists(path_claude_config):
-        with open(path_claude_config, "w") as f:
-            json.dump({"mcpServers": {}}, f, indent=2)
-
-    with open(path_claude_config, "r") as f:
-        claude_config = json.load(f)
-        claude_config["mcpServers"].pop("Skyvern", None)
-        claude_config["mcpServers"]["Skyvern"] = {"command": claude_command, "args": claude_args}
-
-    with open(path_claude_config, "w") as f:
-        json.dump(claude_config, f, indent=2)
-
-    print("Claude Desktop configuration updated successfully.")
-
-
 def get_mcp_server_url(deployment_type: str, host: str = "") -> str:
     """Get the MCP server URL based on deployment type."""
-    if deployment_type in ["local", "cloud"]:
-        return os.path.join(os.path.abspath("./skyvern/mcp"), "server.py")
+    if deployment_type == "self-hosted":
+        return "http://localhost:8000"
+    elif deployment_type == "cloud":
+        return "https://api.skyvern.com"
     else:
         raise ValueError(f"Invalid deployment type: {deployment_type}")
 
 
 def setup_mcp_config(host_system: str, deployment_type: str, host: str = "") -> tuple[str, str]:
     """Set up MCP configuration based on deployment type."""
-    if deployment_type in ["local", "cloud"]:
-        # For local deployment, we need Python environment
+    if deployment_type in ["self-hosted", "cloud"]:
         python_path = shutil.which("python")
         if python_path:
             path_to_env = python_path
@@ -376,71 +340,23 @@ def setup_mcp_config(host_system: str, deployment_type: str, host: str = "") -> 
         raise NotImplementedError()
 
 
-def get_command_config(host_system: str, command: str, target: str, env_vars: str) -> tuple[str, list]:
+def get_command_config(host_system: str, command: str, target: str) -> tuple[str, list]:
     """Get the command and arguments for MCP configuration."""
-    base_env_vars = f"{env_vars} ENABLE_OPENAI=true LOG_LEVEL=CRITICAL"
-    artifacts_path = os.path.join(os.path.abspath("./"), "artifacts")
-
-    if host_system == "wsl":
-        env_vars = f"{base_env_vars} ARTIFACT_STORAGE_PATH={artifacts_path} BROWSER_TYPE=chromium-headless"
-        return "wsl.exe", ["bash", "-c", f"{env_vars} {command} {target}"]
-
     if host_system in ["linux", "darwin"]:
-        env_vars = f"{base_env_vars} ARTIFACT_STORAGE_PATH={artifacts_path}"
-        if target.startswith("http"):
-            return command, ["-X", "POST", target]
-        return command, [target]
+        return command, ["-m", "skyvern", "run", "mcp"]
+    elif host_system == "wsl":
+        return "wsl.exe", ["bash", "-c", f"{command} skyvern run mcp"]
 
     raise Exception(f"Unsupported host system: {host_system}")
 
 
-@run_app.command(name="setupmcp")
-def setup_mcp() -> None:
-    """Configure MCP for different Skyvern deployments."""
-    host_system = detect_os()
-
-    # Prompt for deployment type
-    deployment_types = ["local", "cloud"]
-    deployment_type = typer.prompt("Select Skyvern deployment type", type=Choice(deployment_types), default="local")
-
-    try:
-        command, target = setup_mcp_config(host_system, deployment_type)
-    except Exception as e:
-        print(f"Error setting up MCP configuration: {e}")
-        return
-
-    # Cloud deployment variables
-    env_vars = ""
-    if deployment_type == "cloud":
-        for key in ["SKYVERN_MCP_CLOUD_URL", "SKYVERN_MCP_API_KEY"]:
-            value = os.getenv(key)
-            if value is None:
-                value = typer.prompt(f"Enter your {key}")
-            env_vars += f"{key}={value} "
-
-    # Setup environment variables
-    for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]:
-        value = os.getenv(key)
-        if value is None:
-            value = typer.prompt(f"Enter your {key}")
-        env_vars += f"{key}={value} "
-
-    # Configure both Claude Desktop and Cursor
-    success = False
-    success |= setup_claude_desktop_config(host_system, command, target, env_vars)
-    success |= setup_cursor_config(host_system, command, target, env_vars)
-
-    if not success:
-        print("Neither Claude Desktop nor Cursor is installed. Please install at least one of them.")
-
-
-def setup_claude_desktop_config(host_system: str, command: str, target: str, env_vars: str) -> bool:
+def setup_claude_desktop_config(host_system: str, command: str, target: str) -> bool:
     """Set up Claude Desktop configuration with given command and args."""
     if not is_claude_desktop_installed(host_system):
         return False
 
     try:
-        claude_command, claude_args = get_command_config(host_system, command, target, env_vars)
+        claude_command, claude_args = get_command_config(host_system, command, target)
         path_claude_config = get_claude_config_path(host_system)
 
         os.makedirs(os.path.dirname(path_claude_config), exist_ok=True)
@@ -451,7 +367,14 @@ def setup_claude_desktop_config(host_system: str, command: str, target: str, env
         with open(path_claude_config, "r") as f:
             claude_config = json.load(f)
             claude_config["mcpServers"].pop("Skyvern", None)
-            claude_config["mcpServers"]["Skyvern"] = {"command": claude_command, "args": claude_args}
+            claude_config["mcpServers"]["Skyvern"] = {
+                "command": claude_command,
+                "args": claude_args,
+                "env": {
+                    "SKYVERN_BASE_URL": target,
+                    "SKYVERN_API_KEY": "test",  # str(_setup_local_organization())
+                },
+            }
 
         with open(path_claude_config, "w") as f:
             json.dump(claude_config, f, indent=2)
@@ -464,17 +387,23 @@ def setup_claude_desktop_config(host_system: str, command: str, target: str, env
         return False
 
 
-def setup_cursor_config(host_system: str, command: str, target: str, env_vars: str) -> bool:
+def setup_cursor_config(host_system: str, command: str, target: str) -> bool:
     """Set up Cursor configuration with given command and args."""
     if not is_cursor_installed(host_system):
         return False
 
     try:
-        cursor_command, cursor_args = get_command_config(host_system, command, target, env_vars)
+        cursor_command, cursor_args = get_command_config(host_system, command, target)
         path_cursor_config = get_cursor_config_path(host_system)
 
         os.makedirs(os.path.dirname(path_cursor_config), exist_ok=True)
-        config = {"Skyvern": {"command": cursor_command, "args": cursor_args}}
+        config = {
+            "Skyvern": {
+                "command": cursor_command,
+                "args": cursor_args,
+                "env": {"SKYVERN_BASE_URL": target, "SKYVERN_API_KEY": _setup_local_organization()},
+            }
+        }
 
         if os.path.exists(path_cursor_config):
             try:
@@ -496,6 +425,44 @@ def setup_cursor_config(host_system: str, command: str, target: str, env_vars: s
         return False
 
 
+def setup_windsurf_config(host_system: str, command: str, target: str) -> bool:
+    """Set up Windsurf configuration with given command and args."""
+    if not is_windsurf_installed(host_system):
+        return False
+
+    try:
+        windsurf_command, windsurf_args = get_command_config(host_system, command, target)
+        path_windsurf_config = get_windsurf_config_path(host_system)
+
+        os.makedirs(os.path.dirname(path_windsurf_config), exist_ok=True)
+        config = {
+            "Skyvern": {
+                "command": windsurf_command,
+                "args": windsurf_args,
+                "env": {"SKYVERN_BASE_URL": target, "SKYVERN_API_KEY": _setup_local_organization()},
+            }
+        }
+
+        if os.path.exists(path_windsurf_config):
+            try:
+                with open(path_windsurf_config, "r") as f:
+                    existing_config = json.load(f)
+                    existing_config.update(config)
+                    config = existing_config
+            except json.JSONDecodeError:
+                pass
+
+        with open(path_windsurf_config, "w") as f:
+            json.dump(config, f, indent=2)
+
+        print(f"Windsurf configuration updated successfully at {path_windsurf_config}")
+        return True
+
+    except Exception as e:
+        print(f"Error configuring Windsurf: {e}")
+        return False
+
+
 @run_app.command(name="server")
 def run_server() -> None:
     port = int(os.environ.get("PORT", 8000))
@@ -511,3 +478,30 @@ def run_server() -> None:
 def run_mcp() -> None:
     """Run the MCP server."""
     mcp.run(transport="stdio")
+
+
+@run_app.command(name="setupmcp")
+def setup_mcp() -> None:
+    """Configure MCP for different Skyvern deployments."""
+    host_system = detect_os()
+
+    # Prompt for deployment type
+    deployment_types = ["self-hosted", "cloud"]
+    deployment_type = typer.prompt(
+        "Select Skyvern deployment type", type=Choice(deployment_types), default="self-hosted"
+    )
+
+    try:
+        command, target = setup_mcp_config(host_system, deployment_type)
+    except Exception as e:
+        print(f"Error setting up MCP configuration: {e}")
+        return
+
+    # Configure both Claude Desktop and Cursor
+    success = False
+    success |= setup_claude_desktop_config(host_system, command, target)
+    success |= setup_cursor_config(host_system, command, target)
+    success |= setup_windsurf_config(host_system, command, target)
+
+    if not success:
+        print("Neither Claude Desktop, Windsurf, nor Cursor is installed. Please install at least one of them.")
