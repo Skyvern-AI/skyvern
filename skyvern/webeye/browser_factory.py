@@ -360,8 +360,10 @@ async def _create_cdp_connection_browser(
         browser_process = subprocess.Popen(
             [browser_path, "--remote-debugging-port=9222"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
+        # Add small delay to allow browser to start
+        time.sleep(1)
         if browser_process.poll() is not None:
-            raise Exception(f"Failed to open browser. browser_path: {browser_path}")
+            raise Exception(f"Failed to open browser. browser_path: {browser_path}, returncode: {browser_process.returncode}, error: {browser_process.stderr.read().decode()}")
 
     browser_args = BrowserContextFactory.build_browser_args()
 

@@ -352,7 +352,7 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
         if browser_type == "chromium-headless":
             print("   - Runs Chrome in headless mode (no visible window)")
         elif browser_type == "chromium-headful":
-            print("   - Runs Chrome with visible window)")
+            print("   - Runs Chrome with visible window")
         elif browser_type == "cdp-connect":
             print("   - Connects to an existing Chrome instance")
             print("   - Requires Chrome to be running with remote debugging enabled")
@@ -404,7 +404,7 @@ async def _setup_local_organization() -> str:
     return org_auth_token.token if org_auth_token else ""
 
 
-@typer_app.command(name="init")
+@app.command(name="init")
 def init() -> None:
     setup_postgresql()
     api_key = asyncio.run(_setup_local_organization())
@@ -416,7 +416,6 @@ def init() -> None:
             return
 
     print("Initializing .env file...")
-    shutil.copy(".env.example", ".env")
     setup_llm_providers()
 
     # Configure browser settings
@@ -437,7 +436,7 @@ def init() -> None:
     print(".env file has been initialized.")
 
 
-@typer_app.command(name="migrate")
+@app.command(name="migrate")
 def migrate() -> None:
     migrate_db()
 

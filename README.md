@@ -234,7 +234,7 @@ We love to see how Skyvern is being used in the wild. Here are some examples of 
   <img src="docs/images/geico_shu_recording_cropped.gif"/>
 </p>
 
-# Contibutor Setup
+# Contributor Setup
 ### Prerequisites 
 
 > :warning: :warning: MAKE SURE YOU ARE USING PYTHON 3.11 :warning: :warning:
