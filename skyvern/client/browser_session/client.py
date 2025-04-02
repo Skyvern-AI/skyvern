@@ -9,7 +9,6 @@ from ..core.pydantic_utilities import parse_obj_as
 from ..errors.unauthorized_error import UnauthorizedError
 from ..errors.not_found_error import NotFoundError
 from ..errors.unprocessable_entity_error import UnprocessableEntityError
-from ..types.http_validation_error import HttpValidationError
 from json.decoder import JSONDecodeError
 from ..core.api_error import ApiError
 from ..core.client_wrapper import AsyncClientWrapper
@@ -86,9 +85,9 @@ class BrowserSessionClient:
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
                     typing.cast(
-                        HttpValidationError,
+                        typing.Optional[typing.Any],
                         parse_obj_as(
-                            type_=HttpValidationError,  # type: ignore
+                            type_=typing.Optional[typing.Any],  # type: ignore
                             object_=_response.json(),
                         ),
                     )
@@ -151,9 +150,9 @@ class BrowserSessionClient:
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
                     typing.cast(
-                        HttpValidationError,
+                        typing.Optional[typing.Any],
                         parse_obj_as(
-                            type_=HttpValidationError,  # type: ignore
+                            type_=typing.Optional[typing.Any],  # type: ignore
                             object_=_response.json(),
                         ),
                     )
@@ -216,9 +215,9 @@ class BrowserSessionClient:
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
                     typing.cast(
-                        HttpValidationError,
+                        typing.Optional[typing.Any],
                         parse_obj_as(
-                            type_=HttpValidationError,  # type: ignore
+                            type_=typing.Optional[typing.Any],  # type: ignore
                             object_=_response.json(),
                         ),
                     )
@@ -285,9 +284,9 @@ class BrowserSessionClient:
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
                     typing.cast(
-                        HttpValidationError,
+                        typing.Optional[typing.Any],
                         parse_obj_as(
-                            type_=HttpValidationError,  # type: ignore
+                            type_=typing.Optional[typing.Any],  # type: ignore
                             object_=_response.json(),
                         ),
                     )
@@ -377,9 +376,9 @@ class AsyncBrowserSessionClient:
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
                     typing.cast(
-                        HttpValidationError,
+                        typing.Optional[typing.Any],
                         parse_obj_as(
-                            type_=HttpValidationError,  # type: ignore
+                            type_=typing.Optional[typing.Any],  # type: ignore
                             object_=_response.json(),
                         ),
                     )
@@ -450,9 +449,9 @@ class AsyncBrowserSessionClient:
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
                     typing.cast(
-                        HttpValidationError,
+                        typing.Optional[typing.Any],
                         parse_obj_as(
-                            type_=HttpValidationError,  # type: ignore
+                            type_=typing.Optional[typing.Any],  # type: ignore
                             object_=_response.json(),
                         ),
                     )
@@ -523,9 +522,9 @@ class AsyncBrowserSessionClient:
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
                     typing.cast(
-                        HttpValidationError,
+                        typing.Optional[typing.Any],
                         parse_obj_as(
-                            type_=HttpValidationError,  # type: ignore
+                            type_=typing.Optional[typing.Any],  # type: ignore
                             object_=_response.json(),
                         ),
                     )
@@ -600,9 +599,9 @@ class AsyncBrowserSessionClient:
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
                     typing.cast(
-                        HttpValidationError,
+                        typing.Optional[typing.Any],
                         parse_obj_as(
-                            type_=HttpValidationError,  # type: ignore
+                            type_=typing.Optional[typing.Any],  # type: ignore
                             object_=_response.json(),
                         ),
                     )
