@@ -45,7 +45,6 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
     url: data.url,
     dataExtractionGoal: data.dataExtractionGoal,
     dataSchema: data.dataSchema,
-    maxRetries: data.maxRetries,
     maxStepsOverride: data.maxStepsOverride,
     continueOnFailure: data.continueOnFailure,
     cacheActions: data.cacheActions,
@@ -157,33 +156,6 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
                     parameters={data.parameterKeys}
                     onParametersChange={(parameterKeys) => {
                       updateNodeData(id, { parameterKeys });
-                    }}
-                  />
-                </div>
-                <div className="flex items-center justify-between">
-                  <div className="flex gap-2">
-                    <Label className="text-xs font-normal text-slate-300">
-                      Max Retries
-                    </Label>
-                    <HelpTooltip
-                      content={helpTooltips["extraction"]["maxRetries"]}
-                    />
-                  </div>
-                  <Input
-                    type="number"
-                    placeholder={placeholders["extraction"]["maxRetries"]}
-                    className="nopan w-52 text-xs"
-                    min="0"
-                    value={inputs.maxRetries ?? ""}
-                    onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
-                      const value =
-                        event.target.value === ""
-                          ? null
-                          : Number(event.target.value);
-                      handleChange("maxRetries", value);
                     }}
                   />
                 </div>

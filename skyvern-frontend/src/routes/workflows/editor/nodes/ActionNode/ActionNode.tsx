@@ -21,7 +21,6 @@ import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import type { ActionNode } from "./types";
 import { HelpTooltip } from "@/components/HelpTooltip";
-import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
 import { errorMappingExampleValue } from "../types";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
@@ -54,7 +53,6 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
     url: data.url,
     navigationGoal: data.navigationGoal,
     errorCodeMapping: data.errorCodeMapping,
-    maxRetries: data.maxRetries,
     allowDownloads: data.allowDownloads,
     continueOnFailure: data.continueOnFailure,
     cacheActions: data.cacheActions,
@@ -180,33 +178,6 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                     parameters={data.parameterKeys}
                     onParametersChange={(parameterKeys) => {
                       updateNodeData(id, { parameterKeys });
-                    }}
-                  />
-                </div>
-                <div className="flex items-center justify-between">
-                  <div className="flex gap-2">
-                    <Label className="text-xs font-normal text-slate-300">
-                      Max Retries
-                    </Label>
-                    <HelpTooltip
-                      content={helpTooltips["action"]["maxRetries"]}
-                    />
-                  </div>
-                  <Input
-                    type="number"
-                    placeholder={placeholders["action"]["maxRetries"]}
-                    className="nopan w-52 text-xs"
-                    min="0"
-                    value={inputs.maxRetries ?? ""}
-                    onChange={(event) => {
-                      if (!editable) {
-                        return;
-                      }
-                      const value =
-                        event.target.value === ""
-                          ? null
-                          : Number(event.target.value);
-                      handleChange("maxRetries", value);
                     }}
                   />
                 </div>
