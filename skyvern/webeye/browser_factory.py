@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import subprocess
 import time
 import uuid
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
 import aiofiles
+import psutil
 import structlog
 from playwright.async_api import BrowserContext, ConsoleMessage, Download, Page, Playwright
 from pydantic import BaseModel, PrivateAttr
@@ -304,6 +306,31 @@ def _get_cdp_port(kwargs: dict) -> int | None:
     return None
 
 
+def _is_port_in_use(port: int) -> bool:
+    """Check if a port is already in use."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("localhost", port))
+            return False
+        except socket.error:
+            return True
+
+
+def _is_chrome_running() -> bool:
+    """Check if Chrome is already running."""
+    chrome_process_names = ["chrome", "google-chrome", "google chrome"]
+    for proc in psutil.process_iter(["name"]):
+        try:
+            proc_name = proc.info["name"].lower()
+            if proc_name == "chrome_crashpad_handler":
+                continue
+            if any(chrome_name in proc_name for chrome_name in chrome_process_names):
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+    return False
+
+
 async def _create_headless_chromium(
     playwright: Playwright, proxy_location: ProxyLocation | None = None, **kwargs: dict
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
@@ -357,6 +384,16 @@ async def _create_cdp_connection_browser(
     browser_path = settings.CHROME_EXECUTABLE_PATH
 
     if browser_type == "cdp-connect" and browser_path:
+        # First check if Chrome is already running
+        if _is_chrome_running():
+            raise Exception(
+                "Chrome is already running. Please close all Chrome instances before starting with remote debugging."
+            )
+
+        # Then check if the debugging port is already in use
+        if _is_port_in_use(9222):
+            raise Exception("Port 9222 is already in use. Another process may be using this port.")
+
         browser_process = subprocess.Popen(
             [browser_path, "--remote-debugging-port=9222"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
