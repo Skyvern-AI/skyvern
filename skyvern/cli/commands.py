@@ -393,8 +393,8 @@ def get_command_config(host_system: str, command: str, target: str, env_vars: st
     raise Exception(f"Unsupported host system: {host_system}")
 
 
-@run_app.command(name="mcp")
-def run_mcp() -> None:
+@run_app.command(name="setupmcp")
+def setup_mcp() -> None:
     """Configure MCP for different Skyvern deployments."""
     host_system = detect_os()
 
@@ -504,3 +504,9 @@ def run_server() -> None:
         port=port,
         log_level="info",
     )
+
+
+@run_app.command(name="mcp")
+def run_mcp() -> None:
+    """Run the MCP server."""
+    mcp.run(transport="stdio")
