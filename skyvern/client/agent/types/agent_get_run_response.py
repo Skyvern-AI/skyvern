@@ -5,6 +5,7 @@ from ...core.pydantic_utilities import UniversalBaseModel
 import typing
 from ...types.run_status import RunStatus
 from ...types.output import Output
+from ...types.file_info import FileInfo
 import datetime as dt
 from ...types.task_run_request import TaskRunRequest
 from ...core.pydantic_utilities import IS_PYDANTIC_V2
@@ -17,6 +18,8 @@ class AgentGetRunResponse_TaskV1(UniversalBaseModel):
     run_id: str
     status: RunStatus
     output: typing.Optional[Output] = None
+    downloaded_files: typing.Optional[typing.List[FileInfo]] = None
+    recording_url: typing.Optional[str] = None
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
@@ -37,6 +40,8 @@ class AgentGetRunResponse_TaskV2(UniversalBaseModel):
     run_id: str
     status: RunStatus
     output: typing.Optional[Output] = None
+    downloaded_files: typing.Optional[typing.List[FileInfo]] = None
+    recording_url: typing.Optional[str] = None
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
@@ -57,6 +62,8 @@ class AgentGetRunResponse_WorkflowRun(UniversalBaseModel):
     run_id: str
     status: RunStatus
     output: typing.Optional[Output] = None
+    downloaded_files: typing.Optional[typing.List[FileInfo]] = None
+    recording_url: typing.Optional[str] = None
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime

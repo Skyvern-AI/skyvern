@@ -15,6 +15,6 @@ setup_logger()
 
 from skyvern.forge import app  # noqa: E402, F401
 from skyvern.agent import SkyvernAgent, SkyvernClient  # noqa: E402
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunResponse  # noqa: E402
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunResponseBase  # noqa: E402
 
-__all__ = ["SkyvernAgent", "SkyvernClient", "WorkflowRunResponse"]
+__all__ = ["SkyvernAgent", "SkyvernClient", "WorkflowRunResponseBase"]

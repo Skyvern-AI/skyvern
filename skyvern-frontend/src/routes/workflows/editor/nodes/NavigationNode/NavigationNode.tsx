@@ -47,7 +47,6 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
     url: data.url,
     navigationGoal: data.navigationGoal,
     errorCodeMapping: data.errorCodeMapping,
-    maxRetries: data.maxRetries,
     maxStepsOverride: data.maxStepsOverride,
     allowDownloads: data.allowDownloads,
     continueOnFailure: data.continueOnFailure,
@@ -196,30 +195,6 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                   />
                 </div>
                 <Separator />
-                <div className="flex items-center justify-between">
-                  <div className="flex gap-2">
-                    <Label className="text-xs font-normal text-slate-300">
-                      Max Retries
-                    </Label>
-                    <HelpTooltip
-                      content={helpTooltips["navigation"]["maxRetries"]}
-                    />
-                  </div>
-                  <Input
-                    type="number"
-                    placeholder={placeholders["navigation"]["maxRetries"]}
-                    className="nopan w-52 text-xs"
-                    min="0"
-                    value={inputs.maxRetries ?? ""}
-                    onChange={(event) => {
-                      const value =
-                        event.target.value === ""
-                          ? null
-                          : Number(event.target.value);
-                      handleChange("maxRetries", value);
-                    }}
-                  />
-                </div>
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
                     <Label className="text-xs font-normal text-slate-300">

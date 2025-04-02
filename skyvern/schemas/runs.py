@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field, field_validator
 
+from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.utils.url_validators import validate_url
 
 
@@ -206,6 +207,8 @@ class BaseRunResponse(BaseModel):
     output: dict | list | str | None = Field(
         default=None, description="Output data from the run, if any. Format depends on the schema in the input"
     )
+    downloaded_files: list[FileInfo] | None = Field(default=None, description="List of files downloaded during the run")
+    recording_url: str | None = Field(default=None, description="URL to the recording of the run")
     failure_reason: str | None = Field(default=None, description="Reason for failure if the run failed")
     created_at: datetime = Field(description="Timestamp when this run was created")
     modified_at: datetime = Field(description="Timestamp when this run was last modified")

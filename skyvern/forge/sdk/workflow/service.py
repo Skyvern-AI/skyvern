@@ -80,7 +80,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRun,
     WorkflowRunOutputParameter,
     WorkflowRunParameter,
-    WorkflowRunResponse,
+    WorkflowRunResponseBase,
     WorkflowRunStatus,
     WorkflowStatus,
 )
@@ -958,7 +958,7 @@ class WorkflowService:
         workflow_run_id: str,
         organization_id: str,
         include_cost: bool = False,
-    ) -> WorkflowRunResponse:
+    ) -> WorkflowRunResponseBase:
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         if workflow_run is None:
             LOG.error(f"Workflow run {workflow_run_id} not found")
@@ -977,7 +977,7 @@ class WorkflowService:
         workflow_run_id: str,
         organization_id: str,
         include_cost: bool = False,
-    ) -> WorkflowRunResponse:
+    ) -> WorkflowRunResponseBase:
         workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id)
         if workflow is None:
             LOG.error(f"Workflow {workflow_permanent_id} not found")
@@ -1073,7 +1073,7 @@ class WorkflowService:
             # successful steps are the ones that have a status of completed and the total count of unique step.order
             successful_steps = [step for step in workflow_run_steps if step.status == StepStatus.completed]
             total_cost = 0.1 * (len(successful_steps) + len(text_prompt_blocks))
-        return WorkflowRunResponse(
+        return WorkflowRunResponseBase(
             workflow_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run_id,
             status=workflow_run.status,
