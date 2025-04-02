@@ -21,11 +21,6 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.utils import detect_os, get_windows_appdata_roaming, migrate_db
 
 mcp = FastMCP("Skyvern")
-skyvern_agent = SkyvernAgent(
-    base_url=settings.SKYVERN_BASE_URL,
-    api_key=settings.SKYVERN_API_KEY,
-    extra_headers={"X-User-Agent": "skyvern-mcp"},
-)
 
 
 @mcp.tool()
@@ -36,15 +31,20 @@ async def skyvern_run_task(prompt: str, url: str) -> str:
         prompt: brief description of what the user wants to accomplish
         url: the target website for the user goal
     """
+    skyvern_agent = SkyvernAgent(
+        base_url=settings.SKYVERN_BASE_URL,
+        api_key=settings.SKYVERN_API_KEY,
+        extra_headers={"X-User-Agent": "skyvern-mcp"},
+    )
     res = await skyvern_agent.run_task(prompt=prompt, url=url)
     return res.model_dump()["output"]
 
 
 load_dotenv()
 
-typer_app = typer.Typer()
+cli_app = typer.Typer()
 run_app = typer.Typer()
-typer_app.add_typer(run_app, name="run")
+cli_app.add_typer(run_app, name="run")
 
 
 def command_exists(command: str) -> bool:
@@ -395,6 +395,10 @@ async def _setup_local_organization() -> str:
     """
     Returns the API key for the local organization generated
     """
+    skyvern_agent = SkyvernAgent(
+        base_url=settings.SKYVERN_BASE_URL,
+        api_key=settings.SKYVERN_API_KEY,
+    )
     organization = await skyvern_agent.get_organization()
 
     org_auth_token = await app.DATABASE.get_valid_org_auth_token(
@@ -404,27 +408,50 @@ async def _setup_local_organization() -> str:
     return org_auth_token.token if org_auth_token else ""
 
 
-@typer_app.command(name="init")
+@cli_app.command(name="init")
 def init() -> None:
-    setup_postgresql()
-    api_key = asyncio.run(_setup_local_organization())
+    run_local = input("Would you like to run Skyvern locally or in the cloud? (local/cloud) [cloud]: ").strip().lower()
+    run_local = run_local == "local" if run_local else False
 
-    if os.path.exists(".env"):
-        print(".env file already exists, skipping initialization.")
-        redo_llm_setup = input("Do you want to go through LLM provider setup again (y/n)? ")
-        if redo_llm_setup.lower() != "y":
-            return
+    if run_local:
+        setup_postgresql()
+        api_key = asyncio.run(_setup_local_organization())
 
-    print("Initializing .env file...")
-    setup_llm_providers()
+        if os.path.exists(".env"):
+            print(".env file already exists, skipping initialization.")
+            redo_llm_setup = input("Do you want to go through LLM provider setup again (y/n)? ")
+            if redo_llm_setup.lower() != "y":
+                return
 
-    # Configure browser settings
-    browser_type, browser_location, remote_debugging_url = setup_browser_config()
-    update_or_add_env_var("BROWSER_TYPE", browser_type)
-    if browser_location:
-        update_or_add_env_var("CHROME_EXECUTABLE_PATH", browser_location)
-    if remote_debugging_url:
-        update_or_add_env_var("BROWSER_REMOTE_DEBUGGING_URL", remote_debugging_url)
+        print("Initializing .env file...")
+        setup_llm_providers()
+
+        # Configure browser settings
+        browser_type, browser_location, remote_debugging_url = setup_browser_config()
+        update_or_add_env_var("BROWSER_TYPE", browser_type)
+        if browser_location:
+            update_or_add_env_var("CHROME_EXECUTABLE_PATH", browser_location)
+        if remote_debugging_url:
+            update_or_add_env_var("BROWSER_REMOTE_DEBUGGING_URL", remote_debugging_url)
+        
+        print("Defaulting Skyvern Base URL to: http://localhost:8000")
+        update_or_add_env_var("SKYVERN_BASE_URL", "http://localhost:8000")
+
+    else:
+        base_url = input("Enter Skyvern base URL (press Enter for api.skyvern.com): ").strip()
+        if not base_url:
+            base_url = "https://api.skyvern.com"
+
+        print("To get your API key:")
+        print("1. Create an account at app.skyvern.com")
+        print("2. Go to Settings")
+        print("3. Copy your API key")
+        api_key = input("Enter your Skyvern API key: ").strip()
+        if not api_key:
+            print("API key is required")
+            api_key = input("Enter your Skyvern API key: ").strip()
+        
+        update_or_add_env_var("SKYVERN_BASE_URL", base_url)
 
     # Ask for email or generate UUID
     analytics_id = input("Please enter your email for analytics (press enter to skip): ")
@@ -435,8 +462,14 @@ def init() -> None:
     update_or_add_env_var("SKYVERN_API_KEY", api_key)
     print(".env file has been initialized.")
 
+    # Ask if user wants to configure MCP server
+    configure_mcp = input("\nWould you like to configure the MCP server (y/n)? ").lower() == "y"
+    if configure_mcp:
+        setup_mcp()
+        print("\nMCP server configuration completed.")
 
-@typer_app.command(name="migrate")
+
+@cli_app.command(name="migrate")
 def migrate() -> None:
     migrate_db()
 
@@ -598,26 +631,16 @@ def setup_claude_desktop(host_system: str, path_to_env: str, path_to_server: str
     print("Claude Desktop configuration updated successfully.")
 
 
-def get_mcp_server_url(deployment_type: str, host: str = "") -> str:
-    """Get the MCP server URL based on deployment type."""
-    if deployment_type in ["local", "cloud"]:
-        return os.path.join(os.path.abspath("./skyvern/mcp"), "server.py")
-    else:
-        raise ValueError(f"Invalid deployment type: {deployment_type}")
-
-
 def setup_mcp_config(host_system: str, deployment_type: str, host: str = "") -> tuple[str, str]:
-    """Set up MCP configuration based on deployment type."""
-    if deployment_type in ["local", "cloud"]:
-        # For local deployment, we need Python environment
-        python_path = shutil.which("python")
-        if python_path:
+    # For local deployment, we need Python environment
+    python_path = shutil.which("python")
+    if python_path:
+        use_default = typer.prompt(f"Found Python at {python_path}. Use this path? (y/n)").lower() == 'y'
+        if use_default:
             path_to_env = python_path
         else:
             path_to_env = typer.prompt("Enter the full path to your configured python environment")
-        return path_to_env, get_mcp_server_url(deployment_type)
-    else:
-        raise NotImplementedError()
+    return path_to_env
 
 
 def get_command_config(host_system: str, command: str, target: str, env_vars: str) -> tuple[str, list]:
@@ -638,36 +661,12 @@ def get_command_config(host_system: str, command: str, target: str, env_vars: st
     raise Exception(f"Unsupported host system: {host_system}")
 
 
-@run_app.command(name="setupmcp")
 def setup_mcp() -> None:
     """Configure MCP for different Skyvern deployments."""
     host_system = detect_os()
 
-    # Prompt for deployment type
-    deployment_types = ["local", "cloud"]
-    deployment_type = typer.prompt("Select Skyvern deployment type", type=Choice(deployment_types), default="local")
 
-    try:
-        command, target = setup_mcp_config(host_system, deployment_type)
-    except Exception as e:
-        print(f"Error setting up MCP configuration: {e}")
-        return
-
-    # Cloud deployment variables
-    env_vars = ""
-    if deployment_type == "cloud":
-        for key in ["SKYVERN_MCP_CLOUD_URL", "SKYVERN_MCP_API_KEY"]:
-            value = os.getenv(key)
-            if value is None:
-                value = typer.prompt(f"Enter your {key}")
-            env_vars += f"{key}={value} "
-
-    # Setup environment variables
-    for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]:
-        value = os.getenv(key)
-        if value is None:
-            value = typer.prompt(f"Enter your {key}")
-        env_vars += f"{key}={value} "
+    path_to_python_env = setup_mcp_config(host_system)
 
     # Configure both Claude Desktop and Cursor
     success = False

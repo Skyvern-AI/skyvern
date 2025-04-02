@@ -1,4 +1,5 @@
 import asyncio
+import os
 import subprocess
 from typing import Any, cast
 
@@ -35,11 +36,11 @@ class SkyvernAgent:
         self.extra_headers = extra_headers
         self.client: SkyvernClient | None = None
         if base_url is None and api_key is None:
-            # TODO: run at the root wherever the code is initiated
+            if not os.path.exists(".env"):
+                raise Exception("No .env file found. Please run 'skyvern init' first to set up your environment.")
+
             load_dotenv(".env")
             migrate_db()
-            # TODO: will this change the already imported settings?
-            # TODO: maybe refresh the settings
 
         self.cdp_url = cdp_url
         if browser_path:
