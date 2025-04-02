@@ -30,7 +30,9 @@ class SkyvernAgent:
         cdp_url: str | None = None,
         browser_path: str | None = None,
         browser_type: str | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
+        self.extra_headers = extra_headers
         self.client: SkyvernClient | None = None
         if base_url is None and api_key is None:
             # TODO: run at the root wherever the code is initiated
@@ -69,7 +71,7 @@ class SkyvernAgent:
             self.client = SkyvernClient(
                 base_url=base_url,
                 api_key=api_key,
-                extra_headers={"X-User-Agent": "skyvern-mcp"},
+                extra_headers=self.extra_headers,
             )
         else:
             raise ValueError("base_url and api_key must be both provided")
