@@ -404,7 +404,7 @@ async def _setup_local_organization() -> str:
     return org_auth_token.token if org_auth_token else ""
 
 
-@app.command(name="init")
+@typer_app.command(name="init")
 def init() -> None:
     setup_postgresql()
     api_key = asyncio.run(_setup_local_organization())
@@ -436,7 +436,7 @@ def init() -> None:
     print(".env file has been initialized.")
 
 
-@app.command(name="migrate")
+@typer_app.command(name="migrate")
 def migrate() -> None:
     migrate_db()
 
