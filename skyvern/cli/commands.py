@@ -140,6 +140,246 @@ def setup_postgresql() -> None:
         run_command("docker exec postgresql-container createdb -U postgres skyvern -O skyvern")
         print("Database and user created successfully.")
 
+def update_or_add_env_var(key: str, value: str) -> None:
+    """Update or add environment variable in .env file."""
+    from dotenv import load_dotenv, set_key
+    from pathlib import Path
+
+    env_path = Path(".env")
+    if not env_path.exists():
+        env_path.touch()
+        # Write default environment variables using dotenv
+        defaults = {
+            "ENV": "local",
+            "ENABLE_OPENAI": "false",
+            "OPENAI_API_KEY": "",
+            "ENABLE_ANTHROPIC": "false", 
+            "ANTHROPIC_API_KEY": "",
+            "ENABLE_AZURE": "false",
+            "AZURE_DEPLOYMENT": "",
+            "AZURE_API_KEY": "",
+            "AZURE_API_BASE": "",
+            "AZURE_API_VERSION": "",
+            "ENABLE_AZURE_GPT4O_MINI": "false",
+            "AZURE_GPT4O_MINI_DEPLOYMENT": "",
+            "AZURE_GPT4O_MINI_API_KEY": "",
+            "AZURE_GPT4O_MINI_API_BASE": "",
+            "AZURE_GPT4O_MINI_API_VERSION": "",
+            "ENABLE_GEMINI": "false",
+            "GEMINI_API_KEY": "",
+            "ENABLE_NOVITA": "false",
+            "NOVITA_API_KEY": "",
+            "LLM_KEY": "",
+            "SECONDARY_LLM_KEY": "",
+            "BROWSER_TYPE": "chromium-headful",
+            "MAX_SCRAPING_RETRIES": "0",
+            "VIDEO_PATH": "./videos",
+            "BROWSER_ACTION_TIMEOUT_MS": "5000",
+            "MAX_STEPS_PER_RUN": "50",
+            "LOG_LEVEL": "INFO",
+            "DATABASE_STRING": "postgresql+psycopg://skyvern@localhost/skyvern",
+            "PORT": "8000",
+            "ANALYTICS_ID": "anonymous",
+            "ENABLE_LOG_ARTIFACTS": "false"
+        }
+        for key, value in defaults.items():
+            set_key(env_path, key, value)
+
+    load_dotenv(env_path)
+    set_key(env_path, key, value)
+
+
+
+def setup_llm_providers() -> None:
+    """Configure Large Language Model (LLM) Providers."""
+    print("Configuring Large Language Model (LLM) Providers...")
+    print("Note: All information provided here will be stored only on your local machine.")
+    model_options = []
+
+    # OpenAI Configuration
+    print("To enable OpenAI, you must have an OpenAI API key.")
+    enable_openai = input("Do you want to enable OpenAI (y/n)? ").lower() == "y"
+    if enable_openai:
+        openai_api_key = input("Enter your OpenAI API key: ")
+        if not openai_api_key:
+            print("Error: OpenAI API key is required.")
+            print("OpenAI will not be enabled.")
+        else:
+            update_or_add_env_var("OPENAI_API_KEY", openai_api_key)
+            update_or_add_env_var("ENABLE_OPENAI", "true")
+            model_options.extend(["OPENAI_GPT4O"])
+    else:
+        update_or_add_env_var("ENABLE_OPENAI", "false")
+
+    # Anthropic Configuration
+    print("To enable Anthropic, you must have an Anthropic API key.")
+    enable_anthropic = input("Do you want to enable Anthropic (y/n)? ").lower() == "y"
+    if enable_anthropic:
+        anthropic_api_key = input("Enter your Anthropic API key: ")
+        if not anthropic_api_key:
+            print("Error: Anthropic API key is required.")
+            print("Anthropic will not be enabled.")
+        else:
+            update_or_add_env_var("ANTHROPIC_API_KEY", anthropic_api_key)
+            update_or_add_env_var("ENABLE_ANTHROPIC", "true")
+            model_options.extend(["ANTHROPIC_CLAUDE3_OPUS", "ANTHROPIC_CLAUDE3_HAIKU", "ANTHROPIC_CLAUDE3.5_SONNET", "ANTHROPIC_CLAUDE3.7_SONNET"])
+    else:
+        update_or_add_env_var("ENABLE_ANTHROPIC", "false")
+
+    # Azure Configuration
+    print("To enable Azure, you must have an Azure deployment name, API key, base URL, and API version.")
+    enable_azure = input("Do you want to enable Azure (y/n)? ").lower() == "y"
+    if enable_azure:
+        azure_deployment = input("Enter your Azure deployment name: ")
+        azure_api_key = input("Enter your Azure API key: ")
+        azure_api_base = input("Enter your Azure API base URL: ")
+        azure_api_version = input("Enter your Azure API version: ")
+        if not all([azure_deployment, azure_api_key, azure_api_base, azure_api_version]):
+            print("Error: All Azure fields must be populated.")
+            print("Azure will not be enabled.")
+        else:
+            update_or_add_env_var("AZURE_DEPLOYMENT", azure_deployment)
+            update_or_add_env_var("AZURE_API_KEY", azure_api_key)
+            update_or_add_env_var("AZURE_API_BASE", azure_api_base)
+            update_or_add_env_var("AZURE_API_VERSION", azure_api_version)
+            update_or_add_env_var("ENABLE_AZURE", "true")
+            model_options.append("AZURE_OPENAI_GPT4O")
+    else:
+        update_or_add_env_var("ENABLE_AZURE", "false")
+
+    # Gemini Configuration
+    print("To enable Gemini, you must have an Gemini API key.")
+    enable_gemini = input("Do you want to enable Gemini (y/n)? ").lower() == "y"
+    if enable_gemini:
+        gemini_api_key = input("Enter your Gemini API key: ")
+        if not gemini_api_key:
+            print("Error: Gemini API key is required.")
+            print("Gemini will not be enabled.")
+        else:
+            update_or_add_env_var("GEMINI_API_KEY", gemini_api_key)
+            update_or_add_env_var("ENABLE_GEMINI", "true")
+            model_options.extend(["GEMINI_FLASH_2_0", "GEMINI_FLASH_2_0_LITE", "GEMINI_PRO"])
+    else:
+        update_or_add_env_var("ENABLE_GEMINI", "false")
+
+    # Novita AI Configuration
+    print("To enable Novita AI, you must have an Novita AI API key.")
+    enable_novita = input("Do you want to enable Novita AI (y/n)? ").lower() == "y"
+    if enable_novita:
+        novita_api_key = input("Enter your Novita AI API key: ")
+        if not novita_api_key:
+            print("Error: Novita AI API key is required.")
+            print("Novita AI will not be enabled.")
+        else:
+            update_or_add_env_var("NOVITA_API_KEY", novita_api_key)
+            update_or_add_env_var("ENABLE_NOVITA", "true")
+            model_options.extend([
+                "NOVITA_DEEPSEEK_R1",
+                "NOVITA_DEEPSEEK_V3", 
+                "NOVITA_LLAMA_3_3_70B",
+                "NOVITA_LLAMA_3_2_1B",
+                "NOVITA_LLAMA_3_2_3B",
+                "NOVITA_LLAMA_3_2_11B_VISION",
+                "NOVITA_LLAMA_3_1_8B",
+                "NOVITA_LLAMA_3_1_70B",
+                "NOVITA_LLAMA_3_1_405B",
+                "NOVITA_LLAMA_3_8B",
+                "NOVITA_LLAMA_3_70B"
+            ])
+    else:
+        update_or_add_env_var("ENABLE_NOVITA", "false")
+
+    # Model Selection
+    if not model_options:
+        print("No LLM providers enabled. You won't be able to run Skyvern unless you enable at least one provider. You can re-run this script to enable providers or manually update the .env file.")
+    else:
+        print("Available LLM models based on your selections:")
+        for i, model in enumerate(model_options, 1):
+            print(f"{i}. {model}")
+        
+        while True:
+            try:
+                model_choice = int(input(f"Choose a model by number (e.g., 1 for {model_options[0]}): "))
+                if 1 <= model_choice <= len(model_options):
+                    break
+                print(f"Please enter a number between 1 and {len(model_options)}")
+            except ValueError:
+                print("Please enter a valid number")
+        
+        chosen_model = model_options[model_choice - 1]
+        print(f"Chosen LLM Model: {chosen_model}")
+        update_or_add_env_var("LLM_KEY", chosen_model)
+
+    print("LLM provider configurations updated in .env.")
+
+
+def get_default_chrome_location(host_system: str) -> str:
+    """Get the default Chrome/Chromium location based on OS."""
+    if host_system == "darwin":
+        return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    elif host_system == "linux":
+        # Common Linux locations
+        chrome_paths = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser"
+        ]
+        for path in chrome_paths:
+            if os.path.exists(path):
+                return path
+        return "/usr/bin/google-chrome"  # default if not found
+    elif host_system == "wsl":
+        return "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe"
+    else:
+        return "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+
+def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
+    """Configure browser settings for Skyvern."""
+    print("\nConfiguring web browser for scraping...")
+    browser_types = ["chromium-headless", "chromium-headful", "cdp-connect"]
+    
+    for i, browser_type in enumerate(browser_types, 1):
+        print(f"{i}. {browser_type}")
+        if browser_type == "chromium-headless":
+            print("   - Runs Chrome in headless mode (no visible window)")
+        elif browser_type == "chromium-headful":
+            print("   - Runs Chrome with visible window)")
+        elif browser_type == "cdp-connect":
+            print("   - Connects to an existing Chrome instance")
+            print("   - Requires Chrome to be running with remote debugging enabled")
+    
+    while True:
+        try:
+            choice = int(input("\nChoose browser type (1-3): "))
+            if 1 <= choice <= len(browser_types):
+                selected_browser = browser_types[choice - 1]
+                break
+            print(f"Please enter a number between 1 and {len(browser_types)}")
+        except ValueError:
+            print("Please enter a valid number")
+
+    browser_location = None
+    remote_debugging_url = None
+    
+    if selected_browser == "cdp-connect":
+        host_system = detect_os()
+        default_location = get_default_chrome_location(host_system)
+        print(f"\nDefault Chrome location for your system: {default_location}")
+        browser_location = input("Enter Chrome executable location (press Enter to use default): ").strip()
+        if not browser_location:
+            browser_location = default_location
+        
+        if not os.path.exists(browser_location):
+            print(f"Warning: Chrome not found at {browser_location}. Please verify the location is correct.")
+
+        print("\nTo use CDP connection, Chrome must be running with remote debugging enabled.")
+        print("Example: chrome --remote-debugging-port=9222")
+        print("Default debugging URL: http://localhost:9222")
+        remote_debugging_url = input("Enter remote debugging URL (press Enter for default): ").strip()
+        if not remote_debugging_url:
+            remote_debugging_url = "http://localhost:9222"
+
+    return selected_browser, browser_location, remote_debugging_url
 
 async def _setup_local_organization() -> str:
     """
@@ -182,6 +422,32 @@ def init(
 ) -> None:
     setup_postgresql()
     api_key = asyncio.run(_setup_local_organization())
+
+    if os.path.exists(".env"):
+        print(".env file already exists, skipping initialization.")
+        redo_llm_setup = input("Do you want to go through LLM provider setup again (y/n)? ")
+        if redo_llm_setup.lower() != "y":
+            return
+
+    print("Initializing .env file...")
+    shutil.copy(".env.example", ".env")
+    setup_llm_providers()
+
+    # Configure browser settings
+    browser_type, browser_location, remote_debugging_url = setup_browser_config()
+    update_or_add_env_var("BROWSER_TYPE", browser_type)
+    if browser_location:
+        update_or_add_env_var("CHROME_EXECUTABLE_PATH", browser_location)
+    if remote_debugging_url:
+        update_or_add_env_var("BROWSER_REMOTE_DEBUGGING_URL", remote_debugging_url)
+
+    # Ask for email or generate UUID
+    analytics_id = input("Please enter your email for analytics (press enter to skip): ")
+    if not analytics_id:
+        analytics_id = str(uuid.uuid4())
+    
+    update_or_add_env_var("ANALYTICS_ID", analytics_id)
+    print(".env file has been initialized.")
     # Generate .env file
     with open(".env", "w") as env_file:
         env_file.write("LITELLM_LOG=ERROR\n")
@@ -499,7 +765,19 @@ def setup_cursor_config(host_system: str, command: str, target: str, env_vars: s
 
 @run_app.command(name="server")
 def run_server() -> None:
-    port = int(os.environ.get("PORT", 8000))
+    load_dotenv()
+    from skyvern.config import settings
+    port = settings.PORT
+    browser_type = settings.BROWSER_TYPE
+    browser_path = settings.CHROME_EXECUTABLE_PATH
+
+    if browser_type == "cdp-connect" and browser_path:
+        browser_process = subprocess.Popen(
+            [browser_path, "--remote-debugging-port=9222"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        if browser_process.poll() is not None:
+            raise Exception(f"Failed to open browser. browser_path: {browser_path}")
+
     uvicorn.run(
         "skyvern.forge.api_app:app",
         host="0.0.0.0",

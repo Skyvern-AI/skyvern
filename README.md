@@ -69,23 +69,25 @@ https://github.com/user-attachments/assets/5cab4668-e8e2-4982-8551-aab05ff73a7f
 
 
 # Skyvern Cloud
-We offer a managed cloud version of Skyvern that allows you to run Skyvern without having to manage the infrastructure. It allows you to run multiple Skyvern instances in parallel to automate your workflows at scale. In addition, Skyvern cloud comes bundled with anti-bot detection mechanisms, proxy network, and CAPTCHA solving to allow you to complete more complicated workflows.
+We offer a managed cloud version of Skyvern that allows you to run Skyvern without having to manage the infrastructure. It allows you to run multiple Skyvern instances in parallel and comes bundled with anti-bot detection mechanisms, proxy network, and CAPTCHA solvers.
 
 If you'd like to try it out, 
 1. Navigate to [app.skyvern.com](https://app.skyvern.com)
 1. Create an account & Get $5 of credits on us
 1. Kick off your first task and see Skyvern in action!
 
-Here are some tips that may help you on your adventure:
-1. Skyvern is really good at carrying out a single goal. If you give it too many instructions to do, it has a high likelihood of getting confused along the way. 
-2. Being really explicit about goals is very important. For example, if you're generating an insurance quote, let it know very clearly how it can identify it has accomplished its goals. Use words like "COMPLETE" or "TERMINATE" to indicate success and failure modes, respectively.
-3. Workflows can be used if you'd like to do more advanced things such as chaining multiple instructions together, or securely logging in. If you need any help with this, please feel free to book some time with us! We're always happy to help
-
 
 # Quickstart
 This quickstart guide will walk you through getting Skyvern up and running on your local machine. 
 
-## Docker Compose setup (Recommended)
+## Local
+```
+pip install skyvern
+skyvern init
+skyvern run server
+```
+
+## Docker Compose setup
 
 1. Make sure you have [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running on your machine
 1. Make sure you don't have postgres running locally (Run `docker ps` to check)
@@ -98,65 +100,29 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
 3. Navigate to `http://localhost:8080` in your browser to start using the UI
 
 
-## Full Setup (Contributors) - Prerequisites 
+## MCP
+If you want to try out Skyvern's 
 
-### :warning: :warning: MAKE SURE YOU ARE USING PYTHON 3.11 :warning: :warning:
-:warning: :warning: Only well-tested on MacOS :warning: :warning:
+## Prompting Tips
 
-Before you begin, make sure you have the following installed:
+Here are some tips that may help you on your adventure:
+1. Skyvern is really good at carrying out a single goal. If you give it too many instructions to do, it has a high likelihood of hallucinating along the way. 
+2. Being really explicit about goals is very important. For example, if you're generating an insurance quote, let it know very clearly how it can identify it has accomplished its goals. Use words like "COMPLETE" or "TERMINATE" to indicate success and failure modes, respectively.
+3. Workflows can be used if you'd like to do more advanced things such as chaining multiple instructions together, or securely logging in. If you need any help with this, please feel free to book some time with us! We're always happy to help
 
-- [Brew (if you're on a Mac)](https://brew.sh/)
-- [Poetry](https://python-poetry.org/docs/#installation)
-    - `brew install poetry`
-- [node](https://nodejs.org/en/download/)
-- [Docker](https://docs.docker.com/engine/install/)
-  
-
-Note: Our setup script does these two for you, but they are here for reference.
-- [Python 3.11](https://www.python.org/downloads/)
-    - `poetry env use 3.11`
-- [PostgreSQL 14](https://www.postgresql.org/download/) (if you're on a Mac, setup script will install it for you if you have homebrew installed)
-    - `brew install postgresql`
-
-## Setup (Contributors)
-1. Clone the repository and navigate to the root directory
-1. Open Docker Desktop (Works for Windows, macOS, and Linux) or run Docker Daemon
-1. Run the setup script to install the necessary dependencies and setup your environment
-    ```bash
-    ./setup.sh
-    ```
-1. Start the server
-    ```bash
-    ./run_skyvern.sh
-    ```
-1. You can start sending requests to the server, but we built a simple UI to help you get started. To start the UI, run the following command:
-    ```bash
-    ./run_ui.sh
-    ```
-1. Navigate to `http://localhost:8080` in your browser to start using the UI
-
-## Additional Setup for Contributors
-If you're looking to contribute to Skyvern, you'll need to install the pre-commit hooks to ensure code quality and consistency. You can do this by running the following command:
-```bash
-pre-commit install
-```
 
 # Supported Functionality
 
 ## Skyvern 2.0
 Skyvern 2.0 is a major overhaul of Skyvern that includes a multi-agent architecture with a planner + validator agent, allowing Skyvern to complete more complex tasks with a zero-shot prompt.
 
-<p align="center">
-  <img src="docs/images/skyvern_2_0_screenshot.png"/>
-</p>
-
 ## Skyvern Tasks
 Tasks are the fundamental building block inside Skyvern. Each task is a single request to Skyvern, instructing it to navigate through a website and accomplish a specific goal. 
 
-Tasks require you to specify a `url`, `navigation_goal`, and optionally `data_extraction_goal` if you'd like to extract data from the website, and a `navigation_payload` if you'd like to provide additional context to help Skyvern fill information or answer questions presented by a website.
+Tasks require you to specify a `url`, `prompt`, and can optionally include a `data schema` (if you want the output to conform to a specific schema) and `error codes` (if you want Skyvern to stop running in specific situations). 
 
 <p align="center">
-  <img src="docs/images/task_creation_form_example.png"/>
+  <img src="docs/images/skyvern_2_0_screenshot.png"/>
 </p>
 
 
@@ -268,9 +234,53 @@ We love to see how Skyvern is being used in the wild. Here are some examples of 
   <img src="docs/images/geico_shu_recording_cropped.gif"/>
 </p>
 
+# Contibutor Setup
+### Prerequisites 
+
+> :warning: :warning: MAKE SURE YOU ARE USING PYTHON 3.11 :warning: :warning:
+:warning: :warning: Only well-tested on MacOS :warning: :warning:
+
+Before you begin, make sure you have the following installed:
+
+- [Brew (if you're on a Mac)](https://brew.sh/)
+- [Poetry](https://python-poetry.org/docs/#installation)
+    - `brew install poetry`
+- [node](https://nodejs.org/en/download/)
+- [Docker](https://docs.docker.com/engine/install/)
+  
+
+Note: Our setup script does these two for you, but they are here for reference.
+- [Python 3.11](https://www.python.org/downloads/)
+    - `poetry env use 3.11`
+- [PostgreSQL 14](https://www.postgresql.org/download/) (if you're on a Mac, setup script will install it for you if you have homebrew installed)
+    - `brew install postgresql`
+
+## Setup (Contributors)
+1. Clone the repository and navigate to the root directory
+1. Open Docker Desktop (Works for Windows, macOS, and Linux) or run Docker Daemon
+1. Run the setup script to install the necessary dependencies and setup your environment
+    ```bash
+    skyvern/scripts/setup.sh
+    ```
+1. Start the server
+    ```bash
+    ./run_skyvern.sh
+    ```
+1. You can start sending requests to the server, but we built a simple UI to help you get started. To start the UI, run the following command:
+    ```bash
+    ./run_ui.sh
+    ```
+1. Navigate to `http://localhost:8080` in your browser to start using the UI
+
+## Additional Setup for Contributors
+If you're looking to contribute to Skyvern, you'll need to install the pre-commit hooks to ensure code quality and consistency. You can do this by running the following command:
+```bash
+pre-commit install
+```
+
 # Documentation
 
-More extensive documentation can be found on our [documentation website](https://docs.skyvern.com). Please let us know if something is unclear or missing by opening an issue or reaching out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
+More extensive documentation can be found on our [docs page](https://docs.skyvern.com). Please let us know if something is unclear or missing by opening an issue or reaching out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
 
 # Supported LLMs
 | Provider | Supported Models |
