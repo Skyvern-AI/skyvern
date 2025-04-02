@@ -44,6 +44,7 @@ import { ImportWorkflowButton } from "./ImportWorkflowButton";
 import { WorkflowApiResponse } from "./types/workflowTypes";
 import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 import { WorkflowActions } from "./WorkflowActions";
+import { WorkflowTemplates } from "../discover/WorkflowTemplates";
 
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
@@ -303,6 +304,7 @@ function Workflows() {
             </PaginationContent>
           </Pagination>
         </div>
+        <WorkflowTemplates />
       </div>
     </div>
   );
