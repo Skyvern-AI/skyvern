@@ -5,6 +5,7 @@ import pydantic
 from .run_status import RunStatus
 import typing
 from .output import Output
+from .file_info import FileInfo
 import datetime as dt
 from .workflow_run_request import WorkflowRunRequest
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
@@ -24,6 +25,16 @@ class WorkflowRunResponse(UniversalBaseModel):
     output: typing.Optional[Output] = pydantic.Field(default=None)
     """
     Output data from the run, if any. Format depends on the schema in the input
+    """
+
+    downloaded_files: typing.Optional[typing.List[FileInfo]] = pydantic.Field(default=None)
+    """
+    List of files downloaded during the run
+    """
+
+    recording_url: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    URL to the recording of the run
     """
 
     failure_reason: typing.Optional[str] = pydantic.Field(default=None)
