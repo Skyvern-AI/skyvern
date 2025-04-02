@@ -58,7 +58,6 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
     completeCriterion: data.completeCriterion,
     terminateCriterion: data.terminateCriterion,
     dataSchema: data.dataSchema,
-    maxRetries: data.maxRetries,
     maxStepsOverride: data.maxStepsOverride,
     allowDownloads: data.allowDownloads,
     continueOnFailure: data.continueOnFailure,
@@ -229,28 +228,6 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                   />
                 </div>
                 <Separator />
-                <div className="flex items-center justify-between">
-                  <div className="flex gap-2">
-                    <Label className="text-xs font-normal text-slate-300">
-                      Max Retries
-                    </Label>
-                    <HelpTooltip content={helpTooltips["task"]["maxRetries"]} />
-                  </div>
-                  <Input
-                    type="number"
-                    placeholder={placeholders["task"]["maxRetries"]}
-                    className="nopan w-52 text-xs"
-                    min="0"
-                    value={inputs.maxRetries ?? ""}
-                    onChange={(event) => {
-                      const value =
-                        event.target.value === ""
-                          ? null
-                          : Number(event.target.value);
-                      handleChange("maxRetries", value);
-                    }}
-                  />
-                </div>
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
                     <Label className="text-xs font-normal text-slate-300">
