@@ -1547,8 +1547,8 @@ class AgentDB:
 
     async def get_workflow_runs_by_parent_workflow_run_id(
         self,
-        organization_id: str,
         parent_workflow_run_id: str,
+        organization_id: str | None = None,
     ) -> list[WorkflowRun]:
         try:
             async with self.Session() as session:
