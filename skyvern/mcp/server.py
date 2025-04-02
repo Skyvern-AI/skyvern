@@ -1,17 +1,14 @@
-import os
-
 from mcp.server.fastmcp import FastMCP
 
 from skyvern.agent import SkyvernAgent
+from skyvern.config import settings
+from skyvern.schemas.runs import RunEngine
 
 mcp = FastMCP("Skyvern")
-
-if "SKYVERN_MCP_CLOUD_URL" in os.environ and "SKYVERN_MCP_API_KEY" in os.environ:
-    skyvern_agent = SkyvernAgent(
-        base_url=os.environ.get("SKYVERN_MCP_CLOUD_URL"), api_key=os.environ.get("SKYVERN_MCP_API_KEY")
-    )
-else:
-    skyvern_agent = SkyvernAgent()
+skyvern_agent = SkyvernAgent(
+    base_url=settings.SKYVERN_BASE_URL,
+    api_key=settings.SKYVERN_API_KEY,
+)
 
 
 @mcp.tool()
@@ -22,7 +19,7 @@ async def skyvern_run_task(prompt: str, url: str) -> str:
         prompt: brief description of what the user wants to accomplish
         url: the target website for the user goal
     """
-    res = await skyvern_agent.run_task(prompt=prompt, url=url)
+    res = await skyvern_agent.run_task(prompt=prompt, url=url, engine=RunEngine.skyvern_v1)
     return res.model_dump()["output"]
 
 
