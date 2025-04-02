@@ -21,6 +21,7 @@ mcp = FastMCP("Skyvern")
 skyvern_agent = SkyvernAgent(
     base_url=settings.SKYVERN_BASE_URL,
     api_key=settings.SKYVERN_API_KEY,
+    extra_headers={"X-User-Agent": "skyvern-mcp"},
 )
 
 
