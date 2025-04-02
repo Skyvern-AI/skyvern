@@ -183,6 +183,7 @@ def init(
     api_key = asyncio.run(_setup_local_organization())
     # Generate .env file
     with open(".env", "w") as env_file:
+        env_file.write("LITELLM_LOG=ERROR\n")
         env_file.write("ENABLE_OPENAI=true\n")
         env_file.write(f"OPENAI_API_KEY={openai_api_key}\n")
         env_file.write(f"LOG_LEVEL={log_level}\n")
