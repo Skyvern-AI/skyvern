@@ -2174,8 +2174,11 @@ if (window.globalDomDepthMap === undefined) {
 }
 
 function isClassNameIncludesHidden(className) {
-  // some hidden elements are with the classname like `class="select-items select-hide"`
-  return className.toLowerCase().includes("hide");
+  // some hidden elements are with the classname like `class="select-items select-hide"` or `class="dropdown-container dropdown-invisible"`
+  return (
+    className.toLowerCase().includes("hide") ||
+    className.toLowerCase().includes("invisible")
+  );
 }
 
 function waitForNextFrame() {
