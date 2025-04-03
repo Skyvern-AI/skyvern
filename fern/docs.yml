@@ -14,7 +14,13 @@ colors:
   background:
     dark: '#000000'
     light: '#FFFFFF'
+analytics:
+  posthog:
+    api-key: ${POSTHOG_API_KEY}
 navigation:
+  - api: API Reference
+    snippets:
+      python: skyvern
   - section: Getting Started
     contents:
       - page: Introduction

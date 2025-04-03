@@ -4,96 +4,85 @@ subtitle: The core building block in Skyvern
 slug: running-tasks/api-spec
 ---
 
-
-Tasks are the building block of Skyvern. They represent a single instruction (goal) to the browser to go do something using language models. Ex. “Go to alibaba and extract this information”
+Tasks are the building block of Skyvern. They represent a single instruction (goal) to the browser to go do something using language models. Ex. "Go to alibaba and extract this information"
 
 ## Request - Initiate a task 
 Request type: `POST`
 
-Production:`https://api.skyvern.com/api/v1/tasks/`
+Production: `https://api.skyvern.com/v1/run/tasks`
 
 ### Header 
 
 | Parameter | Type | Required? | Sample Value | Description |
 | --- | --- | --- | --- | --- |
 | x-api-key | String | yes | [your-api-key-here] | Bearer token that gives your backend access to the Skyvern API. This will be manually provided by us |
-| x-max-steps-override | Integer | no | 10 | Overrides any max step configuration for the initiated task |
 
 ### Body
 
 | Parameter | Type | Required? | Sample Value | Description |
 | --- | --- | --- | --- | --- |
-| url | HttpUrl | yes | https://www.example.com | It must be a http or https URL |
-| navigation_goal | String | no | Apply for a job | The prompt that tells the agent what the user-facing goal is. This is the guiding light for the LLM as it navigates a particular website / sitemap to achieve this specified goal |
-| data_extraction_goal | String | no | Was the job application successful? | The prompt that instructs the agent to extract information once the agent has achieved its user_goal |
-| navigation_payload | Object | no |         "name": "Chris P. Bacon",<br/>"email": "mailto:chris@pbacon.com" | JSON-formatted payload with any “facts” or information that would help the agent perform its job. In the case of navigating an insurance quote, this payload would include any user information to help fill out the insurance flow such as date of birth, or age they got their license, and so on<br/><br/>This can include nested information, and the formatting isn’t validated |
-| webhook_callback_url | HttpUrl | no | …  | The callback URL once our system is finished processing this async task |
-| proxy_location | String | yes | RESIDENTIAL | Proxy location for the web-browsing request. Please pass RESIDENTIAL as a value |
-| extracted_information_schema | JSON | no |  | Used to enforce a JSON schema spec to be enforced in the data_extraction_goal. Similar to https://json-schema.org/ definition. |
-| totp_verification_url | HttpUrl | no | https://mywebsite.com/two_factor_code | The url of your TOTP endpoint. If this field is provided, Skyvern will call the url to fetch the TOTP/2FA/MFA code when needed |
-| totp_identifier | String | no | myemail@example.com / 4155558888 | The email address or the phone number which receives the TOTP/2FA/MFA code. If this field is provided, Skyvern will fetch the code that is pushed to [Skyvern's TOTP API](https://docs.skyvern.com/running-tasks/advanced-features#push-code-to-skyvern) |
+| prompt | String | yes | "Apply for a job" | The goal or task description for Skyvern to accomplish |
+| url | String | no | https://www.example.com | The starting URL for the task. If not provided, Skyvern will attempt to determine an appropriate URL |
+| title | String | no | "Job Application Task" | Optional title for the task |
+| engine | String | no | "skyvern-2.0" | The Skyvern engine version to use for this task. Supported values are "skyvern-1.0" and "skyvern-2.0". Default is "skyvern-2.0" |
+| proxy_location | String | no | "RESIDENTIAL" | Geographic Proxy location to route the browser traffic through. Default is "RESIDENTIAL" |
+| data_extraction_schema | Object | no | \{ "success": \{ "type": "boolean" } } | Schema defining what data should be extracted from the webpage |
+| error_code_mapping | Object | no | \{ "AUTH_FAILED": "Authentication failed" } | Custom mapping of error codes to error messages if Skyvern encounters an error |
+| max_steps | Integer | no | 10 | Maximum number of steps the task can take before timing out |
+| webhook_url | String | no | https://api.example.com/webhook | URL to send task status updates to after a run is finished |
+| totp_identifier | String | no | "user@example.com" | Identifier for TOTP (Time-based One-Time Password) authentication if codes are being pushed to Skyvern |
+| totp_url | String | no | https://api.example.com/totp | URL for TOTP authentication setup if Skyvern should be polling endpoint for 2FA codes |
+| browser_session_id | String | no | "sess_123" | ID of an existing browser session to reuse, having it continue from the current screen state |
+| publish_workflow | Boolean | no | false | Whether to publish this task as a reusable workflow. Default is false |
 
 ## Example Request (Apply for a job)
 
 ```python
-POST https://api.skyvern.com/api/v1/tasks/ 
+POST https://api.skyvern.com/v1/run/tasks
 
 {
+    "prompt": "Apply for a job on behalf of this person: name: Chris P Bacon. email: chris@pbacon.com",
     "url": "https://jobs.lever.co/leverdemo-8/45d39614-464a-4b62-a5cd-8683ce4fb80a/apply",
-    "navigation_goal": "Apply for a job",
-    "data_extraction_goal": "Was the job application successful?",
+    "title": "Job Application Task",
+    "engine": "skyvern-2.0",
     "proxy_location": "RESIDENTIAL",
-    "navigation_payload": {
-        "name": "Chris P. Bacon",
-        "email": "chris@pbacon.com"
+    "data_extraction_schema": {
+        "application_success": {
+            "type": "boolean"
+        }
     }
 }
 ```
 
 ## Response
-Each task has an associated `task_id` -- a unique identifier you can use to look up information about any task.
+Each task run has an associated `run_id` -- a unique identifier you can use to look up information about any task run.
 
 | Parameter | Type | Always returned? | Sample Value | Description |
 | --- | --- | --- | --- | --- |
-| task_id | String | yes | t_123456 | The task id associated with this specific task |
-
-## Response Webhook - Task conclusion (POST)
-If a `webhook_callback_url` is specified within your task request, Skyvern will make a callback to your system letting you know that it has either finished, terminated or failed a task execution. 
-
-The following headers can be used to validate it's an authentic Skyvern request. 
-
-### Headers
-
-| Parameter | Type | Required? | Sample Value | Description |
-| --- | --- | --- | --- | --- |
-| x-skyvern-signature | String | yes | v0=a2114d57b48eac39b9ad189<br/>dd8316235a7b4a8d21a10bd275<br/>19666489c69b503 | Authentication token that allows our service to communicate with your backend service via callback / webhook <br/>We’ll be using the same strategy slack uses, as defined here: https://api.slack.com/authentication/verifying-requests-from-slack#making__validating-a-request |
-| x-skyvern-timestamp | String | yes | 1531420618 | Timestamp used to decode and validate the incoming webhook call<br/><br/>We’ll be using the same strategy slack uses, as defined here: https://api.slack.com/authentication/verifying-requests-from-slack#making__validating-a-request |
-
-### Body
-These parameters are returned in the body of the `webhook_callback_url`. 
-
-| Parameter | Type | Always returned? | Sample Value | Description |
-| --- | --- | --- | --- | --- |
-| task_id | String | yes | t_123456 | The task id associated with this specific task |
-| status | String | yes | success | The status of the task | 
-| extracted_information | Object | Yes | 'price’: ‘$100.0’ | Unstructured JSON payload containing the extracted information as specified by the users’ input prompt |
-| screenshot_url | String | Yes | … url to screenshot … | Screenshot of the final page, where the data extraction occurs |
-| recording_url | String | Yes | .. url to recording … | Recording of the entire browsing session to help debug any issues |
-| failure_reason | String | No | “Failed to pass this page - missing information: date of birth” | A failure reason that caused the job to fail. This can range from internal errors (Skyvern side) or external errors (insufficient information provided) |
+| run_id | String | yes | "t_123456" or "oc_12345" | Unique identifier for this run |
+| status | String | yes | "running" | Current status of the run. Possible values: "created", "queued", "running", "timed_out", "failed", "terminated", "completed", "canceled" |
+| output | Object/Array/String/null | no | \{ "success": true } | Output data from the run, if any. Format depends on the schema in the input |
+| downloaded_files | Array/null | no | [\{ "url": "...", "checksum": "...", "filename": "..." }] | List of files downloaded during the run |
+| recording_url | String | no | "https://..." | URL to the recording of the run |
+| failure_reason | String | no | "Max steps exceeded" | Reason for failure if the run failed |
+| created_at | String | yes | "2024-03-20T10:00:00Z" | Timestamp when this run was created |
+| modified_at | String | yes | "2024-03-20T10:05:00Z" | Timestamp when this run was last modified |
+| run_type | String | yes | "task_v2" | Type of task run - either task_v1 or task_v2 |
+| run_request | Object | yes | \{...} | The original request parameters used to start this task run |
 
 ## Request - Task Details (GET)
 
-You can use this API to poll for task status updates if you don’t want to wait for webhook callbacks.
+You can use this API to poll for task status updates if you don't want to wait for webhook callbacks.
 
 Request type: `GET`
 
-Production:`api.skyvern.com/api/v1/tasks/{task_id}`
+Production: `https://api.skyvern.com/v1/run/tasks/{run_id}`
 
 | Parameter | Type | Required? | Sample Value | Description |
 | --- | --- | --- | --- | --- |
-| task_id | String | yes | t_123 | The id of the task you want to check the status of |
+| run_id | String | yes | "run_123" | The id of the run you want to check the status of |
 
-## Request - List Task Details (GET)
+## Request - List Task Run Details (GET)
 
 Request type: `GET`
 
@@ -101,35 +90,36 @@ Production:`api.skyvern.com/api/v1/tasks/`
 
 | Parameter | Type | Required? | Sample Value | Description |
 | --- | --- | --- | --- | --- |
-| page | Integer | no | 1 | default=1
-has to be ≥1 |
-| page_size | Integer | no | 10 | default=10
-has to be ≥1 |
+| page | Integer | no | 1 | default=1, has to be ≥1 |
+| page_size | Integer | no | 10 | default=10, has to be ≥1 |
 
 ## Response - Task Details (GET)
+Production: `https://api.skyvern.com/v1/runs/{run_id}`
+
+The response follows the same schema as the task creation response, containing:
 
 | Parameter | Type | Sample Value | Description |
 | --- | --- | --- | --- |
-| request | JSON |  | Includes the initial request sent to create the task. Fields included: url,webhook_callback_url,navigation_goal,data_extraction_goal,navigation_payload,proxy_location,extracted_information_schema  |
-| task_id | String | tsk_123 | The id of the task you want to check the status of |
-| status | String | created / queued / running / completed / terminated / failed / canceled | String indicating the status of this task. created: the initial state when the task is created; queued: the task has been enqueued and is waiting to be picked up by a worker to execute; running: the task is being executed; completed: the task has successfully completed; terminated: the agent doesn't believe the task could be completed so it terminated the task; failed: the task failed due to a specific reason; canceled: the task is canceled by the user |
-| created_at | Timestamp | 2022-11-22T22:55:55 | Timestamp indicating when the task was created. |
-| modified_at | Timestamp | 2022-11-22T22:55:55 | Timestamp indicating when the task was last updated. Used to detect long-running tasks. |
-| extracted_information | Object | 'price’: ‘$100.0’ |  |
-| screenshot_url | String | "https://skyvern-artifacts.s3.amazonaws.com/production/tsk_123/...screenshot_final.png" | … url to screenshot … |
-| recording_url | String | "https://skyvern-artifacts.s3.amazonaws.com/production/tsk_123/...recording.webm" | ... url to recording … |
-| action_screenshot_urls | List[str] | ["https://skyvern-artifacts.s3.amazonaws.com/production/tsk_123/step_2...action.png", "https://skyvern-artifacts.s3.amazonaws.com/production/tsk_123/step_0...action.png", "https://skyvern-artifacts.s3.amazonaws.com/production/tsk_123/step_0...action.png"] | 3 screenshots for the lastest 3 actions that Skyvern took. |
-| failure_reason | String | “Failed to pass this page - missing information: invalid password” | The reason why the task failed. Examples: "Max steps per task (10) exceeded ..." - by default, a task as a cap on the number of steps per task for budget control. This can be configured in your organization settings page; "Max retries per step (3) exceeded..." - this means Skyvern ran into some internal failures. Skyvern Agent is not perfect and doesn't have 100% web coverage today. When it runs into pages it cannot navigate through or take actions on, this failure_reason shows up. (Currently we're improving Skyvern's abilility as well as the failure_reason to show better errors to help generate better feedbacks to your failure) |
+| run_id | String | "t_123456" | Unique identifier for this run |
+| status | String | "created" | Current status of the run. Possible values: "created", "queued", "running", "timed_out", "failed", "terminated", "completed", "canceled" |
+| output | Object | \{ "additionalProp1": \{ } } | Output data from the run |
+| downloaded_files | Array | [\{ "url": "string", "checksum": "string", "filename": "string" }] | List of files downloaded during the run |
+| recording_url | String | "https://..." | URL to the recording of the run |
+| failure_reason | String | "Max steps exceeded" | Reason for failure if the run failed |
+| created_at | String | "2025-04-03T14:08:29.505Z" | Timestamp when this run was created |
+| modified_at | String | "2025-04-03T14:08:29.505Z" | Timestamp when this run was last modified |
+| run_type | String | "task_v1" | Type of task run - either task_v1 or task_v2 |
+| run_request | Object | \{ "prompt": "string", "url": "string", "title": "string", "engine": "skyvern-2.0", "proxy_location": "RESIDENTIAL", "data_extraction_schema": \{ "additionalProp1": \{ } \}, "error_code_mapping": \{ "additionalProp1": "string" \}, "max_steps": 0, "webhook_url": "string", "totp_identifier": "string", "totp_url": "string", "browser_session_id": "string", "publish_workflow": false } | The original request parameters used to start this task run |
 
 ## Request - List Steps (GET)
-Each task is made up of "steps" which are the individual actions Skyvern takes to complete the task. You can use this endpoint to get all the steps of the task.
+Each task run is made up of "steps" which are the individual actions Skyvern takes to complete the task. You can use this endpoint to get all the steps of the run.
 
 Request type: `GET`
 
 Production: `https://api.skyvern.com/api/v1/tasks/{task_id}/steps`
 
 ## Response - List Steps (GET)
-The response is a list of Step Object.
+The response is a list of Step Objects.
 
 ### Step Object
 | Parameter | Type | Sample Value | Description |
@@ -144,8 +134,8 @@ The response is a list of Step Object.
 | output_token_count | Integer | 500 | The number of output tokens generated in this step |
 
 ## Request - Cancel A Task (POST)
-A task that's in any of thsese states can be canceled: ["created", "queued", "running"]. This stops the execution of a task.
+A task that's in any of these states can be canceled: ["created", "queued", "running"]. This stops the execution of the task.
 
 Request type: `POST`
 
-Production: `https://api.skyvern.com/api/v1/tasks/{task_id}/cancel`
+Production: `https://api.skyvern.com/v1/runs/{run_id}/cancel`
