@@ -578,10 +578,12 @@ def setup_mcp_config() -> str:
 
     if not python_paths:
         print("Error: Could not find any Python installation. Please install Python 3.11 first.")
-        path_to_env = typer.prompt("Enter the full path to your configured python environment")
+        path_to_env = typer.prompt(
+            "Enter the full path to your python 3.11 environment. For example in MacOS if you installed it using Homebrew, it would be /opt/homebrew/bin/python3.11"
+        )
     else:
         # Show the first found Python as default
-        default_cmd, default_path = python_paths[0]
+        _, default_path = python_paths[0]
         path_to_env = default_path
     return path_to_env
 
