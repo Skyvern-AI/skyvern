@@ -19,6 +19,8 @@ You can connect your MCP-enabled applications to Skyvern in two ways:
    - Get the API key from the settings page which will be used for setup
 
 ## Quickstart
+> ⚠️ **REQUIREMENT**: Skyvern only runs in Python 3.11 environment today ⚠️
+
 1. **Install Skyvern**
 	```bash
 	pip install skyvern
