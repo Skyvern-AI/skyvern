@@ -39,7 +39,7 @@ You can connect your MCP-enabled applications to Skyvern in two ways:
 	```
 
 ## Supported Applications
-`skyvern init` helps configure the following applicaitons for you:
+`skyvern init` helps configure the following applications for you:
 - Cursor
 - Windsurf
 - Claude Desktop
