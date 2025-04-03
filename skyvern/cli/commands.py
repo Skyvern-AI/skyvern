@@ -28,7 +28,7 @@ mcp = FastMCP("Skyvern")
 
 
 @mcp.tool()
-async def skyvern_run_task(prompt: str, url: str) -> str:
+async def skyvern_run_task(prompt: str, url: str) -> dict[str, str]:
     """Execute automated browser actions to accomplish a user's goal on a website.
 
     This tool uses Skyvern's browser automation to navigate websites and perform actions to achieve
@@ -36,7 +36,7 @@ async def skyvern_run_task(prompt: str, url: str) -> str:
     and multi-step workflows.
 
     Args:
-        prompt: A natural language description of what needs to be accomplished (e.g. "Book a flight from 
+        prompt: A natural language description of what needs to be accomplished (e.g. "Book a flight from
                NYC to LA", "Sign up for the newsletter", "Find the price of item X", "Apply to a job")
         url: The starting URL of the website where the task should be performed
     """
@@ -50,11 +50,10 @@ async def skyvern_run_task(prompt: str, url: str) -> str:
     # TODO: It would be nice if we could return the task URL here
     output = res.model_dump()["output"]
     base_url = settings.SKYVERN_BASE_URL
-    run_history_url = "https://app.skyvern.com/history" if "skyvern.com" in base_url else "http://localhost:8080/history"
-    return {
-        "output": output,
-        "run_history_url": run_history_url
-    }
+    run_history_url = (
+        "https://app.skyvern.com/history" if "skyvern.com" in base_url else "http://localhost:8080/history"
+    )
+    return {"output": output, "run_history_url": run_history_url}
 
 
 def command_exists(command: str) -> bool:
@@ -679,15 +678,15 @@ def setup_mcp() -> None:
 
     # Configure both Claude Desktop and Cursor
     claude_response = input("Would you like to set up MCP integration for Claude Desktop? (y/n) [y]: ").strip().lower()
-    if not claude_response or claude_response == 'y':
+    if not claude_response or claude_response == "y":
         setup_claude_desktop_config(host_system, path_to_env)
 
     cursor_response = input("Would you like to set up MCP integration for Cursor? (y/n) [y]: ").strip().lower()
-    if not cursor_response or cursor_response == 'y':
+    if not cursor_response or cursor_response == "y":
         setup_cursor_config(host_system, path_to_env)
 
     windsurf_response = input("Would you like to set up MCP integration for Windsurf? (y/n) [y]: ").strip().lower()
-    if not windsurf_response or windsurf_response == 'y':
+    if not windsurf_response or windsurf_response == "y":
         setup_windsurf_config(host_system, path_to_env)
 
 
@@ -714,7 +713,7 @@ def run_ui() -> None:
         result = subprocess.run("lsof -t -i :8080", shell=True, capture_output=True, text=True, check=False)
         if result.stdout.strip():
             response = input("Process already running on port 8080. Kill it? (y/n) [y]: ").strip().lower()
-            if not response or response == 'y':
+            if not response or response == "y":
                 subprocess.run("lsof -t -i :8080 | xargs kill", shell=True, check=False)
             else:
                 print("UI server not started. Process already running on port 8080.")
