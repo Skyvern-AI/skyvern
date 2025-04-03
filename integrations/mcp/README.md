@@ -15,6 +15,13 @@
 
 Skyvern's MCP server implementation helps connect your AI Applications to the browser. This allows your AI applications to do things like: Fill out forms, download files, research information on the web, and more.
 
+You can connect your MCP-enabled applications to Skyvern in two ways:
+1. **Local Skyvern Server**
+   - Use your favourite LLM to power Skyvern
+2. **Skyvern Cloud**
+   - Create an account at [app.skyvern.com](https://app.skyvern.com)
+   - Get the API key from the settings page which will be used for setup
+
 ## Quickstart
 1. **Install Skyvern**
 	```bash
@@ -27,24 +34,9 @@ Skyvern's MCP server implementation helps connect your AI Applications to the br
 	```
 
 3. **(Optional) Launch the Skyvern Server. Only required in local mode** 
-
 	```bash
 	skyvern run server
 	```
-
-## Integration Options
-
-You can connect your MCP-enabled applications to Skyvern in two ways:
-1. **Local Skyvern Server**
-   - Configure your applications to connect to skyvern server running on the localhost
-   - To run Skyvern server locally: `skyvern run server`
-
-2. **Skyvern Cloud**
-   - Configure your applications to connect to Skyvern Cloud
-   - Create an account at [app.skyvern.com](https://app.skyvern.com)
-   - Get the API key from the settings page which will be used for setup
-
-Follow the [installation instructions](#local) to set up. 
 
 ## Supported Applications
 `skyvern init` helps configure the following applicaitons for you:
@@ -54,7 +46,7 @@ Follow the [installation instructions](#local) to set up.
 - Your custom MCP App?
 
 Use the following config if you want to set up Skyvern for any other MCP-enabled application
-```
+```json
 {
   "mcpServers": {
     "Skyvern": {
