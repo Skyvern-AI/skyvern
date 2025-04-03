@@ -1,9 +1,5 @@
 <!-- DOCTOC SKIP -->
 
-- [Model Context Protocol (MCP)](#model-context-protocol-mcp)
-  - [Integration Options](#integration-options)
-  - [Supported Applications](#supported-applications)
-
 <h1 align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="images/SkyvernMCP.png"/>
