@@ -38,6 +38,11 @@ You can connect your MCP-enabled applications to Skyvern in two ways:
 	skyvern run server
 	```
 
+## Examples
+### Skyvern allows Claude to look up the top Hackernews posts today
+
+### Cursor looking up the top programming jobs in your area
+
 ## Supported Applications
 `skyvern init` helps configure the following applications for you:
 - Cursor
