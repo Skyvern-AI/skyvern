@@ -26,8 +26,8 @@ Production: `https://api.skyvern.com/v1/run/tasks`
 | title | String | no | "Job Application Task" | Optional title for the task |
 | engine | String | no | "skyvern-2.0" | The Skyvern engine version to use for this task. Supported values are "skyvern-1.0" and "skyvern-2.0". Default is "skyvern-2.0" |
 | proxy_location | String | no | "RESIDENTIAL" | Geographic Proxy location to route the browser traffic through. Default is "RESIDENTIAL" |
-| data_extraction_schema | Object | no | { "success": { "type": "boolean" } } | Schema defining what data should be extracted from the webpage |
-| error_code_mapping | Object | no | { "AUTH_FAILED": "Authentication failed" } | Custom mapping of error codes to error messages if Skyvern encounters an error |
+| data_extraction_schema | Object | no | \{ "success": \{ "type": "boolean" } } | Schema defining what data should be extracted from the webpage |
+| error_code_mapping | Object | no | \{ "AUTH_FAILED": "Authentication failed" } | Custom mapping of error codes to error messages if Skyvern encounters an error |
 | max_steps | Integer | no | 10 | Maximum number of steps the task can take before timing out |
 | webhook_url | String | no | https://api.example.com/webhook | URL to send task status updates to after a run is finished |
 | totp_identifier | String | no | "user@example.com" | Identifier for TOTP (Time-based One-Time Password) authentication if codes are being pushed to Skyvern |
