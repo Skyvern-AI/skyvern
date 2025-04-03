@@ -42,24 +42,6 @@ class LLMConfigRegistry:
         return cls._configs[llm_key]
 
 
-# if none of the LLM providers are enabled, raise an error
-if not any(
-    [
-        settings.ENABLE_OPENAI,
-        settings.ENABLE_ANTHROPIC,
-        settings.ENABLE_AZURE,
-        settings.ENABLE_AZURE_GPT4O_MINI,
-        settings.ENABLE_BEDROCK,
-        settings.ENABLE_GEMINI,
-        settings.ENABLE_NOVITA,
-    ]
-):
-    LOG.warning(
-        "To run skyvern locally, you need to enable at least one LLM provider. Run setup.sh and follow through the LLM provider setup, or "
-        "update the .env file (check out .env.example to see the required environment variables)."
-    )
-
-
 if settings.ENABLE_OPENAI:
     LLMConfigRegistry.register_config(
         "OPENAI_GPT4_TURBO",

@@ -4,25 +4,27 @@ import os
 import shutil
 import subprocess
 import time
+import uuid
+from pathlib import Path
 from typing import Optional
 
 import typer
 import uvicorn
-from click import Choice
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 from mcp.server.fastmcp import FastMCP
 
 from skyvern.agent import SkyvernAgent
 from skyvern.config import settings
-from skyvern.schemas.runs import RunEngine
+from skyvern.forge import app
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.utils import detect_os, get_windows_appdata_roaming, migrate_db
 
+load_dotenv()
+
+cli_app = typer.Typer()
+run_app = typer.Typer()
+cli_app.add_typer(run_app, name="run")
 mcp = FastMCP("Skyvern")
-skyvern_agent = SkyvernAgent(
-    base_url=settings.SKYVERN_BASE_URL,
-    api_key=settings.SKYVERN_API_KEY,
-    extra_headers={"X-User-Agent": "skyvern-mcp"},
-)
 
 
 @mcp.tool()
@@ -33,15 +35,13 @@ async def skyvern_run_task(prompt: str, url: str) -> str:
         prompt: brief description of what the user wants to accomplish
         url: the target website for the user goal
     """
-    res = await skyvern_agent.run_task(prompt=prompt, url=url, engine=RunEngine.skyvern_v1)
+    skyvern_agent = SkyvernAgent(
+        base_url=settings.SKYVERN_BASE_URL,
+        api_key=settings.SKYVERN_API_KEY,
+        extra_headers={"X-User-Agent": "skyvern-mcp"},
+    )
+    res = await skyvern_agent.run_task(prompt=prompt, url=url)
     return res.model_dump()["output"]
-
-
-load_dotenv()
-
-app = typer.Typer()
-run_app = typer.Typer()
-app.add_typer(run_app, name="run")
 
 
 def command_exists(command: str) -> bool:
@@ -141,33 +141,260 @@ def setup_postgresql() -> None:
         print("Database and user created successfully.")
 
 
+def update_or_add_env_var(key: str, value: str) -> None:
+    """Update or add environment variable in .env file."""
+
+    env_path = Path(".env")
+    if not env_path.exists():
+        env_path.touch()
+        # Write default environment variables using dotenv
+        defaults = {
+            "ENV": "local",
+            "ENABLE_OPENAI": "false",
+            "OPENAI_API_KEY": "",
+            "ENABLE_ANTHROPIC": "false",
+            "ANTHROPIC_API_KEY": "",
+            "ENABLE_AZURE": "false",
+            "AZURE_DEPLOYMENT": "",
+            "AZURE_API_KEY": "",
+            "AZURE_API_BASE": "",
+            "AZURE_API_VERSION": "",
+            "ENABLE_AZURE_GPT4O_MINI": "false",
+            "AZURE_GPT4O_MINI_DEPLOYMENT": "",
+            "AZURE_GPT4O_MINI_API_KEY": "",
+            "AZURE_GPT4O_MINI_API_BASE": "",
+            "AZURE_GPT4O_MINI_API_VERSION": "",
+            "ENABLE_GEMINI": "false",
+            "GEMINI_API_KEY": "",
+            "ENABLE_NOVITA": "false",
+            "NOVITA_API_KEY": "",
+            "LLM_KEY": "",
+            "SECONDARY_LLM_KEY": "",
+            "BROWSER_TYPE": "chromium-headful",
+            "MAX_SCRAPING_RETRIES": "0",
+            "VIDEO_PATH": "./videos",
+            "BROWSER_ACTION_TIMEOUT_MS": "5000",
+            "MAX_STEPS_PER_RUN": "50",
+            "LOG_LEVEL": "INFO",
+            "DATABASE_STRING": "postgresql+psycopg://skyvern@localhost/skyvern",
+            "PORT": "8000",
+            "ANALYTICS_ID": "anonymous",
+            "ENABLE_LOG_ARTIFACTS": "false",
+        }
+        for k, v in defaults.items():
+            set_key(env_path, k, v)
+
+    load_dotenv(env_path)
+    set_key(env_path, key, value)
+
+
+def setup_llm_providers() -> None:
+    """Configure Large Language Model (LLM) Providers."""
+    print("Configuring Large Language Model (LLM) Providers...")
+    print("Note: All information provided here will be stored only on your local machine.")
+    model_options = []
+
+    # OpenAI Configuration
+    print("To enable OpenAI, you must have an OpenAI API key.")
+    enable_openai = input("Do you want to enable OpenAI (y/n)? ").lower() == "y"
+    if enable_openai:
+        openai_api_key = input("Enter your OpenAI API key: ")
+        if not openai_api_key:
+            print("Error: OpenAI API key is required.")
+            print("OpenAI will not be enabled.")
+        else:
+            update_or_add_env_var("OPENAI_API_KEY", openai_api_key)
+            update_or_add_env_var("ENABLE_OPENAI", "true")
+            model_options.extend(["OPENAI_GPT4O"])
+    else:
+        update_or_add_env_var("ENABLE_OPENAI", "false")
+
+    # Anthropic Configuration
+    print("To enable Anthropic, you must have an Anthropic API key.")
+    enable_anthropic = input("Do you want to enable Anthropic (y/n)? ").lower() == "y"
+    if enable_anthropic:
+        anthropic_api_key = input("Enter your Anthropic API key: ")
+        if not anthropic_api_key:
+            print("Error: Anthropic API key is required.")
+            print("Anthropic will not be enabled.")
+        else:
+            update_or_add_env_var("ANTHROPIC_API_KEY", anthropic_api_key)
+            update_or_add_env_var("ENABLE_ANTHROPIC", "true")
+            model_options.extend(
+                [
+                    "ANTHROPIC_CLAUDE3_OPUS",
+                    "ANTHROPIC_CLAUDE3_HAIKU",
+                    "ANTHROPIC_CLAUDE3.5_SONNET",
+                    "ANTHROPIC_CLAUDE3.7_SONNET",
+                ]
+            )
+    else:
+        update_or_add_env_var("ENABLE_ANTHROPIC", "false")
+
+    # Azure Configuration
+    print("To enable Azure, you must have an Azure deployment name, API key, base URL, and API version.")
+    enable_azure = input("Do you want to enable Azure (y/n)? ").lower() == "y"
+    if enable_azure:
+        azure_deployment = input("Enter your Azure deployment name: ")
+        azure_api_key = input("Enter your Azure API key: ")
+        azure_api_base = input("Enter your Azure API base URL: ")
+        azure_api_version = input("Enter your Azure API version: ")
+        if not all([azure_deployment, azure_api_key, azure_api_base, azure_api_version]):
+            print("Error: All Azure fields must be populated.")
+            print("Azure will not be enabled.")
+        else:
+            update_or_add_env_var("AZURE_DEPLOYMENT", azure_deployment)
+            update_or_add_env_var("AZURE_API_KEY", azure_api_key)
+            update_or_add_env_var("AZURE_API_BASE", azure_api_base)
+            update_or_add_env_var("AZURE_API_VERSION", azure_api_version)
+            update_or_add_env_var("ENABLE_AZURE", "true")
+            model_options.append("AZURE_OPENAI_GPT4O")
+    else:
+        update_or_add_env_var("ENABLE_AZURE", "false")
+
+    # Gemini Configuration
+    print("To enable Gemini, you must have an Gemini API key.")
+    enable_gemini = input("Do you want to enable Gemini (y/n)? ").lower() == "y"
+    if enable_gemini:
+        gemini_api_key = input("Enter your Gemini API key: ")
+        if not gemini_api_key:
+            print("Error: Gemini API key is required.")
+            print("Gemini will not be enabled.")
+        else:
+            update_or_add_env_var("GEMINI_API_KEY", gemini_api_key)
+            update_or_add_env_var("ENABLE_GEMINI", "true")
+            model_options.extend(["GEMINI_FLASH_2_0", "GEMINI_FLASH_2_0_LITE", "GEMINI_PRO"])
+    else:
+        update_or_add_env_var("ENABLE_GEMINI", "false")
+
+    # Novita AI Configuration
+    print("To enable Novita AI, you must have an Novita AI API key.")
+    enable_novita = input("Do you want to enable Novita AI (y/n)? ").lower() == "y"
+    if enable_novita:
+        novita_api_key = input("Enter your Novita AI API key: ")
+        if not novita_api_key:
+            print("Error: Novita AI API key is required.")
+            print("Novita AI will not be enabled.")
+        else:
+            update_or_add_env_var("NOVITA_API_KEY", novita_api_key)
+            update_or_add_env_var("ENABLE_NOVITA", "true")
+            model_options.extend(
+                [
+                    "NOVITA_DEEPSEEK_R1",
+                    "NOVITA_DEEPSEEK_V3",
+                    "NOVITA_LLAMA_3_3_70B",
+                    "NOVITA_LLAMA_3_2_1B",
+                    "NOVITA_LLAMA_3_2_3B",
+                    "NOVITA_LLAMA_3_2_11B_VISION",
+                    "NOVITA_LLAMA_3_1_8B",
+                    "NOVITA_LLAMA_3_1_70B",
+                    "NOVITA_LLAMA_3_1_405B",
+                    "NOVITA_LLAMA_3_8B",
+                    "NOVITA_LLAMA_3_70B",
+                ]
+            )
+    else:
+        update_or_add_env_var("ENABLE_NOVITA", "false")
+
+    # Model Selection
+    if not model_options:
+        print(
+            "No LLM providers enabled. You won't be able to run Skyvern unless you enable at least one provider. You can re-run this script to enable providers or manually update the .env file."
+        )
+    else:
+        print("Available LLM models based on your selections:")
+        for i, model in enumerate(model_options, 1):
+            print(f"{i}. {model}")
+
+        while True:
+            try:
+                model_choice = int(input(f"Choose a model by number (e.g., 1 for {model_options[0]}): "))
+                if 1 <= model_choice <= len(model_options):
+                    break
+                print(f"Please enter a number between 1 and {len(model_options)}")
+            except ValueError:
+                print("Please enter a valid number")
+
+        chosen_model = model_options[model_choice - 1]
+        print(f"Chosen LLM Model: {chosen_model}")
+        update_or_add_env_var("LLM_KEY", chosen_model)
+
+    print("LLM provider configurations updated in .env.")
+
+
+def get_default_chrome_location(host_system: str) -> str:
+    """Get the default Chrome/Chromium location based on OS."""
+    if host_system == "darwin":
+        return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    elif host_system == "linux":
+        # Common Linux locations
+        chrome_paths = ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
+        for path in chrome_paths:
+            if os.path.exists(path):
+                return path
+        return "/usr/bin/google-chrome"  # default if not found
+    elif host_system == "wsl":
+        return "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe"
+    else:
+        return "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+
+
+def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
+    """Configure browser settings for Skyvern."""
+    print("\nConfiguring web browser for scraping...")
+    browser_types = ["chromium-headless", "chromium-headful", "cdp-connect"]
+
+    for i, browser_type in enumerate(browser_types, 1):
+        print(f"{i}. {browser_type}")
+        if browser_type == "chromium-headless":
+            print("   - Runs Chrome in headless mode (no visible window)")
+        elif browser_type == "chromium-headful":
+            print("   - Runs Chrome with visible window")
+        elif browser_type == "cdp-connect":
+            print("   - Connects to an existing Chrome instance")
+            print("   - Requires Chrome to be running with remote debugging enabled")
+
+    while True:
+        try:
+            choice = int(input("\nChoose browser type (1-3): "))
+            if 1 <= choice <= len(browser_types):
+                selected_browser = browser_types[choice - 1]
+                break
+            print(f"Please enter a number between 1 and {len(browser_types)}")
+        except ValueError:
+            print("Please enter a valid number")
+
+    browser_location = None
+    remote_debugging_url = None
+
+    if selected_browser == "cdp-connect":
+        host_system = detect_os()
+        default_location = get_default_chrome_location(host_system)
+        print(f"\nDefault Chrome location for your system: {default_location}")
+        browser_location = input("Enter Chrome executable location (press Enter to use default): ").strip()
+        if not browser_location:
+            browser_location = default_location
+
+        if not os.path.exists(browser_location):
+            print(f"Warning: Chrome not found at {browser_location}. Please verify the location is correct.")
+
+        print("\nTo use CDP connection, Chrome must be running with remote debugging enabled.")
+        print("Example: chrome --remote-debugging-port=9222")
+        print("Default debugging URL: http://localhost:9222")
+        remote_debugging_url = input("Enter remote debugging URL (press Enter for default): ").strip()
+        if not remote_debugging_url:
+            remote_debugging_url = "http://localhost:9222"
+
+    return selected_browser, browser_location, remote_debugging_url
+
+
 async def _setup_local_organization() -> str:
     """
     Returns the API key for the local organization generated
     """
-    from skyvern.forge import app
-    from skyvern.forge.sdk.core import security
-    from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-    from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
+    skyvern_agent = SkyvernAgent()
+    organization = await skyvern_agent.get_organization()
 
-    organization = await app.DATABASE.get_organization_by_domain("skyvern.local")
-    if not organization:
-        organization = await app.DATABASE.create_organization(
-            organization_name="Skyvern-local",
-            domain="skyvern.local",
-            max_steps_per_run=10,
-            max_retries_per_step=3,
-        )
-        api_key = security.create_access_token(
-            organization.organization_id,
-            expires_delta=API_KEY_LIFETIME,
-        )
-        # generate OrganizationAutoToken
-        await app.DATABASE.create_org_auth_token(
-            organization_id=organization.organization_id,
-            token=api_key,
-            token_type=OrganizationAuthTokenType.api,
-        )
     org_auth_token = await app.DATABASE.get_valid_org_auth_token(
         organization_id=organization.organization_id,
         token_type=OrganizationAuthTokenType.api,
@@ -175,25 +402,7 @@ async def _setup_local_organization() -> str:
     return org_auth_token.token if org_auth_token else ""
 
 
-@app.command(name="init")
-def init(
-    openai_api_key: str = typer.Option(..., help="The OpenAI API key"),
-    log_level: str = typer.Option("INFO", help="The log level"),
-) -> None:
-    setup_postgresql()
-    api_key = asyncio.run(_setup_local_organization())
-    # Generate .env file
-    with open(".env", "w") as env_file:
-        env_file.write("LITELLM_LOG=ERROR\n")
-        env_file.write("ENABLE_OPENAI=true\n")
-        env_file.write(f"OPENAI_API_KEY={openai_api_key}\n")
-        env_file.write(f"LOG_LEVEL={log_level}\n")
-        env_file.write("ARTIFACT_STORAGE_PATH=./artifacts\n")
-        env_file.write(f"SKYVERN_API_KEY={api_key}\n")
-    print(".env file created with the parameters provided.")
-
-
-@app.command(name="migrate")
+@cli_app.command(name="migrate")
 def migrate() -> None:
     migrate_db()
 
@@ -272,176 +481,91 @@ def is_cursor_installed(host_system: str) -> bool:
         return False
 
 
-def setup_cursor_mcp(host_system: str, path_to_env: str, path_to_server: str, env_vars: str) -> None:
-    """Set up Cursor MCP configuration."""
-    if not is_cursor_installed(host_system):
-        print("Cursor is not installed. Skipping Cursor MCP setup.")
-        return
+def is_windsurf_installed(host_system: str) -> bool:
+    """Check if Windsurf is installed by looking for its config directory."""
+    try:
+        config_dir = os.path.expanduser("~/.codeium/windsurf")
+        return os.path.exists(config_dir)
+    except Exception:
+        return False
+
+
+def get_windsurf_config_path(host_system: str) -> str:
+    """Get the Windsurf config file path for the current OS."""
+    return os.path.expanduser("~/.codeium/windsurf/mcp_config.json")
+
+
+def setup_windsurf_config(host_system: str, path_to_env: str) -> bool:
+    """Set up Windsurf configuration for Skyvern MCP."""
+    if not is_windsurf_installed(host_system):
+        return False
+
+    load_dotenv(".env")
+    skyvern_base_url = os.environ.get("SKYVERN_BASE_URL", "")
+    skyvern_api_key = os.environ.get("SKYVERN_API_KEY", "")
+    if not skyvern_base_url or not skyvern_api_key:
+        print(
+            "Error: SKYVERN_BASE_URL and SKYVERN_API_KEY must be set in .env file to set up Windsurf MCP. Please open {path_windsurf_config} and set the these variables manually."
+        )
 
     try:
-        path_cursor_config = get_cursor_config_path(host_system)
+        path_windsurf_config = get_windsurf_config_path(host_system)
+        os.makedirs(os.path.dirname(path_windsurf_config), exist_ok=True)
+        if not os.path.exists(path_windsurf_config):
+            with open(path_windsurf_config, "w") as f:
+                json.dump({"mcpServers": {}}, f, indent=2)
+
+        windsurf_config: dict = {"mcpServers": {}}
+
+        if os.path.exists(path_windsurf_config):
+            try:
+                with open(path_windsurf_config, "r") as f:
+                    windsurf_config = json.load(f)
+                    windsurf_config["mcpServers"].pop("Skyvern", None)
+                    windsurf_config["mcpServers"]["Skyvern"] = {
+                        "env": {
+                            "SKYVERN_BASE_URL": skyvern_base_url,
+                            "SKYVERN_API_KEY": skyvern_api_key,
+                        },
+                        "command": path_to_env,
+                        "args": ["-m", "skyvern", "run", "mcp"],
+                    }
+            except json.JSONDecodeError:
+                print(
+                    f"JSONDecodeError when reading Error configuring Windsurf. Please open {path_windsurf_config} and fix the json config first."
+                )
+                return False
+
+        with open(path_windsurf_config, "w") as f:
+            json.dump(windsurf_config, f, indent=2)
     except Exception as e:
-        print(f"Error setting up Cursor: {e}")
-        return
+        print(f"Error configuring Windsurf: {e}")
+        return False
 
-    # Get command configuration
-    try:
-        command, args = get_claude_command_config(host_system, path_to_env, path_to_server, env_vars)
-    except Exception as e:
-        print(f"Error configuring Cursor command: {e}")
-        return
-
-    # Create or update Cursor config file
-    os.makedirs(os.path.dirname(path_cursor_config), exist_ok=True)
-    config = {"Skyvern": {"command": command, "args": args}}
-
-    if os.path.exists(path_cursor_config):
-        try:
-            with open(path_cursor_config, "r") as f:
-                existing_config = json.load(f)
-                existing_config.update(config)
-                config = existing_config
-        except json.JSONDecodeError:
-            pass  # Use default config if file is corrupted
-
-    with open(path_cursor_config, "w") as f:
-        json.dump(config, f, indent=2)
-
-    print("Cursor MCP configuration updated successfully.")
+    print(f"Windsurf MCP configuration updated successfully at {path_windsurf_config}.")
+    return True
 
 
-def setup_claude_desktop(host_system: str, path_to_env: str, path_to_server: str) -> None:
-    """Set up Claude Desktop configuration for Skyvern MCP."""
-    if not is_claude_desktop_installed(host_system):
-        print("Claude Desktop is not installed. Skipping MCP setup.")
-        return
-
-    # Get config file path
-    try:
-        path_claude_config = get_claude_config_path(host_system)
-    except Exception as e:
-        print(f"Error setting up Claude Desktop: {e}")
-        return
-
-    # Setup environment variables
-    env_vars = ""
-    for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]:
-        value = os.getenv(key)
-        if value is None:
-            value = typer.prompt(f"Enter your {key}")
-        env_vars += f"{key}={value} "
-
-    # Get command configuration
-    try:
-        claude_command, claude_args = get_claude_command_config(host_system, path_to_env, path_to_server, env_vars)
-    except Exception as e:
-        print(f"Error configuring Claude Desktop command: {e}")
-        return
-
-    # Create or update Claude config file
-    os.makedirs(os.path.dirname(path_claude_config), exist_ok=True)
-    if not os.path.exists(path_claude_config):
-        with open(path_claude_config, "w") as f:
-            json.dump({"mcpServers": {}}, f, indent=2)
-
-    with open(path_claude_config, "r") as f:
-        claude_config = json.load(f)
-        claude_config["mcpServers"].pop("Skyvern", None)
-        claude_config["mcpServers"]["Skyvern"] = {"command": claude_command, "args": claude_args}
-
-    with open(path_claude_config, "w") as f:
-        json.dump(claude_config, f, indent=2)
-
-    print("Claude Desktop configuration updated successfully.")
-
-
-def get_mcp_server_url(deployment_type: str, host: str = "") -> str:
-    """Get the MCP server URL based on deployment type."""
-    if deployment_type in ["local", "cloud"]:
-        return os.path.join(os.path.abspath("./skyvern/mcp"), "server.py")
-    else:
-        raise ValueError(f"Invalid deployment type: {deployment_type}")
-
-
-def setup_mcp_config(host_system: str, deployment_type: str, host: str = "") -> tuple[str, str]:
-    """Set up MCP configuration based on deployment type."""
-    if deployment_type in ["local", "cloud"]:
-        # For local deployment, we need Python environment
-        python_path = shutil.which("python")
-        if python_path:
+def setup_mcp_config() -> str:
+    """
+    return the path to the python environment
+    """
+    python_path = shutil.which("python")
+    if python_path:
+        use_default = typer.prompt(f"Found Python at {python_path}. Use this path? (y/n)").lower() == "y"
+        if use_default:
             path_to_env = python_path
         else:
             path_to_env = typer.prompt("Enter the full path to your configured python environment")
-        return path_to_env, get_mcp_server_url(deployment_type)
-    else:
-        raise NotImplementedError()
+    return path_to_env
 
 
-def get_command_config(host_system: str, command: str, target: str, env_vars: str) -> tuple[str, list]:
-    """Get the command and arguments for MCP configuration."""
-    base_env_vars = f"{env_vars} ENABLE_OPENAI=true LOG_LEVEL=CRITICAL"
-    artifacts_path = os.path.join(os.path.abspath("./"), "artifacts")
-
-    if host_system == "wsl":
-        env_vars = f"{base_env_vars} ARTIFACT_STORAGE_PATH={artifacts_path} BROWSER_TYPE=chromium-headless"
-        return "wsl.exe", ["bash", "-c", f"{env_vars} {command} {target}"]
-
-    if host_system in ["linux", "darwin"]:
-        env_vars = f"{base_env_vars} ARTIFACT_STORAGE_PATH={artifacts_path}"
-        if target.startswith("http"):
-            return command, ["-X", "POST", target]
-        return command, [target]
-
-    raise Exception(f"Unsupported host system: {host_system}")
-
-
-@run_app.command(name="setupmcp")
-def setup_mcp() -> None:
-    """Configure MCP for different Skyvern deployments."""
-    host_system = detect_os()
-
-    # Prompt for deployment type
-    deployment_types = ["local", "cloud"]
-    deployment_type = typer.prompt("Select Skyvern deployment type", type=Choice(deployment_types), default="local")
-
-    try:
-        command, target = setup_mcp_config(host_system, deployment_type)
-    except Exception as e:
-        print(f"Error setting up MCP configuration: {e}")
-        return
-
-    # Cloud deployment variables
-    env_vars = ""
-    if deployment_type == "cloud":
-        for key in ["SKYVERN_MCP_CLOUD_URL", "SKYVERN_MCP_API_KEY"]:
-            value = os.getenv(key)
-            if value is None:
-                value = typer.prompt(f"Enter your {key}")
-            env_vars += f"{key}={value} "
-
-    # Setup environment variables
-    for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]:
-        value = os.getenv(key)
-        if value is None:
-            value = typer.prompt(f"Enter your {key}")
-        env_vars += f"{key}={value} "
-
-    # Configure both Claude Desktop and Cursor
-    success = False
-    success |= setup_claude_desktop_config(host_system, command, target, env_vars)
-    success |= setup_cursor_config(host_system, command, target, env_vars)
-
-    if not success:
-        print("Neither Claude Desktop nor Cursor is installed. Please install at least one of them.")
-
-
-def setup_claude_desktop_config(host_system: str, command: str, target: str, env_vars: str) -> bool:
+def setup_claude_desktop_config(host_system: str, path_to_env: str) -> bool:
     """Set up Claude Desktop configuration with given command and args."""
     if not is_claude_desktop_installed(host_system):
         return False
 
     try:
-        claude_command, claude_args = get_command_config(host_system, command, target, env_vars)
         path_claude_config = get_claude_config_path(host_system)
 
         os.makedirs(os.path.dirname(path_claude_config), exist_ok=True)
@@ -449,15 +573,30 @@ def setup_claude_desktop_config(host_system: str, command: str, target: str, env
             with open(path_claude_config, "w") as f:
                 json.dump({"mcpServers": {}}, f, indent=2)
 
+        # Read environment variables from .env file
+        load_dotenv(".env")
+        skyvern_base_url = os.environ.get("SKYVERN_BASE_URL", "")
+        skyvern_api_key = os.environ.get("SKYVERN_API_KEY", "")
+
+        if not skyvern_base_url or not skyvern_api_key:
+            print("Error: SKYVERN_BASE_URL and SKYVERN_API_KEY must be set in .env file")
+
         with open(path_claude_config, "r") as f:
             claude_config = json.load(f)
             claude_config["mcpServers"].pop("Skyvern", None)
-            claude_config["mcpServers"]["Skyvern"] = {"command": claude_command, "args": claude_args}
+            claude_config["mcpServers"]["Skyvern"] = {
+                "env": {
+                    "SKYVERN_BASE_URL": skyvern_base_url,
+                    "SKYVERN_API_KEY": skyvern_api_key,
+                },
+                "command": path_to_env,
+                "args": ["-m", "skyvern", "run", "mcp"],
+            }
 
         with open(path_claude_config, "w") as f:
             json.dump(claude_config, f, indent=2)
 
-        print("Claude Desktop configuration updated successfully.")
+        print(f"Claude Desktop MCP configuration updated successfully at {path_claude_config}.")
         return True
 
     except Exception as e:
@@ -465,31 +604,53 @@ def setup_claude_desktop_config(host_system: str, command: str, target: str, env
         return False
 
 
-def setup_cursor_config(host_system: str, command: str, target: str, env_vars: str) -> bool:
+def setup_cursor_config(host_system: str, path_to_env: str) -> bool:
     """Set up Cursor configuration with given command and args."""
     if not is_cursor_installed(host_system):
         return False
 
     try:
-        cursor_command, cursor_args = get_command_config(host_system, command, target, env_vars)
         path_cursor_config = get_cursor_config_path(host_system)
 
         os.makedirs(os.path.dirname(path_cursor_config), exist_ok=True)
-        config = {"Skyvern": {"command": cursor_command, "args": cursor_args}}
+        if not os.path.exists(path_cursor_config):
+            with open(path_cursor_config, "w") as f:
+                json.dump({"mcpServers": {}}, f, indent=2)
+
+        load_dotenv(".env")
+        skyvern_base_url = os.environ.get("SKYVERN_BASE_URL", "")
+        skyvern_api_key = os.environ.get("SKYVERN_API_KEY", "")
+
+        if not skyvern_base_url or not skyvern_api_key:
+            print(
+                f"Error: SKYVERN_BASE_URL and SKYVERN_API_KEY must be set in .env file to set up Cursor MCP. Please open {path_cursor_config} and set the these variables manually."
+            )
+
+        cursor_config: dict = {"mcpServers": {}}
 
         if os.path.exists(path_cursor_config):
             try:
                 with open(path_cursor_config, "r") as f:
-                    existing_config = json.load(f)
-                    existing_config.update(config)
-                    config = existing_config
+                    cursor_config = json.load(f)
+                    cursor_config["mcpServers"].pop("Skyvern", None)
+                    cursor_config["mcpServers"]["Skyvern"] = {
+                        "env": {
+                            "SKYVERN_BASE_URL": skyvern_base_url,
+                            "SKYVERN_API_KEY": skyvern_api_key,
+                        },
+                        "command": path_to_env,
+                        "args": ["-m", "skyvern", "run", "mcp"],
+                    }
             except json.JSONDecodeError:
-                pass
+                print(
+                    f"JSONDecodeError when reading Error configuring Cursor. Please open {path_cursor_config} and fix the json config first."
+                )
+                return False
 
         with open(path_cursor_config, "w") as f:
-            json.dump(config, f, indent=2)
+            json.dump(cursor_config, f, indent=2)
 
-        print(f"Cursor configuration updated successfully at {path_cursor_config}")
+        print(f"Cursor MCP configuration updated successfully at {path_cursor_config}")
         return True
 
     except Exception as e:
@@ -497,9 +658,24 @@ def setup_cursor_config(host_system: str, command: str, target: str, env_vars: s
         return False
 
 
+def setup_mcp() -> None:
+    """Configure MCP for different Skyvern deployments."""
+    host_system = detect_os()
+
+    path_to_env = setup_mcp_config()
+
+    # Configure both Claude Desktop and Cursor
+    setup_claude_desktop_config(host_system, path_to_env)
+    setup_cursor_config(host_system, path_to_env)
+    setup_windsurf_config(host_system, path_to_env)
+
+
 @run_app.command(name="server")
 def run_server() -> None:
-    port = int(os.environ.get("PORT", 8000))
+    load_dotenv()
+    from skyvern.config import settings
+
+    port = settings.PORT
     uvicorn.run(
         "skyvern.forge.api_app:app",
         host="0.0.0.0",
@@ -512,3 +688,66 @@ def run_server() -> None:
 def run_mcp() -> None:
     """Run the MCP server."""
     mcp.run(transport="stdio")
+
+
+@cli_app.command(name="init")
+def init() -> None:
+    run_local_str = (
+        input("Would you like to run Skyvern locally or in the cloud? (local/cloud) [cloud]: ").strip().lower()
+    )
+    run_local = run_local_str == "local" if run_local_str else False
+
+    if run_local:
+        setup_postgresql()
+        api_key = asyncio.run(_setup_local_organization())
+
+        if os.path.exists(".env"):
+            print(".env file already exists, skipping initialization.")
+            redo_llm_setup = input("Do you want to go through LLM provider setup again (y/n)? ")
+            if redo_llm_setup.lower() != "y":
+                return
+
+        print("Initializing .env file...")
+        setup_llm_providers()
+
+        # Configure browser settings
+        browser_type, browser_location, remote_debugging_url = setup_browser_config()
+        update_or_add_env_var("BROWSER_TYPE", browser_type)
+        if browser_location:
+            update_or_add_env_var("CHROME_EXECUTABLE_PATH", browser_location)
+        if remote_debugging_url:
+            update_or_add_env_var("BROWSER_REMOTE_DEBUGGING_URL", remote_debugging_url)
+
+        print("Defaulting Skyvern Base URL to: http://localhost:8000")
+        update_or_add_env_var("SKYVERN_BASE_URL", "http://localhost:8000")
+
+    else:
+        base_url = input("Enter Skyvern base URL (press Enter for https://api.skyvern.com): ").strip()
+        if not base_url:
+            base_url = "https://api.skyvern.com"
+
+        print("To get your API key:")
+        print("1. Create an account at https://app.skyvern.com")
+        print("2. Go to Settings")
+        print("3. Copy your API key")
+        api_key = input("Enter your Skyvern API key: ").strip()
+        if not api_key:
+            print("API key is required")
+            api_key = input("Enter your Skyvern API key: ").strip()
+
+        update_or_add_env_var("SKYVERN_BASE_URL", base_url)
+
+    # Ask for email or generate UUID
+    analytics_id = input("Please enter your email for analytics (press enter to skip): ")
+    if not analytics_id:
+        analytics_id = str(uuid.uuid4())
+
+    update_or_add_env_var("ANALYTICS_ID", analytics_id)
+    update_or_add_env_var("SKYVERN_API_KEY", api_key)
+    print(".env file has been initialized.")
+
+    # Ask if user wants to configure MCP server
+    configure_mcp = input("\nWould you like to configure the MCP server (y/n)? ").lower() == "y"
+    if configure_mcp:
+        setup_mcp()
+        print("\nMCP server configuration completed.")

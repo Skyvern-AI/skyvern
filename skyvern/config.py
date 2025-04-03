@@ -11,6 +11,7 @@ class Settings(BaseSettings):
 
     BROWSER_TYPE: str = "chromium-headful"
     BROWSER_REMOTE_DEBUGGING_URL: str = "http://127.0.0.1:9222"
+    CHROME_EXECUTABLE_PATH: str | None = None
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = "./video"
     HAR_PATH: str | None = "./har"
