@@ -633,7 +633,7 @@ def setup_claude_desktop(host_system: str, path_to_env: str, path_to_server: str
 
 
 def is_windsurf_installed(host_system: str) -> bool:
-    """Check if Cursor is installed by looking for its config directory."""
+    """Check if Windsurf is installed by looking for its config directory."""
     try:
         config_dir = os.path.expanduser("~/.codeium/windsurf")
         return os.path.exists(config_dir)
