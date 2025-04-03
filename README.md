@@ -65,9 +65,6 @@ Skyvern uses a swarm of agents to comprehend a website, and plan and execute its
 <!-- Redo demo -->
 https://github.com/user-attachments/assets/5cab4668-e8e2-4982-8551-aab05ff73a7f
 
-
-
-
 # Skyvern Cloud
 We offer a managed cloud version of Skyvern that allows you to run Skyvern without having to manage the infrastructure. It allows you to run multiple Skyvern instances in parallel and comes bundled with anti-bot detection mechanisms, proxy network, and CAPTCHA solvers.
 
