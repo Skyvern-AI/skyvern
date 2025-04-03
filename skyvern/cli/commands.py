@@ -23,17 +23,21 @@ load_dotenv()
 
 cli_app = typer.Typer()
 run_app = typer.Typer()
+setup_app = typer.Typer()
 cli_app.add_typer(run_app, name="run")
+cli_app.add_typer(setup_app, name="setup")
 mcp = FastMCP("Skyvern")
 
 
 @mcp.tool()
 async def skyvern_run_task(prompt: str, url: str) -> dict[str, str]:
-    """Execute automated browser actions to accomplish a user's goal on a website.
+    """Use Skyvern to execute anything in the browser. Useful for accomplishing tasks that require browser automation.
 
     This tool uses Skyvern's browser automation to navigate websites and perform actions to achieve
     the user's intended outcome. It can handle tasks like form filling, clicking buttons, data extraction,
     and multi-step workflows.
+
+    It can even help you find updated data on the internet if your model information is outdated.
 
     Args:
         prompt: A natural language description of what needs to be accomplished (e.g. "Book a flight from
@@ -578,6 +582,7 @@ def setup_mcp_config() -> str:
 def setup_claude_desktop_config(host_system: str, path_to_env: str) -> bool:
     """Set up Claude Desktop configuration with given command and args."""
     if not is_claude_desktop_installed(host_system):
+        print("Claude Desktop is not installed. Please install it first.")
         return False
 
     try:
@@ -673,6 +678,7 @@ def setup_cursor_config(host_system: str, path_to_env: str) -> bool:
         return False
 
 
+@setup_app.command(name="mcp")
 def setup_mcp() -> None:
     """Configure MCP for different Skyvern deployments."""
     host_system = detect_os()
