@@ -181,8 +181,8 @@ def update_or_add_env_var(key: str, value: str) -> None:
             "ANALYTICS_ID": "anonymous",
             "ENABLE_LOG_ARTIFACTS": "false",
         }
-        for key, value in defaults.items():
-            set_key(env_path, key, value)
+        for k, v in defaults.items():
+            set_key(env_path, k, v)
 
     load_dotenv(env_path)
     set_key(env_path, key, value)
@@ -437,12 +437,12 @@ def init() -> None:
         update_or_add_env_var("SKYVERN_BASE_URL", "http://localhost:8000")
 
     else:
-        base_url = input("Enter Skyvern base URL (press Enter for api.skyvern.com): ").strip()
+        base_url = input("Enter Skyvern base URL (press Enter for https://api.skyvern.com): ").strip()
         if not base_url:
             base_url = "https://api.skyvern.com"
 
         print("To get your API key:")
-        print("1. Create an account at app.skyvern.com")
+        print("1. Create an account at https://app.skyvern.com")
         print("2. Go to Settings")
         print("3. Copy your API key")
         api_key = input("Enter your Skyvern API key: ").strip()
@@ -743,16 +743,6 @@ def run_server() -> None:
     from skyvern.config import settings
 
     port = settings.PORT
-    browser_type = settings.BROWSER_TYPE
-    browser_path = settings.CHROME_EXECUTABLE_PATH
-
-    if browser_type == "cdp-connect" and browser_path:
-        browser_process = subprocess.Popen(
-            [browser_path, "--remote-debugging-port=9222"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        if browser_process.poll() is not None:
-            raise Exception(f"Failed to open browser. browser_path: {browser_path}")
-
     uvicorn.run(
         "skyvern.forge.api_app:app",
         host="0.0.0.0",
