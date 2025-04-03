@@ -61,14 +61,14 @@ Each task run has an associated `run_id` -- a unique identifier you can use to l
 | --- | --- | --- | --- | --- |
 | run_id | String | yes | "t_123456" or "oc_12345" | Unique identifier for this run |
 | status | String | yes | "running" | Current status of the run. Possible values: "created", "queued", "running", "timed_out", "failed", "terminated", "completed", "canceled" |
-| output | Object/Array/String/null | no | { "success": true } | Output data from the run, if any. Format depends on the schema in the input |
-| downloaded_files | Array/null | no | [{ "url": "...", "checksum": "...", "filename": "..." }] | List of files downloaded during the run |
+| output | Object/Array/String/null | no | \{ "success": true } | Output data from the run, if any. Format depends on the schema in the input |
+| downloaded_files | Array/null | no | [\{ "url": "...", "checksum": "...", "filename": "..." }] | List of files downloaded during the run |
 | recording_url | String | no | "https://..." | URL to the recording of the run |
 | failure_reason | String | no | "Max steps exceeded" | Reason for failure if the run failed |
 | created_at | String | yes | "2024-03-20T10:00:00Z" | Timestamp when this run was created |
 | modified_at | String | yes | "2024-03-20T10:05:00Z" | Timestamp when this run was last modified |
 | run_type | String | yes | "task_v2" | Type of task run - either task_v1 or task_v2 |
-| run_request | Object | yes | {...} | The original request parameters used to start this task run |
+| run_request | Object | yes | \{...} | The original request parameters used to start this task run |
 
 ## Request - Task Details (GET)
 
@@ -102,14 +102,14 @@ The response follows the same schema as the task creation response, containing:
 | --- | --- | --- | --- |
 | run_id | String | "t_123456" | Unique identifier for this run |
 | status | String | "created" | Current status of the run. Possible values: "created", "queued", "running", "timed_out", "failed", "terminated", "completed", "canceled" |
-| output | Object | { "additionalProp1": {} } | Output data from the run |
-| downloaded_files | Array | [{ "url": "string", "checksum": "string", "filename": "string" }] | List of files downloaded during the run |
+| output | Object | \{ "additionalProp1": \{ } } | Output data from the run |
+| downloaded_files | Array | [\{ "url": "string", "checksum": "string", "filename": "string" }] | List of files downloaded during the run |
 | recording_url | String | "https://..." | URL to the recording of the run |
 | failure_reason | String | "Max steps exceeded" | Reason for failure if the run failed |
 | created_at | String | "2025-04-03T14:08:29.505Z" | Timestamp when this run was created |
 | modified_at | String | "2025-04-03T14:08:29.505Z" | Timestamp when this run was last modified |
 | run_type | String | "task_v1" | Type of task run - either task_v1 or task_v2 |
-| run_request | Object | { "prompt": "string", "url": "string", "title": "string", "engine": "skyvern-2.0", "proxy_location": "RESIDENTIAL", "data_extraction_schema": { "additionalProp1": {} }, "error_code_mapping": { "additionalProp1": "string" }, "max_steps": 0, "webhook_url": "string", "totp_identifier": "string", "totp_url": "string", "browser_session_id": "string", "publish_workflow": false } | The original request parameters used to start this task run |
+| run_request | Object | \{ "prompt": "string", "url": "string", "title": "string", "engine": "skyvern-2.0", "proxy_location": "RESIDENTIAL", "data_extraction_schema": \{ "additionalProp1": \{ } \}, "error_code_mapping": \{ "additionalProp1": "string" \}, "max_steps": 0, "webhook_url": "string", "totp_identifier": "string", "totp_url": "string", "browser_session_id": "string", "publish_workflow": false } | The original request parameters used to start this task run |
 
 ## Request - List Steps (GET)
 Each task run is made up of "steps" which are the individual actions Skyvern takes to complete the task. You can use this endpoint to get all the steps of the run.
