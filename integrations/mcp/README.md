@@ -6,10 +6,9 @@
 
 <h1 align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="integrations/mcp/images/SkyvernMCP.png"/>
-    <img height="120" src="integrations/mcp/images/SkyvernMCP.png"/>
+    <source media="(prefers-color-scheme: dark)" srcset="images/SkyvernMCP.png"/>
+    <img src="images/SkyvernMCP.png" alt="Skyvern MCP Logo" width="75%"/>
   </picture>
- <br />
 </h1>
 
 # Model Context Protocol (MCP)
