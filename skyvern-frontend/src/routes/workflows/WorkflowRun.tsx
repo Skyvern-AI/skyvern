@@ -35,7 +35,6 @@ import { useWorkflowRunQuery } from "./hooks/useWorkflowRunQuery";
 import { WorkflowRunTimeline } from "./workflowRun/WorkflowRunTimeline";
 import { useWorkflowRunTimelineQuery } from "./hooks/useWorkflowRunTimelineQuery";
 import { findActiveItem } from "./workflowRun/workflowTimelineUtils";
-import { getAggregatedExtractedInformation } from "./workflowRun/workflowRunUtils";
 import { Label } from "@/components/ui/label";
 import { CodeEditor } from "./components/CodeEditor";
 import { cn } from "@/util/utils";
@@ -138,13 +137,16 @@ function WorkflowRun() {
   const isTaskv2Run = workflowRun && workflowRun.task_v2 !== null;
 
   const outputs = workflowRun?.outputs;
-  const aggregatedExtractedInformation = getAggregatedExtractedInformation(
-    outputs ?? {},
-  );
+  const extractedInformation =
+    typeof outputs === "object" &&
+    outputs !== null &&
+    "extracted_information" in outputs
+      ? (outputs.extracted_information as Record<string, unknown>)
+      : null;
 
-  const hasSomeExtractedInformation = Object.values(
-    aggregatedExtractedInformation,
-  ).some((value) => value !== null);
+  const hasSomeExtractedInformation = extractedInformation
+    ? Object.values(extractedInformation).some((value) => value !== null)
+    : false;
 
   const hasTaskv2Output = Boolean(isTaskv2Run && workflowRun.task_v2?.output);
 
@@ -282,7 +284,7 @@ function WorkflowRun() {
                 value={
                   hasTaskv2Output
                     ? JSON.stringify(workflowRun.task_v2?.output, null, 2)
-                    : JSON.stringify(aggregatedExtractedInformation, null, 2)
+                    : JSON.stringify(extractedInformation, null, 2)
                 }
                 readOnly
                 maxHeight="250px"

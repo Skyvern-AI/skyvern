@@ -12,16 +12,6 @@ import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuer
 import { Status } from "@/api/types";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { isTaskVariantBlock } from "../types/workflowTypes";
-import { getAggregatedExtractedInformation } from "./workflowRunUtils";
-
-function formatExtractedInformation(outputs: Record<string, unknown>) {
-  const aggregateExtractedInformation =
-    getAggregatedExtractedInformation(outputs);
-  return {
-    extracted_information: aggregateExtractedInformation,
-    ...outputs,
-  };
-}
 
 function WorkflowRunOutput() {
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
@@ -60,9 +50,6 @@ function WorkflowRunOutput() {
     activeBlock.status === Status.Completed;
 
   const outputs = workflowRun?.outputs;
-  const formattedOutputs = outputs
-    ? formatExtractedInformation(outputs)
-    : outputs;
   const fileUrls = workflowRun?.downloaded_file_urls ?? [];
   const observerOutput = workflowRun?.task_v2?.output;
 
@@ -140,9 +127,7 @@ function WorkflowRunOutput() {
           <h1 className="text-lg font-bold">Workflow Run Outputs</h1>
           <CodeEditor
             language="json"
-            value={
-              formattedOutputs ? JSON.stringify(formattedOutputs, null, 2) : ""
-            }
+            value={outputs ? JSON.stringify(outputs, null, 2) : ""}
             readOnly
             minHeight="96px"
             maxHeight="200px"
