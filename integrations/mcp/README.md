@@ -41,7 +41,15 @@ You can connect your MCP-enabled applications to Skyvern in two ways:
 ## Examples
 ### Skyvern allows Claude to look up the top Hackernews posts today
 
+https://github.com/user-attachments/assets/0c10dd96-c6ff-4b99-ad99-f34a5afd04fe
+
 ### Cursor looking up the top programming jobs in your area
+
+https://github.com/user-attachments/assets/084c89c9-6229-4bac-adc9-6ad69b41327d
+
+### Ask Windsurf to do a form 5500 search and download some files 
+
+https://github.com/user-attachments/assets/70cfe310-24dc-431a-adde-e72691f198a7
 
 ## Supported Applications
 `skyvern init` helps configure the following applications for you:
