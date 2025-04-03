@@ -26,7 +26,7 @@ Skyvern's MCP server implementation helps connect your AI Applications to the br
 	skyvern init
 	```
 
-3. ** (Optional) Launch the Skyvern Server. Only required in local mode** 
+3. **(Optional) Launch the Skyvern Server. Only required in local mode** 
 
 	```bash
 	skyvern run server
