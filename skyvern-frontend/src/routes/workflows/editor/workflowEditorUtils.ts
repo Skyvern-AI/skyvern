@@ -3,6 +3,7 @@ import type { Node } from "@xyflow/react";
 import { Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
 import {
+  WorkflowBlockType,
   WorkflowBlockTypes,
   WorkflowParameterTypes,
   WorkflowParameterValueType,
@@ -1459,13 +1460,30 @@ const sendEmailExpectedParameters = [
   },
 ] as const;
 
+function getBlocksOfType(
+  blocks: Array<BlockYAML>,
+  blockType: WorkflowBlockType,
+): Array<BlockYAML> {
+  const blocksOfType: Array<BlockYAML> = [];
+  for (const block of blocks) {
+    if (block.block_type === WorkflowBlockTypes.ForLoop) {
+      const subBlocks = block.loop_blocks;
+      const subBlocksOfType = getBlocksOfType(subBlocks, blockType);
+      blocksOfType.push(...subBlocksOfType);
+    } else {
+      if (block.block_type === blockType) {
+        blocksOfType.push(block);
+      }
+    }
+  }
+  return blocksOfType;
+}
+
 function getAdditionalParametersForEmailBlock(
   blocks: Array<BlockYAML>,
   parameters: Array<ParameterYAML>,
 ): Array<ParameterYAML> {
-  const emailBlocks = blocks.filter(
-    (block) => block.block_type === WorkflowBlockTypes.SendEmail,
-  );
+  const emailBlocks = getBlocksOfType(blocks, WorkflowBlockTypes.SendEmail);
   if (emailBlocks.length === 0) {
     return [];
   }
