@@ -1036,6 +1036,28 @@ async def handle_select_option_action(
             )
             return await normal_select(action=action, skyvern_element=skyvern_element, dom=dom, task=task, step=step)
 
+        if not exist:
+            return await normal_select(action=action, skyvern_element=skyvern_element, dom=dom, task=task, step=step)
+
+        if blocking_element is None:
+            LOG.info(
+                "Try to scroll the element into view, then detecting the blocking element",
+                step_id=step.step_id,
+            )
+            try:
+                await skyvern_element.scroll_into_view()
+                blocking_element, exist = await skyvern_element.find_blocking_element(dom=dom)
+            except Exception:
+                LOG.warning(
+                    "Failed to find the blocking element when scrolling into view, fallback to normal select",
+                    action=action,
+                    step_id=step.step_id,
+                    exc_info=True,
+                )
+                return await normal_select(
+                    action=action, skyvern_element=skyvern_element, dom=dom, task=task, step=step
+                )
+
         if not exist or blocking_element is None:
             return await normal_select(action=action, skyvern_element=skyvern_element, dom=dom, task=task, step=step)
         LOG.info(
