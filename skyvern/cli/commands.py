@@ -404,7 +404,10 @@ async def _setup_local_organization() -> str:
     """
     Returns the API key for the local organization generated
     """
-    skyvern_agent = SkyvernAgent()
+    skyvern_agent = SkyvernAgent(
+        base_url=settings.SKYVERN_BASE_URL,
+        api_key=settings.SKYVERN_API_KEY,
+    )
     organization = await skyvern_agent.get_organization()
 
     org_auth_token = await app.DATABASE.get_valid_org_auth_token(
@@ -693,6 +696,7 @@ def setup_mcp() -> None:
 @run_app.command(name="server")
 def run_server() -> None:
     load_dotenv()
+    load_dotenv(".env")
     from skyvern.config import settings
 
     port = settings.PORT
