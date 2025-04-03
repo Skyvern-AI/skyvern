@@ -569,22 +569,13 @@ def setup_mcp_config() -> str:
     """
     return the path to the python environment
     """
-    # Try to find Python in this order: python, python3, python3.12, python3.11, python3.10, python3.9
-    python_paths = []
-    for python_cmd in ["python", "python3.11"]:
-        python_path = shutil.which(python_cmd)
-        if python_path:
-            python_paths.append((python_cmd, python_path))
-
-    if not python_paths:
-        print("Error: Could not find any Python installation. Please install Python 3.11 first.")
-        path_to_env = typer.prompt(
-            "Enter the full path to your python 3.11 environment. For example in MacOS if you installed it using Homebrew, it would be /opt/homebrew/bin/python3.11"
-        )
-    else:
-        # Show the first found Python as default
-        _, default_path = python_paths[0]
-        path_to_env = default_path
+    python_path = shutil.which("python")
+    if python_path:
+        use_default = typer.prompt(f"Found Python at {python_path}. Use this path? (y/n)").lower() == "y"
+        if use_default:
+            path_to_env = python_path
+        else:
+            path_to_env = typer.prompt("Enter the full path to your configured python environment")
     return path_to_env
 
 
