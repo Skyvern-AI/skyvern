@@ -1,12 +1,16 @@
-<!-- START doctoc generated TOC please keep comment here to allow auto update -->
-<!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
-**Table of Contents**  *generated with [DocToc](https://github.com/thlorenz/doctoc)*
+<!-- DOCTOC SKIP -->
 
 - [Model Context Protocol (MCP)](#model-context-protocol-mcp)
   - [Integration Options](#integration-options)
   - [Supported Applications](#supported-applications)
 
-<!-- END doctoc generated TOC please keep comment here to allow auto update -->
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="integrations/mcp/images/SkyvernMCP.png"/>
+    <img height="120" src="integrations/mcp/images/SkyvernMCP.png"/>
+  </picture>
+ <br />
+</h1>
 
 # Model Context Protocol (MCP)
 
