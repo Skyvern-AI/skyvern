@@ -19,6 +19,11 @@ from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.utils import detect_os, get_windows_appdata_roaming, migrate_db
 
+load_dotenv()
+
+cli_app = typer.Typer()
+run_app = typer.Typer()
+cli_app.add_typer(run_app, name="run")
 mcp = FastMCP("Skyvern")
 
 
@@ -37,13 +42,6 @@ async def skyvern_run_task(prompt: str, url: str) -> str:
     )
     res = await skyvern_agent.run_task(prompt=prompt, url=url)
     return res.model_dump()["output"]
-
-
-load_dotenv()
-
-cli_app = typer.Typer()
-run_app = typer.Typer()
-cli_app.add_typer(run_app, name="run")
 
 
 def command_exists(command: str) -> bool:
@@ -549,89 +547,6 @@ def is_cursor_installed(host_system: str) -> bool:
         return False
 
 
-def setup_cursor_mcp(host_system: str, path_to_env: str, path_to_server: str, env_vars: str) -> None:
-    """Set up Cursor MCP configuration."""
-    if not is_cursor_installed(host_system):
-        print("Cursor is not installed. Skipping Cursor MCP setup.")
-        return
-
-    try:
-        path_cursor_config = get_cursor_config_path(host_system)
-    except Exception as e:
-        print(f"Error setting up Cursor: {e}")
-        return
-
-    # Get command configuration
-    try:
-        command, args = get_claude_command_config(host_system, path_to_env, path_to_server, env_vars)
-    except Exception as e:
-        print(f"Error configuring Cursor command: {e}")
-        return
-
-    # Create or update Cursor config file
-    os.makedirs(os.path.dirname(path_cursor_config), exist_ok=True)
-    config = {"Skyvern": {"command": command, "args": args}}
-
-    if os.path.exists(path_cursor_config):
-        try:
-            with open(path_cursor_config, "r") as f:
-                existing_config = json.load(f)
-                existing_config.update(config)
-                config = existing_config
-        except json.JSONDecodeError:
-            pass  # Use default config if file is corrupted
-
-    with open(path_cursor_config, "w") as f:
-        json.dump(config, f, indent=2)
-
-    print("Cursor MCP configuration updated successfully.")
-
-
-def setup_claude_desktop(host_system: str, path_to_env: str, path_to_server: str) -> None:
-    """Set up Claude Desktop configuration for Skyvern MCP."""
-    if not is_claude_desktop_installed(host_system):
-        print("Claude Desktop is not installed. Skipping MCP setup.")
-        return
-
-    # Get config file path
-    try:
-        path_claude_config = get_claude_config_path(host_system)
-    except Exception as e:
-        print(f"Error setting up Claude Desktop: {e}")
-        return
-
-    # Setup environment variables
-    env_vars = ""
-    for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]:
-        value = os.getenv(key)
-        if value is None:
-            value = typer.prompt(f"Enter your {key}")
-        env_vars += f"{key}={value} "
-
-    # Get command configuration
-    try:
-        claude_command, claude_args = get_claude_command_config(host_system, path_to_env, path_to_server, env_vars)
-    except Exception as e:
-        print(f"Error configuring Claude Desktop command: {e}")
-        return
-
-    # Create or update Claude config file
-    os.makedirs(os.path.dirname(path_claude_config), exist_ok=True)
-    if not os.path.exists(path_claude_config):
-        with open(path_claude_config, "w") as f:
-            json.dump({"mcpServers": {}}, f, indent=2)
-
-    with open(path_claude_config, "r") as f:
-        claude_config = json.load(f)
-        claude_config["mcpServers"].pop("Skyvern", None)
-        claude_config["mcpServers"]["Skyvern"] = {"command": claude_command, "args": claude_args}
-
-    with open(path_claude_config, "w") as f:
-        json.dump(claude_config, f, indent=2)
-
-    print("Claude Desktop configuration updated successfully.")
-
-
 def is_windsurf_installed(host_system: str) -> bool:
     """Check if Windsurf is installed by looking for its config directory."""
     try:
@@ -646,40 +561,55 @@ def get_windsurf_config_path(host_system: str) -> str:
     return os.path.expanduser("~/.codeium/windsurf/mcp_config.json")
 
 
-def setup_windsurf_config(host_system: str, path_to_env: str) -> None:
+def setup_windsurf_config(host_system: str, path_to_env: str) -> bool:
     """Set up Windsurf configuration for Skyvern MCP."""
     if not is_windsurf_installed(host_system):
-        return
+        return False
 
-    load_dotenv()
-    skyvern_base_url = os.getenv("SKYVERN_BASE_URL", "")
-    skyvern_api_key = os.getenv("SKYVERN_API_KEY", "")
+    load_dotenv(".env")
+    skyvern_base_url = os.environ.get("SKYVERN_BASE_URL", "")
+    skyvern_api_key = os.environ.get("SKYVERN_API_KEY", "")
     if not skyvern_base_url or not skyvern_api_key:
         print(
             "Error: SKYVERN_BASE_URL and SKYVERN_API_KEY must be set in .env file to set up Windsurf MCP. Please open {path_windsurf_config} and set the these variables manually."
         )
 
-    path_windsurf_config = get_windsurf_config_path(host_system)
-    os.makedirs(os.path.dirname(path_windsurf_config), exist_ok=True)
-    config = {
-        "Skyvern": {
-            "env": {"SKYVERN_BASE_URL": skyvern_base_url, "SKYVERN_API_KEY": skyvern_api_key},
-            "command": path_to_env,
-            "args": ["-m", "skyvern", "run", "mcp"],
-        }
-    }
-    if os.path.exists(path_windsurf_config):
-        try:
-            with open(path_windsurf_config, "r") as f:
-                existing_config = json.load(f)
-                existing_config.update(config)
-                config = existing_config
-        except json.JSONDecodeError:
-            pass
-    with open(path_windsurf_config, "w") as f:
-        json.dump(config, f, indent=2)
+    try:
+        path_windsurf_config = get_windsurf_config_path(host_system)
+        os.makedirs(os.path.dirname(path_windsurf_config), exist_ok=True)
+        if not os.path.exists(path_windsurf_config):
+            with open(path_windsurf_config, "w") as f:
+                json.dump({"mcpServers": {}}, f, indent=2)
 
-    print(f"Windsurf configuration updated successfully at {path_windsurf_config}.")
+        windsurf_config: dict = {"mcpServers": {}}
+
+        if os.path.exists(path_windsurf_config):
+            try:
+                with open(path_windsurf_config, "r") as f:
+                    windsurf_config = json.load(f)
+                    windsurf_config["mcpServers"].pop("Skyvern", None)
+                    windsurf_config["mcpServers"]["Skyvern"] = {
+                        "env": {
+                            "SKYVERN_BASE_URL": skyvern_base_url,
+                            "SKYVERN_API_KEY": skyvern_api_key,
+                        },
+                        "command": path_to_env,
+                        "args": ["-m", "skyvern", "run", "mcp"],
+                    }
+            except json.JSONDecodeError:
+                print(
+                    f"JSONDecodeError when reading Error configuring Windsurf. Please open {path_windsurf_config} and fix the json config first."
+                )
+                return False
+
+        with open(path_windsurf_config, "w") as f:
+            json.dump(windsurf_config, f, indent=2)
+    except Exception as e:
+        print(f"Error configuring Windsurf: {e}")
+        return False
+
+    print(f"Windsurf MCP configuration updated successfully at {path_windsurf_config}.")
+    return True
 
 
 def setup_mcp_config() -> str:
@@ -723,9 +653,9 @@ def setup_claude_desktop_config(host_system: str, path_to_env: str) -> bool:
                 json.dump({"mcpServers": {}}, f, indent=2)
 
         # Read environment variables from .env file
-        load_dotenv()
-        skyvern_base_url = os.getenv("SKYVERN_BASE_URL", "")
-        skyvern_api_key = os.getenv("SKYVERN_API_KEY", "")
+        load_dotenv(".env")
+        skyvern_base_url = os.environ.get("SKYVERN_BASE_URL", "")
+        skyvern_api_key = os.environ.get("SKYVERN_API_KEY", "")
 
         if not skyvern_base_url or not skyvern_api_key:
             print("Error: SKYVERN_BASE_URL and SKYVERN_API_KEY must be set in .env file")
@@ -745,7 +675,7 @@ def setup_claude_desktop_config(host_system: str, path_to_env: str) -> bool:
         with open(path_claude_config, "w") as f:
             json.dump(claude_config, f, indent=2)
 
-        print(f"Claude Desktop configuration updated successfully at {path_claude_config}.")
+        print(f"Claude Desktop MCP configuration updated successfully at {path_claude_config}.")
         return True
 
     except Exception as e:
@@ -762,38 +692,44 @@ def setup_cursor_config(host_system: str, path_to_env: str) -> bool:
         path_cursor_config = get_cursor_config_path(host_system)
 
         os.makedirs(os.path.dirname(path_cursor_config), exist_ok=True)
-        load_dotenv()
-        skyvern_base_url = os.getenv("SKYVERN_BASE_URL", "")
-        skyvern_api_key = os.getenv("SKYVERN_API_KEY", "")
+        if not os.path.exists(path_cursor_config):
+            with open(path_cursor_config, "w") as f:
+                json.dump({"mcpServers": {}}, f, indent=2)
+
+        load_dotenv(".env")
+        skyvern_base_url = os.environ.get("SKYVERN_BASE_URL", "")
+        skyvern_api_key = os.environ.get("SKYVERN_API_KEY", "")
 
         if not skyvern_base_url or not skyvern_api_key:
             print(
                 f"Error: SKYVERN_BASE_URL and SKYVERN_API_KEY must be set in .env file to set up Cursor MCP. Please open {path_cursor_config} and set the these variables manually."
             )
 
-        config = {
-            "Skyvern": {
-                "env": {
-                    "SKYVERN_BASE_URL": skyvern_base_url,
-                    "SKYVERN_API_KEY": skyvern_api_key,
-                },
-                "command": path_to_env,
-                "args": ["-m", "skyvern", "run", "mcp"],
-            }
-        }
+        cursor_config: dict = {"mcpServers": {}}
+
         if os.path.exists(path_cursor_config):
             try:
                 with open(path_cursor_config, "r") as f:
-                    existing_config = json.load(f)
-                    existing_config.update(config)
-                    config = existing_config
+                    cursor_config = json.load(f)
+                    cursor_config["mcpServers"].pop("Skyvern", None)
+                    cursor_config["mcpServers"]["Skyvern"] = {
+                        "env": {
+                            "SKYVERN_BASE_URL": skyvern_base_url,
+                            "SKYVERN_API_KEY": skyvern_api_key,
+                        },
+                        "command": path_to_env,
+                        "args": ["-m", "skyvern", "run", "mcp"],
+                    }
             except json.JSONDecodeError:
-                pass
+                print(
+                    f"JSONDecodeError when reading Error configuring Cursor. Please open {path_cursor_config} and fix the json config first."
+                )
+                return False
 
         with open(path_cursor_config, "w") as f:
-            json.dump(config, f, indent=2)
+            json.dump(cursor_config, f, indent=2)
 
-        print(f"Cursor configuration updated successfully at {path_cursor_config}")
+        print(f"Cursor MCP configuration updated successfully at {path_cursor_config}")
         return True
 
     except Exception as e:

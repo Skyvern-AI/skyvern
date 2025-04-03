@@ -134,7 +134,7 @@ skip = ["webeye/actions/__init__.py", "forge/sdk/__init__.py"]
 plugins = "sqlalchemy.ext.mypy.plugin"
 
 [tool.poetry.scripts]
-skyvern = "skyvern.cli.commands:app"
+skyvern = "skyvern.cli.commands:cli_app"
 
 [tool.codeflash]                                                                                                                                                                                                                                                                                                             
 # All paths are relative to this pyproject.toml's directory.                                                                                                                                                                                                                                                                 

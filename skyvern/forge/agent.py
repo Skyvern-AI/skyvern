@@ -109,18 +109,6 @@ class ForgeAgent:
                 "Additional modules loaded",
                 modules=settings.ADDITIONAL_MODULES,
             )
-        LOG.info(
-            "Initializing ForgeAgent",
-            env=settings.ENV,
-            execute_all_steps=settings.EXECUTE_ALL_STEPS,
-            browser_type=settings.BROWSER_TYPE,
-            max_scraping_retries=settings.MAX_SCRAPING_RETRIES,
-            video_path=settings.VIDEO_PATH,
-            browser_action_timeout_ms=settings.BROWSER_ACTION_TIMEOUT_MS,
-            max_steps_per_run=settings.MAX_STEPS_PER_RUN,
-            long_running_task_warning_ratio=settings.LONG_RUNNING_TASK_WARNING_RATIO,
-            debug_mode=settings.DEBUG_MODE,
-        )
         self.async_operation_pool = AsyncOperationPool()
 
     async def create_task_and_step_from_block(
