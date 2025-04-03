@@ -17,57 +17,90 @@ colors:
 analytics:
   posthog:
     api-key: ${POSTHOG_API_KEY}
+tabs:
+  home:
+    display-name: Home
+    icon: home
+  api: 
+    display-name: API Reference
+    icon: code
+  blog:
+    display-name: Blog
+    icon: newspaper
+    href: https://blog.skyvern.com
+  community:
+    display-name: Community 
+    icon: discord
+    href: https://discord.gg/fG2XXEuQX3
+  github:
+    display-name: Github
+    icon: fa-github dark:fa-github fa-toggle-on
+    href: https://github.com/Skyvern-AI/Skyvern/
+  cloud:
+    display-name: Skyvern Cloud
+    icon: cloud
+    href: https://app.skyvern.com
+  demo:
+    display-name: Book a demo
+    icon: calendar
+    href: https://meetings.hubspot.com/skyvern/demo
 navigation:
-  - api: API Reference
-    snippets:
-      python: skyvern
-  - section: Getting Started
-    contents:
-      - page: Introduction
-        path: introduction.mdx
-      - page: Skyvern In Action
-        path: getting-started/skyvern-in-action.mdx
-      - page: Task Prompting Guide
-        path: getting-started/prompting-guide.mdx
-  - section: Tasks
-    contents:
-      - page: Introduction
-        path: running-tasks/introduction.mdx
-      - page: Tasks API
-        path: running-tasks/api-spec.mdx
-      - page: Tasks V2 API
-        path: running-tasks/api-v2-spec.mdx
-      - api: Endpoints
-        paginated: true
-        snippets: 
+  - tab: home
+    layout:
+    - section: Getting Started
+      contents:
+        - page: Introduction
+          path: introduction.mdx
+        - page: Skyvern In Action
+          path: getting-started/skyvern-in-action.mdx
+        - page: Task Prompting Guide
+          path: getting-started/prompting-guide.mdx
+    - section: Tasks
+      contents:
+        - page: Introduction
+          path: running-tasks/introduction.mdx
+        - page: Tasks API
+          path: running-tasks/api-spec.mdx
+        - api: Endpoints
+          paginated: true
+          snippets: 
+            python: skyvern
+        - page: Webhooks FAQ
+          path: running-tasks/webhooks-faq.mdx
+        - page: Visualizing Results
+          path: running-tasks/visualizing-results.mdx
+        - page: Advanced Settings for tasks
+          path: running-tasks/advanced-features.mdx
+    - section: Workflows (Beta)
+      contents:
+        - page: Introduction
+          path: workflows/introduction.mdx
+        - page: Creating Workflows
+          path: workflows/creating-workflows.mdx
+        - page: Getting Existing Workflows
+          path: workflows/getting-workflows.mdx
+        - page: Running Workflows
+          path: workflows/running-workflows.mdx
+        - page: Workflow Blocks
+          path: workflows/workflow-blocks.mdx
+        - page: What the heck is a parameter?
+          path: workflows/what-is-a-parameter.mdx
+    - section: Integrations
+      contents:
+        - page: API Integrations
+          path: integrations/api.mdx
+        - page: Zapier
+          path: integrations/zapier.mdx
+        - page: ''
+          path: integrations/make.com.mdx
+        - page: Workato
+          path: integrations/workato.mdx
+  - tab: api
+    layout:
+      - api: API Reference
+        snippets:
           python: skyvern
-      - page: Webhooks FAQ
-        path: running-tasks/webhooks-faq.mdx
-      - page: Visualizing Results
-        path: running-tasks/visualizing-results.mdx
-      - page: Advanced Settings for tasks
-        path: running-tasks/advanced-features.mdx
-  - section: Workflows (Beta)
-    contents:
-      - page: Introduction
-        path: workflows/introduction.mdx
-      - page: Creating Workflows
-        path: workflows/creating-workflows.mdx
-      - page: Getting Existing Workflows
-        path: workflows/getting-workflows.mdx
-      - page: Running Workflows
-        path: workflows/running-workflows.mdx
-      - page: Workflow Blocks
-        path: workflows/workflow-blocks.mdx
-      - page: What the heck is a parameter?
-        path: workflows/what-is-a-parameter.mdx
-  - section: Integrations
-    contents:
-      - page: API Integrations
-        path: integrations/api.mdx
-      - page: Zapier
-        path: integrations/zapier.mdx
-      - page: ''
-        path: integrations/make.com.mdx
-      - page: Workato
-        path: integrations/workato.mdx
+  - tab: blog
+  - tab: github
+  - tab: cloud
+  - tab: demo
