@@ -392,10 +392,7 @@ async def _setup_local_organization() -> str:
     """
     Returns the API key for the local organization generated
     """
-    skyvern_agent = SkyvernAgent(
-        base_url=settings.SKYVERN_BASE_URL,
-        api_key=settings.SKYVERN_API_KEY,
-    )
+    skyvern_agent = SkyvernAgent()
     organization = await skyvern_agent.get_organization()
 
     org_auth_token = await app.DATABASE.get_valid_org_auth_token(
@@ -403,69 +400,6 @@ async def _setup_local_organization() -> str:
         token_type=OrganizationAuthTokenType.api,
     )
     return org_auth_token.token if org_auth_token else ""
-
-
-@cli_app.command(name="init")
-def init() -> None:
-    run_local_str = (
-        input("Would you like to run Skyvern locally or in the cloud? (local/cloud) [cloud]: ").strip().lower()
-    )
-    run_local = run_local_str == "local" if run_local_str else False
-
-    if run_local:
-        setup_postgresql()
-        api_key = asyncio.run(_setup_local_organization())
-
-        if os.path.exists(".env"):
-            print(".env file already exists, skipping initialization.")
-            redo_llm_setup = input("Do you want to go through LLM provider setup again (y/n)? ")
-            if redo_llm_setup.lower() != "y":
-                return
-
-        print("Initializing .env file...")
-        setup_llm_providers()
-
-        # Configure browser settings
-        browser_type, browser_location, remote_debugging_url = setup_browser_config()
-        update_or_add_env_var("BROWSER_TYPE", browser_type)
-        if browser_location:
-            update_or_add_env_var("CHROME_EXECUTABLE_PATH", browser_location)
-        if remote_debugging_url:
-            update_or_add_env_var("BROWSER_REMOTE_DEBUGGING_URL", remote_debugging_url)
-
-        print("Defaulting Skyvern Base URL to: http://localhost:8000")
-        update_or_add_env_var("SKYVERN_BASE_URL", "http://localhost:8000")
-
-    else:
-        base_url = input("Enter Skyvern base URL (press Enter for https://api.skyvern.com): ").strip()
-        if not base_url:
-            base_url = "https://api.skyvern.com"
-
-        print("To get your API key:")
-        print("1. Create an account at https://app.skyvern.com")
-        print("2. Go to Settings")
-        print("3. Copy your API key")
-        api_key = input("Enter your Skyvern API key: ").strip()
-        if not api_key:
-            print("API key is required")
-            api_key = input("Enter your Skyvern API key: ").strip()
-
-        update_or_add_env_var("SKYVERN_BASE_URL", base_url)
-
-    # Ask for email or generate UUID
-    analytics_id = input("Please enter your email for analytics (press enter to skip): ")
-    if not analytics_id:
-        analytics_id = str(uuid.uuid4())
-
-    update_or_add_env_var("ANALYTICS_ID", analytics_id)
-    update_or_add_env_var("SKYVERN_API_KEY", api_key)
-    print(".env file has been initialized.")
-
-    # Ask if user wants to configure MCP server
-    configure_mcp = input("\nWould you like to configure the MCP server (y/n)? ").lower() == "y"
-    if configure_mcp:
-        setup_mcp()
-        print("\nMCP server configuration completed.")
 
 
 @cli_app.command(name="migrate")
@@ -626,19 +560,6 @@ def setup_mcp_config() -> str:
     return path_to_env
 
 
-def setup_mcp() -> None:
-    """Configure MCP for different Skyvern deployments."""
-    host_system = detect_os()
-
-    path_to_env = setup_mcp_config()
-
-    # Configure both Claude Desktop and Cursor
-
-    setup_claude_desktop_config(host_system, path_to_env)
-    setup_cursor_config(host_system, path_to_env)
-    setup_windsurf_config(host_system, path_to_env)
-
-
 def setup_claude_desktop_config(host_system: str, path_to_env: str) -> bool:
     """Set up Claude Desktop configuration with given command and args."""
     if not is_claude_desktop_installed(host_system):
@@ -737,6 +658,18 @@ def setup_cursor_config(host_system: str, path_to_env: str) -> bool:
         return False
 
 
+def setup_mcp() -> None:
+    """Configure MCP for different Skyvern deployments."""
+    host_system = detect_os()
+
+    path_to_env = setup_mcp_config()
+
+    # Configure both Claude Desktop and Cursor
+    setup_claude_desktop_config(host_system, path_to_env)
+    setup_cursor_config(host_system, path_to_env)
+    setup_windsurf_config(host_system, path_to_env)
+
+
 @run_app.command(name="server")
 def run_server() -> None:
     load_dotenv()
@@ -755,3 +688,66 @@ def run_server() -> None:
 def run_mcp() -> None:
     """Run the MCP server."""
     mcp.run(transport="stdio")
+
+
+@cli_app.command(name="init")
+def init() -> None:
+    run_local_str = (
+        input("Would you like to run Skyvern locally or in the cloud? (local/cloud) [cloud]: ").strip().lower()
+    )
+    run_local = run_local_str == "local" if run_local_str else False
+
+    if run_local:
+        setup_postgresql()
+        api_key = asyncio.run(_setup_local_organization())
+
+        if os.path.exists(".env"):
+            print(".env file already exists, skipping initialization.")
+            redo_llm_setup = input("Do you want to go through LLM provider setup again (y/n)? ")
+            if redo_llm_setup.lower() != "y":
+                return
+
+        print("Initializing .env file...")
+        setup_llm_providers()
+
+        # Configure browser settings
+        browser_type, browser_location, remote_debugging_url = setup_browser_config()
+        update_or_add_env_var("BROWSER_TYPE", browser_type)
+        if browser_location:
+            update_or_add_env_var("CHROME_EXECUTABLE_PATH", browser_location)
+        if remote_debugging_url:
+            update_or_add_env_var("BROWSER_REMOTE_DEBUGGING_URL", remote_debugging_url)
+
+        print("Defaulting Skyvern Base URL to: http://localhost:8000")
+        update_or_add_env_var("SKYVERN_BASE_URL", "http://localhost:8000")
+
+    else:
+        base_url = input("Enter Skyvern base URL (press Enter for https://api.skyvern.com): ").strip()
+        if not base_url:
+            base_url = "https://api.skyvern.com"
+
+        print("To get your API key:")
+        print("1. Create an account at https://app.skyvern.com")
+        print("2. Go to Settings")
+        print("3. Copy your API key")
+        api_key = input("Enter your Skyvern API key: ").strip()
+        if not api_key:
+            print("API key is required")
+            api_key = input("Enter your Skyvern API key: ").strip()
+
+        update_or_add_env_var("SKYVERN_BASE_URL", base_url)
+
+    # Ask for email or generate UUID
+    analytics_id = input("Please enter your email for analytics (press enter to skip): ")
+    if not analytics_id:
+        analytics_id = str(uuid.uuid4())
+
+    update_or_add_env_var("ANALYTICS_ID", analytics_id)
+    update_or_add_env_var("SKYVERN_API_KEY", api_key)
+    print(".env file has been initialized.")
+
+    # Ask if user wants to configure MCP server
+    configure_mcp = input("\nWould you like to configure the MCP server (y/n)? ").lower() == "y"
+    if configure_mcp:
+        setup_mcp()
+        print("\nMCP server configuration completed.")
