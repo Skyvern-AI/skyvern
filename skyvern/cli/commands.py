@@ -28,12 +28,17 @@ mcp = FastMCP("Skyvern")
 
 
 @mcp.tool()
-async def skyvern_run_task(prompt: str, url: str) -> str:
-    """Browse the internet using a browser to achieve a user goal.
+async def skyvern_run_task(prompt: str, url: str) -> dict[str, str]:
+    """Execute automated browser actions to accomplish a user's goal on a website.
+
+    This tool uses Skyvern's browser automation to navigate websites and perform actions to achieve
+    the user's intended outcome. It can handle tasks like form filling, clicking buttons, data extraction,
+    and multi-step workflows.
 
     Args:
-        prompt: brief description of what the user wants to accomplish
-        url: the target website for the user goal
+        prompt: A natural language description of what needs to be accomplished (e.g. "Book a flight from
+               NYC to LA", "Sign up for the newsletter", "Find the price of item X", "Apply to a job")
+        url: The starting URL of the website where the task should be performed
     """
     skyvern_agent = SkyvernAgent(
         base_url=settings.SKYVERN_BASE_URL,
@@ -41,7 +46,14 @@ async def skyvern_run_task(prompt: str, url: str) -> str:
         extra_headers={"X-User-Agent": "skyvern-mcp"},
     )
     res = await skyvern_agent.run_task(prompt=prompt, url=url)
-    return res.model_dump()["output"]
+
+    # TODO: It would be nice if we could return the task URL here
+    output = res.model_dump()["output"]
+    base_url = settings.SKYVERN_BASE_URL
+    run_history_url = (
+        "https://app.skyvern.com/history" if "skyvern.com" in base_url else "http://localhost:8080/history"
+    )
+    return {"output": output, "run_history_url": run_history_url}
 
 
 def command_exists(command: str) -> bool:
@@ -665,9 +677,17 @@ def setup_mcp() -> None:
     path_to_env = setup_mcp_config()
 
     # Configure both Claude Desktop and Cursor
-    setup_claude_desktop_config(host_system, path_to_env)
-    setup_cursor_config(host_system, path_to_env)
-    setup_windsurf_config(host_system, path_to_env)
+    claude_response = input("Would you like to set up MCP integration for Claude Desktop? (y/n) [y]: ").strip().lower()
+    if not claude_response or claude_response == "y":
+        setup_claude_desktop_config(host_system, path_to_env)
+
+    cursor_response = input("Would you like to set up MCP integration for Cursor? (y/n) [y]: ").strip().lower()
+    if not cursor_response or cursor_response == "y":
+        setup_cursor_config(host_system, path_to_env)
+
+    windsurf_response = input("Would you like to set up MCP integration for Windsurf? (y/n) [y]: ").strip().lower()
+    if not windsurf_response or windsurf_response == "y":
+        setup_windsurf_config(host_system, path_to_env)
 
 
 @run_app.command(name="server")
@@ -682,6 +702,59 @@ def run_server() -> None:
         port=port,
         log_level="info",
     )
+
+
+@run_app.command(name="ui")
+def run_ui() -> None:
+    # FIXME: This is untested and may not work
+    """Run the Skyvern UI server."""
+    # Check for and handle any existing process on port 8080
+    try:
+        result = subprocess.run("lsof -t -i :8080", shell=True, capture_output=True, text=True, check=False)
+        if result.stdout.strip():
+            response = input("Process already running on port 8080. Kill it? (y/n) [y]: ").strip().lower()
+            if not response or response == "y":
+                subprocess.run("lsof -t -i :8080 | xargs kill", shell=True, check=False)
+            else:
+                print("UI server not started. Process already running on port 8080.")
+                return
+    except Exception:
+        pass
+
+    # Get the frontend directory path relative to this file
+    current_dir = Path(__file__).parent.parent.parent
+    frontend_dir = current_dir / "skyvern-frontend"
+    if not frontend_dir.exists():
+        print(f"[ERROR] Skyvern Frontend directory not found at {frontend_dir}. Are you in the right repo?")
+        return
+
+    if not (frontend_dir / ".env").exists():
+        shutil.copy(frontend_dir / ".env.example", frontend_dir / ".env")
+        # Update VITE_SKYVERN_API_KEY in frontend .env with SKYVERN_API_KEY from main .env
+        main_env_path = current_dir / ".env"
+        if main_env_path.exists():
+            load_dotenv(main_env_path)
+            skyvern_api_key = os.getenv("SKYVERN_API_KEY")
+            if skyvern_api_key:
+                frontend_env_path = frontend_dir / ".env"
+                set_key(str(frontend_env_path), "VITE_SKYVERN_API_KEY", skyvern_api_key)
+            else:
+                print("[ERROR] SKYVERN_API_KEY not found in .env file")
+        else:
+            print("[ERROR] .env file not found")
+
+        print("Successfully set up frontend .env file")
+
+    # Change to frontend directory
+    os.chdir(frontend_dir)
+
+    # Run npm install and start
+    try:
+        subprocess.run("npm install --silent", shell=True, check=True)
+        subprocess.run("npm run start", shell=True, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error running UI server: {e}")
+        return
 
 
 @run_app.command(name="mcp")
@@ -751,3 +824,10 @@ def init() -> None:
     if configure_mcp:
         setup_mcp()
         print("\nMCP server configuration completed.")
+
+        if not run_local:
+            print("\nMCP configuration is complete! Your AI applications are now ready to use Skyvern Cloud.")
+
+    if run_local:
+        print("\nTo start using Skyvern, run:")
+        print("    skyvern run server")

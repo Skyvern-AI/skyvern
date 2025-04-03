@@ -99,6 +99,12 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
 	skyvern run server
 	```
 
+4. **Launch the Skyvern UI**
+
+```bash
+skyvern run ui
+```
+
 ## Docker Compose setup
 
 1. Make sure you have [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running on your machine
