@@ -88,7 +88,7 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
 	pip install skyvern
 	```
 
-2. **Configure Skyvern** Run the setup wizard which will guide you through the configuration process, including Skyvern MCP integration. This will generate a `.env` as the configuration settings file.
+2. **Configure Skyvern** Run the setup wizard which will guide you through the configuration process, including Skyvern [MCP](https://github.com/Skyvern-AI/skyvern/blob/main/integrations/mcp/README.md) integration. This will generate a `.env` as the configuration settings file.
 	```bash
 	skyvern init
 	```
@@ -112,48 +112,7 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
 3. Navigate to `http://localhost:8080` in your browser to start using the UI
 
 ## Model Context Protocol (MCP)
-
-Skyvern provides an MCP server implementation that seamlessly integrates with applications so your application gets access to the browser, fetching any live information from the browser and take actions through Skyvern's browser agent.
-
-### Integration Options
-
-You can connect your MCP-enabled applications to Skyvern in two ways:
-1. **Local Skyvern Server**
-   - Configure your applications to connect to skyvern server running on the localhost
-   - To run Skyvern server locally: `skyvern run server`
-
-2. **Skyvern Cloud**
-   - Configure your applications to connect to Skyvern Cloud
-   - Make sure to an account at [cloud.skyvern.com](https://cloud.skyvern.com) first
-   - Get the API key from the settings page which will be used for setup
-
-Follow the [installation instructions](#local) to set up. 
-
-### Supported Applications
-- Cursor
-- Windsurf
-- Claude Desktop
-
-`skyvern init` helps you set up the MCP config files for these supported applications automatically - no need to copy-paste the config files. In case you want to set up Skyvern for any other MCP-enabled application, here's the config:
-```
-{
-  "mcpServers": {
-    "Skyvern": {
-      "env": {
-        "SKYVERN_BASE_URL": "https://api.skyvern.com", # "http://localhost:8000" if running locally
-        "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY" # find the local SKYVERN_API_KEY in the .env file after running `skyvern init`
-      },
-      "command": "PATH_TO_PYTHON",
-      "args": [
-        "-m",
-        "skyvern",
-        "run",
-        "mcp"
-      ]
-    }
-  }
-}
-```
+See the MCP documentation [here](https://github.com/Skyvern-AI/skyvern/blob/main/integrations/mcp/README.md)
 
 ## Prompting Tips
 
