@@ -661,12 +661,9 @@ class SkyvernElement:
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> float:
         self_rect = await self.get_locator().bounding_box(timeout=timeout)
-        if self_rect is None:
-            raise Exception("Can't Skyvern element rect")
-
         target_rect = await target_locator.bounding_box(timeout=timeout)
         if self_rect is None or target_rect is None:
-            raise Exception("Can't get the target element rect")
+            return float("inf")  # Return infinity as the distance when element rect is not available
 
         y_1 = self_rect["y"] + self_rect["height"] - target_rect["y"]
         y_2 = self_rect["y"] - (target_rect["y"] + target_rect["height"])
@@ -686,12 +683,9 @@ class SkyvernElement:
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> float:
         self_rect = await self.get_locator().bounding_box(timeout=timeout)
-        if self_rect is None:
-            raise Exception("Can't Skyvern element rect")
-
         target_rect = await target_locator.bounding_box(timeout=timeout)
         if self_rect is None or target_rect is None:
-            raise Exception("Can't get the target element rect")
+            return float("inf")  # Return infinity as the distance when element rect is not available
 
         x_1 = self_rect["x"] + self_rect["width"] - target_rect["x"]
         x_2 = self_rect["x"] - (target_rect["x"] + target_rect["width"])
