@@ -278,6 +278,12 @@ async def run_task_v2(
             organization_id=organization_id,
         )
     finally:
+        if task_v2.workflow_id and not workflow:
+            workflow = await app.WORKFLOW_SERVICE.get_workflow(task_v2.workflow_id, organization_id=organization_id)
+        if task_v2.workflow_run_id and not workflow_run:
+            workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+                task_v2.workflow_run_id, organization_id=organization_id
+            )
         if workflow and workflow_run and workflow_run.parent_workflow_run_id is None:
             await app.WORKFLOW_SERVICE.clean_up_workflow(
                 workflow=workflow,
