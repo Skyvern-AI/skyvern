@@ -12,6 +12,7 @@ from urllib.parse import unquote, urlparse
 import aiohttp
 import structlog
 from multidict import CIMultiDictProxy
+from yarl import URL
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, BROWSER_DOWNLOADING_SUFFIX, REPO_ROOT_DIR
@@ -83,7 +84,7 @@ async def download_file(url: str, max_size_mb: int | None = None) -> str:
 
         async with aiohttp.ClientSession(raise_for_status=True) as session:
             LOG.info("Starting to download file", url=url)
-            async with session.get(url) as response:
+            async with session.get(URL(url, encoded=True)) as response:
                 # Check the content length if available
                 if max_size_mb and response.content_length and response.content_length > max_size_mb * 1024 * 1024:
                     # todo: move to root exception.py
