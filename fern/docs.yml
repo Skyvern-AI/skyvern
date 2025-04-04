@@ -17,6 +17,16 @@ colors:
 analytics:
   posthog:
     api-key: ${POSTHOG_API_KEY}
+navbar-links:
+  - type: minimal
+    icon: fa-brands fa-discord
+    href: https://discord.gg/fG2XXEuQX3
+  - type: minimal
+    icon: fa-brands fa-github
+    href: https://github.com/Skyvern-AI/Skyvern/
+  - type: filled
+    text: Try Skyvern Cloud
+    href: https://app.skyvern.com
 tabs:
   home:
     display-name: Home
@@ -34,7 +44,7 @@ tabs:
     href: https://discord.gg/fG2XXEuQX3
   github:
     display-name: Github
-    icon: fa-github dark:fa-github fa-toggle-on
+    icon: fa-brands fa-github
     href: https://github.com/Skyvern-AI/Skyvern/
   cloud:
     display-name: Skyvern Cloud
@@ -91,8 +101,10 @@ navigation:
           path: integrations/api.mdx
         - page: Zapier
           path: integrations/zapier.mdx
-        - page: ''
+        - page: Make
           path: integrations/make.com.mdx
+        - page: N8N
+          path: integrations/n8n.mdx
         - page: Workato
           path: integrations/workato.mdx
   - tab: api
