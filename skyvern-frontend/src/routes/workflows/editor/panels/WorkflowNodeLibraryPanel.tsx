@@ -44,8 +44,8 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Task v2 Block",
-    description: "Runs a Skyvern 2.0 Task",
+    title: "Navigation v2 Block",
+    description: "Navigate on the page with Skyvern 2.0",
   },
   {
     nodeType: "action",
