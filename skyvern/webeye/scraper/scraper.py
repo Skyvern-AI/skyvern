@@ -229,6 +229,7 @@ class ScrapedPage(BaseModel):
     hash_to_element_ids: dict[str, list[str]]
     element_tree: list[dict]
     element_tree_trimmed: list[dict]
+    economy_element_tree: list[dict] | None = None
     screenshots: list[bytes]
     url: str
     html: str
@@ -267,6 +268,58 @@ class ScrapedPage(BaseModel):
             )
 
         raise UnknownElementTreeFormat(fmt=fmt)
+
+    def build_economy_elements_tree(
+        self,
+        fmt: ElementTreeFormat = ElementTreeFormat.HTML,
+        html_need_skyvern_attrs: bool = True,
+        percent_to_keep: float = 1,
+    ) -> str:
+        """
+        Economy elements tree doesn't include secondary elements like SVG, etc
+        """
+        if not self.economy_element_tree:
+            economy_elements = []
+            copied_element_tree_trimmed = copy.deepcopy(self.element_tree_trimmed)
+
+            # Process each root element
+            for root_element in copied_element_tree_trimmed:
+                processed_element = self._process_element_for_economy_tree(root_element)
+                if processed_element:
+                    economy_elements.append(processed_element)
+
+            self.economy_element_tree = economy_elements
+
+        final_element_tree = self.economy_element_tree[: int(len(self.economy_element_tree) * percent_to_keep)]
+
+        if fmt == ElementTreeFormat.JSON:
+            return json.dumps(final_element_tree)
+
+        if fmt == ElementTreeFormat.HTML:
+            return "".join(
+                json_to_html(element, need_skyvern_attrs=html_need_skyvern_attrs) for element in final_element_tree
+            )
+
+        raise UnknownElementTreeFormat(fmt=fmt)
+
+    def _process_element_for_economy_tree(self, element: dict) -> dict | None:
+        """
+        Helper method to process an element for the economy tree using BFS.
+        Removes SVG elements and their children.
+        """
+        # Skip SVG elements entirely
+        if element.get("tagName", "").lower() == "svg":
+            return None
+
+        # Process children using BFS
+        if "children" in element:
+            new_children = []
+            for child in element["children"]:
+                processed_child = self._process_element_for_economy_tree(child)
+                if processed_child:
+                    new_children.append(processed_child)
+            element["children"] = new_children
+        return element
 
     async def refresh(self, draw_boxes: bool = True) -> Self:
         refreshed_page = await scrape_website(

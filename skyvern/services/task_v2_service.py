@@ -53,6 +53,7 @@ from skyvern.forge.sdk.workflow.models.yaml import (
     WorkflowDefinitionYAML,
 )
 from skyvern.schemas.runs import ProxyLocation, RunType
+from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -462,10 +463,11 @@ async def run_task_v2_helper(
                 continue
             current_url = current_url if current_url else str(await SkyvernFrame.get_url(frame=page) if page else url)
 
-            task_v2_prompt = prompt_engine.load_prompt(
+            task_v2_prompt = load_prompt_with_elements(
+                scraped_page,
+                prompt_engine,
                 "task_v2",
                 current_url=current_url,
-                elements=element_tree_in_prompt,
                 user_goal=user_prompt,
                 task_history=task_history,
                 local_datetime=datetime.now(context.tz_info).isoformat(),

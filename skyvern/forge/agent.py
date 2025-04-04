@@ -68,6 +68,7 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, Tas
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, ValidationBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
+from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions.actions import (
     Action,
     ActionStatus,
@@ -1196,11 +1197,12 @@ class ForgeAgent:
         )
         scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False)
 
-        verification_prompt = prompt_engine.load_prompt(
-            "check-user-goal",
+        verification_prompt = load_prompt_with_elements(
+            scraped_page=scraped_page_refreshed,
+            prompt_engine=prompt_engine,
+            template_name="check-user-goal",
             navigation_goal=task.navigation_goal,
             navigation_payload=task.navigation_payload,
-            elements=scraped_page_refreshed.build_element_tree(ElementTreeFormat.HTML),
             complete_criterion=task.complete_criterion,
         )
 
@@ -1432,7 +1434,7 @@ class ForgeAgent:
             task,
             step,
             browser_state,
-            element_tree_in_prompt,
+            scraped_page,
             verification_code_check=bool(task.totp_verification_url or task.totp_identifier),
             expire_verification_code=True,
         )
@@ -1470,7 +1472,7 @@ class ForgeAgent:
         task: Task,
         step: Step,
         browser_state: BrowserState,
-        element_tree_in_prompt: str,
+        scraped_page: ScrapedPage,
         verification_code_check: bool = False,
         expire_verification_code: bool = False,
     ) -> str:
@@ -1525,13 +1527,14 @@ class ForgeAgent:
             raise UnsupportedTaskType(task_type=task_type)
 
         context = skyvern_context.ensure_context()
-        return prompt_engine.load_prompt(
-            template=template,
+        return load_prompt_with_elements(
+            scraped_page=scraped_page,
+            prompt_engine=prompt_engine,
+            template_name=template,
             navigation_goal=navigation_goal,
             navigation_payload_str=json.dumps(final_navigation_payload),
             starting_url=starting_url,
             current_url=current_url,
-            elements=element_tree_in_prompt,
             data_extraction_goal=task.data_extraction_goal,
             action_history=actions_and_results_str,
             error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
@@ -2300,12 +2303,11 @@ class ForgeAgent:
             current_context = skyvern_context.ensure_context()
             current_context.totp_codes[task.task_id] = verification_code
 
-            element_tree_in_prompt: str = scraped_page.build_element_tree(ElementTreeFormat.HTML)
             extract_action_prompt = await self._build_extract_action_prompt(
                 task,
                 step,
                 browser_state,
-                element_tree_in_prompt,
+                scraped_page,
                 verification_code_check=False,
                 expire_verification_code=True,
             )
