@@ -79,7 +79,9 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
                 titleClassName="text-base"
                 inputClassName="text-base"
               />
-              <span className="text-xs text-slate-400">Task v2 Block</span>
+              <span className="text-xs text-slate-400">
+                Navigation v2 Block
+              </span>
             </div>
           </div>
           <NodeActionMenu
