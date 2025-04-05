@@ -187,6 +187,11 @@ class BrowserContextFactory:
         if cdp_port:
             browser_args.append(f"--remote-debugging-port={cdp_port}")
 
+        if extension_paths:
+            joined_paths = ",".join(extension_paths)
+            browser_args.extend([f"--disable-extensions-except={joined_paths}", f"--load-extension={joined_paths}"])
+            LOG.info("Extensions added to browser args", extensions=joined_paths)
+
         args = {
             "locale": settings.BROWSER_LOCALE,
             "color_scheme": "no-preference",
@@ -201,16 +206,6 @@ class BrowserContextFactory:
                 "height": settings.BROWSER_HEIGHT,
             },
         }
-
-        if extension_paths:
-            joined_paths = ",".join(extension_paths)
-            args["args"].extend(
-                [
-                    f"--disable-extensions-except={joined_paths}",
-                    f"--load-extension={joined_paths}",
-                ]
-            )
-            LOG.info("Extensions added to browser args", extensions=joined_paths)
 
         if proxy_location:
             if tz_info := get_tzinfo_from_proxy(proxy_location=proxy_location):
