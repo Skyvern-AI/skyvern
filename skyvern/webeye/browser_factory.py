@@ -170,6 +170,16 @@ class BrowserContextFactory:
             f"{settings.HAR_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{BrowserContextFactory.get_subdir()}.har"
         )
 
+        extension_paths = []
+        if settings.EXTENSIONS and settings.EXTENSIONS_BASE_PATH:
+            try:
+                os.makedirs(settings.EXTENSIONS_BASE_PATH, exist_ok=True)
+
+                extension_paths = [str(Path(settings.EXTENSIONS_BASE_PATH) / ext) for ext in settings.EXTENSIONS]
+                LOG.info("Extensions paths constructed", extension_paths=extension_paths)
+            except Exception as e:
+                LOG.error("Error constructing extension paths", error=str(e))
+
         browser_args = [
             "--disable-blink-features=AutomationControlled",
             "--disk-cache-size=1",
@@ -179,6 +189,11 @@ class BrowserContextFactory:
 
         if cdp_port:
             browser_args.append(f"--remote-debugging-port={cdp_port}")
+
+        if extension_paths:
+            joined_paths = ",".join(extension_paths)
+            browser_args.extend([f"--disable-extensions-except={joined_paths}", f"--load-extension={joined_paths}"])
+            LOG.info("Extensions added to browser args", extensions=joined_paths)
 
         args = {
             "locale": settings.BROWSER_LOCALE,

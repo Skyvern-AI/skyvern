@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     BROWSER_WIDTH: int = 1920
     BROWSER_HEIGHT: int = 1080
 
+    # Add extension folders name here to load extension in your browser
+    EXTENSIONS_BASE_PATH: str = "./extensions"
+    EXTENSIONS: list[str] = []
+
     # Workflow constant parameters
     WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY: str = "SKYVERN_DOWNLOAD_DIRECTORY"
     WORKFLOW_WAIT_BLOCK_MAX_SEC: int = 30 * 60
