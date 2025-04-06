@@ -109,7 +109,13 @@ setup_llm_providers() {
         else
             update_or_add_env_var "GEMINI_API_KEY" "$gemini_api_key"
             update_or_add_env_var "ENABLE_GEMINI" "true"
-            model_options+=("GEMINI_PRO")
+            model_options+=(
+                "GEMINI_FLASH_2_0"
+                "GEMINI_FLASH_2_0_LITE"
+                "GEMINI_PRO"
+                "GEMINI_2.5_PRO_PREVIEW_03_25"
+                "GEMINI_2.5_PRO_EXP_03_25"
+            )
         fi
     else
         update_or_add_env_var "ENABLE_GEMINI" "false"
