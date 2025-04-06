@@ -279,7 +279,15 @@ def setup_llm_providers() -> None:
         else:
             update_or_add_env_var("GEMINI_API_KEY", gemini_api_key)
             update_or_add_env_var("ENABLE_GEMINI", "true")
-            model_options.extend(["GEMINI_FLASH_2_0", "GEMINI_FLASH_2_0_LITE", "GEMINI_PRO"])
+            model_options.extend(
+                [
+                    "GEMINI_FLASH_2_0",
+                    "GEMINI_FLASH_2_0_LITE",
+                    "GEMINI_PRO",
+                    "GEMINI_2.5_PRO_PREVIEW_03_25",
+                    "GEMINI_2.5_PRO_EXP_03_25",
+                ]
+            )
     else:
         update_or_add_env_var("ENABLE_GEMINI", "false")
 

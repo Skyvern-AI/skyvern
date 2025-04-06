@@ -348,6 +348,27 @@ if settings.ENABLE_GEMINI:
             max_completion_tokens=8192,
         ),
     )
+    LLMConfigRegistry.register_config(
+        "GEMINI_2.5_PRO_PREVIEW_03_25",
+        LLMConfig(
+            "gemini/gemini-2.5-pro-preview-03-25",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=1048576,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "GEMINI_2.5_PRO_EXP_03_25",
+        LLMConfig(
+            "gemini/gemini-2.5-pro-exp-03-25",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=1048576,
+        ),
+    )
+
 
 if settings.ENABLE_NOVITA:
     LLMConfigRegistry.register_config(
