@@ -67,6 +67,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
+from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions import actions
 from skyvern.webeye.actions.actions import (
     Action,
@@ -84,7 +85,6 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.scraper.scraper import (
     CleanupElementTreeFunc,
-    ElementTreeFormat,
     IncrementalScrapePage,
     ScrapedPage,
     hash_element,
@@ -751,12 +751,12 @@ async def handle_input_text_action(
             return [ActionSuccess()]
 
         if not await skyvern_element.is_raw_input():
-            # parse the input context to help executing input action
-            prompt = prompt_engine.load_prompt(
-                "parse-input-or-select-context",
+            prompt = load_prompt_with_elements(
+                scraped_page=scraped_page,
+                prompt_engine=prompt_engine,
+                template_name="parse-input-or-select-context",
                 element_id=action.element_id,
                 action_reasoning=action.reasoning,
-                elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
             )
 
             json_response = await app.SECONDARY_LLM_API_HANDLER(
@@ -1934,11 +1934,12 @@ async def sequentially_select_from_dropdown(
     Only return the last value today
     """
 
-    prompt = prompt_engine.load_prompt(
-        "parse-input-or-select-context",
+    prompt = load_prompt_with_elements(
+        scraped_page=dom.scraped_page,
+        prompt_engine=prompt_engine,
+        template_name="parse-input-or-select-context",
         action_reasoning=action.reasoning,
         element_id=action.element_id,
-        elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
     )
     json_response = await app.SECONDARY_LLM_API_HANDLER(
         prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
@@ -2617,11 +2618,12 @@ async def normal_select(
     is_success = False
     locator = skyvern_element.get_locator()
 
-    prompt = prompt_engine.load_prompt(
-        "parse-input-or-select-context",
+    prompt = load_prompt_with_elements(
+        scraped_page=dom.scraped_page,
+        prompt_engine=prompt_engine,
+        template_name="parse-input-or-select-context",
         action_reasoning=action.reasoning,
         element_id=action.element_id,
-        elements=dom.scraped_page.build_element_tree(ElementTreeFormat.HTML),
     )
     json_response = await app.SECONDARY_LLM_API_HANDLER(
         prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
@@ -2785,20 +2787,15 @@ async def extract_information_for_navigation_goal(
     1. JSON representation of what the user is seeing
     2. The scraped page
     """
-    prompt_template = "extract-information"
-
-    # TODO: we only use HTML element for now, introduce a way to switch in the future
-    element_tree_format = ElementTreeFormat.HTML
-    element_tree_in_prompt: str = scraped_page.build_element_tree(element_tree_format, html_need_skyvern_attrs=False)
-
     scraped_page_refreshed = await scraped_page.refresh()
-
     context = ensure_context()
-    extract_information_prompt = prompt_engine.load_prompt(
-        prompt_template,
+    extract_information_prompt = load_prompt_with_elements(
+        scraped_page=scraped_page_refreshed,
+        prompt_engine=prompt_engine,
+        template_name="extract-information",
+        html_need_skyvern_attrs=False,
         navigation_goal=task.navigation_goal,
         navigation_payload=task.navigation_payload,
-        elements=element_tree_in_prompt,
         data_extraction_goal=task.data_extraction_goal,
         extracted_information_schema=task.extracted_information_schema,
         current_url=scraped_page_refreshed.url,

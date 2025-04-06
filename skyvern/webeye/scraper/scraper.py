@@ -10,10 +10,11 @@ from playwright.async_api import Frame, Locator, Page
 from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
-from skyvern.constants import BUILDING_ELEMENT_TREE_TIMEOUT_MS, SKYVERN_DIR, SKYVERN_ID_ATTR
+from skyvern.constants import BUILDING_ELEMENT_TREE_TIMEOUT_MS, DEFAULT_MAX_TOKENS, SKYVERN_DIR, SKYVERN_ID_ATTR
 from skyvern.exceptions import FailedToTakeScreenshot, ScrapingFailed, UnknownElementTreeFormat
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.utils.token_counter import count_tokens
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -230,6 +231,7 @@ class ScrapedPage(BaseModel):
     element_tree: list[dict]
     element_tree_trimmed: list[dict]
     economy_element_tree: list[dict] | None = None
+    last_used_element_tree: list[dict] | None = None
     screenshots: list[bytes]
     url: str
     html: str
@@ -258,6 +260,7 @@ class ScrapedPage(BaseModel):
     def build_element_tree(
         self, fmt: ElementTreeFormat = ElementTreeFormat.HTML, html_need_skyvern_attrs: bool = True
     ) -> str:
+        self.last_used_element_tree = self.element_tree_trimmed
         if fmt == ElementTreeFormat.JSON:
             return json.dumps(self.element_tree_trimmed)
 
@@ -291,6 +294,7 @@ class ScrapedPage(BaseModel):
             self.economy_element_tree = economy_elements
 
         final_element_tree = self.economy_element_tree[: int(len(self.economy_element_tree) * percent_to_keep)]
+        self.last_used_element_tree = final_element_tree
 
         if fmt == ElementTreeFormat.JSON:
             return json.dumps(final_element_tree)
@@ -488,13 +492,26 @@ async def scrape_web_unsafe(
     LOG.info("Waiting for 5 seconds before scraping the website.")
     await asyncio.sleep(5)
 
-    screenshots = []
-    if take_screenshots:
-        screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=url, draw_boxes=draw_boxes)
-
     elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
     element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))
+    element_tree_trimmed = trim_element_tree(copy.deepcopy(element_tree))
 
+    screenshots = []
+    if take_screenshots:
+        element_tree_trimmed_html_str = "".join(
+            json_to_html(element, need_skyvern_attrs=False) for element in element_tree_trimmed
+        )
+        token_count = count_tokens(element_tree_trimmed_html_str)
+        max_screenshot_number = settings.MAX_NUM_SCREENSHOTS
+        if token_count > DEFAULT_MAX_TOKENS:
+            max_screenshot_number = min(max_screenshot_number, 1)
+
+        screenshots = await SkyvernFrame.take_split_screenshots(
+            page=page,
+            url=url,
+            draw_boxes=draw_boxes,
+            max_number=max_screenshot_number,
+        )
     id_to_css_dict, id_to_element_dict, id_to_frame_dict, id_to_element_hash, hash_to_element_ids = build_element_dict(
         elements
     )
@@ -524,7 +541,7 @@ async def scrape_web_unsafe(
         id_to_element_hash=id_to_element_hash,
         hash_to_element_ids=hash_to_element_ids,
         element_tree=element_tree,
-        element_tree_trimmed=trim_element_tree(copy.deepcopy(element_tree)),
+        element_tree_trimmed=element_tree_trimmed,
         screenshots=screenshots,
         url=page.url,
         html=html,
