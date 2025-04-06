@@ -32,3 +32,4 @@ class ScrapeType(StrEnum):
 
 
 SCRAPE_TYPE_ORDER = [ScrapeType.NORMAL, ScrapeType.NORMAL, ScrapeType.RELOAD]
+DEFAULT_MAX_TOKENS = 100000
