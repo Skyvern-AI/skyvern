@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import re
 import socket
 import subprocess
 import time
 import uuid
-import random
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
 from typing import Any, Awaitable, Callable, Protocol
+from urllib.parse import urlparse
 
 import aiofiles
 import psutil
@@ -358,7 +358,7 @@ def setup_proxy() -> dict | None:
 
 
 def _is_valid_proxy_url(url: str) -> bool:
-    PROXY_PATTERN = re.compile(r'^(http|https|socks5)://([^:@]*:[^@]*@)?[^:@]+:\d+$')
+    PROXY_PATTERN = re.compile(r"^(http|https|socks5)://([^:@]*:[^@]*@)?[^:@]+:\d+$")
     try:
         parsed = urlparse(url)
         if not parsed.scheme or not parsed.netloc:
