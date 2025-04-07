@@ -1320,6 +1320,23 @@ async def mark_task_v2_as_terminated(
     return task_v2
 
 
+async def mark_task_v2_as_timed_out(
+    task_v2_id: str,
+    workflow_run_id: str | None = None,
+    organization_id: str | None = None,
+    failure_reason: str | None = None,
+) -> TaskV2:
+    task_v2 = await app.DATABASE.update_task_v2(
+        task_v2_id,
+        organization_id=organization_id,
+        status=TaskV2Status.timed_out,
+    )
+    if workflow_run_id:
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_timed_out(workflow_run_id, failure_reason)
+    await send_task_v2_webhook(task_v2)
+    return task_v2
+
+
 def _get_extracted_data_from_block_result(
     block_result: BlockResult,
     task_type: str,

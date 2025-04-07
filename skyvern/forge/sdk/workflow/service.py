@@ -770,6 +770,18 @@ class WorkflowService:
             status=WorkflowRunStatus.canceled,
         )
 
+    async def mark_workflow_run_as_timed_out(self, workflow_run_id: str, failure_reason: str | None = None) -> None:
+        LOG.info(
+            f"Marking workflow run {workflow_run_id} as timed out",
+            workflow_run_id=workflow_run_id,
+            workflow_status="timed_out",
+        )
+        await app.DATABASE.update_workflow_run(
+            workflow_run_id=workflow_run_id,
+            status=WorkflowRunStatus.timed_out,
+            failure_reason=failure_reason,
+        )
+
     async def get_workflow_run(self, workflow_run_id: str, organization_id: str | None = None) -> WorkflowRun:
         workflow_run = await app.DATABASE.get_workflow_run(
             workflow_run_id=workflow_run_id,
