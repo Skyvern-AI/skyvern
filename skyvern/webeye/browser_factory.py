@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import socket
 import subprocess
 import time
 import uuid
+import random
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any, Awaitable, Callable, Protocol
 
 import aiofiles
@@ -210,6 +213,11 @@ class BrowserContextFactory:
             },
         }
 
+        if settings.ENABLE_PROXY:
+            proxy_config = setup_proxy()
+            if proxy_config:
+                args["proxy"] = proxy_config
+
         if proxy_location:
             if tz_info := get_tzinfo_from_proxy(proxy_location=proxy_location):
                 args["timezone_id"] = tz_info.key
@@ -309,6 +317,66 @@ class BrowserArtifacts(BaseModel):
 
             async with aiofiles.open(self.browser_console_log_path, "rb") as f:
                 return await f.read()
+
+
+def setup_proxy() -> dict | None:
+    if not settings.HOSTED_PROXY_POOL or settings.HOSTED_PROXY_POOL.strip() == "":
+        LOG.warning("No proxy server value found. Continuing without using proxy...")
+        return None
+
+    proxy_servers = [server.strip() for server in settings.HOSTED_PROXY_POOL.split(",") if server.strip()]
+
+    if not proxy_servers:
+        LOG.warning("Proxy pool contains only empty values. Continuing without proxy...")
+        return None
+
+    valid_proxies = []
+    for proxy in proxy_servers:
+        if _is_valid_proxy_url(proxy):
+            valid_proxies.append(proxy)
+        else:
+            LOG.warning(f"Invalid proxy URL format: {proxy}")
+
+    if not valid_proxies:
+        LOG.warning("No valid proxy URLs found. Continuing without proxy...")
+        return None
+
+    try:
+        proxy_server = random.choice(valid_proxies)
+        proxy_creds = _get_proxy_server_creds(proxy_server)
+
+        LOG.info(f"Using proxy: {proxy_server}")
+
+        return {
+            "server": proxy_server,
+            "username": proxy_creds.get("username", ""),
+            "password": proxy_creds.get("password", ""),
+        }
+    except Exception as e:
+        LOG.warning(f"Error setting up proxy: {e}. Continuing without proxy...")
+        return None
+
+
+def _is_valid_proxy_url(url: str) -> bool:
+    PROXY_PATTERN = re.compile(r'^(http|https|socks5)://([^:@]*:[^@]*@)?[^:@]+:\d+$')
+    try:
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return False
+        return bool(PROXY_PATTERN.match(url))
+    except Exception:
+        return False
+
+
+def _get_proxy_server_creds(proxy: str) -> dict:
+    parsed_url = urlparse(proxy)
+    if parsed_url.username and parsed_url.password:
+        LOG.info(
+            f"Extracted username: {parsed_url.username} and password: {parsed_url.password} from the proxy url: {proxy}"
+        )
+        return {"username": parsed_url.username, "password": parsed_url.password}
+    LOG.warning("No credentials found in the proxy URL.")
+    return {}
 
 
 def _get_cdp_port(kwargs: dict) -> int | None:
