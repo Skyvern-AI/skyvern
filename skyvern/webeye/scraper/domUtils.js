@@ -770,6 +770,11 @@ function isInteractable(element, hoverStylesMap) {
   if (hasASPClientControl() && tagName === "tr") {
     return true;
   }
+
+  if (tagName === "div" && element.hasAttribute("data-selectable")) {
+    return true;
+  }
+
   return false;
 }
 
