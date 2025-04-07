@@ -345,7 +345,7 @@ def setup_proxy() -> dict | None:
         proxy_server = random.choice(valid_proxies)
         proxy_creds = _get_proxy_server_creds(proxy_server)
 
-        LOG.info(f"Using proxy: {proxy_server}")
+        LOG.info("Found proxy server creds, using them...")
 
         return {
             "server": proxy_server,
@@ -371,9 +371,6 @@ def _is_valid_proxy_url(url: str) -> bool:
 def _get_proxy_server_creds(proxy: str) -> dict:
     parsed_url = urlparse(proxy)
     if parsed_url.username and parsed_url.password:
-        LOG.info(
-            f"Extracted username: {parsed_url.username} and password: {parsed_url.password} from the proxy url: {proxy}"
-        )
         return {"username": parsed_url.username, "password": parsed_url.password}
     LOG.warning("No credentials found in the proxy URL.")
     return {}
