@@ -1962,31 +1962,6 @@ async def sequentially_select_from_dropdown(
         )
         return None
 
-    # if it's a <input> date picker, try to input the current date directly first
-    if (
-        input_or_select_context.is_date_related
-        and skyvern_element.get_tag_name() == InteractiveElement.INPUT
-        and action.option.label
-    ):
-        LOG.info(
-            "It's a <input> date picker, going to input the current date directly",
-            step_id=step.step_id,
-            task_id=task.task_id,
-        )
-        try:
-            await skyvern_element.input_sequentially(action.option.label)
-            result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
-            result.action_result = ActionSuccess()
-            return result
-        except Exception:
-            LOG.warning(
-                "Failed to input the current date directly, trigger the selection mode",
-                exc_info=True,
-                step_id=step.step_id,
-                task_id=task.task_id,
-            )
-            await skyvern_element.input_clear()
-
     # TODO: only suport the third-level dropdown selection now
     MAX_SELECT_DEPTH = 3
     values: list[str | None] = []
@@ -2015,15 +1990,36 @@ async def sequentially_select_from_dropdown(
 
         # HACK: if agent took mini actions 2 times, stop executing the rest actions
         # this is a hack to fix some date picker issues.
-        if input_or_select_context.is_date_related and i >= 1 and single_select_result.action_result:
-            LOG.warning(
-                "It's a date picker, going to skip reamaining actions",
-                depth=i,
-                task_id=task.task_id,
-                step_id=step.step_id,
-            )
-            single_select_result.action_result.skip_remaining_actions = True
-            break
+        if input_or_select_context.is_date_related and i >= 1:
+            if skyvern_element.get_tag_name() == InteractiveElement.INPUT and action.option.label:
+                try:
+                    LOG.info(
+                        "Try to input the date directly",
+                        step_id=step.step_id,
+                        task_id=task.task_id,
+                    )
+                    await skyvern_element.input_sequentially(action.option.label)
+                    result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
+                    result.action_result = ActionSuccess()
+                    return result
+
+                except Exception:
+                    LOG.warning(
+                        "Failed to input the date directly",
+                        exc_info=True,
+                        step_id=step.step_id,
+                        task_id=task.task_id,
+                    )
+
+            if single_select_result.action_result:
+                LOG.warning(
+                    "It's a date picker, going to skip reamaining actions",
+                    depth=i,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                )
+                single_select_result.action_result.skip_remaining_actions = True
+                break
 
         if await single_select_result.is_done():
             return single_select_result
