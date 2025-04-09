@@ -6,6 +6,7 @@ from enum import StrEnum
 from typing import Any, Awaitable, Callable, Self
 
 import structlog
+from playwright._impl._errors import TimeoutError
 from playwright.async_api import Frame, Locator, Page
 from pydantic import BaseModel, PrivateAttr
 
@@ -675,9 +676,20 @@ class IncrementalScrapePage:
         frame = self.skyvern_frame.get_frame()
 
         js_script = "async () => await getIncrementElements()"
-        incremental_elements, incremental_tree = await SkyvernFrame.evaluate(
-            frame=frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
-        )
+        try:
+            incremental_elements, incremental_tree = await SkyvernFrame.evaluate(
+                frame=frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+            )
+        except TimeoutError:
+            LOG.warning(
+                "Timeout to get incremental elements with wait_until_finished, going to get incremental elements without waiting",
+            )
+
+            js_script = "async () => await getIncrementElements(false)"
+            incremental_elements, incremental_tree = await SkyvernFrame.evaluate(
+                frame=frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+            )
+
         # we listen the incremental elements seperated by frames, so all elements will be in the same SkyvernFrame
         self.id_to_css_dict, self.id_to_element_dict, _, _, _ = build_element_dict(incremental_elements)
 

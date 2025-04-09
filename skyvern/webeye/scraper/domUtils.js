@@ -2344,12 +2344,14 @@ async function stopGlobalIncrementalObserver() {
   window.globalDomDepthMap = new Map();
 }
 
-async function getIncrementElements() {
-  while (
-    (await window.globalParsedElementCounter.get()) <
-    window.globalOneTimeIncrementElements.length
-  ) {
-    await asyncSleepFor(100);
+async function getIncrementElements(wait_until_finished = true) {
+  if (wait_until_finished) {
+    while (
+      (await window.globalParsedElementCounter.get()) <
+      window.globalOneTimeIncrementElements.length
+    ) {
+      await asyncSleepFor(100);
+    }
   }
 
   // cleanup the chidren tree, remove the duplicated element
