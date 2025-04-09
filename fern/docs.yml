@@ -71,6 +71,8 @@ navigation:
           path: running-tasks/introduction.mdx
         - page: Tasks API
           path: running-tasks/api-spec.mdx
+        - page: Tasks V2 API
+          path: running-tasks/api-v2-spec.mdx
         - api: Endpoints
           paginated: true
           snippets: 
