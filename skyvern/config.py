@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     BLOCKED_HOSTS: list[str] = ["localhost"]
     ALLOWED_HOSTS: list[str] = []
 
+    # Format: "http://<username>:<password>@host:port, http://<username>:<password>@host:port, ...."
+    HOSTED_PROXY_POOL: str = ""
+    ENABLE_PROXY: bool = False
+
     # Secret key for JWT. Please generate your own secret key in production
     SECRET_KEY: str = "PLACEHOLDER"
     # Algorithm used to sign the JWT
