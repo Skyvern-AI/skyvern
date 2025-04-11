@@ -68,7 +68,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
-from skyvern.utils.prompt_engine import load_prompt_with_elements
+from skyvern.utils.prompt_engine import CheckPhoneNumberFormatResponse, load_prompt_with_elements
 from skyvern.webeye.actions import actions
 from skyvern.webeye.actions.actions import (
     Action,
@@ -209,6 +209,52 @@ def clean_and_remove_element_tree_factory(
         return element_tree
 
     return helper_func
+
+
+async def check_phone_number_format(
+    phone_number: str,
+    action: actions.InputTextAction,
+    skyvern_element: SkyvernElement,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> str:
+    # check the phone number format
+    LOG.info(
+        "Input is a tel input, trigger phone number format checking",
+        action=action,
+        element_id=skyvern_element.get_id(),
+    )
+
+    new_scraped_page = await scraped_page.generate_scraped_page_without_screenshots()
+    html = new_scraped_page.build_element_tree(html_need_skyvern_attrs=False)
+    prompt = prompt_engine.load_prompt(
+        template="check-phone-number-format",
+        current_phone_number=phone_number,
+        navigation_goal=task.navigation_goal,
+        navigation_payload_str=json.dumps(task.navigation_payload),
+        elements=html,
+        local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+    )
+
+    json_response = await app.SECONDARY_LLM_API_HANDLER(
+        prompt=prompt, step=step, prompt_name="check-phone-number-format"
+    )
+
+    check_phone_number_format_response = CheckPhoneNumberFormatResponse.model_validate(json_response)
+    if (
+        check_phone_number_format_response.is_current_format_correct
+        or not check_phone_number_format_response.recommended_phone_number
+    ):
+        return phone_number
+
+    LOG.info(
+        "The current phone number format is incorrect, using the recommended phone number",
+        action=action,
+        element_id=skyvern_element.get_id(),
+        recommended_phone_number=check_phone_number_format_response.recommended_phone_number,
+    )
+    return check_phone_number_format_response.recommended_phone_number
 
 
 class AutoCompletionResult(BaseModel):
@@ -557,7 +603,7 @@ async def handle_input_text_action(
 
     # before filling text, we need to validate if the element can be filled if it's not one of COMMON_INPUT_TAGS
     tag_name = scraped_page.id_to_element_dict[action.element_id]["tagName"].lower()
-    text = await get_actual_value_of_parameter_if_secret(task, action.text)
+    text: str | None = await get_actual_value_of_parameter_if_secret(task, action.text)
     if text is None:
         return [ActionFailure(FailedToFetchSecret())]
 
@@ -706,6 +752,25 @@ async def handle_input_text_action(
 
     # force to move focus back to the element
     await skyvern_element.get_locator().focus(timeout=timeout)
+
+    # check the phone number format
+    if await skyvern_element.get_attr("type") == "tel":
+        try:
+            text = await check_phone_number_format(
+                phone_number=text,
+                action=action,
+                skyvern_element=skyvern_element,
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to check the phone number format, using the original text",
+                action=action,
+                exc_info=True,
+            )
+
     # `Locator.clear()` on a spin button could cause the cursor moving away, and never be back
     if not await skyvern_element.is_spinbtn_input():
         try:

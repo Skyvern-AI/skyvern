@@ -1,6 +1,7 @@
 from typing import Any
 
 import structlog
+from pydantic import BaseModel
 
 from skyvern.constants import DEFAULT_MAX_TOKENS
 from skyvern.forge.sdk.prompting import PromptEngine
@@ -8,6 +9,13 @@ from skyvern.utils.token_counter import count_tokens
 from skyvern.webeye.scraper.scraper import ScrapedPage
 
 LOG = structlog.get_logger()
+
+
+class CheckPhoneNumberFormatResponse(BaseModel):
+    phone_number_format: str
+    thought: str
+    is_current_format_correct: bool
+    recommended_phone_number: str | None
 
 
 def load_prompt_with_elements(
