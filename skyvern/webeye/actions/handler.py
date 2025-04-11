@@ -68,7 +68,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
-from skyvern.utils.prompt_engine import load_prompt_with_elements
+from skyvern.utils.prompt_engine import CheckPhoneNumberFormatResponse, load_prompt_with_elements
 from skyvern.webeye.actions import actions
 from skyvern.webeye.actions.actions import (
     Action,
@@ -708,6 +708,43 @@ async def handle_input_text_action(
     await skyvern_element.get_locator().focus(timeout=timeout)
     # `Locator.clear()` on a spin button could cause the cursor moving away, and never be back
     if not await skyvern_element.is_spinbtn_input():
+        if await skyvern_element.get_attr("type") == "tel":
+            # check the phone number format
+            LOG.info(
+                "Input is a tel input, trigger phone number format checking",
+                action=action,
+                element_id=skyvern_element.get_id(),
+            )
+
+            new_scraped_page = await scraped_page.generate_scraped_page_without_screenshots()
+            html = new_scraped_page.build_element_tree(html_need_skyvern_attrs=False)
+            prompt = prompt_engine.load_prompt(
+                template="check-phone-number-format",
+                current_phone_number=text,
+                navigation_goal=task.navigation_goal,
+                navigation_payload_str=json.dumps(task.navigation_payload),
+                elements=html,
+                local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+            )
+
+            json_response = await app.SECONDARY_LLM_API_HANDLER(
+                prompt=prompt, step=step, prompt_name="check-phone-number-format"
+            )
+
+            check_phone_number_format_response = CheckPhoneNumberFormatResponse.model_validate(json_response)
+
+            if (
+                not check_phone_number_format_response.is_current_format_correct
+                and check_phone_number_format_response.recommended_phone_number
+            ):
+                LOG.info(
+                    "The current phone number format is incorrect, using the recommended phone number",
+                    action=action,
+                    element_id=skyvern_element.get_id(),
+                    recommended_phone_number=check_phone_number_format_response.recommended_phone_number,
+                )
+                text = check_phone_number_format_response.recommended_phone_number
+
         try:
             await skyvern_element.input_clear()
         except TimeoutError:
