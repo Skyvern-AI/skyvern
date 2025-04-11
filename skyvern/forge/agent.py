@@ -688,6 +688,7 @@ class ForgeAgent:
                 "Scraping failed, marking the task as failed",
                 task_id=task.task_id,
                 step_id=step.step_id,
+                exc_info=True,
             )
             await self.fail_task(
                 task,
@@ -1525,6 +1526,7 @@ class ForgeAgent:
                     f"{e.__class__.__name__} happened in two normal attempts and reload-page retry",
                     task_id=task.task_id,
                     step_id=step.step_id,
+                    exc_info=True,
                 )
                 raise ScrapingFailed()
 
