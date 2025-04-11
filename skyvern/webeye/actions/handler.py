@@ -77,6 +77,7 @@ from skyvern.webeye.actions.actions import (
     CheckboxAction,
     ClickAction,
     InputOrSelectContext,
+    InputTextAction,
     ScrapeResult,
     SelectOption,
     SelectOptionAction,
@@ -392,6 +393,12 @@ def check_for_invalid_web_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    if isinstance(action, ClickAction) and action.x is not None and action.y is not None:
+        return []
+
+    if isinstance(action, InputTextAction) and not action.element_id:
+        return []
+
     if isinstance(action, WebAction) and action.element_id not in scraped_page.id_to_element_dict:
         return [ActionFailure(MissingElement(element_id=action.element_id), stop_execution_on_failure=False)]
 
@@ -420,6 +427,36 @@ async def handle_click_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    if action.x is not None and action.y is not None:
+        # Find the element at the clicked location using JavaScript evaluation
+        element_id = await page.evaluate(
+            """data => {
+            const element = document.elementFromPoint(data.x, data.y);
+            if (!element) return null;
+
+            // Function to get the unique_id attribute of an element
+            function getElementUniqueId(element) {
+                if (element && element.nodeType === 1) {
+                    // Check if the element has the unique_id attribute
+                    if (element.hasAttribute('unique_id')) {
+                        return element.getAttribute('unique_id');
+                    }
+                    
+                    // If no unique_id attribute is found, return null
+                    return null;
+                }
+                return null;
+            }
+
+            return getElementUniqueId(element);
+        }""",
+            {"x": action.x, "y": action.y},
+        )
+        LOG.info("Clicked element at location", x=action.x, y=action.y, element_id=element_id, button=action.button)
+
+        await page.mouse.click(x=action.x, y=action.y, button=action.button)
+        return [ActionSuccess()]
+
     dom = DomUtil(scraped_page=scraped_page, page=page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     await asyncio.sleep(0.3)
@@ -591,6 +628,11 @@ async def handle_input_text_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    if not action.element_id:
+        # This is a CUA type action
+        await page.keyboard.type(action.text)
+        return [ActionSuccess()]
+
     dom = DomUtil(scraped_page, page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
@@ -1348,7 +1390,7 @@ async def handle_wait_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await asyncio.sleep(20)
+    await asyncio.sleep(action.seconds)
     return [ActionFailure(exception=Exception("Wait action is treated as a failure"))]
 
 
@@ -1422,6 +1464,35 @@ async def handle_extract_action(
         return [ActionFailure(exception=Exception("No data extraction goal"))]
 
 
+async def handle_scroll_action(
+    action: actions.ScrollAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    await page.mouse.move(action.x, action.y)
+    await page.evaluate(f"window.scrollBy({action.scroll_x}, {action.scroll_y})")
+    return [ActionSuccess()]
+
+
+async def handle_keypress_action(
+    action: actions.KeypressAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    for key in action.keys:
+        if key.lower() == "enter":
+            await page.keyboard.press("Enter")
+        elif key.lower() == "space":
+            await page.keyboard.press(" ")
+        else:
+            await page.keyboard.press(key)
+    return [ActionSuccess()]
+
+
 ActionHandler.register_action_type(ActionType.SOLVE_CAPTCHA, handle_solve_captcha_action)
 ActionHandler.register_action_type(ActionType.CLICK, handle_click_action)
 ActionHandler.register_action_type(ActionType.INPUT_TEXT, handle_input_text_action)
@@ -1433,6 +1504,8 @@ ActionHandler.register_action_type(ActionType.WAIT, handle_wait_action)
 ActionHandler.register_action_type(ActionType.TERMINATE, handle_terminate_action)
 ActionHandler.register_action_type(ActionType.COMPLETE, handle_complete_action)
 ActionHandler.register_action_type(ActionType.EXTRACT, handle_extract_action)
+ActionHandler.register_action_type(ActionType.SCROLL, handle_scroll_action)
+ActionHandler.register_action_type(ActionType.KEYPRESS, handle_keypress_action)
 
 
 async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) -> Any:

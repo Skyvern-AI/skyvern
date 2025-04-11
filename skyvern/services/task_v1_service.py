@@ -13,7 +13,7 @@ from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration, TaskGenerationBase
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest
-from skyvern.schemas.runs import RunType
+from skyvern.schemas.runs import RunEngine, RunType
 
 LOG = structlog.get_logger()
 
@@ -76,6 +76,7 @@ async def generate_task(user_prompt: str, organization: Organization) -> TaskGen
 async def run_task(
     task: TaskRequest,
     organization: Organization,
+    engine: RunEngine = RunEngine.skyvern_v1,
     x_max_steps_override: int | None = None,
     x_api_key: str | None = None,
     request: Request | None = None,
@@ -83,8 +84,11 @@ async def run_task(
 ) -> Task:
     created_task = await app.agent.create_task(task, organization.organization_id)
     url_hash = generate_url_hash(task.url)
+    run_type = RunType.task_v1
+    if engine == RunEngine.openai_cua:
+        run_type = RunType.openai_cua
     await app.DATABASE.create_task_run(
-        task_run_type=RunType.task_v1,
+        task_run_type=run_type,
         organization_id=organization.organization_id,
         run_id=created_task.task_id,
         title=task.title,
