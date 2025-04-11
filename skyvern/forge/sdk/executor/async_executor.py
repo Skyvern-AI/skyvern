@@ -10,6 +10,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.runs import RunEngine, RunType
 from skyvern.services import task_v2_service
 
 LOG = structlog.get_logger()
@@ -91,6 +92,10 @@ class BackgroundTaskExecutor(AsyncExecutor):
             status=TaskStatus.running,
             organization_id=organization_id,
         )
+        run_obj = await app.DATABASE.get_run(run_id=task_id, organization_id=organization_id)
+        engine = RunEngine.skyvern_v1
+        if run_obj and run_obj.task_run_type == RunType.openai_cua:
+            engine = RunEngine.openai_cua
 
         context: SkyvernContext = skyvern_context.ensure_context()
         context.task_id = task.task_id
@@ -106,6 +111,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 api_key,
                 close_browser_on_completion=close_browser_on_completion,
                 browser_session_id=browser_session_id,
+                engine=engine,
             )
 
     async def execute_workflow(

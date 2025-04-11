@@ -1,9 +1,11 @@
 from typing import Any, Dict
 
 import structlog
+from openai.types.responses.response import Response as OpenAIResponse
 from pydantic import ValidationError
 
 from skyvern.exceptions import UnsupportedActionType
+from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.webeye.actions.actions import (
     Action,
@@ -13,7 +15,9 @@ from skyvern.webeye.actions.actions import (
     CompleteAction,
     DownloadFileAction,
     InputTextAction,
+    KeypressAction,
     NullAction,
+    ScrollAction,
     SelectOption,
     SelectOptionAction,
     SolveCaptchaAction,
@@ -193,4 +197,105 @@ def parse_actions(
             all_element_ids=all_element_ids,
         )
     ############################ This part of code might not be needed ############################
+    return actions
+
+
+def parse_cua_actions(
+    task: Task,
+    step: Step,
+    response: OpenAIResponse,
+) -> list[Action]:
+    computer_calls = [item for item in response.output if item.type == "computer_call"]
+    reasonings = [item for item in response.output if item.type == "reasoning"]
+    actions: list[Action] = []
+    for idx, computer_call in enumerate(computer_calls):
+        cua_action = computer_call.action
+        action_type = cua_action.type
+        try:
+            reasoning = None
+            if idx < len(reasonings):
+                try:
+                    reasoning = reasonings[idx].summary[0].text
+                except Exception:
+                    LOG.exception(
+                        "Failed to parse reasoning",
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        step_order=step.order,
+                        action_order=idx,
+                    )
+
+            match action_type:
+                case "click":
+                    button = cua_action.button
+                    if button != "left" and button != "right":
+                        button = "left"
+                    reasoning = reasoning or f"Click at: ({cua_action.x}, {cua_action.y})"
+                    action = ClickAction(
+                        element_id="",
+                        x=cua_action.x,
+                        y=cua_action.y,
+                        button=button,
+                        reasoning=reasoning,
+                        intention=reasoning,
+                        response=f"Click at: ({cua_action.x}, {cua_action.y})",
+                    )
+                case "scroll":
+                    reasoning = reasoning or f"Scroll by: ({cua_action.x}, {cua_action.y})"
+                    action = ScrollAction(
+                        element_id="",
+                        x=cua_action.x,
+                        y=cua_action.y,
+                        scroll_x=cua_action.scroll_x,
+                        scroll_y=cua_action.scroll_y,
+                        reasoning=reasoning,
+                        intention=reasoning,
+                        response=f"Scroll by: ({cua_action.x}, {cua_action.y})",
+                    )
+                case "keypress":
+                    reasoning_str = f"Press keys: {cua_action.keys}"
+                    if len(cua_action.keys) == 1:
+                        reasoning_str = f"Press the '{cua_action.keys[0]}' key"
+                    reasoning = reasoning or reasoning_str
+                    action = KeypressAction(
+                        element_id="",
+                        keys=cua_action.keys,
+                        reasoning=reasoning,
+                        intention=reasoning,
+                        response=str(cua_action.keys),
+                    )
+                case "type":
+                    action = InputTextAction(
+                        element_id="",
+                        text=cua_action.text,
+                        reasoning=reasoning,
+                        intention=reasoning,
+                        response=cua_action.text,
+                    )
+                case "wait":
+                    action = WaitAction(
+                        seconds=5,
+                        reasoning=reasoning,
+                        intention=reasoning,
+                    )
+                case _:
+                    raise ValueError(f"Unsupported action type: {action_type}")
+            action.organization_id = task.organization_id
+            action.workflow_run_id = task.workflow_run_id
+            action.task_id = task.task_id
+            action.step_id = step.step_id
+            action.step_order = step.order
+            action.action_order = idx
+            actions.append(action)
+        except Exception:
+            LOG.exception(
+                "Failed to parse action",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                step_order=step.order,
+                action_order=idx,
+            )
+            break
+    if not actions:
+        return [CompleteAction(reasoning="No actions generated", verified=True)]
     return actions

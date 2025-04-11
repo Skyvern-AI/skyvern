@@ -92,11 +92,13 @@ class RunType(StrEnum):
     task_v1 = "task_v1"
     task_v2 = "task_v2"
     workflow_run = "workflow_run"
+    openai_cua = "openai_cua"
 
 
 class RunEngine(StrEnum):
     skyvern_v1 = "skyvern-1.0"
     skyvern_v2 = "skyvern-2.0"
+    openai_cua = "openai-cua"
 
 
 class RunStatus(StrEnum):
