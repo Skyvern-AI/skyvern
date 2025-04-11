@@ -1204,6 +1204,7 @@ class ForgeAgent:
             navigation_goal=task.navigation_goal,
             navigation_payload=task.navigation_payload,
             complete_criterion=task.complete_criterion,
+            local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
         )
 
         # this prompt is critical to our agent so let's use the primary LLM API handler
@@ -2155,6 +2156,7 @@ class ForgeAgent:
                 navigation_goal=task.navigation_goal,
                 navigation_payload=task.navigation_payload,
                 steps=steps_results,
+                local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
             json_response = await app.LLM_API_HANDLER(
                 prompt=prompt, screenshots=screenshots, step=step, prompt_name="summarize-max-steps-reason"

@@ -60,6 +60,7 @@ from skyvern.forge.sdk.api.files import (
     wait_for_download_finished,
 )
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_post
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.skyvern_context import ensure_context
@@ -1668,6 +1669,7 @@ async def choose_auto_completion_dropdown(
             navigation_goal=task.navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
             elements=html,
+            local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
         )
         LOG.info(
             "Confirm if it's an auto completion dropdown",
@@ -1825,6 +1827,7 @@ async def input_or_auto_complete_input(
             current_value=current_value,
             navigation_goal=task.navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
+            local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
         )
 
         LOG.info(
@@ -1888,6 +1891,7 @@ async def input_or_auto_complete_input(
                 navigation_payload_str=json.dumps(task.navigation_payload),
                 tried_values=json.dumps(tried_values),
                 popped_up_elements="".join([json_to_html(element) for element in cleaned_new_elements]),
+                local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
             json_respone = await app.SECONDARY_LLM_API_HANDLER(
                 prompt=prompt, step=step, prompt_name="auto-completion-tweak-value"
@@ -2644,6 +2648,7 @@ async def normal_select(
         navigation_goal=task.navigation_goal,
         navigation_payload_str=json.dumps(task.navigation_payload),
         options=options_html,
+        local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
 
     json_response = await app.SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
