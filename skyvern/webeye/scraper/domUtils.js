@@ -590,9 +590,6 @@ function isValidCSSSelector(selector) {
 }
 
 function isInteractable(element, hoverStylesMap) {
-  if (element.shadowRoot) {
-    return false;
-  }
   if (!isElementVisible(element)) {
     return false;
   }
