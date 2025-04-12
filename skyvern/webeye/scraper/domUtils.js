@@ -2194,6 +2194,15 @@ function asyncSleepFor(ms) {
 }
 
 async function addIncrementalNodeToMap(parentNode, childrenNode) {
+  const maxParsedElement = 3000;
+  if ((await window.globalParsedElementCounter.get()) > maxParsedElement) {
+    console.warn(
+      "Too many elements parsed, stopping the observer to parse the elements",
+    );
+    await window.globalParsedElementCounter.add();
+    return;
+  }
+
   // make the dom parser async
   await waitForNextFrame();
   if (window.globalListnerFlag) {
