@@ -1,5 +1,5 @@
 import ipaddress
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse, urlsplit, urlunsplit
 
 from fastapi import status
 from pydantic import HttpUrl, ValidationError
@@ -59,3 +59,10 @@ def validate_url(url: str) -> str | None:
     if blocked:
         raise BlockedHost(host=host)
     return str(v)
+
+
+def encode_url(url: str) -> str:
+    parts = list(urlsplit(url))
+    # Encode the path while preserving "/" and "%"
+    parts[2] = quote(parts[2], safe="/%")
+    return urlunsplit(parts)
