@@ -33,7 +33,7 @@ ARTIFACT_MANAGER = ArtifactManager()
 BROWSER_MANAGER = BrowserManager()
 EXPERIMENTATION_PROVIDER: BaseExperimentationProvider = NoOpExperimentationProvider()
 LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(SettingsManager.get_settings().LLM_KEY)
-OPENAI_CLIENT = AsyncOpenAI(api_key=SettingsManager.get_settings().OPENAI_API_KEY)
+OPENAI_CLIENT = AsyncOpenAI(api_key=SettingsManager.get_settings().OPENAI_API_KEY or "")
 if SettingsManager.get_settings().ENABLE_AZURE_CUA:
     OPENAI_CLIENT = AsyncAzureOpenAI(
         api_key=SettingsManager.get_settings().AZURE_CUA_API_KEY,
