@@ -13,11 +13,14 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
     if not run:
         return None
 
-    if run.task_run_type == RunType.task_v1:
+    if run.task_run_type == RunType.task_v1 or run.task_run_type == RunType.openai_cua:
         # fetch task v1 from db and transform to task run response
         task_v1 = await app.DATABASE.get_task(run.run_id, organization_id=organization_id)
         if not task_v1:
             return None
+        run_engine = RunEngine.skyvern_v1
+        if run.task_run_type == RunType.openai_cua:
+            run_engine = RunEngine.openai_cua
         return TaskRunResponse(
             run_id=run.run_id,
             run_type=run.task_run_type,
@@ -27,7 +30,7 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
             created_at=task_v1.created_at,
             modified_at=task_v1.modified_at,
             run_request=TaskRunRequest(
-                engine=RunEngine.skyvern_v1,
+                engine=run_engine,
                 prompt=task_v1.navigation_goal,
                 url=task_v1.url,
                 webhook_url=task_v1.webhook_callback_url,
