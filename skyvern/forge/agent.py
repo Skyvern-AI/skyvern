@@ -1245,6 +1245,7 @@ class ForgeAgent:
                     "generate_summary": "concise",
                 },
                 truncation="auto",
+                temperature=0,
             )
             previous_response = first_response
             input_tokens = first_response.usage.input_tokens or 0
@@ -1299,6 +1300,7 @@ class ForgeAgent:
                 "generate_summary": "concise",
             },
             truncation="auto",
+            temperature=0,
         )
         input_tokens = current_response.usage.input_tokens or 0
         output_tokens = current_response.usage.output_tokens or 0
