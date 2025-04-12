@@ -1503,17 +1503,20 @@ async def run_task(
             request=request,
             background_tasks=background_tasks,
         )
+        run_type = RunType.task_v1
+        if run_request.engine == RunEngine.openai_cua:
+            run_type = RunType.openai_cua
         # build the task run response
         return TaskRunResponse(
             run_id=task_v1_response.task_id,
-            run_type=RunType.task_v1,
+            run_type=run_type,
             status=str(task_v1_response.status),
             output=task_v1_response.extracted_information,
             failure_reason=task_v1_response.failure_reason,
             created_at=task_v1_response.created_at,
             modified_at=task_v1_response.modified_at,
             run_request=TaskRunRequest(
-                engine=RunEngine.skyvern_v1,
+                engine=run_request.engine,
                 prompt=task_v1_response.navigation_goal,
                 url=task_v1_response.url,
                 webhook_url=task_v1_response.webhook_callback_url,

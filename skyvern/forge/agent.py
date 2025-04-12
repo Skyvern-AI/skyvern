@@ -1247,6 +1247,22 @@ class ForgeAgent:
                 truncation="auto",
             )
             previous_response = first_response
+            input_tokens = first_response.usage.input_tokens or 0
+            output_tokens = first_response.usage.output_tokens or 0
+            first_response.usage.total_tokens or 0
+            cached_tokens = first_response.usage.input_tokens_details.cached_tokens or 0
+            reasoning_tokens = first_response.usage.output_tokens_details.reasoning_tokens or 0
+            llm_cost = (3.0 / 1000000) * input_tokens + (12.0 / 1000000) * output_tokens
+            await app.DATABASE.update_step(
+                task_id=task.task_id,
+                step_id=step.step_id,
+                organization_id=task.organization_id,
+                incremental_cost=llm_cost,
+                incremental_input_tokens=input_tokens if input_tokens > 0 else None,
+                incremental_output_tokens=output_tokens if output_tokens > 0 else None,
+                incremental_reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
+                incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
+            )
 
         computer_calls = [item for item in previous_response.output if item.type == "computer_call"]
         if not computer_calls:
@@ -1283,6 +1299,22 @@ class ForgeAgent:
                 "generate_summary": "concise",
             },
             truncation="auto",
+        )
+        input_tokens = current_response.usage.input_tokens or 0
+        output_tokens = current_response.usage.output_tokens or 0
+        current_response.usage.total_tokens or 0
+        cached_tokens = current_response.usage.input_tokens_details.cached_tokens or 0
+        reasoning_tokens = current_response.usage.output_tokens_details.reasoning_tokens or 0
+        llm_cost = (3.0 / 1000000) * input_tokens + (12.0 / 1000000) * output_tokens
+        await app.DATABASE.update_step(
+            task_id=task.task_id,
+            step_id=step.step_id,
+            organization_id=task.organization_id,
+            incremental_cost=llm_cost,
+            incremental_input_tokens=input_tokens if input_tokens > 0 else None,
+            incremental_output_tokens=output_tokens if output_tokens > 0 else None,
+            incremental_reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
+            incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
         )
 
         return parse_cua_actions(task, step, current_response), current_response

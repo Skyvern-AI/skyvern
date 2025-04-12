@@ -297,5 +297,24 @@ def parse_cua_actions(
             )
             break
     if not actions:
-        return [CompleteAction(reasoning="No actions generated", verified=True)]
+        LOG.info(
+            "Empty action returned by CUA",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            organization_id=task.organization_id,
+            workflow_run_id=task.workflow_run_id,
+            response=response.dict(),
+        )
+        complete_action = CompleteAction(
+            reasoning="No more actions to take",
+            verified=True,
+            data_extraction_goal=task.data_extraction_goal,
+            organization_id=task.organization_id,
+            workflow_run_id=task.workflow_run_id,
+            task_id=task.task_id,
+            step_id=step.step_id,
+            step_order=step.order,
+            action_order=0,
+        )
+        return [complete_action]
     return actions
