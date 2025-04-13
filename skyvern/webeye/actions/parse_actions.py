@@ -283,6 +283,7 @@ async def parse_cua_actions(
                         intention=reasoning,
                     )
                 case "move":
+                    reasoning = reasoning or f"Move mouse to: ({cua_action.x}, {cua_action.y})"
                     action = MoveAction(
                         x=cua_action.x,
                         y=cua_action.y,
