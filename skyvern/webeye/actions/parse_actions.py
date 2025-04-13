@@ -351,5 +351,12 @@ async def parse_cua_actions(
                 reasoning=reasoning,
                 intention=reasoning,
             )
+
+        action.organization_id = task.organization_id
+        action.workflow_run_id = task.workflow_run_id
+        action.task_id = task.task_id
+        action.step_id = step.step_id
+        action.step_order = step.order
+        action.action_order = 0
         return [action]
     return actions
