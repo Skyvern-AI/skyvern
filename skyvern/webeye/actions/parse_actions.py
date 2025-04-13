@@ -331,12 +331,19 @@ async def parse_cua_actions(
             prompt_name="cua-fallback-action",
         )
         skyvern_action_type = action_response.get("action")
+        useful_information = action_response.get("useful_information")
         action = WaitAction(
             seconds=5,
             reasoning=reasoning,
             intention=reasoning,
         )
         if skyvern_action_type == "complete":
+            if not task.data_extraction_goal and useful_information:
+                await app.DATABASE.update_task(
+                    task.task_id,
+                    organization_id=task.organization_id,
+                    extracted_information=useful_information,
+                )
             action = CompleteAction(
                 reasoning=reasoning,
                 intention=reasoning,
