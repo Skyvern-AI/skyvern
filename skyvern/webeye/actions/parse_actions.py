@@ -18,6 +18,7 @@ from skyvern.webeye.actions.actions import (
     DownloadFileAction,
     InputTextAction,
     KeypressAction,
+    MoveAction,
     NullAction,
     ScrollAction,
     SelectOption,
@@ -278,6 +279,13 @@ async def parse_cua_actions(
                 case "wait":
                     action = WaitAction(
                         seconds=5,
+                        reasoning=reasoning,
+                        intention=reasoning,
+                    )
+                case "move":
+                    action = MoveAction(
+                        x=cua_action.x,
+                        y=cua_action.y,
                         reasoning=reasoning,
                         intention=reasoning,
                     )
