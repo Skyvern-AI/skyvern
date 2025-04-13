@@ -179,6 +179,7 @@ export const ActionTypes = {
   ReloadPage: "reload_page",
   KeyPress: "keypress",
   Scroll: "scroll",
+  Move: "move",
 } as const;
 
 export type ActionType = (typeof ActionTypes)[keyof typeof ActionTypes];
@@ -198,6 +199,7 @@ export const ReadableActionTypes: {
   reload_page: "Reload Page",
   keypress: "Press Keys",
   scroll: "Scroll",
+  move: "Move",
 };
 
 export type Option = {
