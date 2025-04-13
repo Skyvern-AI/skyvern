@@ -136,7 +136,7 @@ async def cancel_run(run_id: str, organization_id: str | None = None, api_key: s
             detail=f"Run not found {run_id}",
         )
 
-    if run.task_run_type == RunType.task_v1:
+    if run.task_run_type in [RunType.task_v1, RunType.openai_cua]:
         await cancel_task_v1(run_id, organization_id=organization_id, api_key=api_key)
     elif run.task_run_type == RunType.task_v2:
         await cancel_task_v2(run_id, organization_id=organization_id)

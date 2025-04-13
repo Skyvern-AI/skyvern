@@ -1319,7 +1319,7 @@ class ForgeAgent:
             incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
         )
 
-        return parse_cua_actions(task, step, current_response), current_response
+        return await parse_cua_actions(task, step, current_response), current_response
 
     @staticmethod
     async def complete_verify(page: Page, scraped_page: ScrapedPage, task: Task, step: Step) -> CompleteVerifyResult:
