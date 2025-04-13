@@ -5,6 +5,8 @@ from openai.types.responses.response import Response as OpenAIResponse
 from pydantic import ValidationError
 
 from skyvern.exceptions import UnsupportedActionType
+from skyvern.forge import app
+from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.webeye.actions.actions import (
@@ -200,13 +202,14 @@ def parse_actions(
     return actions
 
 
-def parse_cua_actions(
+async def parse_cua_actions(
     task: Task,
     step: Step,
     response: OpenAIResponse,
 ) -> list[Action]:
     computer_calls = [item for item in response.output if item.type == "computer_call"]
     reasonings = [item for item in response.output if item.type == "reasoning"]
+    assistant_messages = [item for item in response.output if item.type == "message" and item.role == "assistant"]
     actions: list[Action] = []
     for idx, computer_call in enumerate(computer_calls):
         cua_action = computer_call.action
@@ -305,16 +308,48 @@ def parse_cua_actions(
             workflow_run_id=task.workflow_run_id,
             response=response.dict(),
         )
-        complete_action = CompleteAction(
-            reasoning="No more actions to take",
-            verified=True,
-            data_extraction_goal=task.data_extraction_goal,
-            organization_id=task.organization_id,
-            workflow_run_id=task.workflow_run_id,
-            task_id=task.task_id,
-            step_id=step.step_id,
-            step_order=step.order,
-            action_order=0,
+        reasoning = reasonings[0].summary[0].text if reasonings and reasonings[0].summary else None
+        assistant_message = assistant_messages[0].content[0].text if assistant_messages else None
+        fallback_action_prompt = prompt_engine.load_prompt(
+            "cua-fallback-action",
+            navigation_goal=task.navigation_goal,
+            assistant_message=assistant_message,
+            assistant_reasoning=reasoning,
         )
-        return [complete_action]
+
+        action_response = await app.LLM_API_HANDLER(
+            prompt=fallback_action_prompt,
+            prompt_name="cua-fallback-action",
+        )
+        skyvern_action_type = action_response.get("action")
+        action = WaitAction(
+            seconds=5,
+            reasoning=reasoning,
+            intention=reasoning,
+        )
+        if skyvern_action_type == "complete":
+            action = CompleteAction(
+                reasoning=reasoning,
+                intention=reasoning,
+                verified=False,
+                data_extraction_goal=task.data_extraction_goal,
+            )
+        elif skyvern_action_type == "terminate":
+            action = TerminateAction(
+                reasoning=reasoning,
+                intention=reasoning,
+            )
+        elif skyvern_action_type == "solve_captcha":
+            action = SolveCaptchaAction(
+                reasoning=reasoning,
+                intention=reasoning,
+            )
+        elif skyvern_action_type == "get_verification_code":
+            # Currently we don't support verification code
+            # TODO: handle verification code by fetching the code and send it to CUA
+            action = TerminateAction(
+                reasoning=reasoning,
+                intention=reasoning,
+            )
+        return [action]
     return actions

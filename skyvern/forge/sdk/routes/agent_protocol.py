@@ -1479,6 +1479,8 @@ async def run_task(
         )
         url = url or task_generation.url
         navigation_goal = task_generation.navigation_goal or run_request.prompt
+        if run_request.engine == RunEngine.openai_cua:
+            navigation_goal = run_request.prompt
         navigation_payload = task_generation.navigation_payload
         data_extraction_goal = task_generation.data_extraction_goal
         data_extraction_schema = data_extraction_schema or task_generation.extracted_information_schema
