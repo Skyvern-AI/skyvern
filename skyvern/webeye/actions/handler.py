@@ -1493,6 +1493,17 @@ async def handle_keypress_action(
     return [ActionSuccess()]
 
 
+async def handle_move_action(
+    action: actions.MoveAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    await page.mouse.move(action.x, action.y)
+    return [ActionSuccess()]
+
+
 ActionHandler.register_action_type(ActionType.SOLVE_CAPTCHA, handle_solve_captcha_action)
 ActionHandler.register_action_type(ActionType.CLICK, handle_click_action)
 ActionHandler.register_action_type(ActionType.INPUT_TEXT, handle_input_text_action)
@@ -1506,6 +1517,7 @@ ActionHandler.register_action_type(ActionType.COMPLETE, handle_complete_action)
 ActionHandler.register_action_type(ActionType.EXTRACT, handle_extract_action)
 ActionHandler.register_action_type(ActionType.SCROLL, handle_scroll_action)
 ActionHandler.register_action_type(ActionType.KEYPRESS, handle_keypress_action)
+ActionHandler.register_action_type(ActionType.MOVE, handle_move_action)
 
 
 async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) -> Any:

@@ -31,6 +31,7 @@ class ActionType(StrEnum):
     SCROLL = "scroll"
     KEYPRESS = "keypress"
     TYPE = "type"
+    MOVE = "move"
 
     def is_web_action(self) -> bool:
         return self in [
@@ -276,6 +277,12 @@ class ScrollAction(Action):
 class KeypressAction(Action):
     action_type: ActionType = ActionType.KEYPRESS
     keys: list[str] = []
+
+
+class MoveAction(Action):
+    action_type: ActionType = ActionType.MOVE
+    x: int
+    y: int
 
 
 class ScrapeResult(BaseModel):
