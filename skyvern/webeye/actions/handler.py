@@ -1483,13 +1483,46 @@ async def handle_keypress_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    updated_keys = []
     for key in action.keys:
         if key.lower() == "enter":
-            await page.keyboard.press("Enter")
+            updated_keys.append("Enter")
         elif key.lower() == "space":
-            await page.keyboard.press(" ")
+            updated_keys.append(" ")
+        elif key.lower() == "ctrl":
+            updated_keys.append("Control")
+        elif key.lower() == "backspace":
+            updated_keys.append("Backspace")
+        elif key.lower() == "pagedown":
+            updated_keys.append("PageDown")
+        elif key.lower() == "pageup":
+            updated_keys.append("PageUp")
+        elif key.lower() == "tab":
+            updated_keys.append("Tab")
+        elif key.lower() == "shift":
+            updated_keys.append("Shift")
+        elif key.lower() == "arrowleft":
+            updated_keys.append("ArrowLeft")
+        elif key.lower() == "arrowright":
+            updated_keys.append("ArrowRight")
+        elif key.lower() == "arrowup":
+            updated_keys.append("ArrowUp")
+        elif key.lower() == "arrowdown":
+            updated_keys.append("ArrowDown")
+        elif key.lower() == "home":
+            updated_keys.append("Home")
+        elif key.lower() == "end":
+            updated_keys.append("End")
+        elif key.lower() == "delete":
+            updated_keys.append("Delete")
+        elif key.lower() == "ecs":
+            updated_keys.append("Escape")
+        elif key.lower() == "alt":
+            updated_keys.append("Alt")
         else:
-            await page.keyboard.press(key)
+            updated_keys.append(key)
+    keypress_str = "+".join(updated_keys)
+    await page.keyboard.press(keypress_str)
     return [ActionSuccess()]
 
 
