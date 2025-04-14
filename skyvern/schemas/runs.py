@@ -92,11 +92,13 @@ class RunType(StrEnum):
     task_v1 = "task_v1"
     task_v2 = "task_v2"
     workflow_run = "workflow_run"
+    openai_cua = "openai_cua"
 
 
 class RunEngine(StrEnum):
     skyvern_v1 = "skyvern-1.0"
     skyvern_v2 = "skyvern-2.0"
+    openai_cua = "openai-cua"
 
 
 class RunStatus(StrEnum):
@@ -215,8 +217,8 @@ class BaseRunResponse(BaseModel):
 
 
 class TaskRunResponse(BaseRunResponse):
-    run_type: Literal[RunType.task_v1, RunType.task_v2] = Field(
-        description="Type of task run - either task_v1 or task_v2"
+    run_type: Literal[RunType.task_v1, RunType.task_v2, RunType.openai_cua] = Field(
+        description="Types of a task run - task_v1, task_v2, openai_cua"
     )
     run_request: TaskRunRequest | None = Field(
         default=None, description="The original request parameters used to start this task run"

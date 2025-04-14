@@ -120,6 +120,7 @@ class Settings(BaseSettings):
     ENABLE_AZURE_O3_MINI: bool = False
     ENABLE_BEDROCK: bool = False
     ENABLE_GEMINI: bool = False
+    ENABLE_AZURE_CUA: bool = False
     # OPENAI
     OPENAI_API_KEY: str | None = None
     # ANTHROPIC
@@ -129,6 +130,10 @@ class Settings(BaseSettings):
     AZURE_API_KEY: str | None = None
     AZURE_API_BASE: str | None = None
     AZURE_API_VERSION: str | None = None
+    AZURE_CUA_API_KEY: str | None = None
+    AZURE_CUA_ENDPOINT: str | None = None
+    AZURE_CUA_DEPLOYMENT: str | None = "computer-use-preview"
+    AZURE_CUA_API_VERSION: str | None = "2025-03-01-preview"
 
     # AZURE GPT-4o mini
     AZURE_GPT4O_MINI_DEPLOYMENT: str | None = None

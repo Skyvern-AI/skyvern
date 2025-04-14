@@ -1,6 +1,7 @@
 from typing import Awaitable, Callable
 
 from fastapi import FastAPI
+from openai import AsyncAzureOpenAI, AsyncOpenAI
 
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.agent_functions import AgentFunction
@@ -32,6 +33,15 @@ ARTIFACT_MANAGER = ArtifactManager()
 BROWSER_MANAGER = BrowserManager()
 EXPERIMENTATION_PROVIDER: BaseExperimentationProvider = NoOpExperimentationProvider()
 LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(SettingsManager.get_settings().LLM_KEY)
+OPENAI_CLIENT = AsyncOpenAI(api_key=SettingsManager.get_settings().OPENAI_API_KEY or "")
+if SettingsManager.get_settings().ENABLE_AZURE_CUA:
+    OPENAI_CLIENT = AsyncAzureOpenAI(
+        api_key=SettingsManager.get_settings().AZURE_CUA_API_KEY,
+        api_version=SettingsManager.get_settings().AZURE_CUA_API_VERSION,
+        azure_endpoint=SettingsManager.get_settings().AZURE_CUA_ENDPOINT,
+        azure_deployment=SettingsManager.get_settings().AZURE_CUA_DEPLOYMENT,
+    )
+
 SECONDARY_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
     SETTINGS_MANAGER.SECONDARY_LLM_KEY if SETTINGS_MANAGER.SECONDARY_LLM_KEY else SETTINGS_MANAGER.LLM_KEY
 )

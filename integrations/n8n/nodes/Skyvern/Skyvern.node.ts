@@ -1,5 +1,61 @@
 import { FieldType, IDataObject, IExecuteSingleFunctions, IHttpRequestMethods, IHttpRequestOptions, ILoadOptionsFunctions, INodePropertyOptions, INodeType, INodeTypeDescription, NodeConnectionType, ResourceMapperField, ResourceMapperFields } from 'n8n-workflow';
-const fetch = require('node-fetch');
+import https from 'https';
+import { URL } from 'url';
+
+async function makeRequest(url: string, options: any = {}): Promise<any> {
+    return new Promise((resolve, reject) => {
+        const parsedUrl = new URL(url);
+        const requestOptions = {
+            hostname: parsedUrl.hostname,
+            path: parsedUrl.pathname + parsedUrl.search,
+            method: options.method || 'GET',
+            headers: options.headers || {},
+        };
+
+        const req = https.request(requestOptions, (res) => {
+            let data = '';
+            
+            res.on('data', (chunk) => {
+                data += chunk;
+            });
+            
+            res.on('end', () => {
+                if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+                    const response = {
+                        ok: true,
+                        status: res.statusCode,
+                        statusText: res.statusMessage || '',
+                        headers: res.headers,
+                        json: () => {
+                            try {
+                                return Promise.resolve(JSON.parse(data));
+                            } catch (e) {
+                                return Promise.reject(new Error('Invalid JSON response'));
+                            }
+                        },
+                        text: () => Promise.resolve(data),
+                        blob: () => Promise.resolve(new Blob([data])),
+                        arrayBuffer: () => Promise.resolve(Buffer.from(data)),
+                        clone: () => response,
+                    };
+                    resolve(response);
+                } else {
+                    reject(new Error(`Request failed with status code ${res.statusCode}`));
+                }
+            });
+        });
+        
+        req.on('error', (error) => {
+            reject(error);
+        });
+        
+        if (options.body) {
+            req.write(options.body);
+        }
+        
+        req.end();
+    });
+}
 
 export class Skyvern implements INodeType {
     description: INodeTypeDescription = {
@@ -79,7 +135,7 @@ export class Skyvern implements INodeType {
                                 // trigger the generate task v1 logic
                                 const credentials = await this.getCredentials('skyvernApi');
                                 const userPrompt = this.getNodeParameter('userPrompt');
-                                const response = await fetch(credentials['baseUrl'] + '/api/v1/generate/task', {
+                                const response = await makeRequest(credentials['baseUrl'] + '/api/v1/generate/task', {
                                     method: 'POST',
                                     headers: {
                                         'Content-Type': 'application/json',
@@ -317,7 +373,7 @@ export class Skyvern implements INodeType {
                 if (resource !== 'workflow') return [];
 
                 const credentials = await this.getCredentials('skyvernApi');
-                const response = await fetch(credentials['baseUrl'] + '/api/v1/workflows?page_size=100', {
+                const response = await makeRequest(credentials['baseUrl'] + '/api/v1/workflows?page_size=100', {
                     headers: {
                         'x-api-key': credentials['apiKey'],
                     },
@@ -344,7 +400,7 @@ export class Skyvern implements INodeType {
                 if (!workflowId) return { fields: [] };
 
                 const credentials = await this.getCredentials('skyvernApi');
-                const response = await fetch(credentials['baseUrl'] + '/api/v1/workflows/' + workflowId, {
+                const response = await makeRequest(credentials['baseUrl'] + '/api/v1/workflows/' + workflowId, {
                     headers: {
                         'x-api-key': credentials['apiKey'],
                     },
@@ -361,7 +417,7 @@ export class Skyvern implements INodeType {
                         let options: INodePropertyOptions[] | undefined = undefined;
                         let parameterType: FieldType | undefined = undefined;
                         if (parameter.parameter_type === 'credential') {
-                            const response = await fetch(credentials['baseUrl'] + '/api/v1/credentials', {
+                            const response = await makeRequest(credentials['baseUrl'] + '/api/v1/credentials', {
                                 headers: {
                                     'x-api-key': credentials['apiKey'],
                                 },

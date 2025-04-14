@@ -590,9 +590,6 @@ function isValidCSSSelector(selector) {
 }
 
 function isInteractable(element, hoverStylesMap) {
-  if (element.shadowRoot) {
-    return false;
-  }
   if (!isElementVisible(element)) {
     return false;
   }
@@ -2197,6 +2194,15 @@ function asyncSleepFor(ms) {
 }
 
 async function addIncrementalNodeToMap(parentNode, childrenNode) {
+  const maxParsedElement = 3000;
+  if ((await window.globalParsedElementCounter.get()) > maxParsedElement) {
+    console.warn(
+      "Too many elements parsed, stopping the observer to parse the elements",
+    );
+    await window.globalParsedElementCounter.add();
+    return;
+  }
+
   // make the dom parser async
   await waitForNextFrame();
   if (window.globalListnerFlag) {
@@ -2344,12 +2350,14 @@ async function stopGlobalIncrementalObserver() {
   window.globalDomDepthMap = new Map();
 }
 
-async function getIncrementElements() {
-  while (
-    (await window.globalParsedElementCounter.get()) <
-    window.globalOneTimeIncrementElements.length
-  ) {
-    await asyncSleepFor(100);
+async function getIncrementElements(wait_until_finished = true) {
+  if (wait_until_finished) {
+    while (
+      (await window.globalParsedElementCounter.get()) <
+      window.globalOneTimeIncrementElements.length
+    ) {
+      await asyncSleepFor(100);
+    }
   }
 
   // cleanup the chidren tree, remove the duplicated element

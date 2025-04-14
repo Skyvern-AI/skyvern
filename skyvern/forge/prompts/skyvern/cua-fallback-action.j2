@@ -1,0 +1,22 @@
+The user is trying to achieve a goal in the browser assisted by an browser AI assistant.
+
+According to the AI assistant's feedback, including reasoning and its message, there's no immediate action the assistant can take in the website.
+
+Help the user decide what to do next based on the assistant's message. Here's the list of available actions:
+- solve_captcha: the task is blocked by captcha and the assistant is asking the user to solve the captcha
+- complete: the user goal has been achieved
+- terminate: the user goal cannot be achieved. Terminate the task. Examples: 1) there's not enough data provided to achieve the goal and the assistant is asking the user to provide more information. For examples: login is required and the user has not provided the login credentials or incorrect credentials are provided; a form needs to be filled and a required field is missing. 2) The site is stuck or not loading after multiple attempts
+- get_verification_code: the assistant is asking the user to provide a verification code (2FA, MFA or TOTP code)
+- other: the assistant is asking the user to do something else
+
+Return the action to take next in the following JSON format:
+{
+    "action": str // complete, terminate, solve_captcha, get_verification_code
+    "useful_information": str // If there is any useful information the assistant has provided that contributes to the user goal, put it here.
+}
+
+User goal: {{ navigation_goal }}
+
+Assistant reasoning: {{ assistant_reasoning }}
+
+Assistant message: {{ assistant_message }}

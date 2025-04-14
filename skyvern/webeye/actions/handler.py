@@ -60,6 +60,7 @@ from skyvern.forge.sdk.api.files import (
     wait_for_download_finished,
 )
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_post
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.core.skyvern_context import ensure_context
@@ -67,7 +68,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
-from skyvern.utils.prompt_engine import load_prompt_with_elements
+from skyvern.utils.prompt_engine import CheckPhoneNumberFormatResponse, load_prompt_with_elements
 from skyvern.webeye.actions import actions
 from skyvern.webeye.actions.actions import (
     Action,
@@ -76,6 +77,7 @@ from skyvern.webeye.actions.actions import (
     CheckboxAction,
     ClickAction,
     InputOrSelectContext,
+    InputTextAction,
     ScrapeResult,
     SelectOption,
     SelectOptionAction,
@@ -208,6 +210,52 @@ def clean_and_remove_element_tree_factory(
         return element_tree
 
     return helper_func
+
+
+async def check_phone_number_format(
+    phone_number: str,
+    action: actions.InputTextAction,
+    skyvern_element: SkyvernElement,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> str:
+    # check the phone number format
+    LOG.info(
+        "Input is a tel input, trigger phone number format checking",
+        action=action,
+        element_id=skyvern_element.get_id(),
+    )
+
+    new_scraped_page = await scraped_page.generate_scraped_page_without_screenshots()
+    html = new_scraped_page.build_element_tree(html_need_skyvern_attrs=False)
+    prompt = prompt_engine.load_prompt(
+        template="check-phone-number-format",
+        current_phone_number=phone_number,
+        navigation_goal=task.navigation_goal,
+        navigation_payload_str=json.dumps(task.navigation_payload),
+        elements=html,
+        local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+    )
+
+    json_response = await app.SECONDARY_LLM_API_HANDLER(
+        prompt=prompt, step=step, prompt_name="check-phone-number-format"
+    )
+
+    check_phone_number_format_response = CheckPhoneNumberFormatResponse.model_validate(json_response)
+    if (
+        check_phone_number_format_response.is_current_format_correct
+        or not check_phone_number_format_response.recommended_phone_number
+    ):
+        return phone_number
+
+    LOG.info(
+        "The current phone number format is incorrect, using the recommended phone number",
+        action=action,
+        element_id=skyvern_element.get_id(),
+        recommended_phone_number=check_phone_number_format_response.recommended_phone_number,
+    )
+    return check_phone_number_format_response.recommended_phone_number
 
 
 class AutoCompletionResult(BaseModel):
@@ -345,6 +393,12 @@ def check_for_invalid_web_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    if isinstance(action, ClickAction) and action.x is not None and action.y is not None:
+        return []
+
+    if isinstance(action, InputTextAction) and not action.element_id:
+        return []
+
     if isinstance(action, WebAction) and action.element_id not in scraped_page.id_to_element_dict:
         return [ActionFailure(MissingElement(element_id=action.element_id), stop_execution_on_failure=False)]
 
@@ -373,6 +427,36 @@ async def handle_click_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    if action.x is not None and action.y is not None:
+        # Find the element at the clicked location using JavaScript evaluation
+        element_id = await page.evaluate(
+            """data => {
+            const element = document.elementFromPoint(data.x, data.y);
+            if (!element) return null;
+
+            // Function to get the unique_id attribute of an element
+            function getElementUniqueId(element) {
+                if (element && element.nodeType === 1) {
+                    // Check if the element has the unique_id attribute
+                    if (element.hasAttribute('unique_id')) {
+                        return element.getAttribute('unique_id');
+                    }
+                    
+                    // If no unique_id attribute is found, return null
+                    return null;
+                }
+                return null;
+            }
+
+            return getElementUniqueId(element);
+        }""",
+            {"x": action.x, "y": action.y},
+        )
+        LOG.info("Clicked element at location", x=action.x, y=action.y, element_id=element_id, button=action.button)
+
+        await page.mouse.click(x=action.x, y=action.y, button=action.button)
+        return [ActionSuccess()]
+
     dom = DomUtil(scraped_page=scraped_page, page=page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     await asyncio.sleep(0.3)
@@ -544,6 +628,11 @@ async def handle_input_text_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    if not action.element_id:
+        # This is a CUA type action
+        await page.keyboard.type(action.text)
+        return [ActionSuccess()]
+
     dom = DomUtil(scraped_page, page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
@@ -556,7 +645,7 @@ async def handle_input_text_action(
 
     # before filling text, we need to validate if the element can be filled if it's not one of COMMON_INPUT_TAGS
     tag_name = scraped_page.id_to_element_dict[action.element_id]["tagName"].lower()
-    text = await get_actual_value_of_parameter_if_secret(task, action.text)
+    text: str | None = await get_actual_value_of_parameter_if_secret(task, action.text)
     if text is None:
         return [ActionFailure(FailedToFetchSecret())]
 
@@ -705,6 +794,25 @@ async def handle_input_text_action(
 
     # force to move focus back to the element
     await skyvern_element.get_locator().focus(timeout=timeout)
+
+    # check the phone number format
+    if await skyvern_element.get_attr("type") == "tel":
+        try:
+            text = await check_phone_number_format(
+                phone_number=text,
+                action=action,
+                skyvern_element=skyvern_element,
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to check the phone number format, using the original text",
+                action=action,
+                exc_info=True,
+            )
+
     # `Locator.clear()` on a spin button could cause the cursor moving away, and never be back
     if not await skyvern_element.is_spinbtn_input():
         try:
@@ -1282,7 +1390,7 @@ async def handle_wait_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await asyncio.sleep(20)
+    await asyncio.sleep(action.seconds)
     return [ActionFailure(exception=Exception("Wait action is treated as a failure"))]
 
 
@@ -1356,6 +1464,79 @@ async def handle_extract_action(
         return [ActionFailure(exception=Exception("No data extraction goal"))]
 
 
+async def handle_scroll_action(
+    action: actions.ScrollAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    await page.mouse.move(action.x, action.y)
+    await page.evaluate(f"window.scrollBy({action.scroll_x}, {action.scroll_y})")
+    return [ActionSuccess()]
+
+
+async def handle_keypress_action(
+    action: actions.KeypressAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    updated_keys = []
+    for key in action.keys:
+        if key.lower() == "enter":
+            updated_keys.append("Enter")
+        elif key.lower() == "space":
+            updated_keys.append(" ")
+        elif key.lower() == "ctrl":
+            updated_keys.append("Control")
+        elif key.lower() == "backspace":
+            updated_keys.append("Backspace")
+        elif key.lower() == "pagedown":
+            updated_keys.append("PageDown")
+        elif key.lower() == "pageup":
+            updated_keys.append("PageUp")
+        elif key.lower() == "tab":
+            updated_keys.append("Tab")
+        elif key.lower() == "shift":
+            updated_keys.append("Shift")
+        elif key.lower() == "arrowleft":
+            updated_keys.append("ArrowLeft")
+        elif key.lower() == "arrowright":
+            updated_keys.append("ArrowRight")
+        elif key.lower() == "arrowup":
+            updated_keys.append("ArrowUp")
+        elif key.lower() == "arrowdown":
+            updated_keys.append("ArrowDown")
+        elif key.lower() == "home":
+            updated_keys.append("Home")
+        elif key.lower() == "end":
+            updated_keys.append("End")
+        elif key.lower() == "delete":
+            updated_keys.append("Delete")
+        elif key.lower() == "ecs":
+            updated_keys.append("Escape")
+        elif key.lower() == "alt":
+            updated_keys.append("Alt")
+        else:
+            updated_keys.append(key)
+    keypress_str = "+".join(updated_keys)
+    await page.keyboard.press(keypress_str)
+    return [ActionSuccess()]
+
+
+async def handle_move_action(
+    action: actions.MoveAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    await page.mouse.move(action.x, action.y)
+    return [ActionSuccess()]
+
+
 ActionHandler.register_action_type(ActionType.SOLVE_CAPTCHA, handle_solve_captcha_action)
 ActionHandler.register_action_type(ActionType.CLICK, handle_click_action)
 ActionHandler.register_action_type(ActionType.INPUT_TEXT, handle_input_text_action)
@@ -1367,6 +1548,9 @@ ActionHandler.register_action_type(ActionType.WAIT, handle_wait_action)
 ActionHandler.register_action_type(ActionType.TERMINATE, handle_terminate_action)
 ActionHandler.register_action_type(ActionType.COMPLETE, handle_complete_action)
 ActionHandler.register_action_type(ActionType.EXTRACT, handle_extract_action)
+ActionHandler.register_action_type(ActionType.SCROLL, handle_scroll_action)
+ActionHandler.register_action_type(ActionType.KEYPRESS, handle_keypress_action)
+ActionHandler.register_action_type(ActionType.MOVE, handle_move_action)
 
 
 async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) -> Any:
@@ -1668,6 +1852,7 @@ async def choose_auto_completion_dropdown(
             navigation_goal=task.navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
             elements=html,
+            local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
         )
         LOG.info(
             "Confirm if it's an auto completion dropdown",
@@ -1825,6 +2010,7 @@ async def input_or_auto_complete_input(
             current_value=current_value,
             navigation_goal=task.navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
+            local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
         )
 
         LOG.info(
@@ -1888,6 +2074,7 @@ async def input_or_auto_complete_input(
                 navigation_payload_str=json.dumps(task.navigation_payload),
                 tried_values=json.dumps(tried_values),
                 popped_up_elements="".join([json_to_html(element) for element in cleaned_new_elements]),
+                local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
             json_respone = await app.SECONDARY_LLM_API_HANDLER(
                 prompt=prompt, step=step, prompt_name="auto-completion-tweak-value"
@@ -1962,31 +2149,6 @@ async def sequentially_select_from_dropdown(
         )
         return None
 
-    # if it's a <input> date picker, try to input the current date directly first
-    if (
-        input_or_select_context.is_date_related
-        and skyvern_element.get_tag_name() == InteractiveElement.INPUT
-        and action.option.label
-    ):
-        LOG.info(
-            "It's a <input> date picker, going to input the current date directly",
-            step_id=step.step_id,
-            task_id=task.task_id,
-        )
-        try:
-            await skyvern_element.input_sequentially(action.option.label)
-            result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
-            result.action_result = ActionSuccess()
-            return result
-        except Exception:
-            LOG.warning(
-                "Failed to input the current date directly, trigger the selection mode",
-                exc_info=True,
-                step_id=step.step_id,
-                task_id=task.task_id,
-            )
-            await skyvern_element.input_clear()
-
     # TODO: only suport the third-level dropdown selection now
     MAX_SELECT_DEPTH = 3
     values: list[str | None] = []
@@ -2015,15 +2177,36 @@ async def sequentially_select_from_dropdown(
 
         # HACK: if agent took mini actions 2 times, stop executing the rest actions
         # this is a hack to fix some date picker issues.
-        if input_or_select_context.is_date_related and i >= 1 and single_select_result.action_result:
-            LOG.warning(
-                "It's a date picker, going to skip reamaining actions",
-                depth=i,
-                task_id=task.task_id,
-                step_id=step.step_id,
-            )
-            single_select_result.action_result.skip_remaining_actions = True
-            break
+        if input_or_select_context.is_date_related and i >= 1:
+            if skyvern_element.get_tag_name() == InteractiveElement.INPUT and action.option.label:
+                try:
+                    LOG.info(
+                        "Try to input the date directly",
+                        step_id=step.step_id,
+                        task_id=task.task_id,
+                    )
+                    await skyvern_element.input_sequentially(action.option.label)
+                    result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
+                    result.action_result = ActionSuccess()
+                    return result
+
+                except Exception:
+                    LOG.warning(
+                        "Failed to input the date directly",
+                        exc_info=True,
+                        step_id=step.step_id,
+                        task_id=task.task_id,
+                    )
+
+            if single_select_result.action_result:
+                LOG.warning(
+                    "It's a date picker, going to skip reamaining actions",
+                    depth=i,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                )
+                single_select_result.action_result.skip_remaining_actions = True
+                break
 
         if await single_select_result.is_done():
             return single_select_result
@@ -2648,6 +2831,7 @@ async def normal_select(
         navigation_goal=task.navigation_goal,
         navigation_payload_str=json.dumps(task.navigation_payload),
         options=options_html,
+        local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
 
     json_response = await app.SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
@@ -2891,7 +3075,12 @@ async def poll_verification_code(
             )
         verification_code = None
         if totp_verification_url:
-            verification_code = await _get_verification_code_from_url(task_id, totp_verification_url, org_token.token)
+            verification_code = await _get_verification_code_from_url(
+                task_id,
+                totp_verification_url,
+                org_token.token,
+                workflow_run_id=workflow_run_id,
+            )
         elif totp_identifier:
             verification_code = await _get_verification_code_from_db(
                 task_id, organization_id, totp_identifier, workflow_id=workflow_id

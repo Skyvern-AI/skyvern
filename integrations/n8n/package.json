@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-skyvern",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Skyvern Node for n8n",
   "keywords": [
     "n8n-community-node-package"
@@ -54,9 +54,5 @@
   },
   "peerDependencies": {
     "n8n-workflow": "*"
-  },
-  "dependencies": {
-    "node-fetch": "2",
-    "sqlite3": "^5.1.7"
   }
 }

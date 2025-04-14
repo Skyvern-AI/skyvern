@@ -28,6 +28,10 @@ class ActionType(StrEnum):
     RELOAD_PAGE = "reload_page"
 
     EXTRACT = "extract"
+    SCROLL = "scroll"
+    KEYPRESS = "keypress"
+    TYPE = "type"
+    MOVE = "move"
 
     def is_web_action(self) -> bool:
         return self in [
@@ -177,6 +181,9 @@ class ClickAction(WebAction):
     action_type: ActionType = ActionType.CLICK
     file_url: str | None = None
     download: bool = False
+    x: int | None = None
+    y: int | None = None
+    button: str = "left"
 
     def __repr__(self) -> str:
         return f"ClickAction(element_id={self.element_id}, file_url={self.file_url}, download={self.download})"
@@ -240,6 +247,7 @@ class CheckboxAction(WebAction):
 
 class WaitAction(Action):
     action_type: ActionType = ActionType.WAIT
+    seconds: int = 20
 
 
 class TerminateAction(DecisiveAction):
@@ -256,6 +264,25 @@ class ExtractAction(Action):
     action_type: ActionType = ActionType.EXTRACT
     data_extraction_goal: str | None = None
     data_extraction_schema: dict[str, Any] | None = None
+
+
+class ScrollAction(Action):
+    action_type: ActionType = ActionType.SCROLL
+    x: int
+    y: int
+    scroll_x: int
+    scroll_y: int
+
+
+class KeypressAction(Action):
+    action_type: ActionType = ActionType.KEYPRESS
+    keys: list[str] = []
+
+
+class MoveAction(Action):
+    action_type: ActionType = ActionType.MOVE
+    x: int
+    y: int
 
 
 class ScrapeResult(BaseModel):

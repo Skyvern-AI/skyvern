@@ -1465,7 +1465,7 @@ async def run_task(
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
 
-    if run_request.engine == RunEngine.skyvern_v1:
+    if run_request.engine in [RunEngine.skyvern_v1, RunEngine.openai_cua]:
         # create task v1
         # if there's no url, call task generation first to generate the url, data schema if any
         url = run_request.url
@@ -1479,6 +1479,8 @@ async def run_task(
         )
         url = url or task_generation.url
         navigation_goal = task_generation.navigation_goal or run_request.prompt
+        if run_request.engine == RunEngine.openai_cua:
+            navigation_goal = run_request.prompt
         navigation_payload = task_generation.navigation_payload
         data_extraction_goal = task_generation.data_extraction_goal
         data_extraction_schema = data_extraction_schema or task_generation.extracted_information_schema
@@ -1497,22 +1499,26 @@ async def run_task(
         task_v1_response = await task_v1_service.run_task(
             task=task_v1_request,
             organization=current_org,
+            engine=run_request.engine,
             x_max_steps_override=run_request.max_steps,
             x_api_key=x_api_key,
             request=request,
             background_tasks=background_tasks,
         )
+        run_type = RunType.task_v1
+        if run_request.engine == RunEngine.openai_cua:
+            run_type = RunType.openai_cua
         # build the task run response
         return TaskRunResponse(
             run_id=task_v1_response.task_id,
-            run_type=RunType.task_v1,
+            run_type=run_type,
             status=str(task_v1_response.status),
             output=task_v1_response.extracted_information,
             failure_reason=task_v1_response.failure_reason,
             created_at=task_v1_response.created_at,
             modified_at=task_v1_response.modified_at,
             run_request=TaskRunRequest(
-                engine=RunEngine.skyvern_v1,
+                engine=run_request.engine,
                 prompt=task_v1_response.navigation_goal,
                 url=task_v1_response.url,
                 webhook_url=task_v1_response.webhook_callback_url,
@@ -1577,6 +1583,8 @@ async def run_task(
                 publish_workflow=run_request.publish_workflow,
             ),
         )
+    if run_request.engine == RunEngine.openai_cua:
+        pass
     raise HTTPException(status_code=400, detail=f"Invalid agent engine: {run_request.engine}")
 
 

@@ -98,8 +98,11 @@ class SkyvernFrame:
         url: str,
         draw_boxes: bool = False,
         max_number: int = settings.MAX_NUM_SCREENSHOTS,
+        scroll: bool = True,
     ) -> List[bytes]:
         skyvern_page = await SkyvernFrame.create_instance(frame=page)
+        if not scroll:
+            return [await SkyvernFrame.take_screenshot(page=skyvern_page.frame, full_page=False)]
 
         # page is the main frame and the index must be 0
         assert isinstance(skyvern_page.frame, Page)

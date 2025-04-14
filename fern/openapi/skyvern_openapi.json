@@ -5571,7 +5571,8 @@
         "type": "string",
         "enum": [
           "skyvern-1.0",
-          "skyvern-2.0"
+          "skyvern-2.0",
+          "openai-cua"
         ],
         "title": "RunEngine"
       },

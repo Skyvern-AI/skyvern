@@ -6,6 +6,7 @@ from enum import StrEnum
 from typing import Any, Awaitable, Callable, Self
 
 import structlog
+from playwright._impl._errors import TimeoutError
 from playwright.async_api import Frame, Locator, Page
 from pydantic import BaseModel, PrivateAttr
 
@@ -325,13 +326,14 @@ class ScrapedPage(BaseModel):
             element["children"] = new_children
         return element
 
-    async def refresh(self, draw_boxes: bool = True) -> Self:
+    async def refresh(self, draw_boxes: bool = True, scroll: bool = True) -> Self:
         refreshed_page = await scrape_website(
             browser_state=self._browser_state,
             url=self.url,
             cleanup_element_tree=self._clean_up_func,
             scrape_exclude=self._scrape_exclude,
             draw_boxes=draw_boxes,
+            scroll=scroll,
         )
         self.elements = refreshed_page.elements
         self.id_to_css_dict = refreshed_page.id_to_css_dict
@@ -365,6 +367,8 @@ async def scrape_website(
     scrape_exclude: ScrapeExcludeFunc | None = None,
     take_screenshots: bool = True,
     draw_boxes: bool = True,
+    max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
+    scroll: bool = True,
 ) -> ScrapedPage:
     """
     ************************************************************************************************
@@ -396,6 +400,8 @@ async def scrape_website(
             scrape_exclude=scrape_exclude,
             take_screenshots=take_screenshots,
             draw_boxes=draw_boxes,
+            max_screenshot_number=max_screenshot_number,
+            scroll=scroll,
         )
     except Exception as e:
         # NOTE: MAX_SCRAPING_RETRIES is set to 0 in both staging and production
@@ -419,6 +425,8 @@ async def scrape_website(
             scrape_exclude=scrape_exclude,
             take_screenshots=take_screenshots,
             draw_boxes=draw_boxes,
+            max_screenshot_number=max_screenshot_number,
+            scroll=scroll,
         )
 
 
@@ -468,6 +476,8 @@ async def scrape_web_unsafe(
     scrape_exclude: ScrapeExcludeFunc | None = None,
     take_screenshots: bool = True,
     draw_boxes: bool = True,
+    max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
+    scroll: bool = True,
 ) -> ScrapedPage:
     """
     Asynchronous function that performs web scraping without any built-in error handling. This function is intended
@@ -502,7 +512,6 @@ async def scrape_web_unsafe(
             json_to_html(element, need_skyvern_attrs=False) for element in element_tree_trimmed
         )
         token_count = count_tokens(element_tree_trimmed_html_str)
-        max_screenshot_number = settings.MAX_NUM_SCREENSHOTS
         if token_count > DEFAULT_MAX_TOKENS:
             max_screenshot_number = min(max_screenshot_number, 1)
 
@@ -511,6 +520,7 @@ async def scrape_web_unsafe(
             url=url,
             draw_boxes=draw_boxes,
             max_number=max_screenshot_number,
+            scroll=scroll,
         )
     id_to_css_dict, id_to_element_dict, id_to_frame_dict, id_to_element_hash, hash_to_element_ids = build_element_dict(
         elements
@@ -675,9 +685,20 @@ class IncrementalScrapePage:
         frame = self.skyvern_frame.get_frame()
 
         js_script = "async () => await getIncrementElements()"
-        incremental_elements, incremental_tree = await SkyvernFrame.evaluate(
-            frame=frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
-        )
+        try:
+            incremental_elements, incremental_tree = await SkyvernFrame.evaluate(
+                frame=frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+            )
+        except TimeoutError:
+            LOG.warning(
+                "Timeout to get incremental elements with wait_until_finished, going to get incremental elements without waiting",
+            )
+
+            js_script = "async () => await getIncrementElements(false)"
+            incremental_elements, incremental_tree = await SkyvernFrame.evaluate(
+                frame=frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+            )
+
         # we listen the incremental elements seperated by frames, so all elements will be in the same SkyvernFrame
         self.id_to_css_dict, self.id_to_element_dict, _, _, _ = build_element_dict(incremental_elements)
 

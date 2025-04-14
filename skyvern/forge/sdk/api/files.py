@@ -18,6 +18,7 @@ from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, BROWSER_DOWNLOADING_SUFFIX, REPO_ROOT_DIR
 from skyvern.exceptions import DownloadFileMaxSizeExceeded, DownloadFileMaxWaitingTime
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
+from skyvern.utils.url_validators import encode_url
 
 LOG = structlog.get_logger()
 
@@ -84,7 +85,8 @@ async def download_file(url: str, max_size_mb: int | None = None) -> str:
 
         async with aiohttp.ClientSession(raise_for_status=True) as session:
             LOG.info("Starting to download file", url=url)
-            async with session.get(URL(url, encoded=True)) as response:
+            encoded_url = encode_url(url)
+            async with session.get(URL(encoded_url, encoded=True)) as response:
                 # Check the content length if available
                 if max_size_mb and response.content_length and response.content_length > max_size_mb * 1024 * 1024:
                     # todo: move to root exception.py

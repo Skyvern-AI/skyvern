@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from openai.types.responses.response import Response as OpenAIResponse
 from pydantic import BaseModel
 
 from skyvern.config import settings
@@ -40,6 +41,7 @@ class DetailedAgentStepOutput(BaseModel):
     action_results: list[ActionResult] | None
     actions_and_results: list[tuple[Action, list[ActionResult]]] | None
     step_exception: str | None = None
+    cua_response: OpenAIResponse | None = None
 
     class Config:
         exclude = ["scraped_page", "extract_action_prompt"]
@@ -72,6 +74,7 @@ class DetailedAgentStepOutput(BaseModel):
             if self.actions_and_results is None
             else [(action, result) for action, result in self.actions_and_results if result],
             step_exception=self.step_exception,
+            cua_response=self.cua_response,
         )
 
     def to_agent_step_output(self) -> AgentStepOutput:
