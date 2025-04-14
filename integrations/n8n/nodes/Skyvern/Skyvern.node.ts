@@ -2,7 +2,6 @@ import { FieldType, IDataObject, IExecuteSingleFunctions, IHttpRequestMethods, I
 import https from 'https';
 import { URL } from 'url';
 
-// 辅助函数：使用原生https模块发送请求
 async function makeRequest(url: string, options: any = {}): Promise<any> {
     return new Promise((resolve, reject) => {
         const parsedUrl = new URL(url);
