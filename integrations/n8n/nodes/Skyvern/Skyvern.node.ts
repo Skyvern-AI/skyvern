@@ -21,12 +21,24 @@ async function makeRequest(url: string, options: any = {}): Promise<any> {
             
             res.on('end', () => {
                 if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-                    try {
-                        const jsonData = JSON.parse(data);
-                        resolve({ ok: true, status: res.statusCode, json: () => Promise.resolve(jsonData) });
-                    } catch (e) {
-                        resolve({ ok: true, status: res.statusCode, text: () => Promise.resolve(data) });
-                    }
+                    const response = {
+                        ok: true,
+                        status: res.statusCode,
+                        statusText: res.statusMessage || '',
+                        headers: res.headers,
+                        json: () => {
+                            try {
+                                return Promise.resolve(JSON.parse(data));
+                            } catch (e) {
+                                return Promise.reject(new Error('Invalid JSON response'));
+                            }
+                        },
+                        text: () => Promise.resolve(data),
+                        blob: () => Promise.resolve(new Blob([data])),
+                        arrayBuffer: () => Promise.resolve(Buffer.from(data)),
+                        clone: () => response,
+                    };
+                    resolve(response);
                 } else {
                     reject(new Error(`Request failed with status code ${res.statusCode}`));
                 }
