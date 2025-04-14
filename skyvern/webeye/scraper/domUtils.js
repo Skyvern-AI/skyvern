@@ -731,7 +731,8 @@ function isInteractable(element, hoverStylesMap) {
     tagName === "li" ||
     tagName === "p" ||
     tagName === "td" ||
-    tagName === "svg"
+    tagName === "svg" ||
+    tagName === "strong"
   ) {
     const elementCursor = getElementComputedStyle(element)?.cursor;
     if (elementCursor === "pointer") {
@@ -2388,6 +2389,8 @@ async function getIncrementElements(wait_until_finished = true) {
           );
           newChild.children = child.children;
           children[i] = newChild;
+        } else {
+          children[i].interactable = false;
         }
       }
 
@@ -2421,6 +2424,8 @@ async function getIncrementElements(wait_until_finished = true) {
         );
         newHead.children = treeHeadElement.children;
         treeHeadElement = newHead;
+      } else {
+        treeHeadElement.interactable = false;
       }
 
       // check if the element is existed
