@@ -14,7 +14,7 @@ If you are trying to extract the href links which are using the jinja style like
 User Data Extraction Goal: {{ data_extraction_goal }}
 
 {% if previous_extracted_information %}
-Previous contexts or thoughts: {{ previous_extracted_information }}
+Previous contexts or thoughts: ```{{ previous_extracted_information }}```
 {% endif %}
 
 {% if error_code_mapping_str %}

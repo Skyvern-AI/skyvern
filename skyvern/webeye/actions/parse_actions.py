@@ -338,20 +338,19 @@ async def parse_cua_actions(
             intention=reasoning,
         )
         if skyvern_action_type == "complete":
-            if not task.data_extraction_goal and useful_information:
-                LOG.info(
-                    "Updating task with useful information",
-                    task_id=task.task_id,
-                    organization_id=task.organization_id,
-                    useful_information=useful_information,
-                    assistant_message=assistant_message,
-                    reasoning=reasoning,
-                )
-                await app.DATABASE.update_task(
-                    task.task_id,
-                    organization_id=task.organization_id,
-                    extracted_information=assistant_message,
-                )
+            LOG.info(
+                "Updating task with useful information",
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+                useful_information=useful_information,
+                assistant_message=assistant_message,
+                reasoning=reasoning,
+            )
+            await app.DATABASE.update_task(
+                task.task_id,
+                organization_id=task.organization_id,
+                extracted_information=assistant_message,
+            )
             action = CompleteAction(
                 reasoning=reasoning,
                 intention=reasoning,

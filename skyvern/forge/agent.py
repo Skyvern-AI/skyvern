@@ -1165,7 +1165,9 @@ class ForgeAgent:
             ):
                 working_page = await browser_state.must_get_working_page()
                 # refresh task in case the extracted information is updated previously
-                task = await app.DATABASE.get_task(task.task_id, task.organization_id)
+                refreshed_task = await app.DATABASE.get_task(task.task_id, task.organization_id)
+                assert refreshed_task is not None
+                task = refreshed_task
                 extract_action = await self.create_extract_action(task, step, scraped_page)
                 extract_results = await ActionHandler.handle_action(
                     scraped_page, task, step, working_page, extract_action

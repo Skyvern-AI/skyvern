@@ -232,9 +232,6 @@ class Task(TaskBase):
         if status.cant_have_extracted_info() and extracted_information is not None:
             raise ValueError(f"status_cant_have_extracted_information({self.task_id})")
 
-        if self.extracted_information is not None and extracted_information is not None:
-            raise ValueError(f"cant_override_extracted_information({self.task_id})")
-
         if self.failure_reason is not None and failure_reason is not None:
             raise ValueError(f"cant_override_failure_reason({self.task_id})")
 
