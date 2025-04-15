@@ -2986,6 +2986,7 @@ async def extract_information_for_navigation_goal(
         html_need_skyvern_attrs=False,
         navigation_goal=task.navigation_goal,
         navigation_payload=task.navigation_payload,
+        previous_extracted_information=task.extracted_information,
         data_extraction_goal=task.data_extraction_goal,
         extracted_information_schema=task.extracted_information_schema,
         current_url=scraped_page_refreshed.url,
