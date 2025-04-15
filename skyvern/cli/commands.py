@@ -221,7 +221,14 @@ def setup_llm_providers() -> None:
         else:
             update_or_add_env_var("OPENAI_API_KEY", openai_api_key)
             update_or_add_env_var("ENABLE_OPENAI", "true")
-            model_options.extend(["OPENAI_GPT4O"])
+            model_options.extend(
+                [
+                    "OPENAI_GPT4_1",
+                    "OPENAI_GPT4_1_MINI",
+                    "OPENAI_GPT4_1_NANO",
+                    "OPENAI_GPT4O",
+                ]
+            )
     else:
         update_or_add_env_var("ENABLE_OPENAI", "false")
 
@@ -238,8 +245,6 @@ def setup_llm_providers() -> None:
             update_or_add_env_var("ENABLE_ANTHROPIC", "true")
             model_options.extend(
                 [
-                    "ANTHROPIC_CLAUDE3_OPUS",
-                    "ANTHROPIC_CLAUDE3_HAIKU",
                     "ANTHROPIC_CLAUDE3.5_SONNET",
                     "ANTHROPIC_CLAUDE3.7_SONNET",
                 ]
@@ -283,7 +288,6 @@ def setup_llm_providers() -> None:
                 [
                     "GEMINI_FLASH_2_0",
                     "GEMINI_FLASH_2_0_LITE",
-                    "GEMINI_PRO",
                     "GEMINI_2.5_PRO_PREVIEW_03_25",
                     "GEMINI_2.5_PRO_EXP_03_25",
                 ]
@@ -856,5 +860,9 @@ def init() -> None:
             print("\nMCP configuration is complete! Your AI applications are now ready to use Skyvern Cloud.")
 
     if run_local:
+        print("\nInstalling Chromium browser...")
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+        print("Chromium installation complete.")
+
         print("\nTo start using Skyvern, run:")
         print("    skyvern run server")

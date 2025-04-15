@@ -52,7 +52,12 @@ setup_llm_providers() {
         else
             update_or_add_env_var "OPENAI_API_KEY" "$openai_api_key"
             update_or_add_env_var "ENABLE_OPENAI" "true"
-            model_options+=("OPENAI_GPT4_TURBO" "OPENAI_GPT4V" "OPENAI_GPT4O")
+            model_options+=(
+                "OPENAI_GPT4_1"
+                "OPENAI_GPT4_1_MINI"
+                "OPENAI_GPT4_1_NANO"
+                "OPENAI_GPT4O"
+            )
         fi
     else
         update_or_add_env_var "ENABLE_OPENAI" "false"
@@ -69,7 +74,10 @@ setup_llm_providers() {
         else
             update_or_add_env_var "ANTHROPIC_API_KEY" "$anthropic_api_key"
             update_or_add_env_var "ENABLE_ANTHROPIC" "true"
-            model_options+=("ANTHROPIC_CLAUDE3_OPUS" "ANTHROPIC_CLAUDE3_SONNET" "ANTHROPIC_CLAUDE3_HAIKU" "ANTHROPIC_CLAUDE3.5_SONNET")
+            model_options+=(
+                "ANTHROPIC_CLAUDE3.5_SONNET"
+                "ANTHROPIC_CLAUDE3.7_SONNET"
+            )
         fi
     else
         update_or_add_env_var "ENABLE_ANTHROPIC" "false"
@@ -92,7 +100,9 @@ setup_llm_providers() {
             update_or_add_env_var "AZURE_API_BASE" "$azure_api_base"
             update_or_add_env_var "AZURE_API_VERSION" "$azure_api_version"
             update_or_add_env_var "ENABLE_AZURE" "true"
-            model_options+=("AZURE_OPENAI_GPT4V")
+            model_options+=(
+                "AZURE_OPENAI_GPT4O"
+            )
         fi
     else
         update_or_add_env_var "ENABLE_AZURE" "false"
@@ -112,7 +122,6 @@ setup_llm_providers() {
             model_options+=(
                 "GEMINI_FLASH_2_0"
                 "GEMINI_FLASH_2_0_LITE"
-                "GEMINI_PRO"
                 "GEMINI_2.5_PRO_PREVIEW_03_25"
                 "GEMINI_2.5_PRO_EXP_03_25"
             )

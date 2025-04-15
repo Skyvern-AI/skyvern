@@ -37,7 +37,17 @@ class LLMConfigRegistry:
     @classmethod
     def get_config(cls, llm_key: str) -> LLMRouterConfig | LLMConfig:
         if llm_key not in cls._configs:
-            raise InvalidLLMConfigError(llm_key)
+            # If the key is not found in registered configs, treat it as a general model
+            LOG.info("Using general model configuration for unknown LLM key", llm_key=llm_key)
+            if not settings.LLM_KEY:
+                raise InvalidLLMConfigError(f"LLM_KEY not set for {llm_key}")
+            return LLMConfig(
+                llm_key,  # Use the LLM_KEY as the model name
+                ["LLM_API_KEY"],
+                supports_vision=settings.LLM_CONFIG_SUPPORT_VISION,
+                add_assistant_prefix=settings.LLM_CONFIG_ADD_ASSISTANT_PREFIX,
+                max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
+            )
 
         return cls._configs[llm_key]
 
@@ -50,6 +60,36 @@ if settings.ENABLE_OPENAI:
             ["OPENAI_API_KEY"],
             supports_vision=False,
             add_assistant_prefix=False,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_GPT4_1",
+        LLMConfig(
+            "gpt-4.1",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=16384,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_GPT4_1_MINI",
+        LLMConfig(
+            "gpt-4.1-mini",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=16384,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_GPT4_1_NANO",
+        LLMConfig(
+            "gpt-4.1-nano",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=16384,
         ),
     )
     LLMConfigRegistry.register_config(
