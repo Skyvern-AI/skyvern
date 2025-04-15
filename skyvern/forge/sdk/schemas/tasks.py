@@ -4,9 +4,16 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from fastapi import status
+from pydantic import BaseModel, Field, field_validator, model_validator
+from typing_extensions import Self
 
-from skyvern.exceptions import InvalidTaskStatusTransition, TaskAlreadyCanceled, TaskAlreadyTimeout
+from skyvern.exceptions import (
+    InvalidTaskStatusTransition,
+    SkyvernHTTPException,
+    TaskAlreadyCanceled,
+    TaskAlreadyTimeout,
+)
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.schemas.runs import ProxyLocation
@@ -99,9 +106,25 @@ class TaskRequest(TaskBase):
     totp_verification_url: str | None = None
     browser_session_id: str | None = None
 
-    @field_validator("url", "webhook_callback_url", "totp_verification_url")
+    @model_validator(mode="after")
+    def validate_url(self) -> Self:
+        url = self.url
+        browser_session_id = self.browser_session_id
+
+        if len(url) == 0 and browser_session_id is not None:
+            return self
+
+        url_validation_result = validate_url(url)
+
+        if url_validation_result is None:
+            raise SkyvernHTTPException(message=f"Invalid URL: {url}", status_code=status.HTTP_400_BAD_REQUEST)
+
+        self.url = url_validation_result
+        return self
+
+    @field_validator("webhook_callback_url", "totp_verification_url")
     @classmethod
-    def validate_urls(cls, url: str | None) -> str | None:
+    def validate_optional_urls(cls, url: str | None) -> str | None:
         if url is None:
             return None
 
