@@ -358,7 +358,7 @@ def setup_proxy() -> dict | None:
 
 
 def _is_valid_proxy_url(url: str) -> bool:
-    PROXY_PATTERN = re.compile(r"^(http|https|socks5)://([^:@]*:[^@]*@)?[^:@]+:\d+$")
+    PROXY_PATTERN = re.compile(r"^(http|https|socks5)://" r"([^:@]+(:[^@]*)?@)?" r"[^\s:/]+" r"(:\d+)?$")
     try:
         parsed = urlparse(url)
         if not parsed.scheme or not parsed.netloc:
