@@ -613,6 +613,8 @@ class BaseTaskBlock(Block):
                         raise e
 
             try:
+                current_context = skyvern_context.ensure_context()
+                current_context.task_id = task.task_id
                 await app.agent.execute_step(
                     organization=organization,
                     task=task,
@@ -631,6 +633,8 @@ class BaseTaskBlock(Block):
                     failure_reason=str(e),
                 )
                 raise e
+            finally:
+                current_context.task_id = None
 
             # Check task status
             updated_task = await app.DATABASE.get_task(
