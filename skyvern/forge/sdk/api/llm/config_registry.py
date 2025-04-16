@@ -243,6 +243,22 @@ if settings.ENABLE_BEDROCK:
         ),
     )
 
+# Changed on my own to support ollam
+if settings.ENABLE_OLLAMA:
+    LLMConfigRegistry.register_config(
+        "OLLAMA",
+        LLMConfig(
+            f"ollama/{settings.OLLAMA_MODEL}",  # ✅ Prefix with `ollama/`
+            ["OLLAMA_SERVER_URL"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            litellm_params=LiteLLMParams(
+                api_base=settings.OLLAMA_SERVER_URL,
+                api_key="not_needed",  # Ollama does not require an API key
+                model_info={"model_name": f"ollama/{settings.OLLAMA_MODEL}"},  
+            ),
+        ),
+    )
 
 if settings.ENABLE_AZURE:
     LLMConfigRegistry.register_config(
