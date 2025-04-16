@@ -48,6 +48,7 @@ from skyvern.forge.sdk.api.files import (
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
@@ -2457,34 +2458,43 @@ class TaskV2Block(Block):
         workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id, organization_id)
         if not workflow_run:
             raise ValueError(f"WorkflowRun not found {workflow_run_id} when running TaskV2Block")
-        task_v2 = await task_v2_service.initialize_task_v2(
-            organization=organization,
-            user_prompt=self.prompt,
-            user_url=self.url,
-            parent_workflow_run_id=workflow_run_id,
-            proxy_location=workflow_run.proxy_location,
-        )
-        await app.DATABASE.update_task_v2(
-            task_v2.observer_cruise_id, status=TaskV2Status.queued, organization_id=organization_id
-        )
-        if task_v2.workflow_run_id:
-            await app.DATABASE.update_workflow_run(
-                workflow_run_id=task_v2.workflow_run_id,
-                status=WorkflowRunStatus.queued,
+        try:
+            task_v2 = await task_v2_service.initialize_task_v2(
+                organization=organization,
+                user_prompt=self.prompt,
+                user_url=self.url,
+                parent_workflow_run_id=workflow_run_id,
+                proxy_location=workflow_run.proxy_location,
             )
-            await app.DATABASE.update_workflow_run_block(
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-                block_workflow_run_id=task_v2.workflow_run_id,
+            await app.DATABASE.update_task_v2(
+                task_v2.observer_cruise_id, status=TaskV2Status.queued, organization_id=organization_id
             )
+            if task_v2.workflow_run_id:
+                await app.DATABASE.update_workflow_run(
+                    workflow_run_id=task_v2.workflow_run_id,
+                    status=WorkflowRunStatus.queued,
+                )
+                await app.DATABASE.update_workflow_run_block(
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    block_workflow_run_id=task_v2.workflow_run_id,
+                )
 
-        task_v2 = await task_v2_service.run_task_v2(
-            organization=organization,
-            task_v2_id=task_v2.observer_cruise_id,
-            request_id=None,
-            max_steps_override=self.max_steps,
-            browser_session_id=browser_session_id,
-        )
+            task_v2 = await task_v2_service.run_task_v2(
+                organization=organization,
+                task_v2_id=task_v2.observer_cruise_id,
+                request_id=None,
+                max_steps_override=self.max_steps,
+                browser_session_id=browser_session_id,
+            )
+        finally:
+            skyvern_context.set(
+                skyvern_context.SkyvernContext(
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    browser_session_id=browser_session_id,
+                )
+            )
         result_dict = None
         if task_v2:
             result_dict = task_v2.output
