@@ -48,7 +48,6 @@ from skyvern.forge.sdk.api.files import (
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
@@ -613,8 +612,6 @@ class BaseTaskBlock(Block):
                         raise e
 
             try:
-                current_context = skyvern_context.ensure_context()
-                current_context.task_id = task.task_id
                 await app.agent.execute_step(
                     organization=organization,
                     task=task,
@@ -633,8 +630,6 @@ class BaseTaskBlock(Block):
                     failure_reason=str(e),
                 )
                 raise e
-            finally:
-                current_context.task_id = None
 
             # Check task status
             updated_task = await app.DATABASE.get_task(
