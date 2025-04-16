@@ -32,6 +32,7 @@ class ActionType(StrEnum):
     KEYPRESS = "keypress"
     TYPE = "type"
     MOVE = "move"
+    DRAG = "drag"
 
     def is_web_action(self) -> bool:
         return self in [
@@ -283,6 +284,13 @@ class MoveAction(Action):
     action_type: ActionType = ActionType.MOVE
     x: int
     y: int
+
+
+class DragAction(Action):
+    action_type: ActionType = ActionType.DRAG
+    start_x: int
+    start_y: int
+    path: list[tuple[int, int]] = []
 
 
 class ScrapeResult(BaseModel):

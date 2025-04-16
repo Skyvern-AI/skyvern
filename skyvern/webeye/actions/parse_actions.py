@@ -16,6 +16,7 @@ from skyvern.webeye.actions.actions import (
     ClickAction,
     CompleteAction,
     DownloadFileAction,
+    DragAction,
     InputTextAction,
     KeypressAction,
     MoveAction,
@@ -290,6 +291,32 @@ async def parse_cua_actions(
                         reasoning=reasoning,
                         intention=reasoning,
                     )
+                case "drag":
+                    whole_path = cua_action.path
+                    if not whole_path or len(whole_path) < 2:
+                        LOG.warning(
+                            "Invalid drag action",
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            step_order=step.order,
+                            action_order=idx,
+                            whole_path=whole_path,
+                        )
+                        action = WaitAction(
+                            seconds=5,
+                            reasoning=reasoning,
+                            intention=reasoning,
+                        )
+                    else:
+                        start_x, start_y = whole_path[0][0], whole_path[0][1]
+                        reasoning = reasoning or f"Drag action path: {whole_path}"
+                        action = DragAction(
+                            start_x=start_x,
+                            start_y=start_y,
+                            path=whole_path[1:],
+                            reasoning=reasoning,
+                            intention=reasoning,
+                        )
                 case _:
                     raise ValueError(f"Unsupported action type: {action_type}")
             action.organization_id = task.organization_id
