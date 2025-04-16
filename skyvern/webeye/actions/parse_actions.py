@@ -317,6 +317,11 @@ async def parse_cua_actions(
                             reasoning=reasoning,
                             intention=reasoning,
                         )
+                case "screenshot":
+                    return NullAction(
+                        reasoning=reasoning,
+                        intention=reasoning,
+                    )
                 case _:
                     raise ValueError(f"Unsupported action type: {action_type}")
             action.organization_id = task.organization_id
