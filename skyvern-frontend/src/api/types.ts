@@ -181,6 +181,7 @@ export const ActionTypes = {
   Scroll: "scroll",
   Move: "move",
   NullAction: "null_action",
+  VerificationCode: "verification_code",
 } as const;
 
 export type ActionType = (typeof ActionTypes)[keyof typeof ActionTypes];
@@ -202,6 +203,7 @@ export const ReadableActionTypes: {
   scroll: "Scroll",
   move: "Move",
   null_action: "Screenshot",
+  verification_code: "Verification Code",
 };
 
 export type Option = {
