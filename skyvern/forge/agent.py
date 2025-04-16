@@ -879,15 +879,6 @@ class ForgeAgent:
                     status=StepStatus.failed,
                     output=detailed_agent_step_output.to_agent_step_output(),
                 )
-                detailed_agent_step_output = DetailedAgentStepOutput(
-                    scraped_page=scraped_page,
-                    extract_action_prompt=extract_action_prompt,
-                    llm_response=json_response,
-                    actions=actions,
-                    action_results=[],
-                    actions_and_results=[],
-                    step_exception=None,
-                )
                 return step, detailed_agent_step_output
 
             # Execute the actions
@@ -1268,44 +1259,86 @@ class ForgeAgent:
                 incremental_reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                 incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
             )
-
-        computer_calls = [item for item in previous_response.output if item.type == "computer_call"]
-        if not computer_calls:
-            return [], previous_response
-
         if not scraped_page.screenshots:
             return [], previous_response
 
-        last_call_id = computer_calls[-1].call_id
-        screenshot_base64 = base64.b64encode(scraped_page.screenshots[0]).decode("utf-8")
+        computer_calls = [item for item in previous_response.output if item.type == "computer_call"]
+        reasonings = [item for item in previous_response.output if item.type == "reasoning"]
+        assistant_messages = [
+            item for item in previous_response.output if item.type == "message" and item.role == "assistant"
+        ]
+        last_call_id = None
+        if computer_calls:
+            last_call_id = computer_calls[-1].call_id
 
-        current_response = await app.OPENAI_CLIENT.responses.create(
-            model="computer-use-preview",
-            previous_response_id=previous_response.id,
-            tools=[
-                {
-                    "type": "computer_use_preview",
-                    "display_width": settings.BROWSER_WIDTH,
-                    "display_height": settings.BROWSER_HEIGHT,
-                    "environment": "browser",
-                }
-            ],
-            input=[
-                {
-                    "call_id": last_call_id,
-                    "type": "computer_call_output",
-                    "output": {
-                        "type": "input_image",
-                        "image_url": f"data:image/png;base64,{screenshot_base64}",
-                    },
-                }
-            ],
-            reasoning={
-                "generate_summary": "concise",
-            },
-            truncation="auto",
-            temperature=0,
-        )
+        screenshot_base64 = base64.b64encode(scraped_page.screenshots[0]).decode("utf-8")
+        if last_call_id is None:
+            # try address the conversation with the context we have
+            reasoning = reasonings[0].summary[0].text if reasonings and reasonings[0].summary else None
+            assistant_message = assistant_messages[0].content[0].text if assistant_messages else None
+            skyvern_repsonse_prompt = load_prompt_with_elements(
+                scraped_page=scraped_page,
+                prompt_engine=prompt_engine,
+                template_name="cua-answer-question",
+                navigation_goal=task.navigation_goal,
+                assistant_reasoning=reasoning,
+                assistant_message=assistant_message,
+            )
+            skyvern_response = await app.LLM_API_HANDLER(
+                prompt=skyvern_repsonse_prompt,
+                prompt_name="cua-answer-question",
+                step=step,
+                screenshots=scraped_page.screenshots,
+            )
+            resp_content = skyvern_response.get("answer")
+            if not resp_content:
+                resp_content = "I don't know. Can you help me make the best decision to achieve the goal?"
+            current_response = await app.OPENAI_CLIENT.responses.create(
+                model="computer-use-preview",
+                previous_response_id=previous_response.id,
+                tools=[
+                    {
+                        "type": "computer_use_preview",
+                        "display_width": settings.BROWSER_WIDTH,
+                        "display_height": settings.BROWSER_HEIGHT,
+                        "environment": "browser",
+                    }
+                ],
+                input=[
+                    {"role": "user", "content": resp_content},
+                ],
+                reasoning={"generate_summary": "concise"},
+                truncation="auto",
+                temperature=0,
+            )
+        else:
+            current_response = await app.OPENAI_CLIENT.responses.create(
+                model="computer-use-preview",
+                previous_response_id=previous_response.id,
+                tools=[
+                    {
+                        "type": "computer_use_preview",
+                        "display_width": settings.BROWSER_WIDTH,
+                        "display_height": settings.BROWSER_HEIGHT,
+                        "environment": "browser",
+                    }
+                ],
+                input=[
+                    {
+                        "call_id": last_call_id,
+                        "type": "computer_call_output",
+                        "output": {
+                            "type": "input_image",
+                            "image_url": f"data:image/png;base64,{screenshot_base64}",
+                        },
+                    }
+                ],
+                reasoning={
+                    "generate_summary": "concise",
+                },
+                truncation="auto",
+                temperature=0,
+            )
         input_tokens = current_response.usage.input_tokens or 0
         output_tokens = current_response.usage.output_tokens or 0
         current_response.usage.total_tokens or 0
