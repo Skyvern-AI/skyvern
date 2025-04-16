@@ -120,10 +120,24 @@ class Settings(BaseSettings):
     ENABLE_BEDROCK: bool = False
     ENABLE_GEMINI: bool = False
     ENABLE_AZURE_CUA: bool = False
+    ENABLE_OPENAI_COMPATIBLE: bool = False
     # OPENAI
     OPENAI_API_KEY: str | None = None
     # ANTHROPIC
     ANTHROPIC_API_KEY: str | None = None
+    
+    # OPENAI COMPATIBLE
+    OPENAI_COMPATIBLE_MODEL_NAME: str | None = None
+    OPENAI_COMPATIBLE_API_KEY: str | None = None
+    OPENAI_COMPATIBLE_API_BASE: str | None = None
+    OPENAI_COMPATIBLE_API_VERSION: str | None = None
+    OPENAI_COMPATIBLE_MAX_TOKENS: int | None = None
+    OPENAI_COMPATIBLE_TEMPERATURE: float | None = None
+    OPENAI_COMPATIBLE_SUPPORTS_VISION: bool = False
+    OPENAI_COMPATIBLE_ADD_ASSISTANT_PREFIX: bool = False
+    OPENAI_COMPATIBLE_MODEL_KEY: str = "OPENAI_COMPATIBLE"
+    OPENAI_COMPATIBLE_REASONING_EFFORT: str | None = None
+    
     # AZURE
     AZURE_DEPLOYMENT: str | None = None
     AZURE_API_KEY: str | None = None
