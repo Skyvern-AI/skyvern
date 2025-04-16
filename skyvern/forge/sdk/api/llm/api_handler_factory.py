@@ -263,7 +263,6 @@ class LLMAPIHandlerFactory:
             active_parameters.update(parameters)
             if llm_config.litellm_params:  # type: ignore
                 active_parameters.update(llm_config.litellm_params)  # type: ignore
-                
 
             context = skyvern_context.current()
             if context and len(context.hashed_href_map) > 0:

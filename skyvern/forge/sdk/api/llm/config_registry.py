@@ -159,7 +159,7 @@ if settings.ENABLE_OPENAI:
             temperature=None,  # Temperature isn't supported in the O-model series
             reasoning_effort="high",
             litellm_params=LiteLLMParams(
-                drop_params=True,
+                drop_params=True,  # type: ignore
             ),
         ),
     )
@@ -174,7 +174,7 @@ if settings.ENABLE_OPENAI:
             temperature=None,  # Temperature isn't supported in the O-model series
             reasoning_effort="high",
             litellm_params=LiteLLMParams(
-                drop_params=True,
+                drop_params=True,  # type: ignore
             ),
         ),
     )
