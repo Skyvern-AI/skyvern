@@ -99,7 +99,8 @@ class Settings(BaseSettings):
     # LLM Configuration #
     #####################
     # ACTIVE LLM PROVIDER
-    LLM_KEY: str = "OPENAI_GPT4O"
+    LLM_KEY: str = "OPENAI_GPT4O"  # This is the model name
+    LLM_API_KEY: str | None = None  # API key for the model
     SECONDARY_LLM_KEY: str | None = None
     SELECT_AGENT_LLM_KEY: str | None = None
     SINGLE_CLICK_AGENT_LLM_KEY: str | None = None
@@ -108,6 +109,8 @@ class Settings(BaseSettings):
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
     LLM_CONFIG_TEMPERATURE: float = 0
+    LLM_CONFIG_SUPPORT_VISION: bool = True  # Whether the model supports vision
+    LLM_CONFIG_ADD_ASSISTANT_PREFIX: bool = False  # Whether to add assistant prefix
     # LLM PROVIDER SPECIFIC
     ENABLE_OPENAI: bool = False
     ENABLE_ANTHROPIC: bool = False
