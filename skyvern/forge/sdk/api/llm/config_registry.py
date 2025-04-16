@@ -39,7 +39,7 @@ class LLMConfigRegistry:
         if llm_key not in cls._configs:
             # If the key is not found in registered configs, treat it as a general model
             LOG.info("Using general model configuration for unknown LLM key", llm_key=llm_key)
-            if not settings.LLM_KEY:
+            if not llm_key:
                 raise InvalidLLMConfigError(f"LLM_KEY not set for {llm_key}")
             return LLMConfig(
                 llm_key,  # Use the LLM_KEY as the model name
