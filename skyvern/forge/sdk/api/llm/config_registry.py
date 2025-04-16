@@ -586,7 +586,7 @@ if settings.ENABLE_OPENAI_COMPATIBLE:
     model_name = settings.OPENAI_COMPATIBLE_MODEL_NAME
     
     if not model_name:
-        LOG.error("OPENAI_COMPATIBLE_MODEL_NAME is required but not set. OpenAI-compatible model will not be registered.")
+        raise InvalidLLMConfigError("OPENAI_COMPATIBLE_MODEL_NAME is required but not set. OpenAI-compatible model will not be registered.")
     else:
         # Required environment variables to check
         required_env_vars = ["OPENAI_COMPATIBLE_API_KEY", "OPENAI_COMPATIBLE_MODEL_NAME", "OPENAI_COMPATIBLE_API_BASE"]
