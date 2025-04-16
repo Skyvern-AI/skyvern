@@ -160,7 +160,7 @@ class LLMAPIHandlerFactory:
                 try:
                     llm_cost = litellm.completion_cost(completion_response=response)
                 except Exception as e:
-                    LOG.exception("Failed to calculate LLM cost", error=str(e))
+                    LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
                     llm_cost = 0
                 prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
                 completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
@@ -350,7 +350,7 @@ class LLMAPIHandlerFactory:
                 try:
                     llm_cost = litellm.completion_cost(completion_response=response)
                 except Exception as e:
-                    LOG.exception("Failed to calculate LLM cost", error=str(e))
+                    LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
                     llm_cost = 0
                 prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
                 completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
