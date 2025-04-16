@@ -17,4 +17,4 @@ def get_provider():
     elif key in PROVIDERS:
         return PROVIDERS[key]()
     else:
-        raise Exception(f"Unknown LLM provider: {key}")
+        raise ValueError(f"Unknown LLM provider: {key}")
