@@ -331,11 +331,13 @@ More extensive documentation can be found on our [docs page](https://docs.skyver
 | `AZURE_API_VERSION` | Azure API Version| String | `2024-02-01`|
 | `GEMINI_API_KEY` | Gemini API Key| String | `your_google_gemini_api_key`|
 | `NOVITA_API_KEY` | Novita AI API Key| String | `your_novita_api_key`|
-| `OPENAI_COMPATIBLE_MODEL_NAME` | Model name for OpenAI-compatible endpoint (required)| String | `yi-34b`, `gpt-3.5-turbo`, `mistral-large`, etc.|
-| `OPENAI_COMPATIBLE_API_KEY` | API key for OpenAI-compatible endpoint (required)| String | `sk-1234567890`|
-| `OPENAI_COMPATIBLE_API_BASE` | Base URL for OpenAI-compatible endpoint (required)| String | `https://api.together.xyz/v1`, `http://localhost:8000/v1`, etc.|
+| `OPENAI_COMPATIBLE_MODEL_NAME` | Model name for OpenAI-compatible endpoint | String | `yi-34b`, `gpt-3.5-turbo`, `mistral-large`, etc.|
+| `OPENAI_COMPATIBLE_API_KEY` | API key for OpenAI-compatible endpoint | String | `sk-1234567890`|
+| `OPENAI_COMPATIBLE_API_BASE` | Base URL for OpenAI-compatible endpoint | String | `https://api.together.xyz/v1`, `http://localhost:8000/v1`, etc.|
 
 #### Environment Variables (OpenAI-Compatible model - additional config)
+| Variable | Description| Type | Sample Value|
+| -------- | ------- | ------- | ------- |
 | `OPENAI_COMPATIBLE_API_VERSION` | API version for OpenAI-compatible endpoint, optional| String | `2023-05-15`|
 | `OPENAI_COMPATIBLE_MAX_TOKENS` | Maximum tokens for completion, optional| Integer | `4096`, `8192`, etc.|
 | `OPENAI_COMPATIBLE_TEMPERATURE` | Temperature setting, optional| Float | `0.0`, `0.5`, `0.7`, etc.|
