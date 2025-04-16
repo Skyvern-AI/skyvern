@@ -2216,6 +2216,8 @@ async function addIncrementalNodeToMap(parentNode, childrenNode) {
 
     try {
       for (const child of childrenNode) {
+        // sleep for a while until animation ends
+        await asyncSleepFor(300);
         // Pass -1 as frame_index to indicate the frame number is not sensitive in this case
         const [_, newNodeTree] = await buildElementTree(child, "", true);
         if (newNodeTree.length > 0) {
@@ -2270,7 +2272,8 @@ if (window.globalObserverForDOMIncrement === undefined) {
           if (!mutation.oldValue) continue;
           if (
             !isClassNameIncludesHidden(mutation.oldValue) &&
-            !node.hasAttribute("data-menu-uid") // google framework use this to trace dropdown menu
+            !node.hasAttribute("data-menu-uid") && // google framework use this to trace dropdown menu
+            !mutation.oldValue.includes("select__items")
           )
             continue;
           const newStyle = getElementComputedStyle(node);
