@@ -180,6 +180,7 @@ export const ActionTypes = {
   KeyPress: "keypress",
   Scroll: "scroll",
   Move: "move",
+  NullAction: "null_action",
 } as const;
 
 export type ActionType = (typeof ActionTypes)[keyof typeof ActionTypes];
@@ -200,6 +201,7 @@ export const ReadableActionTypes: {
   keypress: "Press Keys",
   scroll: "Scroll",
   move: "Move",
+  null_action: "Screenshot",
 };
 
 export type Option = {
