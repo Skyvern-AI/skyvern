@@ -107,7 +107,14 @@ async def aiohttp_post(
                         return await response.json()
                     if raise_exception:
                         raise HttpException(response.status, url)
-                    LOG.error("None 200 async post response", url=url, status_code=response.status, method="POST")
+                    response_text = await response.text()
+                    LOG.error(
+                        "Non 200 async post response",
+                        url=url,
+                        status_code=response.status,
+                        method="POST",
+                        response=response_text,
+                    )
                     return {}
             except Exception:
                 if retry_timeout > 0:

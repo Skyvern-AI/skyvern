@@ -1439,6 +1439,12 @@ async def handle_complete_action(
             workflow_run_id=task.workflow_run_id,
         )
         action.verified = True
+        if not task.data_extraction_goal and verification_result.thoughts:
+            await app.DATABASE.update_task(
+                task.task_id,
+                organization_id=task.organization_id,
+                extracted_information=verification_result.thoughts,
+            )
 
     return [ActionSuccess()]
 
@@ -1537,6 +1543,22 @@ async def handle_move_action(
     return [ActionSuccess()]
 
 
+async def handle_drag_action(
+    action: actions.DragAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    await page.mouse.move(action.start_x, action.start_y)
+    await page.mouse.down()
+    for point in action.path:
+        x, y = point[0], point[1]
+        await page.mouse.move(x, y)
+    await page.mouse.up()
+    return [ActionSuccess()]
+
+
 ActionHandler.register_action_type(ActionType.SOLVE_CAPTCHA, handle_solve_captcha_action)
 ActionHandler.register_action_type(ActionType.CLICK, handle_click_action)
 ActionHandler.register_action_type(ActionType.INPUT_TEXT, handle_input_text_action)
@@ -1551,6 +1573,7 @@ ActionHandler.register_action_type(ActionType.EXTRACT, handle_extract_action)
 ActionHandler.register_action_type(ActionType.SCROLL, handle_scroll_action)
 ActionHandler.register_action_type(ActionType.KEYPRESS, handle_keypress_action)
 ActionHandler.register_action_type(ActionType.MOVE, handle_move_action)
+ActionHandler.register_action_type(ActionType.DRAG, handle_drag_action)
 
 
 async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) -> Any:
@@ -2980,6 +3003,7 @@ async def extract_information_for_navigation_goal(
         html_need_skyvern_attrs=False,
         navigation_goal=task.navigation_goal,
         navigation_payload=task.navigation_payload,
+        previous_extracted_information=task.extracted_information,
         data_extraction_goal=task.data_extraction_goal,
         extracted_information_schema=task.extracted_information_schema,
         current_url=scraped_page_refreshed.url,

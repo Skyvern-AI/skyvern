@@ -13,6 +13,10 @@ If you are trying to extract the href links which are using the jinja style like
 
 User Data Extraction Goal: {{ data_extraction_goal }}
 
+{% if previous_extracted_information %}
+Previous contexts or thoughts: ```{{ previous_extracted_information }}```
+{% endif %}
+
 {% if error_code_mapping_str %}
 Use the error codes and their descriptions to return errors in the output, do not return any error that's not defined by the user. Don't return any outputs if the schema doesn't specify an error related field. Here are the descriptions defined by the user: {{ error_code_mapping_str }}
 {% endif %}

@@ -16,6 +16,7 @@ from skyvern.webeye.actions.actions import (
     ClickAction,
     CompleteAction,
     DownloadFileAction,
+    DragAction,
     InputTextAction,
     KeypressAction,
     MoveAction,
@@ -290,6 +291,32 @@ async def parse_cua_actions(
                         reasoning=reasoning,
                         intention=reasoning,
                     )
+                case "drag":
+                    whole_path = cua_action.path
+                    if not whole_path or len(whole_path) < 2:
+                        LOG.warning(
+                            "Invalid drag action",
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            step_order=step.order,
+                            action_order=idx,
+                            whole_path=whole_path,
+                        )
+                        action = WaitAction(
+                            seconds=5,
+                            reasoning=reasoning,
+                            intention=reasoning,
+                        )
+                    else:
+                        start_x, start_y = whole_path[0][0], whole_path[0][1]
+                        reasoning = reasoning or f"Drag action path: {whole_path}"
+                        action = DragAction(
+                            start_x=start_x,
+                            start_y=start_y,
+                            path=whole_path[1:],
+                            reasoning=reasoning,
+                            intention=reasoning,
+                        )
                 case _:
                     raise ValueError(f"Unsupported action type: {action_type}")
             action.organization_id = task.organization_id
@@ -338,16 +365,23 @@ async def parse_cua_actions(
             intention=reasoning,
         )
         if skyvern_action_type == "complete":
-            if not task.data_extraction_goal and useful_information:
-                await app.DATABASE.update_task(
-                    task.task_id,
-                    organization_id=task.organization_id,
-                    extracted_information=useful_information,
-                )
+            LOG.info(
+                "Updating task with useful information",
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+                useful_information=useful_information,
+                assistant_message=assistant_message,
+                reasoning=reasoning,
+            )
+            await app.DATABASE.update_task(
+                task.task_id,
+                organization_id=task.organization_id,
+                extracted_information=assistant_message,
+            )
             action = CompleteAction(
                 reasoning=reasoning,
                 intention=reasoning,
-                verified=False,
+                verified=True,
                 data_extraction_goal=task.data_extraction_goal,
             )
         elif skyvern_action_type == "terminate":
