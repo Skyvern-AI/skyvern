@@ -159,6 +159,39 @@ setup_llm_providers() {
         update_or_add_env_var "ENABLE_NOVITA" "false"
     fi
 
+    # OpenAI Compatible Configuration
+    echo "To enable an OpenAI-compatible provider, you must have a model name, API key, and API base URL."
+    read -p "Do you want to enable an OpenAI-compatible provider (y/n)? " enable_openai_compatible
+    if [[ "$enable_openai_compatible" == "y" ]]; then
+        read -p "Enter the model name (e.g., 'yi-34b', 'mistral-large'): " openai_compatible_model_name
+        read -p "Enter your API key: " openai_compatible_api_key
+        read -p "Enter the API base URL (e.g., 'https://api.together.xyz/v1'): " openai_compatible_api_base
+        read -p "Does this model support vision (y/n)? " openai_compatible_vision
+        
+        if [ -z "$openai_compatible_model_name" ] || [ -z "$openai_compatible_api_key" ] || [ -z "$openai_compatible_api_base" ]; then
+            echo "Error: All required fields must be populated."
+            echo "OpenAI-compatible provider will not be enabled."
+        else
+            update_or_add_env_var "OPENAI_COMPATIBLE_MODEL_NAME" "$openai_compatible_model_name"
+            update_or_add_env_var "OPENAI_COMPATIBLE_API_KEY" "$openai_compatible_api_key"
+            update_or_add_env_var "OPENAI_COMPATIBLE_API_BASE" "$openai_compatible_api_base"
+            
+            # Set vision support
+            if [[ "$openai_compatible_vision" == "y" ]]; then
+                update_or_add_env_var "OPENAI_COMPATIBLE_SUPPORTS_VISION" "true"
+            else
+                update_or_add_env_var "OPENAI_COMPATIBLE_SUPPORTS_VISION" "false"
+            fi
+
+            update_or_add_env_var "ENABLE_OPENAI_COMPATIBLE" "true"
+            model_options+=(
+                "OPENAI_COMPATIBLE"
+            )
+        fi
+    else
+        update_or_add_env_var "ENABLE_OPENAI_COMPATIBLE" "false"
+    fi
+
     # Model Selection
     if [ ${#model_options[@]} -eq 0 ]; then
         echo "No LLM providers enabled. You won't be able to run Skyvern unless you enable at least one provider. You can re-run this script to enable providers or manually update the .env file."

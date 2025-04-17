@@ -323,6 +323,39 @@ def setup_llm_providers() -> None:
             )
     else:
         update_or_add_env_var("ENABLE_NOVITA", "false")
+        
+    # OpenAI Compatible Configuration
+    print("To enable an OpenAI-compatible provider, you must have a model name, API key, and API base URL.")
+    enable_openai_compatible = input("Do you want to enable an OpenAI-compatible provider (y/n)? ").lower() == "y"
+    if enable_openai_compatible:
+        openai_compatible_model_name = input("Enter the model name (e.g., 'yi-34b', 'mistral-large'): ")
+        openai_compatible_api_key = input("Enter your API key: ")
+        openai_compatible_api_base = input("Enter the API base URL (e.g., 'https://api.together.xyz/v1'): ")
+        openai_compatible_vision = input("Does this model support vision (y/n)? ").lower() == "y"
+        
+        if not all([openai_compatible_model_name, openai_compatible_api_key, openai_compatible_api_base]):
+            print("Error: All required fields must be populated.")
+            print("OpenAI-compatible provider will not be enabled.")
+        else:
+            update_or_add_env_var("OPENAI_COMPATIBLE_MODEL_NAME", openai_compatible_model_name)
+            update_or_add_env_var("OPENAI_COMPATIBLE_API_KEY", openai_compatible_api_key)
+            update_or_add_env_var("OPENAI_COMPATIBLE_API_BASE", openai_compatible_api_base)
+            
+            # Set vision support
+            if openai_compatible_vision:
+                update_or_add_env_var("OPENAI_COMPATIBLE_SUPPORTS_VISION", "true")
+            else:
+                update_or_add_env_var("OPENAI_COMPATIBLE_SUPPORTS_VISION", "false")
+
+            # Optional: Ask for API version
+            openai_compatible_api_version = input("Enter API version (optional, press enter to skip): ")
+            if openai_compatible_api_version:
+                update_or_add_env_var("OPENAI_COMPATIBLE_API_VERSION", openai_compatible_api_version)
+
+            update_or_add_env_var("ENABLE_OPENAI_COMPATIBLE", "true")
+            model_options.append("OPENAI_COMPATIBLE")
+    else:
+        update_or_add_env_var("ENABLE_OPENAI_COMPATIBLE", "false")
 
     # Model Selection
     if not model_options:
