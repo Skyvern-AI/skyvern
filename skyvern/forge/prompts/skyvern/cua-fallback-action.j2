@@ -5,8 +5,8 @@ According to the AI assistant's feedback, including reasoning and its message, t
 Help the user decide what to do next based on the assistant's message. Here's the list of available actions:
 - solve_captcha: the task is blocked by captcha and the assistant is asking the user to solve the captcha
 - complete: the user goal has been achieved
-- terminate: the user goal cannot be achieved. Terminate the task. Examples: 1) there's not enough data provided to achieve the goal and the assistant is asking the user to provide more information. For examples: login is required and the user has not provided the login credentials or incorrect credentials are provided; a form needs to be filled and a required field is missing. 2) The site is stuck or not loading after multiple attempts
 - get_verification_code: the assistant is asking the user to provide a verification code (2FA, MFA or TOTP code)
+- terminate: the user goal cannot be achieved. Terminate the task. Examples: 1) there's not enough data provided to achieve the goal and the assistant is asking the user to provide more information. For examples: login is required and the user has not provided the login credentials or incorrect credentials are provided; a form needs to be filled and a required field is missing. 2) The site is stuck or not loading after multiple attempts. Do not terminate if receiving verification code is an option which has not been sent.
 - other: the assistant is asking the user to do something else
 
 Return the action to take next in the following JSON format:
