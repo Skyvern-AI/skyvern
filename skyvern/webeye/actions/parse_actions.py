@@ -320,7 +320,7 @@ async def parse_cua_actions(
                             intention=reasoning,
                         )
                 case "screenshot":
-                    return NullAction(
+                    action = NullAction(
                         reasoning=reasoning,
                         intention=reasoning,
                     )
