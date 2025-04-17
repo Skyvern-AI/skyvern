@@ -1495,6 +1495,8 @@ async def run_task(
             error_code_mapping=run_request.error_code_mapping,
             proxy_location=run_request.proxy_location,
             browser_session_id=run_request.browser_session_id,
+            totp_verification_url=run_request.totp_url,
+            totp_identifier=run_request.totp_identifier,
         )
         task_v1_response = await task_v1_service.run_task(
             task=task_v1_request,
