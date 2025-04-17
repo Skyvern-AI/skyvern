@@ -57,6 +57,8 @@ setup_llm_providers() {
                 "OPENAI_GPT4_1_MINI"
                 "OPENAI_GPT4_1_NANO"
                 "OPENAI_GPT4O"
+                "OPENAI_O4_MINI"
+                "OPENAI_O3"
             )
         fi
     else

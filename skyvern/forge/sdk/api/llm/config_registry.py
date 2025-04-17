@@ -148,6 +148,36 @@ if settings.ENABLE_OPENAI:
             max_completion_tokens=16384,
         ),
     )
+    LLMConfigRegistry.register_config(
+        "OPENAI_O4_MINI",
+        LLMConfig(
+            "o4-mini",
+            ["OPENAI_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            max_completion_tokens=16384,
+            temperature=None,  # Temperature isn't supported in the O-model series
+            reasoning_effort="high",
+            litellm_params=LiteLLMParams(
+                drop_params=True,  # type: ignore
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_O3",
+        LLMConfig(
+            "o3",
+            ["OPENAI_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            max_completion_tokens=16384,
+            temperature=None,  # Temperature isn't supported in the O-model series
+            reasoning_effort="high",
+            litellm_params=LiteLLMParams(
+                drop_params=True,  # type: ignore
+            ),
+        ),
+    )
 
 
 if settings.ENABLE_ANTHROPIC:
@@ -343,7 +373,7 @@ if settings.ENABLE_AZURE_O3_MINI:
             add_assistant_prefix=False,
             max_completion_tokens=16384,
             temperature=None,  # Temperature isn't supported in the O-model series
-            reasoning_effort="low",
+            reasoning_effort="high",
         ),
     )
 
