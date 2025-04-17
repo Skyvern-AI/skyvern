@@ -364,6 +364,7 @@ async def parse_cua_actions(
             prompt=fallback_action_prompt,
             prompt_name="cua-fallback-action",
         )
+        LOG.info("Fallback action response", action_response=action_response)
         skyvern_action_type = action_response.get("action")
         useful_information = action_response.get("useful_information")
         action = WaitAction(
