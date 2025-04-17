@@ -297,6 +297,8 @@ class SkyvernAgent:
                     extracted_information_schema=data_extraction_schema,
                     error_code_mapping=error_code_mapping,
                     proxy_location=proxy_location,
+                    totp_identifier=totp_identifier,
+                    totp_verification_url=totp_url,
                 )
 
                 created_task = await app.agent.create_task(task_request, organization.organization_id)
