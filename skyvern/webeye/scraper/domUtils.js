@@ -2273,7 +2273,11 @@ if (window.globalObserverForDOMIncrement === undefined) {
           if (
             !isClassNameIncludesHidden(mutation.oldValue) &&
             !node.hasAttribute("data-menu-uid") && // google framework use this to trace dropdown menu
-            !mutation.oldValue.includes("select__items")
+            !mutation.oldValue.includes("select__items") &&
+            !(
+              node.hasAttribute("data-testid") &&
+              node.getAttribute("data-testid").includes("select-dropdown")
+            )
           )
             continue;
           const newStyle = getElementComputedStyle(node);
