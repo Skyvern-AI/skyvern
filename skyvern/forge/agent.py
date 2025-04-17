@@ -1274,6 +1274,7 @@ class ForgeAgent:
         screenshot_base64 = base64.b64encode(scraped_page.screenshots[0]).decode("utf-8")
         if last_call_id is None:
             current_context = skyvern_context.ensure_context()
+            resp_content = None
             if task.task_id in current_context.totp_codes:
                 verification_code = current_context.totp_codes[task.task_id]
                 current_context.totp_codes.pop(task.task_id)
