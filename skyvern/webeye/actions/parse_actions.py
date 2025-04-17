@@ -27,8 +27,10 @@ from skyvern.webeye.actions.actions import (
     SolveCaptchaAction,
     TerminateAction,
     UploadFileAction,
+    VerificationCodeAction,
     WaitAction,
 )
+from skyvern.webeye.actions.handler import poll_verification_code
 from skyvern.webeye.scraper.scraper import ScrapedPage
 
 LOG = structlog.get_logger()
@@ -400,12 +402,33 @@ async def parse_cua_actions(
                 intention=reasoning,
             )
         elif skyvern_action_type == "get_verification_code":
-            # Currently we don't support verification code
-            # TODO: handle verification code by fetching the code and send it to CUA
-            action = TerminateAction(
-                reasoning=reasoning,
-                intention=reasoning,
-            )
+            if (task.totp_verification_url or task.totp_identifier) and task.organization_id:
+                LOG.info(
+                    "Getting verification code for CUA",
+                    task_id=task.task_id,
+                    organization_id=task.organization_id,
+                    workflow_run_id=task.workflow_run_id,
+                    totp_verification_url=task.totp_verification_url,
+                    totp_identifier=task.totp_identifier,
+                )
+                verification_code = await poll_verification_code(
+                    task.task_id,
+                    task.organization_id,
+                    workflow_run_id=task.workflow_run_id,
+                    totp_verification_url=task.totp_verification_url,
+                    totp_identifier=task.totp_identifier,
+                )
+                reasoning = reasoning or f"Received verification code: {verification_code}"
+                action = VerificationCodeAction(
+                    verification_code=verification_code,
+                    reasoning=reasoning,
+                    intention=reasoning,
+                )
+            else:
+                action = TerminateAction(
+                    reasoning=reasoning,
+                    intention=reasoning,
+                )
 
         action.organization_id = task.organization_id
         action.workflow_run_id = task.workflow_run_id
