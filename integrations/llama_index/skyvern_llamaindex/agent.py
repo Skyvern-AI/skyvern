@@ -10,6 +10,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.schemas.task_generations import TaskGenerationBase
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, TaskRequest, TaskResponse
+from skyvern.schemas.runs import RunEngine, TaskRunResponse
 
 
 class SkyvernTool:
@@ -57,7 +58,7 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt, prompt_name="generate-task")
         return TaskGenerationBase.model_validate(llm_response)
 
-    async def run_task(self, user_prompt: str, url: Optional[str] = None) -> TaskResponse | TaskV2:
+    async def run_task(self, user_prompt: str, url: Optional[str] = None) -> TaskRunResponse:
         """
         Use Skyvern agent to run a task. This function won't return until the task is finished.
 
@@ -67,9 +68,9 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         """
 
         if self.engine == "TaskV1":
-            return await self.run_task_v1(user_prompt=user_prompt, url=url)
+            return await self.agent.run_task(prompt=user_prompt, url=url, engine=RunEngine.skyvern_v1)
         else:
-            return await self.run_task_v2(user_prompt=user_prompt, url=url)
+            return await self.agent.run_task(prompt=user_prompt, url=url, engine=RunEngine.skyvern_v2)
 
     async def dispatch_task(self, user_prompt: str, url: Optional[str] = None) -> CreateTaskResponse | TaskV2:
         """
@@ -98,14 +99,6 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         else:
             return await self.get_task_v2(task_id)
 
-    async def run_task_v1(self, user_prompt: str, url: Optional[str] = None) -> TaskResponse:
-        task_generation = await self._generate_v1_task_request(user_prompt=user_prompt)
-        task_request = TaskRequest.model_validate(task_generation, from_attributes=True)
-        if url is not None:
-            task_request.url = url
-
-        return await self.agent.run_task_v1(task_request=task_request, timeout_seconds=self.run_task_timeout_seconds)
-
     async def dispatch_task_v1(self, user_prompt: str, url: Optional[str] = None) -> CreateTaskResponse:
         task_generation = await self._generate_v1_task_request(user_prompt=user_prompt)
         task_request = TaskRequest.model_validate(task_generation, from_attributes=True)
@@ -116,12 +109,6 @@ class SkyvernTaskToolSpec(BaseToolSpec):
 
     async def get_task_v1(self, task_id: str) -> TaskResponse | None:
         return await self.agent.get_task(task_id=task_id)
-
-    async def run_task_v2(self, user_prompt: str, url: Optional[str] = None) -> TaskV2:
-        task_request = TaskV2Request(user_prompt=user_prompt, url=url)
-        return await self.agent.run_observer_task_v_2(
-            task_request=task_request, timeout_seconds=self.run_task_timeout_seconds
-        )
 
     async def dispatch_task_v2(self, user_prompt: str, url: Optional[str] = None) -> TaskV2:
         task_request = TaskV2Request(user_prompt=user_prompt, url=url)
