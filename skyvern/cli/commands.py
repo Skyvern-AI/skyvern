@@ -805,6 +805,7 @@ def init() -> None:
 
     if run_local:
         setup_postgresql()
+        migrate_db()
         api_key = asyncio.run(_setup_local_organization())
 
         if os.path.exists(".env"):
