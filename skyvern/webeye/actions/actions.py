@@ -33,6 +33,7 @@ class ActionType(StrEnum):
     TYPE = "type"
     MOVE = "move"
     DRAG = "drag"
+    VERIFICATION_CODE = "verification_code"
 
     def is_web_action(self) -> bool:
         return self in [
@@ -291,6 +292,11 @@ class DragAction(Action):
     start_x: int
     start_y: int
     path: list[tuple[int, int]] = []
+
+
+class VerificationCodeAction(Action):
+    action_type: ActionType = ActionType.VERIFICATION_CODE
+    verification_code: str
 
 
 class ScrapeResult(BaseModel):

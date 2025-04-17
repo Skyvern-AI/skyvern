@@ -1273,26 +1273,37 @@ class ForgeAgent:
 
         screenshot_base64 = base64.b64encode(scraped_page.screenshots[0]).decode("utf-8")
         if last_call_id is None:
-            # try address the conversation with the context we have
-            reasoning = reasonings[0].summary[0].text if reasonings and reasonings[0].summary else None
-            assistant_message = assistant_messages[0].content[0].text if assistant_messages else None
-            skyvern_repsonse_prompt = load_prompt_with_elements(
-                scraped_page=scraped_page,
-                prompt_engine=prompt_engine,
-                template_name="cua-answer-question",
-                navigation_goal=task.navigation_goal,
-                assistant_reasoning=reasoning,
-                assistant_message=assistant_message,
-            )
-            skyvern_response = await app.LLM_API_HANDLER(
-                prompt=skyvern_repsonse_prompt,
-                prompt_name="cua-answer-question",
-                step=step,
-                screenshots=scraped_page.screenshots,
-            )
-            resp_content = skyvern_response.get("answer")
-            if not resp_content:
-                resp_content = "I don't know. Can you help me make the best decision to achieve the goal?"
+            current_context = skyvern_context.ensure_context()
+            if task.task_id in current_context.totp_codes:
+                verification_code = current_context.totp_codes[task.task_id]
+                current_context.totp_codes.pop(task.task_id)
+                LOG.info(
+                    "Using verification code from context",
+                    task_id=task.task_id,
+                    verification_code=verification_code,
+                )
+                resp_content = f"Here is the verification code: {verification_code}"
+            else:
+                # try address the conversation with the context we have
+                reasoning = reasonings[0].summary[0].text if reasonings and reasonings[0].summary else None
+                assistant_message = assistant_messages[0].content[0].text if assistant_messages else None
+                skyvern_repsonse_prompt = load_prompt_with_elements(
+                    scraped_page=scraped_page,
+                    prompt_engine=prompt_engine,
+                    template_name="cua-answer-question",
+                    navigation_goal=task.navigation_goal,
+                    assistant_reasoning=reasoning,
+                    assistant_message=assistant_message,
+                )
+                skyvern_response = await app.LLM_API_HANDLER(
+                    prompt=skyvern_repsonse_prompt,
+                    prompt_name="cua-answer-question",
+                    step=step,
+                    screenshots=scraped_page.screenshots,
+                )
+                resp_content = skyvern_response.get("answer")
+                if not resp_content:
+                    resp_content = "I don't know. Can you help me make the best decision to achieve the goal?"
             current_response = await app.OPENAI_CLIENT.responses.create(
                 model="computer-use-preview",
                 previous_response_id=previous_response.id,
