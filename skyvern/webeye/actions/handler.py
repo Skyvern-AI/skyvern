@@ -823,8 +823,10 @@ async def handle_input_text_action(
         except Exception:
             LOG.warning("Failed to clear the input field", action=action, exc_info=True)
 
-            # some <span> is supported to use `locator.press_sequentially()` to fill in the data
-            if skyvern_element.get_tag_name() != "span":
+            # TODO: some elements are supported to use `locator.press_sequentially()` to fill in the data
+            # we need find a better way to detect the attribute in the future
+            class_name: str | None = await skyvern_element.get_attr("class")
+            if not class_name or "blinking-cursor" not in class_name:
                 return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
 
             await skyvern_element.press_fill(text=text)
