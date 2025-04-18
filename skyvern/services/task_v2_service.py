@@ -1031,6 +1031,7 @@ async def _generate_loop_task(
         data_schema=data_extraction_schema,
         parameter_keys=[param.key for param in task_parameters],
         continue_on_failure=True,
+        complete_verification=False,
     )
     block_yaml_output_parameter = await app.WORKFLOW_SERVICE.create_output_parameter_for_block(
         workflow_id=workflow_id,
@@ -1046,6 +1047,7 @@ async def _generate_loop_task(
         output_parameter=block_yaml_output_parameter,
         parameters=task_parameters,
         continue_on_failure=True,
+        complete_verification=False,
     )
 
     # use the output parameter of the extraction block to create the for loop block
