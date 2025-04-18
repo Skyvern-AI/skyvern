@@ -1,6 +1,8 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
+
+from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 
 
 class TOTPCodeBase(BaseModel):
@@ -18,6 +20,12 @@ class TOTPCodeBase(BaseModel):
 class TOTPCodeCreate(TOTPCodeBase):
     totp_identifier: str
     content: str
+
+    @field_validator("content")
+    @classmethod
+    def sanitize_content(cls, value: str) -> str:
+        """Remove NUL (0x00) bytes from content to avoid PostgreSQL DataError."""
+        return sanitize_postgres_text(value)
 
 
 class TOTPCode(TOTPCodeCreate):
