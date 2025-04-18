@@ -1324,6 +1324,18 @@ class ForgeAgent:
                 temperature=0,
             )
         else:
+            last_computer_call = computer_calls[-1]
+            computer_call_input = {
+                "call_id": last_call_id,
+                "type": "computer_call_output",
+                "output": {
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{screenshot_base64}",
+                },
+            }
+            if last_computer_call.pending_safety_checks:
+                computer_call_input["acknowledge_safety_checks"] = last_computer_call.pending_safety_checks
+
             current_response = await app.OPENAI_CLIENT.responses.create(
                 model="computer-use-preview",
                 previous_response_id=previous_response.id,
@@ -1335,16 +1347,7 @@ class ForgeAgent:
                         "environment": "browser",
                     }
                 ],
-                input=[
-                    {
-                        "call_id": last_call_id,
-                        "type": "computer_call_output",
-                        "output": {
-                            "type": "input_image",
-                            "image_url": f"data:image/png;base64,{screenshot_base64}",
-                        },
-                    }
-                ],
+                input=[computer_call_input],
                 reasoning={
                     "generate_summary": "concise",
                 },
