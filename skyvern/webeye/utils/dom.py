@@ -148,12 +148,16 @@ class SkyvernElement:
         if tag_name != InteractiveElement.INPUT:
             return False
 
-        autocomplete = await self.get_attr("aria-autocomplete")
-        if autocomplete and autocomplete == "list":
+        data_bind: str | None = await self.get_attr("data-x-bind")
+        if data_bind and "autocomplete" in data_bind.lower():
+            return True
+
+        autocomplete: str | None = await self.get_attr("aria-autocomplete")
+        if autocomplete and autocomplete.lower() == "list":
             return True
 
         class_name: str | None = await self.get_attr("class")
-        if class_name and "autocomplete-input" in class_name:
+        if class_name and "autocomplete-input" in class_name.lower():
             return True
 
         return False
