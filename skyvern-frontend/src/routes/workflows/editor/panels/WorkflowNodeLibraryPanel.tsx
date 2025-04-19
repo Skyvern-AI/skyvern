@@ -234,7 +234,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
       <div className="space-y-4">
         <header className="space-y-2">
           <div className="flex justify-between">
-            <h1 className="text-lg">Node Library</h1>
+            <h1 className="text-lg">Block Library</h1>
             {!first && (
               <Cross2Icon
                 className="size-6 cursor-pointer"
