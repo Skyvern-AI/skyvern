@@ -170,6 +170,18 @@ Updating, improving and correcting the documentation
 -->
 
 ## Styleguides
+
+### Pre Commit Hooks
+Make sure to run the pre-commit hooks before committing your code. 
+This will help you to automatically format your code and catch cicd failures early.
+```bash
+# Make sure `pre-commit` is installed
+pip install pre-commit
+
+# Run pre-commit hooks on files in your commit
+pre-commit run --all-files
+```
+
 ### Commit Messages
 <!-- TODO
 
