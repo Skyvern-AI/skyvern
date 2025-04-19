@@ -72,6 +72,17 @@ services:
       # - AWS_REGION=us-west-2                         # Replace this with a different AWS region, if you desire
       # - AWS_ACCESS_KEY_ID=FILL_ME_IN_PLEASE
       # - AWS_SECRET_ACCESS_KEY=FILL_ME_IN_PLEASE
+      
+      # Bitwarden env are added
+      # - BITWARDEN_CLIENT_SECRET=add_your_screte
+      # - BITWARDEN_CLIENT_ID=user.add_your_user_id
+      # - BITWARDEN_MASTER_PASSWORD=Your_master_pass
+
+      # added ollama support
+      # - LLM_KEY=OLLAMA
+      # - ENABLE_OLLAMA=true
+      # - OLLAMA_SERVER_URL=https://localhost:1142
+      # - OLLAMA_MODEL=gemma3:27b
     depends_on:
       postgres:
         condition: service_healthy
@@ -100,6 +111,13 @@ services:
     #   A route for the UI: yourdomain.com -> localhost:8080
     #   A route for the artifact API: artifact.yourdomain.com -> localhost:9090 (maybe not needed)
       - VITE_WSS_BASE_URL=ws://localhost:8000/api/v1
+
+    # Used to enable code block & Artifacts
+    # Removed safety messures for codeblock ;)
+    # Refer to skyvern\forge\sdk\workflow\models\block.py 1144
+      - ENABLE_CODE_BLOCK=true
+      - VITE_ENABLE_LOG_ARTIFACTS=true
+      - VITE_ENABLE_CODE_BLOCK=true
     #   - VITE_ARTIFACT_API_BASE_URL=http://localhost:9090
     #   - VITE_API_BASE_URL=http://localhost:8000/api/v1
     #   - VITE_SKYVERN_API_KEY=<get this from "settings" in the Skyvern UI>

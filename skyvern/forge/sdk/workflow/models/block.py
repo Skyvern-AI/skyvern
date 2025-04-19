@@ -1141,13 +1141,17 @@ class CodeBlock(Block):
         for node in ast.walk(tree):
             if hasattr(node, "attr") and str(node.attr).startswith("__"):
                 raise InsecureCodeDetected("Not allowed to access private methods or attributes")
-            if isinstance(node, ast.Import) or isinstance(node, ast.ImportFrom):
-                raise InsecureCodeDetected("Not allowed to import modules")
+            
+            #changed on my own to remove the insecure code detection that was stoping importing libraries
+            # if isinstance(node, ast.Import) or isinstance(node, ast.ImportFrom):
+            #     raise InsecureCodeDetected("Not allowed to import modules")
 
     @staticmethod
     def build_safe_vars() -> dict[str, Any]:
         return {
-            "__builtins__": {},  # only allow several builtins due to security concerns
+            "__builtins__": {
+                "__import__": __import__, #changed on my own to allow imports
+            },  # only allow several builtins due to security concerns
             "locals": locals,
             "print": print,
             "len": len,
