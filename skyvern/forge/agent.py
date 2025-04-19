@@ -1335,7 +1335,7 @@ class ForgeAgent:
             }
             if last_computer_call.pending_safety_checks:
                 pending_checks = [check.model_dump() for check in last_computer_call.pending_safety_checks]
-                computer_call_input["acknowledge_safety_checks"] = pending_checks
+                computer_call_input["acknowledged_safety_checks"] = pending_checks
 
             current_response = await app.OPENAI_CLIENT.responses.create(
                 model="computer-use-preview",
