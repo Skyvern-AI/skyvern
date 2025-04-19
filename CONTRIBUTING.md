@@ -16,6 +16,7 @@
     - [Your First Code Contribution](#your-first-code-contribution)
     - [Improving The Documentation](#improving-the-documentation)
   - [Styleguides](#styleguides)
+    - [Pre Commit Hooks](#pre-commit-hooks)
     - [Commit Messages](#commit-messages)
   - [Join The Project Team](#join-the-project-team)
   - [Attribution](#attribution)
