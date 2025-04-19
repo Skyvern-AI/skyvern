@@ -834,7 +834,8 @@ class ForgeAgent:
                 ):
                     using_cached_action_plan = True
                 else:
-                    self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)
+                    if engine != RunEngine.openai_cua:
+                        self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)
                     json_response = await app.LLM_API_HANDLER(
                         prompt=extract_action_prompt,
                         prompt_name="extract-actions",
@@ -996,7 +997,8 @@ class ForgeAgent:
 
                     element_id_to_last_action[action.element_id] = action_idx
 
-                self.async_operation_pool.run_operation(task.task_id, AgentPhase.action)
+                if engine != RunEngine.openai_cua:
+                    self.async_operation_pool.run_operation(task.task_id, AgentPhase.action)
                 current_page = await browser_state.must_get_working_page()
                 if isinstance(action, CompleteAction) and not complete_verification:
                     # Do not verify the complete action when complete_verification is False
@@ -1588,7 +1590,8 @@ class ForgeAgent:
         engine: RunEngine,
     ) -> tuple[ScrapedPage, str]:
         # start the async tasks while running scrape_website
-        self.async_operation_pool.run_operation(task.task_id, AgentPhase.scrape)
+        if engine != RunEngine.openai_cua:
+            self.async_operation_pool.run_operation(task.task_id, AgentPhase.scrape)
 
         # Scrape the web page and get the screenshot and the elements
         # HACK: try scrape_website three time to handle screenshot timeout
