@@ -4,7 +4,7 @@ import structlog
 from openai.types.responses.response import Response as OpenAIResponse
 from pydantic import ValidationError
 
-from skyvern.exceptions import UnsupportedActionType
+from skyvern.exceptions import NoTOTPVerificationCodeFound, UnsupportedActionType
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.models import Step
@@ -412,19 +412,28 @@ async def parse_cua_actions(
                     totp_verification_url=task.totp_verification_url,
                     totp_identifier=task.totp_identifier,
                 )
-                verification_code = await poll_verification_code(
-                    task.task_id,
-                    task.organization_id,
-                    workflow_run_id=task.workflow_run_id,
-                    totp_verification_url=task.totp_verification_url,
-                    totp_identifier=task.totp_identifier,
-                )
-                reasoning = reasoning or f"Received verification code: {verification_code}"
-                action = VerificationCodeAction(
-                    verification_code=verification_code,
-                    reasoning=reasoning,
-                    intention=reasoning,
-                )
+                try:
+                    verification_code = await poll_verification_code(
+                        task.task_id,
+                        task.organization_id,
+                        workflow_run_id=task.workflow_run_id,
+                        totp_verification_url=task.totp_verification_url,
+                        totp_identifier=task.totp_identifier,
+                    )
+                    reasoning = reasoning or f"Received verification code: {verification_code}"
+                    action = VerificationCodeAction(
+                        verification_code=verification_code,
+                        reasoning=reasoning,
+                        intention=reasoning,
+                    )
+                except NoTOTPVerificationCodeFound:
+                    reasoning_suffix = "No verification code found"
+                    reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
+                    action = TerminateAction(
+                        reasoning=reasoning,
+                        intention=reasoning,
+                    )
+
             else:
                 action = TerminateAction(
                     reasoning=reasoning,
