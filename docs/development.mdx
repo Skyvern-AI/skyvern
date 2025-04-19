@@ -96,3 +96,69 @@ Repeat step 3.
 </AccordionGroup>
 
 Curious about what changed in a CLI version? [Check out the CLI changelog.](/changelog/command-line)
+
+## Environment Variable Configuration
+
+The simplest way to get started with Skyvern is to set environment variables in a `.env` file at the root of the project. This file is loaded by the application at runtime, and the values are used to configure the system.
+
+### LLM Configuration
+
+Skyvern works with multiple LLM providers. You need to set the following environment variables to configure your LLM provider:
+
+```bash
+# One of the below must be set to true
+ENABLE_OPENAI=true
+# ENABLE_ANTHROPIC=true
+# ENABLE_AZURE=true
+# ENABLE_BEDROCK=true
+# ENABLE_GEMINI=true
+# ENABLE_NOVITA=true
+# ENABLE_OPENAI_COMPATIBLE=true
+
+# Set your LLM provider API key
+OPENAI_API_KEY=sk-xxxxxxxxxxxxx
+
+# Set which model to use
+LLM_KEY=OPENAI_GPT4O
+```
+
+If you're using OpenAI, you'll need to set `ENABLE_OPENAI=true` and provide your `OPENAI_API_KEY`. The `LLM_KEY` specifies which model to use, and should match one of the registered models in the `LLMConfigRegistry`.
+
+#### Using Custom OpenAI-compatible Models
+
+Skyvern can also use any OpenAI-compatible LLM API endpoint. This is useful for connecting to alternative providers that follow the OpenAI API format or to self-hosted models. This feature is implemented using [liteLLM's OpenAI-compatible provider support](https://docs.litellm.ai/docs/providers/openai_compatible).
+
+To enable this:
+
+```bash
+# Enable OpenAI-compatible mode
+ENABLE_OPENAI_COMPATIBLE=true
+
+# Required configuration
+OPENAI_COMPATIBLE_MODEL_NAME=gpt-3.5-turbo  # The model name supported by your endpoint (REQUIRED)
+OPENAI_COMPATIBLE_API_KEY=your-api-key      # API key for your endpoint (REQUIRED)
+OPENAI_COMPATIBLE_API_BASE=https://your-api-endpoint.com/v1  # Base URL for your endpoint (REQUIRED)
+
+# Optional configuration
+OPENAI_COMPATIBLE_API_VERSION=2023-05-15  # Optional API version
+OPENAI_COMPATIBLE_MAX_TOKENS=4096         # Optional, defaults to LLM_CONFIG_MAX_TOKENS
+OPENAI_COMPATIBLE_TEMPERATURE=0.0         # Optional, defaults to LLM_CONFIG_TEMPERATURE 
+OPENAI_COMPATIBLE_SUPPORTS_VISION=false   # Optional, defaults to false
+OPENAI_COMPATIBLE_ADD_ASSISTANT_PREFIX=false  # Optional, defaults to false
+OPENAI_COMPATIBLE_MODEL_KEY=OPENAI_COMPATIBLE  # Optional custom key to register the model with
+```
+
+**Important Note**: When using this feature, the model name you provide will be prefixed with "openai/" in the liteLLM configuration. This is how liteLLM determines the routing for OpenAI-compatible providers.
+
+This feature allows you to use models from providers like:
+- Together.ai
+- Anyscale
+- Mistral
+- Self-hosted models (e.g., using LM Studio or a local vLLM server)
+- Any API endpoint that follows the OpenAI API format
+
+Once configured, you can set `LLM_KEY=OPENAI_COMPATIBLE` to use this model as your primary LLM.
+
+For more detailed information about OpenAI-compatible providers supported by liteLLM, see their [documentation](https://docs.litellm.ai/docs/providers/openai_compatible).
+
+### Running the Server
