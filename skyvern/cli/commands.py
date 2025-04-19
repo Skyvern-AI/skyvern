@@ -323,7 +323,7 @@ def setup_llm_providers() -> None:
             )
     else:
         update_or_add_env_var("ENABLE_NOVITA", "false")
-        
+
     # OpenAI Compatible Configuration
     print("To enable an OpenAI-compatible provider, you must have a model name, API key, and API base URL.")
     enable_openai_compatible = input("Do you want to enable an OpenAI-compatible provider (y/n)? ").lower() == "y"
@@ -332,7 +332,7 @@ def setup_llm_providers() -> None:
         openai_compatible_api_key = input("Enter your API key: ")
         openai_compatible_api_base = input("Enter the API base URL (e.g., 'https://api.together.xyz/v1'): ")
         openai_compatible_vision = input("Does this model support vision (y/n)? ").lower() == "y"
-        
+
         if not all([openai_compatible_model_name, openai_compatible_api_key, openai_compatible_api_base]):
             print("Error: All required fields must be populated.")
             print("OpenAI-compatible provider will not be enabled.")
@@ -340,7 +340,7 @@ def setup_llm_providers() -> None:
             update_or_add_env_var("OPENAI_COMPATIBLE_MODEL_NAME", openai_compatible_model_name)
             update_or_add_env_var("OPENAI_COMPATIBLE_API_KEY", openai_compatible_api_key)
             update_or_add_env_var("OPENAI_COMPATIBLE_API_BASE", openai_compatible_api_base)
-            
+
             # Set vision support
             if openai_compatible_vision:
                 update_or_add_env_var("OPENAI_COMPATIBLE_SUPPORTS_VISION", "true")

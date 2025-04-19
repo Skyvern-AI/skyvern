@@ -125,7 +125,7 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str | None = None
     # ANTHROPIC
     ANTHROPIC_API_KEY: str | None = None
-    
+
     # OPENAI COMPATIBLE
     OPENAI_COMPATIBLE_MODEL_NAME: str | None = None
     OPENAI_COMPATIBLE_API_KEY: str | None = None
@@ -137,7 +137,7 @@ class Settings(BaseSettings):
     OPENAI_COMPATIBLE_ADD_ASSISTANT_PREFIX: bool = False
     OPENAI_COMPATIBLE_MODEL_KEY: str = "OPENAI_COMPATIBLE"
     OPENAI_COMPATIBLE_REASONING_EFFORT: str | None = None
-    
+
     # AZURE
     AZURE_DEPLOYMENT: str | None = None
     AZURE_API_KEY: str | None = None
