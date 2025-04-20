@@ -958,7 +958,7 @@ class ForgeAgent:
                     )
                     detailed_agent_step_output.actions_and_results[action_idx] = (action, [action_result])
                     await app.DATABASE.create_action(action=action)
-                    await self.record_artifacts_after_action(task, step, browser_state)
+                    await self.record_artifacts_after_action(task, step, browser_state, engine)
                     break
 
                 action = action_node.action
@@ -1011,7 +1011,7 @@ class ForgeAgent:
                 )
                 # wait random time between actions to avoid detection
                 await asyncio.sleep(random.uniform(1.0, 2.0))
-                await self.record_artifacts_after_action(task, step, browser_state)
+                await self.record_artifacts_after_action(task, step, browser_state, engine)
                 for result in results:
                     result.step_retry_number = step.retry_index
                     result.step_order = step.order
@@ -1147,7 +1147,7 @@ class ForgeAgent:
                             scraped_page, task, step, working_page, complete_action
                         )
                         detailed_agent_step_output.actions_and_results.append((complete_action, complete_results))
-                        await self.record_artifacts_after_action(task, step, browser_state)
+                        await self.record_artifacts_after_action(task, step, browser_state, engine)
 
             # if the last action is complete and is successful, check if there's a data extraction goal
             # if task has navigation goal and extraction goal at the same time, handle ExtractAction before marking step as completed
@@ -1441,12 +1441,23 @@ class ForgeAgent:
             )
             return None
 
-    async def record_artifacts_after_action(self, task: Task, step: Step, browser_state: BrowserState) -> None:
+    async def record_artifacts_after_action(
+        self,
+        task: Task,
+        step: Step,
+        browser_state: BrowserState,
+        engine: RunEngine,
+    ) -> None:
         working_page = await browser_state.get_working_page()
         if not working_page:
             raise BrowserStateMissingPage()
+
+        fullpage_screenshot = True
+        if engine == RunEngine.openai_cua:
+            fullpage_screenshot = False
+
         try:
-            screenshot = await browser_state.take_screenshot(full_page=True)
+            screenshot = await browser_state.take_screenshot(full_page=fullpage_screenshot)
             await app.ARTIFACT_MANAGER.create_artifact(
                 step=step,
                 artifact_type=ArtifactType.SCREENSHOT_ACTION,
