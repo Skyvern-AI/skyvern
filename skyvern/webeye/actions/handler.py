@@ -711,7 +711,7 @@ async def handle_input_text_action(
     if skyvern_element.get_tag_name() == InteractiveElement.INPUT and not await skyvern_element.is_raw_input():
         await skyvern_element.scroll_into_view()
         # press arrowdown to watch if there's any options popping up
-        await incremental_scraped.start_listen_dom_increment()
+        await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
         try:
             await skyvern_element.input_clear()
         except Exception:
@@ -925,7 +925,7 @@ async def handle_input_text_action(
                     auto_complete_hacky_flag = False
                     return [result]
 
-        await incremental_scraped.start_listen_dom_increment()
+        await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
         try:
             await skyvern_element.input_sequentially(text=text)
@@ -1263,7 +1263,7 @@ async def handle_select_option_action(
     results: list[ActionResult] = []
 
     try:
-        await incremental_scraped.start_listen_dom_increment()
+        await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
         await skyvern_element.scroll_into_view()
 
         await skyvern_element.click(page=page, dom=dom, timeout=timeout)
@@ -1343,7 +1343,7 @@ async def handle_select_option_action(
         step_id=step.step_id,
     )
     try:
-        await incremental_scraped.start_listen_dom_increment()
+        await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
         timeout = settings.BROWSER_ACTION_TIMEOUT_MS
         await skyvern_element.scroll_into_view()
 
@@ -1879,7 +1879,7 @@ async def choose_auto_completion_dropdown(
     current_frame = skyvern_element.get_frame()
     skyvern_frame = await SkyvernFrame.create_instance(current_frame)
     incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
-    await incremental_scraped.start_listen_dom_increment()
+    await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
     try:
         await skyvern_element.press_fill(text)

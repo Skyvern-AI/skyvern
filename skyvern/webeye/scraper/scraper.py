@@ -7,7 +7,7 @@ from typing import Any, Awaitable, Callable, Self
 
 import structlog
 from playwright._impl._errors import TimeoutError
-from playwright.async_api import Frame, Locator, Page
+from playwright.async_api import ElementHandle, Frame, Locator, Page
 from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
@@ -712,9 +712,9 @@ class IncrementalScrapePage:
 
         return self.element_tree_trimmed
 
-    async def start_listen_dom_increment(self) -> None:
-        js_script = "() => startGlobalIncrementalObserver()"
-        await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script)
+    async def start_listen_dom_increment(self, element: ElementHandle | None = None) -> None:
+        js_script = "(element) => startGlobalIncrementalObserver(element)"
+        await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script, arg=element)
 
     async def stop_listen_dom_increment(self) -> None:
         # check if the DOM has navigated away or refreshed
