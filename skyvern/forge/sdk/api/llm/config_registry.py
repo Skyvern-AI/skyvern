@@ -69,7 +69,7 @@ if settings.ENABLE_OPENAI:
             ["OPENAI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
-            max_completion_tokens=16384,
+            max_completion_tokens=32768,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -79,7 +79,7 @@ if settings.ENABLE_OPENAI:
             ["OPENAI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
-            max_completion_tokens=16384,
+            max_completion_tokens=32768,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -89,7 +89,7 @@ if settings.ENABLE_OPENAI:
             ["OPENAI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
-            max_completion_tokens=16384,
+            max_completion_tokens=32768,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -153,9 +153,9 @@ if settings.ENABLE_OPENAI:
         LLMConfig(
             "o4-mini",
             ["OPENAI_API_KEY"],
-            supports_vision=False,
+            supports_vision=True,
             add_assistant_prefix=False,
-            max_completion_tokens=16384,
+            max_completion_tokens=100000,
             temperature=None,  # Temperature isn't supported in the O-model series
             reasoning_effort="high",
             litellm_params=LiteLLMParams(
@@ -168,9 +168,9 @@ if settings.ENABLE_OPENAI:
         LLMConfig(
             "o3",
             ["OPENAI_API_KEY"],
-            supports_vision=False,
+            supports_vision=True,
             add_assistant_prefix=False,
-            max_completion_tokens=16384,
+            max_completion_tokens=100000,
             temperature=None,  # Temperature isn't supported in the O-model series
             reasoning_effort="high",
             litellm_params=LiteLLMParams(
@@ -377,6 +377,123 @@ if settings.ENABLE_AZURE_O3_MINI:
         ),
     )
 
+if settings.ENABLE_AZURE_GPT4_1:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT4_1",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT4_1_DEPLOYMENT}",
+            [
+                "AZURE_GPT4_1_DEPLOYMENT",
+                "AZURE_GPT4_1_API_KEY",
+                "AZURE_GPT4_1_API_BASE",
+                "AZURE_GPT4_1_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT4_1_API_BASE,
+                api_key=settings.AZURE_GPT4_1_API_KEY,
+                api_version=settings.AZURE_GPT4_1_API_VERSION,
+                model_info={"model_name": "azure/gpt-4.1"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=32768,
+        ),
+    )
+
+if settings.ENABLE_AZURE_GPT4_1_MINI:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT4_1_MINI",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT4_1_MINI_DEPLOYMENT}",
+            [
+                "AZURE_GPT4_1_MINI_DEPLOYMENT",
+                "AZURE_GPT4_1_MINI_API_KEY",
+                "AZURE_GPT4_1_MINI_API_BASE",
+                "AZURE_GPT4_1_MINI_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT4_1_MINI_API_BASE,
+                api_key=settings.AZURE_GPT4_1_MINI_API_KEY,
+                api_version=settings.AZURE_GPT4_1_MINI_API_VERSION,
+                model_info={"model_name": "azure/gpt-4.1-mini"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=32768,
+        ),
+    )
+
+if settings.ENABLE_AZURE_GPT4_1_NANO:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT4_1_NANO",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT4_1_NANO_DEPLOYMENT}",
+            [
+                "AZURE_GPT4_1_NANO_DEPLOYMENT",
+                "AZURE_GPT4_1_NANO_API_KEY",
+                "AZURE_GPT4_1_NANO_API_BASE",
+                "AZURE_GPT4_1_NANO_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT4_1_NANO_API_BASE,
+                api_key=settings.AZURE_GPT4_1_NANO_API_KEY,
+                api_version=settings.AZURE_GPT4_1_NANO_API_VERSION,
+                model_info={"model_name": "azure/gpt-4.1-nano"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=32768,
+        ),
+    )
+
+
+if settings.ENABLE_AZURE_O4_MINI:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_O4_MINI",
+        LLMConfig(
+            f"azure/{settings.AZURE_O4_MINI_DEPLOYMENT}",
+            [
+                "AZURE_O4_MINI_DEPLOYMENT",
+                "AZURE_O4_MINI_API_KEY",
+                "AZURE_O4_MINI_API_BASE",
+                "AZURE_O4_MINI_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_O4_MINI_API_BASE,
+                api_key=settings.AZURE_O4_MINI_API_KEY,
+                api_version=settings.AZURE_O4_MINI_API_VERSION,
+                model_info={"model_name": "azure/o4-mini"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=100000,
+        ),
+    )
+
+
+if settings.ENABLE_AZURE_O3:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_O3",
+        LLMConfig(
+            f"azure/{settings.AZURE_O3_DEPLOYMENT}",
+            [
+                "AZURE_O3_DEPLOYMENT",
+                "AZURE_O3_API_KEY",
+                "AZURE_O3_API_BASE",
+                "AZURE_O3_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_O3_API_BASE,
+                api_key=settings.AZURE_O3_API_KEY,
+                api_version=settings.AZURE_O3_API_VERSION,
+                model_info={"model_name": "azure/o3"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=100000,
+        ),
+    )
+
 if settings.ENABLE_GEMINI:
     LLMConfigRegistry.register_config(
         "GEMINI_FLASH_2_0",
@@ -425,7 +542,7 @@ if settings.ENABLE_GEMINI:
             ["GEMINI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
-            max_completion_tokens=1048576,
+            max_completion_tokens=65536,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -435,7 +552,7 @@ if settings.ENABLE_GEMINI:
             ["GEMINI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
-            max_completion_tokens=1048576,
+            max_completion_tokens=65536,
         ),
     )
 
