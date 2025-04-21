@@ -153,7 +153,7 @@ if settings.ENABLE_OPENAI:
         LLMConfig(
             "o4-mini",
             ["OPENAI_API_KEY"],
-            supports_vision=False,
+            supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=100000,
             temperature=None,  # Temperature isn't supported in the O-model series
@@ -168,7 +168,7 @@ if settings.ENABLE_OPENAI:
         LLMConfig(
             "o3",
             ["OPENAI_API_KEY"],
-            supports_vision=False,
+            supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=100000,
             temperature=None,  # Temperature isn't supported in the O-model series
@@ -464,12 +464,35 @@ if settings.ENABLE_AZURE_O4_MINI:
                 api_version=settings.AZURE_O4_MINI_API_VERSION,
                 model_info={"model_name": "azure/o4-mini"},
             ),
-            supports_vision=False,
+            supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=100000,
         ),
     )
 
+
+if settings.ENABLE_AZURE_O3:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_O3",
+        LLMConfig(
+            f"azure/{settings.AZURE_O3_DEPLOYMENT}",
+            [
+                "AZURE_O3_DEPLOYMENT",
+                "AZURE_O3_API_KEY",
+                "AZURE_O3_API_BASE",
+                "AZURE_O3_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_O3_API_BASE,
+                api_key=settings.AZURE_O3_API_KEY,
+                api_version=settings.AZURE_O3_API_VERSION,
+                model_info={"model_name": "azure/o3"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=100000,
+        ),
+    )
 
 if settings.ENABLE_GEMINI:
     LLMConfigRegistry.register_config(

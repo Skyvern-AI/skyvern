@@ -192,6 +192,13 @@ class Settings(BaseSettings):
     AZURE_O4_MINI_API_BASE: str | None = None
     AZURE_O4_MINI_API_VERSION: str = "2025-01-01-preview"
 
+    # AZURE o3
+    ENABLE_AZURE_O3: bool = False
+    AZURE_O3_DEPLOYMENT: str = "o3"
+    AZURE_O3_API_KEY: str | None = None
+    AZURE_O3_API_BASE: str | None = None
+    AZURE_O3_API_VERSION: str = "2025-01-01-preview"
+
     # GEMINI
     GEMINI_API_KEY: str | None = None
 
