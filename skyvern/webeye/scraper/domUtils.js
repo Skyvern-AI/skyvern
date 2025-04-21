@@ -2184,6 +2184,14 @@ function isClassNameIncludesHidden(className) {
   );
 }
 
+function isClassNameIncludesActivatedStatus(className) {
+  // some elements are with the classname like `class="open"` or `class="active"` should be considered as activated by the click
+  return (
+    className.toLowerCase().includes("open") ||
+    className.toLowerCase().includes("active")
+  );
+}
+
 function waitForNextFrame() {
   return new Promise((resolve) => {
     requestAnimationFrame(() => resolve());
@@ -2270,8 +2278,12 @@ if (window.globalObserverForDOMIncrement === undefined) {
           if (node.nodeType === Node.TEXT_NODE) continue;
           if (node.tagName.toLowerCase() === "body") continue;
           if (!mutation.oldValue) continue;
+          const currentClassName = node.className
+            ? node.className.toString()
+            : "";
           if (
             !isClassNameIncludesHidden(mutation.oldValue) &&
+            !isClassNameIncludesActivatedStatus(currentClassName) &&
             !node.hasAttribute("data-menu-uid") && // google framework use this to trace dropdown menu
             !mutation.oldValue.includes("select__items") &&
             !(
