@@ -16,8 +16,8 @@ Reply in JSON format with the following keys:
         "id": str, // The id of the element to take action on. The id has to be one from the elements list.
         "text": str, // The text to input.
     }]{% if verification_code_check %}
-    "verification_code_reasoning": str, // Let's think step by step. Describe what you see and think if there is somewhere on the current page where you must enter the verification code now for login or any verification step. Explain why you believe a verification code needs to be enter somewhere or not. Do not imagine any place to enter the code if the code has not been sent yet.
-    "place_to_enter_verification_code": bool // Whether there is a place on the current page to enter the verificaton code now. {% endif %}
+    "verification_code_reasoning": str, // Let's think step by step. Describe what you see and think if there is somewhere on the current page where you must enter the verification code now for login or any verification step. Explain why you believe a verification code needs to be entered somewhere or not. Do not imagine any place to enter the code if the code has not been sent yet.
+    "place_to_enter_verification_code": bool // Whether there is a place on the current page to enter the verification code now. {% endif %}
 }
 
 User instruction:
