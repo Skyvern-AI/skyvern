@@ -11,6 +11,7 @@ class TOTPCodeBase(BaseModel):
     totp_identifier: str | None = None
     task_id: str | None = None
     workflow_id: str | None = None
+    workflow_run_id: str | None = None
     source: str | None = None
     content: str | None = None
 

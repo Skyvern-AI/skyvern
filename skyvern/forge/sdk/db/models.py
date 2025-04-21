@@ -491,6 +491,7 @@ class TOTPCodeModel(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
     task_id = Column(String, ForeignKey("tasks.task_id"))
     workflow_id = Column(String, ForeignKey("workflows.workflow_id"))
+    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"))
     content = Column(String, nullable=False)
     code = Column(String, nullable=False)
     source = Column(String)
