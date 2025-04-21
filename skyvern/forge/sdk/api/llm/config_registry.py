@@ -606,3 +606,45 @@ if settings.ENABLE_NOVITA:
             ),
         ),
     )
+
+# Add support for dynamically configuring OpenAI-compatible LLM models
+# Based on liteLLM's support for OpenAI-compatible APIs
+# See documentation: https://docs.litellm.ai/docs/providers/openai_compatible
+if settings.ENABLE_OPENAI_COMPATIBLE:
+    # Check for required model name
+    model_key = settings.OPENAI_COMPATIBLE_MODEL_KEY
+    model_name = settings.OPENAI_COMPATIBLE_MODEL_NAME
+
+    if not model_name:
+        raise InvalidLLMConfigError(
+            "OPENAI_COMPATIBLE_MODEL_NAME is required but not set. OpenAI-compatible model will not be registered."
+        )
+    else:
+        # Required environment variables to check
+        required_env_vars = ["OPENAI_COMPATIBLE_API_KEY", "OPENAI_COMPATIBLE_MODEL_NAME", "OPENAI_COMPATIBLE_API_BASE"]
+
+        # Configure litellm parameters - note the "openai/" prefix required for liteLLM routing
+        litellm_params = LiteLLMParams(
+            api_key=settings.OPENAI_COMPATIBLE_API_KEY,
+            api_base=settings.OPENAI_COMPATIBLE_API_BASE,
+            api_version=settings.OPENAI_COMPATIBLE_API_VERSION,
+            model_info={"model_name": f"openai/{model_name}"},
+        )
+
+        # Configure LLMConfig
+        LLMConfigRegistry.register_config(
+            model_key,
+            LLMConfig(
+                f"openai/{model_name}",  # Add openai/ prefix for liteLLM
+                required_env_vars,
+                supports_vision=settings.OPENAI_COMPATIBLE_SUPPORTS_VISION,
+                add_assistant_prefix=settings.OPENAI_COMPATIBLE_ADD_ASSISTANT_PREFIX,
+                max_completion_tokens=settings.OPENAI_COMPATIBLE_MAX_TOKENS or settings.LLM_CONFIG_MAX_TOKENS,
+                temperature=settings.OPENAI_COMPATIBLE_TEMPERATURE
+                if settings.OPENAI_COMPATIBLE_TEMPERATURE is not None
+                else settings.LLM_CONFIG_TEMPERATURE,
+                litellm_params=litellm_params,
+                reasoning_effort=settings.OPENAI_COMPATIBLE_REASONING_EFFORT,
+            ),
+        )
+        LOG.info(f"Registered OpenAI-compatible model with key {model_key}", model_name=model_name)

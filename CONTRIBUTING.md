@@ -16,6 +16,7 @@
     - [Your First Code Contribution](#your-first-code-contribution)
     - [Improving The Documentation](#improving-the-documentation)
   - [Styleguides](#styleguides)
+    - [Pre Commit Hooks](#pre-commit-hooks)
     - [Commit Messages](#commit-messages)
   - [Join The Project Team](#join-the-project-team)
   - [Attribution](#attribution)
@@ -170,6 +171,18 @@ Updating, improving and correcting the documentation
 -->
 
 ## Styleguides
+
+### Pre Commit Hooks
+Make sure to run the pre-commit hooks before committing your code. 
+This will help you to automatically format your code and catch cicd failures early.
+```bash
+# Make sure `pre-commit` is installed
+pip install pre-commit
+
+# Run pre-commit hooks on files in your commit
+pre-commit run --all-files
+```
+
 ### Commit Messages
 <!-- TODO
 
