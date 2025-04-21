@@ -1304,6 +1304,7 @@ class ForgeAgent:
                     step=step,
                     screenshots=scraped_page.screenshots,
                 )
+                LOG.info("Skyvern response to CUA question", skyvern_response=skyvern_response)
                 resp_content = skyvern_response.get("answer")
                 if not resp_content:
                     resp_content = "I don't know. Can you help me make the best decision to achieve the goal?"
