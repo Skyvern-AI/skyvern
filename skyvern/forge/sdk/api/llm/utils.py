@@ -1,4 +1,5 @@
 import base64
+import copy
 import json
 import re
 from typing import Any
@@ -43,6 +44,36 @@ async def llm_messages_builder(
             {"role": "assistant", "content": "{"},
         ]
     return [{"role": "user", "content": messages}]
+
+
+async def llm_messages_builder_with_history(
+    prompt: str,
+    screenshots: list[bytes] | None = None,
+    message_history: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    if message_history:
+        messages = copy.deepcopy(message_history)
+    current_user_messages: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": prompt,
+        }
+    ]
+
+    if screenshots:
+        for screenshot in screenshots:
+            encoded_image = base64.b64encode(screenshot).decode("utf-8")
+            current_user_messages.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{encoded_image}",
+                    },
+                }
+            )
+    messages.append({"role": "user", "content": current_user_messages})
+    return messages
 
 
 def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bool = False) -> dict[str, Any]:
