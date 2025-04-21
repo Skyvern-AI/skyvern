@@ -432,7 +432,7 @@ if settings.ENABLE_AZURE_GPT4_1_NANO:
                 "AZURE_GPT4_1_NANO_DEPLOYMENT",
                 "AZURE_GPT4_1_NANO_API_KEY",
                 "AZURE_GPT4_1_NANO_API_BASE",
-                "AZURE_GPT4_1_MINI_API_VERSION",
+                "AZURE_GPT4_1_NANO_API_VERSION",
             ],
             litellm_params=LiteLLMParams(
                 api_base=settings.AZURE_GPT4_1_NANO_API_BASE,
