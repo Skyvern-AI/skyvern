@@ -164,6 +164,34 @@ class Settings(BaseSettings):
     AZURE_O3_MINI_API_BASE: str | None = None
     AZURE_O3_MINI_API_VERSION: str | None = None
 
+    # AZURE gpt-4.1
+    ENABLE_AZURE_GPT4_1: bool = False
+    AZURE_GPT4_1_DEPLOYMENT: str = "gpt-4.1"
+    AZURE_GPT4_1_API_KEY: str | None = None
+    AZURE_GPT4_1_API_BASE: str | None = None
+    AZURE_GPT4_1_API_VERSION: str = "2025-01-01-preview"
+
+    # AZURE gpt-4.1 mini
+    ENABLE_AZURE_GPT4_1_MINI: bool = False
+    AZURE_GPT4_1_MINI_DEPLOYMENT: str = "gpt-4.1-mini"
+    AZURE_GPT4_1_MINI_API_KEY: str | None = None
+    AZURE_GPT4_1_MINI_API_BASE: str | None = None
+    AZURE_GPT4_1_MINI_API_VERSION: str = "2025-01-01-preview"
+
+    # AZURE gpt-4.1 nano
+    ENABLE_AZURE_GPT4_1_NANO: bool = False
+    AZURE_GPT4_1_NANO_DEPLOYMENT: str = "gpt-4.1-nano"
+    AZURE_GPT4_1_NANO_API_KEY: str | None = None
+    AZURE_GPT4_1_NANO_API_BASE: str | None = None
+    AZURE_GPT4_1_NANO_API_VERSION: str = "2025-01-01-preview"
+
+    # AZURE o4-mini
+    ENABLE_AZURE_O4_MINI: bool = False
+    AZURE_O4_MINI_DEPLOYMENT: str = "o4-mini"
+    AZURE_O4_MINI_API_KEY: str | None = None
+    AZURE_O4_MINI_API_BASE: str | None = None
+    AZURE_O4_MINI_API_VERSION: str = "2025-01-01-preview"
+
     # GEMINI
     GEMINI_API_KEY: str | None = None
 
