@@ -545,6 +545,7 @@ function hasWidgetRole(element) {
     "spinbutton",
     "switch",
     "gridcell",
+    "option",
   ];
   return widgetRoles.includes(role.toLowerCase().trim());
 }
@@ -1423,6 +1424,9 @@ async function buildElementTree(
       const interactable = isInteractable(element, hoverStylesMap);
       let elementObj = null;
       let isParentSVG = null;
+      if (element.shadowRoot) {
+        children = getChildElements(element.shadowRoot);
+      }
       if (interactable) {
         elementObj = await buildElementObject(frame, element, interactable);
       } else if (
@@ -1433,7 +1437,6 @@ async function buildElementTree(
         elementObj = await buildElementObject(frame, element, interactable);
       } else if (element.shadowRoot) {
         elementObj = await buildElementObject(frame, element, interactable);
-        children = getChildElements(element.shadowRoot);
       } else if (isTableRelatedElement(element)) {
         // build all table related elements into skyvern element
         // we need these elements to preserve the DOM structure
@@ -2341,7 +2344,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
   });
 }
 
-function startGlobalIncrementalObserver() {
+function startGlobalIncrementalObserver(element = null) {
   window.globalListnerFlag = true;
   window.globalDomDepthMap = new Map();
   window.globalOneTimeIncrementElements = [];
@@ -2354,6 +2357,17 @@ function startGlobalIncrementalObserver() {
     subtree: true,
     characterData: true,
   });
+
+  // if the element is in shadow DOM, we need to observe the shadow DOM as well
+  if (element && element.getRootNode() instanceof ShadowRoot) {
+    window.globalObserverForDOMIncrement.observe(element.getRootNode(), {
+      attributes: true,
+      attributeOldValue: true,
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+  }
 }
 
 async function stopGlobalIncrementalObserver() {
@@ -2397,6 +2411,10 @@ async function getIncrementElements(wait_until_finished = true) {
       let children = element.children;
       for (let i = 0; i < children.length; i++) {
         const child = children[i];
+        // FIXME: skip to update the element if it is in shadow DOM, since document.querySelector will not work
+        if (child.shadowHost) {
+          continue;
+        }
         const domElement = document.querySelector(`[unique_id="${child.id}"]`);
         // if the element is still on the page, we rebuild the element to update the information
         if (domElement) {
@@ -2430,21 +2448,24 @@ async function getIncrementElements(wait_until_finished = true) {
     };
 
     for (let treeHeadElement of treeList) {
-      const domElement = document.querySelector(
-        `[unique_id="${treeHeadElement.id}"]`,
-      );
-      // if the element is still on the page, we rebuild the element to update the information
-      if (domElement) {
-        let newHead = await buildElementObject(
-          "",
-          domElement,
-          treeHeadElement.interactable,
-          treeHeadElement.purgeable,
+      // FIXME: skip to update the element if it is in shadow DOM, since document.querySelector will not work
+      if (!treeHeadElement.shadowHost) {
+        const domElement = document.querySelector(
+          `[unique_id="${treeHeadElement.id}"]`,
         );
-        newHead.children = treeHeadElement.children;
-        treeHeadElement = newHead;
-      } else {
-        treeHeadElement.interactable = false;
+        // if the element is still on the page, we rebuild the element to update the information
+        if (domElement) {
+          let newHead = await buildElementObject(
+            "",
+            domElement,
+            treeHeadElement.interactable,
+            treeHeadElement.purgeable,
+          );
+          newHead.children = treeHeadElement.children;
+          treeHeadElement = newHead;
+        } else {
+          treeHeadElement.interactable = false;
+        }
       }
 
       // check if the element is existed
