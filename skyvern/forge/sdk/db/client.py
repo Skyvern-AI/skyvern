@@ -2089,6 +2089,7 @@ class AgentDB:
         code: str,
         task_id: str | None = None,
         workflow_id: str | None = None,
+        workflow_run_id: str | None = None,
         source: str | None = None,
         expired_at: datetime | None = None,
     ) -> TOTPCode:
@@ -2100,6 +2101,7 @@ class AgentDB:
                 code=code,
                 task_id=task_id,
                 workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
                 source=source,
                 expired_at=expired_at,
             )

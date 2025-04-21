@@ -3128,7 +3128,11 @@ async def poll_verification_code(
             )
         elif totp_identifier:
             verification_code = await _get_verification_code_from_db(
-                task_id, organization_id, totp_identifier, workflow_id=workflow_id
+                task_id,
+                organization_id,
+                totp_identifier,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
             )
         if verification_code:
             LOG.info("Got verification code", verification_code=verification_code)
@@ -3169,9 +3173,12 @@ async def _get_verification_code_from_db(
     organization_id: str,
     totp_identifier: str,
     workflow_id: str | None = None,
+    workflow_run_id: str | None = None,
 ) -> str | None:
     totp_codes = await app.DATABASE.get_totp_codes(organization_id=organization_id, totp_identifier=totp_identifier)
     for totp_code in totp_codes:
+        if totp_code.workflow_run_id and workflow_run_id and totp_code.workflow_run_id != workflow_run_id:
+            continue
         if totp_code.workflow_id and workflow_id and totp_code.workflow_id != workflow_id:
             continue
         if totp_code.task_id and totp_code.task_id != task_id:
