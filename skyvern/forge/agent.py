@@ -2520,8 +2520,12 @@ class ForgeAgent:
         browser_state: BrowserState,
         json_response: dict[str, Any],
     ) -> dict[str, Any]:
-        need_verification_code = json_response.get("need_verification_code")
-        if need_verification_code and (task.totp_verification_url or task.totp_identifier) and task.organization_id:
+        place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
+        if (
+            place_to_enter_verification_code
+            and (task.totp_verification_url or task.totp_identifier)
+            and task.organization_id
+        ):
             LOG.info("Need verification code", step_id=step.step_id)
             verification_code = await poll_verification_code(
                 task.task_id,
