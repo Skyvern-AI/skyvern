@@ -116,11 +116,16 @@ async def _convert_svg_to_string(
     element: Dict,
     task: Task | None = None,
     step: Step | None = None,
+    always_drop: bool = False,
 ) -> None:
     if element.get("tagName") != "svg":
         return
 
     if element.get("isDropped", False):
+        return
+
+    if always_drop:
+        _mark_element_as_dropped(element)
         return
 
     task_id = task.task_id if task else None
@@ -476,6 +481,8 @@ class AgentFunction:
         task: Task | None = None,
         step: Step | None = None,
     ) -> CleanupElementTreeFunc:
+        MAX_ELEMENT_CNT = 3000
+
         async def cleanup_element_tree_func(frame: Page | Frame, url: str, element_tree: list[dict]) -> list[dict]:
             """
             Remove rect and attribute.unique_id from the elements.
@@ -491,10 +498,19 @@ class AgentFunction:
             current_frame_index = context.frame_index_map.get(frame, 0)
 
             queue = []
+            element_cnt = 0
             for element in element_tree:
                 queue.append(element)
             while queue:
                 queue_ele = queue.pop(0)
+
+                element_cnt += 1
+                if element_cnt == MAX_ELEMENT_CNT:
+                    LOG.warning(
+                        f"Element reached max count {MAX_ELEMENT_CNT}, will stop converting svg and css element."
+                    )
+                element_exceeded = element_cnt > MAX_ELEMENT_CNT
+
                 if queue_ele.get("frame_index") != current_frame_index:
                     new_frame = next(
                         (k for k, v in context.frame_index_map.items() if v == queue_ele.get("frame_index")), frame
@@ -503,9 +519,9 @@ class AgentFunction:
                     current_frame_index = queue_ele.get("frame_index", 0)
 
                 _remove_rect(queue_ele)
-                await _convert_svg_to_string(skyvern_frame, queue_ele, task, step)
+                await _convert_svg_to_string(skyvern_frame, queue_ele, task, step, always_drop=element_exceeded)
 
-                if _should_css_shape_convert(element=queue_ele):
+                if not element_exceeded and _should_css_shape_convert(element=queue_ele):
                     await _convert_css_shape_to_string(
                         skyvern_frame=skyvern_frame,
                         element=queue_ele,
