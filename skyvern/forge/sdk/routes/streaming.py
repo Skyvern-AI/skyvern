@@ -13,6 +13,8 @@ from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.org_auth_service import get_current_org
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 
+from . import user_protocol
+
 LOG = structlog.get_logger()
 STREAMING_TIMEOUT = 300
 
@@ -220,6 +222,61 @@ async def workflow_run_streaming(
                         }
                     )
                     last_activity_timestamp = datetime.utcnow()
+
+            """
+            TODO(jdo): can use an automated checker against the message type,
+            smth like typeguard; manual parsing is tedious/error prone; this
+            will require specifying the types on the backend, and keeping them
+            in sync with the TypeScript types on the frontend (there may be some
+            ways to automate that bit, too)
+            """
+            try:
+                while True:
+                    async with asyncio.timeout(0.1):
+                        client_message = await websocket.receive_json()
+
+                        if not isinstance(client_message, dict):
+                            LOG.error("Malformed client message, it must be a dict", client_message=client_message)
+                            continue
+
+                        LOG.info("Received client message", client_message=client_message)
+
+                        event = client_message.get('event')
+                        detail = client_message.get('detail')
+
+                        if event is None:
+                            LOG.error("Malformed client message, must have an event key")
+                            continue
+
+                        if event == 'click':
+                            if detail is None:
+                                LOG.error("Malformed click message, must have a detail key")
+                                continue
+
+                            if not isinstance(detail, dict):
+                                LOG.error("Malformed click message, detail must be a dict")
+                                continue
+
+                            pos = detail.get('pos')
+
+                            if not isinstance(pos, dict):
+                                LOG.error("Malformed click message, detail.pos must be a dict")
+                                continue
+
+                            x = pos.get('x')
+                            y = pos.get('y')
+
+                            if not isinstance(x, (int, float)) or not isinstance(y, (int,float)):
+                                LOG.error("Malformed click message, detail.pos.x/y must be numbers")
+                                continue
+
+                            await user_protocol.click(workflow_run_id, x, y)
+                            LOG.info("Click message optimistically sent.")
+
+
+            except asyncio.TimeoutError:
+                pass
+
             await asyncio.sleep(2)
 
     except ValidationError as e:
