@@ -2,6 +2,7 @@ import { Status } from "@/api/types";
 import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { useEffect, useState } from "react";
+import * as apiTypes from "@/api/types";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useParams } from "react-router-dom";
@@ -15,6 +16,7 @@ type StreamMessage = {
   screenshot?: string;
 };
 
+// TODO(jdo): can't this be inside a `React.useRef`?
 let socket: WebSocket | null = null;
 
 const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
@@ -26,6 +28,24 @@ function WorkflowRunStream() {
   const credentialGetter = useCredentialGetter();
   const { workflowRunId, workflowPermanentId } = useParams();
   const queryClient = useQueryClient();
+
+  const handleClick = (pos: apiTypes.Position) => {
+    if (!socket) {
+      console.warn("No WebSocket to handle click message", pos);
+      return;
+    }
+
+    const message: apiTypes.UserEventClick = {
+      event: "click",
+      detail: {
+        pos,
+      },
+    };
+
+    const data = JSON.stringify(message);
+
+    socket.send(data);
+  };
 
   useEffect(() => {
     if (!showStream) {
@@ -47,6 +67,7 @@ function WorkflowRunStream() {
       socket = new WebSocket(
         `${wssBaseUrl}/stream/workflow_runs/${workflowRunId}${credential}`,
       );
+
       // Listen for messages
       socket.addEventListener("message", (event) => {
         try {
@@ -93,10 +114,6 @@ function WorkflowRunStream() {
           console.error("Failed to parse message", e);
         }
       });
-
-      socket.addEventListener("close", () => {
-        socket = null;
-      });
     }
     run();
 
@@ -122,6 +139,7 @@ function WorkflowRunStream() {
       </div>
     );
   }
+
   if (workflowRun?.status === Status.Queued) {
     return (
       <div className="flex h-full w-full flex-col items-center justify-center gap-8 rounded-md bg-slate-900 py-8 text-lg">
@@ -145,6 +163,7 @@ function WorkflowRunStream() {
         <ZoomableImage
           src={`data:image/png;base64,${streamImgSrc}`}
           className="rounded-md"
+          captureClick={handleClick}
         />
       </div>
     );

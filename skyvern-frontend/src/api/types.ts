@@ -360,3 +360,24 @@ export type CreditCardCredential = {
   card_brand: string;
   card_holder_name: string;
 };
+
+export interface Position {
+  x: number;
+  y: number;
+}
+
+export interface UserEventClick {
+  event: "click";
+  detail: {
+    pos: Position;
+  };
+}
+
+export interface UserEventX {
+  event: "X";
+  detail: null;
+}
+
+export type UserEvent = UserEventClick | UserEventX;
+
+export type UserEventType = UserEvent["event"];
