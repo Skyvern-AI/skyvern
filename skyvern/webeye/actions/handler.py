@@ -242,7 +242,7 @@ def clean_and_remove_element_tree_factory(
 
 
 async def check_phone_number_format(
-    phone_number: str,
+    value: str,
     action: actions.InputTextAction,
     skyvern_element: SkyvernElement,
     scraped_page: ScrapedPage,
@@ -260,7 +260,8 @@ async def check_phone_number_format(
     html = new_scraped_page.build_element_tree(html_need_skyvern_attrs=False)
     prompt = prompt_engine.load_prompt(
         template="check-phone-number-format",
-        current_phone_number=phone_number,
+        context=action.intention,
+        current_value=value,
         navigation_goal=task.navigation_goal,
         navigation_payload_str=json.dumps(task.navigation_payload),
         elements=html,
@@ -273,10 +274,11 @@ async def check_phone_number_format(
 
     check_phone_number_format_response = CheckPhoneNumberFormatResponse.model_validate(json_response)
     if (
-        check_phone_number_format_response.is_current_format_correct
+        not check_phone_number_format_response.is_phone_number_input
+        or check_phone_number_format_response.is_current_format_correct
         or not check_phone_number_format_response.recommended_phone_number
     ):
-        return phone_number
+        return value
 
     LOG.info(
         "The current phone number format is incorrect, using the recommended phone number",
@@ -826,11 +828,11 @@ async def handle_input_text_action(
     # force to move focus back to the element
     await skyvern_element.get_locator().focus(timeout=timeout)
 
-    # check the phone number format
-    if await skyvern_element.get_attr("type") == "tel":
+    # check the phone number format when type=tel and the text is not a secret value
+    if await skyvern_element.get_attr("type") == "tel" and text == action.text:
         try:
             text = await check_phone_number_format(
-                phone_number=text,
+                value=text,
                 action=action,
                 skyvern_element=skyvern_element,
                 scraped_page=scraped_page,
