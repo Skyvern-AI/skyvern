@@ -8,6 +8,7 @@ async function makeRequest(url: string, options: any = {}): Promise<any> {
         const requestOptions = {
             hostname: parsedUrl.hostname,
             path: parsedUrl.pathname + parsedUrl.search,
+					  port: parsedUrl.port,
             method: options.method || 'GET',
             headers: options.headers || {},
         };
