@@ -12,9 +12,11 @@ LOG = structlog.get_logger()
 
 
 class CheckPhoneNumberFormatResponse(BaseModel):
-    phone_number_format: str
+    page_info: str
+    is_phone_number_input: bool
     thought: str
-    is_current_format_correct: bool
+    phone_number_format: str | None
+    is_current_format_correct: bool | None
     recommended_phone_number: str | None
 
 
