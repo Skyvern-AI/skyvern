@@ -349,14 +349,21 @@ class ScrapedPage(BaseModel):
         self.url = refreshed_page.url
         return self
 
-    async def generate_scraped_page_without_screenshots(self) -> Self:
+    async def generate_scraped_page(
+        self, draw_boxes: bool = True, scroll: bool = True, take_screenshots: bool = True
+    ) -> Self:
         return await scrape_website(
             browser_state=self._browser_state,
             url=self.url,
             cleanup_element_tree=self._clean_up_func,
             scrape_exclude=self._scrape_exclude,
-            take_screenshots=False,
+            take_screenshots=take_screenshots,
+            draw_boxes=draw_boxes,
+            scroll=scroll,
         )
+
+    async def generate_scraped_page_without_screenshots(self) -> Self:
+        return await self.generate_scraped_page(take_screenshots=False)
 
 
 async def scrape_website(
