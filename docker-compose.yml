@@ -1,10 +1,9 @@
+version: "3.9"
+
 services:
   postgres:
     image: postgres:14-alpine
     restart: always
-    # comment out if you want to externally connect DB
-    # ports:
-    #   - 5432:5432
     volumes:
       - ./postgres-data:/var/lib/postgresql/data
     environment:
@@ -19,9 +18,10 @@ services:
       retries: 5
 
   skyvern:
-    image: public.ecr.aws/skyvern/skyvern:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     restart: on-failure
-    # comment out if you want to externally call skyvern API
     ports:
       - 8000:8000
     volumes:
@@ -30,58 +30,22 @@ services:
       - ./har:/data/har
       - ./log:/data/log
       - ./.streamlit:/app/.streamlit
-      # Uncomment the following two lines if you want to connect to any local changes
-      # - ./skyvern:/app/skyvern
-      # - ./alembic:/app/alembic
+      - ./skyvern:/app/skyvern
+      - ./alembic:/app/alembic
     environment:
       - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
-      - BROWSER_TYPE=chromium-headful
-      - ENABLE_OPENAI=true
-      - LLM_KEY=OPENAI_GPT4O
-      - OPENAI_API_KEY=<your_openai_key>
-      # If you want to use other LLM provider, like azure and anthropic:
-      # - ENABLE_ANTHROPIC=true
-      # - LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET
-      # - ANTHROPIC_API_KEY=<your_anthropic_key>
-      # Microsoft Azure OpenAI support:
-      # If you'd like to use Microsoft Azure OpenAI as your managed LLM service integration with Skyvern, use the environment variables below.
-      # In your Microsoft Azure subscription, you will need to provision the OpenAI service and deploy a model, in order to utilize it.
-      # 1. Login to the Azure Portal
-      # 2. Create an Azure Resource Group
-      # 3. Create an OpenAI resource in the Resource Group (choose a region and pricing tier)
-      # 4. From the OpenAI resource's Overview page, open the "Azure AI Foundry" portal (click the "Explore Azure AI Foundry Portal" button)
-      # 5. In Azure AI Foundry, click "Shared Resources" --> "Deployments"
-      # 6. Click "Deploy Model" --> "Deploy Base Model" --> select a model (specify this model "Deployment Name" value for the AZURE_DEPLOYMENT variable below)
-      # - ENABLE_AZURE=true
-      # - LLM_KEY=AZURE_OPENAI                          # Leave this value static, don't change it
-      # - AZURE_DEPLOYMENT=<your_azure_deployment>      # Use the OpenAI model "Deployment Name" that you deployed, using the steps above
-      # - AZURE_API_KEY=<your_azure_api_key>            # Copy and paste Key1 or Key2 from the OpenAI resource in Azure Portal
-      # - AZURE_API_BASE=<your_azure_api_base>          # Copy and paste the "Endpoint" from the OpenAI resource in Azure Portal (eg. https://xyzxyzxyz.openai.azure.com/)
-      # - AZURE_API_VERSION=<your_azure_api_version>    # Specify a valid Azure OpenAI data-plane API version (eg. 2024-08-01-preview) Docs: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference
-      # Amazon Bedrock Support:
-      # Amazon Bedrock is a managed service that enables you to invoke LLMs and bill them through your AWS account.
-      # To use Amazon Bedrock as the LLM provider for Skyvern, specify the following environment variables.
-      # 1. In the AWS IAM console, create a new AWS IAM User (name it whatever you want)
-      # 2. Assign the "AmazonBedrockFullAccess" policy to the user
-      # 3. Generate an IAM Access Key under the IAM User's Security Credentials tab
-      # 4. In the Amazon Bedrock console, go to "Model Access"
-      # 5. Click Modify Model Access button
-      # 6. Enable "Claude 3.5 Sonnet v2" and save changes
-      # - ENABLE_BEDROCK=true
-      # - LLM_KEY=BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET   # This is the Claude 3.5 Sonnet "V2" model. Change to BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_V1 for the non-v2 version.
-      # - AWS_REGION=us-west-2                         # Replace this with a different AWS region, if you desire
-      # - AWS_ACCESS_KEY_ID=FILL_ME_IN_PLEASE
-      # - AWS_SECRET_ACCESS_KEY=FILL_ME_IN_PLEASE
-      
-      # Bitwarden env are added
-      # - BITWARDEN_CLIENT_SECRET=add_your_screte
-      # - BITWARDEN_CLIENT_ID=user.add_your_user_id
-      # - BITWARDEN_MASTER_PASSWORD=Your_master_pass
-
-      # added ollama support
-      # - LLM_KEY=OLLAMA
+      - BROWSER_TYPE=cdp-connect
+      - BROWSER_REMOTE_DEBUGGING_URL=ws://host.docker.internal:9222/devtools/browser/1df3d48a-b382-4bf1-928e-2e20857d64d7
+      - ENABLE_GEMINI=true
+      - GEMINI_API_KEY=AIzaSyCuss3OPWjIHBnsTe8YDd-FUFqOhVjZR1c
+      - LLM_KEY=GEMINI_FLASH
+      - BITWARDEN_CLIENT_SECRET=3tdh7vbnG6A4gtmSuefGiyzJEfb5zP
+      - BITWARDEN_CLIENT_ID=user.9362a4e5-dda8-4e96-b9c0-b2bc0014af7a
+      - BITWARDEN_MASTER_PASSWORD=Dynoxusa@2030
+      # Optional: Uncomment below to enable Ollama
       # - ENABLE_OLLAMA=true
-      # - OLLAMA_SERVER_URL=https://localhost:1142
+      # - LLM_KEY=OLLAMA
+      # - OLLAMA_SERVER_URL=https://11434-dep-01jqq7nbkbm5askvhp71fw8ez1-d.cloudspaces.litng.ai
       # - OLLAMA_MODEL=gemma3:27b
     depends_on:
       postgres:
@@ -93,7 +57,9 @@ services:
       retries: 5
 
   skyvern-ui:
-    image: public.ecr.aws/skyvern/skyvern-ui:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
     restart: on-failure
     ports:
       - 8080:8080
@@ -104,23 +70,10 @@ services:
       - ./har:/data/har
       - ./.streamlit:/app/.streamlit
     environment:
-    # if you want to run skyvern on a remote server,
-    # you need to change the host in VITE_WSS_BASE_URL and VITE_API_BASE_URL to match your server ip
-    # If you're self-hosting this behind a dns, you'll want to set:
-    #   A route for the API: api.yourdomain.com -> localhost:8000
-    #   A route for the UI: yourdomain.com -> localhost:8080
-    #   A route for the artifact API: artifact.yourdomain.com -> localhost:9090 (maybe not needed)
       - VITE_WSS_BASE_URL=ws://localhost:8000/api/v1
-
-    # Used to enable code block & Artifacts
-    # Removed safety messures for codeblock ;)
-    # Refer to skyvern\forge\sdk\workflow\models\block.py 1144
       - ENABLE_CODE_BLOCK=true
       - VITE_ENABLE_LOG_ARTIFACTS=true
       - VITE_ENABLE_CODE_BLOCK=true
-    #   - VITE_ARTIFACT_API_BASE_URL=http://localhost:9090
-    #   - VITE_API_BASE_URL=http://localhost:8000/api/v1
-    #   - VITE_SKYVERN_API_KEY=<get this from "settings" in the Skyvern UI>
     depends_on:
       skyvern:
         condition: service_healthy

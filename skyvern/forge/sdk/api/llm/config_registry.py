@@ -73,7 +73,7 @@ if settings.ENABLE_OPENAI:
     LLMConfigRegistry.register_config(
         "OPENAI_GPT4O",
         LLMConfig(
-            "gpt-4o", ["OPENAI_API_KEY"], supports_vision=True, add_assistant_prefix=False, max_completion_tokens=16384
+            "gpt-4.1-nano", ["OPENAI_API_KEY"], supports_vision=True, add_assistant_prefix=False, max_completion_tokens=16384
         ),
     )
     LLMConfigRegistry.register_config(
@@ -357,7 +357,7 @@ if settings.ENABLE_GEMINI:
     LLMConfigRegistry.register_config(
         "GEMINI_FLASH",
         LLMConfig(
-            "gemini/gemini-1.5-flash",
+            "gemini/gemini-2.5-flash-preview-04-17",
             ["GEMINI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
