@@ -113,7 +113,7 @@ if settings.ENABLE_OPENAI:
     LLMConfigRegistry.register_config(
         "OPENAI_GPT4O",
         LLMConfig(
-            "gpt-4o", ["OPENAI_API_KEY"], supports_vision=True, add_assistant_prefix=False, max_completion_tokens=16384
+            "gpt-4.1-nano", ["OPENAI_API_KEY"], supports_vision=True, add_assistant_prefix=False, max_completion_tokens=16384
         ),
     )
     LLMConfigRegistry.register_config(
@@ -323,6 +323,22 @@ if settings.ENABLE_BEDROCK:
         ),
     )
 
+# Changed on my own to support ollam
+if settings.ENABLE_OLLAMA:
+    LLMConfigRegistry.register_config(
+        "OLLAMA",
+        LLMConfig(
+            f"ollama/{settings.OLLAMA_MODEL}",  # ✅ Prefix with `ollama/`
+            ["OLLAMA_SERVER_URL"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            litellm_params=LiteLLMParams(
+                api_base=settings.OLLAMA_SERVER_URL,
+                api_key="not_needed",  # Ollama does not require an API key
+                model_info={"model_name": f"ollama/{settings.OLLAMA_MODEL}"},  
+            ),
+        ),
+    )
 
 if settings.ENABLE_AZURE:
     LLMConfigRegistry.register_config(
@@ -538,7 +554,7 @@ if settings.ENABLE_GEMINI:
     LLMConfigRegistry.register_config(
         "GEMINI_FLASH",
         LLMConfig(
-            "gemini/gemini-1.5-flash",
+            "gemini/gemini-2.5-flash-preview-04-17",
             ["GEMINI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,

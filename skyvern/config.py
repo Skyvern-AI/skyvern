@@ -207,6 +207,11 @@ class Settings(BaseSettings):
     NOVITA_API_KEY: str | None = None
     NOVITA_API_VERSION: str = "v3"
 
+    # Changed on my own Ollama Models
+    ENABLE_OLLAMA: bool = False
+    OLLAMA_SERVER_URL: str | None = None
+    OLLAMA_MODEL: str | None = None
+
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
@@ -228,8 +233,9 @@ class Settings(BaseSettings):
 
     SVG_MAX_LENGTH: int = 100000
 
-    ENABLE_LOG_ARTIFACTS: bool = False
-    ENABLE_CODE_BLOCK: bool = False
+# Changed on my own to true both
+    ENABLE_LOG_ARTIFACTS: bool = True
+    ENABLE_CODE_BLOCK: bool = True
 
     # SkyvernClient Settings
     SKYVERN_BASE_URL: str = "https://api.skyvern.com"

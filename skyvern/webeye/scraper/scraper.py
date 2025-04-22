@@ -506,8 +506,9 @@ async def scrape_web_unsafe(
     # This also solves the issue where we can't scroll due to a popup.(e.g. geico first popup on the homepage after
     # clicking start my quote)
 
-    LOG.info("Waiting for 5 seconds before scraping the website.")
-    await asyncio.sleep(5)
+    # Changed on my own - time limit redused
+    LOG.info("Waiting for 1 seconds before scraping the website.")
+    await asyncio.sleep(1)
 
     elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
     element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))

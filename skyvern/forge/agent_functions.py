@@ -27,8 +27,9 @@ from skyvern.webeye.utils.page import SkyvernFrame
 LOG = structlog.get_logger()
 
 USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
-SVG_SHAPE_CONVERTION_ATTEMPTS = 3
-CSS_SHAPE_CONVERTION_ATTEMPTS = 1
+# Changed on my own - to avoid SVG & CSS reading
+SVG_SHAPE_CONVERTION_ATTEMPTS = 0
+CSS_SHAPE_CONVERTION_ATTEMPTS = 0
 INVALID_SHAPE = "N/A"
 
 
