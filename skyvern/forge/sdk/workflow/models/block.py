@@ -2469,6 +2469,8 @@ class TaskV2Block(Block):
                 user_url=self.url,
                 parent_workflow_run_id=workflow_run_id,
                 proxy_location=workflow_run.proxy_location,
+                totp_identifier=self.totp_identifier,
+                totp_verification_url=self.totp_verification_url,
             )
             await app.DATABASE.update_task_v2(
                 task_v2.observer_cruise_id, status=TaskV2Status.queued, organization_id=organization_id
