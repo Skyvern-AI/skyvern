@@ -1403,7 +1403,11 @@ async function buildElementTree(
       return;
     }
 
-    const tagName = element.tagName.toLowerCase();
+    const tagName = element.tagName?.toLowerCase();
+    if (!tagName) {
+      console.log("get a null tagName");
+      return;
+    }
 
     // skip proccessing option element as they are already added to the select.options
     if (tagName === "option") {
