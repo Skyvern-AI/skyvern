@@ -1383,9 +1383,13 @@ async function buildElementTree(
   starter = document.body,
   frame,
   full_tree = false,
+  needContext = true,
+  hoverStylesMap = undefined,
 ) {
   // Generate hover styles map at the start
-  const hoverStylesMap = getHoverStylesMap();
+  if (hoverStylesMap === undefined) {
+    hoverStylesMap = getHoverStylesMap();
+  }
 
   var elements = [];
   var resultArray = [];
@@ -1725,35 +1729,36 @@ async function buildElementTree(
     }
 
     let ctxList = [];
-    try {
-      ctxList = getContextByLinked(element, ctxList);
-    } catch (e) {
-      console.error("failed to get context by linked: ", e);
-    }
+    if (needContext) {
+      try {
+        ctxList = getContextByLinked(element, ctxList);
+      } catch (e) {
+        console.error("failed to get context by linked: ", e);
+      }
 
-    try {
-      ctxList = getContextByParent(element, ctxList);
-    } catch (e) {
-      console.error("failed to get context by parent: ", e);
-    }
+      try {
+        ctxList = getContextByParent(element, ctxList);
+      } catch (e) {
+        console.error("failed to get context by parent: ", e);
+      }
 
-    try {
-      ctxList = getContextByTable(element, ctxList);
-    } catch (e) {
-      console.error("failed to get context by table: ", e);
-    }
-    const context = ctxList.join(";");
-    if (context && context.length <= 5000) {
-      element.context = context;
-    }
-
-    // FIXME: skip <a> for now to prevent navigating to other page by mistake
-    if (element.tagName !== "a" && checkStringIncludeRequire(context)) {
-      if (
-        !element.attributes["required"] &&
-        !element.attributes["aria-required"]
-      ) {
-        element.attributes["required"] = true;
+      try {
+        ctxList = getContextByTable(element, ctxList);
+      } catch (e) {
+        console.error("failed to get context by table: ", e);
+      }
+      const context = ctxList.join(";");
+      if (context && context.length <= 5000) {
+        element.context = context;
+      }
+      // FIXME: skip <a> for now to prevent navigating to other page by mistake
+      if (element.tagName !== "a" && checkStringIncludeRequire(context)) {
+        if (
+          !element.attributes["required"] &&
+          !element.attributes["aria-required"]
+        ) {
+          element.attributes["required"] = true;
+        }
       }
     }
   }
@@ -1761,7 +1766,9 @@ async function buildElementTree(
   resultArray = removeOrphanNode(resultArray);
   resultArray.forEach((root) => {
     trimDuplicatedText(root);
-    trimDuplicatedContext(root);
+    if (needContext) {
+      trimDuplicatedContext(root);
+    }
   });
 
   return [elements, resultArray];
@@ -2211,6 +2218,7 @@ function asyncSleepFor(ms) {
 
 async function addIncrementalNodeToMap(parentNode, childrenNode) {
   const maxParsedElement = 3000;
+  const maxElementToWait = 100;
   if ((await window.globalParsedElementCounter.get()) > maxParsedElement) {
     console.warn(
       "Too many elements parsed, stopping the observer to parse the elements",
@@ -2232,9 +2240,19 @@ async function addIncrementalNodeToMap(parentNode, childrenNode) {
     try {
       for (const child of childrenNode) {
         // sleep for a while until animation ends
-        await asyncSleepFor(300);
+        if (
+          (await window.globalParsedElementCounter.get()) < maxElementToWait
+        ) {
+          await asyncSleepFor(300);
+        }
         // Pass -1 as frame_index to indicate the frame number is not sensitive in this case
-        const [_, newNodeTree] = await buildElementTree(child, "", true);
+        const [_, newNodeTree] = await buildElementTree(
+          child,
+          "",
+          true,
+          false,
+          window.globalHoverStylesMap,
+        );
         if (newNodeTree.length > 0) {
           newNodesTreeList.push(...newNodeTree);
         }
@@ -2352,6 +2370,7 @@ function startGlobalIncrementalObserver(element = null) {
   window.globalListnerFlag = true;
   window.globalDomDepthMap = new Map();
   window.globalOneTimeIncrementElements = [];
+  window.globalHoverStylesMap = getHoverStylesMap();
   window.globalParsedElementCounter = new SafeCounter();
   window.globalObserverForDOMIncrement.takeRecords(); // cleanup the older data
   window.globalObserverForDOMIncrement.observe(document.body, {

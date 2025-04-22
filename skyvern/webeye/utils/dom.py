@@ -163,7 +163,7 @@ class SkyvernElement:
         return False
 
     async def is_custom_option(self) -> bool:
-        return self.get_tag_name() == "li" or await self.get_attr("role") == "option"
+        return self.get_tag_name() == "li" or await self.get_attr("role", mode="static") == "option"
 
     async def is_checkbox(self) -> bool:
         tag_name = self.get_tag_name()
@@ -243,9 +243,10 @@ class SkyvernElement:
         aria_disabled_attr: bool | str | None = None
         style_disabled: bool = False
 
+        mode: typing.Literal["auto", "dynamic"] = "dynamic" if dynamic else "auto"
         try:
-            disabled_attr = await self.get_attr("disabled", dynamic=dynamic)
-            aria_disabled_attr = await self.get_attr("aria-disabled", dynamic=dynamic)
+            disabled_attr = await self.get_attr("disabled", mode=mode)
+            aria_disabled_attr = await self.get_attr("aria-disabled", mode=mode)
             skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
             style_disabled = await skyvern_frame.get_disabled_from_style(await self.get_element_handler())
 
@@ -511,12 +512,18 @@ class SkyvernElement:
     async def get_attr(
         self,
         attr_name: str,
-        dynamic: bool = False,
+        mode: typing.Literal["auto", "dynamic", "static"] = "auto",
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> typing.Any:
-        if not dynamic:
+        """
+        mode:
+            auto: use value from the self.get_attributes() first. if empty, then try to get the value from the locator.get_attribute()
+            dynamic: always use locator.get_attribute()
+            static: always use self.get_attributes()
+        """
+        if mode != "dynamic":
             attr = self.get_attributes().get(attr_name)
-            if attr is not None:
+            if attr is not None or mode == "static":
                 return attr
 
         return await self.locator.get_attribute(attr_name, timeout=timeout)
