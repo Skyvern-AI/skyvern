@@ -38,7 +38,6 @@ class LLMConfigRegistry:
     def get_config(cls, llm_key: str) -> LLMRouterConfig | LLMConfig:
         if llm_key not in cls._configs:
             # If the key is not found in registered configs, treat it as a general model
-            LOG.info("Using general model configuration for unknown LLM key", llm_key=llm_key)
             if not llm_key:
                 raise InvalidLLMConfigError(f"LLM_KEY not set for {llm_key}")
             return LLMConfig(
