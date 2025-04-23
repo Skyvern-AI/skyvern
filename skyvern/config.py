@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     DEBUG_MODE: bool = False
     DATABASE_STRING: str = "postgresql+psycopg://skyvern@localhost/skyvern"
     DATABASE_STATEMENT_TIMEOUT_MS: int = 60000
+    DISABLE_CONNECTION_POOL: bool = False
     PROMPT_ACTION_HISTORY_WINDOW: int = 1
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
