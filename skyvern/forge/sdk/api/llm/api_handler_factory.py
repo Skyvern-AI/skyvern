@@ -470,7 +470,7 @@ class LLMCaller:
         tools: list | None = None,
         use_message_history: bool = False,
     ) -> dict[str, Any]:
-        start_time = time.time()
+        start_time = time.perf_counter()
         active_parameters = self.base_parameters or {}
         if parameters is None:
             parameters = LLMAPIHandlerFactory.get_api_parameters(self.llm_config)
@@ -627,7 +627,7 @@ class LLMCaller:
             )
 
         # Track LLM API handler duration
-        duration_seconds = time.time() - start_time
+        duration_seconds = time.perf_counter() - start_time
         LOG.info(
             "LLM API handler duration metrics",
             llm_key=self.llm_key,
