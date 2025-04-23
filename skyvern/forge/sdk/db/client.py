@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Optional, Sequence
 
 import structlog
-from sqlalchemy import and_, delete, distinct, func, select, tuple_, update
+from sqlalchemy import and_, delete, distinct, func, pool, select, tuple_, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -113,6 +113,7 @@ class AgentDB:
             database_string,
             json_serializer=_custom_json_serializer,
             connect_args=DB_CONNECT_ARGS,
+            poolclass=pool.NullPool if settings.DISABLE_CONNECTION_POOL else None,
         )
         self.Session = async_sessionmaker(bind=self.engine)
 
