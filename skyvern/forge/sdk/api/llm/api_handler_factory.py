@@ -467,6 +467,7 @@ class LLMCaller:
         ai_suggestion: AISuggestion | None = None,
         screenshots: list[bytes] | None = None,
         parameters: dict[str, Any] | None = None,
+        tools: list | None = None,
         use_message_history: bool = False,
     ) -> dict[str, Any]:
         start_time = time.time()
@@ -527,6 +528,7 @@ class LLMCaller:
             response = await litellm.acompletion(
                 model=self.llm_config.model_name,
                 messages=messages,
+                tools=tools,
                 timeout=settings.LLM_CONFIG_TIMEOUT,
                 **active_parameters,
             )

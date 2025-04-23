@@ -318,7 +318,7 @@ if settings.ENABLE_BEDROCK:
             ["AWS_REGION"],
             supports_vision=True,
             add_assistant_prefix=True,
-            max_completion_tokens=200000,
+            max_completion_tokens=64000,
         ),
     )
 
