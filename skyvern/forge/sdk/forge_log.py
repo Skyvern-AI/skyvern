@@ -3,6 +3,7 @@ import logging
 import structlog
 from structlog.typing import EventDict
 
+from skyvern._version import __version__
 from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
 
@@ -39,6 +40,7 @@ def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: Ev
 
     # Add env to the log
     event_dict["env"] = settings.ENV
+    event_dict["version"] = __version__
 
     if method_name not in ["info", "warning", "error", "critical", "exception"]:
         # Only modify the log for these log levels

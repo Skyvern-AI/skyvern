@@ -10,6 +10,7 @@ from fastapi import BackgroundTasks, Depends, Header, HTTPException, Path, Query
 from fastapi.responses import ORJSONResponse
 
 from skyvern import analytics
+from skyvern._version import __version__
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -155,7 +156,7 @@ async def heartbeat() -> Response:
     """
     Check if the server is running.
     """
-    return Response(content="Server is running.", status_code=200)
+    return Response(content="Server is running.", status_code=200, headers={"X-Skyvern-API-Version": __version__})
 
 
 @legacy_base_router.post(
