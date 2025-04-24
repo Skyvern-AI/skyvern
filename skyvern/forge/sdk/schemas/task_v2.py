@@ -61,11 +61,13 @@ class ThoughtType(StrEnum):
     metadata = "metadata"
     user_goal_check = "user_goal_check"
     internal_plan = "internal_plan"
+    failure_describe = "failure_describe"
 
 
 class ThoughtScenario(StrEnum):
     generate_plan = "generate_plan"
     user_goal_check = "user_goal_check"
+    failure_describe = "failure_describe"
     summarization = "summarization"
     generate_metadata = "generate_metadata"
     extract_loop_values = "extract_loop_values"

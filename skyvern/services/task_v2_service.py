@@ -85,6 +85,62 @@ def _generate_data_extraction_schema_for_loop(loop_values_key: str) -> dict:
     }
 
 
+async def _summarize_max_steps_failure_reason(
+    task_v2: TaskV2, organization_id: str, browser_state: BrowserState | None
+) -> str:
+    """
+    Summarize the failure reason for the task v2.
+    """
+    try:
+        assert task_v2.workflow_run_id is not None
+
+        if browser_state is None:
+            return "Failed to start browser"
+
+        page = await browser_state.get_working_page()
+        if page is None:
+            return "Failed to get the current browser page"
+
+        screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=str(task_v2.url), draw_boxes=False)
+
+        run_blocks = await app.DATABASE.get_workflow_run_blocks(
+            workflow_run_id=task_v2.workflow_run_id,
+            organization_id=organization_id,
+        )
+
+        history = [f"{idx + 1}. {block.description} -- {block.status}" for idx, block in enumerate(run_blocks[::-1])]
+
+        thought = await app.DATABASE.create_thought(
+            task_v2_id=task_v2.observer_cruise_id,
+            organization_id=task_v2.organization_id,
+            workflow_run_id=task_v2.workflow_run_id,
+            workflow_id=task_v2.workflow_id,
+            workflow_permanent_id=task_v2.workflow_permanent_id,
+            thought_type=ThoughtType.failure_describe,
+            thought_scenario=ThoughtScenario.failure_describe,
+        )
+
+        context = skyvern_context.ensure_context()
+        prompt = prompt_engine.load_prompt(
+            template="task_v2_summarize-max-steps-reason",
+            block_cnt=len(run_blocks),
+            navigation_goal=task_v2.prompt,
+            history=history,
+            local_datetime=datetime.now(context.tz_info).isoformat(),
+        )
+
+        json_response = await app.LLM_API_HANDLER(
+            prompt=prompt,
+            screenshots=screenshots,
+            prompt_name="task_v2_summarize-max-steps-reason",
+            thought=thought,
+        )
+        return json_response.get("reasoning", "")
+    except Exception:
+        LOG.warning("Failed to summarize the failure reason for task v2", exc_info=True)
+        return ""
+
+
 async def initialize_task_v2(
     organization: Organization,
     user_prompt: str,
@@ -386,6 +442,7 @@ async def run_task_v2_helper(
     task_history: list[dict] = []
     yaml_blocks: list[BLOCK_YAML_TYPES] = []
     yaml_parameters: list[PARAMETER_YAML_TYPES] = []
+    browser_state: BrowserState | None = None
 
     max_steps = int_max_steps_override or settings.MAX_STEPS_PER_TASK_V2
     for i in range(DEFAULT_MAX_ITERATIONS):
@@ -733,10 +790,11 @@ async def run_task_v2_helper(
         )
         if total_step_count >= max_steps:
             LOG.info("Task v2 failed - run out of steps", max_steps=max_steps, workflow_run_id=workflow_run_id)
+            failure_reason = await _summarize_max_steps_failure_reason(task_v2, organization_id, browser_state)
             await mark_task_v2_as_failed(
                 task_v2_id=task_v2_id,
                 workflow_run_id=workflow_run_id,
-                failure_reason=f'Reached the max number of {max_steps} steps. If you need more steps, update the "Max Steps Override" configuration when running the task. Or add/update the "x-max-steps-override" header with your desired number of steps in the API request.',
+                failure_reason=f'Reached the max number of {max_steps} steps. Possible failure reasons: {failure_reason} If you need more steps, update the "Max Steps Override" configuration when running the task. Or add/update the "x-max-steps-override" header with your desired number of steps in the API request.',
                 organization_id=organization_id,
             )
             return workflow, workflow_run, task_v2
@@ -747,11 +805,11 @@ async def run_task_v2_helper(
             max_steps=max_steps,
             workflow_run_id=workflow_run_id,
         )
+        failure_reason = await _summarize_max_steps_failure_reason(task_v2, organization_id, browser_state)
         task_v2 = await mark_task_v2_as_failed(
             task_v2_id=task_v2_id,
             workflow_run_id=workflow_run_id,
-            # TODO: add a better failure reason with LLM
-            failure_reason="Max iterations reached",
+            failure_reason=f"Max iterations reached. Possible failure reasons: {failure_reason}",
             organization_id=organization_id,
         )
 
