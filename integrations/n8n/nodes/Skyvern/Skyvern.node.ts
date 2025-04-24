@@ -1,18 +1,21 @@
 import { FieldType, IDataObject, IExecuteSingleFunctions, IHttpRequestMethods, IHttpRequestOptions, ILoadOptionsFunctions, INodePropertyOptions, INodeType, INodeTypeDescription, NodeConnectionType, ResourceMapperField, ResourceMapperFields } from 'n8n-workflow';
 import https from 'https';
+import http from 'http';
 import { URL } from 'url';
 
 async function makeRequest(url: string, options: any = {}): Promise<any> {
     return new Promise((resolve, reject) => {
         const parsedUrl = new URL(url);
+        const transport = parsedUrl.protocol === 'https:' ? https : http;
         const requestOptions = {
             hostname: parsedUrl.hostname,
             path: parsedUrl.pathname + parsedUrl.search,
+					  port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
             method: options.method || 'GET',
             headers: options.headers || {},
         };
 
-        const req = https.request(requestOptions, (res) => {
+        const req = transport.request(requestOptions, (res) => {
             let data = '';
             
             res.on('data', (chunk) => {
