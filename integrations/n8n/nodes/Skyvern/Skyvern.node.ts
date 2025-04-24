@@ -10,18 +10,18 @@ async function makeRequest(url: string, options: any = {}): Promise<any> {
         const requestOptions = {
             hostname: parsedUrl.hostname,
             path: parsedUrl.pathname + parsedUrl.search,
-					  port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+            port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
             method: options.method || 'GET',
             headers: options.headers || {},
         };
 
         const req = transport.request(requestOptions, (res) => {
             let data = '';
-            
+
             res.on('data', (chunk) => {
                 data += chunk;
             });
-            
+
             res.on('end', () => {
                 if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
                     const response = {
@@ -47,15 +47,15 @@ async function makeRequest(url: string, options: any = {}): Promise<any> {
                 }
             });
         });
-        
+
         req.on('error', (error) => {
             reject(error);
         });
-        
+
         if (options.body) {
             req.write(options.body);
         }
-        
+
         req.end();
     });
 }
@@ -83,7 +83,7 @@ export class Skyvern implements INodeType {
                 displayName: 'Resource',
                 name: 'resource',
                 type: 'options',
-				noDataExpression: true,
+                noDataExpression: true,
                 options: [
                     {
                         name: 'Task',
@@ -93,7 +93,6 @@ export class Skyvern implements INodeType {
                         name: 'Workflow',
                         value: 'workflow',
                     },
-                    
                 ],
                 default: 'task',
             },
@@ -135,18 +134,31 @@ export class Skyvern implements INodeType {
                                 const taskOptions: IDataObject = this.getNodeParameter('taskOptions') as IDataObject;
                                 if (taskOptions["engine"] !== "v1") return requestOptions;
 
-                                // trigger the generate task v1 logic
                                 const credentials = await this.getCredentials('skyvernApi');
                                 const userPrompt = this.getNodeParameter('userPrompt');
+
+                                // *** capture optional webhook URL ***
+                                let webhookUrl: string | undefined;
+                                try {
+                                    webhookUrl = this.getNodeParameter('webhookUrl') as string;
+                                } catch (e) {
+                                    webhookUrl = undefined;
+                                }
+
+                                const generateBody: IDataObject = {
+                                    prompt: userPrompt,
+                                };
+                                if (webhookUrl) {
+                                    generateBody['webhook_callback_url'] = webhookUrl; // include for TaskV1 generation
+                                }
+
                                 const response = await makeRequest(credentials['baseUrl'] + '/api/v1/generate/task', {
                                     method: 'POST',
                                     headers: {
                                         'Content-Type': 'application/json',
                                         'x-api-key': credentials['apiKey'],
                                     },
-                                    body: JSON.stringify({
-                                        prompt: userPrompt,
-                                    }),
+                                    body: JSON.stringify(generateBody),
                                 });
                                 if (!response.ok) {
                                     throw new Error('Request to generate Task V1 failed'); // eslint-disable-line
@@ -159,7 +171,11 @@ export class Skyvern implements INodeType {
                                     navigation_payload: data.navigation_payload,
                                     data_extraction_goal: data.data_extraction_goal,
                                     extracted_information_schema: data.extracted_information_schema,
-                                };
+                                } as IDataObject;
+
+                                if (webhookUrl) {
+                                    (requestOptions.body as IDataObject)['webhook_callback_url'] = webhookUrl;
+                                }
                                 return requestOptions;
                             },
                         ],
@@ -205,6 +221,28 @@ export class Skyvern implements INodeType {
                     request: {
                         body: {
                             url: '={{$value ? $value : null}}',
+                        },
+                    },
+                },
+            },
+            // *** New property: optional webhook URL for Task dispatch ***
+            {
+                displayName: 'Webhook Callback URL',
+                description: 'Optional URL that Skyvern will call when the task finishes',
+                name: 'webhookUrl',
+                type: 'string',
+                default: '',
+                placeholder: 'https://example.com/webhook',
+                displayOptions: {
+                    show: {
+                        resource: ['task'],
+                        taskOperation: ['dispatch'],
+                    },
+                },
+                routing: {
+                    request: {
+                        body: {
+                            webhook_callback_url: '={{$value ? $value : undefined}}',
                         },
                     },
                 },
@@ -365,10 +403,32 @@ export class Skyvern implements INodeType {
                     },
                 },
             },
+            // *** New property: optional webhook URL for Workflow dispatch ***
+            {
+                displayName: 'Webhook Callback URL',
+                description: 'Optional URL that Skyvern will call when the workflow run finishes',
+                name: 'webhookCallbackUrl',
+                type: 'string',
+                default: '',
+                placeholder: 'https://example.com/webhook',
+                displayOptions: {
+                    show: {
+                        resource: ['workflow'],
+                        workflowOperation: ['dispatch'],
+                    },
+                },
+                routing: {
+                    request: {
+                        body: {
+                            webhook_callback_url: '={{$value ? $value : undefined}}',
+                        },
+                    },
+                },
+            },
         ],
         version: 1,
     };
-    
+
     methods = {
         loadOptions: {
             async getWorkflows(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
@@ -398,7 +458,7 @@ export class Skyvern implements INodeType {
 
                 const workflowOperation = this.getCurrentNodeParameter('workflowOperation') as string;
                 if (workflowOperation !== 'dispatch') return { fields: [] };
-               
+
                 const workflowId = this.getCurrentNodeParameter('workflowId') as string;
                 if (!workflowId) return { fields: [] };
 
@@ -415,48 +475,49 @@ export class Skyvern implements INodeType {
                 const parameters: any[] = workflow.workflow_definition.parameters;
 
                 const fields: ResourceMapperField[] = await Promise.all(
-                    parameters.filter((parameter: any) => parameter.parameter_type === 'workflow' || parameter.parameter_type === 'credential')
-                    .map(async (parameter: any) => {
-                        let options: INodePropertyOptions[] | undefined = undefined;
-                        let parameterType: FieldType | undefined = undefined;
-                        if (parameter.parameter_type === 'credential') {
-                            const response = await makeRequest(credentials['baseUrl'] + '/api/v1/credentials', {
-                                headers: {
-                                    'x-api-key': credentials['apiKey'],
-                                },
-                            });
-                            if (!response.ok) {
-                                throw new Error('Request to get credentials failed'); // eslint-disable-line
+                    parameters
+                        .filter((parameter: any) => parameter.parameter_type === 'workflow' || parameter.parameter_type === 'credential')
+                        .map(async (parameter: any) => {
+                            let options: INodePropertyOptions[] | undefined = undefined;
+                            let parameterType: FieldType | undefined = undefined;
+                            if (parameter.parameter_type === 'credential') {
+                                const credResponse = await makeRequest(credentials['baseUrl'] + '/api/v1/credentials', {
+                                    headers: {
+                                        'x-api-key': credentials['apiKey'],
+                                    },
+                                });
+                                if (!credResponse.ok) {
+                                    throw new Error('Request to get credentials failed');
+                                }
+                                const credData = await credResponse.json();
+                                options = credData.map((credential: any) => ({
+                                    name: credential.name,
+                                    value: credential.credential_id,
+                                }));
+                                parameterType = 'options';
+                            } else {
+                                const parameter_type_map: Record<string, FieldType> = {
+                                    string: 'string',
+                                    integer: 'number',
+                                    float: 'number',
+                                    boolean: 'boolean',
+                                    json: 'json',
+                                    file_url: 'url',
+                                }
+                                parameterType = parameter_type_map[parameter.workflow_parameter_type];
                             }
-                            const data = await response.json();
-                            options = data.map((credential: any) => ({
-                                name: credential.name,
-                                value: credential.credential_id,
-                            }));
-                            parameterType = 'options';
-                        }else{
-                            const parameter_type_map: Record<string, string> = {
-                                'string': 'string',
-                                'integer': 'number',
-                                'float': 'number',
-                                'boolean': 'boolean',
-                                'json': 'json',
-                                'file_url': 'url',
-                            }
-                            parameterType = parameter_type_map[parameter.workflow_parameter_type] as FieldType;
-                        }
 
-                        return {
-                            id: parameter.key,
-                            displayName: parameter.key,
-                            defaultMatch: true,
-                            canBeUsedToMatch: false,
-                            required: parameter.default_value === undefined || parameter.default_value === null,
-                            display: true,
-                            type: parameterType,
-                            options: options,
-                        };
-                    })
+                            return {
+                                id: parameter.key,
+                                displayName: parameter.key,
+                                defaultMatch: true,
+                                canBeUsedToMatch: false,
+                                required: parameter.default_value === undefined || parameter.default_value === null,
+                                display: true,
+                                type: parameterType,
+                                options: options,
+                            };
+                        })
                 );
 
 
