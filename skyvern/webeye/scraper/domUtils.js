@@ -603,15 +603,15 @@ function isInteractable(element, hoverStylesMap) {
     return false;
   }
 
+  if (hasWidgetRole(element)) {
+    return true;
+  }
+
   // element with pointer-events: none should not be considered as interactable
   // https://developer.mozilla.org/en-US/docs/Web/CSS/pointer-events#none
   const elementPointerEvent = getElementComputedStyle(element)?.pointerEvents;
   if (elementPointerEvent === "none") {
     return false;
-  }
-
-  if (hasWidgetRole(element)) {
-    return true;
   }
 
   if (isInteractableInput(element)) {
