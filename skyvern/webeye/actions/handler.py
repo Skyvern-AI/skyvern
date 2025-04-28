@@ -696,6 +696,7 @@ async def handle_input_text_action(
         await page.keyboard.type(action.text)
         return [ActionSuccess()]
 
+    input_or_select_context: InputOrSelectContext | None = None
     dom = DomUtil(scraped_page, page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
@@ -789,8 +790,16 @@ async def handle_input_text_action(
             try_to_quit_dropdown = True
             try:
                 # TODO: we don't select by value for the auto completion detect case
+                if input_or_select_context is None:
+                    input_or_select_context = await _get_input_or_select_context(
+                        action=action,
+                        scraped_page=scraped_page,
+                        step=step,
+                    )
+
                 select_result = await sequentially_select_from_dropdown(
                     action=select_action,
+                    input_or_select_context=input_or_select_context,
                     page=page,
                     dom=dom,
                     skyvern_element=skyvern_element,
@@ -926,25 +935,12 @@ async def handle_input_text_action(
             return [ActionSuccess()]
 
         if not await skyvern_element.is_raw_input():
-            prompt = load_prompt_with_elements(
-                scraped_page=scraped_page,
-                prompt_engine=prompt_engine,
-                template_name="parse-input-or-select-context",
-                element_id=action.element_id,
-                action_reasoning=action.reasoning,
-            )
-
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
-                prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
-            )
-            json_response["intention"] = action.intention
-            input_or_select_context = InputOrSelectContext.model_validate(json_response)
-            LOG.info(
-                "Parsed input/select context",
-                context=input_or_select_context,
-                task_id=task.task_id,
-                step_id=step.step_id,
-            )
+            if input_or_select_context is None:
+                input_or_select_context = await _get_input_or_select_context(
+                    action=action,
+                    scraped_page=scraped_page,
+                    step=step,
+                )
 
             if await skyvern_element.is_auto_completion_input() or input_or_select_context.is_location_input:
                 if result := await input_or_auto_complete_input(
@@ -1327,13 +1323,28 @@ async def handle_select_option_action(
                 ),
             )
 
+        input_or_select_context = await _get_input_or_select_context(
+            action=action, scraped_page=scraped_page, step=step
+        )
+
         if len(incremental_element) == 0:
-            raise NoIncrementalElementFoundForCustomSelection(element_id=skyvern_element.get_id())
+            results.append(
+                await select_from_emerging_elements(
+                    action=action,
+                    input_or_select_context=input_or_select_context,
+                    page=page,
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                )
+            )
+            return results
 
         is_open = True
         # TODO: support sequetially select from dropdown by value, just support single select now
         result = await sequentially_select_from_dropdown(
             action=action,
+            input_or_select_context=input_or_select_context,
             page=page,
             dom=dom,
             skyvern_element=skyvern_element,
@@ -2222,6 +2233,7 @@ async def input_or_auto_complete_input(
 
 async def sequentially_select_from_dropdown(
     action: SelectOptionAction,
+    input_or_select_context: InputOrSelectContext,
     page: Page,
     dom: DomUtil,
     skyvern_element: SkyvernElement,
@@ -2237,26 +2249,6 @@ async def sequentially_select_from_dropdown(
     TODO: support to return all values retrieved from the sequentially select
     Only return the last value today
     """
-
-    prompt = load_prompt_with_elements(
-        scraped_page=dom.scraped_page,
-        prompt_engine=prompt_engine,
-        template_name="parse-input-or-select-context",
-        action_reasoning=action.reasoning,
-        element_id=action.element_id,
-    )
-    json_response = await app.SECONDARY_LLM_API_HANDLER(
-        prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
-    )
-    json_response["intention"] = action.intention
-    input_or_select_context = InputOrSelectContext.model_validate(json_response)
-    LOG.info(
-        "Parsed input/select context",
-        context=input_or_select_context,
-        task_id=task.task_id,
-        step_id=step.step_id,
-    )
-
     if not force_select and input_or_select_context.is_search_bar:
         LOG.info(
             "Exit custom selection mode since it's a non-force search bar",
@@ -2412,6 +2404,93 @@ def build_sequential_select_history(history_list: list[CustomSingleSelectResult]
         for select_result in history_list
     ]
     return result
+
+
+async def select_from_emerging_elements(
+    action: SelectOptionAction,
+    input_or_select_context: InputOrSelectContext,
+    page: Page,
+    scraped_page: ScrapedPage,
+    step: Step,
+    task: Task,
+) -> ActionResult:
+    # TODO: support to handle the case when options are loaded by scroll
+    LOG.info(
+        "No incremental elements detected by MutationObserver, using re-scraping the page to find the match element"
+    )
+    scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
+    new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(scraped_page.id_to_css_dict.keys())
+
+    dom_after_open = DomUtil(scraped_page=scraped_page_after_open, page=page)
+    new_interactable_element_ids = [
+        element_id
+        for element_id in new_element_ids
+        if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
+    ]
+
+    if len(new_interactable_element_ids) == 0:
+        raise NoIncrementalElementFoundForCustomSelection(element_id=action.element_id)
+
+    prompt = load_prompt_with_elements(
+        scraped_page=scraped_page_after_open,
+        prompt_engine=prompt_engine,
+        template_name="custom-select",
+        is_date_related=input_or_select_context.is_date_related,
+        field_information=input_or_select_context.field
+        if not input_or_select_context.intention
+        else input_or_select_context.intention,
+        required_field=input_or_select_context.is_required,
+        target_value=action.option.label,
+        navigation_goal=task.navigation_goal,
+        new_elements_ids=new_interactable_element_ids,
+        navigation_payload_str=json.dumps(task.navigation_payload),
+        local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+    )
+    LOG.info(
+        "Calling LLM to find the match element",
+        step_id=step.step_id,
+        task_id=task.task_id,
+    )
+
+    json_response = await app.LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
+    value: str | None = json_response.get("value", None)
+    LOG.info(
+        "LLM response for the matched element",
+        matched_value=value,
+        response=json_response,
+        step_id=step.step_id,
+        task_id=task.task_id,
+    )
+
+    action_type_str: str = json_response.get("action_type", "")
+    action_type = ActionType(action_type_str.lower())
+    element_id: str | None = json_response.get("id", None)
+    if not element_id or action_type not in [ActionType.CLICK, ActionType.INPUT_TEXT]:
+        raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
+
+    if value is not None and action_type == ActionType.INPUT_TEXT:
+        LOG.info(
+            "No clickable option found, but found input element to search",
+            element_id=element_id,
+        )
+        input_element = await dom_after_open.get_skyvern_element_by_id(element_id)
+        await input_element.scroll_into_view()
+        current_text = await get_input_value(input_element.get_tag_name(), input_element.get_locator())
+        if current_text == value:
+            return ActionSuccess()
+
+        await input_element.input_clear()
+        await input_element.input_sequentially(value)
+        return ActionSuccess()
+
+    else:
+        selected_element = await dom_after_open.get_skyvern_element_by_id(element_id)
+        if await selected_element.get_attr("role") == "listbox":
+            return ActionFailure(exception=InteractWithDropdownContainer(element_id=element_id))
+
+    await selected_element.scroll_into_view()
+    await selected_element.click(page=page)
+    return ActionSuccess()
 
 
 async def select_from_dropdown(
@@ -3264,3 +3343,25 @@ async def _get_verification_code_from_db(
             continue
         return totp_code.code
     return None
+
+
+async def _get_input_or_select_context(
+    action: InputTextAction | SelectOptionAction, scraped_page: ScrapedPage, step: Step
+) -> InputOrSelectContext:
+    prompt = load_prompt_with_elements(
+        scraped_page=scraped_page,
+        prompt_engine=prompt_engine,
+        template_name="parse-input-or-select-context",
+        action_reasoning=action.reasoning,
+        element_id=action.element_id,
+    )
+    json_response = await app.SECONDARY_LLM_API_HANDLER(
+        prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
+    )
+    json_response["intention"] = action.intention
+    input_or_select_context = InputOrSelectContext.model_validate(json_response)
+    LOG.info(
+        "Parsed input/select context",
+        context=input_or_select_context,
+    )
+    return input_or_select_context
