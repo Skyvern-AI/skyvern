@@ -512,7 +512,7 @@ async def parse_anthropic_actions(
                     task_id=task.task_id,
                     step_id=step.step_id,
                     step_order=step.order,
-                    action_order=idx - 1,
+                    action_order=idx,
                     tool_call_id=tool_call_id,
                 )
             )
