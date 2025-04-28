@@ -700,6 +700,7 @@ class LLMCaller:
             betas=betas,
             tools=tools,
             timeout=timeout,
+            messages_length=len(messages),
         )
         response = await app.ANTHROPIC_CLIENT.beta.messages.create(
             max_tokens=max_tokens,

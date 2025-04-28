@@ -1405,9 +1405,19 @@ class ForgeAgent:
         scraped_page: ScrapedPage,
         llm_caller: LLMCaller,
     ) -> list[Action]:
+        LOG.info(
+            "Anthropic CU call starts",
+            tool_results=llm_caller.current_tool_results,
+            message_length=len(llm_caller.message_history),
+        )
         if llm_caller.current_tool_results:
             llm_caller.message_history.append({"role": "user", "content": llm_caller.current_tool_results})
             llm_caller.clear_tool_results()
+            LOG.info(
+                "Anthropic CU call - appended tool result message to message history and cleared cached tool results",
+                message=llm_caller.current_tool_results,
+                message_length=len(llm_caller.message_history),
+            )
         tools = [
             {
                 "type": "computer_20250124",

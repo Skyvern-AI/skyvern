@@ -371,7 +371,7 @@ class ActionHandler:
                         tool_call_result = {
                             "type": "tool_result",
                             "tool_use_id": action.tool_call_id,
-                            "content": {"result": "Tool execution failed"},
+                            "content": "Tool execution failed",
                         }
                         llm_caller.add_tool_result(tool_call_result)
                         LOG.info("Tool call result", tool_call_result=tool_call_result, action=action)
@@ -381,7 +381,7 @@ class ActionHandler:
                     tool_call_result = {
                         "type": "tool_result",
                         "tool_use_id": action.tool_call_id,
-                        "content": {"result": "Tool executed successfully"},
+                        "content": "Tool executed successfully",
                     }
                     LOG.info("Tool call result", tool_call_result=tool_call_result, action=action)
                     llm_caller.add_tool_result(tool_call_result)
