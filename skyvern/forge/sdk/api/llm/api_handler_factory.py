@@ -642,7 +642,7 @@ class LLMCaller:
             organization_id=step.organization_id if step else (thought.organization_id if thought else None),
         )
         if raw_response:
-            return response.model_dump()
+            return response.model_dump(exclude_none=True)
 
         parsed_response = parse_api_response(response, self.llm_config.add_assistant_prefix)
         await app.ARTIFACT_MANAGER.create_llm_artifact(
@@ -694,7 +694,13 @@ class LLMCaller:
         model_name = self.llm_config.model_name.replace("bedrock/", "").replace("anthropic/", "")
         betas = active_parameters.get("betas", NOT_GIVEN)
         thinking = active_parameters.get("thinking", NOT_GIVEN)
-        LOG.info("Anthropic request", betas=betas, tools=tools, timeout=timeout)
+        LOG.info(
+            "Anthropic request",
+            model_name=model_name,
+            betas=betas,
+            tools=tools,
+            timeout=timeout,
+        )
         response = await app.ANTHROPIC_CLIENT.beta.messages.create(
             max_tokens=max_tokens,
             messages=messages,
@@ -704,7 +710,14 @@ class LLMCaller:
             betas=betas,
             thinking=thinking,
         )
-        LOG.info("Anthropic response", response=response, betas=betas, tools=tools, timeout=timeout)
+        LOG.info(
+            "Anthropic response",
+            model_name=model_name,
+            response=response,
+            betas=betas,
+            tools=tools,
+            timeout=timeout,
+        )
         return response
 
 
