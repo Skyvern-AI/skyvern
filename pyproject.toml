@@ -55,6 +55,7 @@ pypdf = "^5.1.0"
 fastmcp = "^0.4.1"
 psutil = ">=7.0.0"
 tiktoken = ">=0.9.0"
+anthropic = "^0.50.0"
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"
