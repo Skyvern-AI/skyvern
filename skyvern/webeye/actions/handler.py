@@ -620,18 +620,22 @@ async def handle_click_to_download_file_action(
         return [ActionFailure(e, download_triggered=False)]
 
     try:
+        LOG.info(
+            "Checking if there is any new files after click",
+            download_dir=download_dir,
+        )
         async with asyncio.timeout(BROWSER_DOWNLOAD_MAX_WAIT_TIME):
             while True:
                 list_files_after = list_files_in_directory(download_dir)
-                LOG.info(
-                    "Number of files in download directory after click",
-                    num_downloaded_files_after=len(list_files_after),
-                    download_dir=download_dir,
-                    task_id=task.task_id,
-                    step_id=step.step_id,
-                    workflow_run_id=task.workflow_run_id,
-                )
                 if len(list_files_after) > len(list_files_before):
+                    LOG.info(
+                        "Found new files in download directory after click",
+                        num_downloaded_files_after=len(list_files_after),
+                        download_dir=download_dir,
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        workflow_run_id=task.workflow_run_id,
+                    )
                     break
                 await asyncio.sleep(1)
 
