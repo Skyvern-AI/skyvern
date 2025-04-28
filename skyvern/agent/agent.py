@@ -119,6 +119,7 @@ class SkyvernAgent:
             skyvern_context.set(
                 SkyvernContext(
                     organization_id=organization.organization_id,
+                    organization_name=organization.organization_name,
                     task_id=task.task_id,
                     max_steps_override=max_steps,
                 )

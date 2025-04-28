@@ -211,7 +211,7 @@ async def initialize_task_v2(
             request_id=None,
             workflow_request=WorkflowRequestBody(),
             workflow_permanent_id=new_workflow.workflow_permanent_id,
-            organization_id=organization.organization_id,
+            organization=organization,
             version=None,
             max_steps_override=max_steps_override,
             parent_workflow_run_id=parent_workflow_run_id,
@@ -1491,7 +1491,6 @@ async def _summarize_task_v2(
     )
     task_v2_summary_resp = await app.LLM_API_HANDLER(
         prompt=task_v2_summary_prompt,
-        screenshots=screenshots,
         thought=thought,
         prompt_name="task_v2_summary",
     )

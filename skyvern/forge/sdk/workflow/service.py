@@ -102,7 +102,7 @@ class WorkflowService:
         request_id: str | None,
         workflow_request: WorkflowRequestBody,
         workflow_permanent_id: str,
-        organization_id: str,
+        organization: Organization,
         is_template_workflow: bool = False,
         version: int | None = None,
         max_steps_override: int | None = None,
@@ -121,7 +121,7 @@ class WorkflowService:
         # Validate the workflow and the organization
         workflow = await self.get_workflow_by_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
-            organization_id=None if is_template_workflow else organization_id,
+            organization_id=None if is_template_workflow else organization.organization_id,
             version=version,
         )
         if workflow is None:
@@ -137,7 +137,7 @@ class WorkflowService:
             workflow_request=workflow_request,
             workflow_permanent_id=workflow_permanent_id,
             workflow_id=workflow_id,
-            organization_id=organization_id,
+            organization_id=organization.organization_id,
             parent_workflow_run_id=parent_workflow_run_id,
         )
         LOG.info(
@@ -151,7 +151,8 @@ class WorkflowService:
         )
         skyvern_context.set(
             SkyvernContext(
-                organization_id=organization_id,
+                organization_id=organization.organization_id,
+                organization_name=organization.organization_name,
                 request_id=request_id,
                 workflow_id=workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,

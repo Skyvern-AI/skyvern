@@ -7,6 +7,7 @@ from skyvern.exceptions import OrganizationNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -36,7 +37,7 @@ class AsyncExecutor(abc.ABC):
         self,
         request: Request | None,
         background_tasks: BackgroundTasks,
-        organization_id: str,
+        organization: Organization,
         workflow_id: str,
         workflow_run_id: str,
         max_steps_override: int | None,
@@ -120,7 +121,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         self,
         request: Request | None,
         background_tasks: BackgroundTasks | None,
-        organization_id: str,
+        organization: Organization,
         workflow_id: str,
         workflow_run_id: str,
         max_steps_override: int | None,
@@ -132,10 +133,6 @@ class BackgroundTaskExecutor(AsyncExecutor):
             "Executing workflow using background task executor",
             workflow_run_id=workflow_run_id,
         )
-
-        organization = await app.DATABASE.get_organization(organization_id)
-        if organization is None:
-            raise OrganizationNotFound(organization_id)
 
         if background_tasks:
             background_tasks.add_task(

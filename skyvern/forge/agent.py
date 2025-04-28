@@ -2657,7 +2657,7 @@ class ForgeAgent:
         )
 
         data_extraction_summary_resp = await app.SECONDARY_LLM_API_HANDLER(
-            prompt=prompt, step=step, screenshots=scraped_page.screenshots, prompt_name="data-extraction-summary"
+            prompt=prompt, step=step, prompt_name="data-extraction-summary"
         )
         return ExtractAction(
             reasoning=data_extraction_summary_resp.get("summary", "Extracting information from the page"),
