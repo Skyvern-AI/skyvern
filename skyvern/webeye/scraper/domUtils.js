@@ -513,6 +513,20 @@ function isReadonlyElement(element) {
   return false;
 }
 
+function isDropdownRelatedElement(element) {
+  const tagName = element.tagName?.toLowerCase();
+  if (tagName === "select") {
+    return true;
+  }
+
+  const role = element.getAttribute("role")?.toLowerCase();
+  if (role === "option" || role === "listbox") {
+    return true;
+  }
+
+  return false;
+}
+
 function hasAngularClickBinding(element) {
   return (
     element.hasAttribute("ng-click") || element.hasAttribute("data-ng-click")
@@ -2272,94 +2286,116 @@ if (window.globalObserverForDOMIncrement === undefined) {
   ) {
     // TODO: how to detect duplicated recreate element?
     for (const mutation of mutationsList) {
-      if (mutation.type === "attributes") {
-        if (mutation.attributeName === "hidden") {
-          const node = mutation.target;
-          if (!node.hidden) {
-            window.globalOneTimeIncrementElements.push({
-              targetNode: node,
-              newNodes: [node],
-            });
-            await addIncrementalNodeToMap(node, [node]);
-          }
-        }
-        if (mutation.attributeName === "style") {
-          // TODO: need to confirm that elemnent is hidden previously
-          const node = mutation.target;
-          if (node.nodeType === Node.TEXT_NODE) continue;
-          if (node.tagName.toLowerCase() === "body") continue;
-          const newStyle = getElementComputedStyle(node);
-          const newDisplay = newStyle?.display;
-          if (newDisplay !== "none") {
-            window.globalOneTimeIncrementElements.push({
-              targetNode: node,
-              newNodes: [node],
-            });
-            await addIncrementalNodeToMap(node, [node]);
-          }
-        }
-        if (mutation.attributeName === "class") {
-          const node = mutation.target;
-          if (node.nodeType === Node.TEXT_NODE) continue;
-          if (node.tagName.toLowerCase() === "body") continue;
-          if (!mutation.oldValue) continue;
-          const currentClassName = node.className
-            ? node.className.toString()
-            : "";
-          if (
-            !isClassNameIncludesHidden(mutation.oldValue) &&
-            !isClassNameIncludesActivatedStatus(currentClassName) &&
-            !node.hasAttribute("data-menu-uid") && // google framework use this to trace dropdown menu
-            !mutation.oldValue.includes("select__items") &&
-            !(
-              node.hasAttribute("data-testid") &&
-              node.getAttribute("data-testid").includes("select-dropdown")
-            )
-          )
-            continue;
-          const newStyle = getElementComputedStyle(node);
-          const newDisplay = newStyle?.display;
-          if (newDisplay !== "none") {
-            window.globalOneTimeIncrementElements.push({
-              targetNode: node,
-              newNodes: [node],
-            });
-            await addIncrementalNodeToMap(node, [node]);
-          }
-        }
+      const node = mutation.target;
+      if (node.nodeType === Node.TEXT_NODE) continue;
+      const tagName = node.tagName?.toLowerCase();
+
+      // if the changing element is dropdown related elements, we should consider
+      // they're the new element as long as the element is still visible on the page
+      if (
+        isDropdownRelatedElement(node) &&
+        getElementComputedStyle(node)?.display !== "none"
+      ) {
+        window.globalOneTimeIncrementElements.push({
+          targetNode: node,
+          newNodes: [node],
+        });
+        await addIncrementalNodeToMap(node, [node]);
+        continue;
       }
 
-      if (mutation.type === "childList") {
-        if (mutation.target.nodeType === Node.TEXT_NODE) continue;
-        const node = mutation.target;
-        let changedNode = {
-          targetNode: node, // TODO: for future usage, when we want to parse new elements into a tree
-        };
-        let newNodes = [];
-        if (mutation.addedNodes && mutation.addedNodes.length > 0) {
-          for (const node of mutation.addedNodes) {
-            // skip the text nodes, they won't be interactable
-            if (node.nodeType === Node.TEXT_NODE) continue;
-            newNodes.push(node);
+      // if they're not the dropdown related elements
+      // we detect the element based on the following rules
+      switch (mutation.type) {
+        case "attributes": {
+          switch (mutation.attributeName) {
+            case "hidden": {
+              if (!node.hidden) {
+                window.globalOneTimeIncrementElements.push({
+                  targetNode: node,
+                  newNodes: [node],
+                });
+                await addIncrementalNodeToMap(node, [node]);
+              }
+              break;
+            }
+            case "style": {
+              // TODO: need to confirm that elemnent is hidden previously
+              if (tagName === "body") continue;
+              if (
+                (getElementComputedStyle(node)?.display !== "none") !==
+                "none"
+              ) {
+                window.globalOneTimeIncrementElements.push({
+                  targetNode: node,
+                  newNodes: [node],
+                });
+                await addIncrementalNodeToMap(node, [node]);
+              }
+              break;
+            }
+            case "class": {
+              if (tagName === "body") continue;
+              if (!mutation.oldValue) continue;
+              const currentClassName = node.className
+                ? node.className.toString()
+                : "";
+              if (
+                !isClassNameIncludesHidden(mutation.oldValue) &&
+                !isClassNameIncludesActivatedStatus(currentClassName) &&
+                !node.hasAttribute("data-menu-uid") && // google framework use this to trace dropdown menu
+                !mutation.oldValue.includes("select__items") &&
+                !(
+                  node.hasAttribute("data-testid") &&
+                  node.getAttribute("data-testid").includes("select-dropdown")
+                )
+              )
+                continue;
+              if (
+                (getElementComputedStyle(node)?.display !== "none") !==
+                "none"
+              ) {
+                window.globalOneTimeIncrementElements.push({
+                  targetNode: node,
+                  newNodes: [node],
+                });
+                await addIncrementalNodeToMap(node, [node]);
+              }
+              break;
+            }
           }
         }
-        if (
-          newNodes.length == 0 &&
-          (node.tagName.toLowerCase() === "ul" ||
-            (node.tagName.toLowerCase() === "div" &&
-              node.hasAttribute("role") &&
-              node.getAttribute("role").toLowerCase() === "listbox"))
-        ) {
-          newNodes.push(node);
-        }
+        case "childList": {
+          let changedNode = {
+            targetNode: node, // TODO: for future usage, when we want to parse new elements into a tree
+          };
+          let newNodes = [];
+          if (mutation.addedNodes && mutation.addedNodes.length > 0) {
+            for (const node of mutation.addedNodes) {
+              // skip the text nodes, they won't be interactable
+              if (node.nodeType === Node.TEXT_NODE) continue;
+              newNodes.push(node);
+            }
+          }
+          if (
+            newNodes.length == 0 &&
+            (tagName === "ul" ||
+              (tagName === "div" &&
+                node.hasAttribute("role") &&
+                node.getAttribute("role").toLowerCase() === "listbox"))
+          ) {
+            newNodes.push(node);
+          }
 
-        if (newNodes.length > 0) {
-          changedNode.newNodes = newNodes;
-          window.globalOneTimeIncrementElements.push(changedNode);
-          await addIncrementalNodeToMap(
-            changedNode.targetNode,
-            changedNode.newNodes,
-          );
+          if (newNodes.length > 0) {
+            changedNode.newNodes = newNodes;
+            window.globalOneTimeIncrementElements.push(changedNode);
+            await addIncrementalNodeToMap(
+              changedNode.targetNode,
+              changedNode.newNodes,
+            );
+          }
+          break;
         }
       }
     }
