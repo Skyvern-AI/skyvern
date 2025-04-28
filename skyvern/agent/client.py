@@ -81,7 +81,7 @@ class SkyvernClient:
         run_id: str,
     ) -> RunResponse:
         run_obj = await self.client.agent.get_run(run_id=run_id)
-        if run_obj.run_type in [RunType.task_v1, RunType.task_v2, RunType.openai_cua]:
+        if run_obj.run_type in [RunType.task_v1, RunType.task_v2, RunType.openai_cua, RunType.anthropic_cua]:
             return TaskRunResponse.model_validate(run_obj.dict())
         elif run_obj.run_type == RunType.workflow_run:
             return WorkflowRunResponse.model_validate(run_obj.dict())

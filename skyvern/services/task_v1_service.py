@@ -87,6 +87,8 @@ async def run_task(
     run_type = RunType.task_v1
     if engine == RunEngine.openai_cua:
         run_type = RunType.openai_cua
+    elif engine == RunEngine.anthropic_cua:
+        run_type = RunType.anthropic_cua
     await app.DATABASE.create_task_run(
         task_run_type=run_type,
         organization_id=organization.organization_id,

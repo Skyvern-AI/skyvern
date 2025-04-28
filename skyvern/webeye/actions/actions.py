@@ -113,6 +113,7 @@ class Action(BaseModel):
     element_id: Annotated[str, Field(coerce_numbers_to_str=True)] | None = None
     skyvern_element_hash: str | None = None
     skyvern_element_data: dict[str, Any] | None = None
+    tool_call_id: str | None = None
 
     # DecisiveAction (CompleteAction, TerminateAction) fields
     errors: list[UserDefinedError] | None = None

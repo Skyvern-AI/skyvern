@@ -62,6 +62,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
 from skyvern.schemas.runs import (
+    CUA_ENGINES,
     RunEngine,
     RunResponse,
     RunType,
@@ -1466,7 +1467,7 @@ async def run_task(
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
 
-    if run_request.engine in [RunEngine.skyvern_v1, RunEngine.openai_cua]:
+    if run_request.engine in CUA_ENGINES:
         # create task v1
         # if there's no url, call task generation first to generate the url, data schema if any
         url = run_request.url
@@ -1480,7 +1481,7 @@ async def run_task(
         )
         url = url or task_generation.url
         navigation_goal = task_generation.navigation_goal or run_request.prompt
-        if run_request.engine == RunEngine.openai_cua:
+        if run_request.engine in CUA_ENGINES:
             navigation_goal = run_request.prompt
         navigation_payload = task_generation.navigation_payload
         data_extraction_goal = task_generation.data_extraction_goal
@@ -1511,6 +1512,8 @@ async def run_task(
         run_type = RunType.task_v1
         if run_request.engine == RunEngine.openai_cua:
             run_type = RunType.openai_cua
+        elif run_request.engine == RunEngine.anthropic_cua:
+            run_type = RunType.anthropic_cua
         # build the task run response
         return TaskRunResponse(
             run_id=task_v1_response.task_id,
@@ -1586,8 +1589,6 @@ async def run_task(
                 publish_workflow=run_request.publish_workflow,
             ),
         )
-    if run_request.engine == RunEngine.openai_cua:
-        pass
     raise HTTPException(status_code=400, detail=f"Invalid agent engine: {run_request.engine}")
 
 

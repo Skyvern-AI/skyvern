@@ -58,6 +58,7 @@ from skyvern.forge.sdk.api.files import (
     rename_file,
     wait_for_download_finished,
 )
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller, LLMCallerManager
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
@@ -70,7 +71,7 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, Tas
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, ValidationBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
-from skyvern.schemas.runs import RunEngine, RunType
+from skyvern.schemas.runs import CUA_ENGINES, CUA_RUN_TYPES, RunEngine
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions.actions import (
     Action,
@@ -88,7 +89,7 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.actions.caching import retrieve_action_plan
 from skyvern.webeye.actions.handler import ActionHandler, poll_verification_code
 from skyvern.webeye.actions.models import AgentStepOutput, DetailedAgentStepOutput
-from skyvern.webeye.actions.parse_actions import parse_actions, parse_cua_actions
+from skyvern.webeye.actions.parse_actions import parse_actions, parse_anthropic_actions, parse_cua_actions
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
@@ -253,6 +254,7 @@ class ForgeAgent:
         complete_verification: bool = True,
         engine: RunEngine = RunEngine.skyvern_v1,
         cua_response: OpenAIResponse | None = None,
+        llm_caller: LLMCaller | None = None,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
         workflow_run: WorkflowRun | None = None
         if task.workflow_run_id:
@@ -378,6 +380,13 @@ class ForgeAgent:
             if page := await browser_state.get_working_page():
                 await self.register_async_operations(organization, task, page)
 
+            llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
+            if engine == RunEngine.anthropic_cua and not llm_caller:
+                # llm_caller = LLMCaller(llm_key="BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_INFERENCE_PROFILE")
+                llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
+                if not llm_caller:
+                    llm_caller = LLMCaller(llm_key="ANTHROPIC_CLAUDE3.5_SONNET")
+                    LLMCallerManager.set_llm_caller(task.task_id, llm_caller)
             step, detailed_output = await self.agent_step(
                 task,
                 step,
@@ -387,6 +396,7 @@ class ForgeAgent:
                 complete_verification=complete_verification,
                 engine=engine,
                 cua_response=cua_response,
+                llm_caller=llm_caller,
             )
             await app.AGENT_FUNCTION.post_step_execution(task, step)
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)
@@ -778,6 +788,7 @@ class ForgeAgent:
         task_block: BaseTaskBlock | None = None,
         complete_verification: bool = True,
         cua_response: OpenAIResponse | None = None,
+        llm_caller: LLMCaller | None = None,
     ) -> tuple[Step, DetailedAgentStepOutput]:
         detailed_agent_step_output = DetailedAgentStepOutput(
             scraped_page=None,
@@ -821,8 +832,17 @@ class ForgeAgent:
                     step=step,
                     scraped_page=scraped_page,
                     previous_response=cua_response,
+                    engine=engine,
                 )
                 detailed_agent_step_output.cua_response = new_cua_response
+            elif engine == RunEngine.anthropic_cua:
+                assert llm_caller is not None
+                actions = await self._generate_anthropic_actions(
+                    task=task,
+                    step=step,
+                    scraped_page=scraped_page,
+                    llm_caller=llm_caller,
+                )
             else:
                 using_cached_action_plan = False
                 if not task.navigation_goal and not isinstance(task_block, ValidationBlock):
@@ -834,7 +854,7 @@ class ForgeAgent:
                 ):
                     using_cached_action_plan = True
                 else:
-                    if engine != RunEngine.openai_cua:
+                    if engine in CUA_ENGINES:
                         self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)
                     json_response = await app.LLM_API_HANDLER(
                         prompt=extract_action_prompt,
@@ -1219,7 +1239,8 @@ class ForgeAgent:
         step: Step,
         scraped_page: ScrapedPage,
         previous_response: OpenAIResponse | None = None,
-    ) -> tuple[list[Action], OpenAIResponse]:
+        engine: RunEngine = RunEngine.openai_cua,
+    ) -> tuple[list[Action], OpenAIResponse | None]:
         if not previous_response:
             # this is the first step
             first_response: OpenAIResponse = await app.OPENAI_CLIENT.responses.create(
@@ -1377,6 +1398,48 @@ class ForgeAgent:
 
         return await parse_cua_actions(task, step, current_response), current_response
 
+    async def _generate_anthropic_actions(
+        self,
+        task: Task,
+        step: Step,
+        scraped_page: ScrapedPage,
+        llm_caller: LLMCaller,
+    ) -> list[Action]:
+        if llm_caller.current_tool_results:
+            llm_caller.message_history.append({"role": "user", "content": llm_caller.current_tool_results})
+            llm_caller.clear_tool_results()
+        tools = [
+            {
+                "type": "computer_20250124",
+                "name": "computer",
+                "display_height_px": settings.BROWSER_HEIGHT,
+                "display_width_px": settings.BROWSER_WIDTH,
+            }
+        ]
+        if not llm_caller.message_history:
+            llm_response = await llm_caller.call(
+                prompt=task.navigation_goal,
+                screenshots=scraped_page.screenshots,
+                use_message_history=True,
+                tools=tools,
+                raw_response=True,
+                betas=["computer-use-2025-01-24"],
+            )
+        else:
+            llm_response = await llm_caller.call(
+                screenshots=scraped_page.screenshots,
+                use_message_history=True,
+                tools=tools,
+                raw_response=True,
+                betas=["computer-use-2025-01-24"],
+            )
+        LOG.info("Anthropic response", llm_response=llm_response)
+        assistant_content = llm_response["content"]
+        llm_caller.message_history.append({"role": "assistant", "content": assistant_content})
+
+        actions = await parse_anthropic_actions(task, step, assistant_content)
+        return actions
+
     @staticmethod
     async def complete_verify(page: Page, scraped_page: ScrapedPage, task: Task, step: Step) -> CompleteVerifyResult:
         LOG.info(
@@ -1387,7 +1450,7 @@ class ForgeAgent:
         )
         run_obj = await app.DATABASE.get_run(run_id=task.task_id, organization_id=task.organization_id)
         scroll = True
-        if run_obj and run_obj.task_run_type == RunType.openai_cua:
+        if run_obj and run_obj.task_run_type in CUA_RUN_TYPES:
             scroll = False
 
         scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False, scroll=scroll)
@@ -1454,7 +1517,7 @@ class ForgeAgent:
             raise BrowserStateMissingPage()
 
         fullpage_screenshot = True
-        if engine == RunEngine.openai_cua:
+        if engine in CUA_ENGINES:
             fullpage_screenshot = False
 
         try:
@@ -1580,7 +1643,7 @@ class ForgeAgent:
         max_screenshot_number = settings.MAX_NUM_SCREENSHOTS
         draw_boxes = True
         scroll = True
-        if engine == RunEngine.openai_cua:
+        if engine in CUA_ENGINES:
             max_screenshot_number = 1
             draw_boxes = False
             scroll = False
@@ -1602,7 +1665,7 @@ class ForgeAgent:
         engine: RunEngine,
     ) -> tuple[ScrapedPage, str]:
         # start the async tasks while running scrape_website
-        if engine != RunEngine.openai_cua:
+        if engine not in CUA_ENGINES:
             self.async_operation_pool.run_operation(task.task_id, AgentPhase.scrape)
 
         # Scrape the web page and get the screenshot and the elements
@@ -1653,7 +1716,7 @@ class ForgeAgent:
         element_tree_format = ElementTreeFormat.HTML
         element_tree_in_prompt: str = scraped_page.build_element_tree(element_tree_format)
         extract_action_prompt = ""
-        if engine != RunEngine.openai_cua:
+        if engine not in CUA_ENGINES:
             extract_action_prompt = await self._build_extract_action_prompt(
                 task,
                 step,
@@ -2371,7 +2434,7 @@ class ForgeAgent:
 
             run_obj = await app.DATABASE.get_run(run_id=task.task_id, organization_id=task.organization_id)
             scroll = True
-            if run_obj and run_obj.task_run_type == RunType.openai_cua:
+            if run_obj and run_obj.task_run_type in CUA_RUN_TYPES:
                 scroll = False
 
             screenshots: list[bytes] = []
