@@ -733,6 +733,78 @@ if settings.ENABLE_NOVITA:
         ),
     )
 
+# Create a GCP service account WITH the Vertex AI API access enabled
+# Get the credentials json file. See documentation: https://support.google.com/a/answer/7378726?hl=en
+# my_vertex_credentials = json.dumps(json.load(open("my_credentials_file.json")))
+# Set the value of my_vertex_credentials as the environment variable VERTEX_CREDENTIALS
+if settings.ENABLE_VERTEX_AI:
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_2.5_PRO_EXP_03_25",
+        LLMConfig(
+            "vertex_ai/gemini-2.5-pro-preview-03-25",
+            ["VERTEX_CREDENTIALS"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65535,
+            litellm_params=LiteLLMParams(
+                vertex_credentials=settings.VERTEX_CREDENTIALS,  # type: ignore
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_2.5_PRO_PREVIEW_03_25",
+        LLMConfig(
+            "vertex_ai/gemini-2.5-pro-preview-03-25",
+            ["VERTEX_CREDENTIALS"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65535,
+            litellm_params=LiteLLMParams(
+                vertex_credentials=settings.VERTEX_CREDENTIALS,  # type: ignore
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_FLASH_2_0",
+        LLMConfig(
+            "vertex_ai/gemini-2.0-flash-001",
+            ["VERTEX_CREDENTIALS"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=8192,
+            litellm_params=LiteLLMParams(
+                vertex_credentials=settings.VERTEX_CREDENTIALS,  # type: ignore
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_PRO",
+        LLMConfig(
+            "vertex_ai/gemini-1.5-pro",
+            ["VERTEX_CREDENTIALS"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=8192,
+            litellm_params=LiteLLMParams(
+                vertex_credentials=settings.VERTEX_CREDENTIALS,  # type: ignore
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_FLASH",
+        LLMConfig(
+            "vertex_ai/gemini-1.5-flash",
+            ["VERTEX_CREDENTIALS"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=8192,
+            litellm_params=LiteLLMParams(
+                vertex_credentials=settings.VERTEX_CREDENTIALS,  # type: ignore
+            ),
+        ),
+    )
+
+
 # Add support for dynamically configuring OpenAI-compatible LLM models
 # Based on liteLLM's support for OpenAI-compatible APIs
 # See documentation: https://docs.litellm.ai/docs/providers/openai_compatible
