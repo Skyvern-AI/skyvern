@@ -517,11 +517,24 @@ class LLMCaller:
         if not self.llm_config.supports_vision:
             screenshots = None
 
+        message_pattern = "openai"
+        if "ANTHROPIC" in self.llm_key:
+            message_pattern = "anthropic"
+
         if use_message_history:
             # self.message_history will be updated in place
-            messages = await llm_messages_builder_with_history(prompt, screenshots, self.message_history)
+            messages = await llm_messages_builder_with_history(
+                prompt,
+                screenshots,
+                self.message_history,
+                message_pattern=message_pattern,
+            )
         else:
-            messages = await llm_messages_builder_with_history(prompt, screenshots)
+            messages = await llm_messages_builder_with_history(
+                prompt,
+                screenshots,
+                message_pattern=message_pattern,
+            )
         await app.ARTIFACT_MANAGER.create_llm_artifact(
             data=json.dumps(
                 {
@@ -680,11 +693,12 @@ class LLMCaller:
         max_tokens = active_parameters.get("max_completion_tokens") or active_parameters.get("max_tokens") or 4096
         model_name = self.llm_config.model_name.replace("bedrock/", "").replace("anthropic/", "")
         betas = active_parameters.get("betas", NOT_GIVEN)
+        LOG.info("Anthropic request", betas=betas, tools=tools, timeout=timeout)
         response = await app.ANTHROPIC_CLIENT.beta.messages.create(
             max_tokens=max_tokens,
             messages=messages,
             model=model_name,
-            tools=tools,
+            tools=tools or NOT_GIVEN,
             timeout=timeout,
             betas=betas,
         )
