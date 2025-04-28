@@ -534,6 +534,7 @@ async def handle_click_action(
             step_id=step.step_id,
             workflow_run_id=task.workflow_run_id,
         )
+        results: list[ActionResult] = []
         try:
             results = await handle_click_to_download_file_action(action, page, scraped_page, task, step)
         except Exception:
@@ -555,21 +556,36 @@ async def handle_click_action(
                 workflow_run_id=task.workflow_run_id,
             )
             if page_count_after_download > initial_page_count and browser_state and browser_state.browser_context:
-                LOG.info(
-                    "Extra page opened after download, closing it",
-                    task_id=task.task_id,
-                    step_id=step.step_id,
-                    workflow_run_id=task.workflow_run_id,
-                )
-                if page == browser_state.browser_context.pages[-1]:
-                    LOG.warning(
-                        "The extra page is the current page, closing it",
+                if results and results[-1].download_triggered:
+                    LOG.info(
+                        "Download triggered, closing the extra page",
                         task_id=task.task_id,
                         step_id=step.step_id,
                         workflow_run_id=task.workflow_run_id,
                     )
-                # close the extra page
-                await browser_state.browser_context.pages[-1].close()
+
+                    LOG.info(
+                        "Extra page opened after download, closing it",
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        workflow_run_id=task.workflow_run_id,
+                    )
+                    if page == browser_state.browser_context.pages[-1]:
+                        LOG.warning(
+                            "The extra page is the current page, closing it",
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            workflow_run_id=task.workflow_run_id,
+                        )
+                    # close the extra page
+                    await browser_state.browser_context.pages[-1].close()
+                else:
+                    LOG.info(
+                        "No download triggered, not closing the extra page",
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        workflow_run_id=task.workflow_run_id,
+                    )
     else:
         results = await chain_click(
             task,
