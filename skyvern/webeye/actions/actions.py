@@ -189,7 +189,7 @@ class ClickAction(WebAction):
     button: str = "left"
 
     def __repr__(self) -> str:
-        return f"ClickAction(element_id={self.element_id}, file_url={self.file_url}, download={self.download})"
+        return f"ClickAction(element_id={self.element_id}, file_url={self.file_url}, download={self.download}, x={self.x}, y={self.y}, button={self.button}, tool_call_id={self.tool_call_id})"
 
 
 class InputTextAction(WebAction):
@@ -197,7 +197,7 @@ class InputTextAction(WebAction):
     text: str
 
     def __repr__(self) -> str:
-        return f"InputTextAction(element_id={self.element_id}, text={self.text})"
+        return f"InputTextAction(element_id={self.element_id}, text={self.text}, tool_call_id={self.tool_call_id})"
 
 
 class UploadFileAction(WebAction):
