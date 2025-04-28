@@ -1433,7 +1433,6 @@ class ForgeAgent:
                 raw_response=True,
                 betas=["computer-use-2025-01-24"],
             )
-        LOG.info("Anthropic response", llm_response=llm_response)
         assistant_content = llm_response["content"]
         llm_caller.message_history.append({"role": "assistant", "content": assistant_content})
 

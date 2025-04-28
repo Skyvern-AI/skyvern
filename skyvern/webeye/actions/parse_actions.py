@@ -482,7 +482,6 @@ async def parse_anthropic_actions(
                     tool_call_id=tool_call_id,
                 )
             )
-            idx += 1
         elif action == "left_click":
             if idx - 1 >= 0:
                 prev_tool_call = tool_calls[idx - 1]
@@ -494,12 +493,12 @@ async def parse_anthropic_actions(
             else:
                 coordinate = parsed_args.get("coordinate")
 
-            idx += 1
             if not coordinate:
                 LOG.warning(
                     "Left click action has no coordinate and it doesn't have mouse_move before it",
                     tool_call=tool_call,
                 )
+                idx += 1
                 continue
             x, y = coordinate
             actions.append(
@@ -519,12 +518,12 @@ async def parse_anthropic_actions(
             )
         elif action == "type":
             text = parsed_args.get("text")
-            idx += 1
             if not text:
                 LOG.warning(
                     "Type action has no text",
                     tool_call=tool_call,
                 )
+                idx += 1
                 continue
             actions.append(
                 InputTextAction(
@@ -541,12 +540,12 @@ async def parse_anthropic_actions(
             )
         elif action == "key":
             text = parsed_args.get("text")
-            idx += 1
             if not text:
                 LOG.warning(
                     "Key action has no text",
                     tool_call=tool_call,
                 )
+                idx += 1
                 continue
             actions.append(
                 KeypressAction(
@@ -561,12 +560,24 @@ async def parse_anthropic_actions(
                     tool_call_id=tool_call_id,
                 )
             )
+        elif action == "screenshot":
+            actions.append(
+                NullAction(
+                    organization_id=task.organization_id,
+                    workflow_run_id=task.workflow_run_id,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    step_order=step.order,
+                    action_order=idx,
+                    tool_call_id=tool_call_id,
+                )
+            )
         else:
             LOG.error(
                 "Unsupported action",
                 tool_call=tool_call,
             )
-            idx += 1
+        idx += 1
     return actions
 
 
