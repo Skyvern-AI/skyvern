@@ -667,7 +667,7 @@ async def run_workflow_legacy(
 
     workflow_run = await workflow_service.run_workflow(
         workflow_id=workflow_id,
-        organization_id=current_org.organization_id,
+        organization=current_org,
         workflow_request=workflow_request,
         template=template,
         version=version,
@@ -1634,7 +1634,7 @@ async def run_workflow(
     )
     workflow_run = await workflow_service.run_workflow(
         workflow_id=workflow_id,
-        organization_id=current_org.organization_id,
+        organization=current_org,
         workflow_request=legacy_workflow_request,
         template=template,
         version=None,

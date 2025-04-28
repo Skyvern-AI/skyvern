@@ -128,4 +128,5 @@ async def _get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
     context = skyvern_context.current()
     if context:
         context.organization_id = organization.organization_id
+        context.organization_name = organization.organization_name
     return organization

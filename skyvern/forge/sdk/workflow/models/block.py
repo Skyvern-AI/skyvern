@@ -2497,6 +2497,9 @@ class TaskV2Block(Block):
             skyvern_context.set(
                 skyvern_context.SkyvernContext(
                     organization_id=organization_id,
+                    organization_name=organization.organization_name,
+                    workflow_id=workflow_run.workflow_id,
+                    workflow_permanent_id=workflow_run.workflow_permanent_id,
                     workflow_run_id=workflow_run_id,
                     browser_session_id=browser_session_id,
                 )
