@@ -1416,6 +1416,8 @@ class ForgeAgent:
                 "display_width_px": settings.BROWSER_WIDTH,
             }
         ]
+        thinking = {"type": "enabled", "budget_tokens": 1024}
+        betas = ["computer-use-2025-01-24"]
         if not llm_caller.message_history:
             llm_response = await llm_caller.call(
                 prompt=task.navigation_goal,
@@ -1423,7 +1425,8 @@ class ForgeAgent:
                 use_message_history=True,
                 tools=tools,
                 raw_response=True,
-                betas=["computer-use-2025-01-24"],
+                betas=betas,
+                thinking=thinking,
             )
         else:
             llm_response = await llm_caller.call(
@@ -1431,7 +1434,8 @@ class ForgeAgent:
                 use_message_history=True,
                 tools=tools,
                 raw_response=True,
-                betas=["computer-use-2025-01-24"],
+                betas=betas,
+                thinking=thinking,
             )
         assistant_content = llm_response["content"]
         llm_caller.message_history.append({"role": "assistant", "content": assistant_content})
