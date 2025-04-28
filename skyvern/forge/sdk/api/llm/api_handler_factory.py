@@ -693,6 +693,7 @@ class LLMCaller:
         max_tokens = active_parameters.get("max_completion_tokens") or active_parameters.get("max_tokens") or 4096
         model_name = self.llm_config.model_name.replace("bedrock/", "").replace("anthropic/", "")
         betas = active_parameters.get("betas", NOT_GIVEN)
+        thinking = active_parameters.get("thinking", NOT_GIVEN)
         LOG.info("Anthropic request", betas=betas, tools=tools, timeout=timeout)
         response = await app.ANTHROPIC_CLIENT.beta.messages.create(
             max_tokens=max_tokens,
@@ -701,6 +702,7 @@ class LLMCaller:
             tools=tools or NOT_GIVEN,
             timeout=timeout,
             betas=betas,
+            thinking=thinking,
         )
         LOG.info("Anthropic response", response=response, betas=betas, tools=tools, timeout=timeout)
         return response
