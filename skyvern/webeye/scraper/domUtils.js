@@ -2322,10 +2322,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
             case "style": {
               // TODO: need to confirm that elemnent is hidden previously
               if (tagName === "body") continue;
-              if (
-                (getElementComputedStyle(node)?.display !== "none") !==
-                "none"
-              ) {
+              if (getElementComputedStyle(node)?.display !== "none") {
                 window.globalOneTimeIncrementElements.push({
                   targetNode: node,
                   newNodes: [node],
@@ -2351,10 +2348,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
                 )
               )
                 continue;
-              if (
-                (getElementComputedStyle(node)?.display !== "none") !==
-                "none"
-              ) {
+              if (getElementComputedStyle(node)?.display !== "none") {
                 window.globalOneTimeIncrementElements.push({
                   targetNode: node,
                   newNodes: [node],
