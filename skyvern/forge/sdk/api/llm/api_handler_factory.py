@@ -676,7 +676,7 @@ class LLMCaller:
         timeout: float = settings.LLM_CONFIG_TIMEOUT,
         **active_parameters: dict[str, Any],
     ) -> ModelResponse | CustomStreamWrapper | AnthropicMessage:
-        if self.llm_key and self.llm_key.startswith("ANTHROPIC"):
+        if self.llm_key and "ANTHROPIC" in self.llm_key:
             return await self._call_anthropic(messages, tools, timeout, **active_parameters)
 
         return await litellm.acompletion(
