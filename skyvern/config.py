@@ -131,6 +131,7 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str | None = None
     # ANTHROPIC
     ANTHROPIC_API_KEY: str | None = None
+    ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE3.7_SONNET"
 
     # OPENAI COMPATIBLE
     OPENAI_COMPATIBLE_MODEL_NAME: str | None = None

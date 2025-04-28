@@ -6,6 +6,7 @@ from typing import Any
 
 import litellm
 import structlog
+from anthropic import NOT_GIVEN
 from anthropic.types.beta.beta_message import BetaMessage as AnthropicMessage
 from jinja2 import Template
 from litellm.utils import CustomStreamWrapper, ModelResponse
@@ -663,7 +664,7 @@ class LLMCaller:
         **active_parameters: dict[str, Any],
     ) -> ModelResponse | CustomStreamWrapper | AnthropicMessage:
         if self.llm_key and self.llm_key.startswith("ANTHROPIC"):
-            return await self._call_anthropic(messages, tools, timeout)
+            return await self._call_anthropic(messages, tools, timeout, **active_parameters)
 
         return await litellm.acompletion(
             model=self.llm_config.model_name, messages=messages, tools=tools, timeout=timeout, **active_parameters
@@ -678,15 +679,16 @@ class LLMCaller:
     ) -> AnthropicMessage:
         max_tokens = active_parameters.get("max_completion_tokens") or active_parameters.get("max_tokens") or 4096
         model_name = self.llm_config.model_name.replace("bedrock/", "").replace("anthropic/", "")
+        betas = active_parameters.get("betas", NOT_GIVEN)
         response = await app.ANTHROPIC_CLIENT.beta.messages.create(
             max_tokens=max_tokens,
             messages=messages,
             model=model_name,
             tools=tools,
             timeout=timeout,
-            betas=active_parameters.get("betas", None),
+            betas=betas,
         )
-        LOG.info("Anthropic response", response=response)
+        LOG.info("Anthropic response", response=response, betas=betas, tools=tools, timeout=timeout)
         return response
 
 

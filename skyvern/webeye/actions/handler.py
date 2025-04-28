@@ -374,6 +374,7 @@ class ActionHandler:
                             "content": {"result": "Tool execution failed"},
                         }
                         llm_caller.add_tool_result(tool_call_result)
+                        LOG.info("Tool call result", tool_call_result=tool_call_result, action=action)
                     return actions_result
 
                 if llm_caller and action.tool_call_id:
@@ -382,6 +383,7 @@ class ActionHandler:
                         "tool_use_id": action.tool_call_id,
                         "content": {"result": "Tool executed successfully"},
                     }
+                    LOG.info("Tool call result", tool_call_result=tool_call_result, action=action)
                     llm_caller.add_tool_result(tool_call_result)
 
                 # do the teardown

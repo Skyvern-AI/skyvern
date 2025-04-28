@@ -385,7 +385,7 @@ class ForgeAgent:
                 # llm_caller = LLMCaller(llm_key="BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_INFERENCE_PROFILE")
                 llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
                 if not llm_caller:
-                    llm_caller = LLMCaller(llm_key="ANTHROPIC_CLAUDE3.5_SONNET")
+                    llm_caller = LLMCaller(llm_key=settings.ANTHROPIC_CUA_LLM_KEY)
                     LLMCallerManager.set_llm_caller(task.task_id, llm_caller)
             step, detailed_output = await self.agent_step(
                 task,
