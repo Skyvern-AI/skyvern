@@ -125,6 +125,7 @@ class Settings(BaseSettings):
     ENABLE_AZURE_O3_MINI: bool = False
     ENABLE_BEDROCK: bool = False
     ENABLE_GEMINI: bool = False
+    ENABLE_VERTEX_AI: bool = False
     ENABLE_AZURE_CUA: bool = False
     ENABLE_OPENAI_COMPATIBLE: bool = False
     # OPENAI
@@ -204,6 +205,9 @@ class Settings(BaseSettings):
 
     # GEMINI
     GEMINI_API_KEY: str | None = None
+
+    # VERTEX_AI
+    VERTEX_CREDENTIALS: str | None = None
 
     # NOVITA AI
     ENABLE_NOVITA: bool = False
