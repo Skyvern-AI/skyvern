@@ -1,4 +1,3 @@
-import json
 from typing import Any, Dict
 
 import structlog
@@ -456,19 +455,20 @@ async def parse_anthropic_actions(
     step: Step,
     assistant_content: list[dict[str, Any]],
 ) -> list[Action]:
-    tool_calls = [block for block in assistant_content if block["type"] == "tool_use"]
+    tool_calls = [block for block in assistant_content if block["type"] == "tool_use" and block["name"] == "computer"]
     idx = 0
     actions: list[Action] = []
+    LOG.info("Anthropic tool calls", tool_calls=tool_calls, assistant_content=assistant_content)
     while idx < len(tool_calls):
         tool_call = tool_calls[idx]
         tool_call_id = tool_call["id"]
-        parsed_args = _parse_anthropic_computer_args(tool_call)
-        if not parsed_args:
+        tool_call_input = tool_call.get("input")
+        if not tool_call_input:
             idx += 1
             continue
-        action = parsed_args["action"]
+        action = tool_call_input["action"]
         if action == "mouse_move":
-            x, y = parsed_args["coordinate"]
+            x, y = tool_call_input["coordinate"]
             actions.append(
                 MoveAction(
                     x=x,
@@ -483,15 +483,12 @@ async def parse_anthropic_actions(
                 )
             )
         elif action == "left_click":
-            if idx - 1 >= 0:
+            coordinate = tool_call_input.get("coordinate")
+            if not coordinate and idx - 1 >= 0:
                 prev_tool_call = tool_calls[idx - 1]
-                prev_parsed_args = _parse_anthropic_computer_args(prev_tool_call)
-                if prev_parsed_args and prev_parsed_args["action"] == "mouse_move":
-                    coordinate = prev_parsed_args["coordinate"]
-                else:
-                    coordinate = parsed_args.get("coordinate")
-            else:
-                coordinate = parsed_args.get("coordinate")
+                prev_tool_call_input = prev_tool_call.get("input")
+                if prev_tool_call_input and prev_tool_call_input["action"] == "mouse_move":
+                    coordinate = prev_tool_call_input.get("coordinate")
 
             if not coordinate:
                 LOG.warning(
@@ -517,10 +514,10 @@ async def parse_anthropic_actions(
                 )
             )
         elif action == "type":
-            text = parsed_args.get("text")
+            text = tool_call_input.get("text")
             if not text:
                 LOG.warning(
-                    "Type action has no text",
+                    "Anthropic type action has no text",
                     tool_call=tool_call,
                 )
                 idx += 1
@@ -539,7 +536,7 @@ async def parse_anthropic_actions(
                 )
             )
         elif action == "key":
-            text = parsed_args.get("text")
+            text = tool_call_input.get("text")
             if not text:
                 LOG.warning(
                     "Key action has no text",
@@ -579,14 +576,3 @@ async def parse_anthropic_actions(
             )
         idx += 1
     return actions
-
-
-def _parse_anthropic_computer_args(tool_call: dict[str, Any]) -> dict[str, Any] | None:
-    tool_call_type = tool_call["type"]
-    if tool_call_type != "function":
-        return None
-    tool_call_name = tool_call["function"]["name"]
-    if tool_call_name != "computer":
-        return None
-    tool_call_arguments = tool_call["function"]["arguments"]
-    return json.loads(tool_call_arguments)
