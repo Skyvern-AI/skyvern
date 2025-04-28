@@ -1,5 +1,6 @@
 from typing import Awaitable, Callable
 
+from anthropic import AsyncAnthropic, AsyncAnthropicBedrock
 from fastapi import FastAPI
 from openai import AsyncAzureOpenAI, AsyncOpenAI
 
@@ -41,6 +42,9 @@ if SettingsManager.get_settings().ENABLE_AZURE_CUA:
         azure_endpoint=SettingsManager.get_settings().AZURE_CUA_ENDPOINT,
         azure_deployment=SettingsManager.get_settings().AZURE_CUA_DEPLOYMENT,
     )
+ANTHROPIC_CLIENT = AsyncAnthropic(api_key=SettingsManager.get_settings().ANTHROPIC_API_KEY)
+if SettingsManager.get_settings().ENABLE_BEDROCK_ANTHROPIC:
+    ANTHROPIC_CLIENT = AsyncAnthropicBedrock()
 
 SECONDARY_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
     SETTINGS_MANAGER.SECONDARY_LLM_KEY if SETTINGS_MANAGER.SECONDARY_LLM_KEY else SETTINGS_MANAGER.LLM_KEY

@@ -18,6 +18,7 @@ class ActionResult(BaseModel):
     interacted_with_sibling: bool | None = None
     interacted_with_parent: bool | None = None
     skip_remaining_actions: bool | None = None
+    tool_call_result: dict[str, Any] | None = None
 
     def __str__(self) -> str:
         results = [f"ActionResult(success={self.success}"]

@@ -119,6 +119,7 @@ class Settings(BaseSettings):
     # LLM PROVIDER SPECIFIC
     ENABLE_OPENAI: bool = False
     ENABLE_ANTHROPIC: bool = False
+    ENABLE_BEDROCK_ANTHROPIC: bool = False
     ENABLE_AZURE: bool = False
     ENABLE_AZURE_GPT4O_MINI: bool = False
     ENABLE_AZURE_O3_MINI: bool = False

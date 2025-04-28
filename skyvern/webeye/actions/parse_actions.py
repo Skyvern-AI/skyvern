@@ -1,3 +1,4 @@
+import json
 from typing import Any, Dict
 
 import structlog
@@ -448,3 +449,133 @@ async def parse_cua_actions(
         action.action_order = 0
         return [action]
     return actions
+
+
+async def parse_anthropic_actions(
+    task: Task,
+    step: Step,
+    assistant_content: list[dict[str, Any]],
+) -> list[Action]:
+    tool_calls = [block for block in assistant_content if block["type"] == "tool_use"]
+    idx = 0
+    actions: list[Action] = []
+    while idx < len(tool_calls):
+        tool_call = tool_calls[idx]
+        tool_call_id = tool_call["id"]
+        parsed_args = _parse_anthropic_computer_args(tool_call)
+        if not parsed_args:
+            idx += 1
+            continue
+        action = parsed_args["action"]
+        if action == "mouse_move":
+            x, y = parsed_args["coordinate"]
+            actions.append(
+                MoveAction(
+                    x=x,
+                    y=y,
+                    organization_id=task.organization_id,
+                    workflow_run_id=task.workflow_run_id,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    step_order=step.order,
+                    action_order=idx,
+                    tool_call_id=tool_call_id,
+                )
+            )
+            idx += 1
+        elif action == "left_click":
+            if idx - 1 >= 0:
+                prev_tool_call = tool_calls[idx - 1]
+                prev_parsed_args = _parse_anthropic_computer_args(prev_tool_call)
+                if prev_parsed_args and prev_parsed_args["action"] == "mouse_move":
+                    coordinate = prev_parsed_args["coordinate"]
+                else:
+                    coordinate = parsed_args.get("coordinate")
+            else:
+                coordinate = parsed_args.get("coordinate")
+
+            idx += 1
+            if not coordinate:
+                LOG.warning(
+                    "Left click action has no coordinate and it doesn't have mouse_move before it",
+                    tool_call=tool_call,
+                )
+                continue
+            x, y = coordinate
+            actions.append(
+                ClickAction(
+                    element_id="",
+                    x=x,
+                    y=y,
+                    button="left",
+                    organization_id=task.organization_id,
+                    workflow_run_id=task.workflow_run_id,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    step_order=step.order,
+                    action_order=idx - 1,
+                    tool_call_id=tool_call_id,
+                )
+            )
+        elif action == "type":
+            text = parsed_args.get("text")
+            idx += 1
+            if not text:
+                LOG.warning(
+                    "Type action has no text",
+                    tool_call=tool_call,
+                )
+                continue
+            actions.append(
+                InputTextAction(
+                    element_id="",
+                    text=text,
+                    organization_id=task.organization_id,
+                    workflow_run_id=task.workflow_run_id,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    step_order=step.order,
+                    action_order=idx,
+                    tool_call_id=tool_call_id,
+                )
+            )
+        elif action == "key":
+            text = parsed_args.get("text")
+            idx += 1
+            if not text:
+                LOG.warning(
+                    "Key action has no text",
+                    tool_call=tool_call,
+                )
+                continue
+            actions.append(
+                KeypressAction(
+                    element_id="",
+                    keys=[text],
+                    organization_id=task.organization_id,
+                    workflow_run_id=task.workflow_run_id,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    step_order=step.order,
+                    action_order=idx,
+                    tool_call_id=tool_call_id,
+                )
+            )
+        else:
+            LOG.error(
+                "Unsupported action",
+                tool_call=tool_call,
+            )
+            idx += 1
+    return actions
+
+
+def _parse_anthropic_computer_args(tool_call: dict[str, Any]) -> dict[str, Any] | None:
+    tool_call_type = tool_call["type"]
+    if tool_call_type != "function":
+        return None
+    tool_call_name = tool_call["function"]["name"]
+    if tool_call_name != "computer":
+        return None
+    tool_call_arguments = tool_call["function"]["arguments"]
+    return json.loads(tool_call_arguments)

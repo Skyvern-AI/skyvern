@@ -59,6 +59,7 @@ from skyvern.forge.sdk.api.files import (
     list_files_in_directory,
     wait_for_download_finished,
 )
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCallerManager
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_post
@@ -363,8 +364,25 @@ class ActionHandler:
                 handler = ActionHandler._handled_action_types[action.action_type]
                 results = await handler(action, page, scraped_page, task, step)
                 actions_result.extend(results)
+                llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
                 if not results or not isinstance(actions_result[-1], ActionSuccess):
+                    if llm_caller and action.tool_call_id:
+                        # add failure message to the llm caller
+                        tool_call_result = {
+                            "type": "tool_result",
+                            "tool_use_id": action.tool_call_id,
+                            "content": {"result": "Tool execution failed"},
+                        }
+                        llm_caller.add_tool_result(tool_call_result)
                     return actions_result
+
+                if llm_caller and action.tool_call_id:
+                    tool_call_result = {
+                        "type": "tool_result",
+                        "tool_use_id": action.tool_call_id,
+                        "content": {"result": "Tool executed successfully"},
+                    }
+                    llm_caller.add_tool_result(tool_call_result)
 
                 # do the teardown
                 teardown = ActionHandler._teardown_action_types.get(action.action_type)
@@ -1532,7 +1550,7 @@ async def handle_keypress_action(
 ) -> list[ActionResult]:
     updated_keys = []
     for key in action.keys:
-        if key.lower() == "enter":
+        if key.lower() in ("enter", "return"):
             updated_keys.append("Enter")
         elif key.lower() == "space":
             updated_keys.append(" ")

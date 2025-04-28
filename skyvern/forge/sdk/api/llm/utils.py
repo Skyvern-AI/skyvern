@@ -47,19 +47,22 @@ async def llm_messages_builder(
 
 
 async def llm_messages_builder_with_history(
-    prompt: str,
+    prompt: str | None = None,
     screenshots: list[bytes] | None = None,
     message_history: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     if message_history:
         messages = copy.deepcopy(message_history)
-    current_user_messages: list[dict[str, Any]] = [
-        {
-            "type": "text",
-            "text": prompt,
-        }
-    ]
+
+    current_user_messages: list[dict[str, Any]] = []
+    if prompt:
+        current_user_messages.append(
+            {
+                "type": "text",
+                "text": prompt,
+            }
+        )
 
     if screenshots:
         for screenshot in screenshots:

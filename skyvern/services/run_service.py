@@ -13,7 +13,11 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
     if not run:
         return None
 
-    if run.task_run_type == RunType.task_v1 or run.task_run_type == RunType.openai_cua:
+    if (
+        run.task_run_type == RunType.task_v1
+        or run.task_run_type == RunType.openai_cua
+        or run.task_run_type == RunType.anthropic_cua
+    ):
         # fetch task v1 from db and transform to task run response
         task_v1 = await app.DATABASE.get_task(run.run_id, organization_id=organization_id)
         if not task_v1:
@@ -21,6 +25,8 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
         run_engine = RunEngine.skyvern_v1
         if run.task_run_type == RunType.openai_cua:
             run_engine = RunEngine.openai_cua
+        elif run.task_run_type == RunType.anthropic_cua:
+            run_engine = RunEngine.anthropic_cua
         return TaskRunResponse(
             run_id=run.run_id,
             run_type=run.task_run_type,
@@ -136,7 +142,7 @@ async def cancel_run(run_id: str, organization_id: str | None = None, api_key: s
             detail=f"Run not found {run_id}",
         )
 
-    if run.task_run_type in [RunType.task_v1, RunType.openai_cua]:
+    if run.task_run_type in [RunType.task_v1, RunType.openai_cua, RunType.anthropic_cua]:
         await cancel_task_v1(run_id, organization_id=organization_id, api_key=api_key)
     elif run.task_run_type == RunType.task_v2:
         await cancel_task_v2(run_id, organization_id=organization_id)

@@ -672,3 +672,8 @@ class SkyvernContextWindowExceededError(SkyvernException):
     def __init__(self) -> None:
         message = "Context window exceeded. Please contact support@skyvern.com for help."
         super().__init__(message)
+
+
+class LLMCallerNotFoundError(SkyvernException):
+    def __init__(self, uid: str) -> None:
+        super().__init__(f"LLM caller for {uid} is not found")
