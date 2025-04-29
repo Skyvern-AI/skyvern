@@ -301,6 +301,10 @@ class SkyvernElement:
         return self.__static_element
 
     def get_selectable(self) -> bool:
+        if self.get_tag_name() == InteractiveElement.INPUT:
+            input_type = self.get_attr("type", mode="static")
+            if input_type == "select-one" or input_type == "select-multiple":
+                return True
         return self._selectable
 
     def get_tag_name(self) -> str:
