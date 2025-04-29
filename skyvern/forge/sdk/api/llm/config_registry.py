@@ -739,9 +739,9 @@ if settings.ENABLE_NOVITA:
 # Set the value of my_vertex_credentials as the environment variable VERTEX_CREDENTIALS
 if settings.ENABLE_VERTEX_AI:
     LLMConfigRegistry.register_config(
-        "VERTEX_GEMINI_2.5_PRO_EXP_03_25",
+        "VERTEX_GEMINI_2.5_FLASH_PREVIEW_04_17",
         LLMConfig(
-            "vertex_ai/gemini-2.5-pro-preview-03-25",
+            "vertex_ai/gemini-2.5-flash-preview-04-17",
             ["VERTEX_CREDENTIALS"],
             supports_vision=True,
             add_assistant_prefix=False,
