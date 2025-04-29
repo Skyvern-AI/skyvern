@@ -2464,7 +2464,7 @@ async def select_from_emerging_elements(
         task_id=task.task_id,
     )
 
-    action_type_str: str = json_response.get("action_type", "")
+    action_type_str: str = json_response.get("action_type", "") or ""
     action_type = ActionType(action_type_str.lower())
     element_id: str | None = json_response.get("id", None)
     if not element_id or action_type not in [ActionType.CLICK, ActionType.INPUT_TEXT]:
@@ -2590,7 +2590,7 @@ async def select_from_dropdown(
         task_id=task.task_id,
     )
 
-    action_type: str = json_response.get("action_type", "")
+    action_type: str = json_response.get("action_type", "") or ""
     action_type = action_type.lower()
     single_select_result.action_type = ActionType(action_type)
     element_id: str | None = json_response.get("id", None)
