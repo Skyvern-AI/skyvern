@@ -15,6 +15,10 @@ from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.models import TokenPayload
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthTokenType
 
+import structlog
+
+LOG = structlog.get_logger()
+
 AUTHENTICATION_TTL = 60 * 60  # one hour
 CACHE_SIZE = 128
 ALGORITHM = "HS256"
@@ -91,6 +95,7 @@ async def _get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
         )
         api_key_data = TokenPayload(**payload)
     except (JWTError, ValidationError):
+        LOG.error("Error decoding JWT", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Could not validate credentials",
