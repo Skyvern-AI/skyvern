@@ -148,9 +148,6 @@ export class Skyvern implements INodeType {
                                 const generateBody: IDataObject = {
                                     prompt: userPrompt,
                                 };
-                                if (webhookUrl) {
-                                    generateBody['webhook_callback_url'] = webhookUrl; // include for TaskV1 generation
-                                }
 
                                 const response = await makeRequest(credentials['baseUrl'] + '/api/v1/generate/task', {
                                     method: 'POST',
