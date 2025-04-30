@@ -189,6 +189,8 @@ class ClickAction(WebAction):
     x: int | None = None
     y: int | None = None
     button: str = "left"
+    # normal click: 1, double click: 2, triple click: 3
+    repeat: int = 1
 
     def __repr__(self) -> str:
         return f"ClickAction(element_id={self.element_id}, file_url={self.file_url}, download={self.download}, x={self.x}, y={self.y}, button={self.button}, tool_call_id={self.tool_call_id})"
