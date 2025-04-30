@@ -72,6 +72,12 @@ services:
       # - AWS_REGION=us-west-2                         # Replace this with a different AWS region, if you desire
       # - AWS_ACCESS_KEY_ID=FILL_ME_IN_PLEASE
       # - AWS_SECRET_ACCESS_KEY=FILL_ME_IN_PLEASE
+      # Ollama Support:
+      # Ollama is a local LLM provider that can be used to run models locally on your machine.
+      # - LLM_KEY=OLLAMA
+      # - ENABLE_OLLAMA=true
+      # - OLLAMA_SERVER_URL=http://localhost:11434 # This is the default URL for the Ollama server. Change this if you are using a different URL.
+      # - OLLAMA_MODEL=gemma3:12b-it-q4_K_M
     depends_on:
       postgres:
         condition: service_healthy
