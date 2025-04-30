@@ -240,8 +240,10 @@ class Settings(BaseSettings):
 
     SVG_MAX_LENGTH: int = 100000
 
-    ENABLE_LOG_ARTIFACTS: bool = False
-    ENABLE_CODE_BLOCK: bool = False
+    # Enable/Disable logging of artifacts
+    ENABLE_LOG_ARTIFACTS: bool = True
+    # Enable/Disable logging of code blocks
+    ENABLE_CODE_BLOCK: bool = True
 
     # SkyvernClient Settings
     SKYVERN_BASE_URL: str = "https://api.skyvern.com"
