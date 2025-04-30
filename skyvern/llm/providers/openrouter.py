@@ -1,18 +1,20 @@
+import os
 import requests
 from skyvern.llm.base import BaseLLMProvider
 from skyvern.config import Settings
 
-class OllamaProvider(BaseLLMProvider):
+class OpenRouterProvider(BaseLLMProvider):
     """
-    Provider for Ollama's OpenAI-compatible local server.
+    Provider for OpenRouter's OpenAI-compatible API.
     """
 
-    def __init__(self, server_url, model):
-        self.server_url = server_url.rstrip("/")
+    def __init__(self, api_key: str, model: str):
+        self.api_key = api_key
         self.model = model
+        self.api_base = "https://openrouter.ai/api/v1"
         self.headers = {
             "Content-Type": "application/json",
-            "Authorization": "Bearer not_needed"  # Not used by Ollama but required by interface
+            "Authorization": f"Bearer {self.api_key}",
         }
 
     def call(self, prompt: str, **kwargs) -> str:
@@ -24,10 +26,10 @@ class OllamaProvider(BaseLLMProvider):
         }
 
         response = requests.post(
-            f"{self.server_url}/v1/chat/completions",
+            f"{self.api_base}/chat/completions",
             headers=self.headers,
             json=payload,
-            timeout=60
+            timeout=60,
         )
         response.raise_for_status()
 

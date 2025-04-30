@@ -219,6 +219,14 @@ class Settings(BaseSettings):
     OLLAMA_SERVER_URL: str | None = None
     OLLAMA_MODEL: str | None = None
 
+    # OPENROUTER
+    ENABLE_OPENROUTER: bool = False
+    OPENROUTER_API_KEY: str | None = None
+    OPENROUTER_MODEL: str | None = None
+
+    # Max Token (only for OpenRouter & Ollama)
+    LLM_CONFIG_MAX_TOKENS: int | None = None
+
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40

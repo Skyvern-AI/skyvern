@@ -43,9 +43,9 @@ services:
       # Then go to http://localhost:9222/json/version to get the remote debugging URL
       # - BROWSER_REMOTE_DEBUGGING_URL=ws://host.docker.internal:9222/devtools/browser/<your_debugging_url>
       # LLM Support:
-      - ENABLE_OPENAI=true
-      - LLM_KEY=OPENAI_GPT4O
-      - OPENAI_API_KEY=<your_openai_key>
+      # - ENABLE_OPENAI=true
+      # - LLM_KEY=OPENAI_GPT4O
+      # - OPENAI_API_KEY=<your_openai_key>
       # If you want to use other LLM provider, like azure and anthropic:
       # - ENABLE_ANTHROPIC=true
       # - LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET
@@ -85,6 +85,13 @@ services:
       # - ENABLE_OLLAMA=true
       # - OLLAMA_SERVER_URL=http://localhost:11434 # This is the default URL for the Ollama server. Change this if you are using a different URL.
       # - OLLAMA_MODEL=gemma3:12b-it-q4_K_M
+      # Open Router Support:
+      - ENABLE_OPENROUTER=true
+      - LLM_KEY=OPENROUTER
+      - OPENROUTER_API_KEY=<your_openrouter_api_key>
+      - OPENROUTER_MODEL=<mistralai/mistral-small-3.1-24b-instruct>
+      # Maximum tokens to use: (only set for OpenRouter aand Ollama)
+      - LLM_CONFIG_MAX_TOKENS=128000
       # Bitwarden Support:
       # If you want to use Bitwarden as your password manager, you need to set the following environment variables:
       - BITWARDEN_CLIENT_SECRET=<your_bitwarden_client_secret>
