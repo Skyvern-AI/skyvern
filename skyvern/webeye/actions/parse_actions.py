@@ -420,7 +420,7 @@ async def parse_anthropic_actions(
                         tool_call_id=tool_call_id,
                     )
                 )
-            elif action == "left_click":
+            elif action in ["left_click", "double_click", "triple_click"]:
                 coordinate = tool_call_input.get("coordinate")
                 if not coordinate and idx - 1 >= 0:
                     prev_tool_call = tool_calls[idx - 1]
@@ -438,6 +438,12 @@ async def parse_anthropic_actions(
                 x, y = validate_and_get_coordinates(
                     coordinate, screenshot_resize_target_dimension, browser_window_dimension
                 )
+                repeat = 1
+                if action == "double_click":
+                    repeat = 2
+                elif action == "triple_click":
+                    repeat = 3
+
                 response = f"Click at: ({x}, {y})"
                 reasoning = reasoning or response
                 actions.append(
@@ -446,6 +452,7 @@ async def parse_anthropic_actions(
                         x=x,
                         y=y,
                         button="left",
+                        repeat=repeat,
                         reasoning=reasoning,
                         intention=reasoning,
                         response=response,

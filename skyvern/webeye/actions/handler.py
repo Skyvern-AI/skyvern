@@ -505,7 +505,15 @@ async def handle_click_action(
         )
         LOG.info("Clicked element at location", x=action.x, y=action.y, element_id=element_id, button=action.button)
 
-        await page.mouse.click(x=action.x, y=action.y, button=action.button)
+        if action.repeat == 1:
+            await page.mouse.click(x=action.x, y=action.y, button=action.button)
+        elif action.repeat == 2:
+            await page.mouse.dblclick(x=action.x, y=action.y, button=action.button)
+        elif action.repeat == 3:
+            await page.mouse.click(x=action.x, y=action.y, button=action.button, click_count=3)
+        else:
+            raise ValueError(f"Invalid repeat value: {action.repeat}")
+
         return [ActionSuccess()]
 
     dom = DomUtil(scraped_page=scraped_page, page=page)
