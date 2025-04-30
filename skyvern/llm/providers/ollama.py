@@ -7,7 +7,7 @@ class OllamaProvider(BaseLLMProvider):
     Provider for Ollama's OpenAI-compatible local server.
     """
 
-    def __init__(self, server_url: str = "http://localhost:11434", model: str = "deepseek-coder:6.7b"):
+    def __init__(self, server_url, model):
         self.server_url = server_url.rstrip("/")
         self.model = model
         self.headers = {
