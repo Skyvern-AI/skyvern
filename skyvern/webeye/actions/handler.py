@@ -732,7 +732,7 @@ async def handle_input_text_action(
         option=SelectOption(label=text),
         intention=action.intention,
     )
-    if skyvern_element.get_selectable():
+    if await skyvern_element.get_selectable():
         LOG.info(
             "Input element is selectable, doing select actions",
             task_id=task.task_id,
