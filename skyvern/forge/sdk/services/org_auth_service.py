@@ -1,6 +1,7 @@
 import time
 from typing import Annotated
 
+import structlog
 from asyncache import cached
 from cachetools import TTLCache
 from fastapi import Header, HTTPException, status
@@ -14,8 +15,6 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.models import TokenPayload
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthTokenType
-
-import structlog
 
 LOG = structlog.get_logger()
 

@@ -684,7 +684,7 @@ class AgentDB:
             raise
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)
-            raise  
+            raise
 
     async def get_organization(self, organization_id: str) -> Organization | None:
         try:
