@@ -78,6 +78,12 @@ services:
       # - ENABLE_OLLAMA=true
       # - OLLAMA_SERVER_URL=http://localhost:11434 # This is the default URL for the Ollama server. Change this if you are using a different URL.
       # - OLLAMA_MODEL=gemma3:12b-it-q4_K_M
+
+      # Bitwarden Support:
+      # If you want to use Bitwarden as your password manager, you need to set the following environment variables:
+      - BITWARDEN_CLIENT_SECRET=<your_bitwarden_client_secret>
+      - BITWARDEN_CLIENT_ID=user.<your_bitwarden_client_id>
+      - BITWARDEN_MASTER_PASSWORD=<your_bitwarden_master_password>
     depends_on:
       postgres:
         condition: service_healthy
