@@ -354,100 +354,7 @@ async def parse_cua_actions(
         )
         reasoning = reasonings[0].summary[0].text if reasonings and reasonings[0].summary else None
         assistant_message = assistant_messages[0].content[0].text if assistant_messages else None
-        fallback_action_prompt = prompt_engine.load_prompt(
-            "cua-fallback-action",
-            navigation_goal=task.navigation_goal,
-            assistant_message=assistant_message,
-            assistant_reasoning=reasoning,
-        )
-
-        action_response = await app.LLM_API_HANDLER(
-            prompt=fallback_action_prompt,
-            prompt_name="cua-fallback-action",
-        )
-        LOG.info("Fallback action response", action_response=action_response)
-        skyvern_action_type = action_response.get("action")
-        useful_information = action_response.get("useful_information")
-        action = WaitAction(
-            seconds=5,
-            reasoning=reasoning,
-            intention=reasoning,
-        )
-        if skyvern_action_type == "complete":
-            LOG.info(
-                "Updating task with useful information",
-                task_id=task.task_id,
-                organization_id=task.organization_id,
-                useful_information=useful_information,
-                assistant_message=assistant_message,
-                reasoning=reasoning,
-            )
-            await app.DATABASE.update_task(
-                task.task_id,
-                organization_id=task.organization_id,
-                extracted_information=assistant_message,
-            )
-            action = CompleteAction(
-                reasoning=reasoning,
-                intention=reasoning,
-                verified=True,
-                data_extraction_goal=task.data_extraction_goal,
-            )
-        elif skyvern_action_type == "terminate":
-            action = TerminateAction(
-                reasoning=reasoning,
-                intention=reasoning,
-            )
-        elif skyvern_action_type == "solve_captcha":
-            action = SolveCaptchaAction(
-                reasoning=reasoning,
-                intention=reasoning,
-            )
-        elif skyvern_action_type == "get_verification_code":
-            if (task.totp_verification_url or task.totp_identifier) and task.organization_id:
-                LOG.info(
-                    "Getting verification code for CUA",
-                    task_id=task.task_id,
-                    organization_id=task.organization_id,
-                    workflow_run_id=task.workflow_run_id,
-                    totp_verification_url=task.totp_verification_url,
-                    totp_identifier=task.totp_identifier,
-                )
-                try:
-                    verification_code = await poll_verification_code(
-                        task.task_id,
-                        task.organization_id,
-                        workflow_run_id=task.workflow_run_id,
-                        totp_verification_url=task.totp_verification_url,
-                        totp_identifier=task.totp_identifier,
-                    )
-                    reasoning = reasoning or f"Received verification code: {verification_code}"
-                    action = VerificationCodeAction(
-                        verification_code=verification_code,
-                        reasoning=reasoning,
-                        intention=reasoning,
-                    )
-                except NoTOTPVerificationCodeFound:
-                    reasoning_suffix = "No verification code found"
-                    reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
-                    action = TerminateAction(
-                        reasoning=reasoning,
-                        intention=reasoning,
-                    )
-
-            else:
-                action = TerminateAction(
-                    reasoning=reasoning,
-                    intention=reasoning,
-                )
-
-        action.organization_id = task.organization_id
-        action.workflow_run_id = task.workflow_run_id
-        action.task_id = task.task_id
-        action.step_id = step.step_id
-        action.step_order = step.order
-        action.action_order = 0
-        return [action]
+        actions = await generate_cua_fallback_actions(task, step, assistant_message, reasoning)
     return actions
 
 
@@ -586,3 +493,104 @@ async def parse_anthropic_actions(
             )
         idx += 1
     return actions
+
+
+async def generate_cua_fallback_actions(
+    task: Task,
+    step: Step,
+    assistant_message: str | None,
+    reasoning: str | None,
+) -> list[Action]:
+    fallback_action_prompt = prompt_engine.load_prompt(
+        "cua-fallback-action",
+        navigation_goal=task.navigation_goal,
+        assistant_message=assistant_message,
+        assistant_reasoning=reasoning,
+    )
+
+    action_response = await app.LLM_API_HANDLER(
+        prompt=fallback_action_prompt,
+        prompt_name="cua-fallback-action",
+    )
+    LOG.info("Fallback action response", action_response=action_response)
+    skyvern_action_type = action_response.get("action")
+    useful_information = action_response.get("useful_information")
+    action = WaitAction(
+        seconds=5,
+        reasoning=reasoning,
+        intention=reasoning,
+    )
+    if skyvern_action_type == "complete":
+        LOG.info(
+            "Updating task with useful information",
+            task_id=task.task_id,
+            organization_id=task.organization_id,
+            useful_information=useful_information,
+            assistant_message=assistant_message,
+            reasoning=reasoning,
+        )
+        await app.DATABASE.update_task(
+            task.task_id,
+            organization_id=task.organization_id,
+            extracted_information=assistant_message,
+        )
+        action = CompleteAction(
+            reasoning=reasoning,
+            intention=reasoning,
+            verified=True,
+            data_extraction_goal=task.data_extraction_goal,
+        )
+    elif skyvern_action_type == "terminate":
+        action = TerminateAction(
+            reasoning=reasoning,
+            intention=reasoning,
+        )
+    elif skyvern_action_type == "solve_captcha":
+        action = SolveCaptchaAction(
+            reasoning=reasoning,
+            intention=reasoning,
+        )
+    elif skyvern_action_type == "get_verification_code":
+        if (task.totp_verification_url or task.totp_identifier) and task.organization_id:
+            LOG.info(
+                "Getting verification code for CUA",
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+                workflow_run_id=task.workflow_run_id,
+                totp_verification_url=task.totp_verification_url,
+                totp_identifier=task.totp_identifier,
+            )
+            try:
+                verification_code = await poll_verification_code(
+                    task.task_id,
+                    task.organization_id,
+                    workflow_run_id=task.workflow_run_id,
+                    totp_verification_url=task.totp_verification_url,
+                    totp_identifier=task.totp_identifier,
+                )
+                reasoning = reasoning or f"Received verification code: {verification_code}"
+                action = VerificationCodeAction(
+                    verification_code=verification_code,
+                    reasoning=reasoning,
+                    intention=reasoning,
+                )
+            except NoTOTPVerificationCodeFound:
+                reasoning_suffix = "No verification code found"
+                reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
+                action = TerminateAction(
+                    reasoning=reasoning,
+                    intention=reasoning,
+                )
+        else:
+            action = TerminateAction(
+                reasoning=reasoning,
+                intention=reasoning,
+            )
+
+    action.organization_id = task.organization_id
+    action.workflow_run_id = task.workflow_run_id
+    action.task_id = task.task_id
+    action.step_id = step.step_id
+    action.step_order = step.order
+    action.action_order = 0
+    return [action]
