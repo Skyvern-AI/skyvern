@@ -9,6 +9,7 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
+from skyvern.utils.image_resizer import Resolution, scale_coordinates
 from skyvern.webeye.actions.actions import (
     Action,
     ActionType,
@@ -454,6 +455,8 @@ async def parse_anthropic_actions(
     task: Task,
     step: Step,
     assistant_content: list[dict[str, Any]],
+    browser_window_dimension: Resolution,
+    screenshot_resize_target_dimension: Resolution,
 ) -> list[Action]:
     tool_calls = [block for block in assistant_content if block["type"] == "tool_use" and block["name"] == "computer"]
     idx = 0
@@ -468,7 +471,11 @@ async def parse_anthropic_actions(
             continue
         action = tool_call_input["action"]
         if action == "mouse_move":
-            x, y = tool_call_input["coordinate"]
+            original_x, original_y = tool_call_input["coordinate"]
+            # (x, y) is the coordinate in resized screenshots. We need to scale it to the browser window dimension.
+            x, y = scale_coordinates(
+                (original_x, original_y), screenshot_resize_target_dimension, browser_window_dimension
+            )
             actions.append(
                 MoveAction(
                     x=x,
@@ -497,7 +504,10 @@ async def parse_anthropic_actions(
                 )
                 idx += 1
                 continue
-            x, y = coordinate
+            original_x, original_y = coordinate
+            x, y = scale_coordinates(
+                (original_x, original_y), screenshot_resize_target_dimension, browser_window_dimension
+            )
             actions.append(
                 ClickAction(
                     element_id="",
