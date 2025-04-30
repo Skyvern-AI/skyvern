@@ -35,7 +35,14 @@ services:
       # - ./alembic:/app/alembic
     environment:
       - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
-      - BROWSER_TYPE=chromium-headful
+      # - BROWSER_TYPE=chromium-headful
+      # To Use Your Local Browser
+      - BROWSER_TYPE=cdp-connect
+      # Use this command to start Chrome with remote debugging:
+      # "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\chrome-cdp-profile" --no-first-run --no-default-browser-check
+      # Then go to http://localhost:9222/json/version to get the remote debugging URL
+      - BROWSER_REMOTE_DEBUGGING_URL=ws://host.docker.internal:9222/devtools/browser/<your_debugging_url>
+      # LLM Support:
       - ENABLE_OPENAI=true
       - LLM_KEY=OPENAI_GPT4O
       - OPENAI_API_KEY=<your_openai_key>
@@ -78,7 +85,6 @@ services:
       # - ENABLE_OLLAMA=true
       # - OLLAMA_SERVER_URL=http://localhost:11434 # This is the default URL for the Ollama server. Change this if you are using a different URL.
       # - OLLAMA_MODEL=gemma3:12b-it-q4_K_M
-
       # Bitwarden Support:
       # If you want to use Bitwarden as your password manager, you need to set the following environment variables:
       - BITWARDEN_CLIENT_SECRET=<your_bitwarden_client_secret>
