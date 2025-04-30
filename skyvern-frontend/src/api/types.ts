@@ -182,6 +182,8 @@ export const ActionTypes = {
   Move: "move",
   NullAction: "null_action",
   VerificationCode: "verification_code",
+  Drag: "drag",
+  LeftMouse: "left_mouse",
 } as const;
 
 export type ActionType = (typeof ActionTypes)[keyof typeof ActionTypes];
@@ -204,6 +206,8 @@ export const ReadableActionTypes: {
   move: "Move",
   null_action: "Screenshot",
   verification_code: "Verification Code",
+  drag: "Drag",
+  left_mouse: "Left Mouse",
 };
 
 export type Option = {

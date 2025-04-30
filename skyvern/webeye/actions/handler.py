@@ -1563,7 +1563,8 @@ async def handle_scroll_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await page.mouse.move(action.x, action.y)
+    if action.x and action.y:
+        await page.mouse.move(action.x, action.y)
     await page.evaluate(f"window.scrollBy({action.scroll_x}, {action.scroll_y})")
     return [ActionSuccess()]
 
@@ -1614,7 +1615,12 @@ async def handle_keypress_action(
         else:
             updated_keys.append(key)
     keypress_str = "+".join(updated_keys)
-    await page.keyboard.press(keypress_str)
+    if action.hold:
+        await page.keyboard.down(keypress_str)
+        await asyncio.sleep(action.duration)
+        await page.keyboard.up(keypress_str)
+    else:
+        await page.keyboard.press(keypress_str)
     return [ActionSuccess()]
 
 
@@ -1636,7 +1642,8 @@ async def handle_drag_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await page.mouse.move(action.start_x, action.start_y)
+    if action.start_x and action.start_y:
+        await page.mouse.move(action.start_x, action.start_y)
     await page.mouse.down()
     for point in action.path:
         x, y = point[0], point[1]
@@ -1663,9 +1670,22 @@ async def handle_verification_code_action(
     return [ActionSuccess()]
 
 
-ActionHandler.register_action_type(ActionType.SOLVE_CAPTCHA, handle_solve_captcha_action)
-ActionHandler.register_action_type(ActionType.CLICK, handle_click_action)
-ActionHandler.register_action_type(ActionType.INPUT_TEXT, handle_input_text_action)
+async def handle_left_mouse_action(
+    action: actions.LeftMouseAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    if action.x and action.y:
+        await page.mouse.move(action.x, action.y)
+    if action.direction == "down":
+        await page.mouse.down()
+    elif action.direction == "up":
+        await page.mouse.up()
+    return [ActionSuccess()]
+
+
 ActionHandler.register_action_type(ActionType.UPLOAD_FILE, handle_upload_file_action)
 # ActionHandler.register_action_type(ActionType.DOWNLOAD_FILE, handle_download_file_action)
 ActionHandler.register_action_type(ActionType.NULL_ACTION, handle_null_action)
@@ -1679,6 +1699,7 @@ ActionHandler.register_action_type(ActionType.KEYPRESS, handle_keypress_action)
 ActionHandler.register_action_type(ActionType.MOVE, handle_move_action)
 ActionHandler.register_action_type(ActionType.DRAG, handle_drag_action)
 ActionHandler.register_action_type(ActionType.VERIFICATION_CODE, handle_verification_code_action)
+ActionHandler.register_action_type(ActionType.LEFT_MOUSE, handle_left_mouse_action)
 
 
 async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) -> Any:
