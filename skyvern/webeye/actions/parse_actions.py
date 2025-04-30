@@ -484,7 +484,7 @@ async def parse_anthropic_actions(
                     )
                 )
             elif action in ["key", "hold_key"]:
-                text = tool_call_input.get("text")
+                text = tool_call_input.get("text", "")
                 if not text:
                     LOG.warning(
                         "Anthropic CUA error: key action has no text",
@@ -492,6 +492,7 @@ async def parse_anthropic_actions(
                     )
                     idx += 1
                     continue
+                text = text.capitalize()
                 response = f"Press keys: {text}"
                 hold = action == "hold_key"
                 duration = tool_call_input.get("duration", 0)
