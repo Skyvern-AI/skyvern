@@ -1686,6 +1686,9 @@ async def handle_left_mouse_action(
     return [ActionSuccess()]
 
 
+ActionHandler.register_action_type(ActionType.SOLVE_CAPTCHA, handle_solve_captcha_action)
+ActionHandler.register_action_type(ActionType.CLICK, handle_click_action)
+ActionHandler.register_action_type(ActionType.INPUT_TEXT, handle_input_text_action)
 ActionHandler.register_action_type(ActionType.UPLOAD_FILE, handle_upload_file_action)
 # ActionHandler.register_action_type(ActionType.DOWNLOAD_FILE, handle_download_file_action)
 ActionHandler.register_action_type(ActionType.NULL_ACTION, handle_null_action)
