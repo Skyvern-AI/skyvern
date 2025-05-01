@@ -1363,6 +1363,7 @@ async def handle_select_option_action(
             step=step,
             task=task,
             force_select=True,
+            target_value=action.option.label or action.option.value or "",
         )
         # force_select won't return None result
         assert result is not None
@@ -2596,7 +2597,7 @@ async def select_from_dropdown(
         is_date_related=context.is_date_related,
         field_information=context.field if not context.intention else context.intention,
         required_field=context.is_required,
-        target_value="" if force_select else target_value,
+        target_value=target_value,
         navigation_goal=task.navigation_goal,
         navigation_payload_str=json.dumps(task.navigation_payload),
         elements=html,
