@@ -1586,39 +1586,40 @@ async def handle_keypress_action(
 ) -> list[ActionResult]:
     updated_keys = []
     for key in action.keys:
-        if key.lower() in ("enter", "return"):
+        key_lower_case = key.lower()
+        if key_lower_case in ("enter", "return"):
             updated_keys.append("Enter")
-        elif key.lower() == "space":
+        elif key_lower_case == "space":
             updated_keys.append(" ")
-        elif key.lower() == "ctrl":
+        elif key_lower_case == "ctrl":
             updated_keys.append("Control")
-        elif key.lower() == "backspace":
+        elif key_lower_case == "backspace":
             updated_keys.append("Backspace")
-        elif key.lower() == "pagedown":
+        elif key_lower_case == "pagedown":
             updated_keys.append("PageDown")
-        elif key.lower() == "pageup":
+        elif key_lower_case == "pageup":
             updated_keys.append("PageUp")
-        elif key.lower() == "tab":
+        elif key_lower_case == "tab":
             updated_keys.append("Tab")
-        elif key.lower() == "shift":
+        elif key_lower_case == "shift":
             updated_keys.append("Shift")
-        elif key.lower() in ("arrowleft", "left"):
+        elif key_lower_case in ("arrowleft", "left"):
             updated_keys.append("ArrowLeft")
-        elif key.lower() in ("arrowright", "right"):
+        elif key_lower_case in ("arrowright", "right"):
             updated_keys.append("ArrowRight")
-        elif key.lower() in ("arrowup", "up"):
+        elif key_lower_case in ("arrowup", "up"):
             updated_keys.append("ArrowUp")
-        elif key.lower() in ("arrowdown", "down"):
+        elif key_lower_case in ("arrowdown", "down"):
             updated_keys.append("ArrowDown")
-        elif key.lower() == "home":
+        elif key_lower_case == "home":
             updated_keys.append("Home")
-        elif key.lower() == "end":
+        elif key_lower_case == "end":
             updated_keys.append("End")
-        elif key.lower() == "delete":
+        elif key_lower_case == "delete":
             updated_keys.append("Delete")
-        elif key.lower() == "ecs":
+        elif key_lower_case == "ecs":
             updated_keys.append("Escape")
-        elif key.lower() == "alt":
+        elif key_lower_case == "alt":
             updated_keys.append("Alt")
         else:
             updated_keys.append(key)
