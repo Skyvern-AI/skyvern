@@ -9,6 +9,7 @@ import json_repair
 import litellm
 import structlog
 
+from skyvern.constants import MAX_IMAGE_MESSAGES
 from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat
 
 LOG = structlog.get_logger()
@@ -96,6 +97,21 @@ async def llm_messages_builder_with_history(
                 }
             current_user_messages.append(message)
     messages.append({"role": "user", "content": current_user_messages})
+    # anthropic has hard limit of image & document messages (20 as of Apr 2025)
+    # limit the number of image type messages to 10 for anthropic
+    # delete the oldest image type message if the number of image type messages is greater than 10
+    if message_pattern == "anthropic":
+        image_count = sum(1 for message in messages if message.get("type") == "image")
+        images_to_delete = image_count - MAX_IMAGE_MESSAGES
+        if images_to_delete > 0:
+            new_messages = []
+            for message in messages:
+                if message.get("type") == "image" and images_to_delete > 0:
+                    images_to_delete -= 1
+                else:
+                    new_messages.append(message)
+            messages = new_messages
+
     return messages
 
 
