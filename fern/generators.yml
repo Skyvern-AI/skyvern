@@ -3,7 +3,7 @@
 api: 
   specs:
     - openapi: openapi/skyvern_openapi.json
-     #origin: https://api.skyvern.com/openapi.json
+      origin: https://api.skyvern.com/openapi.json
       # settings: 
       #   use-title: false
 groups:
