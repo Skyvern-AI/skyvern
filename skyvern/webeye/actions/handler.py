@@ -1602,13 +1602,13 @@ async def handle_keypress_action(
             updated_keys.append("Tab")
         elif key.lower() == "shift":
             updated_keys.append("Shift")
-        elif key.lower() == "arrowleft":
+        elif key.lower() in ("arrowleft", "left"):
             updated_keys.append("ArrowLeft")
-        elif key.lower() == "arrowright":
+        elif key.lower() in ("arrowright", "right"):
             updated_keys.append("ArrowRight")
-        elif key.lower() == "arrowup":
+        elif key.lower() in ("arrowup", "up"):
             updated_keys.append("ArrowUp")
-        elif key.lower() == "arrowdown":
+        elif key.lower() in ("arrowdown", "down"):
             updated_keys.append("ArrowDown")
         elif key.lower() == "home":
             updated_keys.append("Home")
