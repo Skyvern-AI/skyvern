@@ -4,6 +4,7 @@ import structlog
 from openai.types.responses.response import Response as OpenAIResponse
 from pydantic import ValidationError
 
+from skyvern.constants import SCROLL_AMOUNT_MULTIPLIER
 from skyvern.exceptions import NoTOTPVerificationCodeFound, UnsupportedActionType
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -552,15 +553,15 @@ async def parse_anthropic_actions(
                 scroll_amount = tool_call_input.get("scroll_amount")
                 if scroll_direction == "up":
                     scroll_x = 0
-                    scroll_y = -scroll_amount
+                    scroll_y = -scroll_amount * SCROLL_AMOUNT_MULTIPLIER
                 elif scroll_direction == "down":
                     scroll_x = 0
-                    scroll_y = scroll_amount
+                    scroll_y = scroll_amount * SCROLL_AMOUNT_MULTIPLIER
                 elif scroll_direction == "left":
-                    scroll_x = -scroll_amount
+                    scroll_x = -scroll_amount * SCROLL_AMOUNT_MULTIPLIER
                     scroll_y = 0
                 elif scroll_direction == "right":
-                    scroll_x = scroll_amount
+                    scroll_x = scroll_amount * SCROLL_AMOUNT_MULTIPLIER
                     scroll_y = 0
                 else:
                     LOG.warning(
