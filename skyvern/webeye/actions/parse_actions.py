@@ -499,8 +499,8 @@ async def parse_anthropic_actions(
                     )
                     idx += 1
                     continue
-                text = text.capitalize()
                 response = f"Press keys: {text}"
+                keys = text.split("+")
                 hold = action == "hold_key"
                 duration = tool_call_input.get("duration", 0)
                 if hold:
@@ -509,7 +509,7 @@ async def parse_anthropic_actions(
                 actions.append(
                     KeypressAction(
                         element_id="",
-                        keys=[text],
+                        keys=keys,
                         hold=hold,
                         duration=duration,
                         reasoning=reasoning,
