@@ -65,7 +65,8 @@ DEFAULT_MAX_ITERATIONS = 10
 
 MINI_GOAL_TEMPLATE = """Achieve the following mini goal and once it's achieved, complete: {mini_goal}
 
-This mini goal is part of the big goal the user wants to achieve and use the big goal as context to achieve the mini goal: {main_goal}"""
+This mini goal is part of the big goal the user wants to achieve and use the big goal as context to achieve the mini goal:
+```{main_goal}```"""
 
 
 def _generate_data_extraction_schema_for_loop(loop_values_key: str) -> dict:
