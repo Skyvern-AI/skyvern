@@ -420,7 +420,7 @@ async def parse_anthropic_actions(
                         tool_call_id=tool_call_id,
                     )
                 )
-            elif action in ["left_click", "double_click", "triple_click"]:
+            elif action in ["left_click", "double_click", "triple_click", "right_click"]:
                 coordinate = tool_call_input.get("coordinate")
                 if not coordinate and idx - 1 >= 0:
                     prev_tool_call = tool_calls[idx - 1]
@@ -446,12 +446,15 @@ async def parse_anthropic_actions(
 
                 response = f"Click at: ({x}, {y})"
                 reasoning = reasoning or response
+                button = "left"
+                if action == "right_click":
+                    button = "right"
                 actions.append(
                     ClickAction(
                         element_id="",
                         x=x,
                         y=y,
-                        button="left",
+                        button=button,
                         repeat=repeat,
                         reasoning=reasoning,
                         intention=reasoning,
