@@ -862,3 +862,19 @@ if settings.ENABLE_OLLAMA:
             ),
         ),
     )
+
+if settings.ENABLE_OPENROUTER:
+    LLMConfigRegistry.register_config(
+        "OPENROUTER",
+        LLMConfig(
+            f"openrouter/{settings.OPENROUTER_MODEL}",  # OpenRouter model name
+            ["OPENROUTER_API_KEY"],  # Required env var
+            supports_vision=False,
+            add_assistant_prefix=False,
+            litellm_params=LiteLLMParams(
+                api_base="https://openrouter.ai/api/v1",
+                api_key=settings.OPENROUTER_API_KEY,
+                model_info={"model_name": f"openrouter/{settings.OPENROUTER_MODEL}"},
+            ),
+        ),
+    )

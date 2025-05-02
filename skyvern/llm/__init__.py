@@ -1,18 +1,26 @@
 from skyvern.llm.providers.ollama import OllamaProvider
+from skyvern.llm.providers.openrouter import OpenRouterProvider
+
+from skyvern.config import Settings
 
 PROVIDERS = {
     # ... other providers ...
     "OLLAMA": OllamaProvider,
+    "OPENROUTER": OpenRouterProvider,
 }
 
 def get_provider():
-    import os
-    key = os.getenv("LLM_KEY", "").upper()
+    key = Settings.LLM_KEY
 
     if key == "OLLAMA":
         return OllamaProvider(
-            server_url=os.getenv("OLLAMA_SERVER_URL", "http://localhost:11434"),
-            model=os.getenv("OLLAMA_MODEL", "deepseek-coder:6.7b")
+            server_url=Settings.OLLAMA_SERVER_URL,
+            model=Settings.OLLAMA_MODEL,
+        )
+    elif key == "OPENROUTER":
+        return OpenRouterProvider(
+            api_key=Settings.OPENROUTER_API_KEY,
+            model=Settings.OPENROUTER_MODEL,
         )
     elif key in PROVIDERS:
         return PROVIDERS[key]()
