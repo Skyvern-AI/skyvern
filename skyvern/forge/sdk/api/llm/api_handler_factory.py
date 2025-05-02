@@ -28,6 +28,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
+from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
 
 LOG = structlog.get_logger()
 
@@ -454,12 +455,22 @@ class LLMCaller:
     An LLMCaller instance defines the LLM configs and keeps the chat history if needed.
     """
 
-    def __init__(self, llm_key: str, base_parameters: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        llm_key: str,
+        screenshot_scaling_enabled: bool = False,
+        base_parameters: dict[str, Any] | None = None,
+    ):
         self.llm_key = llm_key
         self.llm_config = LLMConfigRegistry.get_config(llm_key)
         self.base_parameters = base_parameters
         self.message_history: list[dict[str, Any]] = []
         self.current_tool_results: list[dict[str, Any]] = []
+        self.screenshot_scaling_enabled = screenshot_scaling_enabled
+        self.browser_window_dimension = Resolution(width=settings.BROWSER_WIDTH, height=settings.BROWSER_HEIGHT)
+        self.screenshot_resize_target_dimension = self.browser_window_dimension
+        if screenshot_scaling_enabled:
+            self.screenshot_resize_target_dimension = get_resize_target_dimension(self.browser_window_dimension)
 
     def add_tool_result(self, tool_result: dict[str, Any]) -> None:
         self.current_tool_results.append(tool_result)
@@ -503,6 +514,9 @@ class LLMCaller:
                 thought=thought,
                 ai_suggestion=ai_suggestion,
             )
+
+        if screenshots and self.screenshot_scaling_enabled:
+            screenshots = resize_screenshots(screenshots, self.screenshot_resize_target_dimension)
 
         await app.ARTIFACT_MANAGER.create_llm_artifact(
             data=prompt.encode("utf-8") if prompt else b"",

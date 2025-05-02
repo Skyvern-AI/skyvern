@@ -1,6 +1,10 @@
 // we only use chromium browser for now
 let browserNameForWorkarounds = "chromium";
 
+let _jsConsoleLog = console?.log ?? function () {}; // prevent no console.log error
+let _jsConsoleError = console?.error ?? _jsConsoleLog;
+let _jsConsoleWarn = console?.warn ?? _jsConsoleLog;
+
 class SafeCounter {
   constructor() {
     this.value = 0;
@@ -1155,7 +1159,7 @@ function getElementContent(element, skipped_element = null) {
         // childText = child.textContent.trim();
         childText = getElementContent(child, skipped_element);
       } else {
-        console.log("Unhandled node type: ", child.nodeType);
+        _jsConsoleLog("Unhandled node type: ", child.nodeType);
       }
       if (childText.length > 0) {
         childTextContentList.push(childText);
@@ -1205,7 +1209,7 @@ function getDOMElementBySkyvenElement(elementObj) {
       `[unique_id="${elementObj.shadowHost}"]`,
     );
     if (!shadowHostEle) {
-      console.log(
+      _jsConsoleLog(
         "Could not find shadowHost element with unique_id: ",
         elementObj.shadowHost,
       );
@@ -1293,7 +1297,7 @@ async function buildElementObject(
       attrs[attr.name] = attrValue;
     }
   } else {
-    console.warn(
+    _jsConsoleWarn(
       "element.attributes is not iterable. element_id=" + element_id,
     );
   }
@@ -1417,13 +1421,13 @@ async function buildElementTree(
   }
   async function processElement(element, parentId) {
     if (element === null) {
-      console.log("get a null element");
+      _jsConsoleLog("get a null element");
       return;
     }
 
     const tagName = element.tagName?.toLowerCase();
     if (!tagName) {
-      console.log("get a null tagName");
+      _jsConsoleLog("get a null tagName");
       return;
     }
 
@@ -1586,7 +1590,7 @@ async function buildElementTree(
           ...document.querySelectorAll(`label[for="${elementId}"]`),
         ];
       } catch (e) {
-        console.log("failed to query labels: ", e);
+        _jsConsoleLog("failed to query labels: ", e);
       }
     }
     const labelled = currentEle.getAttribute("aria-labelledby");
@@ -1736,7 +1740,7 @@ async function buildElementTree(
       element.attributes.value === ""
     ) {
       // TODO (kerem): we may want to pass these elements to the LLM as empty but required fields in the future
-      console.log(
+      _jsConsoleLog(
         "input element with required attribute and no value",
         element,
       );
@@ -1747,19 +1751,19 @@ async function buildElementTree(
       try {
         ctxList = getContextByLinked(element, ctxList);
       } catch (e) {
-        console.error("failed to get context by linked: ", e);
+        _jsConsoleError("failed to get context by linked: ", e);
       }
 
       try {
         ctxList = getContextByParent(element, ctxList);
       } catch (e) {
-        console.error("failed to get context by parent: ", e);
+        _jsConsoleError("failed to get context by parent: ", e);
       }
 
       try {
         ctxList = getContextByTable(element, ctxList);
       } catch (e) {
-        console.error("failed to get context by table: ", e);
+        _jsConsoleError("failed to get context by table: ", e);
       }
       const context = ctxList.join(";");
       if (context && context.length <= 5000) {
@@ -1804,7 +1808,7 @@ async function buildElementsAndDrawBoundingBoxes(
 }
 
 function captchaSolvedCallback() {
-  console.log("captcha solved");
+  _jsConsoleLog("captcha solved");
   if (!window["captchaSolvedCounter"]) {
     window["captchaSolvedCounter"] = 0;
   }
@@ -1882,7 +1886,7 @@ function generateHintStrings(count) {
 
 function createHintMarkersForGroups(groups) {
   if (groups.length === 0) {
-    console.log("No groups found, not adding hint markers to page.");
+    _jsConsoleLog("No groups found, not adding hint markers to page.");
     return [];
   }
 
@@ -1921,11 +1925,11 @@ function createHintMarkersForGroups(groups) {
             hintMarker.hintString.toUpperCase(),
           );
         } catch (policyError) {
-          console.warn("Could not create trusted types policy:", policyError);
+          _jsConsoleWarn("Could not create trusted types policy:", policyError);
           // Skip updating the hint marker if policy creation fails
         }
       } else {
-        console.error("trustedTypes is not supported in this environment.");
+        _jsConsoleError("trustedTypes is not supported in this environment.");
       }
     }
   }
@@ -1994,7 +1998,7 @@ function safeWindowScroll(x, y) {
   } else if (typeof window.scrollTo === "function") {
     window.scrollTo({ left: x, top: y, behavior: "instant" });
   } else {
-    console.error("window.scroll and window.scrollTo are both not supported");
+    _jsConsoleError("window.scroll and window.scrollTo are both not supported");
   }
 }
 
@@ -2157,12 +2161,12 @@ function getHoverStylesMap() {
           }
         }
       } catch (e) {
-        console.warn("Could not access stylesheet:", e);
+        _jsConsoleWarn("Could not access stylesheet:", e);
         continue;
       }
     }
   } catch (e) {
-    console.error("Error processing stylesheets:", e);
+    _jsConsoleError("Error processing stylesheets:", e);
   }
 
   return hoverMap;
@@ -2173,7 +2177,7 @@ function findNodeById(arr, targetId, path = []) {
   for (let i = 0; i < arr.length; i++) {
     const currentPath = [...path, arr[i].id];
     if (arr[i].id === targetId) {
-      console.log("Lineage:", currentPath.join(" -> "));
+      _jsConsoleLog("Lineage:", currentPath.join(" -> "));
       return arr[i];
     }
     if (arr[i].children && arr[i].children.length > 0) {
@@ -2234,7 +2238,7 @@ async function addIncrementalNodeToMap(parentNode, childrenNode) {
   const maxParsedElement = 3000;
   const maxElementToWait = 100;
   if ((await window.globalParsedElementCounter.get()) > maxParsedElement) {
-    console.warn(
+    _jsConsoleWarn(
       "Too many elements parsed, stopping the observer to parse the elements",
     );
     await window.globalParsedElementCounter.add();
@@ -2272,7 +2276,7 @@ async function addIncrementalNodeToMap(parentNode, childrenNode) {
         }
       }
     } catch (error) {
-      console.error("Error building incremental element node:", error);
+      _jsConsoleError("Error building incremental element node:", error);
     }
     window.globalDomDepthMap.set(depth, newNodesTreeList);
   }
@@ -2544,11 +2548,11 @@ removeBoundingBoxes();
 
 // Get the element tree
 const [elements, tree] = buildTreeFromBody();
-console.log(elements); // All elements
-console.log(tree);     // Tree structure
+_jsConsoleLog(elements); // All elements
+_jsConsoleLog(tree);     // Tree structure
 
 // Test if a specific element is interactable
 const element = document.querySelector('button');
 const hoverMap = getHoverStylesMap();
-console.log(isInteractable(element, hoverMap));
+_jsConsoleLog(isInteractable(element, hoverMap));
  */

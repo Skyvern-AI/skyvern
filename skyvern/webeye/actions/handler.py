@@ -505,7 +505,15 @@ async def handle_click_action(
         )
         LOG.info("Clicked element at location", x=action.x, y=action.y, element_id=element_id, button=action.button)
 
-        await page.mouse.click(x=action.x, y=action.y, button=action.button)
+        if action.repeat == 1:
+            await page.mouse.click(x=action.x, y=action.y, button=action.button)
+        elif action.repeat == 2:
+            await page.mouse.dblclick(x=action.x, y=action.y, button=action.button)
+        elif action.repeat == 3:
+            await page.mouse.click(x=action.x, y=action.y, button=action.button, click_count=3)
+        else:
+            raise ValueError(f"Invalid repeat value: {action.repeat}")
+
         return [ActionSuccess()]
 
     dom = DomUtil(scraped_page=scraped_page, page=page)
@@ -732,7 +740,7 @@ async def handle_input_text_action(
         option=SelectOption(label=text),
         intention=action.intention,
     )
-    if skyvern_element.get_selectable():
+    if await skyvern_element.get_selectable():
         LOG.info(
             "Input element is selectable, doing select actions",
             task_id=task.task_id,
@@ -1355,6 +1363,7 @@ async def handle_select_option_action(
             step=step,
             task=task,
             force_select=True,
+            target_value=action.option.label or action.option.value or "",
         )
         # force_select won't return None result
         assert result is not None
@@ -1563,7 +1572,8 @@ async def handle_scroll_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await page.mouse.move(action.x, action.y)
+    if action.x and action.y:
+        await page.mouse.move(action.x, action.y)
     await page.evaluate(f"window.scrollBy({action.scroll_x}, {action.scroll_y})")
     return [ActionSuccess()]
 
@@ -1577,44 +1587,50 @@ async def handle_keypress_action(
 ) -> list[ActionResult]:
     updated_keys = []
     for key in action.keys:
-        if key.lower() in ("enter", "return"):
+        key_lower_case = key.lower()
+        if key_lower_case in ("enter", "return"):
             updated_keys.append("Enter")
-        elif key.lower() == "space":
+        elif key_lower_case == "space":
             updated_keys.append(" ")
-        elif key.lower() == "ctrl":
+        elif key_lower_case == "ctrl":
             updated_keys.append("Control")
-        elif key.lower() == "backspace":
+        elif key_lower_case == "backspace":
             updated_keys.append("Backspace")
-        elif key.lower() == "pagedown":
+        elif key_lower_case == "pagedown":
             updated_keys.append("PageDown")
-        elif key.lower() == "pageup":
+        elif key_lower_case == "pageup":
             updated_keys.append("PageUp")
-        elif key.lower() == "tab":
+        elif key_lower_case == "tab":
             updated_keys.append("Tab")
-        elif key.lower() == "shift":
+        elif key_lower_case == "shift":
             updated_keys.append("Shift")
-        elif key.lower() == "arrowleft":
+        elif key_lower_case in ("arrowleft", "left"):
             updated_keys.append("ArrowLeft")
-        elif key.lower() == "arrowright":
+        elif key_lower_case in ("arrowright", "right"):
             updated_keys.append("ArrowRight")
-        elif key.lower() == "arrowup":
+        elif key_lower_case in ("arrowup", "up"):
             updated_keys.append("ArrowUp")
-        elif key.lower() == "arrowdown":
+        elif key_lower_case in ("arrowdown", "down"):
             updated_keys.append("ArrowDown")
-        elif key.lower() == "home":
+        elif key_lower_case == "home":
             updated_keys.append("Home")
-        elif key.lower() == "end":
+        elif key_lower_case == "end":
             updated_keys.append("End")
-        elif key.lower() == "delete":
+        elif key_lower_case == "delete":
             updated_keys.append("Delete")
-        elif key.lower() == "ecs":
+        elif key_lower_case == "ecs":
             updated_keys.append("Escape")
-        elif key.lower() == "alt":
+        elif key_lower_case == "alt":
             updated_keys.append("Alt")
         else:
             updated_keys.append(key)
     keypress_str = "+".join(updated_keys)
-    await page.keyboard.press(keypress_str)
+    if action.hold:
+        await page.keyboard.down(keypress_str)
+        await asyncio.sleep(action.duration)
+        await page.keyboard.up(keypress_str)
+    else:
+        await page.keyboard.press(keypress_str)
     return [ActionSuccess()]
 
 
@@ -1636,7 +1652,8 @@ async def handle_drag_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await page.mouse.move(action.start_x, action.start_y)
+    if action.start_x and action.start_y:
+        await page.mouse.move(action.start_x, action.start_y)
     await page.mouse.down()
     for point in action.path:
         x, y = point[0], point[1]
@@ -1663,6 +1680,22 @@ async def handle_verification_code_action(
     return [ActionSuccess()]
 
 
+async def handle_left_mouse_action(
+    action: actions.LeftMouseAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    if action.x and action.y:
+        await page.mouse.move(action.x, action.y)
+    if action.direction == "down":
+        await page.mouse.down()
+    elif action.direction == "up":
+        await page.mouse.up()
+    return [ActionSuccess()]
+
+
 ActionHandler.register_action_type(ActionType.SOLVE_CAPTCHA, handle_solve_captcha_action)
 ActionHandler.register_action_type(ActionType.CLICK, handle_click_action)
 ActionHandler.register_action_type(ActionType.INPUT_TEXT, handle_input_text_action)
@@ -1679,6 +1712,7 @@ ActionHandler.register_action_type(ActionType.KEYPRESS, handle_keypress_action)
 ActionHandler.register_action_type(ActionType.MOVE, handle_move_action)
 ActionHandler.register_action_type(ActionType.DRAG, handle_drag_action)
 ActionHandler.register_action_type(ActionType.VERIFICATION_CODE, handle_verification_code_action)
+ActionHandler.register_action_type(ActionType.LEFT_MOUSE, handle_left_mouse_action)
 
 
 async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) -> Any:
@@ -2563,7 +2597,7 @@ async def select_from_dropdown(
         is_date_related=context.is_date_related,
         field_information=context.field if not context.intention else context.intention,
         required_field=context.is_required,
-        target_value="" if force_select else target_value,
+        target_value=target_value,
         navigation_goal=task.navigation_goal,
         navigation_payload_str=json.dumps(task.navigation_payload),
         elements=html,

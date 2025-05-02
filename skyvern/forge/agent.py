@@ -385,7 +385,7 @@ class ForgeAgent:
                 # llm_caller = LLMCaller(llm_key="BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_INFERENCE_PROFILE")
                 llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
                 if not llm_caller:
-                    llm_caller = LLMCaller(llm_key=settings.ANTHROPIC_CUA_LLM_KEY)
+                    llm_caller = LLMCaller(llm_key=settings.ANTHROPIC_CUA_LLM_KEY, screenshot_scaling_enabled=True)
                     LLMCallerManager.set_llm_caller(task.task_id, llm_caller)
             step, detailed_output = await self.agent_step(
                 task,
@@ -1450,7 +1450,13 @@ class ForgeAgent:
         assistant_content = llm_response["content"]
         llm_caller.message_history.append({"role": "assistant", "content": assistant_content})
 
-        actions = await parse_anthropic_actions(task, step, assistant_content)
+        actions = await parse_anthropic_actions(
+            task,
+            step,
+            assistant_content,
+            llm_caller.browser_window_dimension,
+            llm_caller.screenshot_resize_target_dimension,
+        )
         return actions
 
     @staticmethod

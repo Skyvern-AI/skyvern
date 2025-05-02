@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Any, Type, TypeVar
+from typing import Annotated, Any, Literal, Type, TypeVar
 
 import structlog
 from litellm import ConfigDict
@@ -28,12 +28,14 @@ class ActionType(StrEnum):
     RELOAD_PAGE = "reload_page"
 
     EXTRACT = "extract"
+    VERIFICATION_CODE = "verification_code"
+
     SCROLL = "scroll"
     KEYPRESS = "keypress"
     TYPE = "type"
     MOVE = "move"
     DRAG = "drag"
-    VERIFICATION_CODE = "verification_code"
+    LEFT_MOUSE = "left_mouse"
 
     def is_web_action(self) -> bool:
         return self in [
@@ -187,6 +189,8 @@ class ClickAction(WebAction):
     x: int | None = None
     y: int | None = None
     button: str = "left"
+    # normal click: 1, double click: 2, triple click: 3
+    repeat: int = 1
 
     def __repr__(self) -> str:
         return f"ClickAction(element_id={self.element_id}, file_url={self.file_url}, download={self.download}, x={self.x}, y={self.y}, button={self.button}, tool_call_id={self.tool_call_id})"
@@ -271,8 +275,8 @@ class ExtractAction(Action):
 
 class ScrollAction(Action):
     action_type: ActionType = ActionType.SCROLL
-    x: int
-    y: int
+    x: int | None = None
+    y: int | None = None
     scroll_x: int
     scroll_y: int
 
@@ -280,6 +284,8 @@ class ScrollAction(Action):
 class KeypressAction(Action):
     action_type: ActionType = ActionType.KEYPRESS
     keys: list[str] = []
+    hold: bool = False
+    duration: int = 0
 
 
 class MoveAction(Action):
@@ -290,14 +296,21 @@ class MoveAction(Action):
 
 class DragAction(Action):
     action_type: ActionType = ActionType.DRAG
-    start_x: int
-    start_y: int
+    start_x: int | None = None
+    start_y: int | None = None
     path: list[tuple[int, int]] = []
 
 
 class VerificationCodeAction(Action):
     action_type: ActionType = ActionType.VERIFICATION_CODE
     verification_code: str
+
+
+class LeftMouseAction(Action):
+    action_type: ActionType = ActionType.LEFT_MOUSE
+    direction: Literal["down", "up"]
+    x: int | None = None
+    y: int | None = None
 
 
 class ScrapeResult(BaseModel):
