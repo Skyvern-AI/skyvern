@@ -35,7 +35,14 @@ services:
       # - ./alembic:/app/alembic
     environment:
       - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
-      - BROWSER_TYPE=chromium-headful
+      # - BROWSER_TYPE=chromium-headful
+      # To Use Your Local Browser
+      - BROWSER_TYPE=cdp-connect
+      # Use this command to start Chrome with remote debugging:
+      # "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\chrome-cdp-profile" --no-first-run --no-default-browser-check
+      # Then go to http://localhost:9222/json/version to get the remote debugging URL
+      - BROWSER_REMOTE_DEBUGGING_URL=ws://host.docker.internal:9222/devtools/browser/<your_debugging_url>
+      # LLM Support:
       - ENABLE_OPENAI=true
       - LLM_KEY=OPENAI_GPT4O
       - OPENAI_API_KEY=<your_openai_key>
@@ -72,6 +79,18 @@ services:
       # - AWS_REGION=us-west-2                         # Replace this with a different AWS region, if you desire
       # - AWS_ACCESS_KEY_ID=FILL_ME_IN_PLEASE
       # - AWS_SECRET_ACCESS_KEY=FILL_ME_IN_PLEASE
+      # Ollama Support:
+      # Ollama is a local LLM provider that can be used to run models locally on your machine.
+      # - LLM_KEY=OLLAMA
+      # - ENABLE_OLLAMA=true
+      # - OLLAMA_SERVER_URL=http://localhost:11434 # This is the default URL for the Ollama server. Change this if you are using a different URL.
+      # - OLLAMA_MODEL=gemma3:12b-it-q4_K_M
+      # Bitwarden Support:
+      # If you want to use Bitwarden as your password manager, you need to set the following environment variables:
+      - BITWARDEN_CLIENT_SECRET=<your_bitwarden_client_secret>
+      - BITWARDEN_CLIENT_ID=user.<your_bitwarden_client_id>
+      - BITWARDEN_MASTER_PASSWORD=<your_bitwarden_master_password>
+
       # 
       # Bitwarden Settings
       # If you are looking to integrate Skyvern with a password manager (eg Bitwarden), you can use the following environment variables.

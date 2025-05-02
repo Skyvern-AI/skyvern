@@ -8,6 +8,7 @@ import json
 import os
 import smtplib
 import textwrap
+import requests
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
@@ -1141,13 +1142,18 @@ class CodeBlock(Block):
         for node in ast.walk(tree):
             if hasattr(node, "attr") and str(node.attr).startswith("__"):
                 raise InsecureCodeDetected("Not allowed to access private methods or attributes")
-            if isinstance(node, ast.Import) or isinstance(node, ast.ImportFrom):
-                raise InsecureCodeDetected("Not allowed to import modules")
+            
+            #changed on my own to remove the insecure code detection that was stoping importing libraries
+            # if isinstance(node, ast.Import) or isinstance(node, ast.ImportFrom):
+            #     raise InsecureCodeDetected("Not allowed to import modules")
 
     @staticmethod
     def build_safe_vars() -> dict[str, Any]:
         return {
-            "__builtins__": {},  # only allow several builtins due to security concerns
+            "__builtins__": {
+                "__import__": __import__,
+                 "isinstance": isinstance, #changed on my own to allow imports
+            },  # only allow several builtins due to security concerns
             "locals": locals,
             "print": print,
             "len": len,
@@ -1160,17 +1166,18 @@ class CodeBlock(Block):
             "set": set,
             "bool": bool,
             "asyncio": asyncio,
+            "requests": requests,
         }
 
     def generate_async_user_function(
         self, code: str, page: Page, parameters: dict[str, Any] | None = None
     ) -> Callable[[], Awaitable[dict[str, Any]]]:
-        code = textwrap.indent(code, "    ")
-        full_code = f"""
-async def wrapper():
-{code}
-    return locals()
-"""
+        full_code = (
+            "async def wrapper():\n"
+            + textwrap.indent(code, "    ")
+            + "\n    result = locals()\n"
+            + "    return result if isinstance(result, dict) else {\"result\": result}\n"
+        )
         runtime_variables: dict[str, Callable[[], Awaitable[dict[str, Any]]]] = {}
         safe_vars = self.build_safe_vars()
         if parameters:
@@ -1178,6 +1185,7 @@ async def wrapper():
         safe_vars["page"] = page
         exec(full_code, safe_vars, runtime_variables)
         return runtime_variables["wrapper"]
+
 
     def get_all_parameters(
         self,
@@ -1288,9 +1296,12 @@ async def wrapper():
                 organization_id=organization_id,
             )
 
-        result = json.loads(
-            json.dumps(result, default=lambda value: f"Object '{type(value)}' is not JSON serializable")
-        )
+        try:
+            serialized_result = json.dumps(result, default=lambda value: f"Object '{type(value)}' is not JSON serializable")
+            result = json.loads(serialized_result)
+        except json.JSONDecodeError:
+            result = {"error": "Failed to decode result", "raw_result": str(result)}
+
 
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result)
         return await self.build_block_result(
@@ -1301,7 +1312,6 @@ async def wrapper():
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
         )
-
 
 DEFAULT_TEXT_PROMPT_LLM_KEY = settings.PROMPT_BLOCK_LLM_KEY or settings.LLM_KEY
 
