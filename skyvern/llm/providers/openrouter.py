@@ -6,6 +6,8 @@ from skyvern.config import Settings
 class OpenRouterProvider(BaseLLMProvider):
     """
     Provider for OpenRouter's OpenAI-compatible API.
+    only use this if you have an OpenRouter API key.
+    This provider is not intended for use with local models.
     """
 
     def __init__(self, api_key: str, model: str):
