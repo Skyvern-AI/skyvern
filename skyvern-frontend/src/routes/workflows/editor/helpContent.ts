@@ -18,7 +18,7 @@ export const baseHelpTooltipContent = {
   errorCodeMapping:
     "Knowing about why a block terminated can be important, specify error messages here.",
   totpVerificationUrl:
-    "If you have an internal system for storing TOTP codes, link the endpoint here.",
+    "If you do not have a TOTP Identifier at hand, but do have an internal system for storing TOTP codes, link the endpoint here.",
   totpIdentifier:
     "If you are running multiple workflows at once, you will need to give the block an identifier to know that this TOTP goes with this block.",
   continueOnFailure:

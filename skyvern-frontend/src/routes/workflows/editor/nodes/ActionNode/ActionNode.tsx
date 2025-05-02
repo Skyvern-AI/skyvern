@@ -329,6 +329,25 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                     className="nopan text-xs"
                   />
                 </div>
+                <div className="space-y-2">
+                  <div className="flex gap-2">
+                    <Label className="text-xs text-slate-300">
+                      2FA Verification URL
+                    </Label>
+                    <HelpTooltip
+                      content={helpTooltips["task"]["totpVerificationUrl"]}
+                    />
+                  </div>
+                  <WorkflowBlockInputTextarea
+                    nodeId={id}
+                    onChange={(value) => {
+                      handleChange("totpVerificationUrl", value);
+                    }}
+                    value={inputs.totpVerificationUrl ?? ""}
+                    placeholder={placeholders["task"]["totpVerificationUrl"]}
+                    className="nopan text-xs"
+                  />
+                </div>
               </div>
             </AccordionContent>
           </AccordionItem>
