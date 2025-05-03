@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Union
@@ -28,6 +30,70 @@ class ProxyLocation(StrEnum):
     RESIDENTIAL_AR = "RESIDENTIAL_AR"
     RESIDENTIAL_ISP = "RESIDENTIAL_ISP"
     NONE = "NONE"
+
+    @staticmethod
+    def get_zone(proxy_location: ProxyLocation) -> str:
+        zone_mapping = {
+            ProxyLocation.US_CA: "california",
+            ProxyLocation.US_NY: "newyork",
+            ProxyLocation.US_TX: "texas",
+            ProxyLocation.US_FL: "florida",
+            ProxyLocation.US_WA: "washington",
+            ProxyLocation.RESIDENTIAL: "residential_long-country-us",
+        }
+        if proxy_location in zone_mapping:
+            return zone_mapping[proxy_location]
+        raise ValueError(f"No zone mapping for proxy location: {proxy_location}")
+
+    @classmethod
+    def residential_country_locations(cls) -> set[ProxyLocation]:
+        return {
+            cls.RESIDENTIAL,
+            cls.RESIDENTIAL_ES,
+            cls.RESIDENTIAL_IE,
+            cls.RESIDENTIAL_GB,
+            cls.RESIDENTIAL_IN,
+            cls.RESIDENTIAL_JP,
+            cls.RESIDENTIAL_FR,
+            cls.RESIDENTIAL_DE,
+            cls.RESIDENTIAL_NZ,
+            cls.RESIDENTIAL_ZA,
+            cls.RESIDENTIAL_AR,
+        }
+
+    @staticmethod
+    def get_proxy_count(proxy_location: ProxyLocation) -> int:
+        counts = {
+            ProxyLocation.RESIDENTIAL: 10000,
+            ProxyLocation.RESIDENTIAL_ES: 2000,
+            ProxyLocation.RESIDENTIAL_IE: 2000,
+            ProxyLocation.RESIDENTIAL_GB: 2000,
+            ProxyLocation.RESIDENTIAL_IN: 2000,
+            ProxyLocation.RESIDENTIAL_JP: 2000,
+            ProxyLocation.RESIDENTIAL_FR: 2000,
+            ProxyLocation.RESIDENTIAL_DE: 2000,
+            ProxyLocation.RESIDENTIAL_NZ: 2000,
+            ProxyLocation.RESIDENTIAL_ZA: 2000,
+            ProxyLocation.RESIDENTIAL_AR: 2000,
+        }
+        return counts.get(proxy_location, 10000)
+
+    @staticmethod
+    def get_country_code(proxy_location: ProxyLocation) -> str:
+        mapping = {
+            ProxyLocation.RESIDENTIAL: "US",
+            ProxyLocation.RESIDENTIAL_ES: "ES",
+            ProxyLocation.RESIDENTIAL_IE: "IE",
+            ProxyLocation.RESIDENTIAL_GB: "GB",
+            ProxyLocation.RESIDENTIAL_IN: "IN",
+            ProxyLocation.RESIDENTIAL_JP: "JP",
+            ProxyLocation.RESIDENTIAL_FR: "FR",
+            ProxyLocation.RESIDENTIAL_DE: "DE",
+            ProxyLocation.RESIDENTIAL_NZ: "NZ",
+            ProxyLocation.RESIDENTIAL_ZA: "ZA",
+            ProxyLocation.RESIDENTIAL_AR: "AR",
+        }
+        return mapping.get(proxy_location, "US")
 
 
 def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
