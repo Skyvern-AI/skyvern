@@ -804,7 +804,62 @@ if settings.ENABLE_VERTEX_AI:
         ),
     )
 
+if settings.ENABLE_OLLAMA:
+    # Register Ollama model configured in settings
+    if settings.OLLAMA_MODEL:
+        model_name = settings.OLLAMA_MODEL
+        LLMConfigRegistry.register_config(
+            "OLLAMA",
+            LLMConfig(
+                f"ollama/{model_name}",
+                ["OLLAMA_SERVER_URL", "OLLAMA_MODEL"],
+                supports_vision=False,              # Ollama does not support vision yet
+                add_assistant_prefix=False,
+                max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
+                litellm_params=LiteLLMParams(
+                    api_base=settings.OLLAMA_SERVER_URL,
+                    model_info={"model_name": f"ollama/{model_name}"},
+                ),
+            ),
+        )
 
+if settings.ENABLE_OPENROUTER:
+    # Register OpenRouter model configured in settings
+    if settings.OPENROUTER_MODEL:
+        model_name = settings.OPENROUTER_MODEL
+        LLMConfigRegistry.register_config(
+            "OPENROUTER",
+            LLMConfig(
+                f"openrouter/{model_name}",
+                ["OPENROUTER_API_KEY", "OPENROUTER_MODEL"],
+                supports_vision=settings.LLM_CONFIG_SUPPORT_VISION, 
+                add_assistant_prefix=False,
+                max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
+                litellm_params=LiteLLMParams(
+                    api_key=settings.OPENROUTER_API_KEY,
+                    api_base=settings.OPENROUTER_API_BASE,
+                    model_info={"model_name": f"openrouter/{model_name}"},
+                ),
+            ),
+        )
+if settings.ENABLE_GROQ:
+    # Register Groq model configured in settings
+    if settings.GROQ_MODEL:
+        model_name = settings.GROQ_MODEL
+        LLMConfigRegistry.register_config(
+            "GROQ",
+            LLMConfig(
+                f"groq/{model_name}",
+                ["GROQ_API_KEY", "GROQ_MODEL"],
+                supports_vision=settings.LLM_CONFIG_SUPPORT_VISION,
+                add_assistant_prefix=False,
+                max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
+                litellm_params=LiteLLMParams(
+                    api_key=settings.GROQ_API_KEY,
+                    model_info={"model_name": f"groq/{model_name}"},
+                ),
+            ),
+        )
 # Add support for dynamically configuring OpenAI-compatible LLM models
 # Based on liteLLM's support for OpenAI-compatible APIs
 # See documentation: https://docs.litellm.ai/docs/providers/openai_compatible
