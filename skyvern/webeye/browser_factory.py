@@ -475,10 +475,10 @@ async def _create_cdp_connection_browser(
             raise Exception("Port 9222 is already in use. Another process may be using this port.")
 
         browser_process = subprocess.Popen(
-            [browser_path, "--remote-debugging-port=9222"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            [browser_path,"--remote-debugging-port=9222", "--no-first-run", "--no-default-browser-check"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         # Add small delay to allow browser to start
-        time.sleep(1)
+        time.sleep(2)
         if browser_process.poll() is not None:
             raise Exception(f"Failed to open browser. browser_path: {browser_path}")
 
