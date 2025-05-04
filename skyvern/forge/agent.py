@@ -1030,7 +1030,7 @@ class ForgeAgent:
                     results,
                 )
                 # wait random time between actions to avoid detection
-                await asyncio.sleep(random.uniform(1.0, 2.0))
+                await asyncio.sleep(random.uniform(0.5, 1.0))
                 await self.record_artifacts_after_action(task, step, browser_state, engine)
                 for result in results:
                     result.step_retry_number = step.retry_index
