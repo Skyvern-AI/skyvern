@@ -1467,7 +1467,7 @@ async def run_task(
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
 
-    if run_request.engine in CUA_ENGINES:
+    if run_request.engine in CUA_ENGINES or run_request.engine == RunEngine.skyvern_v1:
         # create task v1
         # if there's no url, call task generation first to generate the url, data schema if any
         url = run_request.url
@@ -1589,6 +1589,7 @@ async def run_task(
                 publish_workflow=run_request.publish_workflow,
             ),
         )
+    LOG.error("Invalid agent engine", engine=run_request.engine, organization_id=current_org.organization_id)
     raise HTTPException(status_code=400, detail=f"Invalid agent engine: {run_request.engine}")
 
 
