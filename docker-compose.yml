@@ -24,6 +24,7 @@ services:
     # comment out if you want to externally call skyvern API
     ports:
       - 8000:8000
+      - 9222:9222 # for cdp browser forwarding
     volumes:
       - ./artifacts:/data/artifacts
       - ./videos:/data/videos
@@ -31,8 +32,8 @@ services:
       - ./log:/data/log
       - ./.streamlit:/app/.streamlit
       # Uncomment the following two lines if you want to connect to any local changes
-      - ./skyvern:/app/skyvern
-      - ./alembic:/app/alembic
+      # - ./skyvern:/app/skyvern
+      # - ./alembic:/app/alembic
     environment:
       - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
       - BROWSER_TYPE=chromium-headful
@@ -46,11 +47,12 @@ services:
       # =========================
       # OpenAI Support:
       # If you want to use OpenAI as your LLM provider, uncomment the following lines and fill in your OpenAI API key.
-      # - ENABLE_OPENAI=true
-      # - LLM_KEY=OPENAI_GPT4O
-      # - OPENAI_API_KEY=<your_openai_key>
+      - ENABLE_OPENAI=true
+      - LLM_KEY=OPENAI_GPT4O
+      - OPENAI_API_KEY=<your_openai_key>
       #  Gemini Support:
       # Gemini is a new LLM provider that is currently in beta. You can use it by uncommenting the following lines and filling in your Gemini API key.
+      # - LLM_KEY=GEMINI
       # - ENABLE_GEMINI=true
       # - GEMINI_API_KEY=AIzaSyB5PT-useyourkeylol-plP2fNU
       # - LLM_KEY=GEMINI_FLASH_2_0_LITE
