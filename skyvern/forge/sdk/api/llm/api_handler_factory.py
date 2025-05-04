@@ -491,6 +491,7 @@ class LLMCaller:
         tools: list | None = None,
         use_message_history: bool = False,
         raw_response: bool = False,
+        window_dimension: Resolution | None = None,
         **extra_parameters: Any,
     ) -> dict[str, Any]:
         start_time = time.perf_counter()
@@ -516,7 +517,21 @@ class LLMCaller:
             )
 
         if screenshots and self.screenshot_scaling_enabled:
-            screenshots = resize_screenshots(screenshots, self.screenshot_resize_target_dimension)
+            target_dimension = self.get_screenshot_resize_target_dimension(window_dimension)
+            if window_dimension and window_dimension != self.browser_window_dimension and tools:
+                # THIS situation only applies to Anthropic CUA
+                LOG.info(
+                    "Window dimension is different from the default browser window dimension when making LLM call",
+                    window_dimension=window_dimension,
+                    browser_window_dimension=self.browser_window_dimension,
+                )
+                # update the tools to use the new target dimension
+                for tool in tools:
+                    if "display_height_px" in tool:
+                        tool["display_height_px"] = target_dimension["height"]
+                    if "display_width_px" in tool:
+                        tool["display_width_px"] = target_dimension["width"]
+            screenshots = resize_screenshots(screenshots, target_dimension)
 
         await app.ARTIFACT_MANAGER.create_llm_artifact(
             data=prompt.encode("utf-8") if prompt else b"",
@@ -682,6 +697,11 @@ class LLMCaller:
             )
 
         return parsed_response
+
+    def get_screenshot_resize_target_dimension(self, window_dimension: Resolution | None) -> Resolution:
+        if window_dimension and window_dimension != self.browser_window_dimension:
+            return get_resize_target_dimension(window_dimension)
+        return self.screenshot_resize_target_dimension
 
     async def _dispatch_llm_call(
         self,

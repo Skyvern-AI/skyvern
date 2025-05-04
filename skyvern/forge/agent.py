@@ -7,7 +7,7 @@ import string
 from asyncio.exceptions import CancelledError
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any, Tuple, cast
 
 import httpx
 import structlog
@@ -72,6 +72,7 @@ from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, ValidationBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.runs import CUA_ENGINES, CUA_RUN_TYPES, RunEngine
+from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions.actions import (
     Action,
@@ -1428,6 +1429,7 @@ class ForgeAgent:
         ]
         thinking = {"type": "enabled", "budget_tokens": 1024}
         betas = ["computer-use-2025-01-24"]
+        window_dimension = cast(Resolution, scraped_page.window_dimension) if scraped_page.window_dimension else None
         if not llm_caller.message_history:
             llm_response = await llm_caller.call(
                 prompt=task.navigation_goal,
@@ -1437,6 +1439,7 @@ class ForgeAgent:
                 raw_response=True,
                 betas=betas,
                 thinking=thinking,
+                window_dimension=window_dimension,
             )
         else:
             llm_response = await llm_caller.call(
@@ -1446,6 +1449,7 @@ class ForgeAgent:
                 raw_response=True,
                 betas=betas,
                 thinking=thinking,
+                window_dimension=window_dimension,
             )
         assistant_content = llm_response["content"]
         llm_caller.message_history.append({"role": "assistant", "content": assistant_content})
@@ -1454,8 +1458,8 @@ class ForgeAgent:
             task,
             step,
             assistant_content,
-            llm_caller.browser_window_dimension,
-            llm_caller.screenshot_resize_target_dimension,
+            window_dimension or llm_caller.browser_window_dimension,
+            llm_caller.get_screenshot_resize_target_dimension(window_dimension),
         )
         return actions
 
