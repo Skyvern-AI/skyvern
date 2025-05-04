@@ -22,7 +22,9 @@ def get_resize_target_dimension(
     ratio = window_size["width"] / window_size["height"]
     for dimension in max_scaling_targets.values():
         if abs(dimension["width"] / dimension["height"] - ratio) < 0.02:
-            return dimension
+            if dimension["width"] < window_size["width"]:
+                # we only return the dimension if it's smaller than the window size
+                return dimension
     return window_size
 
 

@@ -15,6 +15,7 @@ from skyvern.constants import BUILDING_ELEMENT_TREE_TIMEOUT_MS, DEFAULT_MAX_TOKE
 from skyvern.exceptions import FailedToTakeScreenshot, ScrapingFailed, UnknownElementTreeFormat
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.token_counter import count_tokens
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -237,7 +238,7 @@ class ScrapedPage(BaseModel):
     url: str
     html: str
     extracted_text: str | None = None
-
+    window_dimension: dict[str, int] | None = None
     _browser_state: BrowserState = PrivateAttr()
     _clean_up_func: CleanupElementTreeFunc = PrivateAttr()
     _scrape_exclude: ScrapeExcludeFunc | None = PrivateAttr(default=None)
@@ -540,9 +541,11 @@ async def scrape_web_unsafe(
     text_content = await get_frame_text(page.main_frame)
 
     html = ""
+    window_dimension = None
     try:
         skyvern_frame = await SkyvernFrame.create_instance(frame=page)
         html = await skyvern_frame.get_content()
+        window_dimension = Resolution(width=page.viewport_size["width"], height=page.viewport_size["height"])
     except Exception:
         LOG.error(
             "Failed out to get HTML content",
@@ -563,6 +566,7 @@ async def scrape_web_unsafe(
         url=page.url,
         html=html,
         extracted_text=text_content,
+        window_dimension=window_dimension,
         _browser_state=browser_state,
         _clean_up_func=cleanup_element_tree,
         _scrape_exclude=scrape_exclude,
