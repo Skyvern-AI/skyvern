@@ -48,7 +48,7 @@ services:
       #  Gemini Support:
       # Gemini is a new LLM provider that is currently in beta. You can use it by uncommenting the following lines and filling in your Gemini API key.
       # - ENABLE_GEMINI=true
-      # - GEMINI_API_KEY=AIzaSyB5PTuseyourkeylol-plP2fNU
+      # - GEMINI_API_KEY=AIzaSyB5PT-useyourkeylol-plP2fNU
       # - LLM_KEY=GEMINI_FLASH_2_0_LITE
       # If you want to use other LLM provider, like azure and anthropic:
       # - ENABLE_ANTHROPIC=true
