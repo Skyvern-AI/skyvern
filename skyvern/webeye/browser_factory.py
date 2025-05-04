@@ -593,7 +593,7 @@ class BrowserState:
     async def navigate_to_url(self, page: Page, url: str, retry_times: int = NAVIGATION_MAX_RETRY_TIME) -> None:
         try:
             for retry_time in range(retry_times):
-                LOG.info(f"Trying to navigate to {url} and waiting for 5 seconds.", url=url, retry_time=retry_time)
+                LOG.info(f"Trying to navigate to {url} and waiting for 1 second.", url=url, retry_time=retry_time)
                 try:
                     start_time = time.time()
                     await page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
@@ -617,8 +617,8 @@ class BrowserState:
                         url=url,
                         retry_time=retry_time,
                     )
-                    # Wait for 5 seconds before retrying
-                    await asyncio.sleep(5)
+                    # Wait for 1 seconds before retrying
+                    await asyncio.sleep(1)
 
         except Exception as e:
             LOG.exception(
