@@ -223,6 +223,7 @@ class Settings(BaseSettings):
     ENABLE_OPENROUTER: bool = False
     OPENROUTER_API_KEY: str | None = None
     OPENROUTER_MODEL: str | None = None
+    OPENROUTER_API_BASE: str = "https://api.openrouter.ai/v1"
 
     # GROQ
     ENABLE_GROQ: bool = False
