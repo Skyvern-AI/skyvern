@@ -747,7 +747,7 @@ if settings.ENABLE_VERTEX_AI:
             add_assistant_prefix=False,
             max_completion_tokens=65535,
             litellm_params=LiteLLMParams(
-                vertex_credentials=settings.VERTEX_CREDENTIALS,  # type: ignore
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
     )
@@ -760,7 +760,7 @@ if settings.ENABLE_VERTEX_AI:
             add_assistant_prefix=False,
             max_completion_tokens=65535,
             litellm_params=LiteLLMParams(
-                vertex_credentials=settings.VERTEX_CREDENTIALS,  # type: ignore
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
     )
