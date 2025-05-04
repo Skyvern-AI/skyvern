@@ -818,6 +818,8 @@ if settings.ENABLE_OLLAMA:
                 max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
                 litellm_params=LiteLLMParams(
                     api_base=settings.OLLAMA_SERVER_URL,
+                    api_key=None,
+                    api_version=None,
                     model_info={"model_name": f"ollama/{model_name}"},
                 ),
             ),
@@ -838,6 +840,7 @@ if settings.ENABLE_OPENROUTER:
                 litellm_params=LiteLLMParams(
                     api_key=settings.OPENROUTER_API_KEY,
                     api_base=settings.OPENROUTER_API_BASE,
+                    api_version=None,
                     model_info={"model_name": f"openrouter/{model_name}"},
                 ),
             ),
@@ -856,6 +859,8 @@ if settings.ENABLE_GROQ:
                 max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
                 litellm_params=LiteLLMParams(
                     api_key=settings.GROQ_API_KEY,
+                    api_version=None,
+                    api_base=settings.GROQ_API_BASE,
                     model_info={"model_name": f"groq/{model_name}"},
                 ),
             ),

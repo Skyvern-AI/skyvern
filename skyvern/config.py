@@ -229,6 +229,7 @@ class Settings(BaseSettings):
     ENABLE_GROQ: bool = False
     GROQ_API_KEY: str | None = None
     GROQ_MODEL: str | None = None
+    GROQ_API_BASE: str = "https://api.groq.com/openai/v1"
 
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
