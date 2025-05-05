@@ -626,9 +626,10 @@ function isInteractable(element, hoverStylesMap) {
   }
 
   // element with pointer-events: none should not be considered as interactable
+  // but for elements which are disabled, we should not use this logic to test the interactable
   // https://developer.mozilla.org/en-US/docs/Web/CSS/pointer-events#none
   const elementPointerEvent = getElementComputedStyle(element)?.pointerEvents;
-  if (elementPointerEvent === "none") {
+  if (elementPointerEvent === "none" && !element.disabled) {
     return false;
   }
 
