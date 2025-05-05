@@ -218,7 +218,7 @@ class Settings(BaseSettings):
     ENABLE_OLLAMA: bool = False
     OLLAMA_SERVER_URL: str | None = None
     OLLAMA_MODEL: str | None = None
-    
+
     # OPENROUTER
     ENABLE_OPENROUTER: bool = False
     OPENROUTER_API_KEY: str | None = None
