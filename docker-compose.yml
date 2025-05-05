@@ -24,6 +24,7 @@ services:
     # comment out if you want to externally call skyvern API
     ports:
       - 8000:8000
+      - 9222:9222 # for cdp browser forwarding
     volumes:
       - ./artifacts:/data/artifacts
       - ./videos:/data/videos
@@ -36,9 +37,26 @@ services:
     environment:
       - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
       - BROWSER_TYPE=chromium-headful
-      - ENABLE_OPENAI=true
-      - LLM_KEY=OPENAI_GPT4O
-      - OPENAI_API_KEY=<your_openai_key>
+      # - BROWSER_TYPE=cdp-connect
+      # Use this command to start Chrome with remote debugging:
+      # "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\chrome-cdp-profile" --no-first-run --no-default-browser-check
+      # /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir="/Users/yourusername/chrome-cdp-profile" --no-first-run --no-default-browser-check
+      # - BROWSER_REMOTE_DEBUGGING_URL=http://host.docker.internal:9222/
+
+      # =========================
+      #       LLM Settings
+      # =========================
+      # OpenAI Support:
+      # If you want to use OpenAI as your LLM provider, uncomment the following lines and fill in your OpenAI API key.
+      # - ENABLE_OPENAI=true
+      # - LLM_KEY=OPENAI_GPT4O
+      # - OPENAI_API_KEY=<your_openai_key>
+      #  Gemini Support:
+      # Gemini is a new LLM provider that is currently in beta. You can use it by uncommenting the following lines and filling in your Gemini API key.
+      - LLM_KEY=GEMINI
+      - ENABLE_GEMINI=true
+      - GEMINI_API_KEY=YOUR_GEMINI_KEY
+      - LLM_KEY=GEMINI_2.5_PRO_PREVIEW_03_25
       # If you want to use other LLM provider, like azure and anthropic:
       # - ENABLE_ANTHROPIC=true
       # - LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET
@@ -72,7 +90,26 @@ services:
       # - AWS_REGION=us-west-2                         # Replace this with a different AWS region, if you desire
       # - AWS_ACCESS_KEY_ID=FILL_ME_IN_PLEASE
       # - AWS_SECRET_ACCESS_KEY=FILL_ME_IN_PLEASE
-      # 
+      # Ollama Support:
+      # Ollama is a local LLM provider that can be used to run models locally on your machine.
+      # - LLM_KEY=OLLAMA
+      # - ENABLE_OLLAMA=true
+      # - OLLAMA_MODEL=qwen2.5:7b-instruct
+      # - OLLAMA_SERVER_URL=http://host.docker.internal:11434
+      # Open Router Support:
+      # - ENABLE_OPENROUTER=true
+      # - LLM_KEY=OPENROUTER
+      # - OPENROUTER_API_KEY=<your_openrouter_api_key>
+      # - OPENROUTER_MODEL=mistralai/mistral-small-3.1-24b-instruct
+      # Groq Support:
+      # - ENABLE_GROQ=true
+      # - LLM_KEY=GROQ
+      # - GROQ_API_KEY=<your_groq_api_key>
+      # - GROQ_MODEL=llama-3.1-8b-instant
+
+      # Maximum tokens to use: (only set for OpenRouter aand Ollama)
+      # - LLM_CONFIG_MAX_TOKENS=128000
+
       # Bitwarden Settings
       # If you are looking to integrate Skyvern with a password manager (eg Bitwarden), you can use the following environment variables.
       # - BITWARDEN_SERVER=http://localhost  # OPTIONAL IF YOU ARE SELF HOSTING BITWARDEN
@@ -80,7 +117,7 @@ services:
       # - BITWARDEN_CLIENT_ID=FILL_ME_IN_PLEASE
       # - BITWARDEN_CLIENT_SECRET=FILL_ME_IN_PLEASE
       # - BITWARDEN_MASTER_PASSWORD=FILL_ME_IN_PLEASE
-
+      
     depends_on:
       postgres:
         condition: service_healthy
