@@ -109,8 +109,18 @@ def is_postgres_container_exists() -> bool:
     return code == 0
 
 
-def setup_postgresql() -> None:
-    print("Setting up PostgreSQL...")
+def setup_postgresql(no_postgres: bool = False) -> None:
+    """Set up PostgreSQL database for Skyvern.
+
+    This function checks if a PostgreSQL server is running locally or in Docker.
+    If no PostgreSQL server is found, it offers to start a Docker container
+    running PostgreSQL (unless explicitly opted out).
+
+    Args:
+        no_postgres: When True, skips starting a PostgreSQL container even if no
+                    local PostgreSQL server is detected. Useful when planning to
+                    use Docker Compose, which provides its own PostgreSQL service.
+    """
 
     if command_exists("psql") and is_postgres_running():
         print("PostgreSQL is already running locally.")
@@ -120,6 +130,11 @@ def setup_postgresql() -> None:
             create_database_and_user()
         return
 
+    if no_postgres:
+        print("Skipping PostgreSQL container setup as requested.")
+        print("If you plan to use Docker Compose, its Postgres service will start automatically.")
+        return
+
     if not is_docker_running():
         print("Docker is not running or not installed. Please install or start Docker and try again.")
         exit(1)
@@ -127,6 +142,19 @@ def setup_postgresql() -> None:
     if is_postgres_running_in_docker():
         print("PostgreSQL is already running in a Docker container.")
     else:
+        if not no_postgres:
+            start_postgres = (
+                input(
+                    'No local Postgres detected. Start a disposable container now? (Y/n) [Y]\n[Tip: choose "n" if you plan to run Skyvern via Docker Compose instead of `skyvern run server`] '
+                )
+                .strip()
+                .lower()
+            )
+            if start_postgres in ["n", "no"]:
+                print("Skipping PostgreSQL container setup.")
+                print("If you plan to use Docker Compose, its Postgres service will start automatically.")
+                return
+
         print("Attempting to install PostgreSQL via Docker...")
         if not is_postgres_container_exists():
             run_command(
@@ -571,7 +599,7 @@ def setup_windsurf_config(host_system: str, path_to_env: str) -> bool:
     skyvern_api_key = os.environ.get("SKYVERN_API_KEY", "")
     if not skyvern_base_url or not skyvern_api_key:
         print(
-            "Error: SKYVERN_BASE_URL and SKYVERN_API_KEY must be set in .env file to set up Windsurf MCP. Please open {path_windsurf_config} and set the these variables manually."
+            "Error: SKYVERN_BASE_URL and SKYVERN_API_KEY must be set in .env file to set up Windsurf MCP. Please open {path_windsurf_config} and set these variables manually."
         )
 
     try:
@@ -830,14 +858,14 @@ def run_mcp() -> None:
 
 
 @cli_app.command(name="init")
-def init() -> None:
+def init(no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container")) -> None:
     run_local_str = (
         input("Would you like to run Skyvern locally or in the cloud? (local/cloud) [cloud]: ").strip().lower()
     )
     run_local = run_local_str == "local" if run_local_str else False
 
     if run_local:
-        setup_postgresql()
+        setup_postgresql(no_postgres)
         migrate_db()
         api_key = asyncio.run(_setup_local_organization())
 
