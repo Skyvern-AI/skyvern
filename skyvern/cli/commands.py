@@ -7,6 +7,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Optional
+import requests
+from urllib.parse import urlparse
 
 import typer
 import uvicorn
@@ -444,6 +446,82 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
         print("\nTo use CDP connection, Chrome must be running with remote debugging enabled.")
         print("Example: chrome --remote-debugging-port=9222")
         print("Default debugging URL: http://localhost:9222")
+        
+        default_port = "9222"  
+        if remote_debugging_url is None:
+            remote_debugging_url = "http://localhost:9222"
+        elif ":" in remote_debugging_url.split("/")[-1]:
+            default_port = remote_debugging_url.split(":")[-1].split("/")[0]
+        
+        parsed_url = urlparse(remote_debugging_url)
+        version_url = f"{parsed_url.scheme}://{parsed_url.netloc}/json/version"
+        
+        print(f"\nChecking if Chrome is already running with remote debugging on port {default_port}...")
+        try:
+            response = requests.get(version_url, timeout=2)
+            if response.status_code == 200:
+                try:
+                    browser_info = response.json()
+                    print(f"Chrome is already running with remote debugging!")
+                    if "Browser" in browser_info:
+                        print(f"Browser: {browser_info['Browser']}")
+                    if "webSocketDebuggerUrl" in browser_info:
+                        print(f"WebSocket URL: {browser_info['webSocketDebuggerUrl']}")
+                    print(f"Connected to {remote_debugging_url}")
+                    return selected_browser, browser_location, remote_debugging_url
+                except json.JSONDecodeError:
+                    print("Port is in use, but doesn't appear to be Chrome with remote debugging.")
+        except requests.RequestException:
+            print(f"No Chrome instance detected on {remote_debugging_url}")
+        
+        print("\nExecuting Chrome with remote debugging enabled:")
+        
+        if host_system == "darwin" or host_system == "linux":
+            chrome_cmd = f'{browser_location} --remote-debugging-port={default_port} --user-data-dir="$HOME/chrome-cdp-profile" --no-first-run --no-default-browser-check'
+            print(f"    {chrome_cmd}")
+        elif host_system == "windows" or host_system == "wsl":
+            chrome_cmd = f'"{browser_location}" --remote-debugging-port={default_port} --user-data-dir="C:\\chrome-cdp-profile" --no-first-run --no-default-browser-check'
+            print(f"    {chrome_cmd}")
+        else:
+            print("Unsupported OS for Chrome configuration. Please set it up manually.")
+        
+        # Ask user if they want to execute the command
+        execute_browser = input("\nWould you like to start Chrome with remote debugging now? (y/n) [y]: ").strip().lower()
+        if not execute_browser or execute_browser == "y":
+            print(f"Starting Chrome with remote debugging on port {default_port}...")
+            try:
+                # Execute in background - different approach per OS
+                if host_system in ["darwin", "linux"]:
+                    subprocess.Popen(f"nohup {chrome_cmd} > /dev/null 2>&1 &", shell=True)
+                elif host_system == "windows":
+                    subprocess.Popen(f"start {chrome_cmd}", shell=True)
+                elif host_system == "wsl":
+                    subprocess.Popen(f"cmd.exe /c start {chrome_cmd}", shell=True)
+                
+                print(f"Chrome started successfully. Connecting to {remote_debugging_url}")
+                
+                print("Waiting for Chrome to initialize...")
+                time.sleep(2)
+                
+                try:
+                    verification_response = requests.get(version_url, timeout=5)
+                    if verification_response.status_code == 200:
+                        try:
+                            browser_info = verification_response.json()
+                            print("Connection verified! Chrome is running with remote debugging.")
+                            if "Browser" in browser_info:
+                                print(f"Browser: {browser_info['Browser']}")
+                        except json.JSONDecodeError:
+                            print("Warning: Response from Chrome debugging port is not valid JSON.")
+                    else:
+                        print(f"Warning: Chrome responded with status code {verification_response.status_code}")
+                except requests.RequestException as e:
+                    print(f"Warning: Could not verify Chrome is running properly: {e}")
+                    print("You may need to check Chrome manually or try a different port.")
+            except Exception as e:
+                print(f"Error starting Chrome: {e}")
+                print("Please start Chrome manually using the command above.")
+        
         remote_debugging_url = input("Enter remote debugging URL (press Enter for default): ").strip()
         if not remote_debugging_url:
             remote_debugging_url = "http://localhost:9222"
