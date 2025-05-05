@@ -174,15 +174,12 @@ class ForgeAgent:
             error_code_mapping=task_block.error_code_mapping,
         )
         LOG.info(
-            "Created new task for workflow run",
+            "Created a new task for workflow run",
             workflow_id=workflow.workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             task_id=task.task_id,
             url=task.url,
             title=task.title,
-            nav_goal=task.navigation_goal,
-            data_goal=task.data_extraction_goal,
-            error_code_mapping=task.error_code_mapping,
             proxy_location=task.proxy_location,
             task_order=task_order,
             task_retry=task_retry,
