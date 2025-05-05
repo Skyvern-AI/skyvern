@@ -1,5 +1,5 @@
 from enum import StrEnum
-from typing import IO, Any, Callable
+from typing import IO, Any
 from urllib.parse import urlparse
 
 import aioboto3
@@ -14,20 +14,6 @@ class AWSClientType(StrEnum):
     S3 = "s3"
     SECRETS_MANAGER = "secretsmanager"
     ECS = "ecs"
-
-
-def execute_with_async_client(client_type: AWSClientType) -> Callable:
-    def decorator(f: Callable) -> Callable:
-        async def wrapper(*args: list[Any], **kwargs: dict[str, Any]) -> Any:
-            self = args[0]
-            assert isinstance(self, AsyncAWSClient)
-            session = aioboto3.Session()
-            async with session.client(client_type, region_name=settings.AWS_REGION) as client:
-                return await f(*args, client=client, **kwargs)
-
-        return wrapper
-
-    return decorator
 
 
 class AsyncAWSClient:
