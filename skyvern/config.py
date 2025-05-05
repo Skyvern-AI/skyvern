@@ -238,6 +238,8 @@ class Settings(BaseSettings):
     ENABLE_LOG_ARTIFACTS: bool = False
     ENABLE_CODE_BLOCK: bool = False
 
+    TASK_BLOCKED_SITE_FALLBACK_URL: str = "https://www.google.com"
+
     # SkyvernClient Settings
     SKYVERN_BASE_URL: str = "https://api.skyvern.com"
     SKYVERN_API_KEY: str = "PLACEHOLDER"
