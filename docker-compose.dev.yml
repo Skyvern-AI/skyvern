@@ -1,0 +1,43 @@
+services:
+  postgres:
+    container_name: postgres_skyvern
+    image: postgres:14-alpine
+    # comment out if you want to externally connect DB
+    # ports:
+    #   - 5432:5432
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    environment:
+      - PGDATA=/var/lib/postgresql/data/pgdata
+      - POSTGRES_USER=skyvern
+      - POSTGRES_PASSWORD=skyvern
+      - POSTGRES_DB=skyvern
+    networks:
+      - skyvern-network
+
+  lab:
+    container_name: skyvern_laboratory
+    build:
+      context: ./docker/dev
+      args:
+        LOCAL_DEV_SSH_PASSWORD: skyvern
+        LOCAL_DEV_UID: 1000
+    ports:
+      - 8000:8000
+      - 8080:8080
+      - 9090:9090
+    volumes:
+      - laboratory:/home/skyvern
+      - ./:/skyvern/laboratory
+    networks:
+      - skyvern-network
+    depends_on:
+      - postgres
+
+networks:
+  skyvern-network:
+    driver: bridge
+
+volumes:
+  postgres-data: {}
+  laboratory: {}
