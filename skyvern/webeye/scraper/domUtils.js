@@ -1446,14 +1446,15 @@ async function buildElementTree(
     }
 
     let children = [];
+    // sometimes the shadowRoot is not visible, but the elemnets in the shadowRoot are visible
+    if (element.shadowRoot) {
+      children = getChildElements(element.shadowRoot);
+    }
     const isVisible = isElementVisible(element);
     if (isVisible && !isHidden(element) && !isScriptOrStyle(element)) {
       const interactable = isInteractable(element, hoverStylesMap);
       let elementObj = null;
       let isParentSVG = null;
-      if (element.shadowRoot) {
-        children = getChildElements(element.shadowRoot);
-      }
       if (interactable) {
         elementObj = await buildElementObject(frame, element, interactable);
       } else if (
