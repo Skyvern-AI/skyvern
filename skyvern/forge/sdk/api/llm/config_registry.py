@@ -815,7 +815,7 @@ if settings.ENABLE_OLLAMA:
                 ["OLLAMA_SERVER_URL", "OLLAMA_MODEL"],
                 supports_vision=False,  # Ollama does not support vision yet
                 add_assistant_prefix=False,
-                max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
+                max_tokens=settings.LLM_CONFIG_MAX_TOKENS,
                 litellm_params=LiteLLMParams(
                     api_base=settings.OLLAMA_SERVER_URL,
                     api_key=None,
