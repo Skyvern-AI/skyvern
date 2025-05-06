@@ -813,7 +813,7 @@ if settings.ENABLE_OLLAMA:
             LLMConfig(
                 f"ollama/{model_name}",
                 ["OLLAMA_SERVER_URL", "OLLAMA_MODEL"],
-                supports_vision=False,              # Ollama does not support vision yet
+                supports_vision=False,  # Ollama does not support vision yet
                 add_assistant_prefix=False,
                 max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
                 litellm_params=LiteLLMParams(
@@ -834,7 +834,7 @@ if settings.ENABLE_OPENROUTER:
             LLMConfig(
                 f"openrouter/{model_name}",
                 ["OPENROUTER_API_KEY", "OPENROUTER_MODEL"],
-                supports_vision=settings.LLM_CONFIG_SUPPORT_VISION, 
+                supports_vision=settings.LLM_CONFIG_SUPPORT_VISION,
                 add_assistant_prefix=False,
                 max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
                 litellm_params=LiteLLMParams(

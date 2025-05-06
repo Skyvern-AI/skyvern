@@ -135,7 +135,7 @@ class Settings(BaseSettings):
     ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE3.7_SONNET"
 
     # OPENAI COMPATIBLE
-    OPENAI_COMPATIBLE_MODEL_NAME: str | None = None
+    OPENAI_COMPATIBLE_MODEL_NAME: str = "qwen3-8b"
     OPENAI_COMPATIBLE_API_KEY: str | None = None
     OPENAI_COMPATIBLE_API_BASE: str | None = None
     OPENAI_COMPATIBLE_API_VERSION: str | None = None
@@ -218,7 +218,7 @@ class Settings(BaseSettings):
     ENABLE_OLLAMA: bool = False
     OLLAMA_SERVER_URL: str | None = None
     OLLAMA_MODEL: str | None = None
-    
+
     # OPENROUTER
     ENABLE_OPENROUTER: bool = False
     OPENROUTER_API_KEY: str | None = None

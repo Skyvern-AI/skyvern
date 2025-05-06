@@ -481,9 +481,9 @@ async def _create_cdp_connection_browser(
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--remote-debugging-address=0.0.0.0",
-            ], 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.PIPE
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
         # Add small delay to allow browser to start
         time.sleep(2)
