@@ -1554,6 +1554,7 @@ async def _summarize_task_v2(
     )
     task_v2_summary_resp = await app.LLM_API_HANDLER(
         prompt=task_v2_summary_prompt,
+        screenshots=screenshots,
         thought=thought,
         prompt_name="task_v2_summary",
     )

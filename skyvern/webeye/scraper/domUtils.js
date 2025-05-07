@@ -626,9 +626,10 @@ function isInteractable(element, hoverStylesMap) {
   }
 
   // element with pointer-events: none should not be considered as interactable
+  // but for elements which are disabled, we should not use this logic to test the interactable
   // https://developer.mozilla.org/en-US/docs/Web/CSS/pointer-events#none
   const elementPointerEvent = getElementComputedStyle(element)?.pointerEvents;
-  if (elementPointerEvent === "none") {
+  if (elementPointerEvent === "none" && !element.disabled) {
     return false;
   }
 
@@ -1445,14 +1446,15 @@ async function buildElementTree(
     }
 
     let children = [];
+    // sometimes the shadowRoot is not visible, but the elemnets in the shadowRoot are visible
+    if (element.shadowRoot) {
+      children = getChildElements(element.shadowRoot);
+    }
     const isVisible = isElementVisible(element);
     if (isVisible && !isHidden(element) && !isScriptOrStyle(element)) {
       const interactable = isInteractable(element, hoverStylesMap);
       let elementObj = null;
       let isParentSVG = null;
-      if (element.shadowRoot) {
-        children = getChildElements(element.shadowRoot);
-      }
       if (interactable) {
         elementObj = await buildElementObject(frame, element, interactable);
       } else if (

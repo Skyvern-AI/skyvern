@@ -430,10 +430,12 @@ class LLMAPIHandlerFactory:
     @staticmethod
     def get_api_parameters(llm_config: LLMConfig | LLMRouterConfig) -> dict[str, Any]:
         params: dict[str, Any] = {}
-        if llm_config.max_completion_tokens is not None:
-            params["max_completion_tokens"] = llm_config.max_completion_tokens
-        elif llm_config.max_tokens is not None:
-            params["max_tokens"] = llm_config.max_tokens
+        if not llm_config.model_name.startswith("ollama/"):
+            # OLLAMA does not support max_completion_tokens
+            if llm_config.max_completion_tokens is not None:
+                params["max_completion_tokens"] = llm_config.max_completion_tokens
+            elif llm_config.max_tokens is not None:
+                params["max_tokens"] = llm_config.max_tokens
 
         if llm_config.temperature is not None:
             params["temperature"] = llm_config.temperature
