@@ -384,6 +384,7 @@ function convertToNode(
         data: {
           ...commonData,
           code: block.code,
+          parameterKeys: block.parameters.map((p) => p.key),
         },
       };
     }
@@ -1140,6 +1141,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
       return {
         ...base,
         block_type: "code",
+        parameter_keys: node.data.parameterKeys,
         code: node.data.code,
       };
     }
@@ -1842,6 +1844,7 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "code",
           code: block.code,
+          parameter_keys: block.parameters.map((p) => p.key),
         };
         return blockYaml;
       }
