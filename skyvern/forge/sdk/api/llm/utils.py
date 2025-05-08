@@ -9,6 +9,7 @@ import json_repair
 import litellm
 import structlog
 
+from skyvern.constants import MAX_IMAGE_MESSAGES
 from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat
 
 LOG = structlog.get_logger()
@@ -78,6 +79,7 @@ async def llm_messages_builder_with_history(
     if screenshots:
         for screenshot in screenshots:
             encoded_image = base64.b64encode(screenshot).decode("utf-8")
+            message: dict[str, Any]
             if message_pattern == "anthropic":
                 message = {
                     "type": "image",
@@ -96,6 +98,39 @@ async def llm_messages_builder_with_history(
                 }
             current_user_messages.append(message)
     messages.append({"role": "user", "content": current_user_messages})
+    # anthropic has hard limit of image & document messages (20 as of Apr 2025)
+    # limit the number of image type messages to 10 for anthropic
+    # delete the oldest image type message if the number of image type messages is greater than 10
+    if message_pattern == "anthropic":
+        image_message_count = 0
+        for message in messages:
+            if message.get("role") == "user":
+                blocks: list[dict[str, Any]] = message.get("content", [])
+                has_image = any(block.get("type") == "image" for block in blocks)
+                if has_image:
+                    image_message_count += 1
+
+        images_to_delete = image_message_count - MAX_IMAGE_MESSAGES
+        if images_to_delete > 0:
+            new_messages = []
+            for message in messages:
+                if message.get("role") != "user":
+                    new_messages.append(message)
+                    continue
+                blocks = message.get("content", [])
+                has_image = any(block.get("type") == "image" for block in blocks)
+                new_content = []
+                if has_image and images_to_delete > 0:
+                    images_to_delete -= 1
+                    for block in blocks:
+                        if block.get("type") != "image":
+                            new_content.append(block)
+                    if new_content:
+                        new_messages.append({"role": "user", "content": new_content})
+                else:
+                    new_messages.append(message)
+            messages = new_messages
+
     return messages
 
 

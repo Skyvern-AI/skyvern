@@ -28,6 +28,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
+from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
 
 LOG = structlog.get_logger()
 
@@ -429,10 +430,12 @@ class LLMAPIHandlerFactory:
     @staticmethod
     def get_api_parameters(llm_config: LLMConfig | LLMRouterConfig) -> dict[str, Any]:
         params: dict[str, Any] = {}
-        if llm_config.max_completion_tokens is not None:
-            params["max_completion_tokens"] = llm_config.max_completion_tokens
-        elif llm_config.max_tokens is not None:
-            params["max_tokens"] = llm_config.max_tokens
+        if not llm_config.model_name.startswith("ollama/"):
+            # OLLAMA does not support max_completion_tokens
+            if llm_config.max_completion_tokens is not None:
+                params["max_completion_tokens"] = llm_config.max_completion_tokens
+            elif llm_config.max_tokens is not None:
+                params["max_tokens"] = llm_config.max_tokens
 
         if llm_config.temperature is not None:
             params["temperature"] = llm_config.temperature
@@ -454,12 +457,22 @@ class LLMCaller:
     An LLMCaller instance defines the LLM configs and keeps the chat history if needed.
     """
 
-    def __init__(self, llm_key: str, base_parameters: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        llm_key: str,
+        screenshot_scaling_enabled: bool = False,
+        base_parameters: dict[str, Any] | None = None,
+    ):
         self.llm_key = llm_key
         self.llm_config = LLMConfigRegistry.get_config(llm_key)
         self.base_parameters = base_parameters
         self.message_history: list[dict[str, Any]] = []
         self.current_tool_results: list[dict[str, Any]] = []
+        self.screenshot_scaling_enabled = screenshot_scaling_enabled
+        self.browser_window_dimension = Resolution(width=settings.BROWSER_WIDTH, height=settings.BROWSER_HEIGHT)
+        self.screenshot_resize_target_dimension = self.browser_window_dimension
+        if screenshot_scaling_enabled:
+            self.screenshot_resize_target_dimension = get_resize_target_dimension(self.browser_window_dimension)
 
     def add_tool_result(self, tool_result: dict[str, Any]) -> None:
         self.current_tool_results.append(tool_result)
@@ -480,6 +493,7 @@ class LLMCaller:
         tools: list | None = None,
         use_message_history: bool = False,
         raw_response: bool = False,
+        window_dimension: Resolution | None = None,
         **extra_parameters: Any,
     ) -> dict[str, Any]:
         start_time = time.perf_counter()
@@ -503,6 +517,23 @@ class LLMCaller:
                 thought=thought,
                 ai_suggestion=ai_suggestion,
             )
+
+        if screenshots and self.screenshot_scaling_enabled:
+            target_dimension = self.get_screenshot_resize_target_dimension(window_dimension)
+            if window_dimension and window_dimension != self.browser_window_dimension and tools:
+                # THIS situation only applies to Anthropic CUA
+                LOG.info(
+                    "Window dimension is different from the default browser window dimension when making LLM call",
+                    window_dimension=window_dimension,
+                    browser_window_dimension=self.browser_window_dimension,
+                )
+                # update the tools to use the new target dimension
+                for tool in tools:
+                    if "display_height_px" in tool:
+                        tool["display_height_px"] = target_dimension["height"]
+                    if "display_width_px" in tool:
+                        tool["display_width_px"] = target_dimension["width"]
+            screenshots = resize_screenshots(screenshots, target_dimension)
 
         await app.ARTIFACT_MANAGER.create_llm_artifact(
             data=prompt.encode("utf-8") if prompt else b"",
@@ -668,6 +699,11 @@ class LLMCaller:
             )
 
         return parsed_response
+
+    def get_screenshot_resize_target_dimension(self, window_dimension: Resolution | None) -> Resolution:
+        if window_dimension and window_dimension != self.browser_window_dimension:
+            return get_resize_target_dimension(window_dimension)
+        return self.screenshot_resize_target_dimension
 
     async def _dispatch_llm_call(
         self,

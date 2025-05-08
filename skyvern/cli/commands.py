@@ -7,7 +7,9 @@ import time
 import uuid
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
+import requests
 import typer
 import uvicorn
 from dotenv import load_dotenv, set_key
@@ -109,8 +111,18 @@ def is_postgres_container_exists() -> bool:
     return code == 0
 
 
-def setup_postgresql() -> None:
-    print("Setting up PostgreSQL...")
+def setup_postgresql(no_postgres: bool = False) -> None:
+    """Set up PostgreSQL database for Skyvern.
+
+    This function checks if a PostgreSQL server is running locally or in Docker.
+    If no PostgreSQL server is found, it offers to start a Docker container
+    running PostgreSQL (unless explicitly opted out).
+
+    Args:
+        no_postgres: When True, skips starting a PostgreSQL container even if no
+                    local PostgreSQL server is detected. Useful when planning to
+                    use Docker Compose, which provides its own PostgreSQL service.
+    """
 
     if command_exists("psql") and is_postgres_running():
         print("PostgreSQL is already running locally.")
@@ -120,6 +132,11 @@ def setup_postgresql() -> None:
             create_database_and_user()
         return
 
+    if no_postgres:
+        print("Skipping PostgreSQL container setup as requested.")
+        print("If you plan to use Docker Compose, its Postgres service will start automatically.")
+        return
+
     if not is_docker_running():
         print("Docker is not running or not installed. Please install or start Docker and try again.")
         exit(1)
@@ -127,6 +144,19 @@ def setup_postgresql() -> None:
     if is_postgres_running_in_docker():
         print("PostgreSQL is already running in a Docker container.")
     else:
+        if not no_postgres:
+            start_postgres = (
+                input(
+                    'No local Postgres detected. Start a disposable container now? (Y/n) [Y]\n[Tip: choose "n" if you plan to run Skyvern via Docker Compose instead of `skyvern run server`] '
+                )
+                .strip()
+                .lower()
+            )
+            if start_postgres in ["n", "no"]:
+                print("Skipping PostgreSQL container setup.")
+                print("If you plan to use Docker Compose, its Postgres service will start automatically.")
+                return
+
         print("Attempting to install PostgreSQL via Docker...")
         if not is_postgres_container_exists():
             run_command(
@@ -444,6 +474,84 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
         print("\nTo use CDP connection, Chrome must be running with remote debugging enabled.")
         print("Example: chrome --remote-debugging-port=9222")
         print("Default debugging URL: http://localhost:9222")
+
+        default_port = "9222"
+        if remote_debugging_url is None:
+            remote_debugging_url = "http://localhost:9222"
+        elif ":" in remote_debugging_url.split("/")[-1]:
+            default_port = remote_debugging_url.split(":")[-1].split("/")[0]
+
+        parsed_url = urlparse(remote_debugging_url)
+        version_url = f"{parsed_url.scheme}://{parsed_url.netloc}/json/version"
+
+        print(f"\nChecking if Chrome is already running with remote debugging on port {default_port}...")
+        try:
+            response = requests.get(version_url, timeout=2)
+            if response.status_code == 200:
+                try:
+                    browser_info = response.json()
+                    print("Chrome is already running with remote debugging!")
+                    if "Browser" in browser_info:
+                        print(f"Browser: {browser_info['Browser']}")
+                    if "webSocketDebuggerUrl" in browser_info:
+                        print(f"WebSocket URL: {browser_info['webSocketDebuggerUrl']}")
+                    print(f"Connected to {remote_debugging_url}")
+                    return selected_browser, browser_location, remote_debugging_url
+                except json.JSONDecodeError:
+                    print("Port is in use, but doesn't appear to be Chrome with remote debugging.")
+        except requests.RequestException:
+            print(f"No Chrome instance detected on {remote_debugging_url}")
+
+        print("\nExecuting Chrome with remote debugging enabled:")
+
+        if host_system == "darwin" or host_system == "linux":
+            chrome_cmd = f'{browser_location} --remote-debugging-port={default_port} --user-data-dir="$HOME/chrome-cdp-profile" --no-first-run --no-default-browser-check'
+            print(f"    {chrome_cmd}")
+        elif host_system == "windows" or host_system == "wsl":
+            chrome_cmd = f'"{browser_location}" --remote-debugging-port={default_port} --user-data-dir="C:\\chrome-cdp-profile" --no-first-run --no-default-browser-check'
+            print(f"    {chrome_cmd}")
+        else:
+            print("Unsupported OS for Chrome configuration. Please set it up manually.")
+
+        # Ask user if they want to execute the command
+        execute_browser = (
+            input("\nWould you like to start Chrome with remote debugging now? (y/n) [y]: ").strip().lower()
+        )
+        if not execute_browser or execute_browser == "y":
+            print(f"Starting Chrome with remote debugging on port {default_port}...")
+            try:
+                # Execute in background - different approach per OS
+                if host_system in ["darwin", "linux"]:
+                    subprocess.Popen(f"nohup {chrome_cmd} > /dev/null 2>&1 &", shell=True)
+                elif host_system == "windows":
+                    subprocess.Popen(f"start {chrome_cmd}", shell=True)
+                elif host_system == "wsl":
+                    subprocess.Popen(f"cmd.exe /c start {chrome_cmd}", shell=True)
+
+                print(f"Chrome started successfully. Connecting to {remote_debugging_url}")
+
+                print("Waiting for Chrome to initialize...")
+                time.sleep(2)
+
+                try:
+                    verification_response = requests.get(version_url, timeout=5)
+                    if verification_response.status_code == 200:
+                        try:
+                            browser_info = verification_response.json()
+                            print("Connection verified! Chrome is running with remote debugging.")
+                            if "Browser" in browser_info:
+                                print(f"Browser: {browser_info['Browser']}")
+                        except json.JSONDecodeError:
+                            print("Warning: Response from Chrome debugging port is not valid JSON.")
+                    else:
+                        print(f"Warning: Chrome responded with status code {verification_response.status_code}")
+                except requests.RequestException as e:
+                    print(f"Warning: Could not verify Chrome is running properly: {e}")
+                    print("You may need to check Chrome manually or try a different port.")
+            except Exception as e:
+                print(f"Error starting Chrome: {e}")
+                print("Please start Chrome manually using the command above.")
+
         remote_debugging_url = input("Enter remote debugging URL (press Enter for default): ").strip()
         if not remote_debugging_url:
             remote_debugging_url = "http://localhost:9222"
@@ -571,7 +679,7 @@ def setup_windsurf_config(host_system: str, path_to_env: str) -> bool:
     skyvern_api_key = os.environ.get("SKYVERN_API_KEY", "")
     if not skyvern_base_url or not skyvern_api_key:
         print(
-            "Error: SKYVERN_BASE_URL and SKYVERN_API_KEY must be set in .env file to set up Windsurf MCP. Please open {path_windsurf_config} and set the these variables manually."
+            "Error: SKYVERN_BASE_URL and SKYVERN_API_KEY must be set in .env file to set up Windsurf MCP. Please open {path_windsurf_config} and set these variables manually."
         )
 
     try:
@@ -830,14 +938,14 @@ def run_mcp() -> None:
 
 
 @cli_app.command(name="init")
-def init() -> None:
+def init(no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container")) -> None:
     run_local_str = (
         input("Would you like to run Skyvern locally or in the cloud? (local/cloud) [cloud]: ").strip().lower()
     )
     run_local = run_local_str == "local" if run_local_str else False
 
     if run_local:
-        setup_postgresql()
+        setup_postgresql(no_postgres)
         migrate_db()
         api_key = asyncio.run(_setup_local_organization())
 

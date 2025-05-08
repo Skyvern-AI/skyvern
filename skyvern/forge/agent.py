@@ -7,7 +7,7 @@ import string
 from asyncio.exceptions import CancelledError
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any, Tuple, cast
 
 import httpx
 import structlog
@@ -72,6 +72,7 @@ from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, ValidationBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.runs import CUA_ENGINES, CUA_RUN_TYPES, RunEngine
+from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions.actions import (
     Action,
@@ -173,15 +174,12 @@ class ForgeAgent:
             error_code_mapping=task_block.error_code_mapping,
         )
         LOG.info(
-            "Created new task for workflow run",
+            "Created a new task for workflow run",
             workflow_id=workflow.workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             task_id=task.task_id,
             url=task.url,
             title=task.title,
-            nav_goal=task.navigation_goal,
-            data_goal=task.data_extraction_goal,
-            error_code_mapping=task.error_code_mapping,
             proxy_location=task.proxy_location,
             task_order=task_order,
             task_retry=task_retry,
@@ -385,7 +383,7 @@ class ForgeAgent:
                 # llm_caller = LLMCaller(llm_key="BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_INFERENCE_PROFILE")
                 llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
                 if not llm_caller:
-                    llm_caller = LLMCaller(llm_key=settings.ANTHROPIC_CUA_LLM_KEY)
+                    llm_caller = LLMCaller(llm_key=settings.ANTHROPIC_CUA_LLM_KEY, screenshot_scaling_enabled=True)
                     LLMCallerManager.set_llm_caller(task.task_id, llm_caller)
             step, detailed_output = await self.agent_step(
                 task,
@@ -1030,7 +1028,7 @@ class ForgeAgent:
                     results,
                 )
                 # wait random time between actions to avoid detection
-                await asyncio.sleep(random.uniform(1.0, 2.0))
+                await asyncio.sleep(random.uniform(0.5, 1.0))
                 await self.record_artifacts_after_action(task, step, browser_state, engine)
                 for result in results:
                     result.step_retry_number = step.retry_index
@@ -1428,6 +1426,7 @@ class ForgeAgent:
         ]
         thinking = {"type": "enabled", "budget_tokens": 1024}
         betas = ["computer-use-2025-01-24"]
+        window_dimension = cast(Resolution, scraped_page.window_dimension) if scraped_page.window_dimension else None
         if not llm_caller.message_history:
             llm_response = await llm_caller.call(
                 prompt=task.navigation_goal,
@@ -1437,6 +1436,7 @@ class ForgeAgent:
                 raw_response=True,
                 betas=betas,
                 thinking=thinking,
+                window_dimension=window_dimension,
             )
         else:
             llm_response = await llm_caller.call(
@@ -1446,11 +1446,18 @@ class ForgeAgent:
                 raw_response=True,
                 betas=betas,
                 thinking=thinking,
+                window_dimension=window_dimension,
             )
         assistant_content = llm_response["content"]
         llm_caller.message_history.append({"role": "assistant", "content": assistant_content})
 
-        actions = await parse_anthropic_actions(task, step, assistant_content)
+        actions = await parse_anthropic_actions(
+            task,
+            step,
+            assistant_content,
+            window_dimension or llm_caller.browser_window_dimension,
+            llm_caller.get_screenshot_resize_target_dimension(window_dimension),
+        )
         return actions
 
     @staticmethod

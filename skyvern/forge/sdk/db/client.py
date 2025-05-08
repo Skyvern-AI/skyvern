@@ -674,6 +674,18 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_all_organizations(self) -> list[Organization]:
+        try:
+            async with self.Session() as session:
+                organizations = (await session.scalars(select(OrganizationModel))).all()
+                return [convert_to_organization(organization) for organization in organizations]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def get_organization(self, organization_id: str) -> Organization | None:
         try:
             async with self.Session() as session:

@@ -9,11 +9,12 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
 
-class LiteLLMParams(TypedDict):
+class LiteLLMParams(TypedDict, total=False):
     api_key: str | None
     api_version: str | None
     api_base: str | None
     model_info: dict[str, Any] | None
+    vertex_credentials: str | None
 
 
 @dataclass(frozen=True)

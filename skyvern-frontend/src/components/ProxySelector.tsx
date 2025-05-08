@@ -24,35 +24,35 @@ function ProxySelector({ value, onChange, className }: Props) {
         <SelectItem value={ProxyLocation.ResidentialISP}>
           Residential ISP (US)
         </SelectItem>
-        <SelectItem value={ProxyLocation.ResidentialES}>
-          Residential (Spain)
-        </SelectItem>
-        <SelectItem value={ProxyLocation.ResidentialIE}>
-          Residential (Ireland)
-        </SelectItem>
-        <SelectItem value={ProxyLocation.ResidentialIN}>
-          Residential (India)
-        </SelectItem>
-        <SelectItem value={ProxyLocation.ResidentialJP}>
-          Residential (Japan)
-        </SelectItem>
-        <SelectItem value={ProxyLocation.ResidentialGB}>
-          Residential (United Kingdom)
-        </SelectItem>
-        <SelectItem value={ProxyLocation.ResidentialFR}>
-          Residential (France)
+        <SelectItem value={ProxyLocation.ResidentialAR}>
+          Residential (Argentina)
         </SelectItem>
         <SelectItem value={ProxyLocation.ResidentialDE}>
           Residential (Germany)
         </SelectItem>
+        <SelectItem value={ProxyLocation.ResidentialFR}>
+          Residential (France)
+        </SelectItem>
+        <SelectItem value={ProxyLocation.ResidentialGB}>
+          Residential (United Kingdom)
+        </SelectItem>
+        <SelectItem value={ProxyLocation.ResidentialIN}>
+          Residential (India)
+        </SelectItem>
+        <SelectItem value={ProxyLocation.ResidentialIE}>
+          Residential (Ireland)
+        </SelectItem>
+        <SelectItem value={ProxyLocation.ResidentialJP}>
+          Residential (Japan)
+        </SelectItem>
         <SelectItem value={ProxyLocation.ResidentialNZ}>
           Residential (New Zealand)
         </SelectItem>
+        <SelectItem value={ProxyLocation.ResidentialES}>
+          Residential (Spain)
+        </SelectItem>
         <SelectItem value={ProxyLocation.ResidentialZA}>
           Residential (South Africa)
-        </SelectItem>
-        <SelectItem value={ProxyLocation.ResidentialAR}>
-          Residential (Argentina)
         </SelectItem>
       </SelectContent>
     </Select>

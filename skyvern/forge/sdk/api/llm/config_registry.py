@@ -739,15 +739,15 @@ if settings.ENABLE_NOVITA:
 # Set the value of my_vertex_credentials as the environment variable VERTEX_CREDENTIALS
 if settings.ENABLE_VERTEX_AI:
     LLMConfigRegistry.register_config(
-        "VERTEX_GEMINI_2.5_PRO_EXP_03_25",
+        "VERTEX_GEMINI_2.5_FLASH_PREVIEW_04_17",
         LLMConfig(
-            "vertex_ai/gemini-2.5-pro-preview-03-25",
+            "vertex_ai/gemini-2.5-flash-preview-04-17",
             ["VERTEX_CREDENTIALS"],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65535,
             litellm_params=LiteLLMParams(
-                vertex_credentials=settings.VERTEX_CREDENTIALS,  # type: ignore
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
     )
@@ -760,7 +760,7 @@ if settings.ENABLE_VERTEX_AI:
             add_assistant_prefix=False,
             max_completion_tokens=65535,
             litellm_params=LiteLLMParams(
-                vertex_credentials=settings.VERTEX_CREDENTIALS,  # type: ignore
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
             ),
         ),
     )
@@ -804,16 +804,75 @@ if settings.ENABLE_VERTEX_AI:
         ),
     )
 
+if settings.ENABLE_OLLAMA:
+    # Register Ollama model configured in settings
+    if settings.OLLAMA_MODEL:
+        ollama_model_name = settings.OLLAMA_MODEL
+        LLMConfigRegistry.register_config(
+            "OLLAMA",
+            LLMConfig(
+                f"ollama/{ollama_model_name}",
+                ["OLLAMA_SERVER_URL", "OLLAMA_MODEL"],
+                supports_vision=False,  # Ollama does not support vision yet
+                add_assistant_prefix=False,
+                litellm_params=LiteLLMParams(
+                    api_base=settings.OLLAMA_SERVER_URL,
+                    api_key=None,
+                    api_version=None,
+                    model_info={"model_name": f"ollama/{ollama_model_name}"},
+                ),
+            ),
+        )
 
+if settings.ENABLE_OPENROUTER:
+    # Register OpenRouter model configured in settings
+    if settings.OPENROUTER_MODEL:
+        openrouter_model_name = settings.OPENROUTER_MODEL
+        LLMConfigRegistry.register_config(
+            "OPENROUTER",
+            LLMConfig(
+                f"openrouter/{openrouter_model_name}",
+                ["OPENROUTER_API_KEY", "OPENROUTER_MODEL"],
+                supports_vision=settings.LLM_CONFIG_SUPPORT_VISION,
+                add_assistant_prefix=False,
+                max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
+                litellm_params=LiteLLMParams(
+                    api_key=settings.OPENROUTER_API_KEY,
+                    api_base=settings.OPENROUTER_API_BASE,
+                    api_version=None,
+                    model_info={"model_name": f"openrouter/{openrouter_model_name}"},
+                ),
+            ),
+        )
+if settings.ENABLE_GROQ:
+    # Register Groq model configured in settings
+    if settings.GROQ_MODEL:
+        groq_model_name = settings.GROQ_MODEL
+        LLMConfigRegistry.register_config(
+            "GROQ",
+            LLMConfig(
+                f"groq/{groq_model_name}",
+                ["GROQ_API_KEY", "GROQ_MODEL"],
+                supports_vision=settings.LLM_CONFIG_SUPPORT_VISION,
+                add_assistant_prefix=False,
+                max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
+                litellm_params=LiteLLMParams(
+                    api_key=settings.GROQ_API_KEY,
+                    api_version=None,
+                    api_base=settings.GROQ_API_BASE,
+                    model_info={"model_name": f"groq/{groq_model_name}"},
+                ),
+            ),
+        )
 # Add support for dynamically configuring OpenAI-compatible LLM models
 # Based on liteLLM's support for OpenAI-compatible APIs
 # See documentation: https://docs.litellm.ai/docs/providers/openai_compatible
 if settings.ENABLE_OPENAI_COMPATIBLE:
     # Check for required model name
-    model_key = settings.OPENAI_COMPATIBLE_MODEL_KEY
-    model_name = settings.OPENAI_COMPATIBLE_MODEL_NAME
+    openai_compatible_model_key = settings.OPENAI_COMPATIBLE_MODEL_KEY
+    openai_compatible_model_name = settings.OPENAI_COMPATIBLE_MODEL_NAME
 
-    if not model_name:
+    if not openai_compatible_model_name:
         raise InvalidLLMConfigError(
             "OPENAI_COMPATIBLE_MODEL_NAME is required but not set. OpenAI-compatible model will not be registered."
         )
@@ -826,14 +885,14 @@ if settings.ENABLE_OPENAI_COMPATIBLE:
             api_key=settings.OPENAI_COMPATIBLE_API_KEY,
             api_base=settings.OPENAI_COMPATIBLE_API_BASE,
             api_version=settings.OPENAI_COMPATIBLE_API_VERSION,
-            model_info={"model_name": f"openai/{model_name}"},
+            model_info={"model_name": f"openai/{openai_compatible_model_name}"},
         )
 
         # Configure LLMConfig
         LLMConfigRegistry.register_config(
-            model_key,
+            openai_compatible_model_key,
             LLMConfig(
-                f"openai/{model_name}",  # Add openai/ prefix for liteLLM
+                f"openai/{openai_compatible_model_name}",  # Add openai/ prefix for liteLLM
                 required_env_vars,
                 supports_vision=settings.OPENAI_COMPATIBLE_SUPPORTS_VISION,
                 add_assistant_prefix=settings.OPENAI_COMPATIBLE_ADD_ASSISTANT_PREFIX,
@@ -845,4 +904,7 @@ if settings.ENABLE_OPENAI_COMPATIBLE:
                 reasoning_effort=settings.OPENAI_COMPATIBLE_REASONING_EFFORT,
             ),
         )
-        LOG.info(f"Registered OpenAI-compatible model with key {model_key}", model_name=model_name)
+        LOG.info(
+            f"Registered OpenAI-compatible model with key {openai_compatible_model_key}",
+            model_name=openai_compatible_model_name,
+        )

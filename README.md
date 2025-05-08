@@ -274,7 +274,7 @@ Note: Our setup script does these two for you, but they are here for reference.
 1. Open Docker Desktop (Works for Windows, macOS, and Linux) or run Docker Daemon
 1. Run the setup script to install the necessary dependencies and setup your environment
     ```bash
-    skyvern/scripts/setup.sh
+    ./setup.sh
     ```
 1. Start the server
     ```bash

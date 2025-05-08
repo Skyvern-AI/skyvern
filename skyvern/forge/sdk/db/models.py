@@ -178,8 +178,8 @@ class ArtifactModel(Base):
     observer_cruise_id = Column(String, index=True)
     observer_thought_id = Column(String, index=True)
     ai_suggestion_id = Column(String, index=True)
-    task_id = Column(String, ForeignKey("tasks.task_id"))
-    step_id = Column(String, ForeignKey("steps.step_id"), index=True)
+    task_id = Column(String)
+    step_id = Column(String, index=True)
     artifact_type = Column(String)
     uri = Column(String)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
@@ -236,11 +236,11 @@ class WorkflowRunModel(Base):
     __table_args__ = (Index("idx_workflow_runs_org_created", "organization_id", "created_at"),)
 
     workflow_run_id = Column(String, primary_key=True, index=True, default=generate_workflow_run_id)
-    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), nullable=False)
+    workflow_id = Column(String, nullable=False)
     workflow_permanent_id = Column(String, nullable=False, index=True)
     # workfow runs with parent_workflow_run_id are nested workflow runs which won't show up in the workflow run history
-    parent_workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True, index=True)
-    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False, index=True)
+    parent_workflow_run_id = Column(String, nullable=True, index=True)
+    organization_id = Column(String, nullable=False, index=True)
     status = Column(String, nullable=False)
     failure_reason = Column(String)
     proxy_location = Column(String)
@@ -265,7 +265,7 @@ class WorkflowParameterModel(Base):
     workflow_parameter_type = Column(String, nullable=False)
     key = Column(String, nullable=False)
     description = Column(String, nullable=True)
-    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), index=True, nullable=False)
+    workflow_id = Column(String, index=True, nullable=False)
     default_value = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -283,7 +283,7 @@ class OutputParameterModel(Base):
     output_parameter_id = Column(String, primary_key=True, index=True, default=generate_output_parameter_id)
     key = Column(String, nullable=False)
     description = Column(String, nullable=True)
-    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), index=True, nullable=False)
+    workflow_id = Column(String, index=True, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -298,7 +298,7 @@ class AWSSecretParameterModel(Base):
     __tablename__ = "aws_secret_parameters"
 
     aws_secret_parameter_id = Column(String, primary_key=True, index=True, default=generate_aws_secret_parameter_id)
-    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), index=True, nullable=False)
+    workflow_id = Column(String, index=True, nullable=False)
     key = Column(String, nullable=False)
     description = Column(String, nullable=True)
     aws_key = Column(String, nullable=False)
@@ -321,7 +321,7 @@ class BitwardenLoginCredentialParameterModel(Base):
         index=True,
         default=generate_bitwarden_login_credential_parameter_id,
     )
-    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), index=True, nullable=False)
+    workflow_id = Column(String, index=True, nullable=False)
     key = Column(String, nullable=False)
     description = Column(String, nullable=True)
     bitwarden_client_id_aws_secret_key = Column(String, nullable=False)
@@ -349,7 +349,7 @@ class BitwardenSensitiveInformationParameterModel(Base):
         index=True,
         default=generate_bitwarden_sensitive_information_parameter_id,
     )
-    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), index=True, nullable=False)
+    workflow_id = Column(String, index=True, nullable=False)
     key = Column(String, nullable=False)
     description = Column(String, nullable=True)
     bitwarden_client_id_aws_secret_key = Column(String, nullable=False)
@@ -378,7 +378,7 @@ class BitwardenCreditCardDataParameterModel(Base):
         index=True,
         default=generate_bitwarden_credit_card_data_parameter_id,
     )
-    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), index=True, nullable=False)
+    workflow_id = Column(String, index=True, nullable=False)
     key = Column(String, nullable=False)
     description = Column(String, nullable=True)
     bitwarden_client_id_aws_secret_key = Column(String, nullable=False)
@@ -395,7 +395,7 @@ class CredentialParameterModel(Base):
     __tablename__ = "credential_parameters"
 
     credential_parameter_id = Column(String, primary_key=True, index=True, default=generate_credential_parameter_id)
-    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), index=True, nullable=False)
+    workflow_id = Column(String, index=True, nullable=False)
     key = Column(String, nullable=False)
     description = Column(String, nullable=True)
 
@@ -411,13 +411,11 @@ class WorkflowRunParameterModel(Base):
 
     workflow_run_id = Column(
         String,
-        ForeignKey("workflow_runs.workflow_run_id"),
         primary_key=True,
         index=True,
     )
     workflow_parameter_id = Column(
         String,
-        ForeignKey("workflow_parameters.workflow_parameter_id"),
         primary_key=True,
         index=True,
     )
@@ -431,13 +429,11 @@ class WorkflowRunOutputParameterModel(Base):
 
     workflow_run_id = Column(
         String,
-        ForeignKey("workflow_runs.workflow_run_id"),
         primary_key=True,
         index=True,
     )
     output_parameter_id = Column(
         String,
-        ForeignKey("output_parameters.output_parameter_id"),
         primary_key=True,
         index=True,
     )
@@ -453,7 +449,7 @@ class TaskGenerationModel(Base):
     __tablename__ = "task_generations"
 
     task_generation_id = Column(String, primary_key=True, default=generate_task_generation_id)
-    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    organization_id = Column(String, nullable=False)
     user_prompt = Column(String, nullable=False)
     user_prompt_hash = Column(String, index=True)
     url = Column(String)
@@ -509,11 +505,11 @@ class ActionModel(Base):
 
     action_id = Column(String, primary_key=True, index=True, default=generate_action_id)
     action_type = Column(String, nullable=False)
-    source_action_id = Column(String, ForeignKey("actions.action_id"), nullable=True, index=True)
-    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
-    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
-    task_id = Column(String, ForeignKey("tasks.task_id"), nullable=False, index=True)
-    step_id = Column(String, ForeignKey("steps.step_id"), nullable=False)
+    source_action_id = Column(String, nullable=True, index=True)
+    organization_id = Column(String, nullable=True)
+    workflow_run_id = Column(String, nullable=True)
+    task_id = Column(String, nullable=False, index=True)
+    step_id = Column(String, nullable=False)
     step_order = Column(Integer, nullable=False)
     action_order = Column(Integer, nullable=False)
     status = Column(String, nullable=False)
@@ -535,15 +531,13 @@ class WorkflowRunBlockModel(Base):
     __table_args__ = (Index("wfrb_org_wfr_index", "organization_id", "workflow_run_id"),)
 
     workflow_run_block_id = Column(String, primary_key=True, default=generate_workflow_run_block_id)
-    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=False)
+    workflow_run_id = Column(String, nullable=False)
     # this is the inner workflow run id of the taskv2 block
-    block_workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
-    parent_workflow_run_block_id = Column(
-        String, ForeignKey("workflow_run_blocks.workflow_run_block_id"), nullable=True
-    )
-    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
+    block_workflow_run_id = Column(String, nullable=True)
+    parent_workflow_run_block_id = Column(String, nullable=True)
+    organization_id = Column(String, nullable=True)
     description = Column(String, nullable=True)
-    task_id = Column(String, ForeignKey("tasks.task_id"), nullable=True)
+    task_id = Column(String, nullable=True)
     label = Column(String, nullable=True)
     block_type = Column(String, nullable=False)
     status = Column(String, nullable=False)
@@ -579,9 +573,9 @@ class TaskV2Model(Base):
     # observer_cruise_id is the task_id for task v2
     observer_cruise_id = Column(String, primary_key=True, default=generate_task_v2_id)
     status = Column(String, nullable=False, default="created")
-    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
-    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
-    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), nullable=True)
+    organization_id = Column(String, nullable=True)
+    workflow_run_id = Column(String, nullable=True)
+    workflow_id = Column(String, nullable=True)
     workflow_permanent_id = Column(String, nullable=True)
     prompt = Column(UnicodeText, nullable=True)
     url = Column(String, nullable=True)
@@ -603,11 +597,11 @@ class ThoughtModel(Base):
     __table_args__ = (Index("observer_cruise_index", "organization_id", "observer_cruise_id"),)
 
     observer_thought_id = Column(String, primary_key=True, default=generate_thought_id)
-    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=True)
-    observer_cruise_id = Column(String, ForeignKey("observer_cruises.observer_cruise_id"), nullable=False)
-    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=True)
-    workflow_run_block_id = Column(String, ForeignKey("workflow_run_blocks.workflow_run_block_id"), nullable=True)
-    workflow_id = Column(String, ForeignKey("workflows.workflow_id"), nullable=True)
+    organization_id = Column(String, nullable=True)
+    observer_cruise_id = Column(String, nullable=False)
+    workflow_run_id = Column(String, nullable=True)
+    workflow_run_block_id = Column(String, nullable=True)
+    workflow_id = Column(String, nullable=True)
     workflow_permanent_id = Column(String, nullable=True)
     user_input = Column(UnicodeText, nullable=True)
     observation = Column(String, nullable=True)
@@ -631,7 +625,7 @@ class PersistentBrowserSessionModel(Base):
     __tablename__ = "persistent_browser_sessions"
 
     persistent_browser_session_id = Column(String, primary_key=True, default=generate_persistent_browser_session_id)
-    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    organization_id = Column(String, nullable=False)
     runnable_type = Column(String, nullable=True)
     runnable_id = Column(String, nullable=True)
     browser_id = Column(String, nullable=True)

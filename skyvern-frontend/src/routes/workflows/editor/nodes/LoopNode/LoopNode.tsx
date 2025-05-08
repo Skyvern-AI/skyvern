@@ -139,20 +139,34 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
             </div>
             <div className="space-y-2">
               <div className="space-y-2">
-                <div className="flex gap-4">
-                  <div className="flex gap-2">
+                <div className="flex justify-between">
+                  <div className="flex items-center gap-2">
+                    <Checkbox
+                      checked={data.completeIfEmpty}
+                      disabled={!data.editable}
+                      onCheckedChange={(checked) => {
+                        handleChange("completeIfEmpty", checked);
+                      }}
+                    />
                     <Label className="text-xs text-slate-300">
-                      Complete if Empty
+                      Continue if Empty
                     </Label>
-                    <HelpTooltip content="When checked, this block will successfully complete when the loop value is an empty list" />
+                    <HelpTooltip content="When checked, the for loop block will successfully complete and workflow execution will continue if the loop value is empty" />
                   </div>
-                  <Checkbox
-                    checked={data.completeIfEmpty}
-                    disabled={!data.editable}
-                    onCheckedChange={(checked) => {
-                      handleChange("completeIfEmpty", checked);
-                    }}
-                  />
+
+                  <div className="flex items-center gap-2">
+                    <Checkbox
+                      checked={data.continueOnFailure}
+                      disabled={!data.editable}
+                      onCheckedChange={(checked) => {
+                        handleChange("continueOnFailure", checked);
+                      }}
+                    />
+                    <Label className="text-xs text-slate-300">
+                      Continue on Failure
+                    </Label>
+                    <HelpTooltip content="When checked, the loop will continue executing even if one of its iterations fails" />
+                  </div>
                 </div>
               </div>
             </div>

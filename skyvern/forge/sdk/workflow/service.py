@@ -1790,6 +1790,7 @@ class WorkflowService:
                 label=block_yaml.label,
                 url=block_yaml.url,
                 title=block_yaml.title,
+                engine=block_yaml.engine,
                 parameters=navigation_block_parameters,
                 output_parameter=output_parameter,
                 navigation_goal=block_yaml.navigation_goal,

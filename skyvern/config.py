@@ -214,6 +214,23 @@ class Settings(BaseSettings):
     NOVITA_API_KEY: str | None = None
     NOVITA_API_VERSION: str = "v3"
 
+    # OLLAMA
+    ENABLE_OLLAMA: bool = False
+    OLLAMA_SERVER_URL: str | None = None
+    OLLAMA_MODEL: str | None = None
+
+    # OPENROUTER
+    ENABLE_OPENROUTER: bool = False
+    OPENROUTER_API_KEY: str | None = None
+    OPENROUTER_MODEL: str | None = None
+    OPENROUTER_API_BASE: str = "https://api.openrouter.ai/v1"
+
+    # GROQ
+    ENABLE_GROQ: bool = False
+    GROQ_API_KEY: str | None = None
+    GROQ_MODEL: str | None = None
+    GROQ_API_BASE: str = "https://api.groq.com/openai/v1"
+
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
@@ -237,6 +254,8 @@ class Settings(BaseSettings):
 
     ENABLE_LOG_ARTIFACTS: bool = False
     ENABLE_CODE_BLOCK: bool = False
+
+    TASK_BLOCKED_SITE_FALLBACK_URL: str = "https://www.google.com"
 
     # SkyvernClient Settings
     SKYVERN_BASE_URL: str = "https://api.skyvern.com"

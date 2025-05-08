@@ -275,7 +275,7 @@ class SkyvernElement:
         return disabled or aria_disabled or style_disabled
 
     async def is_selectable(self) -> bool:
-        return self.get_selectable() or self.get_tag_name() in SELECTABLE_ELEMENT
+        return await self.get_selectable() or self.get_tag_name() in SELECTABLE_ELEMENT
 
     async def is_visible(self, must_visible_style: bool = True) -> bool:
         if not await self.get_locator().count():
@@ -300,7 +300,11 @@ class SkyvernElement:
     def get_element_dict(self) -> dict:
         return self.__static_element
 
-    def get_selectable(self) -> bool:
+    async def get_selectable(self) -> bool:
+        if self.get_tag_name() == InteractiveElement.INPUT:
+            input_type = await self.get_attr("type", mode="static")
+            if input_type == "select-one" or input_type == "select-multiple":
+                return True
         return self._selectable
 
     def get_tag_name(self) -> str:
