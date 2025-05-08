@@ -21,7 +21,7 @@ export const loginNodeDefaultData: LoginNodeData = {
   label: "",
   url: "",
   navigationGoal:
-    "If you're not on the login page, navigate to login page and login using the credentials given. First, take actions on promotional popups or cookie prompts that could prevent taking other action on the web page. If you fail to login to find the login page or can't login after several trials, terminate. If login is completed, you're successful. ",
+    "If you're not on the login page, navigate to login page and login using the credentials given. First, take actions on promotional popups or cookie prompts that could prevent taking other action on the web page. If a 2-factor step appears, enter the authentication code. If you fail to login to find the login page or can't login after several trials, terminate. If login is completed, you're successful. ",
   errorCodeMapping: "null",
   maxRetries: null,
   maxStepsOverride: null,
