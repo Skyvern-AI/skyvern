@@ -1430,6 +1430,7 @@ class ForgeAgent:
         if not llm_caller.message_history:
             llm_response = await llm_caller.call(
                 prompt=task.navigation_goal,
+                step=step,
                 screenshots=scraped_page.screenshots,
                 use_message_history=True,
                 tools=tools,
@@ -1440,6 +1441,7 @@ class ForgeAgent:
             )
         else:
             llm_response = await llm_caller.call(
+                step=step,
                 screenshots=scraped_page.screenshots,
                 use_message_history=True,
                 tools=tools,
