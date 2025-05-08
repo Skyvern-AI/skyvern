@@ -1,4 +1,5 @@
 import { Label } from "@/components/ui/label";
+import { WorkflowBlockInputSet } from "@/components/WorkflowBlockInputSet";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
@@ -19,6 +20,7 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
   });
   const [inputs, setInputs] = useState({
     code: data.code,
+    parameterKeys: data.parameterKeys,
   });
 
   return (
@@ -59,6 +61,20 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
             onDelete={() => {
               deleteNodeCallback(id);
             }}
+          />
+        </div>
+        <div className="space-y-2">
+          <Label className="text-xs text-slate-300">Input Parameters</Label>
+          <WorkflowBlockInputSet
+            nodeId={id}
+            onChange={(parameterKeys) => {
+              setInputs({
+                ...inputs,
+                parameterKeys: Array.from(parameterKeys),
+              });
+              updateNodeData(id, { parameterKeys: Array.from(parameterKeys) });
+            }}
+            values={new Set(inputs.parameterKeys ?? [])}
           />
         </div>
         <div className="space-y-2">

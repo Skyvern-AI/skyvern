@@ -1,0 +1,27 @@
+.workflow-block-input-set {
+  font-size: 0.8rem;
+  width: 100%;
+  padding: 0.5rem;
+  padding-right: 2.25rem;
+  padding-left: 0.75rem;
+}
+
+.workflow-block-input-set .ze-set {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  justify-content: flex-start;
+}
+
+.workflow-block-input-set .parameter-key {
+  background-color: rgba(255, 255, 255, 0.05);
+  padding: 0.25rem;
+  padding-left: 0.35rem;
+  border-radius: 0.25rem;
+}
+
+.workflow-block-input-set .parameter-key.missing {
+  background-color: rgba(255, 0, 0, 0.1);
+  color: red;
+}
