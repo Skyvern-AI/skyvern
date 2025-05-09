@@ -67,7 +67,7 @@ from skyvern.webeye.utils.page import SkyvernFrame
 LOG = structlog.get_logger()
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
 RANDOM_STRING_POOL = string.ascii_letters + string.digits
-DEFAULT_MAX_ITERATIONS = 10
+DEFAULT_MAX_ITERATIONS = 13
 
 MINI_GOAL_TEMPLATE = """Achieve the following mini goal and once it's achieved, complete:
 ```{mini_goal}```
