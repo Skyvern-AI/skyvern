@@ -277,6 +277,7 @@ function hasASPClientControl() {
 }
 
 // from playwright: https://github.com/microsoft/playwright/blob/1b65f26f0287c0352e76673bc5f85bc36c934b55/packages/playwright-core/src/server/injected/domUtils.ts#L100-L119
+// NOTE: According this logic, some elements with aria-hidden won't be considered as invisible. And the result shows they are indeed interactable.
 function isElementVisible(element) {
   // TODO: This is a hack to not check visibility for option elements
   // because they are not visible by default. We check their parent instead for visibility.

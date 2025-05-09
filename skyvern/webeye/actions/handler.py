@@ -32,6 +32,7 @@ from skyvern.exceptions import (
     FailToSelectByValue,
     IllegitComplete,
     ImaginaryFileUrl,
+    InputToInvisibleElement,
     InteractWithDisabledElement,
     InteractWithDropdownContainer,
     InvalidElementForTextInput,
@@ -875,6 +876,11 @@ async def handle_input_text_action(
                     await skyvern_element.press_key("Escape")
                     await skyvern_element.blur()
                 await incremental_scraped.stop_listen_dom_increment()
+
+    ### Start filling text logic
+    # check if the element has hidden attribute
+    if await skyvern_element.has_hidden_attr():
+        return [ActionFailure(InputToInvisibleElement(skyvern_element.get_id()), stop_execution_on_failure=False)]
 
     # force to move focus back to the element
     await skyvern_element.get_locator().focus(timeout=timeout)
