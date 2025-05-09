@@ -286,6 +286,7 @@ class BaseRunResponse(BaseModel):
     failure_reason: str | None = Field(default=None, description="Reason for failure if the run failed")
     created_at: datetime = Field(description="Timestamp when this run was created")
     modified_at: datetime = Field(description="Timestamp when this run was last modified")
+    app_url: str | None = Field(default=None, description="URL to the application UI where the run can be viewed")
 
 
 class TaskRunResponse(BaseRunResponse):
