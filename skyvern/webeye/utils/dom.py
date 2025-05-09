@@ -297,6 +297,15 @@ class SkyvernElement:
         skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
         return await skyvern_frame.is_sibling(await self.get_element_handler(), target)
 
+    async def has_hidden_attr(self) -> bool:
+        hidden: str | None = await self.get_attr("hidden", mode="dynamic")
+        aria_hidden: str | None = await self.get_attr("aria-hidden", mode="dynamic")
+        if hidden is not None and hidden.lower() != "false":
+            return True
+        if aria_hidden is not None and aria_hidden.lower() != "false":
+            return True
+        return False
+
     def get_element_dict(self) -> dict:
         return self.__static_element
 
