@@ -3,13 +3,26 @@ import { NodeBaseData } from "../types";
 
 export type CodeBlockNodeData = NodeBaseData & {
   code: string;
+  parameterKeys: Array<string> | null;
 };
 
 export type CodeBlockNode = Node<CodeBlockNodeData, "codeBlock">;
 
+const codeLead = `
+# This feature is currently in private beta. Please reach out to
+# founders@skyvern.com to get access.
+#
+# Any parameter you've added to the "Input Parameters" list is available in
+# global scope, by the same name.
+#
+# Any top-level variable you create is assigned to the output of this block.
+# e.g., if you've written 'x = 5', then 'x' is included in the block output.
+`;
+
 export const codeBlockNodeDefaultData: CodeBlockNodeData = {
   editable: true,
   label: "",
-  code: `# This feature is currently in private beta. Please reach out to founders@skyvern.com to get access\n# All variables will be assigned to the output of this block.\n# Like 'x = 5', 'x' will be assigned to the output of this block.\n\n`,
+  code: codeLead,
   continueOnFailure: false,
+  parameterKeys: null,
 } as const;

@@ -71,6 +71,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
     WorkflowParameter,
 )
+from skyvern.schemas.runs import RunEngine
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -349,6 +350,7 @@ class BaseTaskBlock(Block):
     task_type: str = TaskType.general
     url: str | None = None
     title: str = ""
+    engine: RunEngine = RunEngine.skyvern_v1
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     navigation_goal: str | None = None
@@ -623,6 +625,7 @@ class BaseTaskBlock(Block):
                     browser_session_id=browser_session_id,
                     close_browser_on_completion=browser_session_id is None,
                     complete_verification=self.complete_verification,
+                    engine=self.engine,
                 )
             except Exception as e:
                 # Make sure the task is marked as failed in the database before raising the exception

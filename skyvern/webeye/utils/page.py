@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import time
+from io import BytesIO
 from typing import Any, Dict, List
 
+import pymupdf
 import structlog
+from PIL import Image
 from playwright._impl._errors import TimeoutError
 from playwright.async_api import ElementHandle, Frame, Page
 
@@ -31,6 +34,96 @@ def load_js_script() -> str:
 JS_FUNCTION_DEFS = load_js_script()
 
 
+async def _current_viewpoint_screenshot_helper(
+    page: Page,
+    file_path: str | None = None,
+    timeout: float = settings.BROWSER_SCREENSHOT_TIMEOUT_MS,
+) -> bytes:
+    if page.is_closed():
+        raise FailedToTakeScreenshot(error_message="Page is closed")
+    try:
+        await page.wait_for_load_state(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+        LOG.debug("Page is fully loaded, agent is about to take screenshots")
+        start_time = time.time()
+        screenshot: bytes = bytes()
+        if file_path:
+            screenshot = await page.screenshot(
+                path=file_path,
+                timeout=timeout,
+                animations="disabled",
+            )
+        else:
+            screenshot = await page.screenshot(
+                timeout=timeout,
+                animations="disabled",
+            )
+        end_time = time.time()
+        LOG.debug(
+            "Screenshot taking time",
+            screenshot_time=end_time - start_time,
+            file_path=file_path,
+        )
+        return screenshot
+    except TimeoutError as e:
+        LOG.exception(f"Timeout error while taking screenshot: {str(e)}")
+        raise FailedToTakeScreenshot(error_message=str(e)) from e
+    except Exception as e:
+        LOG.exception(f"Unknown error while taking screenshot: {str(e)}")
+        raise FailedToTakeScreenshot(error_message=str(e)) from e
+
+
+async def _scrolling_screenshots_helper(
+    page: Page,
+    url: str | None = None,
+    draw_boxes: bool = False,
+    max_number: int = settings.MAX_NUM_SCREENSHOTS,
+) -> List[bytes]:
+    skyvern_page = await SkyvernFrame.create_instance(frame=page)
+    # page is the main frame and the index must be 0
+    assert isinstance(skyvern_page.frame, Page)
+    frame = "main.frame"
+    frame_index = 0
+
+    screenshots: List[bytes] = []
+    if await skyvern_page.is_window_scrollable():
+        scroll_y_px_old = -30.0
+        scroll_y_px = await skyvern_page.scroll_to_top(draw_boxes=draw_boxes, frame=frame, frame_index=frame_index)
+        # Checking max number of screenshots to prevent infinite loop
+        # We are checking the difference between the old and new scroll_y_px to determine if we have reached the end of the
+        # page. If the difference is less than 25, we assume we have reached the end of the page.
+        while abs(scroll_y_px_old - scroll_y_px) > 25 and len(screenshots) < max_number:
+            screenshot = await _current_viewpoint_screenshot_helper(page=skyvern_page.frame)
+            screenshots.append(screenshot)
+            scroll_y_px_old = scroll_y_px
+            LOG.debug("Scrolling to next page", url=url, num_screenshots=len(screenshots))
+            scroll_y_px = await skyvern_page.scroll_to_next_page(
+                draw_boxes=draw_boxes, frame=frame, frame_index=frame_index
+            )
+            LOG.debug(
+                "Scrolled to next page",
+                scroll_y_px=scroll_y_px,
+                scroll_y_px_old=scroll_y_px_old,
+            )
+        if draw_boxes:
+            await skyvern_page.remove_bounding_boxes()
+        await skyvern_page.scroll_to_top(draw_boxes=False, frame=frame, frame_index=frame_index)
+        # wait until animation ends, which is triggered by scrolling
+        LOG.debug("Waiting for 2 seconds until animation ends.")
+        await asyncio.sleep(2)
+    else:
+        if draw_boxes:
+            await skyvern_page.build_elements_and_draw_bounding_boxes(frame=frame, frame_index=frame_index)
+
+        LOG.debug("Page is not scrollable", url=url, num_screenshots=len(screenshots))
+        screenshot = await _current_viewpoint_screenshot_helper(page=skyvern_page.frame)
+        screenshots.append(screenshot)
+
+        if draw_boxes:
+            await skyvern_page.remove_bounding_boxes()
+
+    return screenshots
+
+
 class SkyvernFrame:
     @staticmethod
     async def evaluate(
@@ -55,42 +148,51 @@ class SkyvernFrame:
         page: Page,
         full_page: bool = False,
         file_path: str | None = None,
-        timeout: float = settings.BROWSER_LOADING_TIMEOUT_MS,
+        timeout: float = settings.BROWSER_SCREENSHOT_TIMEOUT_MS,
     ) -> bytes:
-        if page.is_closed():
-            raise FailedToTakeScreenshot(error_message="Page is closed")
-        try:
-            await page.wait_for_load_state(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-            LOG.debug("Page is fully loaded, agent is about to take screenshots")
-            start_time = time.time()
-            screenshot: bytes = bytes()
-            if file_path:
-                screenshot = await page.screenshot(
-                    path=file_path,
-                    full_page=full_page,
-                    timeout=timeout,
-                    animations="disabled",
-                )
-            else:
-                screenshot = await page.screenshot(
-                    full_page=full_page,
-                    timeout=timeout,
-                    animations="disabled",
-                )
-            end_time = time.time()
-            LOG.debug(
-                "Screenshot taking time",
-                screenshot_time=end_time - start_time,
-                full_page=full_page,
-                file_path=file_path,
+        if not full_page:
+            return await _current_viewpoint_screenshot_helper(page=page, file_path=file_path, timeout=timeout)
+
+        LOG.debug("Page is fully loaded, agent is about to generate the full page screenshot")
+        start_time = time.time()
+        async with asyncio.timeout(timeout):
+            pdf_bytes = await page.pdf(
+                print_background=True, width=f"{settings.BROWSER_WIDTH}px", height=f"{settings.BROWSER_HEIGHT}px"
             )
-            return screenshot
-        except TimeoutError as e:
-            LOG.exception(f"Timeout error while taking screenshot: {str(e)}")
-            raise FailedToTakeScreenshot(error_message=str(e)) from e
-        except Exception as e:
-            LOG.exception(f"Unknown error while taking screenshot: {str(e)}")
-            raise FailedToTakeScreenshot(error_message=str(e)) from e
+
+            with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+                images = []
+                for pdf_page in doc:
+                    pix = pdf_page.get_pixmap()
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    images.append(img)
+
+                total_height = sum(img.height for img in images)
+                max_width = max(img.width for img in images)
+
+                merged_img = Image.new("RGB", (max_width, total_height), color=(255, 255, 255))
+
+                current_y = 0
+                for img in images:
+                    merged_img.paste(img, (0, current_y))
+                    current_y += img.height
+
+                buffer = BytesIO()
+                merged_img.save(buffer, format="PNG")
+                buffer.seek(0)
+
+                img_data = buffer.read()
+                if file_path is not None:
+                    with open(file_path, "wb") as f:
+                        f.write(img_data)
+
+                end_time = time.time()
+                LOG.debug(
+                    "Full page screenshot taking time",
+                    screenshot_time=end_time - start_time,
+                    file_path=file_path,
+                )
+                return img_data
 
     @staticmethod
     async def take_split_screenshots(
@@ -100,53 +202,10 @@ class SkyvernFrame:
         max_number: int = settings.MAX_NUM_SCREENSHOTS,
         scroll: bool = True,
     ) -> List[bytes]:
-        skyvern_page = await SkyvernFrame.create_instance(frame=page)
         if not scroll:
-            return [await SkyvernFrame.take_screenshot(page=skyvern_page.frame, full_page=False)]
+            return [await _current_viewpoint_screenshot_helper(page=page)]
 
-        # page is the main frame and the index must be 0
-        assert isinstance(skyvern_page.frame, Page)
-        frame = "main.frame"
-        frame_index = 0
-
-        screenshots: List[bytes] = []
-        if await skyvern_page.is_window_scrollable():
-            scroll_y_px_old = -30.0
-            scroll_y_px = await skyvern_page.scroll_to_top(draw_boxes=draw_boxes, frame=frame, frame_index=frame_index)
-            # Checking max number of screenshots to prevent infinite loop
-            # We are checking the difference between the old and new scroll_y_px to determine if we have reached the end of the
-            # page. If the difference is less than 25, we assume we have reached the end of the page.
-            while abs(scroll_y_px_old - scroll_y_px) > 25 and len(screenshots) < max_number:
-                screenshot = await SkyvernFrame.take_screenshot(page=skyvern_page.frame, full_page=False)
-                screenshots.append(screenshot)
-                scroll_y_px_old = scroll_y_px
-                LOG.debug("Scrolling to next page", url=url, num_screenshots=len(screenshots))
-                scroll_y_px = await skyvern_page.scroll_to_next_page(
-                    draw_boxes=draw_boxes, frame=frame, frame_index=frame_index
-                )
-                LOG.debug(
-                    "Scrolled to next page",
-                    scroll_y_px=scroll_y_px,
-                    scroll_y_px_old=scroll_y_px_old,
-                )
-            if draw_boxes:
-                await skyvern_page.remove_bounding_boxes()
-            await skyvern_page.scroll_to_top(draw_boxes=False, frame=frame, frame_index=frame_index)
-            # wait until animation ends, which is triggered by scrolling
-            LOG.debug("Waiting for 2 seconds until animation ends.")
-            await asyncio.sleep(2)
-        else:
-            if draw_boxes:
-                await skyvern_page.build_elements_and_draw_bounding_boxes(frame=frame, frame_index=frame_index)
-
-            LOG.debug("Page is not scrollable", url=url, num_screenshots=len(screenshots))
-            screenshot = await SkyvernFrame.take_screenshot(page=skyvern_page.frame, full_page=False)
-            screenshots.append(screenshot)
-
-            if draw_boxes:
-                await skyvern_page.remove_bounding_boxes()
-
-        return screenshots
+        return await _scrolling_screenshots_helper(page=page, url=url, max_number=max_number, draw_boxes=draw_boxes)
 
     @classmethod
     async def create_instance(cls, frame: Page | Frame) -> SkyvernFrame:
