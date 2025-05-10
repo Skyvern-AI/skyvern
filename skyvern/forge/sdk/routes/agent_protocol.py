@@ -1523,6 +1523,7 @@ async def run_task(
             failure_reason=task_v1_response.failure_reason,
             created_at=task_v1_response.created_at,
             modified_at=task_v1_response.modified_at,
+            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/tasks/{task_v1_response.task_id}",
             run_request=TaskRunRequest(
                 engine=run_request.engine,
                 prompt=task_v1_response.navigation_goal,
@@ -1566,6 +1567,10 @@ async def run_task(
             max_steps_override=run_request.max_steps,
             browser_session_id=run_request.browser_session_id,
         )
+        refreshed_task_v2 = await app.DATABASE.get_task_v2(
+            task_v2_id=task_v2.observer_cruise_id, organization_id=current_org.organization_id
+        )
+        task_v2 = refreshed_task_v2 if refreshed_task_v2 else task_v2
         return TaskRunResponse(
             run_id=task_v2.observer_cruise_id,
             run_type=RunType.task_v2,
@@ -1574,6 +1579,7 @@ async def run_task(
             failure_reason=None,
             created_at=task_v2.created_at,
             modified_at=task_v2.modified_at,
+            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/{task_v2.workflow_permanent_id}/{task_v2.workflow_run_id}",
             run_request=TaskRunRequest(
                 engine=RunEngine.skyvern_v2,
                 prompt=task_v2.prompt,
