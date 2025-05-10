@@ -1,5 +1,6 @@
 from fastapi import HTTPException, status
 
+from skyvern.config import settings
 from skyvern.exceptions import TaskNotFound, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
@@ -35,6 +36,7 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
             failure_reason=task_v1.failure_reason,
             created_at=task_v1.created_at,
             modified_at=task_v1.modified_at,
+            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/tasks/{task_v1.task_id}",
             run_request=TaskRunRequest(
                 engine=run_engine,
                 prompt=task_v1.navigation_goal,
@@ -63,6 +65,7 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
             failure_reason=workflow_run.failure_reason if workflow_run else None,
             created_at=task_v2.created_at,
             modified_at=task_v2.modified_at,
+            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/{task_v2.workflow_permanent_id}/{task_v2.workflow_run_id}",
             run_request=TaskRunRequest(
                 engine=RunEngine.skyvern_v2,
                 prompt=task_v2.prompt,
