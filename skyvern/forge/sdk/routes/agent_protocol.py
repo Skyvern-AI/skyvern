@@ -1707,7 +1707,7 @@ async def cancel_run(
     await run_service.cancel_run(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
 
 
-@legacy_base_router.get( "/credentials")
+@legacy_base_router.get("/credentials")
 @legacy_base_router.get("/credentials/", include_in_schema=False)
 @base_router.get(
     "/credentials",
