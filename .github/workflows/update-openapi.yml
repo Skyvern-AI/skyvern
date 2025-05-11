@@ -14,11 +14,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.SKYVERN_OSS_GITHUB_TOKEN }}
       - name: Update OpenAPI Spec
         uses: fern-api/sync-openapi@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.SKYVERN_OSS_GITHUB_TOKEN }}
           branch: 'update-openapi-spec'
           update_from_source: true
           add_timestamp: true
