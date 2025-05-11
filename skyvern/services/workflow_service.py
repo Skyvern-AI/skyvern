@@ -1,12 +1,13 @@
 import structlog
 from fastapi import BackgroundTasks, Request
 
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.workflow.exceptions import InvalidTemplateWorkflowPermanentId
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun
-from skyvern.schemas.runs import RunType
+from skyvern.schemas.runs import RunStatus, RunType, WorkflowRunRequest, WorkflowRunResponse
 
 LOG = structlog.get_logger(__name__)
 
@@ -60,3 +61,40 @@ async def run_workflow(
         api_key=api_key,
     )
     return workflow_run
+
+
+async def get_workflow_run_response(
+    workflow_run_id: str, organization_id: str | None = None
+) -> WorkflowRunResponse | None:
+    workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id, organization_id=organization_id)
+    if not workflow_run:
+        return None
+    workflow_run_resp = await app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id(
+        workflow_run_id=workflow_run.workflow_run_id,
+        organization_id=organization_id,
+    )
+    app_url = (
+        f"{settings.SKYVERN_APP_URL.rstrip('/')}/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}"
+    )
+    return WorkflowRunResponse(
+        run_id=workflow_run_id,
+        run_type=RunType.workflow_run,
+        status=RunStatus(workflow_run.status),
+        output=workflow_run_resp.outputs,
+        downloaded_files=workflow_run_resp.downloaded_files,
+        recording_url=workflow_run_resp.recording_url,
+        failure_reason=workflow_run_resp.failure_reason,
+        app_url=app_url,
+        created_at=workflow_run.created_at,
+        modified_at=workflow_run.modified_at,
+        run_request=WorkflowRunRequest(
+            workflow_id=workflow_run.workflow_id,
+            title=workflow_run.title,
+            parameters=workflow_run_resp.parameters,
+            proxy_location=workflow_run.proxy_location,
+            webhook_url=workflow_run.webhook_callback_url,
+            totp_url=workflow_run.totp_verification_url,
+            totp_identifier=workflow_run.totp_identifier,
+            # TODO: add browser session id
+        ),
+    )
