@@ -1707,15 +1707,8 @@ async def cancel_run(
     await run_service.cancel_run(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
 
 
-@legacy_base_router.get(
-    "",
-    tags=["credentials"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "credentials",
-        "x-fern-sdk-method-name": "get_credentials",
-    },
-)
-@legacy_base_router.get("/", include_in_schema=False)
+@legacy_base_router.get( "/credentials")
+@legacy_base_router.get("/credentials/", include_in_schema=False)
 @base_router.get(
     "/credentials",
     response_model=list[CredentialResponse],
@@ -1784,15 +1777,8 @@ async def get_credentials(
     return response_items
 
 
-@legacy_base_router.get(
-    "/{credential_id}",
-    tags=["credentials"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "credentials",
-        "x-fern-sdk-method-name": "get_credential",
-    },
-)
-@legacy_base_router.get("/{credential_id}/", include_in_schema=False)
+@legacy_base_router.get("/credentials/{credential_id}")
+@legacy_base_router.get("/credentials/{credential_id}/", include_in_schema=False)
 @base_router.get(
     "/credentials/{credential_id}",
     response_model=CredentialResponse,
@@ -1853,15 +1839,8 @@ async def get_credential(
     raise HTTPException(status_code=400, detail="Invalid credential type")
 
 
-@legacy_base_router.delete(
-    "/{credential_id}",
-    tags=["credentials"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "credentials",
-        "x-fern-sdk-method-name": "delete_credential",
-    },
-)
-@legacy_base_router.delete("/{credential_id}/", include_in_schema=False)
+@legacy_base_router.delete("/credentials/{credential_id}")
+@legacy_base_router.delete("/credentials/{credential_id}/", include_in_schema=False)
 @base_router.post(
     "/credentials/{credential_id}/delete",
     status_code=204,
@@ -1900,15 +1879,8 @@ async def delete_credential(
     return None
 
 
-@legacy_base_router.post(
-    "",
-    tags=["credentials"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "credentials",
-        "x-fern-sdk-method-name": "create_credential",
-    },
-)
-@legacy_base_router.post("/", include_in_schema=False)
+@legacy_base_router.post("/credentials")
+@legacy_base_router.post("/credentials/", include_in_schema=False)
 @base_router.post(
     "/credentials",
     response_model=CredentialResponse,
