@@ -6,7 +6,19 @@ from typing import Annotated, Any
 
 import structlog
 import yaml
-from fastapi import BackgroundTasks, Depends, Header, HTTPException, Path, Query, Request, Response, UploadFile, status
+from fastapi import (
+    BackgroundTasks,
+    Body,
+    Depends,
+    Header,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.responses import ORJSONResponse
 
 from skyvern import analytics
@@ -25,6 +37,13 @@ from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
+from skyvern.forge.sdk.schemas.credentials import (
+    CreateCredentialRequest,
+    CredentialResponse,
+    CredentialType,
+    CreditCardCredentialResponse,
+    PasswordCredentialResponse,
+)
 from skyvern.forge.sdk.schemas.organizations import (
     GetOrganizationAPIKeysResponse,
     GetOrganizationsResponse,
@@ -44,6 +63,7 @@ from skyvern.forge.sdk.schemas.tasks import (
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
@@ -1685,3 +1705,281 @@ async def cancel_run(
     analytics.capture("skyvern-oss-agent-cancel-run")
 
     await run_service.cancel_run(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
+
+
+@legacy_base_router.get(
+    "",
+    tags=["credentials"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "credentials",
+        "x-fern-sdk-method-name": "get_credentials",
+    },
+)
+@legacy_base_router.get("/", include_in_schema=False)
+@base_router.get(
+    "/credentials",
+    response_model=list[CredentialResponse],
+    summary="Get all credentials",
+    description="Retrieves a paginated list of credentials for the current organization",
+    tags=["credentials"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "credentials",
+        "x-fern-sdk-method-name": "get_credentials",
+    },
+)
+async def get_credentials(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    page: int = Query(
+        1,
+        ge=1,
+        description="Page number for pagination",
+        example=1,
+        openapi_extra={"x-fern-sdk-parameter-name": "page"},
+    ),
+    page_size: int = Query(
+        10,
+        ge=1,
+        description="Number of items per page",
+        example=10,
+        openapi_extra={"x-fern-sdk-parameter-name": "page_size"},
+    ),
+) -> list[CredentialResponse]:
+    organization_bitwarden_collection = await app.DATABASE.get_organization_bitwarden_collection(
+        current_org.organization_id
+    )
+    if not organization_bitwarden_collection:
+        return []
+
+    credentials = await app.DATABASE.get_credentials(current_org.organization_id, page=page, page_size=page_size)
+    items = await BitwardenService.get_collection_items(organization_bitwarden_collection.collection_id)
+
+    response_items = []
+    for credential in credentials:
+        item = next((item for item in items if item.item_id == credential.item_id), None)
+        if not item:
+            continue
+        if item.credential_type == CredentialType.PASSWORD:
+            credential_response = PasswordCredentialResponse(username=item.credential.username)
+            response_items.append(
+                CredentialResponse(
+                    credential=credential_response,
+                    credential_id=credential.credential_id,
+                    credential_type=item.credential_type,
+                    name=item.name,
+                )
+            )
+        elif item.credential_type == CredentialType.CREDIT_CARD:
+            credential_response = CreditCardCredentialResponse(
+                last_four=item.credential.card_number[-4:],
+                brand=item.credential.card_brand,
+            )
+            response_items.append(
+                CredentialResponse(
+                    credential=credential_response,
+                    credential_id=credential.credential_id,
+                    credential_type=item.credential_type,
+                    name=item.name,
+                )
+            )
+    return response_items
+
+
+@legacy_base_router.get(
+    "/{credential_id}",
+    tags=["credentials"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "credentials",
+        "x-fern-sdk-method-name": "get_credential",
+    },
+)
+@legacy_base_router.get("/{credential_id}/", include_in_schema=False)
+@base_router.get(
+    "/credentials/{credential_id}",
+    response_model=CredentialResponse,
+    summary="Get credential by ID",
+    description="Retrieves a specific credential by its ID",
+    tags=["credentials"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "credentials",
+        "x-fern-sdk-method-name": "get_credential",
+    },
+)
+async def get_credential(
+    credential_id: str = Path(
+        ...,
+        description="The unique identifier of the credential",
+        example="cred_1234567890",
+        openapi_extra={"x-fern-sdk-parameter-name": "credential_id"},
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> CredentialResponse:
+    organization_bitwarden_collection = await app.DATABASE.get_organization_bitwarden_collection(
+        current_org.organization_id
+    )
+    if not organization_bitwarden_collection:
+        raise HTTPException(status_code=404, detail="Credential account not found. It might have been deleted.")
+
+    credential = await app.DATABASE.get_credential(
+        credential_id=credential_id, organization_id=current_org.organization_id
+    )
+    if not credential:
+        raise HTTPException(status_code=404, detail="Credential not found")
+
+    credential_item = await BitwardenService.get_credential_item(credential.item_id)
+    if not credential_item:
+        raise HTTPException(status_code=404, detail="Credential not found")
+
+    if credential_item.credential_type == CredentialType.PASSWORD:
+        credential_response = PasswordCredentialResponse(
+            username=credential_item.credential.username,
+        )
+        return CredentialResponse(
+            credential=credential_response,
+            credential_id=credential.credential_id,
+            credential_type=credential_item.credential_type,
+            name=credential_item.name,
+        )
+    if credential_item.credential_type == CredentialType.CREDIT_CARD:
+        credential_response = CreditCardCredentialResponse(
+            last_four=credential_item.credential.card_number[-4:],
+            brand=credential_item.credential.card_brand,
+        )
+        return CredentialResponse(
+            credential=credential_response,
+            credential_id=credential.credential_id,
+            credential_type=credential_item.credential_type,
+            name=credential_item.name,
+        )
+    raise HTTPException(status_code=400, detail="Invalid credential type")
+
+
+@legacy_base_router.delete(
+    "/{credential_id}",
+    tags=["credentials"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "credentials",
+        "x-fern-sdk-method-name": "delete_credential",
+    },
+)
+@legacy_base_router.delete("/{credential_id}/", include_in_schema=False)
+@base_router.post(
+    "/credentials/{credential_id}/delete",
+    status_code=204,
+    summary="Delete credential",
+    description="Deletes a specific credential by its ID",
+    tags=["credentials"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "credentials",
+        "x-fern-sdk-method-name": "delete_credential",
+    },
+)
+async def delete_credential(
+    credential_id: str = Path(
+        ...,
+        description="The unique identifier of the credential to delete",
+        example="cred_1234567890",
+        openapi_extra={"x-fern-sdk-parameter-name": "credential_id"},
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> None:
+    organization_bitwarden_collection = await app.DATABASE.get_organization_bitwarden_collection(
+        current_org.organization_id
+    )
+    if not organization_bitwarden_collection:
+        raise HTTPException(status_code=404, detail="Credential account not found. It might have been deleted.")
+
+    credential = await app.DATABASE.get_credential(
+        credential_id=credential_id, organization_id=current_org.organization_id
+    )
+    if not credential:
+        raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
+
+    await app.DATABASE.delete_credential(credential.credential_id, current_org.organization_id)
+    await BitwardenService.delete_credential_item(credential.item_id)
+
+    return None
+
+
+@legacy_base_router.post(
+    "",
+    tags=["credentials"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "credentials",
+        "x-fern-sdk-method-name": "create_credential",
+    },
+)
+@legacy_base_router.post("/", include_in_schema=False)
+@base_router.post(
+    "/credentials",
+    response_model=CredentialResponse,
+    status_code=201,
+    summary="Create credential",
+    description="Creates a new credential for the current organization",
+    tags=["credentials"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "credentials",
+        "x-fern-sdk-method-name": "create_credential",
+    },
+)
+async def create_credential(
+    data: CreateCredentialRequest = Body(
+        ...,
+        description="The credential data to create",
+        example={
+            "name": "My Credential",
+            "credential_type": "PASSWORD",
+            "credential": {"username": "user@example.com", "password": "securepassword123", "totp": "JBSWY3DPEHPK3PXP"},
+        },
+        openapi_extra={"x-fern-sdk-parameter-name": "data"},
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> CredentialResponse:
+    org_collection = await app.DATABASE.get_organization_bitwarden_collection(current_org.organization_id)
+
+    if not org_collection:
+        LOG.info(
+            "There is no collection for the organization. Creating new collection.",
+            organization_id=current_org.organization_id,
+        )
+        collection_id = await BitwardenService.create_collection(
+            name=current_org.organization_id,
+        )
+        org_collection = await app.DATABASE.create_organization_bitwarden_collection(
+            current_org.organization_id,
+            collection_id,
+        )
+
+    item_id = await BitwardenService.create_credential_item(
+        collection_id=org_collection.collection_id,
+        name=data.name,
+        credential=data.credential,
+    )
+
+    credential = await app.DATABASE.create_credential(
+        organization_id=current_org.organization_id,
+        item_id=item_id,
+        name=data.name,
+        credential_type=data.credential_type,
+    )
+
+    if data.credential_type == CredentialType.PASSWORD:
+        credential_response = PasswordCredentialResponse(
+            username=data.credential.username,
+        )
+        return CredentialResponse(
+            credential=credential_response,
+            credential_id=credential.credential_id,
+            credential_type=data.credential_type,
+            name=data.name,
+        )
+    elif data.credential_type == CredentialType.CREDIT_CARD:
+        credential_response = CreditCardCredentialResponse(
+            last_four=data.credential.card_number[-4:],
+            brand=data.credential.card_brand,
+        )
+        return CredentialResponse(
+            credential=credential_response,
+            credential_id=credential.credential_id,
+            credential_type=data.credential_type,
+            name=data.name,
+        )
