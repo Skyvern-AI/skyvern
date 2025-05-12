@@ -30,7 +30,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { AxiosError } from "axios";
 import { nanoid } from "nanoid";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useBlocker, useParams } from "react-router-dom";
 import { stringify as convertToYAML } from "yaml";
 import {
@@ -85,6 +85,7 @@ import {
   startNode,
 } from "./workflowEditorUtils";
 import { parameterIsBitwardenCredential, ParametersState } from "./types";
+import { useAutoPan } from "./useAutoPan";
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -494,6 +495,10 @@ function FlowRenderer({
     doLayout(newNodesWithUpdatedParameters, newEdges);
   }
 
+  const editorElementRef = useRef<HTMLDivElement>(null);
+
+  useAutoPan(editorElementRef, nodes);
+
   return (
     <>
       <Dialog
@@ -542,6 +547,7 @@ function FlowRenderer({
       >
         <DeleteNodeCallbackContext.Provider value={deleteNode}>
           <ReactFlow
+            ref={editorElementRef}
             nodes={nodes}
             edges={edges}
             onNodesChange={(changes) => {
