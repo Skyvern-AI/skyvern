@@ -677,6 +677,16 @@ class WorkflowService:
             organization_id=organization_id, page=page, page_size=page_size, status=status
         )
 
+    async def get_workflow_runs_count(
+        self,
+        organization_id: str,
+        status: list[WorkflowRunStatus] | None = None,
+    ) -> int:
+        return await app.DATABASE.get_workflow_runs_count(
+            organization_id=organization_id,
+            status=status,
+        )
+
     async def get_workflow_runs_for_workflow_permanent_id(
         self,
         workflow_permanent_id: str,
