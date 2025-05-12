@@ -43,3 +43,4 @@ Follow the [installation guide](https://docs.n8n.io/integrations/community-nodes
 * [n8n community nodes documentation](https://docs.n8n.io/integrations/community-nodes/)
 * [Skyvern documentation](https://docs.skyvern.com/introduction)
 
+* [n8n integration code](https://github.com/Skyvern-AI/skyvern/tree/main/integrations/n8n)
