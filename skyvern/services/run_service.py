@@ -6,7 +6,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.runs import RunEngine, RunResponse, RunType, TaskRunRequest, TaskRunResponse
-from skyvern.services import task_v2_service, workflow_service
+from skyvern.services import task_v2_service
 
 
 async def get_run_response(run_id: str, organization_id: str | None = None) -> RunResponse | None:
@@ -79,7 +79,16 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
             ),
         )
     elif run.task_run_type == RunType.workflow_run:
-        return await workflow_service.get_workflow_run_response(run.run_id, organization_id=organization_id)
+        raise NotImplementedError("Workflow run response not implemented")
+        # return WorkflowRunResponse(
+        #     run_id=run.run_id,
+        #     run_type=run.task_run_type,
+        #     status=run.status,
+        #     output=run.output,
+        #     parameters=None,
+        #     created_at=run.created_at,
+        #     modified_at=run.modified_at,
+        # )
     raise ValueError(f"Invalid task run type: {run.task_run_type}")
 
 

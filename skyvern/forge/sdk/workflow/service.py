@@ -969,7 +969,7 @@ class WorkflowService:
     async def build_workflow_run_status_response_by_workflow_id(
         self,
         workflow_run_id: str,
-        organization_id: str | None = None,
+        organization_id: str,
         include_cost: bool = False,
     ) -> WorkflowRunResponseBase:
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
@@ -988,7 +988,7 @@ class WorkflowService:
         self,
         workflow_permanent_id: str,
         workflow_run_id: str,
-        organization_id: str | None = None,
+        organization_id: str,
         include_cost: bool = False,
     ) -> WorkflowRunResponseBase:
         workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id)
