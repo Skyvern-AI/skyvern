@@ -484,7 +484,7 @@ export class Skyvern implements INodeType {
                                     },
                                 });
                                 if (!credResponse.ok) {
-                                    throw new Error('Request to get credentials failed');
+                                    throw new Error('Request to get credentials failed'); // eslint-disable-line
                                 }
                                 const credData = await credResponse.json();
                                 options = credData.map((credential: any) => ({
