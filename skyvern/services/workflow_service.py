@@ -89,7 +89,7 @@ async def get_workflow_run_response(
         modified_at=workflow_run.modified_at,
         run_request=WorkflowRunRequest(
             workflow_id=workflow_run.workflow_id,
-            title=workflow_run.title,
+            title=workflow_run_resp.workflow_title,
             parameters=workflow_run_resp.parameters,
             proxy_location=workflow_run.proxy_location,
             webhook_url=workflow_run.webhook_callback_url,
