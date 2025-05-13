@@ -498,7 +498,7 @@ export class Skyvern implements INodeType {
                                     integer: 'number',
                                     float: 'number',
                                     boolean: 'boolean',
-                                    json: 'json',
+                                    json: 'object',
                                     file_url: 'url',
                                 }
                                 parameterType = parameter_type_map[parameter.workflow_parameter_type];
