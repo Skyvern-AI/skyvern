@@ -3,9 +3,10 @@ from fastapi.responses import ORJSONResponse
 
 from skyvern import analytics
 from skyvern.forge import app
-from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
+from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.schemas.browser_sessions import CreateBrowserSessionRequest
 from skyvern.webeye.schemas import BrowserSessionResponse
 
 
@@ -24,20 +25,6 @@ from skyvern.webeye.schemas import BrowserSessionResponse
         404: {"description": "Browser session not found"},
         401: {"description": "Unauthorized - Invalid or missing authentication"},
     },
-)
-@legacy_base_router.get(
-    "/browser_sessions/{browser_session_id}",
-    response_model=BrowserSessionResponse,
-    tags=["session"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "session",
-        "x-fern-sdk-method-name": "get_browser_session",
-    },
-)
-@legacy_base_router.get(
-    "/browser_sessions/{browser_session_id}/",
-    response_model=BrowserSessionResponse,
-    include_in_schema=False,
 )
 async def get_browser_session(
     browser_session_id: str,
@@ -68,20 +55,6 @@ async def get_browser_session(
         401: {"description": "Unauthorized - Invalid or missing authentication"},
     },
 )
-@legacy_base_router.get(
-    "/browser_sessions",
-    response_model=list[BrowserSessionResponse],
-    tags=["session"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "browser_sessions",
-        "x-fern-sdk-method-name": "get_browser_sessions",
-    },
-)
-@legacy_base_router.get(
-    "/browser_sessions/",
-    response_model=list[BrowserSessionResponse],
-    include_in_schema=False,
-)
 async def get_browser_sessions(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[BrowserSessionResponse]:
@@ -106,24 +79,14 @@ async def get_browser_sessions(
         401: {"description": "Unauthorized - Invalid or missing authentication"},
     },
 )
-@legacy_base_router.post(
-    "/browser_sessions",
-    response_model=BrowserSessionResponse,
-    tags=["Browser Sessions"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "session",
-        "x-fern-sdk-method-name": "create_browser_session",
-    },
-)
-@legacy_base_router.post(
-    "/browser_sessions/",
-    response_model=BrowserSessionResponse,
-    include_in_schema=False,
-)
 async def create_browser_session(
+    browser_session_request: CreateBrowserSessionRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> BrowserSessionResponse:
-    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(current_org.organization_id)
+    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+        organization_id=current_org.organization_id,
+        timeout_minutes=browser_session_request.timeout,
+    )
     return BrowserSessionResponse.from_browser_session(browser_session)
 
 
@@ -140,18 +103,6 @@ async def create_browser_session(
         200: {"description": "Successfully closed browser session"},
         401: {"description": "Unauthorized - Invalid or missing authentication"},
     },
-)
-@legacy_base_router.post(
-    "/browser_sessions/{browser_session_id}/close",
-    tags=["Browser Sessions"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "browser_session",
-        "x-fern-sdk-method-name": "close_browser_session",
-    },
-)
-@legacy_base_router.post(
-    "/browser_sessions/{browser_session_id}/close/",
-    include_in_schema=False,
 )
 async def close_browser_session(
     browser_session_id: str,
