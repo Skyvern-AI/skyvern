@@ -1,6 +1,6 @@
 import json
 from datetime import datetime, timedelta
-from typing import Any, List, Optional, Sequence
+from typing import Any, List, Sequence
 
 import structlog
 from sqlalchemy import and_, delete, distinct, func, pool, select, tuple_, update
@@ -2656,7 +2656,7 @@ class AgentDB:
                 for workflow_run_block in workflow_run_blocks
             ]
 
-    async def get_active_persistent_browser_sessions(self, organization_id: str) -> List[PersistentBrowserSession]:
+    async def get_active_persistent_browser_sessions(self, organization_id: str) -> list[PersistentBrowserSession]:
         """Get all active persistent browser sessions for an organization."""
         try:
             async with self.Session() as session:
@@ -2676,7 +2676,7 @@ class AgentDB:
 
     async def get_persistent_browser_session_by_id(
         self, session_id: str, organization_id: str | None = None
-    ) -> Optional[PersistentBrowserSession]:
+    ) -> PersistentBrowserSession | None:
         """Get a specific persistent browser session."""
         try:
             async with self.Session() as session:
@@ -2703,7 +2703,7 @@ class AgentDB:
 
     async def get_persistent_browser_session(
         self, session_id: str, organization_id: str
-    ) -> Optional[PersistentBrowserSessionModel]:
+    ) -> PersistentBrowserSession | None:
         """Get a specific persistent browser session."""
         try:
             async with self.Session() as session:
@@ -2733,6 +2733,7 @@ class AgentDB:
         organization_id: str,
         runnable_type: str | None = None,
         runnable_id: str | None = None,
+        timeout_minutes: int | None = None,
     ) -> PersistentBrowserSessionModel:
         """Create a new persistent browser session."""
         try:
@@ -2741,6 +2742,7 @@ class AgentDB:
                     organization_id=organization_id,
                     runnable_type=runnable_type,
                     runnable_id=runnable_id,
+                    timeout_minutes=timeout_minutes,
                 )
                 session.add(browser_session)
                 await session.commit()

@@ -12,6 +12,9 @@ class PersistentBrowserSession(BaseModel):
     runnable_id: str | None = None
     browser_address: str | None = None
     status: str | None = None
+    timeout_minutes: int | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
