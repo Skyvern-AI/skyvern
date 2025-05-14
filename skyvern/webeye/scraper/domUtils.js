@@ -1424,7 +1424,7 @@ async function buildTreeFromBody(
 async function buildElementTree(
   starter = document.body,
   frame,
-  full_tree = true,
+  full_tree = false,
   needContext = true,
   hoverStylesMap = undefined,
 ) {
@@ -1519,6 +1519,8 @@ async function buildElementTree(
         getElementText(element).length <= 5000
       ) {
         elementObj = await buildElementObject(frame, element, interactable);
+      } else if (tagName === "div" && isDOMNodeRepresentDiv(element)) {
+        elementObj = await buildElementObject(frame, element, interactable);
       } else if (full_tree) {
         // when building full tree, we only get text from element itself
         // elements without text are purgeable
@@ -1528,10 +1530,7 @@ async function buildElementTree(
           interactable,
           true,
         );
-        if (
-          elementObj.text.length > 0 ||
-          (elementObj.tagName === "div" && isDOMNodeRepresentDiv(element))
-        ) {
+        if (elementObj.text.length > 0) {
           elementObj.purgeable = false;
         }
       }
