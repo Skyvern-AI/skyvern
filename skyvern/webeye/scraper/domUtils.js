@@ -2364,6 +2364,9 @@ if (window.globalObserverForDOMIncrement === undefined) {
       if (node.nodeType === Node.TEXT_NODE) continue;
       const tagName = node.tagName?.toLowerCase();
 
+      // ignore unique_id change to avoid infinite loop about DOM changes
+      if (mutation.attributeName === "unique_id") continue;
+
       // if the changing element is dropdown related elements, we should consider
       // they're the new element as long as the element is still visible on the page
       if (
@@ -2432,6 +2435,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
               break;
             }
           }
+          break;
         }
         case "childList": {
           let changedNode = {
