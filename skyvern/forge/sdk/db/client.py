@@ -1,6 +1,6 @@
 import json
 from datetime import datetime, timedelta
-from typing import Any, List, Optional, Sequence
+from typing import Any, List, Sequence
 
 import structlog
 from sqlalchemy import and_, delete, distinct, func, pool, select, tuple_, update
@@ -650,7 +650,11 @@ class AgentDB:
         try:
             async with self.Session() as session:
                 db_page = page - 1  # offset logic is 0 based
-                query = select(TaskModel).filter(TaskModel.organization_id == organization_id)
+                query = (
+                    select(TaskModel, WorkflowRunModel.workflow_permanent_id)
+                    .join(WorkflowRunModel, TaskModel.workflow_run_id == WorkflowRunModel.workflow_run_id, isouter=True)
+                    .filter(TaskModel.organization_id == organization_id)
+                )
                 if task_status:
                     query = query.filter(TaskModel.status.in_(task_status))
                 if workflow_run_id:
@@ -665,8 +669,42 @@ class AgentDB:
                     .limit(page_size)
                     .offset(db_page * page_size)
                 )
-                tasks = (await session.scalars(query)).all()
-                return [convert_to_task(task, debug_enabled=self.debug_enabled) for task in tasks]
+
+                results = (await session.execute(query)).all()
+
+                return [
+                    convert_to_task(task, debug_enabled=self.debug_enabled, workflow_permanent_id=workflow_permanent_id)
+                    for task, workflow_permanent_id in results
+                ]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_tasks_count(
+        self,
+        organization_id: str,
+        task_status: list[TaskStatus] | None = None,
+        workflow_run_id: str | None = None,
+        only_standalone_tasks: bool = False,
+        application: str | None = None,
+    ) -> int:
+        try:
+            async with self.Session() as session:
+                count_query = (
+                    select(func.count()).select_from(TaskModel).filter(TaskModel.organization_id == organization_id)
+                )
+                if task_status:
+                    count_query = count_query.filter(TaskModel.status.in_(task_status))
+                if workflow_run_id:
+                    count_query = count_query.filter(TaskModel.workflow_run_id == workflow_run_id)
+                if only_standalone_tasks:
+                    count_query = count_query.filter(TaskModel.workflow_run_id.is_(None))
+                if application:
+                    count_query = count_query.filter(TaskModel.application == application)
+                return (await session.execute(count_query)).scalar_one()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -1523,6 +1561,25 @@ class AgentDB:
                     convert_to_workflow_run(run, workflow_title=title, debug_enabled=self.debug_enabled)
                     for run, title in workflow_runs
                 ]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_workflow_runs_count(
+        self,
+        organization_id: str,
+        status: list[WorkflowRunStatus] | None = None,
+    ) -> int:
+        try:
+            async with self.Session() as session:
+                count_query = (
+                    select(func.count())
+                    .select_from(WorkflowRunModel)
+                    .filter(WorkflowRunModel.organization_id == organization_id)
+                )
+                if status:
+                    count_query = count_query.filter(WorkflowRunModel.status.in_(status))
+                return (await session.execute(count_query)).scalar_one()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -2599,7 +2656,7 @@ class AgentDB:
                 for workflow_run_block in workflow_run_blocks
             ]
 
-    async def get_active_persistent_browser_sessions(self, organization_id: str) -> List[PersistentBrowserSession]:
+    async def get_active_persistent_browser_sessions(self, organization_id: str) -> list[PersistentBrowserSession]:
         """Get all active persistent browser sessions for an organization."""
         try:
             async with self.Session() as session:
@@ -2619,7 +2676,7 @@ class AgentDB:
 
     async def get_persistent_browser_session_by_id(
         self, session_id: str, organization_id: str | None = None
-    ) -> Optional[PersistentBrowserSession]:
+    ) -> PersistentBrowserSession | None:
         """Get a specific persistent browser session."""
         try:
             async with self.Session() as session:
@@ -2646,7 +2703,7 @@ class AgentDB:
 
     async def get_persistent_browser_session(
         self, session_id: str, organization_id: str
-    ) -> Optional[PersistentBrowserSessionModel]:
+    ) -> PersistentBrowserSession | None:
         """Get a specific persistent browser session."""
         try:
             async with self.Session() as session:
@@ -2676,6 +2733,7 @@ class AgentDB:
         organization_id: str,
         runnable_type: str | None = None,
         runnable_id: str | None = None,
+        timeout_minutes: int | None = None,
     ) -> PersistentBrowserSessionModel:
         """Create a new persistent browser session."""
         try:
@@ -2684,6 +2742,7 @@ class AgentDB:
                     organization_id=organization_id,
                     runnable_type=runnable_type,
                     runnable_id=runnable_id,
+                    timeout_minutes=timeout_minutes,
                 )
                 session.add(browser_session)
                 await session.commit()

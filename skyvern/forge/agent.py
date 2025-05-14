@@ -1940,10 +1940,11 @@ class ForgeAgent:
                         )
                         return action_result.data
 
-        LOG.warning(
-            "Failed to find extracted information for task",
-            task_id=task.task_id,
-        )
+        if task.data_extraction_goal:
+            LOG.warning(
+                "Failed to find extracted information for task",
+                task_id=task.task_id,
+            )
         return None
 
     async def get_failure_reason_for_task(self, task: Task) -> str | None:

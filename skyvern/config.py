@@ -208,6 +208,8 @@ class Settings(BaseSettings):
 
     # VERTEX_AI
     VERTEX_CREDENTIALS: str | None = None
+    VERTEX_PROJECT_ID: str | None = None
+    VERTEX_LOCATION: str | None = None
 
     # NOVITA AI
     ENABLE_NOVITA: bool = False

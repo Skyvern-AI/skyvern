@@ -37,6 +37,7 @@ services:
     environment:
       - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
       - BROWSER_TYPE=chromium-headful
+      - ENABLE_CODE_BLOCK=true
       # - BROWSER_TYPE=cdp-connect
       # Use this command to start Chrome with remote debugging:
       # "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\chrome-cdp-profile" --no-first-run --no-default-browser-check
@@ -139,6 +140,7 @@ services:
       - ./har:/data/har
       - ./.streamlit:/app/.streamlit
     environment:
+      - VITE_ENABLE_CODE_BLOCK=true
     # if you want to run skyvern on a remote server,
     # you need to change the host in VITE_WSS_BASE_URL and VITE_API_BASE_URL to match your server ip
     # If you're self-hosting this behind a dns, you'll want to set:

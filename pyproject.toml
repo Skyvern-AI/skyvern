@@ -16,7 +16,7 @@ python-multipart = "^0.0.6"
 toml = "^0.10.2"
 jinja2 = "^3.1.2"
 uvicorn = {extras = ["standard"], version = "^0.24.0.post1"}
-litellm = ">=1.67.4"
+litellm = ">=1.68.2"
 playwright = "1.46.0"
 pillow = "^10.1.0"
 starlette-context = "^0.3.6"
@@ -57,7 +57,6 @@ psutil = ">=7.0.0"
 tiktoken = ">=0.9.0"
 anthropic = "^0.50.0"
 google-cloud-aiplatform = "^1.90.0"
-pymupdf = "^1.25.5"
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"

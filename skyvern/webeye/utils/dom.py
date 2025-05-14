@@ -93,6 +93,7 @@ class SkyvernElement:
     When you try to interact with these elements by python, you are supposed to use this class as an interface.
     """
 
+    # TODO: support to create SkyvernElement from incremental page by xpath
     @classmethod
     async def create_from_incremental(cls, incre_page: IncrementalScrapePage, element_id: str) -> SkyvernElement:
         element_dict = incre_page.id_to_element_dict.get(element_id)
@@ -773,8 +774,20 @@ class DomUtil:
 
         num_elements = await locator.count()
         if num_elements < 1:
-            LOG.warning("No elements found with css. Validation failed.", css=css, element_id=element_id)
-            raise MissingElement(selector=css, element_id=element_id)
+            xpath: str | None = element.get("xpath")
+            if not xpath:
+                LOG.warning("No elements found with css. Validation failed.", css=css, element_id=element_id)
+                raise MissingElement(selector=css, element_id=element_id)
+            else:
+                # WARNING: current xpath is based on the tag name.
+                # It can only represent the element possition in the DOM tree with tag name, it's not 100% reliable.
+                # As long as the current possition has the same element with the tag name, the locator can be found.
+                # (maybe) we should validate the element hash to make sure the element is the same?
+                LOG.warning("Fallback to locator element by xpath.", xpath=xpath, element_id=element_id)
+                locator = frame_content.locator(f"xpath={xpath}")
+                num_elements = await locator.count()
+                if num_elements < 1:
+                    raise MissingElement(selector=xpath, element_id=element_id)
 
         elif num_elements > 1:
             LOG.warning(

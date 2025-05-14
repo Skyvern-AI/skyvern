@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import structlog
 from playwright._impl._errors import TargetClosedError
@@ -31,7 +31,7 @@ class PersistentSessionsManager:
         cls.instance.database = database
         return cls.instance
 
-    async def get_active_sessions(self, organization_id: str) -> List[PersistentBrowserSession]:
+    async def get_active_sessions(self, organization_id: str) -> list[PersistentBrowserSession]:
         """Get all active sessions for an organization."""
         return await self.database.get_active_persistent_browser_sessions(organization_id)
 
@@ -40,7 +40,7 @@ class PersistentSessionsManager:
         browser_session = self._browser_sessions.get(session_id)
         return browser_session.browser_state if browser_session else None
 
-    async def get_session(self, session_id: str, organization_id: str) -> Optional[PersistentBrowserSession]:
+    async def get_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession | None:
         """Get a specific browser session by session ID."""
         return await self.database.get_persistent_browser_session(session_id, organization_id)
 
@@ -49,6 +49,7 @@ class PersistentSessionsManager:
         organization_id: str,
         runnable_id: str | None = None,
         runnable_type: str | None = None,
+        timeout_minutes: int | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
 
@@ -61,6 +62,7 @@ class PersistentSessionsManager:
             organization_id=organization_id,
             runnable_type=runnable_type,
             runnable_id=runnable_id,
+            timeout_minutes=timeout_minutes,
         )
 
         return browser_session_db
