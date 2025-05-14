@@ -444,6 +444,14 @@ function expectHitTarget(hitPoint, targetElement) {
   return hitParents[0] || document.documentElement;
 }
 
+function getChildElements(element) {
+  if (element.childElementCount !== 0) {
+    return Array.from(element.children);
+  } else {
+    return [];
+  }
+}
+
 function isParent(parent, child) {
   return parent.contains(child);
 }
@@ -583,6 +591,20 @@ function isTableRelatedElement(element) {
     "colgroup",
     "col",
   ].includes(tagName);
+}
+
+function isDOMNodeRepresentDiv(element) {
+  if (element?.tagName?.toLowerCase() !== "div") {
+    return false;
+  }
+  const style = getElementComputedStyle(element);
+  const children = getChildElements(element);
+  // flex ususally means there are multiple elements in the div as a line or a column
+  // if the children elements are not just one, we should keep it in the HTML tree to represent a tree structure
+  if (style?.display === "flex" && children.length > 1) {
+    return true;
+  }
+  return false;
 }
 
 function isInteractableInput(element) {
@@ -1402,7 +1424,7 @@ async function buildTreeFromBody(
 async function buildElementTree(
   starter = document.body,
   frame,
-  full_tree = false,
+  full_tree = true,
   needContext = true,
   hoverStylesMap = undefined,
 ) {
@@ -1414,13 +1436,6 @@ async function buildElementTree(
   var elements = [];
   var resultArray = [];
 
-  function getChildElements(element) {
-    if (element.childElementCount !== 0) {
-      return Array.from(element.children);
-    } else {
-      return [];
-    }
-  }
   async function processElement(
     element,
     parentId,
@@ -1513,7 +1528,10 @@ async function buildElementTree(
           interactable,
           true,
         );
-        if (elementObj.text.length > 0) {
+        if (
+          elementObj.text.length > 0 ||
+          (elementObj.tagName === "div" && isDOMNodeRepresentDiv(element))
+        ) {
           elementObj.purgeable = false;
         }
       }
