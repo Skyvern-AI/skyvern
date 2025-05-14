@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/skyvern-ai-skyvern-badge.png)](https://mseep.ai/app/skyvern-ai-skyvern)
+
 <!-- DOCTOC SKIP -->
 
 <h1 align="center">
