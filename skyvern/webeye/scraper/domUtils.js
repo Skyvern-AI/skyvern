@@ -1424,7 +1424,7 @@ async function buildTreeFromBody(
 async function buildElementTree(
   starter = document.body,
   frame,
-  full_tree = true,
+  full_tree = false,
   needContext = true,
   hoverStylesMap = undefined,
 ) {
@@ -1514,6 +1514,8 @@ async function buildElementTree(
       ) {
         // if elemnet is the children of the <svg> with an unique_id
         elementObj = await buildElementObject(frame, element, interactable);
+      } else if (tagName === "div" && isDOMNodeRepresentDiv(element)) {
+        elementObj = await buildElementObject(frame, element, interactable);
       } else if (
         getElementText(element).length > 0 &&
         getElementText(element).length <= 5000
@@ -1528,10 +1530,7 @@ async function buildElementTree(
           interactable,
           true,
         );
-        if (
-          elementObj.text.length > 0 ||
-          (elementObj.tagName === "div" && isDOMNodeRepresentDiv(element))
-        ) {
+        if (elementObj.text.length > 0) {
           elementObj.purgeable = false;
         }
       }
