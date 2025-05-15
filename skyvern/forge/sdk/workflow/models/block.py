@@ -367,6 +367,7 @@ class BaseTaskBlock(Block):
     totp_identifier: str | None = None
     cache_actions: bool = False
     complete_verification: bool = True
+    include_action_history_in_verification: bool = False
 
     def get_all_parameters(
         self,
@@ -544,6 +545,7 @@ class BaseTaskBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 task_id=task.task_id,
                 organization_id=organization_id,
+                include_action_history_in_verification=self.include_action_history_in_verification,
             )
             current_running_task = task
             organization = await app.DATABASE.get_organization(organization_id=workflow_run.organization_id)

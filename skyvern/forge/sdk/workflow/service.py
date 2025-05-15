@@ -1621,6 +1621,7 @@ class WorkflowService:
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
                 complete_verification=block_yaml.complete_verification,
+                include_action_history_in_verification=block_yaml.include_action_history_in_verification,
             )
         elif block_yaml.block_type == BlockType.FOR_LOOP:
             loop_blocks = [
@@ -1816,6 +1817,7 @@ class WorkflowService:
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
                 complete_verification=block_yaml.complete_verification,
+                include_action_history_in_verification=block_yaml.include_action_history_in_verification,
             )
 
         elif block_yaml.block_type == BlockType.EXTRACTION:

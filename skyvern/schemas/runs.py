@@ -225,6 +225,9 @@ class TaskRunRequest(BaseModel):
         description="ID of an existing browser session to reuse, having it continue from the current screen state",
     )
     publish_workflow: bool = Field(default=False, description="Whether to publish this task as a reusable workflow. ")
+    include_action_history_in_verification: bool = Field(
+        default=False, description="Whether to include action history when verifying that the task is complete"
+    )
 
     @field_validator("url", "webhook_url", "totp_url")
     @classmethod

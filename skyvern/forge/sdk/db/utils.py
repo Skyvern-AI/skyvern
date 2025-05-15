@@ -71,6 +71,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         url=task_obj.url,
         complete_criterion=task_obj.complete_criterion,
         terminate_criterion=task_obj.terminate_criterion,
+        include_action_history_in_verification=task_obj.include_action_history_in_verification,
         webhook_callback_url=task_obj.webhook_callback_url,
         totp_verification_url=task_obj.totp_verification_url,
         totp_identifier=task_obj.totp_identifier,
@@ -411,6 +412,7 @@ def convert_to_workflow_run_block(
         body=workflow_run_block_model.body,
         created_at=workflow_run_block_model.created_at,
         modified_at=workflow_run_block_model.modified_at,
+        include_action_history_in_verification=workflow_run_block_model.include_action_history_in_verification,
     )
     if task:
         block.url = task.url

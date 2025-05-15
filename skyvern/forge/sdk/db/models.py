@@ -83,6 +83,7 @@ class TaskModel(Base):
     errors = Column(JSON, default=[], nullable=False)
     max_steps_per_run = Column(Integer, nullable=True)
     application = Column(String, nullable=True)
+    include_action_history_in_verification = Column(Boolean, default=False, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(
         DateTime,
@@ -532,6 +533,7 @@ class WorkflowRunBlockModel(Base):
 
     workflow_run_block_id = Column(String, primary_key=True, default=generate_workflow_run_block_id)
     workflow_run_id = Column(String, nullable=False)
+    include_action_history_in_verification = Column(Boolean, default=False, nullable=True)
     # this is the inner workflow run id of the taskv2 block
     block_workflow_run_id = Column(String, nullable=True)
     parent_workflow_run_block_id = Column(String, nullable=True)
