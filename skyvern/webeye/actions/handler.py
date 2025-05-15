@@ -2286,7 +2286,7 @@ async def sequentially_select_from_dropdown(
     dropdown_menu_element: SkyvernElement | None = None,
     force_select: bool = False,
     target_value: str = "",
-    continue_until_click: bool = False,
+    continue_until_close: bool = False,
 ) -> CustomSingleSelectResult | None:
     """
     TODO: support to return all values retrieved from the sequentially select
@@ -2412,7 +2412,7 @@ async def sequentially_select_from_dropdown(
             )
             continue
 
-        if continue_until_click:
+        if continue_until_close:
             LOG.info(
                 "Continue the selecting until the dropdown menu is closed",
                 step_id=step.step_id,
