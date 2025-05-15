@@ -1715,7 +1715,7 @@ async def cancel_run(
     response_model=list[CredentialResponse],
     summary="Get all credentials",
     description="Retrieves a paginated list of credentials for the current organization",
-    tags=["credentials"],
+    tags=["Credentials"],
     openapi_extra={
         "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "get_credentials",
@@ -1785,7 +1785,7 @@ async def get_credentials(
     response_model=CredentialResponse,
     summary="Get credential by ID",
     description="Retrieves a specific credential by its ID",
-    tags=["credentials"],
+    tags=["Credentials"],
     openapi_extra={
         "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "get_credential",
@@ -1847,7 +1847,7 @@ async def get_credential(
     status_code=204,
     summary="Delete credential",
     description="Deletes a specific credential by its ID",
-    tags=["credentials"],
+    tags=["Credentials"],
     openapi_extra={
         "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "delete_credential",
@@ -1888,7 +1888,7 @@ async def delete_credential(
     status_code=201,
     summary="Create credential",
     description="Creates a new credential for the current organization",
-    tags=["credentials"],
+    tags=["Credentials"],
     openapi_extra={
         "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "create_credential",
