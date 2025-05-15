@@ -6,7 +6,7 @@ DEFAULT_TIMEOUT = 60
 
 
 class CreateBrowserSessionRequest(BaseModel):
-    timeout: int = Field(
+    timeout: int | None = Field(
         default=DEFAULT_TIMEOUT,
         description=f"Timeout in minutes for the session. Timeout is applied after the session is started. Must be between {MIN_TIMEOUT} and {MAX_TIMEOUT}. Defaults to {DEFAULT_TIMEOUT}.",
         ge=MIN_TIMEOUT,
