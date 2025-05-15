@@ -61,6 +61,7 @@ function CreateNewTaskFormPage() {
             totpIdentifier: null,
             webhookCallbackUrl: null,
             proxyLocation: null,
+            includeActionHistoryInVerification: null,
           }}
         />
       </div>
@@ -127,6 +128,9 @@ function CreateNewTaskFormPage() {
           maxStepsOverride,
           totpIdentifier: data.workflow_definition.blocks[0].totp_identifier,
           errorCodeMapping: JSON.stringify(errorCodeMapping, null, 2),
+          includeActionHistoryInVerification:
+            data.workflow_definition.blocks[0]
+              .include_action_history_in_verification,
         }}
       />
     </div>

@@ -15,6 +15,7 @@ export type NavigationNodeData = NodeBaseData & {
   totpVerificationUrl: string | null;
   totpIdentifier: string | null;
   cacheActions: boolean;
+  includeActionHistoryInVerification: boolean;
 };
 
 export type NavigationNode = Node<NavigationNodeData, "navigation">;
@@ -36,6 +37,7 @@ export const navigationNodeDefaultData: NavigationNodeData = {
   totpIdentifier: null,
   continueOnFailure: false,
   cacheActions: false,
+  includeActionHistoryInVerification: false,
 } as const;
 
 export function isNavigationNode(node: Node): node is NavigationNode {

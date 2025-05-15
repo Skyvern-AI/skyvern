@@ -139,6 +139,7 @@ export type CreateTaskRequest = {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   application?: string | null;
+  include_action_history_in_verification?: boolean | null;
 };
 
 export type User = {
