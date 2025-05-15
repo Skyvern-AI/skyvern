@@ -3,7 +3,7 @@
 from __future__ import annotations
 from ..core.pydantic_utilities import UniversalBaseModel
 import typing
-from .value import Value
+from .context_parameter_value import ContextParameterValue
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
 from ..core.pydantic_utilities import update_forward_refs
@@ -12,8 +12,8 @@ from ..core.pydantic_utilities import update_forward_refs
 class ContextParameter(UniversalBaseModel):
     key: str
     description: typing.Optional[str] = None
-    source: "Source"
-    value: typing.Optional[Value] = None
+    source: "ContextParameterSource"
+    value: typing.Optional[ContextParameterValue] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -25,6 +25,6 @@ class ContextParameter(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-from .source import Source  # noqa: E402
+from .context_parameter_source import ContextParameterSource  # noqa: E402
 
 update_forward_refs(ContextParameter)

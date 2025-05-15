@@ -4,6 +4,7 @@ from ..core.pydantic_utilities import UniversalBaseModel
 from .context_parameter import ContextParameter
 from .output_parameter import OutputParameter
 import typing
+from .run_engine import RunEngine
 from .login_block_data_schema import LoginBlockDataSchema
 from .login_block_parameters_item import LoginBlockParametersItem
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
@@ -17,6 +18,7 @@ class LoginBlock(UniversalBaseModel):
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     navigation_goal: typing.Optional[str] = None

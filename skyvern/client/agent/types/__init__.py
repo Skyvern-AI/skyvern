@@ -2,6 +2,8 @@
 
 from .agent_get_run_response import (
     AgentGetRunResponse,
+    AgentGetRunResponse_AnthropicCua,
+    AgentGetRunResponse_OpenaiCua,
     AgentGetRunResponse_TaskV1,
     AgentGetRunResponse_TaskV2,
     AgentGetRunResponse_WorkflowRun,
@@ -9,6 +11,8 @@ from .agent_get_run_response import (
 
 __all__ = [
     "AgentGetRunResponse",
+    "AgentGetRunResponse_AnthropicCua",
+    "AgentGetRunResponse_OpenaiCua",
     "AgentGetRunResponse_TaskV1",
     "AgentGetRunResponse_TaskV2",
     "AgentGetRunResponse_WorkflowRun",
