@@ -2679,6 +2679,34 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_persistent_browser_session_by_runnable_id(
+        self, runnable_id: str, organization_id: str | None = None
+    ) -> PersistentBrowserSession | None:
+        """Get a specific persistent browser session."""
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(PersistentBrowserSessionModel)
+                    .filter_by(runnable_id=runnable_id)
+                    .filter_by(deleted_at=None)
+                    .filter_by(completed_at=None)
+                )
+                if organization_id:
+                    query = query.filter_by(organization_id=organization_id)
+                persistent_browser_session = (await session.scalars(query)).first()
+                if persistent_browser_session:
+                    return PersistentBrowserSession.model_validate(persistent_browser_session)
+                raise NotFoundError(f"PersistentBrowserSession {runnable_id} not found")
+        except NotFoundError:
+            LOG.error("NotFoundError", exc_info=True)
+            raise
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def get_persistent_browser_session(
         self,
         session_id: str,
