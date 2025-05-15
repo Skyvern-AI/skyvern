@@ -545,7 +545,6 @@ class BaseTaskBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 task_id=task.task_id,
                 organization_id=organization_id,
-                include_action_history_in_verification=self.include_action_history_in_verification,
             )
             current_running_task = task
             organization = await app.DATABASE.get_organization(organization_id=workflow_run.organization_id)
