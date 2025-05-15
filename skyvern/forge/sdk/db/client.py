@@ -2566,7 +2566,6 @@ class AgentDB:
         wait_sec: int | None = None,
         description: str | None = None,
         block_workflow_run_id: str | None = None,
-        include_action_history_in_verification: bool | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             workflow_run_block = (
@@ -2607,8 +2606,6 @@ class AgentDB:
                     workflow_run_block.description = description
                 if block_workflow_run_id:
                     workflow_run_block.block_workflow_run_id = block_workflow_run_id
-                if include_action_history_in_verification is not None:
-                    workflow_run_block.include_action_history_in_verification = include_action_history_in_verification
                 await session.commit()
                 await session.refresh(workflow_run_block)
             else:

@@ -533,7 +533,6 @@ class WorkflowRunBlockModel(Base):
 
     workflow_run_block_id = Column(String, primary_key=True, default=generate_workflow_run_block_id)
     workflow_run_id = Column(String, nullable=False)
-    include_action_history_in_verification = Column(Boolean, default=False, nullable=True)
     # this is the inner workflow run id of the taskv2 block
     block_workflow_run_id = Column(String, nullable=True)
     parent_workflow_run_block_id = Column(String, nullable=True)

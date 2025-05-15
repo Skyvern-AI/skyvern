@@ -412,7 +412,6 @@ def convert_to_workflow_run_block(
         body=workflow_run_block_model.body,
         created_at=workflow_run_block_model.created_at,
         modified_at=workflow_run_block_model.modified_at,
-        include_action_history_in_verification=workflow_run_block_model.include_action_history_in_verification,
     )
     if task:
         block.url = task.url
@@ -422,5 +421,6 @@ def convert_to_workflow_run_block(
         block.data_schema = task.extracted_information_schema
         block.terminate_criterion = task.terminate_criterion
         block.complete_criterion = task.complete_criterion
+        block.include_action_history_in_verification = task.include_action_history_in_verification
 
     return block
