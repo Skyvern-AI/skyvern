@@ -2693,7 +2693,7 @@ class AgentDB:
                 persistent_browser_session = (await session.scalars(query)).first()
                 if persistent_browser_session:
                     return PersistentBrowserSession.model_validate(persistent_browser_session)
-                raise NotFoundError(f"PersistentBrowserSession {runnable_id} not found")
+                return None
         except NotFoundError:
             LOG.error("NotFoundError", exc_info=True)
             raise
