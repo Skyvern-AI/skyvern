@@ -143,6 +143,7 @@ class TaskBlockYAML(BlockYAML):
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     complete_verification: bool = True
+    include_action_history_in_verification: bool = False
 
 
 class ForLoopBlockYAML(BlockYAML):
@@ -288,6 +289,7 @@ class NavigationBlockYAML(BlockYAML):
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     complete_verification: bool = True
+    include_action_history_in_verification: bool = False
 
 
 class ExtractionBlockYAML(BlockYAML):

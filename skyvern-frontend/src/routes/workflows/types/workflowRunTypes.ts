@@ -40,6 +40,7 @@ export type WorkflowRunBlock = {
   data_schema: object | Array<unknown> | string | null;
   terminate_criterion: string | null;
   complete_criterion: string | null;
+  include_action_history_in_verification: boolean | null;
   actions: Array<ActionsApiResponse> | null;
   recipients?: Array<string> | null;
   attachments?: Array<string> | null;

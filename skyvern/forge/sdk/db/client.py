@@ -139,6 +139,7 @@ class AgentDB:
         error_code_mapping: dict[str, str] | None = None,
         task_type: str = TaskType.general,
         application: str | None = None,
+        include_action_history_in_verification: bool | None = None,
     ) -> Task:
         try:
             async with self.Session() as session:
@@ -164,6 +165,7 @@ class AgentDB:
                     max_steps_per_run=max_steps_per_run,
                     error_code_mapping=error_code_mapping,
                     application=application,
+                    include_action_history_in_verification=include_action_history_in_verification,
                 )
                 session.add(new_task)
                 await session.commit()
@@ -2564,6 +2566,7 @@ class AgentDB:
         wait_sec: int | None = None,
         description: str | None = None,
         block_workflow_run_id: str | None = None,
+        include_action_history_in_verification: bool | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             workflow_run_block = (
@@ -2604,6 +2607,8 @@ class AgentDB:
                     workflow_run_block.description = description
                 if block_workflow_run_id:
                     workflow_run_block.block_workflow_run_id = block_workflow_run_id
+                if include_action_history_in_verification is not None:
+                    workflow_run_block.include_action_history_in_verification = include_action_history_in_verification
                 await session.commit()
                 await session.refresh(workflow_run_block)
             else:

@@ -251,6 +251,7 @@ export type TaskBlock = WorkflowBlockBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  include_action_history_in_verification: boolean;
 };
 
 export type Taskv2Block = WorkflowBlockBase & {
@@ -363,6 +364,7 @@ export type NavigationBlock = WorkflowBlockBase & {
   cache_actions: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
+  include_action_history_in_verification: boolean;
 };
 
 export type ExtractionBlock = WorkflowBlockBase & {

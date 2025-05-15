@@ -172,6 +172,7 @@ class ForgeAgent:
             retry=task_retry,
             max_steps_per_run=task_block.max_steps_per_run,
             error_code_mapping=task_block.error_code_mapping,
+            include_action_history_in_verification=task_block.include_action_history_in_verification,
         )
         LOG.info(
             "Created a new task for workflow run",
@@ -226,6 +227,7 @@ class ForgeAgent:
             extracted_information_schema=task_request.extracted_information_schema,
             error_code_mapping=task_request.error_code_mapping,
             application=task_request.application,
+            include_action_history_in_verification=task_request.include_action_history_in_verification,
         )
         LOG.info(
             "Created new task",
@@ -1033,6 +1035,7 @@ class ForgeAgent:
                 for result in results:
                     result.step_retry_number = step.retry_index
                     result.step_order = step.order
+                step.output = detailed_agent_step_output.to_agent_step_output()
                 action_results.extend(results)
                 # Check the last result for this action. If that succeeded, assume the entire action is successful
                 if results and results[-1].success:
@@ -1462,8 +1465,9 @@ class ForgeAgent:
         )
         return actions
 
-    @staticmethod
-    async def complete_verify(page: Page, scraped_page: ScrapedPage, task: Task, step: Step) -> CompleteVerifyResult:
+    async def complete_verify(
+        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+    ) -> CompleteVerifyResult:
         LOG.info(
             "Checking if user goal is achieved after re-scraping the page",
             task_id=task.task_id,
@@ -1477,6 +1481,10 @@ class ForgeAgent:
 
         scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False, scroll=scroll)
 
+        actions_and_results_str = ""
+        if task.include_action_history_in_verification:
+            actions_and_results_str = await self._get_action_results(task, current_step=step)
+
         verification_prompt = load_prompt_with_elements(
             scraped_page=scraped_page_refreshed,
             prompt_engine=prompt_engine,
@@ -1484,6 +1492,7 @@ class ForgeAgent:
             navigation_goal=task.navigation_goal,
             navigation_payload=task.navigation_payload,
             complete_criterion=task.complete_criterion,
+            action_history=actions_and_results_str,
             local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
         )
 
@@ -1496,12 +1505,11 @@ class ForgeAgent:
         )
         return CompleteVerifyResult.model_validate(verification_result)
 
-    @staticmethod
     async def check_user_goal_complete(
-        page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
     ) -> CompleteAction | None:
         try:
-            verification_result = await app.agent.complete_verify(
+            verification_result = await self.complete_verify(
                 page=page,
                 scraped_page=scraped_page,
                 task=task,
@@ -1878,11 +1886,20 @@ class ForgeAgent:
                 current_context.totp_codes.pop(task.task_id)
         return final_navigation_payload
 
-    async def _get_action_results(self, task: Task) -> str:
+    async def _get_action_results(self, task: Task, current_step: Step | None = None) -> str:
+        """
+        Get the action results from the last app.SETTINGS.PROMPT_ACTION_HISTORY_WINDOW steps.
+        If current_step is provided, the current executing step will be included in the action history.
+        Default is excluding the current executing step from the action history.
+        """
+
         # Get action results from the last app.SETTINGS.PROMPT_ACTION_HISTORY_WINDOW steps
         steps = await app.DATABASE.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
         # the last step is always the newly created one and it should be excluded from the history window
         window_steps = steps[-1 - settings.PROMPT_ACTION_HISTORY_WINDOW : -1]
+        if current_step:
+            window_steps.append(current_step)
+
         actions_and_results: list[tuple[Action, list[ActionResult]]] = []
         for window_step in window_steps:
             if window_step.output and window_step.output.actions_and_results:

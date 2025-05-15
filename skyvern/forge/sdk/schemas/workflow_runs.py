@@ -35,6 +35,7 @@ class WorkflowRunBlock(BaseModel):
     actions: list[Action] = []
     created_at: datetime
     modified_at: datetime
+    include_action_history_in_verification: bool | None = False
 
     # for loop block
     loop_values: list[Any] | None = None

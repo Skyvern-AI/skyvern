@@ -38,7 +38,7 @@ import {
   CreateNewTaskFormValues,
 } from "./taskFormTypes";
 import { ProxySelector } from "@/components/ProxySelector";
-
+import { Switch } from "@/components/ui/switch";
 type Props = {
   initialValues: CreateNewTaskFormValues;
 };
@@ -80,6 +80,8 @@ function createTaskRequestObject(
     extracted_information_schema: extractedInformationSchema,
     totp_identifier: transform(formValues.totpIdentifier),
     error_code_mapping: errorCodeMapping,
+    include_action_history_in_verification:
+      formValues.includeActionHistoryInVerification,
   };
 }
 
@@ -425,6 +427,36 @@ function CreateNewTaskForm({ initialValues }: Props) {
           {isActive("advanced") && (
             <div className="space-y-6">
               <div className="space-y-4">
+                <FormField
+                  control={form.control}
+                  name="includeActionHistoryInVerification"
+                  render={({ field }) => (
+                    <FormItem>
+                      <div className="flex gap-16">
+                        <FormLabel>
+                          <div className="w-72">
+                            <h1 className="text-lg">Include Action History</h1>
+                            <h2 className="text-base text-slate-400">
+                              Whether to include action history when verifying
+                              the task completion.
+                            </h2>
+                          </div>
+                        </FormLabel>
+                        <div className="w-full">
+                          <FormControl>
+                            <Switch
+                              checked={field.value ?? false}
+                              onCheckedChange={(checked) => {
+                                field.onChange(checked);
+                              }}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </div>
+                      </div>
+                    </FormItem>
+                  )}
+                />
                 <FormField
                   control={form.control}
                   name="maxStepsOverride"
