@@ -4,7 +4,7 @@ from ..core.pydantic_utilities import UniversalBaseModel
 import pydantic
 from .run_status import RunStatus
 import typing
-from .output import Output
+from .workflow_run_response_output import WorkflowRunResponseOutput
 from .file_info import FileInfo
 import datetime as dt
 from .workflow_run_request import WorkflowRunRequest
@@ -22,7 +22,7 @@ class WorkflowRunResponse(UniversalBaseModel):
     Current status of the run
     """
 
-    output: typing.Optional[Output] = pydantic.Field(default=None)
+    output: typing.Optional[WorkflowRunResponseOutput] = pydantic.Field(default=None)
     """
     Output data from the run, if any. Format depends on the schema in the input
     """
@@ -50,6 +50,11 @@ class WorkflowRunResponse(UniversalBaseModel):
     modified_at: dt.datetime = pydantic.Field()
     """
     Timestamp when this run was last modified
+    """
+
+    app_url: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    URL to the application UI where the run can be viewed
     """
 
     run_request: typing.Optional[WorkflowRunRequest] = pydantic.Field(default=None)

@@ -6,7 +6,7 @@ import typing
 import datetime as dt
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
-from .value import Value
+from .context_parameter_value import ContextParameterValue
 from .workflow_parameter_type import WorkflowParameterType
 from .workflow_parameter_default_value import WorkflowParameterDefaultValue
 from ..core.pydantic_utilities import update_forward_refs
@@ -114,8 +114,8 @@ class TaskBlockParametersItem_Context(UniversalBaseModel):
     parameter_type: typing.Literal["context"] = "context"
     key: str
     description: typing.Optional[str] = None
-    source: "Source"
-    value: typing.Optional[Value] = None
+    source: "ContextParameterSource"
+    value: typing.Optional[ContextParameterValue] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -128,7 +128,7 @@ class TaskBlockParametersItem_Context(UniversalBaseModel):
 
 
 from .context_parameter import ContextParameter  # noqa: E402
-from .source import Source  # noqa: E402
+from .context_parameter_source import ContextParameterSource  # noqa: E402
 
 
 class TaskBlockParametersItem_Credential(UniversalBaseModel):

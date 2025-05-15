@@ -5,6 +5,7 @@ from ..core.pydantic_utilities import UniversalBaseModel
 from .context_parameter import ContextParameter
 import typing
 from .output_parameter import OutputParameter
+from .run_engine import RunEngine
 from .action_block_data_schema import ActionBlockDataSchema
 from .action_block_parameters_item import ActionBlockParametersItem
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
@@ -43,6 +44,7 @@ class ForLoopBlockLoopBlocksItem_Action(UniversalBaseModel):
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     navigation_goal: typing.Optional[str] = None
@@ -112,6 +114,7 @@ class ForLoopBlockLoopBlocksItem_Extraction(UniversalBaseModel):
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     navigation_goal: typing.Optional[str] = None
@@ -146,6 +149,7 @@ class ForLoopBlockLoopBlocksItem_FileDownload(UniversalBaseModel):
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     navigation_goal: typing.Optional[str] = None
@@ -243,6 +247,7 @@ class ForLoopBlockLoopBlocksItem_GotoUrl(UniversalBaseModel):
     task_type: typing.Optional[str] = None
     url: str
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     navigation_goal: typing.Optional[str] = None
@@ -277,6 +282,7 @@ class ForLoopBlockLoopBlocksItem_Login(UniversalBaseModel):
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     navigation_goal: typing.Optional[str] = None
@@ -311,6 +317,7 @@ class ForLoopBlockLoopBlocksItem_Navigation(UniversalBaseModel):
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     navigation_goal: str
@@ -388,6 +395,7 @@ class ForLoopBlockLoopBlocksItem_Task(UniversalBaseModel):
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     navigation_goal: typing.Optional[str] = None
@@ -481,6 +489,7 @@ class ForLoopBlockLoopBlocksItem_Validation(UniversalBaseModel):
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     navigation_goal: typing.Optional[str] = None
