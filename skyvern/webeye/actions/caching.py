@@ -5,7 +5,7 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
-from skyvern.webeye.actions.actions import Action, ActionStatus, ActionType
+from skyvern.webeye.actions.actions import Action, ActionStatus, ActionType, SelectOption
 from skyvern.webeye.scraper.scraper import ScrapedPage
 
 LOG = structlog.get_logger()
@@ -220,10 +220,12 @@ async def personalize_action(
     elif action.action_type == ActionType.CLICK:
         # TODO: we only use cached action.intention. send the intention, navigation payload + navigation goal, html
         # to small llm and make a decision of which elements to click. Not clicking anything is also an option here
+        # FIXME: what about the cached action is to use click action to upload a file with file_url?
         return [action]
     elif action.action_type == ActionType.SELECT_OPTION:
         # TODO: send the selection action with the original/previous option value. Our current selection agent
-        # is already able to handle it
+        # is already able to handle it. But we need to pass the empty option. otherwise, there will be an unexpected error about the null value
+        action.option = SelectOption()
         return [action]
     elif action.action_type in [
         ActionType.COMPLETE,
