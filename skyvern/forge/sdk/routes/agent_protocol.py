@@ -212,37 +212,7 @@ async def get_task_v1(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> TaskResponse:
     analytics.capture("skyvern-oss-agent-task-get")
-    task_obj = await app.DATABASE.get_task(task_id, organization_id=current_org.organization_id)
-    if not task_obj:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Task not found {task_id}",
-        )
-
-    # get latest step
-    latest_step = await app.DATABASE.get_latest_step(task_id, organization_id=current_org.organization_id)
-    if not latest_step:
-        return await app.agent.build_task_response(task=task_obj)
-
-    failure_reason: str | None = None
-    if task_obj.status == TaskStatus.failed and (latest_step.output or task_obj.failure_reason):
-        failure_reason = ""
-        if task_obj.failure_reason:
-            failure_reason += task_obj.failure_reason or ""
-        if latest_step.output is not None and latest_step.output.actions_and_results is not None:
-            action_results_string: list[str] = []
-            for action, results in latest_step.output.actions_and_results:
-                if len(results) == 0:
-                    continue
-                if results[-1].success:
-                    continue
-                action_results_string.append(f"{action.action_type} action failed.")
-
-            if len(action_results_string) > 0:
-                failure_reason += "(Exceptions: " + str(action_results_string) + ")"
-    return await app.agent.build_task_response(
-        task=task_obj, last_step=latest_step, failure_reason=failure_reason, need_browser_log=True
-    )
+    return await task_v1_service.get_task_v1_response(task_id=task_id, organization_id=current_org.organization_id)
 
 
 @legacy_base_router.post(
