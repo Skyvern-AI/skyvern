@@ -6,7 +6,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.runs import RunEngine, RunResponse, RunType, TaskRunRequest, TaskRunResponse
-from skyvern.services import task_v2_service, workflow_service
+from skyvern.services import task_v1_service, task_v2_service, workflow_service
 
 
 async def get_run_response(run_id: str, organization_id: str | None = None) -> RunResponse | None:
@@ -20,34 +20,40 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
         or run.task_run_type == RunType.anthropic_cua
     ):
         # fetch task v1 from db and transform to task run response
-        task_v1 = await app.DATABASE.get_task(run.run_id, organization_id=organization_id)
-        if not task_v1:
+        try:
+            task_v1_response = await task_v1_service.get_task_v1_response(
+                task_id=run.run_id, organization_id=organization_id
+            )
+        except TaskNotFound:
             return None
         run_engine = RunEngine.skyvern_v1
         if run.task_run_type == RunType.openai_cua:
             run_engine = RunEngine.openai_cua
         elif run.task_run_type == RunType.anthropic_cua:
             run_engine = RunEngine.anthropic_cua
+
         return TaskRunResponse(
             run_id=run.run_id,
             run_type=run.task_run_type,
-            status=str(task_v1.status),
-            output=task_v1.extracted_information,
-            failure_reason=task_v1.failure_reason,
-            created_at=task_v1.created_at,
-            modified_at=task_v1.modified_at,
-            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/tasks/{task_v1.task_id}",
+            status=str(task_v1_response.status),
+            output=task_v1_response.extracted_information,
+            failure_reason=task_v1_response.failure_reason,
+            created_at=task_v1_response.created_at,
+            modified_at=task_v1_response.modified_at,
+            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/tasks/{task_v1_response.task_id}",
+            recording_url=task_v1_response.recording_url,
+            downloaded_files=task_v1_response.downloaded_files,
             run_request=TaskRunRequest(
                 engine=run_engine,
-                prompt=task_v1.navigation_goal,
-                url=task_v1.url,
-                webhook_url=task_v1.webhook_callback_url,
-                totp_identifier=task_v1.totp_identifier,
-                totp_url=task_v1.totp_verification_url,
-                proxy_location=task_v1.proxy_location,
-                max_steps=task_v1.max_steps_per_run,
-                data_extraction_schema=task_v1.extracted_information_schema,
-                error_code_mapping=task_v1.error_code_mapping,
+                prompt=task_v1_response.request.navigation_goal,
+                url=task_v1_response.request.url,
+                webhook_url=task_v1_response.request.webhook_callback_url,
+                totp_identifier=task_v1_response.request.totp_identifier,
+                totp_url=task_v1_response.request.totp_verification_url,
+                proxy_location=task_v1_response.request.proxy_location,
+                max_steps=task_v1_response.max_steps_per_run,
+                data_extraction_schema=task_v1_response.request.extracted_information_schema,
+                error_code_mapping=task_v1_response.request.error_code_mapping,
             ),
         )
     elif run.task_run_type == RunType.task_v2:
@@ -56,7 +62,9 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
             return None
         workflow_run = None
         if task_v2.workflow_run_id:
-            workflow_run = await app.DATABASE.get_workflow_run(task_v2.workflow_run_id, organization_id=organization_id)
+            workflow_run = await workflow_service.get_workflow_run_response(
+                task_v2.workflow_run_id, organization_id=organization_id
+            )
         return TaskRunResponse(
             run_id=run.run_id,
             run_type=run.task_run_type,
@@ -65,6 +73,8 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
             failure_reason=workflow_run.failure_reason if workflow_run else None,
             created_at=task_v2.created_at,
             modified_at=task_v2.modified_at,
+            recording_url=workflow_run.recording_url if workflow_run else None,
+            downloaded_files=workflow_run.downloaded_files if workflow_run else None,
             app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/{task_v2.workflow_permanent_id}/{task_v2.workflow_run_id}",
             run_request=TaskRunRequest(
                 engine=RunEngine.skyvern_v2,

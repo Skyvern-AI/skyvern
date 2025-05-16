@@ -5,6 +5,7 @@ from fastapi import BackgroundTasks, HTTPException, Request
 from sqlalchemy.exc import OperationalError
 
 from skyvern.config import settings
+from skyvern.exceptions import TaskNotFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
@@ -12,7 +13,7 @@ from skyvern.forge.sdk.core.hashing import generate_url_hash
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration, TaskGenerationBase
-from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest
+from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.schemas.runs import RunEngine, RunType
 
 LOG = structlog.get_logger()
@@ -114,3 +115,34 @@ async def run_task(
         api_key=x_api_key,
     )
     return created_task
+
+
+async def get_task_v1_response(task_id: str, organization_id: str | None = None) -> TaskResponse:
+    task_obj = await app.DATABASE.get_task(task_id, organization_id=organization_id)
+    if not task_obj:
+        raise TaskNotFound(task_id=task_id)
+
+    # get latest step
+    latest_step = await app.DATABASE.get_latest_step(task_id, organization_id=organization_id)
+    if not latest_step:
+        return await app.agent.build_task_response(task=task_obj)
+
+    failure_reason: str | None = None
+    if task_obj.status == TaskStatus.failed and (latest_step.output or task_obj.failure_reason):
+        failure_reason = ""
+        if task_obj.failure_reason:
+            failure_reason += task_obj.failure_reason or ""
+        if latest_step.output is not None and latest_step.output.actions_and_results is not None:
+            action_results_string: list[str] = []
+            for action, results in latest_step.output.actions_and_results:
+                if len(results) == 0:
+                    continue
+                if results[-1].success:
+                    continue
+                action_results_string.append(f"{action.action_type} action failed.")
+
+            if len(action_results_string) > 0:
+                failure_reason += "(Exceptions: " + str(action_results_string) + ")"
+    return await app.agent.build_task_response(
+        task=task_obj, last_step=latest_step, failure_reason=failure_reason, need_browser_log=True
+    )
