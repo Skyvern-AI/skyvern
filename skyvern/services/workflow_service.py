@@ -73,9 +73,7 @@ async def get_workflow_run_response(
         workflow_run_id=workflow_run.workflow_run_id,
         organization_id=organization_id,
     )
-    app_url = (
-        f"{settings.SKYVERN_APP_URL.rstrip('/')}/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}"
-    )
+    app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}"
     return WorkflowRunResponse(
         run_id=workflow_run_id,
         run_type=RunType.workflow_run,
@@ -88,12 +86,12 @@ async def get_workflow_run_response(
         created_at=workflow_run.created_at,
         modified_at=workflow_run.modified_at,
         run_request=WorkflowRunRequest(
-            workflow_id=workflow_run.workflow_id,
+            workflow_id=workflow_run.workflow_permanent_id,
             title=workflow_run_resp.workflow_title,
             parameters=workflow_run_resp.parameters,
             proxy_location=workflow_run.proxy_location,
-            webhook_url=workflow_run.webhook_callback_url,
-            totp_url=workflow_run.totp_verification_url,
+            webhook_url=workflow_run.webhook_callback_url or None,
+            totp_url=workflow_run.totp_verification_url or None,
             totp_identifier=workflow_run.totp_identifier,
             # TODO: add browser session id
         ),

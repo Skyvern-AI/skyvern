@@ -1549,7 +1549,7 @@ async def run_task(
             failure_reason=None,
             created_at=task_v2.created_at,
             modified_at=task_v2.modified_at,
-            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/{task_v2.workflow_permanent_id}/{task_v2.workflow_run_id}",
+            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{task_v2.workflow_permanent_id}/{task_v2.workflow_run_id}",
             run_request=TaskRunRequest(
                 engine=RunEngine.skyvern_v2,
                 prompt=task_v2.prompt,
@@ -1633,7 +1633,7 @@ async def run_workflow(
         run_request=workflow_run_request,
         downloaded_files=None,
         recording_url=None,
-        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}",
+        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}",
     )
 
 
