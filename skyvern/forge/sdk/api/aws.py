@@ -205,7 +205,6 @@ class AsyncAWSClient:
                         "assignPublicIp": "DISABLED",
                     }
                 },
-                enableExecuteCommand=True,
             )
 
     async def stop_task(self, cluster: str, task: str, reason: str | None = None) -> dict:
