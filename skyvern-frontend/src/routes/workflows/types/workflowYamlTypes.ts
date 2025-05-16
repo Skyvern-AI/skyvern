@@ -185,6 +185,7 @@ export type NavigationBlockYAML = BlockYAMLBase & {
   cache_actions: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
+  engine: string | null;
   include_action_history_in_verification: boolean;
 };
 

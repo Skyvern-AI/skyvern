@@ -306,6 +306,7 @@ function convertToNode(
           maxStepsOverride: block.max_steps_per_run ?? null,
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
+          engine: block.engine ?? "skyvern-1.0",
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
         },
@@ -1052,6 +1053,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         cache_actions: node.data.cacheActions,
         complete_criterion: node.data.completeCriterion,
         terminate_criterion: node.data.terminateCriterion,
+        engine: node.data.engine,
         include_action_history_in_verification:
           node.data.includeActionHistoryInVerification,
       };
@@ -1763,6 +1765,7 @@ function convertBlocksToBlockYAML(
           block_type: "navigation",
           url: block.url,
           title: block.title,
+          engine: block.engine,
           navigation_goal: block.navigation_goal,
           error_code_mapping: block.error_code_mapping,
           max_retries: block.max_retries,
