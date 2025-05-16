@@ -179,10 +179,7 @@ async def run_task_v1(
     background_tasks: BackgroundTasks,
     task: TaskRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    x_api_key: Annotated[
-        str | None,
-        Header(None, description='Skyvern API key for your organization. You can find it in Skyvern "Settings" page.'),
-    ] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> CreateTaskResponse:
@@ -230,10 +227,7 @@ async def get_task_v1(
 async def cancel_task(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    x_api_key: Annotated[
-        str | None,
-        Header(None, description='Skyvern API key for your organization. You can find it in Skyvern "Settings" page.'),
-    ] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
 ) -> None:
     analytics.capture("skyvern-oss-agent-task-get")
     task_obj = await app.DATABASE.get_task(task_id, organization_id=current_org.organization_id)
@@ -261,10 +255,7 @@ async def cancel_task(
 async def cancel_workflow_run(
     workflow_run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    x_api_key: Annotated[
-        str | None,
-        Header(None, description='Skyvern API key for your organization. You can find it in Skyvern "Settings" page.'),
-    ] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
 ) -> None:
     workflow_run = await app.DATABASE.get_workflow_run(
         workflow_run_id=workflow_run_id,
@@ -309,10 +300,7 @@ async def cancel_workflow_run(
 async def retry_webhook(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    x_api_key: Annotated[
-        str | None,
-        Header(None, description='Skyvern API key for your organization. You can find it in Skyvern "Settings" page.'),
-    ] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
 ) -> TaskResponse:
     analytics.capture("skyvern-oss-agent-task-retry-webhook")
     task_obj = await app.DATABASE.get_task(task_id, organization_id=current_org.organization_id)
@@ -637,10 +625,7 @@ async def run_workflow_legacy(
     version: int | None = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     template: bool = Query(False),
-    x_api_key: Annotated[
-        str | None,
-        Header(None, description='Skyvern API key for your organization. You can find it in Skyvern "Settings" page.'),
-    ] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> RunWorkflowResponse:
@@ -1452,10 +1437,7 @@ async def run_task(
     background_tasks: BackgroundTasks,
     run_request: TaskRunRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    x_api_key: Annotated[
-        str | None,
-        Header(None, description='Skyvern API key for your organization. You can find it in Skyvern "Settings" page.'),
-    ] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TaskRunResponse:
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
@@ -1615,10 +1597,7 @@ async def run_workflow(
     workflow_run_request: WorkflowRunRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     template: bool = Query(False),
-    x_api_key: Annotated[
-        str | None,
-        Header(None, description='Skyvern API key for your organization. You can find it in Skyvern "Settings" page.'),
-    ] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
@@ -1679,10 +1658,7 @@ async def run_workflow(
 async def cancel_run(
     run_id: str = Path(..., description="The id of the task run or the workflow run to cancel."),
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    x_api_key: Annotated[
-        str | None,
-        Header(None, description='Skyvern API key for your organization. You can find it in Skyvern "Settings" page.'),
-    ] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
 ) -> None:
     analytics.capture("skyvern-oss-agent-cancel-run")
 

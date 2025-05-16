@@ -24,10 +24,7 @@ ALGORITHM = "HS256"
 
 
 async def get_current_org(
-    x_api_key: Annotated[
-        str | None,
-        Header(None, description='Skyvern API key for your organization. You can find it in Skyvern "Settings" page.'),
-    ] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
     authorization: Annotated[str | None, Header()] = None,
 ) -> Organization:
     if not x_api_key and not authorization:
