@@ -2125,8 +2125,8 @@ async def input_or_auto_complete_input(
     # 3. try each potential values from #2
     # 4. call LLM to tweak the orignal text according to the information from #3, then start #1 again
 
-    # FIXME: try the whole loop for twice now, to prevent too many LLM calls
-    MAX_AUTO_COMPLETE_ATTEMP = 2
+    # FIXME: try the whole loop for once now, to speed up skyvern
+    MAX_AUTO_COMPLETE_ATTEMP = 1
     current_attemp = 0
     current_value = text
     result = AutoCompletionResult()
@@ -2227,6 +2227,7 @@ async def input_or_auto_complete_input(
             tried_values.append(value)
             whole_new_elements.extend(result.incremental_elements)
 
+        # WARN: currently, we don't trigger this logic because MAX_AUTO_COMPLETE_ATTEMP is 1, to speed up skyvern
         if current_attemp < MAX_AUTO_COMPLETE_ATTEMP:
             LOG.info(
                 "Ask LLM to tweak the current value based on tried input values",
