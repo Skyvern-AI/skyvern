@@ -31,8 +31,8 @@ LOG = structlog.get_logger()
 @base_router.post(
     "/credentials/totp",
     response_model=TOTPCode,
-    summary="Send TOTP code",
-    description="Send a TOTP code to the user",
+    summary="Forward TOTP (2FA, MFA) code to Skyvern",
+    description="Forward a TOTP (2FA, MFA) code to Skyvern",
     tags=["Credentials"],
     openapi_extra={
         "x-fern-sdk-group-name": "credentials",
