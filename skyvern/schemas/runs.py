@@ -193,10 +193,11 @@ class TaskRunRequest(BaseModel):
         default=None,
         description="The starting URL for the task. If not provided, Skyvern will attempt to determine an appropriate URL",
     )
-    title: str | None = Field(default=None, description="Optional title for the task")
     engine: RunEngine = Field(
-        default=RunEngine.skyvern_v2, description="The Skyvern engine version to use for this task"
+        default=RunEngine.skyvern_v2,
+        description="The Skyvern engine version to use for this task. The default value is skyvern-2.0.",
     )
+    title: str | None = Field(default=None, description="The title for the task")
     proxy_location: ProxyLocation | None = Field(
         default=ProxyLocation.RESIDENTIAL, description="Geographic Proxy location to route the browser traffic through"
     )
@@ -224,8 +225,11 @@ class TaskRunRequest(BaseModel):
         default=None,
         description="ID of an existing browser session to reuse, having it continue from the current screen state",
     )
-    publish_workflow: bool = Field(default=False, description="Whether to publish this task as a reusable workflow. ")
-    include_action_history_in_verification: bool = Field(
+    publish_workflow: bool = Field(
+        default=False,
+        description="Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.",
+    )
+    include_action_history_in_verification: bool | None = Field(
         default=False, description="Whether to include action history when verifying that the task is complete"
     )
 
@@ -248,26 +252,29 @@ class TaskRunRequest(BaseModel):
 
 
 class WorkflowRunRequest(BaseModel):
-    workflow_id: str = Field(description="ID of the workflow to run")
-    title: str | None = Field(default=None, description="Optional title for this workflow run")
+    workflow_id: str = Field(
+        description="ID of the workflow to run. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
+    )
+    title: str | None = Field(default=None, description="The title for this workflow run")
     parameters: dict[str, Any] = Field(default={}, description="Parameters to pass to the workflow")
     proxy_location: ProxyLocation = Field(
         default=ProxyLocation.RESIDENTIAL, description="Location of proxy to use for this workflow run"
     )
     webhook_url: str | None = Field(
-        default=None, description="URL to send workflow status updates to after a run is finished"
+        default=None,
+        description="URL to send workflow status updates to after a run is finished. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for webhook questions.",
     )
     totp_url: str | None = Field(
         default=None,
-        description="URL for TOTP authentication setup if Skyvern should be polling endpoint for 2FA codes",
+        description="URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/running-tasks/advanced-features#get-code-from-your-endpoint",
     )
     totp_identifier: str | None = Field(
         default=None,
-        description="Identifier for TOTP (Time-based One-Time Password) authentication if codes are being pushed to Skyvern",
+        description="Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/running-tasks/advanced-features#time-based-one-time-password-totp",
     )
     browser_session_id: str | None = Field(
         default=None,
-        description="ID of an existing browser session to reuse, having it continue from the current screen state",
+        description="ID of a Skyvern browser session to reuse, having it continue from the current screen state",
     )
 
     @field_validator("webhook_url", "totp_url")
@@ -279,17 +286,30 @@ class WorkflowRunRequest(BaseModel):
 
 
 class BaseRunResponse(BaseModel):
-    run_id: str = Field(description="Unique identifier for this run")
-    status: RunStatus = Field(description="Current status of the run")
+    run_id: str = Field(
+        description="Unique identifier for this run. Run ID starts with `tsk_` for task runs and `wr_` for workflow runs.",
+        examples=["tsk_123", "tsk_v2_123", "wr_123"],
+    )
+    status: RunStatus = Field(
+        description="Current status of the run",
+        examples=["created", "queued", "running", "timed_out", "failed", "terminated", "completed", "canceled"],
+    )
     output: dict | list | str | None = Field(
-        default=None, description="Output data from the run, if any. Format depends on the schema in the input"
+        default=None,
+        description="Output data from the run, if any. Format/schema depends on the data extracted by the run.",
     )
     downloaded_files: list[FileInfo] | None = Field(default=None, description="List of files downloaded during the run")
     recording_url: str | None = Field(default=None, description="URL to the recording of the run")
-    failure_reason: str | None = Field(default=None, description="Reason for failure if the run failed")
-    created_at: datetime = Field(description="Timestamp when this run was created")
-    modified_at: datetime = Field(description="Timestamp when this run was last modified")
-    app_url: str | None = Field(default=None, description="URL to the application UI where the run can be viewed")
+    failure_reason: str | None = Field(default=None, description="Reason for failure if the run failed or terminated")
+    created_at: datetime = Field(description="Timestamp when this run was created", examples=["2025-01-01T00:00:00Z"])
+    modified_at: datetime = Field(
+        description="Timestamp when this run was last modified", examples=["2025-01-01T00:05:00Z"]
+    )
+    app_url: str | None = Field(
+        default=None,
+        description="URL to the application UI where the run can be viewed",
+        examples=["https://app.skyvern.com/tasks/tsk_123", "https://app.skyvern.com/workflows/wpid_123/wr_123"],
+    )
 
 
 class TaskRunResponse(BaseRunResponse):
