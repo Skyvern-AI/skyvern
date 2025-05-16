@@ -3319,10 +3319,11 @@ async def poll_verification_code(
     while True:
         # check timeout
         if datetime.utcnow() > timeout_datetime:
-            LOG.warning("Polling verification code timed out", workflow_id=workflow_id)
+            LOG.warning("Polling verification code timed out")
             raise NoTOTPVerificationCodeFound(
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
+                workflow_id=workflow_permanent_id,
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
             )
@@ -3339,7 +3340,7 @@ async def poll_verification_code(
                 task_id,
                 organization_id,
                 totp_identifier,
-                workflow_id=workflow_id,
+                workflow_id=workflow_permanent_id,
                 workflow_run_id=workflow_run_id,
             )
         if verification_code:

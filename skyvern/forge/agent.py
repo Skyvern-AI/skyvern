@@ -2631,10 +2631,18 @@ class ForgeAgent:
             and task.organization_id
         ):
             LOG.info("Need verification code", step_id=step.step_id)
+            workflow_id = workflow_permanent_id = None
+            if task.workflow_run_id:
+                workflow_run = await app.DATABASE.get_workflow_run(task.workflow_run_id)
+                if workflow_run:
+                    workflow_id = workflow_run.workflow_id
+                    workflow_permanent_id = workflow_run.workflow_permanent_id
             verification_code = await poll_verification_code(
                 task.task_id,
                 task.organization_id,
+                workflow_id=workflow_id,
                 workflow_run_id=task.workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
                 totp_verification_url=task.totp_verification_url,
                 totp_identifier=task.totp_identifier,
             )
