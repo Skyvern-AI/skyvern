@@ -49,9 +49,8 @@ async def skyvern_run_task(prompt: str, url: str) -> dict[str, str]:
     skyvern_agent = SkyvernAgent(
         base_url=settings.SKYVERN_BASE_URL,
         api_key=settings.SKYVERN_API_KEY,
-        extra_headers={"X-User-Agent": "skyvern-mcp"},
     )
-    res = await skyvern_agent.run_task(prompt=prompt, url=url)
+    res = await skyvern_agent.run_task(prompt=prompt, url=url, user_agent="skyvern-mcp")
 
     # TODO: It would be nice if we could return the task URL here
     output = res.model_dump()["output"]
