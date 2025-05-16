@@ -44,7 +44,6 @@ async def send_totp_code(
 ) -> TOTPCode:
     LOG.info(
         "Saving TOTP code",
-        data=data,
         organization_id=curr_org.organization_id,
         totp_identifier=data.totp_identifier,
         task_id=data.task_id,
