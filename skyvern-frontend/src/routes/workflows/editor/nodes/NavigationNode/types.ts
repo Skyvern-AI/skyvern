@@ -7,6 +7,7 @@ export type NavigationNodeData = NodeBaseData & {
   errorCodeMapping: string;
   completeCriterion: string;
   terminateCriterion: string;
+  engine: string | null;
   maxRetries: number | null;
   maxStepsOverride: number | null;
   allowDownloads: boolean;
@@ -27,6 +28,7 @@ export const navigationNodeDefaultData: NavigationNodeData = {
   completeCriterion: "",
   terminateCriterion: "",
   errorCodeMapping: "null",
+  engine: "skyvern-1.0",
   maxRetries: null,
   maxStepsOverride: null,
   allowDownloads: false,
