@@ -366,9 +366,9 @@ class SkyvernAgent:
                 while True:
                     task_run = await self.client.agent.get_run(task_run.run_id)
                     if task_run.status.is_final():
-                        return task_run
+                        break
                     await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
-        return task_run
+        return TaskRunResponse.model_validate(task_run.dict())
 
     async def run_workflow(
         self,
