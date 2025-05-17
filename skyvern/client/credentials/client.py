@@ -2,12 +2,14 @@
 
 import typing
 from ..core.client_wrapper import SyncClientWrapper
+import datetime as dt
 from ..core.request_options import RequestOptions
-from ..types.credential_response import CredentialResponse
+from ..types.totp_code import TotpCode
 from ..core.pydantic_utilities import parse_obj_as
 from ..errors.unprocessable_entity_error import UnprocessableEntityError
 from json.decoder import JSONDecodeError
 from ..core.api_error import ApiError
+from ..types.credential_response import CredentialResponse
 from ..types.credential_type import CredentialType
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
 from ..core.serialization import convert_and_respect_annotation_metadata
@@ -21,6 +23,107 @@ OMIT = typing.cast(typing.Any, ...)
 class CredentialsClient:
     def __init__(self, *, client_wrapper: SyncClientWrapper):
         self._client_wrapper = client_wrapper
+
+    def send_totp_code(
+        self,
+        *,
+        totp_identifier: str,
+        content: str,
+        task_id: typing.Optional[str] = OMIT,
+        workflow_id: typing.Optional[str] = OMIT,
+        workflow_run_id: typing.Optional[str] = OMIT,
+        source: typing.Optional[str] = OMIT,
+        expired_at: typing.Optional[dt.datetime] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> TotpCode:
+        """
+        Forward a TOTP (2FA, MFA) code to Skyvern
+
+        Parameters
+        ----------
+        totp_identifier : str
+            The identifier of the TOTP code. It can be the email address, phone number, or the identifier of the user.
+
+        content : str
+            The content of the TOTP code. It can be the email content that contains the TOTP code, or the sms message that contains the TOTP code. Skyvern will automatically extract the TOTP code from the content.
+
+        task_id : typing.Optional[str]
+            The task_id the totp code is for. It can be the task_id of the task that the TOTP code is for.
+
+        workflow_id : typing.Optional[str]
+            The workflow ID the TOTP code is for. It can be the workflow ID of the workflow that the TOTP code is for.
+
+        workflow_run_id : typing.Optional[str]
+            The workflow run id that the TOTP code is for. It can be the workflow run id of the workflow run that the TOTP code is for.
+
+        source : typing.Optional[str]
+            An optional field. The source of the TOTP code. e.g. email, sms, etc.
+
+        expired_at : typing.Optional[dt.datetime]
+            The timestamp when the TOTP code expires
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TotpCode
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
+        )
+        client.credentials.send_totp_code(
+            totp_identifier="john.doe@example.com",
+            content="Hello, your verification code is 123456",
+        )
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "v1/credentials/totp",
+            method="POST",
+            json={
+                "totp_identifier": totp_identifier,
+                "task_id": task_id,
+                "workflow_id": workflow_id,
+                "workflow_run_id": workflow_run_id,
+                "source": source,
+                "content": content,
+                "expired_at": expired_at,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    TotpCode,
+                    parse_obj_as(
+                        type_=TotpCode,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
 
     def get_credentials(
         self,
@@ -294,6 +397,115 @@ class CredentialsClient:
 class AsyncCredentialsClient:
     def __init__(self, *, client_wrapper: AsyncClientWrapper):
         self._client_wrapper = client_wrapper
+
+    async def send_totp_code(
+        self,
+        *,
+        totp_identifier: str,
+        content: str,
+        task_id: typing.Optional[str] = OMIT,
+        workflow_id: typing.Optional[str] = OMIT,
+        workflow_run_id: typing.Optional[str] = OMIT,
+        source: typing.Optional[str] = OMIT,
+        expired_at: typing.Optional[dt.datetime] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> TotpCode:
+        """
+        Forward a TOTP (2FA, MFA) code to Skyvern
+
+        Parameters
+        ----------
+        totp_identifier : str
+            The identifier of the TOTP code. It can be the email address, phone number, or the identifier of the user.
+
+        content : str
+            The content of the TOTP code. It can be the email content that contains the TOTP code, or the sms message that contains the TOTP code. Skyvern will automatically extract the TOTP code from the content.
+
+        task_id : typing.Optional[str]
+            The task_id the totp code is for. It can be the task_id of the task that the TOTP code is for.
+
+        workflow_id : typing.Optional[str]
+            The workflow ID the TOTP code is for. It can be the workflow ID of the workflow that the TOTP code is for.
+
+        workflow_run_id : typing.Optional[str]
+            The workflow run id that the TOTP code is for. It can be the workflow run id of the workflow run that the TOTP code is for.
+
+        source : typing.Optional[str]
+            An optional field. The source of the TOTP code. e.g. email, sms, etc.
+
+        expired_at : typing.Optional[dt.datetime]
+            The timestamp when the TOTP code expires
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TotpCode
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
+        )
+
+
+        async def main() -> None:
+            await client.credentials.send_totp_code(
+                totp_identifier="john.doe@example.com",
+                content="Hello, your verification code is 123456",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "v1/credentials/totp",
+            method="POST",
+            json={
+                "totp_identifier": totp_identifier,
+                "task_id": task_id,
+                "workflow_id": workflow_id,
+                "workflow_run_id": workflow_run_id,
+                "source": source,
+                "content": content,
+                "expired_at": expired_at,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    TotpCode,
+                    parse_obj_as(
+                        type_=TotpCode,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
 
     async def get_credentials(
         self,

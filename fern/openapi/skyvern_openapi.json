@@ -108,7 +108,17 @@
           }
         },
         "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "get_run"
+        "x-fern-sdk-method-name": "get_run",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nclient = Skyvern(api_key=\"your_api_key\")\nrun = await client.get_run(run_id=\"tsk_123\")\nprint(run)\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/workflows": {
@@ -2714,7 +2724,17 @@
           }
         },
         "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "run_task"
+        "x-fern-sdk-method-name": "run_task",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nclient = Skyvern(api_key=\"your_api_key\")\nawait client.run_task(prompt=\"What's the top post on hackernews?\")\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/run/workflows": {
@@ -2837,7 +2857,17 @@
           }
         },
         "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "run_workflow"
+        "x-fern-sdk-method-name": "run_workflow",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nclient = Skyvern(api_key=\"your_api_key\")\nawait client.agent.run_workflow(workflow_id=\"wpid_123\", parameters={\"parameter1\": \"value1\", \"parameter2\": \"value2\"})\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/runs/{run_id}/cancel": {
@@ -4589,7 +4619,7 @@
             "title": "Name",
             "description": "Name of the credential",
             "examples": [
-              "My Credential"
+              "Amazon Login"
             ]
           },
           "credential_type": {
@@ -4724,7 +4754,7 @@
             "title": "Name",
             "description": "Name of the credential",
             "examples": [
-              "My Credential"
+              "Amazon Login"
             ]
           }
         },
