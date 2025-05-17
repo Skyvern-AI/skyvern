@@ -6,7 +6,8 @@ import { AddNodeProps } from "../FlowRenderer";
 import { WorkflowBlockNode } from "../nodes";
 import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
 
-const enableCodeBlock = import.meta.env.VITE_ENABLE_CODE_BLOCK === "true";
+const enableCodeBlock =
+  import.meta.env.VITE_ENABLE_CODE_BLOCK?.toLowerCase() === "true";
 
 const nodeLibraryItems: Array<{
   nodeType: NonNullable<WorkflowBlockNode["type"]>;

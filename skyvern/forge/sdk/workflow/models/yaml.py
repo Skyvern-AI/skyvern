@@ -8,7 +8,7 @@ from skyvern.forge.sdk.workflow.models.block import BlockType, FileType
 from skyvern.forge.sdk.workflow.models.constants import FileStorageType
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowStatus
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.runs import ProxyLocation, RunEngine
 
 
 class ParameterYAML(BaseModel, abc.ABC):
@@ -143,6 +143,7 @@ class TaskBlockYAML(BlockYAML):
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     complete_verification: bool = True
+    include_action_history_in_verification: bool = False
 
 
 class ForLoopBlockYAML(BlockYAML):
@@ -275,6 +276,7 @@ class NavigationBlockYAML(BlockYAML):
     navigation_goal: str
     url: str | None = None
     title: str = ""
+    engine: RunEngine = RunEngine.skyvern_v1
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
@@ -287,6 +289,7 @@ class NavigationBlockYAML(BlockYAML):
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     complete_verification: bool = True
+    include_action_history_in_verification: bool = False
 
 
 class ExtractionBlockYAML(BlockYAML):

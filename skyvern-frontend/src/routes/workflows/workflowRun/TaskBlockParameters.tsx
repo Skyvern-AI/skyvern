@@ -3,6 +3,7 @@ import { Input } from "@/components/ui/input";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { WorkflowRunBlock } from "../types/workflowRunTypes";
 import { isTaskVariantBlock, WorkflowBlockTypes } from "../types/workflowTypes";
+import { Switch } from "@/components/ui/switch";
 
 type Props = {
   block: WorkflowRunBlock;
@@ -27,6 +28,10 @@ function TaskBlockParameters({ block }: Props) {
   const showValidationParameters =
     block.block_type === WorkflowBlockTypes.Validation;
 
+  const showIncludeActionHistoryInVerification =
+    block.block_type === WorkflowBlockTypes.Task ||
+    block.block_type === WorkflowBlockTypes.Navigation;
+
   return (
     <>
       <div className="flex gap-16">
@@ -44,7 +49,7 @@ function TaskBlockParameters({ block }: Props) {
           <div className="w-80">
             <h1 className="text-lg">Navigation Goal</h1>
             <h2 className="text-base text-slate-400">
-              Where should Skyvern go and what should Skyvern do?
+              What should Skyvern do on this page?
             </h2>
           </div>
           <AutoResizingTextarea value={block.navigation_goal ?? ""} readOnly />
@@ -127,6 +132,23 @@ function TaskBlockParameters({ block }: Props) {
             value={block.terminate_criterion ?? ""}
             readOnly
           />
+        </div>
+      ) : null}
+
+      {showIncludeActionHistoryInVerification ? (
+        <div className="flex gap-16">
+          <div className="w-80">
+            <h1 className="text-lg">Include Action History</h1>
+            <h2 className="text-base text-slate-400">
+              Whether to include action history in the completion verification
+            </h2>
+          </div>
+          <div className="w-full">
+            <Switch
+              checked={block.include_action_history_in_verification ?? false}
+              disabled
+            />
+          </div>
         </div>
       ) : null}
     </>

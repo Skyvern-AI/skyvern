@@ -17,6 +17,7 @@ export type TaskNodeData = NodeBaseData & {
   totpVerificationUrl: string | null;
   totpIdentifier: string | null;
   cacheActions: boolean;
+  includeActionHistoryInVerification: boolean;
 };
 
 export type TaskNode = Node<TaskNodeData, "task">;
@@ -40,6 +41,7 @@ export const taskNodeDefaultData: TaskNodeData = {
   totpIdentifier: null,
   continueOnFailure: false,
   cacheActions: false,
+  includeActionHistoryInVerification: false,
 } as const;
 
 export function isTaskNode(node: Node): node is TaskNode {

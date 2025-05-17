@@ -232,6 +232,8 @@ function convertToNode(
           cacheActions: block.cache_actions,
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
+          includeActionHistoryInVerification:
+            block.include_action_history_in_verification ?? false,
         },
       };
     }
@@ -304,6 +306,9 @@ function convertToNode(
           maxStepsOverride: block.max_steps_per_run ?? null,
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
+          engine: block.engine ?? "skyvern-1.0",
+          includeActionHistoryInVerification:
+            block.include_action_history_in_verification ?? false,
         },
       };
     }
@@ -384,6 +389,7 @@ function convertToNode(
         data: {
           ...commonData,
           code: block.code,
+          parameterKeys: block.parameters.map((p) => p.key),
         },
       };
     }
@@ -974,6 +980,8 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         cache_actions: node.data.cacheActions,
+        include_action_history_in_verification:
+          node.data.includeActionHistoryInVerification,
       };
     }
     case "taskv2": {
@@ -1045,6 +1053,9 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         cache_actions: node.data.cacheActions,
         complete_criterion: node.data.completeCriterion,
         terminate_criterion: node.data.terminateCriterion,
+        engine: node.data.engine,
+        include_action_history_in_verification:
+          node.data.includeActionHistoryInVerification,
       };
     }
     case "extraction": {
@@ -1140,6 +1151,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
       return {
         ...base,
         block_type: "code",
+        parameter_keys: node.data.parameterKeys,
         code: node.data.code,
       };
     }
@@ -1701,6 +1713,8 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           cache_actions: block.cache_actions,
+          include_action_history_in_verification:
+            block.include_action_history_in_verification,
         };
         return blockYaml;
       }
@@ -1751,6 +1765,7 @@ function convertBlocksToBlockYAML(
           block_type: "navigation",
           url: block.url,
           title: block.title,
+          engine: block.engine,
           navigation_goal: block.navigation_goal,
           error_code_mapping: block.error_code_mapping,
           max_retries: block.max_retries,
@@ -1763,6 +1778,8 @@ function convertBlocksToBlockYAML(
           cache_actions: block.cache_actions,
           complete_criterion: block.complete_criterion,
           terminate_criterion: block.terminate_criterion,
+          include_action_history_in_verification:
+            block.include_action_history_in_verification,
         };
         return blockYaml;
       }
@@ -1842,6 +1859,7 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "code",
           code: block.code,
+          parameter_keys: block.parameters.map((p) => p.key),
         };
         return blockYaml;
       }

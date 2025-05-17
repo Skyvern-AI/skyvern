@@ -1,6 +1,6 @@
 import json
 from datetime import datetime, timedelta
-from typing import Any, List, Optional, Sequence
+from typing import Any, List, Sequence
 
 import structlog
 from sqlalchemy import and_, delete, distinct, func, pool, select, tuple_, update
@@ -139,6 +139,7 @@ class AgentDB:
         error_code_mapping: dict[str, str] | None = None,
         task_type: str = TaskType.general,
         application: str | None = None,
+        include_action_history_in_verification: bool | None = None,
     ) -> Task:
         try:
             async with self.Session() as session:
@@ -164,6 +165,7 @@ class AgentDB:
                     max_steps_per_run=max_steps_per_run,
                     error_code_mapping=error_code_mapping,
                     application=application,
+                    include_action_history_in_verification=include_action_history_in_verification,
                 )
                 session.add(new_task)
                 await session.commit()
@@ -650,7 +652,11 @@ class AgentDB:
         try:
             async with self.Session() as session:
                 db_page = page - 1  # offset logic is 0 based
-                query = select(TaskModel).filter(TaskModel.organization_id == organization_id)
+                query = (
+                    select(TaskModel, WorkflowRunModel.workflow_permanent_id)
+                    .join(WorkflowRunModel, TaskModel.workflow_run_id == WorkflowRunModel.workflow_run_id, isouter=True)
+                    .filter(TaskModel.organization_id == organization_id)
+                )
                 if task_status:
                     query = query.filter(TaskModel.status.in_(task_status))
                 if workflow_run_id:
@@ -665,8 +671,42 @@ class AgentDB:
                     .limit(page_size)
                     .offset(db_page * page_size)
                 )
-                tasks = (await session.scalars(query)).all()
-                return [convert_to_task(task, debug_enabled=self.debug_enabled) for task in tasks]
+
+                results = (await session.execute(query)).all()
+
+                return [
+                    convert_to_task(task, debug_enabled=self.debug_enabled, workflow_permanent_id=workflow_permanent_id)
+                    for task, workflow_permanent_id in results
+                ]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_tasks_count(
+        self,
+        organization_id: str,
+        task_status: list[TaskStatus] | None = None,
+        workflow_run_id: str | None = None,
+        only_standalone_tasks: bool = False,
+        application: str | None = None,
+    ) -> int:
+        try:
+            async with self.Session() as session:
+                count_query = (
+                    select(func.count()).select_from(TaskModel).filter(TaskModel.organization_id == organization_id)
+                )
+                if task_status:
+                    count_query = count_query.filter(TaskModel.status.in_(task_status))
+                if workflow_run_id:
+                    count_query = count_query.filter(TaskModel.workflow_run_id == workflow_run_id)
+                if only_standalone_tasks:
+                    count_query = count_query.filter(TaskModel.workflow_run_id.is_(None))
+                if application:
+                    count_query = count_query.filter(TaskModel.application == application)
+                return (await session.execute(count_query)).scalar_one()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -1523,6 +1563,25 @@ class AgentDB:
                     convert_to_workflow_run(run, workflow_title=title, debug_enabled=self.debug_enabled)
                     for run, title in workflow_runs
                 ]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_workflow_runs_count(
+        self,
+        organization_id: str,
+        status: list[WorkflowRunStatus] | None = None,
+    ) -> int:
+        try:
+            async with self.Session() as session:
+                count_query = (
+                    select(func.count())
+                    .select_from(WorkflowRunModel)
+                    .filter(WorkflowRunModel.organization_id == organization_id)
+                )
+                if status:
+                    count_query = count_query.filter(WorkflowRunModel.status.in_(status))
+                return (await session.execute(count_query)).scalar_one()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -2599,7 +2658,7 @@ class AgentDB:
                 for workflow_run_block in workflow_run_blocks
             ]
 
-    async def get_active_persistent_browser_sessions(self, organization_id: str) -> List[PersistentBrowserSession]:
+    async def get_active_persistent_browser_sessions(self, organization_id: str) -> list[PersistentBrowserSession]:
         """Get all active persistent browser sessions for an organization."""
         try:
             async with self.Session() as session:
@@ -2617,23 +2676,24 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def get_persistent_browser_session_by_id(
-        self, session_id: str, organization_id: str | None = None
-    ) -> Optional[PersistentBrowserSession]:
+    async def get_persistent_browser_session_by_runnable_id(
+        self, runnable_id: str, organization_id: str | None = None
+    ) -> PersistentBrowserSession | None:
         """Get a specific persistent browser session."""
         try:
             async with self.Session() as session:
                 query = (
                     select(PersistentBrowserSessionModel)
-                    .filter_by(persistent_browser_session_id=session_id)
+                    .filter_by(runnable_id=runnable_id)
                     .filter_by(deleted_at=None)
+                    .filter_by(completed_at=None)
                 )
                 if organization_id:
                     query = query.filter_by(organization_id=organization_id)
                 persistent_browser_session = (await session.scalars(query)).first()
                 if persistent_browser_session:
                     return PersistentBrowserSession.model_validate(persistent_browser_session)
-                raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
+                return None
         except NotFoundError:
             LOG.error("NotFoundError", exc_info=True)
             raise
@@ -2645,8 +2705,10 @@ class AgentDB:
             raise
 
     async def get_persistent_browser_session(
-        self, session_id: str, organization_id: str
-    ) -> Optional[PersistentBrowserSessionModel]:
+        self,
+        session_id: str,
+        organization_id: str | None = None,
+    ) -> PersistentBrowserSession | None:
         """Get a specific persistent browser session."""
         try:
             async with self.Session() as session:
@@ -2676,6 +2738,7 @@ class AgentDB:
         organization_id: str,
         runnable_type: str | None = None,
         runnable_id: str | None = None,
+        timeout_minutes: int | None = None,
     ) -> PersistentBrowserSessionModel:
         """Create a new persistent browser session."""
         try:
@@ -2684,11 +2747,47 @@ class AgentDB:
                     organization_id=organization_id,
                     runnable_type=runnable_type,
                     runnable_id=runnable_id,
+                    timeout_minutes=timeout_minutes,
                 )
                 session.add(browser_session)
                 await session.commit()
                 await session.refresh(browser_session)
                 return PersistentBrowserSession.model_validate(browser_session)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def set_persistent_browser_session_browser_address(
+        self,
+        browser_session_id: str,
+        browser_address: str,
+        organization_id: str | None = None,
+    ) -> None:
+        """Set the browser address for a persistent browser session."""
+        try:
+            async with self.Session() as session:
+                persistent_browser_session = (
+                    await session.scalars(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(persistent_browser_session_id=browser_session_id)
+                        .filter_by(organization_id=organization_id)
+                        .filter_by(deleted_at=None)
+                    )
+                ).first()
+                if persistent_browser_session:
+                    persistent_browser_session.browser_address = browser_address
+                    # once the address is set, the session is started
+                    persistent_browser_session.started_at = datetime.utcnow()
+                    await session.commit()
+                    await session.refresh(persistent_browser_session)
+                else:
+                    raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
+        except NotFoundError:
+            LOG.error("NotFoundError", exc_info=True)
+            raise
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -2754,7 +2853,11 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def release_persistent_browser_session(self, session_id: str, organization_id: str) -> None:
+    async def release_persistent_browser_session(
+        self,
+        session_id: str,
+        organization_id: str,
+    ) -> PersistentBrowserSession:
         """Release a specific persistent browser session."""
         try:
             async with self.Session() as session:
@@ -2771,6 +2874,7 @@ class AgentDB:
                     persistent_browser_session.runnable_id = None
                     await session.commit()
                     await session.refresh(persistent_browser_session)
+                    return PersistentBrowserSession.model_validate(persistent_browser_session)
                 else:
                     raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
         except SQLAlchemyError:
@@ -2778,6 +2882,34 @@ class AgentDB:
             raise
         except NotFoundError:
             LOG.error("NotFoundError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def close_persistent_browser_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession:
+        """Close a specific persistent browser session."""
+        try:
+            async with self.Session() as session:
+                persistent_browser_session = (
+                    await session.scalars(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(persistent_browser_session_id=session_id)
+                        .filter_by(organization_id=organization_id)
+                        .filter_by(deleted_at=None)
+                    )
+                ).first()
+                if persistent_browser_session:
+                    persistent_browser_session.completed_at = datetime.utcnow()
+                    await session.commit()
+                    await session.refresh(persistent_browser_session)
+                    return PersistentBrowserSession.model_validate(persistent_browser_session)
+                raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
+        except NotFoundError:
+            LOG.error("NotFoundError", exc_info=True)
+            raise
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
             raise
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)

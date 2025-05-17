@@ -24,6 +24,8 @@ export const baseHelpTooltipContent = {
   continueOnFailure:
     "Allow the workflow to continue if it encounters a failure.",
   cacheActions: "Cache the actions of this block.",
+  includeActionHistoryInVerification:
+    "Include the action history in the completion verification.",
 } as const;
 
 export const basePlaceholderContent = {

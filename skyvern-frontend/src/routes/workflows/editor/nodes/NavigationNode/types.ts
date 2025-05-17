@@ -7,6 +7,7 @@ export type NavigationNodeData = NodeBaseData & {
   errorCodeMapping: string;
   completeCriterion: string;
   terminateCriterion: string;
+  engine: string | null;
   maxRetries: number | null;
   maxStepsOverride: number | null;
   allowDownloads: boolean;
@@ -15,6 +16,7 @@ export type NavigationNodeData = NodeBaseData & {
   totpVerificationUrl: string | null;
   totpIdentifier: string | null;
   cacheActions: boolean;
+  includeActionHistoryInVerification: boolean;
 };
 
 export type NavigationNode = Node<NavigationNodeData, "navigation">;
@@ -26,6 +28,7 @@ export const navigationNodeDefaultData: NavigationNodeData = {
   completeCriterion: "",
   terminateCriterion: "",
   errorCodeMapping: "null",
+  engine: "skyvern-1.0",
   maxRetries: null,
   maxStepsOverride: null,
   allowDownloads: false,
@@ -36,6 +39,7 @@ export const navigationNodeDefaultData: NavigationNodeData = {
   totpIdentifier: null,
   continueOnFailure: false,
   cacheActions: false,
+  includeActionHistoryInVerification: false,
 } as const;
 
 export function isNavigationNode(node: Node): node is NavigationNode {

@@ -93,6 +93,7 @@ class SkyvernElement:
     When you try to interact with these elements by python, you are supposed to use this class as an interface.
     """
 
+    # TODO: support to create SkyvernElement from incremental page by xpath
     @classmethod
     async def create_from_incremental(cls, incre_page: IncrementalScrapePage, element_id: str) -> SkyvernElement:
         element_dict = incre_page.id_to_element_dict.get(element_id)
@@ -296,6 +297,15 @@ class SkyvernElement:
     async def is_sibling_of(self, target: ElementHandle) -> bool:
         skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
         return await skyvern_frame.is_sibling(await self.get_element_handler(), target)
+
+    async def has_hidden_attr(self) -> bool:
+        hidden: str | None = await self.get_attr("hidden", mode="dynamic")
+        aria_hidden: str | None = await self.get_attr("aria-hidden", mode="dynamic")
+        if hidden is not None and hidden.lower() != "false":
+            return True
+        if aria_hidden is not None and aria_hidden.lower() != "false":
+            return True
+        return False
 
     def get_element_dict(self) -> dict:
         return self.__static_element
@@ -764,8 +774,20 @@ class DomUtil:
 
         num_elements = await locator.count()
         if num_elements < 1:
-            LOG.warning("No elements found with css. Validation failed.", css=css, element_id=element_id)
-            raise MissingElement(selector=css, element_id=element_id)
+            xpath: str | None = element.get("xpath")
+            if not xpath:
+                LOG.warning("No elements found with css. Validation failed.", css=css, element_id=element_id)
+                raise MissingElement(selector=css, element_id=element_id)
+            else:
+                # WARNING: current xpath is based on the tag name.
+                # It can only represent the element possition in the DOM tree with tag name, it's not 100% reliable.
+                # As long as the current possition has the same element with the tag name, the locator can be found.
+                # (maybe) we should validate the element hash to make sure the element is the same?
+                LOG.warning("Fallback to locator element by xpath.", xpath=xpath, element_id=element_id)
+                locator = frame_content.locator(f"xpath={xpath}")
+                num_elements = await locator.count()
+                if num_elements < 1:
+                    raise MissingElement(selector=xpath, element_id=element_id)
 
         elif num_elements > 1:
             LOG.warning(

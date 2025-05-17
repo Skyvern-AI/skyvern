@@ -8,11 +8,11 @@ from .workflow_parameter_default_value import WorkflowParameterDefaultValue
 import datetime as dt
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
-from .value import Value
+from .context_parameter_value import ContextParameterValue
 from ..core.pydantic_utilities import update_forward_refs
 
 
-class Source_Workflow(UniversalBaseModel):
+class ContextParameterSource_Workflow(UniversalBaseModel):
     parameter_type: typing.Literal["workflow"] = "workflow"
     key: str
     description: typing.Optional[str] = None
@@ -34,12 +34,12 @@ class Source_Workflow(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class Source_Context(UniversalBaseModel):
+class ContextParameterSource_Context(UniversalBaseModel):
     parameter_type: typing.Literal["context"] = "context"
     key: str
     description: typing.Optional[str] = None
-    source: "Source"
-    value: typing.Optional[Value] = None
+    source: "ContextParameterSource"
+    value: typing.Optional[ContextParameterValue] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -54,7 +54,7 @@ class Source_Context(UniversalBaseModel):
 from .context_parameter import ContextParameter  # noqa: E402
 
 
-class Source_AwsSecret(UniversalBaseModel):
+class ContextParameterSource_AwsSecret(UniversalBaseModel):
     parameter_type: typing.Literal["aws_secret"] = "aws_secret"
     key: str
     description: typing.Optional[str] = None
@@ -75,7 +75,7 @@ class Source_AwsSecret(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class Source_BitwardenLoginCredential(UniversalBaseModel):
+class ContextParameterSource_BitwardenLoginCredential(UniversalBaseModel):
     parameter_type: typing.Literal["bitwarden_login_credential"] = "bitwarden_login_credential"
     key: str
     description: typing.Optional[str] = None
@@ -101,7 +101,7 @@ class Source_BitwardenLoginCredential(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class Source_BitwardenSensitiveInformation(UniversalBaseModel):
+class ContextParameterSource_BitwardenSensitiveInformation(UniversalBaseModel):
     parameter_type: typing.Literal["bitwarden_sensitive_information"] = "bitwarden_sensitive_information"
     key: str
     description: typing.Optional[str] = None
@@ -127,7 +127,7 @@ class Source_BitwardenSensitiveInformation(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class Source_BitwardenCreditCardData(UniversalBaseModel):
+class ContextParameterSource_BitwardenCreditCardData(UniversalBaseModel):
     parameter_type: typing.Literal["bitwarden_credit_card_data"] = "bitwarden_credit_card_data"
     key: str
     description: typing.Optional[str] = None
@@ -152,7 +152,7 @@ class Source_BitwardenCreditCardData(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class Source_Output(UniversalBaseModel):
+class ContextParameterSource_Output(UniversalBaseModel):
     parameter_type: typing.Literal["output"] = "output"
     key: str
     description: typing.Optional[str] = None
@@ -172,7 +172,7 @@ class Source_Output(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class Source_Credential(UniversalBaseModel):
+class ContextParameterSource_Credential(UniversalBaseModel):
     parameter_type: typing.Literal["credential"] = "credential"
     key: str
     description: typing.Optional[str] = None
@@ -193,14 +193,14 @@ class Source_Credential(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-Source = typing.Union[
-    Source_Workflow,
-    Source_Context,
-    Source_AwsSecret,
-    Source_BitwardenLoginCredential,
-    Source_BitwardenSensitiveInformation,
-    Source_BitwardenCreditCardData,
-    Source_Output,
-    Source_Credential,
+ContextParameterSource = typing.Union[
+    ContextParameterSource_Workflow,
+    ContextParameterSource_Context,
+    ContextParameterSource_AwsSecret,
+    ContextParameterSource_BitwardenLoginCredential,
+    ContextParameterSource_BitwardenSensitiveInformation,
+    ContextParameterSource_BitwardenCreditCardData,
+    ContextParameterSource_Output,
+    ContextParameterSource_Credential,
 ]
-update_forward_refs(Source_Context)
+update_forward_refs(ContextParameterSource_Context)

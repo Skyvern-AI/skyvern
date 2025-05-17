@@ -274,16 +274,6 @@ class BrowserContextFactory:
 
             raise UnknownErrorWhileCreatingBrowserContext(browser_type, e) from e
 
-    @classmethod
-    def set_validate_browser_context(cls, validator: Callable[[Page], Awaitable[bool]]) -> None:
-        cls._validator = validator
-
-    @classmethod
-    async def validate_browser_context(cls, page: Page) -> bool:
-        if cls._validator is None:
-            return True
-        return await cls._validator(page)
-
 
 class VideoArtifact(BaseModel):
     video_path: str | None = None
@@ -475,10 +465,18 @@ async def _create_cdp_connection_browser(
             raise Exception("Port 9222 is already in use. Another process may be using this port.")
 
         browser_process = subprocess.Popen(
-            [browser_path, "--remote-debugging-port=9222"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            [
+                browser_path,
+                "--remote-debugging-port=9222",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--remote-debugging-address=0.0.0.0",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
         # Add small delay to allow browser to start
-        time.sleep(1)
+        time.sleep(2)
         if browser_process.poll() is not None:
             raise Exception(f"Failed to open browser. browser_path: {browser_path}")
 
@@ -603,6 +601,7 @@ class BrowserState:
                         loading_time=end_time - start_time,
                         url=url,
                     )
+                    # Do we need this?
                     await asyncio.sleep(5)
                     LOG.info(f"Successfully went to {url}", url=url, retry_time=retry_time)
                     return
@@ -638,6 +637,30 @@ class BrowserState:
             return self.__page
         await self.set_working_page(last_page, len(self.browser_context.pages) - 1)
         return last_page
+
+    async def validate_browser_context(self, page: Page) -> bool:
+        # validate the content
+        try:
+            skyvern_frame = await SkyvernFrame.create_instance(frame=page)
+            html = await skyvern_frame.get_content()
+        except Exception:
+            LOG.error(
+                "Error happened while getting the first page content",
+                exc_info=True,
+            )
+            return False
+
+        if "Bad gateway error" in html:
+            LOG.warning("Bad gateway error on the page, recreate a new browser context with another proxy node")
+            return False
+
+        if "client_connect_forbidden_host" in html:
+            LOG.warning(
+                "capture the client_connect_forbidden_host error on the page, recreate a new browser context with another proxy node"
+            )
+            return False
+
+        return True
 
     async def must_get_working_page(self) -> Page:
         page = await self.get_working_page()
@@ -710,7 +733,7 @@ class BrowserState:
             )
         page = await self.__assert_page()
 
-        if not await BrowserContextFactory.validate_browser_context(await self.get_working_page()):
+        if not await self.validate_browser_context(await self.get_working_page()):
             if not await self.close_current_open_page():
                 LOG.warning("Failed to close the current open page, going to skip the browser context validation")
                 return page

@@ -14,6 +14,7 @@ const createNewTaskFormSchemaBase = z.object({
   totpIdentifier: z.string().or(z.null()),
   errorCodeMapping: z.string().or(z.null()),
   proxyLocation: z.nativeEnum(ProxyLocation).or(z.null()),
+  includeActionHistoryInVerification: z.boolean().or(z.null()).default(false),
 });
 
 const savedTaskFormSchemaBase = createNewTaskFormSchemaBase.extend({

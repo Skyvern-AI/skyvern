@@ -619,6 +619,13 @@ class InteractWithDisabledElement(SkyvernException):
         )
 
 
+class InputToInvisibleElement(SkyvernException):
+    def __init__(self, element_id: str):
+        super().__init__(
+            f"The element(id={element_id}) now is not visible. Try to interact with other elements, or try to interact with it later when it's visible."
+        )
+
+
 class FailedToParseActionInstruction(SkyvernException):
     def __init__(self, reason: str | None, error_type: str | None):
         super().__init__(
@@ -653,6 +660,7 @@ class NoTOTPVerificationCodeFound(SkyvernHTTPException):
         self,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
+        workflow_id: str | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
     ) -> None:
@@ -661,6 +669,8 @@ class NoTOTPVerificationCodeFound(SkyvernHTTPException):
             msg += f" task_id={task_id}"
         if workflow_run_id:
             msg += f" workflow_run_id={workflow_run_id}"
+        if workflow_id:
+            msg += f" workflow_id={workflow_id}"
         if totp_verification_url:
             msg += f" totp_verification_url={totp_verification_url}"
         if totp_identifier:

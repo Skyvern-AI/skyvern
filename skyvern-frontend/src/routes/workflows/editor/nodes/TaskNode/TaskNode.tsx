@@ -66,6 +66,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
     errorCodeMapping: data.errorCodeMapping,
     totpVerificationUrl: data.totpVerificationUrl,
     totpIdentifier: data.totpIdentifier,
+    includeActionHistoryInVerification: data.includeActionHistoryInVerification,
   });
 
   function handleChange(key: string, value: unknown) {
@@ -290,6 +291,31 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                   )}
                 </div>
                 <Separator />
+                <div className="flex items-center justify-between">
+                  <div className="flex gap-2">
+                    <Label className="text-xs font-normal text-slate-300">
+                      Include Action History
+                    </Label>
+                    <HelpTooltip
+                      content={
+                        helpTooltips["task"][
+                          "includeActionHistoryInVerification"
+                        ]
+                      }
+                    />
+                  </div>
+                  <div className="w-52">
+                    <Switch
+                      checked={inputs.includeActionHistoryInVerification}
+                      onCheckedChange={(checked) => {
+                        handleChange(
+                          "includeActionHistoryInVerification",
+                          checked,
+                        );
+                      }}
+                    />
+                  </div>
+                </div>
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
                     <Label className="text-xs font-normal text-slate-300">

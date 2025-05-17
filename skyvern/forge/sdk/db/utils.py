@@ -58,7 +58,7 @@ def _custom_json_serializer(*args, **kwargs) -> str:
     return json.dumps(*args, default=pydantic.json.pydantic_encoder, **kwargs)
 
 
-def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False) -> Task:
+def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_permanent_id: str | None = None) -> Task:
     if debug_enabled:
         LOG.debug("Converting TaskModel to Task", task_id=task_obj.task_id)
     task = Task(
@@ -71,6 +71,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False) -> Task:
         url=task_obj.url,
         complete_criterion=task_obj.complete_criterion,
         terminate_criterion=task_obj.terminate_criterion,
+        include_action_history_in_verification=task_obj.include_action_history_in_verification,
         webhook_callback_url=task_obj.webhook_callback_url,
         totp_verification_url=task_obj.totp_verification_url,
         totp_identifier=task_obj.totp_identifier,
@@ -83,6 +84,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False) -> Task:
         proxy_location=(ProxyLocation(task_obj.proxy_location) if task_obj.proxy_location else None),
         extracted_information_schema=task_obj.extracted_information_schema,
         workflow_run_id=task_obj.workflow_run_id,
+        workflow_permanent_id=workflow_permanent_id,
         order=task_obj.order,
         retry=task_obj.retry,
         max_steps_per_run=task_obj.max_steps_per_run,
@@ -419,5 +421,6 @@ def convert_to_workflow_run_block(
         block.data_schema = task.extracted_information_schema
         block.terminate_criterion = task.terminate_criterion
         block.complete_criterion = task.complete_criterion
+        block.include_action_history_in_verification = task.include_action_history_in_verification
 
     return block

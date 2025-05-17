@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "skyvern"
-version = "0.1.79"
+version = "0.1.82"
 description = ""
 authors = ["Skyvern AI <info@skyvern.com>"]
 readme = "README.md"
@@ -16,7 +16,7 @@ python-multipart = "^0.0.6"
 toml = "^0.10.2"
 jinja2 = "^3.1.2"
 uvicorn = {extras = ["standard"], version = "^0.24.0.post1"}
-litellm = ">=1.67.4"
+litellm = ">=1.68.2"
 playwright = "1.46.0"
 pillow = "^10.1.0"
 starlette-context = "^0.3.6"

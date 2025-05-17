@@ -3,6 +3,7 @@ import { TaskApiResponse } from "@/api/types";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Switch } from "@/components/ui/switch";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useQuery } from "@tanstack/react-query";
@@ -122,6 +123,22 @@ function TaskParameters() {
           </h2>
         </div>
         <Input value={task.request.webhook_callback_url ?? ""} readOnly />
+      </div>
+      <div className="flex gap-16">
+        <div className="w-72">
+          <h1 className="text-lg">Include Action History</h1>
+          <h2 className="text-base text-slate-400">
+            Include the action history in the completion verification
+          </h2>
+        </div>
+        <div className="w-full">
+          <Switch
+            checked={
+              task.request.include_action_history_in_verification ?? false
+            }
+            disabled
+          />
+        </div>
       </div>
     </section>
   );

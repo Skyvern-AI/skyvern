@@ -32,6 +32,7 @@ from skyvern.exceptions import (
     FailToSelectByValue,
     IllegitComplete,
     ImaginaryFileUrl,
+    InputToInvisibleElement,
     InteractWithDisabledElement,
     InteractWithDropdownContainer,
     InvalidElementForTextInput,
@@ -875,6 +876,11 @@ async def handle_input_text_action(
                     await skyvern_element.press_key("Escape")
                     await skyvern_element.blur()
                 await incremental_scraped.stop_listen_dom_increment()
+
+    ### Start filling text logic
+    # check if the element has hidden attribute
+    if await skyvern_element.has_hidden_attr():
+        return [ActionFailure(InputToInvisibleElement(skyvern_element.get_id()), stop_execution_on_failure=False)]
 
     # force to move focus back to the element
     await skyvern_element.get_locator().focus(timeout=timeout)
@@ -2119,8 +2125,8 @@ async def input_or_auto_complete_input(
     # 3. try each potential values from #2
     # 4. call LLM to tweak the orignal text according to the information from #3, then start #1 again
 
-    # FIXME: try the whole loop for twice now, to prevent too many LLM calls
-    MAX_AUTO_COMPLETE_ATTEMP = 2
+    # FIXME: try the whole loop for once now, to speed up skyvern
+    MAX_AUTO_COMPLETE_ATTEMP = 1
     current_attemp = 0
     current_value = text
     result = AutoCompletionResult()
@@ -2221,6 +2227,7 @@ async def input_or_auto_complete_input(
             tried_values.append(value)
             whole_new_elements.extend(result.incremental_elements)
 
+        # WARN: currently, we don't trigger this logic because MAX_AUTO_COMPLETE_ATTEMP is 1, to speed up skyvern
         if current_attemp < MAX_AUTO_COMPLETE_ATTEMP:
             LOG.info(
                 "Ask LLM to tweak the current value based on tried input values",
@@ -2280,6 +2287,7 @@ async def sequentially_select_from_dropdown(
     dropdown_menu_element: SkyvernElement | None = None,
     force_select: bool = False,
     target_value: str = "",
+    continue_until_close: bool = False,
 ) -> CustomSingleSelectResult | None:
     """
     TODO: support to return all values retrieved from the sequentially select
@@ -2400,6 +2408,14 @@ async def sequentially_select_from_dropdown(
         if single_select_result.action_type is not None and single_select_result.action_type == ActionType.INPUT_TEXT:
             LOG.info(
                 "It's an input mini action, going to continue the select action",
+                step_id=step.step_id,
+                task_id=task.task_id,
+            )
+            continue
+
+        if continue_until_close:
+            LOG.info(
+                "Continue the selecting until the dropdown menu is closed",
                 step_id=step.step_id,
                 task_id=task.task_id,
             )
@@ -3303,10 +3319,11 @@ async def poll_verification_code(
     while True:
         # check timeout
         if datetime.utcnow() > timeout_datetime:
-            LOG.warning("Polling verification code timed out", workflow_id=workflow_id)
+            LOG.warning("Polling verification code timed out")
             raise NoTOTPVerificationCodeFound(
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
+                workflow_id=workflow_permanent_id,
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
             )
@@ -3323,7 +3340,7 @@ async def poll_verification_code(
                 task_id,
                 organization_id,
                 totp_identifier,
-                workflow_id=workflow_id,
+                workflow_id=workflow_permanent_id,
                 workflow_run_id=workflow_run_id,
             )
         if verification_code:

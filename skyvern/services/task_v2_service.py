@@ -10,7 +10,13 @@ from playwright.async_api import Page
 from sqlalchemy.exc import OperationalError
 
 from skyvern.config import settings
-from skyvern.exceptions import FailedToSendWebhook, TaskTerminationError, TaskV2NotFound, UrlGenerationFailure
+from skyvern.exceptions import (
+    FailedToSendWebhook,
+    MissingBrowserState,
+    TaskTerminationError,
+    TaskV2NotFound,
+    UrlGenerationFailure,
+)
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -61,7 +67,7 @@ from skyvern.webeye.utils.page import SkyvernFrame
 LOG = structlog.get_logger()
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
 RANDOM_STRING_POOL = string.ascii_letters + string.digits
-DEFAULT_MAX_ITERATIONS = 10
+DEFAULT_MAX_ITERATIONS = 13
 
 MINI_GOAL_TEMPLATE = """Achieve the following mini goal and once it's achieved, complete:
 ```{mini_goal}```
@@ -481,31 +487,86 @@ async def run_task_v2_helper(
         task_history_record: dict[str, Any] = {}
         context = skyvern_context.ensure_context()
 
+        # Always ensure browser_state is available at the start of the loop
         current_url: str | None = None
         page: Page | None = None
-        browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id, workflow_run.parent_workflow_run_id)
-        if browser_state:
+        fallback_url = settings.TASK_BLOCKED_SITE_FALLBACK_URL
+        browser_state = app.BROWSER_MANAGER.get_for_workflow_run(
+            workflow_run_id=workflow_run_id, parent_workflow_run_id=workflow_run.parent_workflow_run_id
+        )
+        if browser_state is None:
+            fallback_occurred = False
+            try:
+                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                    workflow_run=workflow_run,
+                    url=url,
+                    browser_session_id=browser_session_id,
+                )
+            except Exception:
+                LOG.warning("Failed to get or create browser state, fallback to Google", exc_info=True, url=url)
+
+                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                    workflow_run=workflow_run,
+                    url=fallback_url,
+                    browser_session_id=browser_session_id,
+                )
+
+                fallback_occurred = True
+
+            if browser_state is None:
+                LOG.error("Failed to create browser state even after fallback", workflow_run_id=workflow_run_id)
+                raise MissingBrowserState(workflow_run_id=workflow_run_id)
+
+            page = await browser_state.get_working_page()
+
+            page_loaded = False
+            if page:
+                try:
+                    # Check if the page has a body element to verify it loaded
+                    # page will always be None if browser state failed to load
+                    page_loaded = await browser_state.validate_browser_context(page)
+                except Exception:
+                    page_loaded = False
+                    LOG.warning(
+                        "Page failed to load properly, fallback to Google",
+                        exc_info=True,
+                        url=url,
+                        current_url=current_url,
+                    )
+
+            if not page_loaded:
+                # Page failed to load properly, fallback to Google
+                if page:
+                    try:
+                        await page.goto(fallback_url, timeout=15000)
+                        fallback_occurred = True
+                    except Exception:
+                        LOG.exception("Failed to load Google fallback", exc_info=True, url=url, current_url=current_url)
+        else:
             page = await browser_state.get_working_page()
             if page:
                 current_url = await SkyvernFrame.get_url(page)
 
         if i == 0 and current_url != url:
-            # The first iteration is always a GOTO_URL task
-            task_type = "goto_url"
-            plan = f"Go to this website: {url}"
-            task_history_record = {"type": task_type, "task": plan}
-            block, block_yaml_list, parameter_yaml_list = await _generate_goto_url_task(
-                workflow_id=workflow_id,
-                url=url,
-            )
+            if fallback_occurred:
+                plan = f"Go to Google because the intended website ({url}) failed to load properly."
+                task_type = "goto_url"
+                task_history_record = {"type": task_type, "task": plan}
+                block, block_yaml_list, parameter_yaml_list = await _generate_goto_url_task(
+                    workflow_id=workflow_id,
+                    url=fallback_url,
+                )
+            else:
+                # Page loaded successfully, proceed with original URL
+                plan = f"Go to this website: {url}"
+                task_type = "goto_url"
+                task_history_record = {"type": task_type, "task": plan}
+                block, block_yaml_list, parameter_yaml_list = await _generate_goto_url_task(
+                    workflow_id=workflow_id,
+                    url=url,
+                )
         else:
             try:
-                if browser_state is None:
-                    browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                        workflow_run=workflow_run,
-                        url=url,
-                        browser_session_id=browser_session_id,
-                    )
                 scraped_page = await scrape_website(
                     browser_state,
                     url,
@@ -1493,6 +1554,7 @@ async def _summarize_task_v2(
     )
     task_v2_summary_resp = await app.LLM_API_HANDLER(
         prompt=task_v2_summary_prompt,
+        screenshots=screenshots,
         thought=thought,
         prompt_name="task_v2_summary",
     )

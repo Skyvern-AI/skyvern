@@ -677,6 +677,16 @@ class WorkflowService:
             organization_id=organization_id, page=page, page_size=page_size, status=status
         )
 
+    async def get_workflow_runs_count(
+        self,
+        organization_id: str,
+        status: list[WorkflowRunStatus] | None = None,
+    ) -> int:
+        return await app.DATABASE.get_workflow_runs_count(
+            organization_id=organization_id,
+            status=status,
+        )
+
     async def get_workflow_runs_for_workflow_permanent_id(
         self,
         workflow_permanent_id: str,
@@ -969,7 +979,7 @@ class WorkflowService:
     async def build_workflow_run_status_response_by_workflow_id(
         self,
         workflow_run_id: str,
-        organization_id: str,
+        organization_id: str | None = None,
         include_cost: bool = False,
     ) -> WorkflowRunResponseBase:
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
@@ -988,7 +998,7 @@ class WorkflowService:
         self,
         workflow_permanent_id: str,
         workflow_run_id: str,
-        organization_id: str,
+        organization_id: str | None = None,
         include_cost: bool = False,
     ) -> WorkflowRunResponseBase:
         workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id)
@@ -1611,6 +1621,7 @@ class WorkflowService:
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
                 complete_verification=block_yaml.complete_verification,
+                include_action_history_in_verification=block_yaml.include_action_history_in_verification,
             )
         elif block_yaml.block_type == BlockType.FOR_LOOP:
             loop_blocks = [
@@ -1790,6 +1801,7 @@ class WorkflowService:
                 label=block_yaml.label,
                 url=block_yaml.url,
                 title=block_yaml.title,
+                engine=block_yaml.engine,
                 parameters=navigation_block_parameters,
                 output_parameter=output_parameter,
                 navigation_goal=block_yaml.navigation_goal,
@@ -1805,6 +1817,7 @@ class WorkflowService:
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
                 complete_verification=block_yaml.complete_verification,
+                include_action_history_in_verification=block_yaml.include_action_history_in_verification,
             )
 
         elif block_yaml.block_type == BlockType.EXTRACTION:
