@@ -10,17 +10,17 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2
 class WorkflowRunRequest(UniversalBaseModel):
     workflow_id: str = pydantic.Field()
     """
-    ID of the workflow to run. Workflow ID starts with `wpid_`.
+    ID of the workflow to run
+    """
+
+    title: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Optional title for this workflow run
     """
 
     parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = pydantic.Field(default=None)
     """
     Parameters to pass to the workflow
-    """
-
-    title: typing.Optional[str] = pydantic.Field(default=None)
-    """
-    The title for this workflow run
     """
 
     proxy_location: typing.Optional[ProxyLocation] = pydantic.Field(default=None)
@@ -30,22 +30,22 @@ class WorkflowRunRequest(UniversalBaseModel):
 
     webhook_url: typing.Optional[str] = pydantic.Field(default=None)
     """
-    URL to send workflow status updates to after a run is finished. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for webhook questions.
+    URL to send workflow status updates to after a run is finished
     """
 
     totp_url: typing.Optional[str] = pydantic.Field(default=None)
     """
-    URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/running-tasks/advanced-features#get-code-from-your-endpoint
+    URL for TOTP authentication setup if Skyvern should be polling endpoint for 2FA codes
     """
 
     totp_identifier: typing.Optional[str] = pydantic.Field(default=None)
     """
-    Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/running-tasks/advanced-features#time-based-one-time-password-totp
+    Identifier for TOTP (Time-based One-Time Password) authentication if codes are being pushed to Skyvern
     """
 
     browser_session_id: typing.Optional[str] = pydantic.Field(default=None)
     """
-    ID of a Skyvern browser session to reuse, having it continue from the current screen state
+    ID of an existing browser session to reuse, having it continue from the current screen state
     """
 
     if IS_PYDANTIC_V2:

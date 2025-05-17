@@ -60,7 +60,6 @@ class WorkflowDefinitionBlocksItem_Action(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
-    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -131,7 +130,6 @@ class WorkflowDefinitionBlocksItem_Extraction(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
-    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -167,7 +165,6 @@ class WorkflowDefinitionBlocksItem_FileDownload(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
-    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -267,7 +264,6 @@ class WorkflowDefinitionBlocksItem_GotoUrl(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
-    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -303,7 +299,6 @@ class WorkflowDefinitionBlocksItem_Login(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
-    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -339,7 +334,6 @@ class WorkflowDefinitionBlocksItem_Navigation(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
-    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -418,7 +412,6 @@ class WorkflowDefinitionBlocksItem_Task(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
-    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -513,7 +506,6 @@ class WorkflowDefinitionBlocksItem_Validation(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
-    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
