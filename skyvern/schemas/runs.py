@@ -255,9 +255,9 @@ class WorkflowRunRequest(BaseModel):
     workflow_id: str = Field(
         description="ID of the workflow to run. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
     )
-    title: str | None = Field(default=None, description="The title for this workflow run")
     parameters: dict[str, Any] = Field(default={}, description="Parameters to pass to the workflow")
-    proxy_location: ProxyLocation = Field(
+    title: str | None = Field(default=None, description="The title for this workflow run")
+    proxy_location: ProxyLocation | None = Field(
         default=ProxyLocation.RESIDENTIAL, description="Location of proxy to use for this workflow run"
     )
     webhook_url: str | None = Field(

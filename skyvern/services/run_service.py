@@ -12,6 +12,12 @@ from skyvern.services import task_v1_service, task_v2_service, workflow_service
 async def get_run_response(run_id: str, organization_id: str | None = None) -> RunResponse | None:
     run = await app.DATABASE.get_run(run_id, organization_id=organization_id)
     if not run:
+        # try to see if it's a workflow run id for task v2
+        task_v2 = await app.DATABASE.get_task_v2_by_workflow_run_id(run_id, organization_id=organization_id)
+        if task_v2:
+            run = await app.DATABASE.get_run(task_v2.observer_cruise_id, organization_id=organization_id)
+
+    if not run:
         return None
 
     if (

@@ -23,7 +23,7 @@ from skyvern.webeye.schemas import BrowserSessionResponse
     responses={
         200: {"description": "Successfully retrieved browser session details"},
         404: {"description": "Browser session not found"},
-        401: {"description": "Unauthorized - Invalid or missing authentication"},
+        403: {"description": "Unauthorized - Invalid or missing authentication"},
     },
 )
 async def get_browser_session(
@@ -52,7 +52,7 @@ async def get_browser_session(
     summary="Get all active browser sessions",
     responses={
         200: {"description": "Successfully retrieved all active browser sessions"},
-        401: {"description": "Unauthorized - Invalid or missing authentication"},
+        403: {"description": "Unauthorized - Invalid or missing authentication"},
     },
 )
 async def get_browser_sessions(
@@ -76,7 +76,7 @@ async def get_browser_sessions(
     summary="Create a new browser session",
     responses={
         200: {"description": "Successfully created browser session"},
-        401: {"description": "Unauthorized - Invalid or missing authentication"},
+        403: {"description": "Unauthorized - Invalid or missing authentication"},
     },
 )
 async def create_browser_session(
@@ -101,7 +101,7 @@ async def create_browser_session(
     summary="Close a browser session",
     responses={
         200: {"description": "Successfully closed browser session"},
-        401: {"description": "Unauthorized - Invalid or missing authentication"},
+        403: {"description": "Unauthorized - Invalid or missing authentication"},
     },
 )
 async def close_browser_session(

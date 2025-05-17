@@ -14,6 +14,6 @@ setup_logger()
 
 
 from skyvern.forge import app  # noqa: E402, F401
-from skyvern.agent import SkyvernAgent  # noqa: E402
+from skyvern.library import Skyvern  # noqa: E402
 
-__all__ = ["SkyvernAgent"]
+__all__ = ["Skyvern"]
