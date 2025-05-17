@@ -4,6 +4,6 @@ from ..core.api_error import ApiError
 import typing
 
 
-class ForbiddenError(ApiError):
+class UnauthorizedError(ApiError):
     def __init__(self, body: typing.Optional[typing.Any]):
-        super().__init__(status_code=403, body=body)
+        super().__init__(status_code=401, body=body)
