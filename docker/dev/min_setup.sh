@@ -33,7 +33,7 @@ update_or_add_env_var() {
             continue
         fi
         
-        if [[ "$line" =~ ^[[:space:]]*"$key"= ]]; then
+        if [[ "$line" =~ ^[[:space:]]*$key= ]]; then
             echo "$key=$value" >> "$temp_file"
             found=1
         else
@@ -138,7 +138,7 @@ setup_llm_providers() {
         update_or_add_env_var "ENABLE_AZURE" "false"
     fi
 
-    #Gemini Configuartion
+    #Gemini Configuration
     echo "To enable Gemini, you must have an Gemini API key."
     read -p "Do you want to enable Gemini (y/n)? " enable_gemini
     if [[ "$enable_gemini" == "y" ]]; then

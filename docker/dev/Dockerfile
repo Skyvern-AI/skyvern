@@ -35,9 +35,6 @@ RUN apt-get update && apt-get install -y \
     libpango-1.0-0 \
     libcairo2 \
     libasound2 
-    
-# Setup PPA and update
-RUN add-apt-repository ppa:git-core/ppa && apt-get update && apt-get install -y git
 
 # SSH setup
 RUN mkdir /var/run/sshd

@@ -75,8 +75,7 @@ export NVM_DIR="$HOME/.nvm"
 # Poetry configuration
 export PATH="$HOME/.local/bin:$PATH"
 
-# Poetry configuration
-export PATH="$HOME/.local/bin:$PATH"
+# Alias
 alias pshell="poetry shell"
 alias prun="poetry run"
 alias activate-venv="source \$(poetry env info --path)/bin/activate"
