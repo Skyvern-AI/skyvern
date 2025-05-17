@@ -20,14 +20,14 @@ class TaskRunRequest(UniversalBaseModel):
     The starting URL for the task. If not provided, Skyvern will attempt to determine an appropriate URL
     """
 
-    engine: typing.Optional[RunEngine] = pydantic.Field(default=None)
-    """
-    The Skyvern engine version to use for this task. The default value is skyvern-2.0.
-    """
-
     title: typing.Optional[str] = pydantic.Field(default=None)
     """
-    The title for the task
+    Optional title for the task
+    """
+
+    engine: typing.Optional[RunEngine] = pydantic.Field(default=None)
+    """
+    The Skyvern engine version to use for this task
     """
 
     proxy_location: typing.Optional[ProxyLocation] = pydantic.Field(default=None)
@@ -72,12 +72,7 @@ class TaskRunRequest(UniversalBaseModel):
 
     publish_workflow: typing.Optional[bool] = pydantic.Field(default=None)
     """
-    Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.
-    """
-
-    include_action_history_in_verification: typing.Optional[bool] = pydantic.Field(default=None)
-    """
-    Whether to include action history when verifying that the task is complete
+    Whether to publish this task as a reusable workflow. 
     """
 
     if IS_PYDANTIC_V2:

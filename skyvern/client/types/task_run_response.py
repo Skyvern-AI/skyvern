@@ -14,7 +14,7 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2
 class TaskRunResponse(UniversalBaseModel):
     run_id: str = pydantic.Field()
     """
-    Unique identifier for this run. Run ID starts with `tsk_` for task runs and `wr_` for workflow runs.
+    Unique identifier for this run
     """
 
     status: RunStatus = pydantic.Field()
@@ -24,7 +24,7 @@ class TaskRunResponse(UniversalBaseModel):
 
     output: typing.Optional[TaskRunResponseOutput] = pydantic.Field(default=None)
     """
-    Output data from the run, if any. Format/schema depends on the data extracted by the run.
+    Output data from the run, if any. Format depends on the schema in the input
     """
 
     downloaded_files: typing.Optional[typing.List[FileInfo]] = pydantic.Field(default=None)
@@ -39,7 +39,7 @@ class TaskRunResponse(UniversalBaseModel):
 
     failure_reason: typing.Optional[str] = pydantic.Field(default=None)
     """
-    Reason for failure if the run failed or terminated
+    Reason for failure if the run failed
     """
 
     created_at: dt.datetime = pydantic.Field()
