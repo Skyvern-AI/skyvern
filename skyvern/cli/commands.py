@@ -15,10 +15,10 @@ import uvicorn
 from dotenv import load_dotenv, set_key
 from mcp.server.fastmcp import FastMCP
 
-from skyvern.agent import SkyvernAgent
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.library import Skyvern
 from skyvern.utils import detect_os, get_windows_appdata_roaming, migrate_db
 
 load_dotenv()
@@ -46,7 +46,7 @@ async def skyvern_run_task(prompt: str, url: str) -> dict[str, str]:
                NYC to LA", "Sign up for the newsletter", "Find the price of item X", "Apply to a job")
         url: The starting URL of the website where the task should be performed
     """
-    skyvern_agent = SkyvernAgent(
+    skyvern_agent = Skyvern(
         base_url=settings.SKYVERN_BASE_URL,
         api_key=settings.SKYVERN_API_KEY,
     )
@@ -562,7 +562,7 @@ async def _setup_local_organization() -> str:
     """
     Returns the API key for the local organization generated
     """
-    skyvern_agent = SkyvernAgent(
+    skyvern_agent = Skyvern(
         base_url=settings.SKYVERN_BASE_URL,
         api_key=settings.SKYVERN_API_KEY,
     )

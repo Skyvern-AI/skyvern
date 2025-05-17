@@ -346,7 +346,7 @@ class AgentClient:
             api_key="YOUR_API_KEY",
             authorization="YOUR_AUTHORIZATION",
         )
-        client.agent.run_task(
+        await client.agent.run_task(
             prompt="prompt",
         )
         """
