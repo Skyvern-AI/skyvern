@@ -34,6 +34,7 @@ class ActionBlock(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
+    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
