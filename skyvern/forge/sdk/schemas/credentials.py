@@ -92,7 +92,7 @@ class CredentialItem(BaseModel):
 class CreateCredentialRequest(BaseModel):
     """Request model for creating a new credential."""
 
-    name: str = Field(..., description="Name of the credential", examples=["My Credential"])
+    name: str = Field(..., description="Name of the credential", examples=["Amazon Login"])
     credential_type: CredentialType = Field(..., description="Type of credential to create")
     credential: NonEmptyPasswordCredential | NonEmptyCreditCardCredential = Field(
         ...,
@@ -109,7 +109,7 @@ class CredentialResponse(BaseModel):
         ..., description="The credential data"
     )
     credential_type: CredentialType = Field(..., description="Type of the credential")
-    name: str = Field(..., description="Name of the credential", examples=["My Credential"])
+    name: str = Field(..., description="Name of the credential", examples=["Amazon Login"])
 
 
 class Credential(BaseModel):

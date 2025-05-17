@@ -23,6 +23,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.routes.code_samples import GET_RUN_CODE_SAMPLE, RUN_TASK_CODE_SAMPLE, RUN_WORKFLOW_CODE_SAMPLE
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
 from skyvern.forge.sdk.schemas.organizations import (
@@ -417,6 +418,7 @@ async def get_runs(
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_run",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_RUN_CODE_SAMPLE}]}],
     },
     responses={
         200: {"description": "Successfully got run"},
@@ -1423,6 +1425,16 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "run_task",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {
+                        "sdk": "python",
+                        "code": RUN_TASK_CODE_SAMPLE,
+                    }
+                ]
+            }
+        ],
     },
     description="Run a task",
     summary="Run a task",
@@ -1582,6 +1594,16 @@ async def run_task(
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "run_workflow",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {
+                        "sdk": "python",
+                        "code": RUN_WORKFLOW_CODE_SAMPLE,
+                    }
+                ]
+            }
+        ],
     },
     description="Run a workflow",
     summary="Run a workflow",
