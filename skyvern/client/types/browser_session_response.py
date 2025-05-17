@@ -32,9 +32,24 @@ class BrowserSessionResponse(UniversalBaseModel):
     ID of the associated runnable
     """
 
+    timeout: typing.Optional[int] = pydantic.Field(default=None)
+    """
+    Timeout in minutes for the session. Timeout is applied after the session is started.
+    """
+
+    started_at: typing.Optional[dt.datetime] = pydantic.Field(default=None)
+    """
+    Timestamp when the session was started
+    """
+
+    completed_at: typing.Optional[dt.datetime] = pydantic.Field(default=None)
+    """
+    Timestamp when the session was completed
+    """
+
     created_at: dt.datetime = pydantic.Field()
     """
-    Timestamp when the session was created
+    Timestamp when the session was created (the timestamp for the initial request)
     """
 
     modified_at: dt.datetime = pydantic.Field()
