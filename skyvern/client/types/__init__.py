@@ -180,6 +180,7 @@ from .text_prompt_block_parameters_item import (
     TextPromptBlockParametersItem_Output,
     TextPromptBlockParametersItem_Workflow,
 )
+from .totp_code import TotpCode
 from .upload_to_s3block import UploadToS3Block
 from .url_block import UrlBlock
 from .url_block_data_schema import UrlBlockDataSchema
@@ -423,6 +424,7 @@ __all__ = [
     "TextPromptBlockParametersItem_Credential",
     "TextPromptBlockParametersItem_Output",
     "TextPromptBlockParametersItem_Workflow",
+    "TotpCode",
     "UploadToS3Block",
     "UrlBlock",
     "UrlBlockDataSchema",

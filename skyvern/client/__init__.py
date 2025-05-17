@@ -159,6 +159,7 @@ from .types import (
     TextPromptBlockParametersItem_Credential,
     TextPromptBlockParametersItem_Output,
     TextPromptBlockParametersItem_Workflow,
+    TotpCode,
     UploadToS3Block,
     UrlBlock,
     UrlBlockDataSchema,
@@ -233,7 +234,7 @@ from .types import (
     WorkflowRunResponseOutput,
     WorkflowStatus,
 )
-from .errors import BadRequestError, NotFoundError, UnauthorizedError, UnprocessableEntityError
+from .errors import BadRequestError, ForbiddenError, NotFoundError, UnprocessableEntityError
 from . import agent, browser_session, credentials
 from .agent import (
     AgentGetRunResponse,
@@ -358,6 +359,7 @@ __all__ = [
     "ForLoopBlockLoopOver_Credential",
     "ForLoopBlockLoopOver_Output",
     "ForLoopBlockLoopOver_Workflow",
+    "ForbiddenError",
     "HttpValidationError",
     "LoginBlock",
     "LoginBlockDataSchema",
@@ -419,7 +421,7 @@ __all__ = [
     "TextPromptBlockParametersItem_Credential",
     "TextPromptBlockParametersItem_Output",
     "TextPromptBlockParametersItem_Workflow",
-    "UnauthorizedError",
+    "TotpCode",
     "UnprocessableEntityError",
     "UploadToS3Block",
     "UrlBlock",
