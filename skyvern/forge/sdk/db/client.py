@@ -1544,25 +1544,55 @@ class AgentDB:
             raise
 
     async def get_workflow_runs(
-        self, organization_id: str, page: int = 1, page_size: int = 10, status: list[WorkflowRunStatus] | None = None
+        self,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+        status: list[WorkflowRunStatus] | None = None,
+        ordering: tuple[str, str] | None = None,
     ) -> list[WorkflowRun]:
         try:
             async with self.Session() as session:
                 db_page = page - 1  # offset logic is 0 based
+
                 query = (
                     select(WorkflowRunModel, WorkflowModel.title)
                     .join(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
                     .filter(WorkflowRunModel.organization_id == organization_id)
                     .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
                 )
+
                 if status:
                     query = query.filter(WorkflowRunModel.status.in_(status))
-                query = query.order_by(WorkflowRunModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
+
+                allowed_ordering_fields = {
+                    "created_at": WorkflowRunModel.created_at,
+                    "status": WorkflowRunModel.status,
+                }
+
+                field, direction = ("created_at", "desc")
+
+                if ordering and isinstance(ordering, tuple) and len(ordering) == 2:
+                    req_field, req_direction = ordering
+                    if req_field in allowed_ordering_fields and req_direction in ("asc", "desc"):
+                        field, direction = req_field, req_direction
+
+                order_column = allowed_ordering_fields[field]
+
+                if direction == "asc":
+                    query = query.order_by(order_column.asc())
+                else:
+                    query = query.order_by(order_column.desc())
+
+                query = query.limit(page_size).offset(db_page * page_size)
+
                 workflow_runs = (await session.execute(query)).all()
+
                 return [
                     convert_to_workflow_run(run, workflow_title=title, debug_enabled=self.debug_enabled)
                     for run, title in workflow_runs
                 ]
+
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise

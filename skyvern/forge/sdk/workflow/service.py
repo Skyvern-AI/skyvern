@@ -671,10 +671,19 @@ class WorkflowService:
         )
 
     async def get_workflow_runs(
-        self, organization_id: str, page: int = 1, page_size: int = 10, status: list[WorkflowRunStatus] | None = None
+        self,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+        status: list[WorkflowRunStatus] | None = None,
+        ordering: tuple[str, str] | None = None,
     ) -> list[WorkflowRun]:
         return await app.DATABASE.get_workflow_runs(
-            organization_id=organization_id, page=page, page_size=page_size, status=status
+            organization_id=organization_id,
+            page=page,
+            page_size=page_size,
+            status=status,
+            ordering=ordering,
         )
 
     async def get_workflow_runs_count(
