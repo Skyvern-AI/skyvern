@@ -23,6 +23,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.routes.code_samples import GET_RUN_CODE_SAMPLE, RUN_TASK_CODE_SAMPLE, RUN_WORKFLOW_CODE_SAMPLE
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
 from skyvern.forge.sdk.schemas.organizations import (
@@ -212,37 +213,7 @@ async def get_task_v1(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> TaskResponse:
     analytics.capture("skyvern-oss-agent-task-get")
-    task_obj = await app.DATABASE.get_task(task_id, organization_id=current_org.organization_id)
-    if not task_obj:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Task not found {task_id}",
-        )
-
-    # get latest step
-    latest_step = await app.DATABASE.get_latest_step(task_id, organization_id=current_org.organization_id)
-    if not latest_step:
-        return await app.agent.build_task_response(task=task_obj)
-
-    failure_reason: str | None = None
-    if task_obj.status == TaskStatus.failed and (latest_step.output or task_obj.failure_reason):
-        failure_reason = ""
-        if task_obj.failure_reason:
-            failure_reason += task_obj.failure_reason or ""
-        if latest_step.output is not None and latest_step.output.actions_and_results is not None:
-            action_results_string: list[str] = []
-            for action, results in latest_step.output.actions_and_results:
-                if len(results) == 0:
-                    continue
-                if results[-1].success:
-                    continue
-                action_results_string.append(f"{action.action_type} action failed.")
-
-            if len(action_results_string) > 0:
-                failure_reason += "(Exceptions: " + str(action_results_string) + ")"
-    return await app.agent.build_task_response(
-        task=task_obj, last_step=latest_step, failure_reason=failure_reason, need_browser_log=True
-    )
+    return await task_v1_service.get_task_v1_response(task_id=task_id, organization_id=current_org.organization_id)
 
 
 @legacy_base_router.post(
@@ -447,6 +418,7 @@ async def get_runs(
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_run",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_RUN_CODE_SAMPLE}]}],
     },
     responses={
         200: {"description": "Successfully got run"},
@@ -459,7 +431,9 @@ async def get_runs(
     include_in_schema=False,
 )
 async def get_run(
-    run_id: str = Path(..., description="The id of the task run or the workflow run."),
+    run_id: str = Path(
+        ..., description="The id of the task run or the workflow run.", examples=["tsk_123", "tsk_v2_123", "wr_123"]
+    ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> RunResponse:
     run_response = await run_service.get_run_response(run_id, organization_id=current_org.organization_id)
@@ -946,8 +920,10 @@ async def create_workflow(
     include_in_schema=False,
 )
 async def update_workflow(
-    workflow_id: str,
     request: Request,
+    workflow_id: str = Path(
+        ..., description="The ID of the workflow to update. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
+    ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-update")
@@ -998,7 +974,9 @@ async def update_workflow(
 )
 @base_router.post("/workflows/{workflow_id}/delete/", include_in_schema=False)
 async def delete_workflow(
-    workflow_id: str,
+    workflow_id: str = Path(
+        ..., description="The ID of the workflow to delete. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
+    ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> None:
     analytics.capture("skyvern-oss-agent-workflow-delete")
@@ -1447,6 +1425,16 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "run_task",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {
+                        "sdk": "python",
+                        "code": RUN_TASK_CODE_SAMPLE,
+                    }
+                ]
+            }
+        ],
     },
     description="Run a task",
     summary="Run a task",
@@ -1499,6 +1487,7 @@ async def run_task(
             browser_session_id=run_request.browser_session_id,
             totp_verification_url=run_request.totp_url,
             totp_identifier=run_request.totp_identifier,
+            include_action_history_in_verification=run_request.include_action_history_in_verification,
         )
         task_v1_response = await task_v1_service.run_task(
             task=task_v1_request,
@@ -1523,6 +1512,7 @@ async def run_task(
             failure_reason=task_v1_response.failure_reason,
             created_at=task_v1_response.created_at,
             modified_at=task_v1_response.modified_at,
+            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/tasks/{task_v1_response.task_id}",
             run_request=TaskRunRequest(
                 engine=run_request.engine,
                 prompt=task_v1_response.navigation_goal,
@@ -1566,6 +1556,10 @@ async def run_task(
             max_steps_override=run_request.max_steps,
             browser_session_id=run_request.browser_session_id,
         )
+        refreshed_task_v2 = await app.DATABASE.get_task_v2(
+            task_v2_id=task_v2.observer_cruise_id, organization_id=current_org.organization_id
+        )
+        task_v2 = refreshed_task_v2 if refreshed_task_v2 else task_v2
         return TaskRunResponse(
             run_id=task_v2.observer_cruise_id,
             run_type=RunType.task_v2,
@@ -1574,6 +1568,7 @@ async def run_task(
             failure_reason=None,
             created_at=task_v2.created_at,
             modified_at=task_v2.modified_at,
+            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{task_v2.workflow_permanent_id}/{task_v2.workflow_run_id}",
             run_request=TaskRunRequest(
                 engine=RunEngine.skyvern_v2,
                 prompt=task_v2.prompt,
@@ -1599,6 +1594,16 @@ async def run_task(
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "run_workflow",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {
+                        "sdk": "python",
+                        "code": RUN_WORKFLOW_CODE_SAMPLE,
+                    }
+                ]
+            }
+        ],
     },
     description="Run a workflow",
     summary="Run a workflow",
@@ -1657,6 +1662,7 @@ async def run_workflow(
         run_request=workflow_run_request,
         downloaded_files=None,
         recording_url=None,
+        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}",
     )
 
 

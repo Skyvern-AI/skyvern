@@ -35,6 +35,13 @@ import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { AppNode } from "..";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
+import {
+  Select,
+  SelectTrigger,
+  SelectContent,
+  SelectValue,
+  SelectItem,
+} from "@/components/ui/select";
 
 function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
   const { updateNodeData } = useReactFlow();
@@ -56,6 +63,8 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
     totpIdentifier: data.totpIdentifier,
     completeCriterion: data.completeCriterion,
     terminateCriterion: data.terminateCriterion,
+    engine: data.engine,
+    includeActionHistoryInVerification: data.includeActionHistoryInVerification,
   });
   const deleteNodeCallback = useDeleteNodeCallback();
 
@@ -198,6 +207,30 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
                     <Label className="text-xs font-normal text-slate-300">
+                      Engine
+                    </Label>
+                  </div>
+                  <Select
+                    value={inputs.engine ?? "skyvern-1.0"}
+                    onValueChange={(value) => {
+                      handleChange("engine", value);
+                    }}
+                  >
+                    <SelectTrigger className="nopan w-52 text-xs">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="skyvern-1.0">Skyvern 1.0</SelectItem>
+                      <SelectItem value="openai-cua">OpenAI CUA</SelectItem>
+                      <SelectItem value="anthropic-cua">
+                        Anthropic CUA
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="flex items-center justify-between">
+                  <div className="flex gap-2">
+                    <Label className="text-xs font-normal text-slate-300">
                       Max Steps Override
                     </Label>
                     <HelpTooltip
@@ -257,6 +290,31 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                   )}
                 </div>
                 <Separator />
+                <div className="flex items-center justify-between">
+                  <div className="flex gap-2">
+                    <Label className="text-xs font-normal text-slate-300">
+                      Include Action History
+                    </Label>
+                    <HelpTooltip
+                      content={
+                        helpTooltips["navigation"][
+                          "includeActionHistoryInVerification"
+                        ]
+                      }
+                    />
+                  </div>
+                  <div className="w-52">
+                    <Switch
+                      checked={inputs.includeActionHistoryInVerification}
+                      onCheckedChange={(checked) => {
+                        handleChange(
+                          "includeActionHistoryInVerification",
+                          checked,
+                        );
+                      }}
+                    />
+                  </div>
+                </div>
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
                     <Label className="text-xs font-normal text-slate-300">

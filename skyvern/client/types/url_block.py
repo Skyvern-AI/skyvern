@@ -4,6 +4,7 @@ from ..core.pydantic_utilities import UniversalBaseModel
 from .context_parameter import ContextParameter
 from .output_parameter import OutputParameter
 import typing
+from .run_engine import RunEngine
 from .url_block_data_schema import UrlBlockDataSchema
 from .url_block_parameters_item import UrlBlockParametersItem
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
@@ -17,6 +18,7 @@ class UrlBlock(UniversalBaseModel):
     task_type: typing.Optional[str] = None
     url: str
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     navigation_goal: typing.Optional[str] = None
@@ -32,6 +34,7 @@ class UrlBlock(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
+    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

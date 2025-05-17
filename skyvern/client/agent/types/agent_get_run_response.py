@@ -4,12 +4,13 @@ from __future__ import annotations
 from ...core.pydantic_utilities import UniversalBaseModel
 import typing
 from ...types.run_status import RunStatus
-from ...types.output import Output
+from ...types.task_run_response_output import TaskRunResponseOutput
 from ...types.file_info import FileInfo
 import datetime as dt
 from ...types.task_run_request import TaskRunRequest
 from ...core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
+from ...types.workflow_run_response_output import WorkflowRunResponseOutput
 from ...types.workflow_run_request import WorkflowRunRequest
 
 
@@ -17,12 +18,13 @@ class AgentGetRunResponse_TaskV1(UniversalBaseModel):
     run_type: typing.Literal["task_v1"] = "task_v1"
     run_id: str
     status: RunStatus
-    output: typing.Optional[Output] = None
+    output: typing.Optional[TaskRunResponseOutput] = None
     downloaded_files: typing.Optional[typing.List[FileInfo]] = None
     recording_url: typing.Optional[str] = None
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
+    app_url: typing.Optional[str] = None
     run_request: typing.Optional[TaskRunRequest] = None
 
     if IS_PYDANTIC_V2:
@@ -39,12 +41,59 @@ class AgentGetRunResponse_TaskV2(UniversalBaseModel):
     run_type: typing.Literal["task_v2"] = "task_v2"
     run_id: str
     status: RunStatus
-    output: typing.Optional[Output] = None
+    output: typing.Optional[TaskRunResponseOutput] = None
     downloaded_files: typing.Optional[typing.List[FileInfo]] = None
     recording_url: typing.Optional[str] = None
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
+    app_url: typing.Optional[str] = None
+    run_request: typing.Optional[TaskRunRequest] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class AgentGetRunResponse_OpenaiCua(UniversalBaseModel):
+    run_type: typing.Literal["openai_cua"] = "openai_cua"
+    run_id: str
+    status: RunStatus
+    output: typing.Optional[TaskRunResponseOutput] = None
+    downloaded_files: typing.Optional[typing.List[FileInfo]] = None
+    recording_url: typing.Optional[str] = None
+    failure_reason: typing.Optional[str] = None
+    created_at: dt.datetime
+    modified_at: dt.datetime
+    app_url: typing.Optional[str] = None
+    run_request: typing.Optional[TaskRunRequest] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class AgentGetRunResponse_AnthropicCua(UniversalBaseModel):
+    run_type: typing.Literal["anthropic_cua"] = "anthropic_cua"
+    run_id: str
+    status: RunStatus
+    output: typing.Optional[TaskRunResponseOutput] = None
+    downloaded_files: typing.Optional[typing.List[FileInfo]] = None
+    recording_url: typing.Optional[str] = None
+    failure_reason: typing.Optional[str] = None
+    created_at: dt.datetime
+    modified_at: dt.datetime
+    app_url: typing.Optional[str] = None
     run_request: typing.Optional[TaskRunRequest] = None
 
     if IS_PYDANTIC_V2:
@@ -61,12 +110,13 @@ class AgentGetRunResponse_WorkflowRun(UniversalBaseModel):
     run_type: typing.Literal["workflow_run"] = "workflow_run"
     run_id: str
     status: RunStatus
-    output: typing.Optional[Output] = None
+    output: typing.Optional[WorkflowRunResponseOutput] = None
     downloaded_files: typing.Optional[typing.List[FileInfo]] = None
     recording_url: typing.Optional[str] = None
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
+    app_url: typing.Optional[str] = None
     run_request: typing.Optional[WorkflowRunRequest] = None
 
     if IS_PYDANTIC_V2:
@@ -80,5 +130,9 @@ class AgentGetRunResponse_WorkflowRun(UniversalBaseModel):
 
 
 AgentGetRunResponse = typing.Union[
-    AgentGetRunResponse_TaskV1, AgentGetRunResponse_TaskV2, AgentGetRunResponse_WorkflowRun
+    AgentGetRunResponse_TaskV1,
+    AgentGetRunResponse_TaskV2,
+    AgentGetRunResponse_OpenaiCua,
+    AgentGetRunResponse_AnthropicCua,
+    AgentGetRunResponse_WorkflowRun,
 ]

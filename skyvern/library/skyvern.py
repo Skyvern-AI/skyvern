@@ -1,12 +1,17 @@
 import asyncio
 import os
 import subprocess
-from typing import Any, cast
+import typing
+from typing import Any
 
+import httpx
 from dotenv import load_dotenv
 
-from skyvern.agent.client import SkyvernClient
-from skyvern.agent.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
+from skyvern.client import AsyncSkyvern
+from skyvern.client.agent.types.agent_get_run_response import AgentGetRunResponse
+from skyvern.client.core.pydantic_utilities import parse_obj_as
+from skyvern.client.environment import SkyvernEnvironment
+from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.core import security, skyvern_context
@@ -18,23 +23,34 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Request, TaskV2Statu
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.schemas.runs import ProxyLocation, RunEngine, RunResponse, RunType, TaskRunResponse
+from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
+from skyvern.schemas.runs import CUA_ENGINES, ProxyLocation, RunEngine, RunType
 from skyvern.services import run_service, task_v1_service, task_v2_service
 from skyvern.utils import migrate_db
 
 
-class SkyvernAgent:
+class Skyvern(AsyncSkyvern):
     def __init__(
         self,
+        *,
         base_url: str | None = None,
         api_key: str | None = None,
         cdp_url: str | None = None,
         browser_path: str | None = None,
         browser_type: str | None = None,
-        extra_headers: dict[str, str] | None = None,
+        environment: SkyvernEnvironment = SkyvernEnvironment.PRODUCTION,
+        timeout: float | None = None,
+        follow_redirects: bool | None = True,
+        httpx_client: httpx.AsyncClient | None = None,
     ) -> None:
-        self.extra_headers = extra_headers
-        self.client: SkyvernClient | None = None
+        super().__init__(
+            base_url=base_url,
+            api_key=api_key,
+            environment=environment,
+            timeout=timeout,
+            follow_redirects=follow_redirects,
+            httpx_client=httpx_client,
+        )
         if base_url is None and api_key is None:
             if not os.path.exists(".env"):
                 raise Exception("No .env file found. Please run 'skyvern init' first to set up your environment.")
@@ -42,7 +58,10 @@ class SkyvernAgent:
             load_dotenv(".env")
             migrate_db()
 
-        self.cdp_url = cdp_url
+        self._api_key = api_key
+        self._cdp_url = cdp_url
+        self._browser_path = browser_path
+        self._browser_type = browser_type
         if browser_path:
             # TODO validate browser_path
             # Supported Browsers: Google Chrome, Brave Browser, Microsoft Edge, Firefox
@@ -53,9 +72,9 @@ class SkyvernAgent:
                 if browser_process.poll() is not None:
                     raise Exception(f"Failed to open browser. browser_path: {browser_path}")
 
-                self.cdp_url = "http://127.0.0.1:9222"
+                self._cdp_url = "http://127.0.0.1:9222"
                 settings.BROWSER_TYPE = "cdp-connect"
-                settings.BROWSER_REMOTE_DEBUGGING_URL = self.cdp_url
+                settings.BROWSER_REMOTE_DEBUGGING_URL = self._cdp_url
             else:
                 raise ValueError(
                     f"Unsupported browser or invalid path: {browser_path}. "
@@ -67,15 +86,12 @@ class SkyvernAgent:
                 #     raise Exception("browser type is missing")
                 browser_type = "chromium-headful"
 
+            self._browser_type = browser_type
             settings.BROWSER_TYPE = browser_type
-        elif base_url and api_key:
-            self.client = SkyvernClient(
-                base_url=base_url,
-                api_key=api_key,
-                extra_headers=self.extra_headers,
-            )
+        elif api_key:
+            self._api_key = api_key
         else:
-            raise ValueError("base_url and api_key must be both provided")
+            raise ValueError("Initializing Skyvern failed: api_key must be provided")
 
     async def get_organization(self) -> Organization:
         organization = await app.DATABASE.get_organization_by_domain("skyvern.local")
@@ -98,7 +114,13 @@ class SkyvernAgent:
             )
         return organization
 
-    async def _run_task(self, organization: Organization, task: Task, max_steps: int | None = None) -> None:
+    async def _run_task(
+        self,
+        organization: Organization,
+        task: Task,
+        max_steps: int | None = None,
+        engine: RunEngine = RunEngine.skyvern_v1,
+    ) -> None:
         org_auth_token = await app.DATABASE.get_valid_org_auth_token(
             organization_id=organization.organization_id,
             token_type=OrganizationAuthTokenType.api,
@@ -130,6 +152,7 @@ class SkyvernAgent:
                 task=updated_task,
                 step=step,
                 api_key=org_auth_token.token if org_auth_token else None,
+                engine=engine,
             )
         finally:
             skyvern_context.reset()
@@ -249,12 +272,23 @@ class SkyvernAgent:
                 await asyncio.sleep(1)
 
     ############### officially supported interfaces ###############
-    async def get_run(self, run_id: str) -> RunResponse | None:
-        if not self.client:
+    async def get_run(self, run_id: str) -> AgentGetRunResponse | None:
+        if not self._api_key:
             organization = await self.get_organization()
-            return await run_service.get_run_response(run_id, organization_id=organization.organization_id)
+            get_run_internal_resp = await run_service.get_run_response(
+                run_id, organization_id=organization.organization_id
+            )
+            if not get_run_internal_resp:
+                return None
+            return typing.cast(
+                AgentGetRunResponse,
+                parse_obj_as(
+                    type_=AgentGetRunResponse,  # type: ignore
+                    object_=get_run_internal_resp.model_dump(),
+                ),
+            )
 
-        return await self.client.get_run(run_id)
+        return await self.agent.get_run(run_id)
 
     async def run_task(
         self,
@@ -272,9 +306,10 @@ class SkyvernAgent:
         wait_for_completion: bool = True,
         timeout: float = DEFAULT_AGENT_TIMEOUT,
         browser_session_id: str | None = None,
+        user_agent: str | None = None,
     ) -> TaskRunResponse:
-        if not self.client:
-            if engine == RunEngine.skyvern_v1:
+        if not self._api_key:
+            if engine == RunEngine.skyvern_v1 or engine in CUA_ENGINES:
                 data_extraction_goal = None
                 navigation_goal = prompt
                 navigation_payload = None
@@ -313,13 +348,15 @@ class SkyvernAgent:
                     url_hash=url_hash,
                 )
                 try:
-                    await self._run_task(organization, created_task)
+                    await self._run_task(organization, created_task, engine=engine)
                     run_obj = await self.get_run(run_id=created_task.task_id)
-                    return cast(TaskRunResponse, run_obj)
                 except Exception:
                     # TODO: better error handling and logging
                     run_obj = await self.get_run(run_id=created_task.task_id)
-                    return cast(TaskRunResponse, run_obj)
+                if not run_obj:
+                    raise Exception("Failed to get the task run after creating the task.")
+                return from_run_to_task_run_response(run_obj)
+
             elif engine == RunEngine.skyvern_v2:
                 # initialize task v2
                 organization = await self.get_organization()
@@ -340,11 +377,13 @@ class SkyvernAgent:
 
                 await self._run_task_v2(organization, task_v2)
                 run_obj = await self.get_run(run_id=task_v2.observer_cruise_id)
-                return cast(TaskRunResponse, run_obj)
+                if not run_obj:
+                    raise Exception("Failed to get the task run after creating the task.")
+                return from_run_to_task_run_response(run_obj)
             else:
                 raise ValueError("Local mode is not supported for this method")
 
-        task_run = await self.client.run_task(
+        task_run = await self.agent.run_task(
             prompt=prompt,
             engine=engine,
             url=url,
@@ -355,30 +394,18 @@ class SkyvernAgent:
             error_code_mapping=error_code_mapping,
             proxy_location=proxy_location,
             max_steps=max_steps,
+            user_agent=user_agent,
         )
 
         if wait_for_completion:
             async with asyncio.timeout(timeout):
                 while True:
-                    task_run = await self.client.get_run(task_run.run_id)
+                    task_run = await self.agent.get_run(task_run.run_id)
                     if task_run.status.is_final():
-                        return task_run
+                        break
                     await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
-        return task_run
+        return TaskRunResponse.model_validate(task_run.dict())
 
-    async def run_workflow(
-        self,
-        workflow_id: str,
-        parameters: dict[str, Any],
-        webhook_url: str | None = None,
-        totp_identifier: str | None = None,
-        totp_url: str | None = None,
-        title: str | None = None,
-        error_code_mapping: dict[str, str] | None = None,
-        proxy_location: ProxyLocation | None = None,
-        max_steps: int | None = None,
-        wait_for_completion: bool = True,
-        timeout: float = DEFAULT_AGENT_TIMEOUT,
-        browser_session_id: str | None = None,
-    ) -> None:
-        raise NotImplementedError("Running workflows is currently not supported with skyvern SDK.")
+
+def from_run_to_task_run_response(run_obj: AgentGetRunResponse) -> TaskRunResponse:
+    return TaskRunResponse.model_validate(run_obj.model_dump())

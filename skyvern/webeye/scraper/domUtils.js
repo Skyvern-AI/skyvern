@@ -444,6 +444,14 @@ function expectHitTarget(hitPoint, targetElement) {
   return hitParents[0] || document.documentElement;
 }
 
+function getChildElements(element) {
+  if (element.childElementCount !== 0) {
+    return Array.from(element.children);
+  } else {
+    return [];
+  }
+}
+
 function isParent(parent, child) {
   return parent.contains(child);
 }
@@ -583,6 +591,20 @@ function isTableRelatedElement(element) {
     "colgroup",
     "col",
   ].includes(tagName);
+}
+
+function isDOMNodeRepresentDiv(element) {
+  if (element?.tagName?.toLowerCase() !== "div") {
+    return false;
+  }
+  const style = getElementComputedStyle(element);
+  const children = getChildElements(element);
+  // flex ususally means there are multiple elements in the div as a line or a column
+  // if the children elements are not just one, we should keep it in the HTML tree to represent a tree structure
+  if (style?.display === "flex" && children.length > 1) {
+    return true;
+  }
+  return false;
 }
 
 function isInteractableInput(element) {
@@ -1414,14 +1436,12 @@ async function buildElementTree(
   var elements = [];
   var resultArray = [];
 
-  function getChildElements(element) {
-    if (element.childElementCount !== 0) {
-      return Array.from(element.children);
-    } else {
-      return [];
-    }
-  }
-  async function processElement(element, parentId) {
+  async function processElement(
+    element,
+    parentId,
+    parent_xpath,
+    current_node_index,
+  ) {
     if (element === null) {
       _jsConsoleLog("get a null element");
       return;
@@ -1438,6 +1458,20 @@ async function buildElementTree(
       return;
     }
 
+    let current_xpath = null;
+    if (parent_xpath) {
+      // ignore the namespace, otherwise the xpath sometimes won't find anything, specially for SVG elements
+      current_xpath =
+        parent_xpath +
+        "/" +
+        '*[name()="' +
+        tagName +
+        '"]' +
+        "[" +
+        current_node_index +
+        "]";
+    }
+
     // if element is an "a" tag and has a target="_blank" attribute, remove the target attribute
     // We're doing this so that skyvern can do all the navigation in a single page/tab and not open new tab
     if (tagName === "a") {
@@ -1446,10 +1480,10 @@ async function buildElementTree(
       }
     }
 
-    let children = [];
+    let shadowDOMchildren = [];
     // sometimes the shadowRoot is not visible, but the elemnets in the shadowRoot are visible
     if (element.shadowRoot) {
-      children = getChildElements(element.shadowRoot);
+      shadowDOMchildren = getChildElements(element.shadowRoot);
     }
     const isVisible = isElementVisible(element);
     if (isVisible && !isHidden(element) && !isScriptOrStyle(element)) {
@@ -1480,6 +1514,8 @@ async function buildElementTree(
       ) {
         // if elemnet is the children of the <svg> with an unique_id
         elementObj = await buildElementObject(frame, element, interactable);
+      } else if (tagName === "div" && isDOMNodeRepresentDiv(element)) {
+        elementObj = await buildElementObject(frame, element, interactable);
       } else if (
         getElementText(element).length > 0 &&
         getElementText(element).length <= 5000
@@ -1500,6 +1536,7 @@ async function buildElementTree(
       }
 
       if (elementObj) {
+        elementObj.xpath = current_xpath;
         elements.push(elementObj);
         // If the element is interactable but has no interactable parent,
         // then it starts a new tree, so add it to the result array
@@ -1520,10 +1557,35 @@ async function buildElementTree(
       }
     }
 
-    children = children.concat(getChildElements(element));
+    const children = getChildElements(element);
+    const xpathMap = new Map();
+
     for (let i = 0; i < children.length; i++) {
       const childElement = children[i];
-      await processElement(childElement, parentId);
+      const tagName = childElement?.tagName?.toLowerCase();
+      if (!tagName) {
+        _jsConsoleLog("get a null tagName");
+        continue;
+      }
+      let current_node_index = xpathMap.get(tagName);
+      if (current_node_index == undefined) {
+        current_node_index = 1;
+      } else {
+        current_node_index = current_node_index + 1;
+      }
+      xpathMap.set(tagName, current_node_index);
+      await processElement(
+        childElement,
+        parentId,
+        current_xpath,
+        current_node_index,
+      );
+    }
+
+    // FIXME: xpath won't work when the element is in shadow DOM
+    for (let i = 0; i < shadowDOMchildren.length; i++) {
+      const childElement = shadowDOMchildren[i];
+      await processElement(childElement, parentId, null, 0);
     }
     return;
   }
@@ -1732,8 +1794,13 @@ async function buildElementTree(
     return trimmedResults;
   };
 
+  let current_xpath = null;
+  if (starter === document.body) {
+    current_xpath = "/html[1]";
+  }
+
   // setup before parsing the dom
-  await processElement(starter, null);
+  await processElement(starter, null, current_xpath, 1);
 
   for (var element of elements) {
     if (
@@ -2297,6 +2364,9 @@ if (window.globalObserverForDOMIncrement === undefined) {
       if (node.nodeType === Node.TEXT_NODE) continue;
       const tagName = node.tagName?.toLowerCase();
 
+      // ignore unique_id change to avoid infinite loop about DOM changes
+      if (mutation.attributeName === "unique_id") continue;
+
       // if the changing element is dropdown related elements, we should consider
       // they're the new element as long as the element is still visible on the page
       if (
@@ -2365,6 +2435,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
               break;
             }
           }
+          break;
         }
         case "childList": {
           let changedNode = {

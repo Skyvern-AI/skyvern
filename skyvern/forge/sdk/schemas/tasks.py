@@ -90,6 +90,11 @@ class TaskBase(BaseModel):
         description="The application for which the task is running",
         examples=["forms"],
     )
+    include_action_history_in_verification: bool | None = Field(
+        default=False,
+        description="Whether to include the action history when verifying the task is complete",
+        examples=[True, False],
+    )
 
 
 class TaskRequest(TaskBase):
@@ -226,6 +231,7 @@ class Task(TaskBase):
     )
     organization_id: str | None = None
     workflow_run_id: str | None = None
+    workflow_permanent_id: str | None = None
     order: int | None = None
     retry: int | None = None
     max_steps_per_run: int | None = None

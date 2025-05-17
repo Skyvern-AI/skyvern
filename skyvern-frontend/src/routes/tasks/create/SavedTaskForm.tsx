@@ -99,6 +99,8 @@ function createTaskTemplateRequestObject(values: SavedTaskFormValues) {
           max_steps_per_run: values.maxStepsOverride,
           totp_identifier: values.totpIdentifier,
           error_code_mapping: safeParseMaybeJSONString(values.errorCodeMapping),
+          include_action_history_in_verification:
+            values.includeActionHistoryInVerification,
         },
       ],
     },

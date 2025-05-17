@@ -79,7 +79,11 @@ class Step(BaseModel):
         if output is not None and status is None:
             raise ValueError(f"cant_set_output_without_updating_status({self.step_id})")
 
-        if self.output is not None and output is not None:
+        if (
+            old_status not in [StepStatus.running, StepStatus.created]
+            and self.output is not None
+            and output is not None
+        ):
             raise ValueError(f"cant_override_output({self.step_id})")
 
         if is_last is False:

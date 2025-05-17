@@ -2,12 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import time
-from io import BytesIO
 from typing import Any, Dict, List
 
-import pymupdf
 import structlog
-from PIL import Image
 from playwright._impl._errors import TimeoutError
 from playwright.async_api import ElementHandle, Frame, Page
 
@@ -37,6 +34,7 @@ JS_FUNCTION_DEFS = load_js_script()
 async def _current_viewpoint_screenshot_helper(
     page: Page,
     file_path: str | None = None,
+    full_page: bool = False,
     timeout: float = settings.BROWSER_SCREENSHOT_TIMEOUT_MS,
 ) -> bytes:
     if page.is_closed():
@@ -50,11 +48,13 @@ async def _current_viewpoint_screenshot_helper(
             screenshot = await page.screenshot(
                 path=file_path,
                 timeout=timeout,
+                full_page=full_page,
                 animations="disabled",
             )
         else:
             screenshot = await page.screenshot(
                 timeout=timeout,
+                full_page=full_page,
                 animations="disabled",
             )
         end_time = time.time()
@@ -150,49 +150,9 @@ class SkyvernFrame:
         file_path: str | None = None,
         timeout: float = settings.BROWSER_SCREENSHOT_TIMEOUT_MS,
     ) -> bytes:
-        if not full_page:
-            return await _current_viewpoint_screenshot_helper(page=page, file_path=file_path, timeout=timeout)
-
-        LOG.debug("Page is fully loaded, agent is about to generate the full page screenshot")
-        start_time = time.time()
-        async with asyncio.timeout(timeout):
-            pdf_bytes = await page.pdf(
-                print_background=True, width=f"{settings.BROWSER_WIDTH}px", height=f"{settings.BROWSER_HEIGHT}px"
-            )
-
-            with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
-                images = []
-                for pdf_page in doc:
-                    pix = pdf_page.get_pixmap()
-                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                    images.append(img)
-
-                total_height = sum(img.height for img in images)
-                max_width = max(img.width for img in images)
-
-                merged_img = Image.new("RGB", (max_width, total_height), color=(255, 255, 255))
-
-                current_y = 0
-                for img in images:
-                    merged_img.paste(img, (0, current_y))
-                    current_y += img.height
-
-                buffer = BytesIO()
-                merged_img.save(buffer, format="PNG")
-                buffer.seek(0)
-
-                img_data = buffer.read()
-                if file_path is not None:
-                    with open(file_path, "wb") as f:
-                        f.write(img_data)
-
-                end_time = time.time()
-                LOG.debug(
-                    "Full page screenshot taking time",
-                    screenshot_time=end_time - start_time,
-                    file_path=file_path,
-                )
-                return img_data
+        return await _current_viewpoint_screenshot_helper(
+            page=page, file_path=file_path, full_page=full_page, timeout=timeout
+        )
 
     @staticmethod
     async def take_split_screenshots(

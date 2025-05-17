@@ -5,6 +5,7 @@ from ..core.pydantic_utilities import UniversalBaseModel
 from .context_parameter import ContextParameter
 import typing
 from .output_parameter import OutputParameter
+from .run_engine import RunEngine
 from .action_block_data_schema import ActionBlockDataSchema
 from .action_block_parameters_item import ActionBlockParametersItem
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
@@ -43,6 +44,7 @@ class ForLoopBlockLoopBlocksItem_Action(UniversalBaseModel):
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     navigation_goal: typing.Optional[str] = None
@@ -58,6 +60,7 @@ class ForLoopBlockLoopBlocksItem_Action(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
+    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -112,6 +115,7 @@ class ForLoopBlockLoopBlocksItem_Extraction(UniversalBaseModel):
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     navigation_goal: typing.Optional[str] = None
@@ -127,6 +131,7 @@ class ForLoopBlockLoopBlocksItem_Extraction(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
+    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -146,6 +151,7 @@ class ForLoopBlockLoopBlocksItem_FileDownload(UniversalBaseModel):
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     navigation_goal: typing.Optional[str] = None
@@ -161,6 +167,7 @@ class ForLoopBlockLoopBlocksItem_FileDownload(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
+    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -243,6 +250,7 @@ class ForLoopBlockLoopBlocksItem_GotoUrl(UniversalBaseModel):
     task_type: typing.Optional[str] = None
     url: str
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     navigation_goal: typing.Optional[str] = None
@@ -258,6 +266,7 @@ class ForLoopBlockLoopBlocksItem_GotoUrl(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
+    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -277,6 +286,7 @@ class ForLoopBlockLoopBlocksItem_Login(UniversalBaseModel):
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     navigation_goal: typing.Optional[str] = None
@@ -292,6 +302,7 @@ class ForLoopBlockLoopBlocksItem_Login(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
+    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -311,6 +322,7 @@ class ForLoopBlockLoopBlocksItem_Navigation(UniversalBaseModel):
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     navigation_goal: str
@@ -326,6 +338,7 @@ class ForLoopBlockLoopBlocksItem_Navigation(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
+    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -388,6 +401,7 @@ class ForLoopBlockLoopBlocksItem_Task(UniversalBaseModel):
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     navigation_goal: typing.Optional[str] = None
@@ -403,6 +417,7 @@ class ForLoopBlockLoopBlocksItem_Task(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
+    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -481,6 +496,7 @@ class ForLoopBlockLoopBlocksItem_Validation(UniversalBaseModel):
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     navigation_goal: typing.Optional[str] = None
@@ -496,6 +512,7 @@ class ForLoopBlockLoopBlocksItem_Validation(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
+    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

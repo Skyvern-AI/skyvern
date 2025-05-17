@@ -1,6 +1,5 @@
 <!-- START doctoc generated TOC please keep comment here to allow auto update -->
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
-**Table of Contents**  *generated with [DocToc](https://github.com/thlorenz/doctoc)*
 
 - [n8n-nodes-skyvern](#n8n-nodes-skyvern)
   - [Installation](#installation)
@@ -43,3 +42,4 @@ Follow the [installation guide](https://docs.n8n.io/integrations/community-nodes
 * [n8n community nodes documentation](https://docs.n8n.io/integrations/community-nodes/)
 * [Skyvern documentation](https://docs.skyvern.com/introduction)
 
+* [n8n integration code](https://github.com/Skyvern-AI/skyvern/tree/main/integrations/n8n)

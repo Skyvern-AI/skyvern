@@ -139,6 +139,7 @@ export type CreateTaskRequest = {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   application?: string | null;
+  include_action_history_in_verification?: boolean | null;
 };
 
 export type User = {
@@ -235,16 +236,41 @@ export type Action = {
   index: number;
 };
 
+export type EvalKind = "workflow" | "task";
+
+export interface Eval {
+  kind: EvalKind;
+  created_at: string;
+  organization_id: string;
+  status: Status;
+  title: string | null;
+  workflow_permanent_id: string | null;
+  workflow_run_id: string | null;
+}
+
+export interface EvalWorkflow extends Eval {
+  kind: "workflow";
+}
+
+export interface EvalTask extends Eval {
+  kind: "task";
+  task_id: string;
+  url: string | null;
+}
+
+export type EvalApiResponse = EvalWorkflow[] | EvalTask[];
+
 export type WorkflowRunApiResponse = {
+  created_at: string;
+  failure_reason: string | null;
+  modified_at: string;
+  proxy_location: ProxyLocation | null;
+  status: Status;
+  title?: string;
+  webhook_callback_url: string;
+  workflow_id: string;
   workflow_permanent_id: string;
   workflow_run_id: string;
-  workflow_id: string;
-  status: Status;
-  proxy_location: ProxyLocation | null;
-  webhook_callback_url: string;
-  created_at: string;
-  modified_at: string;
-  failure_reason: string | null;
   workflow_title: string | null;
 };
 

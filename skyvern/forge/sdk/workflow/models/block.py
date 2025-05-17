@@ -367,6 +367,7 @@ class BaseTaskBlock(Block):
     totp_identifier: str | None = None
     cache_actions: bool = False
     complete_verification: bool = True
+    include_action_history_in_verification: bool = False
 
     def get_all_parameters(
         self,

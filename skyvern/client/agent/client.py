@@ -54,7 +54,7 @@ class AgentClient:
             authorization="YOUR_AUTHORIZATION",
         )
         client.agent.get_run(
-            run_id="run_id",
+            run_id="tsk_123",
         )
         """
         _response = self._client_wrapper.httpx_client.request(
@@ -156,6 +156,7 @@ class AgentClient:
         Parameters
         ----------
         workflow_id : str
+            The ID of the workflow to update. Workflow ID starts with `wpid_`.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -174,7 +175,7 @@ class AgentClient:
             authorization="YOUR_AUTHORIZATION",
         )
         client.agent.update_workflow(
-            workflow_id="workflow_id",
+            workflow_id="wpid_123",
         )
         """
         _response = self._client_wrapper.httpx_client.request(
@@ -215,6 +216,7 @@ class AgentClient:
         Parameters
         ----------
         workflow_id : str
+            The ID of the workflow to delete. Workflow ID starts with `wpid_`.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -233,7 +235,7 @@ class AgentClient:
             authorization="YOUR_AUTHORIZATION",
         )
         client.agent.delete_workflow(
-            workflow_id="workflow_id",
+            workflow_id="wpid_123",
         )
         """
         _response = self._client_wrapper.httpx_client.request(
@@ -271,8 +273,8 @@ class AgentClient:
         prompt: str,
         user_agent: typing.Optional[str] = None,
         url: typing.Optional[str] = OMIT,
-        title: typing.Optional[str] = OMIT,
         engine: typing.Optional[RunEngine] = OMIT,
+        title: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
         data_extraction_schema: typing.Optional[TaskRunRequestDataExtractionSchema] = OMIT,
         error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
@@ -282,6 +284,7 @@ class AgentClient:
         totp_url: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
         publish_workflow: typing.Optional[bool] = OMIT,
+        include_action_history_in_verification: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> TaskRunResponse:
         """
@@ -297,11 +300,11 @@ class AgentClient:
         url : typing.Optional[str]
             The starting URL for the task. If not provided, Skyvern will attempt to determine an appropriate URL
 
-        title : typing.Optional[str]
-            Optional title for the task
-
         engine : typing.Optional[RunEngine]
-            The Skyvern engine version to use for this task
+            The Skyvern engine version to use for this task. The default value is skyvern-2.0.
+
+        title : typing.Optional[str]
+            The title for the task
 
         proxy_location : typing.Optional[ProxyLocation]
             Geographic Proxy location to route the browser traffic through
@@ -328,7 +331,10 @@ class AgentClient:
             ID of an existing browser session to reuse, having it continue from the current screen state
 
         publish_workflow : typing.Optional[bool]
-            Whether to publish this task as a reusable workflow.
+            Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.
+
+        include_action_history_in_verification : typing.Optional[bool]
+            Whether to include action history when verifying that the task is complete
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -356,8 +362,8 @@ class AgentClient:
             json={
                 "prompt": prompt,
                 "url": url,
-                "title": title,
                 "engine": engine,
+                "title": title,
                 "proxy_location": proxy_location,
                 "data_extraction_schema": convert_and_respect_annotation_metadata(
                     object_=data_extraction_schema, annotation=TaskRunRequestDataExtractionSchema, direction="write"
@@ -369,6 +375,7 @@ class AgentClient:
                 "totp_url": totp_url,
                 "browser_session_id": browser_session_id,
                 "publish_workflow": publish_workflow,
+                "include_action_history_in_verification": include_action_history_in_verification,
             },
             headers={
                 "x-user-agent": str(user_agent) if user_agent is not None else None,
@@ -417,8 +424,8 @@ class AgentClient:
         template: typing.Optional[bool] = None,
         max_steps_override: typing.Optional[int] = None,
         user_agent: typing.Optional[str] = None,
-        title: typing.Optional[str] = OMIT,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
+        title: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
@@ -432,7 +439,7 @@ class AgentClient:
         Parameters
         ----------
         workflow_id : str
-            ID of the workflow to run
+            ID of the workflow to run. Workflow ID starts with `wpid_`.
 
         template : typing.Optional[bool]
 
@@ -440,26 +447,26 @@ class AgentClient:
 
         user_agent : typing.Optional[str]
 
-        title : typing.Optional[str]
-            Optional title for this workflow run
-
         parameters : typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]]
             Parameters to pass to the workflow
+
+        title : typing.Optional[str]
+            The title for this workflow run
 
         proxy_location : typing.Optional[ProxyLocation]
             Location of proxy to use for this workflow run
 
         webhook_url : typing.Optional[str]
-            URL to send workflow status updates to after a run is finished
+            URL to send workflow status updates to after a run is finished. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for webhook questions.
 
         totp_url : typing.Optional[str]
-            URL for TOTP authentication setup if Skyvern should be polling endpoint for 2FA codes
+            URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/running-tasks/advanced-features#get-code-from-your-endpoint
 
         totp_identifier : typing.Optional[str]
-            Identifier for TOTP (Time-based One-Time Password) authentication if codes are being pushed to Skyvern
+            Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/running-tasks/advanced-features#time-based-one-time-password-totp
 
         browser_session_id : typing.Optional[str]
-            ID of an existing browser session to reuse, having it continue from the current screen state
+            ID of a Skyvern browser session to reuse, having it continue from the current screen state
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -478,7 +485,7 @@ class AgentClient:
             authorization="YOUR_AUTHORIZATION",
         )
         client.agent.run_workflow(
-            workflow_id="workflow_id",
+            workflow_id="wpid_123",
         )
         """
         _response = self._client_wrapper.httpx_client.request(
@@ -489,8 +496,8 @@ class AgentClient:
             },
             json={
                 "workflow_id": workflow_id,
-                "title": title,
                 "parameters": parameters,
+                "title": title,
                 "proxy_location": proxy_location,
                 "webhook_url": webhook_url,
                 "totp_url": totp_url,
@@ -636,7 +643,7 @@ class AsyncAgentClient:
 
         async def main() -> None:
             await client.agent.get_run(
-                run_id="run_id",
+                run_id="tsk_123",
             )
 
 
@@ -751,6 +758,7 @@ class AsyncAgentClient:
         Parameters
         ----------
         workflow_id : str
+            The ID of the workflow to update. Workflow ID starts with `wpid_`.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -774,7 +782,7 @@ class AsyncAgentClient:
 
         async def main() -> None:
             await client.agent.update_workflow(
-                workflow_id="workflow_id",
+                workflow_id="wpid_123",
             )
 
 
@@ -818,6 +826,7 @@ class AsyncAgentClient:
         Parameters
         ----------
         workflow_id : str
+            The ID of the workflow to delete. Workflow ID starts with `wpid_`.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -841,7 +850,7 @@ class AsyncAgentClient:
 
         async def main() -> None:
             await client.agent.delete_workflow(
-                workflow_id="workflow_id",
+                workflow_id="wpid_123",
             )
 
 
@@ -882,8 +891,8 @@ class AsyncAgentClient:
         prompt: str,
         user_agent: typing.Optional[str] = None,
         url: typing.Optional[str] = OMIT,
-        title: typing.Optional[str] = OMIT,
         engine: typing.Optional[RunEngine] = OMIT,
+        title: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
         data_extraction_schema: typing.Optional[TaskRunRequestDataExtractionSchema] = OMIT,
         error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
@@ -893,6 +902,7 @@ class AsyncAgentClient:
         totp_url: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
         publish_workflow: typing.Optional[bool] = OMIT,
+        include_action_history_in_verification: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> TaskRunResponse:
         """
@@ -908,11 +918,11 @@ class AsyncAgentClient:
         url : typing.Optional[str]
             The starting URL for the task. If not provided, Skyvern will attempt to determine an appropriate URL
 
-        title : typing.Optional[str]
-            Optional title for the task
-
         engine : typing.Optional[RunEngine]
-            The Skyvern engine version to use for this task
+            The Skyvern engine version to use for this task. The default value is skyvern-2.0.
+
+        title : typing.Optional[str]
+            The title for the task
 
         proxy_location : typing.Optional[ProxyLocation]
             Geographic Proxy location to route the browser traffic through
@@ -939,7 +949,10 @@ class AsyncAgentClient:
             ID of an existing browser session to reuse, having it continue from the current screen state
 
         publish_workflow : typing.Optional[bool]
-            Whether to publish this task as a reusable workflow.
+            Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.
+
+        include_action_history_in_verification : typing.Optional[bool]
+            Whether to include action history when verifying that the task is complete
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -975,8 +988,8 @@ class AsyncAgentClient:
             json={
                 "prompt": prompt,
                 "url": url,
-                "title": title,
                 "engine": engine,
+                "title": title,
                 "proxy_location": proxy_location,
                 "data_extraction_schema": convert_and_respect_annotation_metadata(
                     object_=data_extraction_schema, annotation=TaskRunRequestDataExtractionSchema, direction="write"
@@ -988,6 +1001,7 @@ class AsyncAgentClient:
                 "totp_url": totp_url,
                 "browser_session_id": browser_session_id,
                 "publish_workflow": publish_workflow,
+                "include_action_history_in_verification": include_action_history_in_verification,
             },
             headers={
                 "x-user-agent": str(user_agent) if user_agent is not None else None,
@@ -1036,8 +1050,8 @@ class AsyncAgentClient:
         template: typing.Optional[bool] = None,
         max_steps_override: typing.Optional[int] = None,
         user_agent: typing.Optional[str] = None,
-        title: typing.Optional[str] = OMIT,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
+        title: typing.Optional[str] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
         webhook_url: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
@@ -1051,7 +1065,7 @@ class AsyncAgentClient:
         Parameters
         ----------
         workflow_id : str
-            ID of the workflow to run
+            ID of the workflow to run. Workflow ID starts with `wpid_`.
 
         template : typing.Optional[bool]
 
@@ -1059,26 +1073,26 @@ class AsyncAgentClient:
 
         user_agent : typing.Optional[str]
 
-        title : typing.Optional[str]
-            Optional title for this workflow run
-
         parameters : typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]]
             Parameters to pass to the workflow
+
+        title : typing.Optional[str]
+            The title for this workflow run
 
         proxy_location : typing.Optional[ProxyLocation]
             Location of proxy to use for this workflow run
 
         webhook_url : typing.Optional[str]
-            URL to send workflow status updates to after a run is finished
+            URL to send workflow status updates to after a run is finished. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for webhook questions.
 
         totp_url : typing.Optional[str]
-            URL for TOTP authentication setup if Skyvern should be polling endpoint for 2FA codes
+            URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/running-tasks/advanced-features#get-code-from-your-endpoint
 
         totp_identifier : typing.Optional[str]
-            Identifier for TOTP (Time-based One-Time Password) authentication if codes are being pushed to Skyvern
+            Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/running-tasks/advanced-features#time-based-one-time-password-totp
 
         browser_session_id : typing.Optional[str]
-            ID of an existing browser session to reuse, having it continue from the current screen state
+            ID of a Skyvern browser session to reuse, having it continue from the current screen state
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1102,7 +1116,7 @@ class AsyncAgentClient:
 
         async def main() -> None:
             await client.agent.run_workflow(
-                workflow_id="workflow_id",
+                workflow_id="wpid_123",
             )
 
 
@@ -1116,8 +1130,8 @@ class AsyncAgentClient:
             },
             json={
                 "workflow_id": workflow_id,
-                "title": title,
                 "parameters": parameters,
+                "title": title,
                 "proxy_location": proxy_location,
                 "webhook_url": webhook_url,
                 "totp_url": totp_url,
