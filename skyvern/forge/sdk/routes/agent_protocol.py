@@ -23,7 +23,15 @@ from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
-from skyvern.forge.sdk.routes.code_samples import GET_RUN_CODE_SAMPLE, RUN_TASK_CODE_SAMPLE, RUN_WORKFLOW_CODE_SAMPLE
+from skyvern.forge.sdk.routes.code_samples import (
+    CANCEL_RUN_CODE_SAMPLE,
+    CREATE_WORKFLOW_CODE_SAMPLE,
+    DELETE_WORKFLOW_CODE_SAMPLE,
+    GET_RUN_CODE_SAMPLE,
+    RUN_TASK_CODE_SAMPLE,
+    RUN_WORKFLOW_CODE_SAMPLE,
+    UPDATE_WORKFLOW_CODE_SAMPLE,
+)
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
 from skyvern.forge.sdk.schemas.organizations import (
@@ -389,6 +397,7 @@ async def get_run(
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "cancel_run",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": CANCEL_RUN_CODE_SAMPLE}]}],
     },
     description="Cancel a run (task or workflow)",
     summary="Cancel a task or workflow run",
@@ -435,6 +444,7 @@ async def cancel_run(
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "create_workflow",
+        "x-fern-examples": [{"code-samples": [{"sdk": "curl", "code": CREATE_WORKFLOW_CODE_SAMPLE}]}],
     },
     description="Create a new workflow",
     summary="Create a new workflow",
@@ -506,6 +516,7 @@ async def create_workflow(
         },
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "update_workflow",
+        "x-fern-examples": [{"code-samples": [{"sdk": "curl", "code": UPDATE_WORKFLOW_CODE_SAMPLE}]}],
     },
     description="Update a workflow definition",
     summary="Update a workflow definition",
@@ -573,6 +584,7 @@ async def update_workflow(
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "delete_workflow",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": DELETE_WORKFLOW_CODE_SAMPLE}]}],
     },
     description="Delete a workflow",
     summary="Delete a workflow",
