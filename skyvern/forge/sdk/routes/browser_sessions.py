@@ -1,8 +1,14 @@
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Path
 from fastapi.responses import ORJSONResponse
 
 from skyvern import analytics
 from skyvern.forge import app
+from skyvern.forge.sdk.routes.code_samples import (
+    CLOSE_BROWSER_SESSION_CODE_SAMPLE,
+    CREATE_BROWSER_SESSION_CODE_SAMPLE,
+    GET_BROWSER_SESSION_CODE_SAMPLE,
+    GET_BROWSER_SESSIONS_CODE_SAMPLE,
+)
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
@@ -17,6 +23,7 @@ from skyvern.webeye.schemas import BrowserSessionResponse
     openapi_extra={
         "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "create_browser_session",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": CREATE_BROWSER_SESSION_CODE_SAMPLE}]}],
     },
     description="Create a new browser session",
     summary="Create a new browser session",
@@ -24,6 +31,11 @@ from skyvern.webeye.schemas import BrowserSessionResponse
         200: {"description": "Successfully created browser session"},
         403: {"description": "Unauthorized - Invalid or missing authentication"},
     },
+)
+@base_router.post(
+    "/browser_sessions/",
+    response_model=BrowserSessionResponse,
+    include_in_schema=False,
 )
 async def create_browser_session(
     browser_session_request: CreateBrowserSessionRequest,
@@ -42,6 +54,7 @@ async def create_browser_session(
     openapi_extra={
         "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "close_browser_session",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": CLOSE_BROWSER_SESSION_CODE_SAMPLE}]}],
     },
     description="Close a browser session",
     summary="Close a browser session",
@@ -50,8 +63,16 @@ async def create_browser_session(
         403: {"description": "Unauthorized - Invalid or missing authentication"},
     },
 )
+@base_router.post(
+    "/browser_sessions/{browser_session_id}/close/",
+    include_in_schema=False,
+)
 async def close_browser_session(
-    browser_session_id: str,
+    browser_session_id: str = Path(
+        ...,
+        description="The ID of the browser session to close. completed_at will be set when the browser session is closed. browser_session_id starts with `pbs_`",
+        examples=["pbs_123456"],
+    ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> ORJSONResponse:
     await app.PERSISTENT_SESSIONS_MANAGER.close_session(current_org.organization_id, browser_session_id)
@@ -69,6 +90,7 @@ async def close_browser_session(
     openapi_extra={
         "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "get_browser_session",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_BROWSER_SESSION_CODE_SAMPLE}]}],
     },
     description="Get details about a specific browser session by ID",
     summary="Get browser session details",
@@ -78,8 +100,15 @@ async def close_browser_session(
         403: {"description": "Unauthorized - Invalid or missing authentication"},
     },
 )
+@base_router.get(
+    "/browser_sessions/{browser_session_id}/",
+    response_model=BrowserSessionResponse,
+    include_in_schema=False,
+)
 async def get_browser_session(
-    browser_session_id: str,
+    browser_session_id: str = Path(
+        ..., description="The ID of the browser session. browser_session_id starts with `pbs_`", examples=["pbs_123456"]
+    ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> BrowserSessionResponse:
     analytics.capture("skyvern-oss-agent-browser-session-get")
@@ -99,6 +128,7 @@ async def get_browser_session(
     openapi_extra={
         "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "get_browser_sessions",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_BROWSER_SESSIONS_CODE_SAMPLE}]}],
     },
     description="Get all active browser sessions for the organization",
     summary="Get all active browser sessions",
@@ -106,6 +136,11 @@ async def get_browser_session(
         200: {"description": "Successfully retrieved all active browser sessions"},
         403: {"description": "Unauthorized - Invalid or missing authentication"},
     },
+)
+@base_router.get(
+    "/browser_sessions/",
+    response_model=list[BrowserSessionResponse],
+    include_in_schema=False,
 )
 async def get_browser_sessions(
     current_org: Organization = Depends(org_auth_service.get_current_org),

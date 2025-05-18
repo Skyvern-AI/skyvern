@@ -347,3 +347,26 @@ skyvern = Skyvern(api_key="your_api_key")
 credentials = await skyvern.credentials.get_credentials()
 print(credentials)
 """
+CREATE_BROWSER_SESSION_CODE_SAMPLE = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="your_api_key")
+browser_session = await skyvern.browser_sessions.create_browser_session(timeout=60)
+print(browser_session)
+"""
+CLOSE_BROWSER_SESSION_CODE_SAMPLE = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="your_api_key")
+await skyvern.browser_sessions.close_browser_session(browser_session_id="pbs_123")
+"""
+GET_BROWSER_SESSION_CODE_SAMPLE = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="your_api_key")
+browser_session = await skyvern.browser_sessions.get_browser_session(browser_session_id="pbs_123")
+print(browser_session)
+"""
+GET_BROWSER_SESSIONS_CODE_SAMPLE = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="your_api_key")
+browser_sessions = await skyvern.browser_sessions.get_browser_sessions()
+print(browser_sessions)
+"""
