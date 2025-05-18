@@ -4,13 +4,13 @@ import typing
 from ..core.client_wrapper import SyncClientWrapper
 from ..core.request_options import RequestOptions
 from ..types.browser_session_response import BrowserSessionResponse
-from ..core.jsonable_encoder import jsonable_encoder
 from ..core.pydantic_utilities import parse_obj_as
 from ..errors.forbidden_error import ForbiddenError
-from ..errors.not_found_error import NotFoundError
 from ..errors.unprocessable_entity_error import UnprocessableEntityError
 from json.decoder import JSONDecodeError
 from ..core.api_error import ApiError
+from ..core.jsonable_encoder import jsonable_encoder
+from ..errors.not_found_error import NotFoundError
 from ..core.client_wrapper import AsyncClientWrapper
 
 # this is used as the default value for optional parameters
@@ -20,85 +20,6 @@ OMIT = typing.cast(typing.Any, ...)
 class BrowserSessionClient:
     def __init__(self, *, client_wrapper: SyncClientWrapper):
         self._client_wrapper = client_wrapper
-
-    def get_browser_session(
-        self, browser_session_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> BrowserSessionResponse:
-        """
-        Get details about a specific browser session by ID
-
-        Parameters
-        ----------
-        browser_session_id : str
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        BrowserSessionResponse
-            Successfully retrieved browser session details
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
-        )
-        client.browser_session.get_browser_session(
-            browser_session_id="browser_session_id",
-        )
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            f"v1/browser_sessions/{jsonable_encoder(browser_session_id)}",
-            method="GET",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                return typing.cast(
-                    BrowserSessionResponse,
-                    parse_obj_as(
-                        type_=BrowserSessionResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-            if _response.status_code == 403:
-                raise ForbiddenError(
-                    typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    )
-                )
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    )
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    )
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, body=_response.text)
-        raise ApiError(status_code=_response.status_code, body=_response_json)
 
     def get_browser_sessions(
         self, *, request_options: typing.Optional[RequestOptions] = None
@@ -249,6 +170,7 @@ class BrowserSessionClient:
         Parameters
         ----------
         browser_session_id : str
+            The ID of the browser session to close. completed_at will be set when the browser session is closed. browser_session_id starts with `pbs_`
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -267,7 +189,7 @@ class BrowserSessionClient:
             authorization="YOUR_AUTHORIZATION",
         )
         client.browser_session.close_browser_session(
-            browser_session_id="browser_session_id",
+            browser_session_id="pbs_123456",
         )
         """
         _response = self._client_wrapper.httpx_client.request(
@@ -309,12 +231,7 @@ class BrowserSessionClient:
             raise ApiError(status_code=_response.status_code, body=_response.text)
         raise ApiError(status_code=_response.status_code, body=_response_json)
 
-
-class AsyncBrowserSessionClient:
-    def __init__(self, *, client_wrapper: AsyncClientWrapper):
-        self._client_wrapper = client_wrapper
-
-    async def get_browser_session(
+    def get_browser_session(
         self, browser_session_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> BrowserSessionResponse:
         """
@@ -323,6 +240,7 @@ class AsyncBrowserSessionClient:
         Parameters
         ----------
         browser_session_id : str
+            The ID of the browser session. browser_session_id starts with `pbs_`
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -334,25 +252,17 @@ class AsyncBrowserSessionClient:
 
         Examples
         --------
-        import asyncio
+        from skyvern import Skyvern
 
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
+        client = Skyvern(
             api_key="YOUR_API_KEY",
             authorization="YOUR_AUTHORIZATION",
         )
-
-
-        async def main() -> None:
-            await client.browser_session.get_browser_session(
-                browser_session_id="browser_session_id",
-            )
-
-
-        asyncio.run(main())
+        client.browser_session.get_browser_session(
+            browser_session_id="pbs_123456",
+        )
         """
-        _response = await self._client_wrapper.httpx_client.request(
+        _response = self._client_wrapper.httpx_client.request(
             f"v1/browser_sessions/{jsonable_encoder(browser_session_id)}",
             method="GET",
             request_options=request_options,
@@ -400,6 +310,11 @@ class AsyncBrowserSessionClient:
         except JSONDecodeError:
             raise ApiError(status_code=_response.status_code, body=_response.text)
         raise ApiError(status_code=_response.status_code, body=_response_json)
+
+
+class AsyncBrowserSessionClient:
+    def __init__(self, *, client_wrapper: AsyncClientWrapper):
+        self._client_wrapper = client_wrapper
 
     async def get_browser_sessions(
         self, *, request_options: typing.Optional[RequestOptions] = None
@@ -566,6 +481,7 @@ class AsyncBrowserSessionClient:
         Parameters
         ----------
         browser_session_id : str
+            The ID of the browser session to close. completed_at will be set when the browser session is closed. browser_session_id starts with `pbs_`
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -589,7 +505,7 @@ class AsyncBrowserSessionClient:
 
         async def main() -> None:
             await client.browser_session.close_browser_session(
-                browser_session_id="browser_session_id",
+                browser_session_id="pbs_123456",
             )
 
 
@@ -611,6 +527,94 @@ class AsyncBrowserSessionClient:
                 )
             if _response.status_code == 403:
                 raise ForbiddenError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
+    async def get_browser_session(
+        self, browser_session_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> BrowserSessionResponse:
+        """
+        Get details about a specific browser session by ID
+
+        Parameters
+        ----------
+        browser_session_id : str
+            The ID of the browser session. browser_session_id starts with `pbs_`
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        BrowserSessionResponse
+            Successfully retrieved browser session details
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
+        )
+
+
+        async def main() -> None:
+            await client.browser_session.get_browser_session(
+                browser_session_id="pbs_123456",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/browser_sessions/{jsonable_encoder(browser_session_id)}",
+            method="GET",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    BrowserSessionResponse,
+                    parse_obj_as(
+                        type_=BrowserSessionResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 403:
+                raise ForbiddenError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            if _response.status_code == 404:
+                raise NotFoundError(
                     typing.cast(
                         typing.Optional[typing.Any],
                         parse_obj_as(

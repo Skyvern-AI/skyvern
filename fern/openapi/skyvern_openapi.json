@@ -6,13 +6,253 @@
     "version": "1.0.0"
   },
   "paths": {
+    "/v1/run/tasks": {
+      "post": {
+        "tags": [
+          "Agent"
+        ],
+        "summary": "Run a task",
+        "description": "Run a task",
+        "operationId": "run_task_v1_run_tasks_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "name": "x-user-agent",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Agent"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskRunRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully run task",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskRunResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid agent engine"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "run_task",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.run_task(prompt=\"What's the top post on hackernews?\")\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "/v1/run/workflows": {
+      "post": {
+        "tags": [
+          "Agent"
+        ],
+        "summary": "Run a workflow",
+        "description": "Run a workflow",
+        "operationId": "run_workflow_v1_run_workflows_post",
+        "parameters": [
+          {
+            "name": "template",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Template"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "name": "x-max-steps-override",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Max-Steps-Override"
+            }
+          },
+          {
+            "name": "x-user-agent",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Agent"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowRunRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully run workflow",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRunResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid workflow run request"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "run_workflow",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.agent.run_workflow(workflow_id=\"wpid_123\", parameters={\"parameter1\": \"value1\", \"parameter2\": \"value2\"})\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
     "/v1/runs/{run_id}": {
       "get": {
         "tags": [
           "Agent"
         ],
         "summary": "Get a task or a workflow run by id",
-        "description": "Get a task or a workflow run by id",
+        "description": "Get run information (task run, workflow run)",
         "operationId": "get_run_v1_runs__run_id__get",
         "parameters": [
           {
@@ -114,7 +354,96 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nclient = Skyvern(api_key=\"your_api_key\")\nrun = await client.get_run(run_id=\"tsk_123\")\nprint(run)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nrun = await skyvern.get_run(run_id=\"tsk_v2_123\")\nprint(run)\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "/v1/runs/{run_id}/cancel": {
+      "post": {
+        "tags": [
+          "Agent"
+        ],
+        "summary": "Cancel a task or workflow run",
+        "description": "Cancel a run (task or workflow)",
+        "operationId": "cancel_run_v1_runs__run_id__cancel_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The id of the task run or the workflow run to cancel.",
+              "title": "Run Id"
+            },
+            "description": "The id of the task run or the workflow run to cancel."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "cancel_run",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.cancel_run(run_id=\"tsk_v2_123\")\n"
               }
             ]
           }
@@ -179,7 +508,17 @@
           }
         },
         "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "create_workflow"
+        "x-fern-sdk-method-name": "create_workflow",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "curl",
+                "code": "curl -X POST https://api.skyvern.com/v1/workflows --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: application/x-yaml' --data-raw 'title: Invoice Downloading Demo (Jun 13)\ndescription: \u003E-\n  Login to the website, download all the invoices after a date, email the\n  invoices\nworkflow_definition:\n  parameters:\n    - key: website_url\n      parameter_type: workflow\n      workflow_parameter_type: string\n    - key: credentials\n      parameter_type: bitwarden_login_credential\n      bitwarden_client_id_aws_secret_key: SECRET\n      bitwarden_client_secret_aws_secret_key: SECRET\n      bitwarden_master_password_aws_secret_key: SECRET\n      bitwarden_collection_id: SECRET\n      url_parameter_key: website_url\n    - key: invoice_retrieval_start_date\n      parameter_type: workflow\n      workflow_parameter_type: string\n    - key: smtp_host\n      parameter_type: aws_secret\n      aws_key: SKYVERN_SMTP_HOST_AWS_SES\n    - key: smtp_port\n      parameter_type: aws_secret\n      aws_key: SKYVERN_SMTP_PORT_AWS_SES\n    - key: smtp_username\n      parameter_type: aws_secret\n      aws_key: SKYVERN_SMTP_USERNAME_SES\n    - key: smtp_password\n      parameter_type: aws_secret\n      aws_key: SKYVERN_SMTP_PASSWORD_SES\n    - parameter_type: context\n      key: order_history_url\n      source_parameter_key: get_order_history_page_url_and_qualifying_order_ids_output\n    - parameter_type: context\n      key: order_ids\n      source_parameter_key: get_order_history_page_url_and_qualifying_order_ids_output\n    - parameter_type: context\n      key: order_id\n      source_parameter_key: order_ids\n  blocks:\n    - block_type: task\n      label: login\n      parameter_keys:\n        - credentials\n      url: website_url\n      navigation_goal: \u003E-\n        If you're not on the login page, navigate to login page and login using the credentials given, and then navigate to the personal account page. First, take actions on promotional popups or cookie prompts that could prevent taking other action on the web page. Then, try to login and navigate to the personal account page. If you fail to login to find the login page or can't login after several trials, terminate. If you're on the personal account page, consider the goal is completed.\n      error_code_mapping:\n        stuck_with_popups: terminate and return this error if you can't close popups after several tries and can't take the necessary actions on the website because there is a blocking popup on the page\n        failed_to_login: terminate and return this error if you fail logging in to the page\n    - block_type: task\n      label: get_order_history_page_url_and_qualifying_order_ids\n      parameter_keys:\n        - invoice_retrieval_start_date\n      navigation_goal: Find the order history page. If there is no orders after given start date, terminate.\n      data_extraction_goal: \u003E-\n        You need to extract the order history page url by looking at the current\n        page you're on. You need to extract contact emails you see on the page. You also need to extract the order ids for orders that\n        happened on or after invoice_retrieval_start_date. Make sure to filter\n        only the orders that happened on or after invoice_retrieval_start_date. You need to compare each order's date with the invoice_download_start_date. You can only include an order in the output if the order's date is after or the same as the invoice_download_start_date.\n        While comparing dates, first compare year, then month, then day. invoice_retrieval_start_date\n        is in YYYY-MM-DD format. The dates on the websites may be in different formats, compare accordingly and compare year, date, and month.\n      error_code_mapping:\n        failed_to_find_order_history_page: return this error if you can't find the order history page on the website\n        no_orders_found_after_start_date: return this error if there are no orders after the specified invoice_download_start_date\n      data_schema:\n        type: object\n        properties:\n          order_history_url:\n            type: url\n            description: \u003E-\n              The exact URL of the order history page. Do not make any\n              assumptions. Return the URL that's passed along in this context.\n          contact_emails:\n            type: array\n            items:\n                type: string\n                description: Contact email for the ecommerce website you're on. If you can't find any return null\n          date_comparison_scratchpad:\n            type: string\n            description: \u003E-\n                You are supposed to filter the orders that happened on or after the invoice_download_start_date. Think through how you will approach this task step-by-step here. Consider these before starting the comparison:\n                - What format is the order date in? How can you parse it into a structured format?\n                - What is the correct way to compare two dates?\n                - How will you compare the order dates to the invoice_download_start_date? \n                \n                Write out your thought process before filling out the order_ids field below. Remember, the original date may be in any format, so parse it carefully! The invoice_download_start_date will be an exact date you can directly compare against in the format YYYY-MM-DD.\n          order_ids:\n            type: array\n            items:\n              type: object\n              properties:\n                order_date:\n                  type: iso-8601-date-string\n                order_id:\n                  type: string\n            description: \u003E-\n              Return a list of order id strings. Do not return order ids of\n              orders that happened before the specified\n              invoice_retrieval_start_date\n    - block_type: for_loop\n      label: iterate_over_order_ids\n      loop_over_parameter_key: order_ids\n      continue_on_failure: true\n      loop_blocks:\n        - block_type: task\n          label: download_invoice_for_order\n          complete_on_download: true\n          continue_on_failure: true\n          parameter_keys:\n            - order_id\n          url: order_history_url\n          navigation_goal: Download the invoice of the order with the given order ID. Make sure to download the invoice for the given order id. If the element tree doesn't have a matching order id, check the screenshots. Complete if you have successfully downloaded the invoice according to action history, if you were able to download it, you'll see download_triggered=True for the last step. If you don't see a way to download an invoice, navigate to the order page if possible. If there's no way to download an invoice terminate. If the text suggests printing, you can assume you can download it. Return click action with download=True if you want to trigger a download.\n          error_code_mapping:\n            not_possible_to_download_invoice: return this error if the website doesn't allow downloading/viewing invoices\n            cant_solve_captcha: return this error if captcha isn't solved after multiple retries\n    - block_type: upload_to_s3\n      label: upload_downloaded_files_to_s3\n      path: SKYVERN_DOWNLOAD_DIRECTORY\n    - block_type: send_email\n      label: send_email\n      smtp_host_secret_parameter_key: smtp_host\n      smtp_port_secret_parameter_key: smtp_port\n      smtp_username_secret_parameter_key: smtp_username\n      smtp_password_secret_parameter_key: smtp_password\n      sender: hello@skyvern.com\n      recipients:\n        - founders@skyvern.com\n      subject: Skyvern - Downloaded Invoices Demo\n      body: website_url\n      file_attachments:\n        - SKYVERN_DOWNLOAD_DIRECTORY\n'\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/workflows/{workflow_id}": {
@@ -2545,7 +2884,17 @@
           "required": true
         },
         "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "update_workflow"
+        "x-fern-sdk-method-name": "update_workflow",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "curl",
+                "code": "curl -X POST https://api.skyvern.com/v1/workflows/wpid_123 --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: application/x-yaml' --data-raw 'title: Invoice Downloading Demo (Jun 13)\ndescription: \u003E-\n  Login to the website, download all the invoices after a date, email the\n  invoices\nworkflow_definition:\n  parameters:\n    - key: website_url\n      parameter_type: workflow\n      workflow_parameter_type: string\n    - key: credentials\n      parameter_type: bitwarden_login_credential\n      bitwarden_client_id_aws_secret_key: SECRET\n      bitwarden_client_secret_aws_secret_key: SECRET\n      bitwarden_master_password_aws_secret_key: SECRET\n      bitwarden_collection_id: SECRET\n      url_parameter_key: website_url\n    - key: invoice_retrieval_start_date\n      parameter_type: workflow\n      workflow_parameter_type: string\n    - key: smtp_host\n      parameter_type: aws_secret\n      aws_key: SKYVERN_SMTP_HOST_AWS_SES\n    - key: smtp_port\n      parameter_type: aws_secret\n      aws_key: SKYVERN_SMTP_PORT_AWS_SES\n    - key: smtp_username\n      parameter_type: aws_secret\n      aws_key: SKYVERN_SMTP_USERNAME_SES\n    - key: smtp_password\n      parameter_type: aws_secret\n      aws_key: SKYVERN_SMTP_PASSWORD_SES\n    - parameter_type: context\n      key: order_history_url\n      source_parameter_key: get_order_history_page_url_and_qualifying_order_ids_output\n    - parameter_type: context\n      key: order_ids\n      source_parameter_key: get_order_history_page_url_and_qualifying_order_ids_output\n    - parameter_type: context\n      key: order_id\n      source_parameter_key: order_ids\n  blocks:\n    - block_type: task\n      label: login\n      parameter_keys:\n        - credentials\n      url: website_url\n      navigation_goal: \u003E-\n        If you're not on the login page, navigate to login page and login using the credentials given, and then navigate to the personal account page. First, take actions on promotional popups or cookie prompts that could prevent taking other action on the web page. Then, try to login and navigate to the personal account page. If you fail to login to find the login page or can't login after several trials, terminate. If you're on the personal account page, consider the goal is completed.\n      error_code_mapping:\n        stuck_with_popups: terminate and return this error if you can't close popups after several tries and can't take the necessary actions on the website because there is a blocking popup on the page\n        failed_to_login: terminate and return this error if you fail logging in to the page\n    - block_type: task\n      label: get_order_history_page_url_and_qualifying_order_ids\n      parameter_keys:\n        - invoice_retrieval_start_date\n      navigation_goal: Find the order history page. If there is no orders after given start date, terminate.\n      data_extraction_goal: \u003E-\n        You need to extract the order history page url by looking at the current\n        page you're on. You need to extract contact emails you see on the page. You also need to extract the order ids for orders that\n        happened on or after invoice_retrieval_start_date. Make sure to filter\n        only the orders that happened on or after invoice_retrieval_start_date. You need to compare each order's date with the invoice_download_start_date. You can only include an order in the output if the order's date is after or the same as the invoice_download_start_date.\n        While comparing dates, first compare year, then month, then day. invoice_retrieval_start_date\n        is in YYYY-MM-DD format. The dates on the websites may be in different formats, compare accordingly and compare year, date, and month.\n      error_code_mapping:\n        failed_to_find_order_history_page: return this error if you can't find the order history page on the website\n        no_orders_found_after_start_date: return this error if there are no orders after the specified invoice_download_start_date\n      data_schema:\n        type: object\n        properties:\n          order_history_url:\n            type: url\n            description: \u003E-\n              The exact URL of the order history page. Do not make any\n              assumptions. Return the URL that's passed along in this context.\n          contact_emails:\n            type: array\n            items:\n                type: string\n                description: Contact email for the ecommerce website you're on. If you can't find any return null\n          date_comparison_scratchpad:\n            type: string\n            description: \u003E-\n                You are supposed to filter the orders that happened on or after the invoice_download_start_date. Think through how you will approach this task step-by-step here. Consider these before starting the comparison:\n                - What format is the order date in? How can you parse it into a structured format?\n                - What is the correct way to compare two dates?\n                - How will you compare the order dates to the invoice_download_start_date? \n                \n                Write out your thought process before filling out the order_ids field below. Remember, the original date may be in any format, so parse it carefully! The invoice_download_start_date will be an exact date you can directly compare against in the format YYYY-MM-DD.\n          order_ids:\n            type: array\n            items:\n              type: object\n              properties:\n                order_date:\n                  type: iso-8601-date-string\n                order_id:\n                  type: string\n            description: \u003E-\n              Return a list of order id strings. Do not return order ids of\n              orders that happened before the specified\n              invoice_retrieval_start_date\n    - block_type: for_loop\n      label: iterate_over_order_ids\n      loop_over_parameter_key: order_ids\n      continue_on_failure: true\n      loop_blocks:\n        - block_type: task\n          label: download_invoice_for_order\n          complete_on_download: true\n          continue_on_failure: true\n          parameter_keys:\n            - order_id\n          url: order_history_url\n          navigation_goal: Download the invoice of the order with the given order ID. Make sure to download the invoice for the given order id. If the element tree doesn't have a matching order id, check the screenshots. Complete if you have successfully downloaded the invoice according to action history, if you were able to download it, you'll see download_triggered=True for the last step. If you don't see a way to download an invoice, navigate to the order page if possible. If there's no way to download an invoice terminate. If the text suggests printing, you can assume you can download it. Return click action with download=True if you want to trigger a download.\n          error_code_mapping:\n            not_possible_to_download_invoice: return this error if the website doesn't allow downloading/viewing invoices\n            cant_solve_captcha: return this error if captcha isn't solved after multiple retries\n    - block_type: upload_to_s3\n      label: upload_downloaded_files_to_s3\n      path: SKYVERN_DOWNLOAD_DIRECTORY\n    - block_type: send_email\n      label: send_email\n      smtp_host_secret_parameter_key: smtp_host\n      smtp_port_secret_parameter_key: smtp_port\n      smtp_username_secret_parameter_key: smtp_username\n      smtp_password_secret_parameter_key: smtp_password\n      sender: hello@skyvern.com\n      recipients:\n        - founders@skyvern.com\n      subject: Skyvern - Downloaded Invoices Demo\n      body: website_url\n      file_attachments:\n        - SKYVERN_DOWNLOAD_DIRECTORY\n'\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/workflows/{workflow_id}/delete": {
@@ -2627,485 +2976,20 @@
           }
         },
         "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "delete_workflow"
-      }
-    },
-    "/v1/run/tasks": {
-      "post": {
-        "tags": [
-          "Agent"
-        ],
-        "summary": "Run a task",
-        "description": "Run a task",
-        "operationId": "run_task_v1_run_tasks_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "x-user-agent",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-User-Agent"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TaskRunRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successfully run task",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TaskRunResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid agent engine"
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "run_task",
+        "x-fern-sdk-method-name": "delete_workflow",
         "x-fern-examples": [
           {
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nclient = Skyvern(api_key=\"your_api_key\")\nawait client.run_task(prompt=\"What's the top post on hackernews?\")\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.agent.delete_workflow(workflow_id=\"wpid_123\")\n"
               }
             ]
           }
         ]
-      }
-    },
-    "/v1/run/workflows": {
-      "post": {
-        "tags": [
-          "Agent"
-        ],
-        "summary": "Run a workflow",
-        "description": "Run a workflow",
-        "operationId": "run_workflow_v1_run_workflows_post",
-        "parameters": [
-          {
-            "name": "template",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": false,
-              "title": "Template"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "x-max-steps-override",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Max-Steps-Override"
-            }
-          },
-          {
-            "name": "x-user-agent",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-User-Agent"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/WorkflowRunRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successfully run workflow",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/WorkflowRunResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid workflow run request"
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "run_workflow",
-        "x-fern-examples": [
-          {
-            "code-samples": [
-              {
-                "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nclient = Skyvern(api_key=\"your_api_key\")\nawait client.agent.run_workflow(workflow_id=\"wpid_123\", parameters={\"parameter1\": \"value1\", \"parameter2\": \"value2\"})\n"
-              }
-            ]
-          }
-        ]
-      }
-    },
-    "/v1/runs/{run_id}/cancel": {
-      "post": {
-        "tags": [
-          "Agent"
-        ],
-        "summary": "Cancel a task or workflow run",
-        "description": "Cancel a task or workflow run",
-        "operationId": "cancel_run_v1_runs__run_id__cancel_post",
-        "parameters": [
-          {
-            "name": "run_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "The id of the task run or the workflow run to cancel.",
-              "title": "Run Id"
-            },
-            "description": "The id of the task run or the workflow run to cancel."
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "cancel_run"
-      }
-    },
-    "/v1/browser_sessions/{browser_session_id}": {
-      "get": {
-        "tags": [
-          "Browser Sessions"
-        ],
-        "summary": "Get browser session details",
-        "description": "Get details about a specific browser session by ID",
-        "operationId": "get_browser_session_v1_browser_sessions__browser_session_id__get",
-        "parameters": [
-          {
-            "name": "browser_session_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Browser Session Id"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successfully retrieved browser session details",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BrowserSessionResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Browser session not found"
-          },
-          "403": {
-            "description": "Unauthorized - Invalid or missing authentication"
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-group-name": "browser_session",
-        "x-fern-sdk-method-name": "get_browser_session"
       }
     },
     "/v1/browser_sessions": {
-      "get": {
-        "tags": [
-          "Browser Sessions"
-        ],
-        "summary": "Get all active browser sessions",
-        "description": "Get all active browser sessions for the organization",
-        "operationId": "get_browser_sessions_v1_browser_sessions_get",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successfully retrieved all active browser sessions",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/BrowserSessionResponse"
-                  },
-                  "title": "Response Get Browser Sessions V1 Browser Sessions Get"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Unauthorized - Invalid or missing authentication"
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-group-name": "browser_session",
-        "x-fern-sdk-method-name": "get_browser_sessions"
-      },
       "post": {
         "tags": [
           "Browser Sessions"
@@ -3183,7 +3067,100 @@
           }
         },
         "x-fern-sdk-group-name": "browser_session",
-        "x-fern-sdk-method-name": "create_browser_session"
+        "x-fern-sdk-method-name": "create_browser_session",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nbrowser_session = await skyvern.browser_sessions.create_browser_session(timeout=60)\nprint(browser_session)\n"
+              }
+            ]
+          }
+        ]
+      },
+      "get": {
+        "tags": [
+          "Browser Sessions"
+        ],
+        "summary": "Get all active browser sessions",
+        "description": "Get all active browser sessions for the organization",
+        "operationId": "get_browser_sessions_v1_browser_sessions_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved all active browser sessions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BrowserSessionResponse"
+                  },
+                  "title": "Response Get Browser Sessions V1 Browser Sessions Get"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Unauthorized - Invalid or missing authentication"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-group-name": "browser_session",
+        "x-fern-sdk-method-name": "get_browser_sessions",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nbrowser_sessions = await skyvern.browser_sessions.get_browser_sessions()\nprint(browser_sessions)\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/browser_sessions/{browser_session_id}/close": {
@@ -3201,8 +3178,13 @@
             "required": true,
             "schema": {
               "type": "string",
+              "description": "The ID of the browser session to close. completed_at will be set when the browser session is closed. browser_session_id starts with `pbs_`",
+              "examples": [
+                "pbs_123456"
+              ],
               "title": "Browser Session Id"
-            }
+            },
+            "description": "The ID of the browser session to close. completed_at will be set when the browser session is closed. browser_session_id starts with `pbs_`"
           },
           {
             "name": "x-api-key",
@@ -3263,7 +3245,115 @@
           }
         },
         "x-fern-sdk-group-name": "browser_session",
-        "x-fern-sdk-method-name": "close_browser_session"
+        "x-fern-sdk-method-name": "close_browser_session",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.browser_sessions.close_browser_session(browser_session_id=\"pbs_123\")\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "/v1/browser_sessions/{browser_session_id}": {
+      "get": {
+        "tags": [
+          "Browser Sessions"
+        ],
+        "summary": "Get browser session details",
+        "description": "Get details about a specific browser session by ID",
+        "operationId": "get_browser_session_v1_browser_sessions__browser_session_id__get",
+        "parameters": [
+          {
+            "name": "browser_session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The ID of the browser session. browser_session_id starts with `pbs_`",
+              "examples": [
+                "pbs_123456"
+              ],
+              "title": "Browser Session Id"
+            },
+            "description": "The ID of the browser session. browser_session_id starts with `pbs_`"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved browser session details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserSessionResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Browser session not found"
+          },
+          "403": {
+            "description": "Unauthorized - Invalid or missing authentication"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-group-name": "browser_session",
+        "x-fern-sdk-method-name": "get_browser_session",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nbrowser_session = await skyvern.browser_sessions.get_browser_session(browser_session_id=\"pbs_123\")\nprint(browser_session)\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/credentials/totp": {
@@ -3271,8 +3361,8 @@
         "tags": [
           "Credentials"
         ],
-        "summary": "Forward TOTP (2FA, MFA) code to Skyvern",
-        "description": "Forward a TOTP (2FA, MFA) code to Skyvern",
+        "summary": "Send TOTP (2FA, MFA) code to Skyvern",
+        "description": "Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern",
         "operationId": "send_totp_code_v1_credentials_totp_post",
         "parameters": [
           {
@@ -3345,6 +3435,109 @@
       }
     },
     "/v1/credentials": {
+      "post": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Create credential",
+        "description": "Creates a new credential for the current organization",
+        "operationId": "create_credential_v1_credentials_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCredentialRequest",
+                "description": "The credential data to create",
+                "openapi_extra": {
+                  "x-fern-sdk-parameter-name": "data"
+                }
+              },
+              "example": {
+                "name": "My Credential",
+                "credential_type": "PASSWORD",
+                "credential": {
+                  "username": "user@example.com",
+                  "password": "securepassword123",
+                  "totp": "JBSWY3DPEHPK3PXP"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CredentialResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-group-name": "credentials",
+        "x-fern-sdk-method-name": "create_credential",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.credentials.create_credential(\n    name=\"Amazon Login\",\n    credential_type=\"password\",\n    credential={\"username\": \"user@example.com\", \"password\": \"myamazonpassword\"},\n)\n"
+              },
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.credentials.create_credential(\n    name=\"Amazon Login\",\n    credential_type=\"credit_card\",\n    credential={\n        \"card_number\": \"4242424242424242\",\n        \"card_cvv\": \"424\",\n        \"card_exp_month\": \"12\",\n        \"card_exp_year\": \"2028\",\n        \"card_brand\": \"visa\",\n        \"card_holder_name\": \"John Doe\",\n    },\n)\n"
+              }
+            ]
+          }
+        ]
+      },
       "get": {
         "tags": [
           "Credentials"
@@ -3447,16 +3640,43 @@
           }
         },
         "x-fern-sdk-group-name": "credentials",
-        "x-fern-sdk-method-name": "get_credentials"
-      },
+        "x-fern-sdk-method-name": "get_credentials",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\ncredentials = await skyvern.credentials.get_credentials()\nprint(credentials)\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "/v1/credentials/{credential_id}/delete": {
       "post": {
         "tags": [
           "Credentials"
         ],
-        "summary": "Create credential",
-        "description": "Creates a new credential for the current organization",
-        "operationId": "create_credential_v1_credentials_post",
+        "summary": "Delete credential",
+        "description": "Deletes a specific credential by its ID",
+        "operationId": "delete_credential_v1_credentials__credential_id__delete_post",
         "parameters": [
+          {
+            "name": "credential_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The unique identifier of the credential to delete",
+              "openapi_extra": {
+                "x-fern-sdk-parameter-name": "credential_id"
+              },
+              "title": "Credential Id"
+            },
+            "description": "The unique identifier of the credential to delete",
+            "example": "cred_1234567890"
+          },
           {
             "name": "x-api-key",
             "in": "header",
@@ -3490,39 +3710,9 @@
             }
           }
         ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CreateCredentialRequest",
-                "description": "The credential data to create",
-                "openapi_extra": {
-                  "x-fern-sdk-parameter-name": "data"
-                }
-              },
-              "example": {
-                "name": "My Credential",
-                "credential_type": "PASSWORD",
-                "credential": {
-                  "username": "user@example.com",
-                  "password": "securepassword123",
-                  "totp": "JBSWY3DPEHPK3PXP"
-                }
-              }
-            }
-          }
-        },
         "responses": {
-          "201": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CredentialResponse"
-                }
-              }
-            }
+          "204": {
+            "description": "Successful Response"
           },
           "422": {
             "description": "Validation Error",
@@ -3536,7 +3726,17 @@
           }
         },
         "x-fern-sdk-group-name": "credentials",
-        "x-fern-sdk-method-name": "create_credential"
+        "x-fern-sdk-method-name": "delete_credential",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.credentials.delete_credential(credential_id=\"cred_123\")\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/credentials/{credential_id}": {
@@ -3619,83 +3819,17 @@
           }
         },
         "x-fern-sdk-group-name": "credentials",
-        "x-fern-sdk-method-name": "get_credential"
-      }
-    },
-    "/v1/credentials/{credential_id}/delete": {
-      "post": {
-        "tags": [
-          "Credentials"
-        ],
-        "summary": "Delete credential",
-        "description": "Deletes a specific credential by its ID",
-        "operationId": "delete_credential_v1_credentials__credential_id__delete_post",
-        "parameters": [
+        "x-fern-sdk-method-name": "get_credential",
+        "x-fern-examples": [
           {
-            "name": "credential_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "The unique identifier of the credential to delete",
-              "openapi_extra": {
-                "x-fern-sdk-parameter-name": "credential_id"
-              },
-              "title": "Credential Id"
-            },
-            "description": "The unique identifier of the credential to delete",
-            "example": "cred_1234567890"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Successful Response"
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\ncredential = await skyvern.credentials.get_credential(credential_id=\"cred_123\")\nprint(credential)\n"
               }
-            }
+            ]
           }
-        },
-        "x-fern-sdk-group-name": "credentials",
-        "x-fern-sdk-method-name": "delete_credential"
+        ]
       }
     }
   },
@@ -4317,7 +4451,10 @@
           "browser_session_id": {
             "type": "string",
             "title": "Browser Session Id",
-            "description": "Unique identifier for the browser session"
+            "description": "Unique identifier for the browser session. browser_session_id starts with `pbs_`.",
+            "examples": [
+              "pbs_123456"
+            ]
           },
           "organization_id": {
             "type": "string",
@@ -4334,7 +4471,11 @@
               }
             ],
             "title": "Runnable Type",
-            "description": "Type of runnable associated with this session (workflow, task etc)"
+            "description": "Type of the current runnable associated with this session (workflow, task etc)",
+            "examples": [
+              "task",
+              "workflow_run"
+            ]
           },
           "runnable_id": {
             "anyOf": [
@@ -4346,7 +4487,11 @@
               }
             ],
             "title": "Runnable Id",
-            "description": "ID of the associated runnable"
+            "description": "ID of the current runnable",
+            "examples": [
+              "tsk_123456",
+              "wr_123456"
+            ]
           },
           "timeout": {
             "anyOf": [
@@ -4358,7 +4503,8 @@
               }
             ],
             "title": "Timeout",
-            "description": "Timeout in minutes for the session. Timeout is applied after the session is started."
+            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Defaults to 60 minutes.",
+            "examples": [60, 120]
           },
           "started_at": {
             "anyOf": [

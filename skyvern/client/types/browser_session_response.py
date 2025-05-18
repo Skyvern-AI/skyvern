@@ -14,7 +14,7 @@ class BrowserSessionResponse(UniversalBaseModel):
 
     browser_session_id: str = pydantic.Field()
     """
-    Unique identifier for the browser session
+    Unique identifier for the browser session. browser_session_id starts with `pbs_`.
     """
 
     organization_id: str = pydantic.Field()
@@ -24,17 +24,17 @@ class BrowserSessionResponse(UniversalBaseModel):
 
     runnable_type: typing.Optional[str] = pydantic.Field(default=None)
     """
-    Type of runnable associated with this session (workflow, task etc)
+    Type of the current runnable associated with this session (workflow, task etc)
     """
 
     runnable_id: typing.Optional[str] = pydantic.Field(default=None)
     """
-    ID of the associated runnable
+    ID of the current runnable
     """
 
     timeout: typing.Optional[int] = pydantic.Field(default=None)
     """
-    Timeout in minutes for the session. Timeout is applied after the session is started.
+    Timeout in minutes for the session. Timeout is applied after the session is started. Defaults to 60 minutes.
     """
 
     started_at: typing.Optional[dt.datetime] = pydantic.Field(default=None)
