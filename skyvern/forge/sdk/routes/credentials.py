@@ -3,6 +3,14 @@ from fastapi import Body, Depends, HTTPException, Path, Query
 
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.routes.code_samples import (
+    CREATE_CREDENTIAL_CODE_SAMPLE,
+    CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD,
+    DELETE_CREDENTIAL_CODE_SAMPLE,
+    GET_CREDENTIAL_CODE_SAMPLE,
+    GET_CREDENTIALS_CODE_SAMPLE,
+    SEND_TOTP_CODE_CODE_SAMPLE,
+)
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
@@ -31,19 +39,25 @@ async def parse_totp_code(content: str) -> str | None:
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "send_totp_code",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": SEND_TOTP_CODE_CODE_SAMPLE}]}],
     },
 )
 @legacy_base_router.post("/totp/", include_in_schema=False)
 @base_router.post(
     "/credentials/totp",
     response_model=TOTPCode,
-    summary="Forward TOTP (2FA, MFA) code to Skyvern",
-    description="Forward a TOTP (2FA, MFA) code to Skyvern",
+    summary="Send TOTP (2FA, MFA) code to Skyvern",
+    description="Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern",
     tags=["Credentials"],
     openapi_extra={
         "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "send_totp_code",
     },
+)
+@base_router.post(
+    "/credentials/totp/",
+    response_model=TOTPCode,
+    include_in_schema=False,
 )
 async def send_totp_code(
     data: TOTPCodeCreate, curr_org: Organization = Depends(org_auth_service.get_current_org)
@@ -83,7 +97,21 @@ async def send_totp_code(
     openapi_extra={
         "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "create_credential",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": CREATE_CREDENTIAL_CODE_SAMPLE},
+                    {"sdk": "python", "code": CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD},
+                ]
+            }
+        ],
     },
+)
+@base_router.post(
+    "/credentials/",
+    response_model=CredentialResponse,
+    status_code=201,
+    include_in_schema=False,
 )
 async def create_credential(
     data: CreateCredentialRequest = Body(
@@ -160,7 +188,13 @@ async def create_credential(
     openapi_extra={
         "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "delete_credential",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": DELETE_CREDENTIAL_CODE_SAMPLE}]}],
     },
+)
+@base_router.post(
+    "/credentials/{credential_id}/delete/",
+    status_code=204,
+    include_in_schema=False,
 )
 async def delete_credential(
     credential_id: str = Path(
@@ -200,7 +234,13 @@ async def delete_credential(
     openapi_extra={
         "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "get_credential",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_CREDENTIAL_CODE_SAMPLE}]}],
     },
+)
+@base_router.get(
+    "/credentials/{credential_id}/",
+    response_model=CredentialResponse,
+    include_in_schema=False,
 )
 async def get_credential(
     credential_id: str = Path(
@@ -262,7 +302,13 @@ async def get_credential(
     openapi_extra={
         "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "get_credentials",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_CREDENTIALS_CODE_SAMPLE}]}],
     },
+)
+@base_router.get(
+    "/credentials/",
+    response_model=list[CredentialResponse],
+    include_in_schema=False,
 )
 async def get_credentials(
     current_org: Organization = Depends(org_auth_service.get_current_org),

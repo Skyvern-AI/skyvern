@@ -300,3 +300,50 @@ DELETE_WORKFLOW_CODE_SAMPLE = """from skyvern import Skyvern
 skyvern = Skyvern(api_key="your_api_key")
 await skyvern.agent.delete_workflow(workflow_id="wpid_123")
 """
+SEND_TOTP_CODE_CODE_SAMPLE = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="your_api_key")
+await skyvern.credentials.send_totp_code(totp_code="123456")
+"""
+CREATE_CREDENTIAL_CODE_SAMPLE = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="your_api_key")
+await skyvern.credentials.create_credential(
+    name="Amazon Login",
+    credential_type="password",
+    credential={"username": "user@example.com", "password": "myamazonpassword"},
+)
+"""
+CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="your_api_key")
+await skyvern.credentials.create_credential(
+    name="Amazon Login",
+    credential_type="credit_card",
+    credential={
+        "card_number": "4242424242424242",
+        "card_cvv": "424",
+        "card_exp_month": "12",
+        "card_exp_year": "2028",
+        "card_brand": "visa",
+        "card_holder_name": "John Doe",
+    },
+)
+"""
+DELETE_CREDENTIAL_CODE_SAMPLE = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="your_api_key")
+await skyvern.credentials.delete_credential(credential_id="cred_123")
+"""
+GET_CREDENTIAL_CODE_SAMPLE = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="your_api_key")
+credential = await skyvern.credentials.get_credential(credential_id="cred_123")
+print(credential)
+"""
+GET_CREDENTIALS_CODE_SAMPLE = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="your_api_key")
+credentials = await skyvern.credentials.get_credentials()
+print(credentials)
+"""
