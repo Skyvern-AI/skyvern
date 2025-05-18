@@ -10,6 +10,58 @@ from skyvern.schemas.browser_sessions import CreateBrowserSessionRequest
 from skyvern.webeye.schemas import BrowserSessionResponse
 
 
+@base_router.post(
+    "/browser_sessions",
+    response_model=BrowserSessionResponse,
+    tags=["Browser Sessions"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "browser_session",
+        "x-fern-sdk-method-name": "create_browser_session",
+    },
+    description="Create a new browser session",
+    summary="Create a new browser session",
+    responses={
+        200: {"description": "Successfully created browser session"},
+        403: {"description": "Unauthorized - Invalid or missing authentication"},
+    },
+)
+async def create_browser_session(
+    browser_session_request: CreateBrowserSessionRequest,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BrowserSessionResponse:
+    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+        organization_id=current_org.organization_id,
+        timeout_minutes=browser_session_request.timeout,
+    )
+    return BrowserSessionResponse.from_browser_session(browser_session)
+
+
+@base_router.post(
+    "/browser_sessions/{browser_session_id}/close",
+    tags=["Browser Sessions"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "browser_session",
+        "x-fern-sdk-method-name": "close_browser_session",
+    },
+    description="Close a browser session",
+    summary="Close a browser session",
+    responses={
+        200: {"description": "Successfully closed browser session"},
+        403: {"description": "Unauthorized - Invalid or missing authentication"},
+    },
+)
+async def close_browser_session(
+    browser_session_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ORJSONResponse:
+    await app.PERSISTENT_SESSIONS_MANAGER.close_session(current_org.organization_id, browser_session_id)
+    return ORJSONResponse(
+        content={"message": "Browser session closed"},
+        status_code=200,
+        media_type="application/json",
+    )
+
+
 @base_router.get(
     "/browser_sessions/{browser_session_id}",
     response_model=BrowserSessionResponse,
@@ -62,55 +114,3 @@ async def get_browser_sessions(
     analytics.capture("skyvern-oss-agent-browser-sessions-get")
     browser_sessions = await app.PERSISTENT_SESSIONS_MANAGER.get_active_sessions(current_org.organization_id)
     return [BrowserSessionResponse.from_browser_session(browser_session) for browser_session in browser_sessions]
-
-
-@base_router.post(
-    "/browser_sessions",
-    response_model=BrowserSessionResponse,
-    tags=["Browser Sessions"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "browser_session",
-        "x-fern-sdk-method-name": "create_browser_session",
-    },
-    description="Create a new browser session",
-    summary="Create a new browser session",
-    responses={
-        200: {"description": "Successfully created browser session"},
-        403: {"description": "Unauthorized - Invalid or missing authentication"},
-    },
-)
-async def create_browser_session(
-    browser_session_request: CreateBrowserSessionRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> BrowserSessionResponse:
-    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
-        organization_id=current_org.organization_id,
-        timeout_minutes=browser_session_request.timeout,
-    )
-    return BrowserSessionResponse.from_browser_session(browser_session)
-
-
-@base_router.post(
-    "/browser_sessions/{browser_session_id}/close",
-    tags=["Browser Sessions"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "browser_session",
-        "x-fern-sdk-method-name": "close_browser_session",
-    },
-    description="Close a browser session",
-    summary="Close a browser session",
-    responses={
-        200: {"description": "Successfully closed browser session"},
-        403: {"description": "Unauthorized - Invalid or missing authentication"},
-    },
-)
-async def close_browser_session(
-    browser_session_id: str,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> ORJSONResponse:
-    await app.PERSISTENT_SESSIONS_MANAGER.close_session(current_org.organization_id, browser_session_id)
-    return ORJSONResponse(
-        content={"message": "Browser session closed"},
-        status_code=200,
-        media_type="application/json",
-    )
