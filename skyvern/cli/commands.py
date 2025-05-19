@@ -1,3 +1,103 @@
+# OS-specific utilities
+def get_os_type() -> str:
+    """
+    Detect the operating system more reliably than detect_os.
+    
+    Returns:
+        str: One of "windows", "wsl", "darwin" (macOS), or "linux"
+    """
+    # Check for WSL first
+    if os.path.exists("/proc/version"):
+        with open("/proc/version", "r") as f:
+            if "microsoft" in f.read().lower():
+                return "wsl"
+    
+    # Get system type
+    system = platform.system().lower()
+    if system == "darwin":
+        return "darwin"
+    elif system == "linux":
+        return "linux"
+    elif system == "windows":
+        return "windows"
+    else:
+        # Default to linux for unknown systems
+        return "linux"
+
+def is_admin() -> bool:
+    """
+    Check if the script is running with administrator/root privileges.
+    
+    Returns:
+        bool: True if running with elevated privileges, False otherwise
+    """
+    if get_os_type() == "windows":
+        try:
+            # This will raise an exception if not admin
+            subprocess.check_output('net session', shell=True, stderr=subprocess.DEVNULL)
+            return True
+        except:
+            return False
+    else:
+        # For Unix-like systems (Linux, macOS, WSL)
+        return os.geteuid() == 0 if hasattr(os, 'geteuid') else False
+
+def get_user_home_dir() -> Path:
+    """
+    Get the user's home directory in a cross-platform way.
+    
+    Returns:
+        Path: Path object representing the user's home directory
+    """
+    return Path.home()
+
+def get_appdata_dir() -> Path:
+    """
+    Get the appropriate application data directory for the current OS.
+    
+    Returns:
+        Path: Path object representing the application data directory
+    """
+    os_type = get_os_type()
+    
+    if os_type == "windows":
+        # %APPDATA% on Windows (typically C:\Users\<username>\AppData\Roaming)
+        return Path(os.environ.get('APPDATA', str(get_user_home_dir() / "AppData" / "Roaming")))
+    elif os_type == "wsl":
+        # For WSL, try to find the Windows AppData directory
+        windows_home = subprocess.check_output(['wslpath', '-u', '$(powershell.exe -c "[Environment]::GetFolderPath(\'UserProfile\')")'], 
+                                             shell=True, text=True).strip()
+        appdata = os.path.join(windows_home, "AppData", "Roaming")
+        return Path(appdata)
+    elif os_type == "darwin":
+        # ~/Library/Application Support on macOS
+        return get_user_home_dir() / "Library" / "Application Support"
+    else:
+        # ~/.config on Linux
+        return get_user_home_dir() / ".config"
+
+def get_config_dir(app_name: str = "skyvern") -> Path:
+    """
+    Get the appropriate configuration directory for Skyvern.
+    
+    Args:
+        app_name: Application name to use for the directory
+        
+    Returns:
+        Path: Path object representing the config directory
+    """
+    os_type = get_os_type()
+    
+    if os_type == "windows" or os_type == "wsl":
+        config_dir = get_appdata_dir() / app_name
+    elif os_type == "darwin":
+        config_dir = get_appdata_dir() / app_name
+    else:  # Linux
+        config_dir = get_user_home_dir() / f".{app_name}"
+    
+    # Create directory if it doesn't exist
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return config_dir
 import asyncio
 import json
 import os
@@ -7,6 +107,7 @@ import sys
 import time
 import webbrowser
 import uuid
+import platform
 from enum import Enum
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
@@ -540,8 +641,10 @@ def list_workflows() -> None:
 #----------------------------------------------------
 
 def setup_postgresql(no_postgres: bool = False) -> None:
-    """Set up PostgreSQL database for Skyvern with improved feedback."""
+    """Set up PostgreSQL database for Skyvern with cross-platform support."""
     console.print(Markdown("## Database Setup"))
+    
+    os_type = get_os_type()
     
     if command_exists("psql") and is_postgres_running():
         console.print("[green]✓[/] PostgreSQL is already running locally")
@@ -560,7 +663,19 @@ def setup_postgresql(no_postgres: bool = False) -> None:
 
     if not is_docker_running():
         console.print("[bold red]×[/] Docker is not running or not installed")
-        console.print("   Please install or start Docker and try again")
+        
+        # OS-specific Docker installation instructions
+        if os_type == "windows":
+            console.print("   Please install Docker Desktop for Windows from https://www.docker.com/products/docker-desktop")
+        elif os_type == "darwin":
+            console.print("   Please install Docker Desktop for Mac from https://www.docker.com/products/docker-desktop")
+        elif os_type == "wsl":
+            console.print("   Please install Docker Desktop for Windows and configure WSL integration")
+            console.print("   See: https://docs.docker.com/desktop/wsl/")
+        else:
+            console.print("   Please install Docker using your distribution's package manager")
+            console.print("   See: https://docs.docker.com/engine/install/")
+        
         exit(1)
 
     if is_postgres_running_in_docker():
@@ -588,25 +703,63 @@ def setup_postgresql(no_postgres: bool = False) -> None:
         console.print("[green]✓[/] PostgreSQL has been installed and started using Docker")
 
         console.print("[yellow]![/] Waiting for PostgreSQL to start...")
-        time.sleep(20)
+        # Use a progress spinner for a better UX during wait time
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
+            task = progress.add_task("[green]Waiting for PostgreSQL to initialize...", total=100)
+            
+            # Check status every 2 seconds for up to 30 seconds
+            for i in range(15):
+                progress.update(task, completed=i*7)
+                time.sleep(2)
+                if check_postgres_in_docker_ready():
+                    progress.update(task, completed=100)
+                    break
+            
+            # Final check
+            if not check_postgres_in_docker_ready():
+                console.print("[yellow]![/] PostgreSQL might not be fully initialized yet, but we'll proceed")
+            else:
+                console.print("[green]✓[/] PostgreSQL is ready")
 
     # Set up user and database in Docker postgres if needed
-    _, code = run_command('docker exec postgresql-container psql -U postgres -c "\\du" | grep -q skyvern', check=False)
+    # Different commands for Windows vs Unix-like systems
+    if os_type == "windows":
+        _, code = run_command('docker exec postgresql-container psql -U postgres -c "\\du" | findstr skyvern', check=False)
+    else:
+        _, code = run_command('docker exec postgresql-container psql -U postgres -c "\\du" | grep -q skyvern', check=False)
+    
     if code == 0:
         console.print("[green]✓[/] Database user exists")
     else:
         console.print("[yellow]![/] Creating database user...")
         run_command("docker exec postgresql-container createuser -U postgres skyvern")
 
-    _, code = run_command(
-        "docker exec postgresql-container psql -U postgres -lqt | cut -d \\| -f 1 | grep -qw skyvern", check=False
-    )
+    if os_type == "windows":
+        _, code = run_command(
+            "docker exec postgresql-container psql -U postgres -lqt | findstr skyvern", check=False
+        )
+    else:
+        _, code = run_command(
+            "docker exec postgresql-container psql -U postgres -lqt | cut -d \\| -f 1 | grep -qw skyvern", check=False
+        )
+    
     if code == 0:
         console.print("[green]✓[/] Database exists")
     else:
         console.print("[yellow]![/] Creating database...")
         run_command("docker exec postgresql-container createdb -U postgres skyvern -O skyvern")
         console.print("[green]✓[/] Database and user created successfully")
+
+
+def check_postgres_in_docker_ready() -> bool:
+    """Check if PostgreSQL in Docker is ready to accept connections."""
+    try:
+        result, code = run_command(
+            "docker exec postgresql-container pg_isready", check=False
+        )
+        return code == 0 and "accepting connections" in result
+    except Exception:
+        return False
 
 
 def setup_llm_providers() -> None:
@@ -905,58 +1058,144 @@ def command_exists(command: str) -> bool:
     return shutil.which(command) is not None
 
 
-def run_command(command: str, check: bool = True) -> tuple[Optional[str], Optional[int]]:
-    """Run a shell command and return the output and return code."""
+def run_command(command: str, check: bool = True, shell: bool = True, capture_output: bool = True) -> tuple[Optional[str], Optional[int]]:
+    """Run a shell command and return the output and return code with better cross-platform support."""
     try:
-        result = subprocess.run(command, shell=True, check=check, capture_output=True, text=True)
-        return result.stdout.strip(), result.returncode
+        # On Windows, certain commands need shell=True, but on WSL and Unix-like systems, it depends
+        os_type = get_os_type()
+        
+        # For PowerShell commands on Windows
+        if os_type == "windows" and command.strip().lower().startswith("powershell"):
+            # Ensure shell is True for PowerShell
+            shell = True
+        
+        # Run the command
+        result = subprocess.run(
+            command, 
+            shell=shell,
+            check=check, 
+            capture_output=capture_output, 
+            text=True,
+            # Avoid opening a console window on Windows
+            creationflags=subprocess.CREATE_NO_WINDOW if os_type == "windows" else 0
+        )
+        
+        return result.stdout.strip() if result.stdout else "", result.returncode
     except subprocess.CalledProcessError as e:
-        return None, e.returncode
+        return e.stdout.strip() if e.stdout else None, e.returncode
+    except Exception as e:
+        console.print(f"[red]Error running command:[/] {str(e)}")
+        return None, 1
 
 
 def is_postgres_running() -> bool:
-    """Check if PostgreSQL is running locally."""
+    """Check if PostgreSQL is running locally with cross-platform support."""
+    os_type = get_os_type()
+    
     if command_exists("pg_isready"):
         result, _ = run_command("pg_isready")
         return result is not None and "accepting connections" in result
+    
+    # Alternative check methods by OS
+    if os_type == "windows":
+        # Check for PostgreSQL service on Windows
+        result, code = run_command("sc query postgresql", check=False)
+        if code == 0 and "RUNNING" in result:
+            return True
+            
+        # Check for PostgreSQL using tasklist
+        result, code = run_command('tasklist /fi "imagename eq postgres.exe" /fo csv /nh', check=False)
+        return code == 0 and "postgres.exe" in result
+    elif os_type == "darwin":
+        # Check for PostgreSQL using ps on macOS
+        result, code = run_command("ps aux | grep -v grep | grep -q postgres", check=False)
+        return code == 0
+    else:
+        # For Linux and WSL
+        result, code = run_command("ps aux | grep -v grep | grep -q postgres", check=False)
+        return code == 0
+    
     return False
 
 
 def database_exists(dbname: str, user: str) -> bool:
-    """Check if a PostgreSQL database exists."""
-    check_db_command = f'psql {dbname} -U {user} -c "\\q"'
-    output, _ = run_command(check_db_command, check=False)
-    return output is not None
+    """Check if a PostgreSQL database exists with cross-platform support."""
+    os_type = get_os_type()
+    
+    if os_type == "windows":
+        # For Windows, use a more compatible command
+        check_db_command = f'psql -U {user} -d {dbname} -c "SELECT 1" -t'
+    else:
+        # Unix-style command
+        check_db_command = f'psql {dbname} -U {user} -c "\\q"'
+        
+    output, code = run_command(check_db_command, check=False)
+    return code == 0
 
 
 def create_database_and_user() -> None:
-    """Create PostgreSQL database and user for Skyvern."""
-    run_command("createuser skyvern")
-    run_command("createdb skyvern -O skyvern")
+    """Create PostgreSQL database and user for Skyvern with cross-platform support."""
+    os_type = get_os_type()
+    
+    if os_type == "windows":
+        # Windows-specific PostgreSQL commands
+        run_command('psql -U postgres -c "CREATE USER skyvern WITH PASSWORD \'skyvern\';"', check=False)
+        run_command('psql -U postgres -c "CREATE DATABASE skyvern OWNER skyvern;"', check=False)
+    else:
+        # Unix/Linux/macOS commands
+        run_command("createuser skyvern", check=False)
+        run_command("createdb skyvern -O skyvern", check=False)
+    
+    console.print("[green]✓[/] Database and user created successfully")
 
 
 def is_docker_running() -> bool:
-    """Check if Docker is running."""
+    """Check if Docker is running with cross-platform support."""
     if not command_exists("docker"):
         return False
-    _, code = run_command("docker info", check=False)
-    return code == 0
+    
+    os_type = get_os_type()
+    
+    if os_type == "windows":
+        # For Windows, query the Docker service
+        _, code = run_command("docker info >nul 2>&1", check=False)
+        return code == 0
+    else:
+        # For Unix-like systems
+        _, code = run_command("docker info > /dev/null 2>&1", check=False)
+        return code == 0
 
 
 def is_postgres_running_in_docker() -> bool:
-    """Check if PostgreSQL is running in Docker."""
-    _, code = run_command("docker ps | grep -q postgresql-container", check=False)
-    return code == 0
+    """Check if PostgreSQL is running in Docker with cross-platform support."""
+    os_type = get_os_type()
+    
+    if os_type == "windows":
+        # Windows-specific command
+        _, code = run_command("docker ps | findstr postgresql-container", check=False)
+        return code == 0
+    else:
+        # Unix/Linux/macOS
+        _, code = run_command("docker ps | grep -q postgresql-container", check=False)
+        return code == 0
 
 
 def is_postgres_container_exists() -> bool:
-    """Check if PostgreSQL Docker container exists."""
-    _, code = run_command("docker ps -a | grep -q postgresql-container", check=False)
-    return code == 0
+    """Check if PostgreSQL Docker container exists with cross-platform support."""
+    os_type = get_os_type()
+    
+    if os_type == "windows":
+        # Windows-specific command
+        _, code = run_command("docker ps -a | findstr postgresql-container", check=False)
+        return code == 0
+    else:
+        # Unix/Linux/macOS
+        _, code = run_command("docker ps -a | grep -q postgresql-container", check=False)
+        return code == 0
 
 
 def update_or_add_env_var(key: str, value: str) -> None:
-    """Update or add environment variable in .env file with better handling."""
+    """Update or add environment variable in .env file with better handling and cross-platform support."""
     env_path = Path(".env")
     if not env_path.exists():
         env_path.touch()
@@ -984,7 +1223,8 @@ def update_or_add_env_var(key: str, value: str) -> None:
             "BROWSER_ACTION_TIMEOUT_MS": "5000",
             "MAX_STEPS_PER_RUN": "50",
             "LOG_LEVEL": "INFO",
-            "DATABASE_STRING": "postgresql+psycopg://skyvern@localhost/skyvern",
+            # Use a dynamic database string based on OS
+            "DATABASE_STRING": get_database_connection_string(),
             "PORT": "8000",
             "ANALYTICS_ID": "anonymous",
             "ENABLE_LOG_ARTIFACTS": "false",
@@ -1001,6 +1241,20 @@ def update_or_add_env_var(key: str, value: str) -> None:
         set_key(env_path, key, value)
         # Also update in current environment
         os.environ[key] = value
+
+
+def get_database_connection_string() -> str:
+    """
+    Get an appropriate database connection string based on the OS.
+    """
+    os_type = get_os_type()
+    
+    if os_type == "windows":
+        # Windows often needs an explicit port and sometimes a different format
+        return "postgresql+psycopg://skyvern@localhost:5432/skyvern"
+    else:
+        # Standard format for Unix-like systems
+        return "postgresql+psycopg://skyvern@localhost/skyvern"
 
 
 async def _setup_local_organization() -> str:
@@ -1020,6 +1274,68 @@ async def _setup_local_organization() -> str:
 
 def get_default_chrome_location(host_system: str) -> str:
     """Get the default Chrome/Chromium location based on OS."""
+    os_type = get_os_type() if host_system is None else host_system
+    
+    if os_type == "darwin":
+        # macOS Chrome locations
+        chrome_paths = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium"
+        ]
+        for path in chrome_paths:
+            if os.path.exists(path):
+                return path
+        return chrome_paths[0]  # Default to regular Chrome
+        
+    elif os_type == "linux":
+        # Common Linux locations
+        chrome_paths = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/snap/bin/chromium"
+        ]
+        for path in chrome_paths:
+            if os.path.exists(path):
+                return path
+        return "/usr/bin/google-chrome"  # default if not found
+        
+    elif os_type == "wsl":
+        # Try to find Chrome in Windows from WSL
+        try:
+            windows_chrome = run_command(
+                "wslpath -u \"$(powershell.exe -Command 'Write-Host $env:ProgramFiles\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe')\"",
+                check=False
+            )[0]
+            if windows_chrome and os.path.exists(windows_chrome):
+                return windows_chrome
+        except:
+            pass
+        
+        # Fallback WSL paths
+        wsl_paths = [
+            "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe",
+            "/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe"
+        ]
+        for path in wsl_paths:
+            if os.path.exists(path):
+                return path
+        return wsl_paths[0]  # Default to first path
+        
+    else:  # Windows
+        # Windows Chrome locations
+        chrome_paths = [
+            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+            os.path.expandvars("%LOCALAPPDATA%\\Google\\Chrome\\Application\\chrome.exe")
+        ]
+        for path in chrome_paths:
+            if os.path.exists(path):
+                return path
+        return chrome_paths[0]  # Default to first path default Chrome/Chromium location based on OS."""
     if host_system == "darwin":
         return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     elif host_system == "linux":
@@ -1160,13 +1476,16 @@ def get_claude_config_path(host_system: str) -> str:
 
     raise Exception(f"Unsupported host system: {host_system}")
 
-
 def setup_claude_desktop_config(host_system: str, path_to_env: str) -> bool:
-    """Set up Claude Desktop configuration."""
+    """Set up Claude Desktop configuration with given command and args."""
+    if not is_claude_desktop_installed(host_system):
+        print("Claude Desktop is not installed. Please install it first.")
+        return False
+
     try:
         path_claude_config = get_claude_config_path(host_system)
+
         os.makedirs(os.path.dirname(path_claude_config), exist_ok=True)
-        
         if not os.path.exists(path_claude_config):
             with open(path_claude_config, "w") as f:
                 json.dump({"mcpServers": {}}, f, indent=2)
@@ -1177,8 +1496,7 @@ def setup_claude_desktop_config(host_system: str, path_to_env: str) -> bool:
         skyvern_api_key = os.environ.get("SKYVERN_API_KEY", "")
 
         if not skyvern_base_url or not skyvern_api_key:
-            console.print("[red]×[/] SKYVERN_BASE_URL and SKYVERN_API_KEY must be set in .env file")
-            return False
+            print("Error: SKYVERN_BASE_URL and SKYVERN_API_KEY must be set in .env file")
 
         with open(path_claude_config, "r") as f:
             claude_config = json.load(f)
@@ -1195,11 +1513,12 @@ def setup_claude_desktop_config(host_system: str, path_to_env: str) -> bool:
         with open(path_claude_config, "w") as f:
             json.dump(claude_config, f, indent=2)
 
+        print(f"Claude Desktop MCP configuration updated successfully at {path_claude_config}.")
         return True
-    except Exception as e:
-        console.print(f"[red]×[/] Error configuring Claude Desktop: {e}")
-        return False
 
+    except Exception as e:
+        print(f"Error configuring Claude Desktop: {e}")
+        return False
 
 def is_cursor_installed(host_system: str) -> bool:
     """Check if Cursor is installed."""
