@@ -70,6 +70,36 @@ Skyvern was inspired by the Task-Driven autonomous agent design popularized by [
 </CardGroup>
 
 ## Quickstart
+### Python SDK Installation
+```bash
+pip install skyvern
+```
+
+### Run Task
+After initializing your local Skyvern setup, you can run agent tasks in any python code:
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern()
+
+task = await skyvern.run_task(prompt="Find the top post on hackernews today")
+print(task)
+```
+
+### Run Task In Skyvern Service
+Get your API key from [Skyvern Cloud](https://app.skyvern.com/settings) and to use Skyvern Cloud to run the task:
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR API KEY")
+# OR pass the base_url to use any Skyvern service
+# skyvern = Skyvern(base_url="http://localhost:8000", api_key="YOUR API KEY")
+
+task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
+print(task)
+```
+More API & SDK information can be found in the [API Reference](/api-reference) section.
+
 <CardGroup cols={2}>
   <Card
     title="Quickstart (Skyvern Cloud)"
