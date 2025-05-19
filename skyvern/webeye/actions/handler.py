@@ -479,6 +479,7 @@ async def handle_click_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    original_url = page.url
     if action.x is not None and action.y is not None:
         # Find the element at the clicked location using JavaScript evaluation
         element_id = await page.evaluate(
@@ -592,14 +593,80 @@ async def handle_click_action(
                         workflow_run_id=task.workflow_run_id,
                     )
     else:
-        results = await chain_click(
-            task,
-            scraped_page,
-            page,
-            action,
-            skyvern_element,
-            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
-        )
+        try:
+            skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
+            incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
+            await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
+
+            results = await chain_click(
+                task,
+                scraped_page,
+                page,
+                action,
+                skyvern_element,
+                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+            )
+            if page.url != original_url:
+                return results
+
+            if results and not isinstance(results[-1], ActionSuccess):
+                return results
+
+            if await incremental_scraped.get_incremental_elements_num() == 0:
+                return results
+
+            incremental_elements = await incremental_scraped.get_incremental_element_tree(
+                clean_and_remove_element_tree_factory(
+                    task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
+                ),
+            )
+
+            if len(incremental_elements) == 0:
+                return results
+
+            LOG.info("Detected new element after clicking", action=action)
+            dropdown_menu_element = await locate_dropdown_menu(
+                current_anchor_element=skyvern_element,
+                incremental_scraped=incremental_scraped,
+                step=step,
+                task=task,
+            )
+
+            if dropdown_menu_element is None:
+                return results
+
+            LOG.info(
+                "Found the dropdown menu element after clicking, triggering the sequential click logic",
+                step_id=step.step_id,
+                task_id=task.task_id,
+                element_id=dropdown_menu_element.get_id(),
+            )
+
+            action_result = await select_from_emerging_elements(
+                current_element_id=skyvern_element.get_id(),
+                options=CustomSelectPromptOptions(
+                    field_information=action.intention if action.intention else action.reasoning,
+                ),  # FIXME: need a better options data
+                page=page,
+                scraped_page=scraped_page,
+                step=step,
+                task=task,
+            )
+
+            results.append(action_result)
+            return results
+
+        except NoIncrementalElementFoundForCustomSelection:
+            LOG.info(
+                "No incremental element found, skip the sequential click logic",
+                step_id=step.step_id,
+                task_id=task.task_id,
+                element_id=skyvern_element.get_id(),
+            )
+            return results
+
+        finally:
+            await incremental_scraped.stop_listen_dom_increment()
 
     return results
 
@@ -1344,10 +1411,18 @@ async def handle_select_option_action(
         )
 
         if len(incremental_element) == 0:
+            LOG.info(
+                "No incremental elements detected by MutationObserver, using re-scraping the page to find the match element"
+            )
             results.append(
                 await select_from_emerging_elements(
-                    action=action,
-                    input_or_select_context=input_or_select_context,
+                    current_element_id=skyvern_element.get_id(),
+                    options=CustomSelectPromptOptions(
+                        is_date_related=input_or_select_context.is_date_related or False,
+                        field_information=input_or_select_context.intention or input_or_select_context.field or "",
+                        required_field=input_or_select_context.is_required or False,
+                        target_value=action.option.label or action.option.value or "",
+                    ),
                     page=page,
                     scraped_page=scraped_page,
                     task=task,
@@ -2458,18 +2533,36 @@ def build_sequential_select_history(history_list: list[CustomSingleSelectResult]
     return result
 
 
+class CustomSelectPromptOptions(BaseModel):
+    """
+    This is the options for the custom select prompt.
+    It's used to generate the prompt for the custom select action.
+    is_date_related: whether the field is date related
+    required_field: whether the field is required
+    field_information: the description about the field, could be field name, action intention, action reasoning about the field, etc.
+    target_value: the target value of the field (generated by the LLM in the main prompt).
+    """
+
+    is_date_related: bool = False
+    required_field: bool = False
+    field_information: str = ""
+    target_value: str | None = None
+
+
 async def select_from_emerging_elements(
-    action: SelectOptionAction,
-    input_or_select_context: InputOrSelectContext,
+    current_element_id: str,
+    options: CustomSelectPromptOptions,
     page: Page,
     scraped_page: ScrapedPage,
     step: Step,
     task: Task,
 ) -> ActionResult:
+    """
+    This is the function to select an element from the new showing elements.
+    Currently mainly used for the dropdown menu selection.
+    """
+
     # TODO: support to handle the case when options are loaded by scroll
-    LOG.info(
-        "No incremental elements detected by MutationObserver, using re-scraping the page to find the match element"
-    )
     scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
     new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(scraped_page.id_to_css_dict.keys())
 
@@ -2481,18 +2574,16 @@ async def select_from_emerging_elements(
     ]
 
     if len(new_interactable_element_ids) == 0:
-        raise NoIncrementalElementFoundForCustomSelection(element_id=action.element_id)
+        raise NoIncrementalElementFoundForCustomSelection(element_id=current_element_id)
 
     prompt = load_prompt_with_elements(
         scraped_page=scraped_page_after_open,
         prompt_engine=prompt_engine,
         template_name="custom-select",
-        is_date_related=input_or_select_context.is_date_related,
-        field_information=input_or_select_context.field
-        if not input_or_select_context.intention
-        else input_or_select_context.intention,
-        required_field=input_or_select_context.is_required,
-        target_value=action.option.label,
+        is_date_related=options.is_date_related,
+        field_information=options.field_information,
+        required_field=options.required_field,
+        target_value=options.target_value,
         navigation_goal=task.navigation_goal,
         new_elements_ids=new_interactable_element_ids,
         navigation_payload_str=json.dumps(task.navigation_payload),
