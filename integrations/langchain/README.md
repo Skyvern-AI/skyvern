@@ -42,7 +42,7 @@ Go to [Langchain Tools](https://python.langchain.com/v0.1/docs/modules/tools/) t
 ### Run a task(sync) locally in your local environment
 > sync task won't return until the task is finished.
 
-:warning: :warning: if you want to run this code block, you need to run `skyvern init --openai-api-key <your_openai_api_key>` command in your terminal to set up skyvern first.
+:warning: :warning: if you want to run this code block, you need to run `skyvern init` command in your terminal to set up skyvern first.
 
 
 ```python
@@ -65,7 +65,7 @@ if __name__ == "__main__":
 
 :warning: :warning: if you want to run the task in the background, you need to keep the script running until the task is finished, otherwise the task will be killed when the script is finished.
 
-:warning: :warning: if you want to run this code block, you need to run `skyvern init --openai-api-key <your_openai_api_key>` command in your terminal to set up skyvern first.
+:warning: :warning: if you want to run this code block, you need to run `skyvern init` command in your terminal to set up skyvern first.
 
 ```python
 import asyncio
@@ -88,7 +88,7 @@ if __name__ == "__main__":
 
 ### Get a task locally in your local environment
 
-:warning: :warning: if you want to run this code block, you need to run `skyvern init --openai-api-key <your_openai_api_key>` command in your terminal to set up skyvern first.
+:warning: :warning: if you want to run this code block, you need to run `skyvern init` command in your terminal to set up skyvern first.
 
 ```python
 import asyncio
@@ -191,7 +191,7 @@ The following two examples show how to build an agent that executes a specified 
 
 > async task will return immediately and the task will be running in the background. You can use `GetTask` tool to poll the task information until the task is finished.
 
-:warning: :warning: if you want to run this code block, you need to run `skyvern init --openai-api-key <your_openai_api_key>` command in your terminal to set up skyvern first.
+:warning: :warning: if you want to run this code block, you need to run `skyvern init` command in your terminal to set up skyvern first.
 
 ```python
 import asyncio
