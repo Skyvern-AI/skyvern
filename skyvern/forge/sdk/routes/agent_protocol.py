@@ -23,7 +23,15 @@ from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
-from skyvern.forge.sdk.routes.code_samples import GET_RUN_CODE_SAMPLE, RUN_TASK_CODE_SAMPLE, RUN_WORKFLOW_CODE_SAMPLE
+from skyvern.forge.sdk.routes.code_samples import (
+    CANCEL_RUN_CODE_SAMPLE,
+    CREATE_WORKFLOW_CODE_SAMPLE,
+    DELETE_WORKFLOW_CODE_SAMPLE,
+    GET_RUN_CODE_SAMPLE,
+    RUN_TASK_CODE_SAMPLE,
+    RUN_WORKFLOW_CODE_SAMPLE,
+    UPDATE_WORKFLOW_CODE_SAMPLE,
+)
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
 from skyvern.forge.sdk.schemas.organizations import (
@@ -99,6 +107,501 @@ class AISuggestionType(str, Enum):
     DATA_SCHEMA = "data_schema"
 
 
+################# /v1 Endpoints #################
+@base_router.post(
+    "/run/tasks",
+    tags=["Agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "run_task",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {
+                        "sdk": "python",
+                        "code": RUN_TASK_CODE_SAMPLE,
+                    }
+                ]
+            }
+        ],
+    },
+    description="Run a task",
+    summary="Run a task",
+    responses={
+        200: {"description": "Successfully run task"},
+        400: {"description": "Invalid agent engine"},
+    },
+)
+@base_router.post("/run/tasks/", include_in_schema=False)
+async def run_task(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    run_request: TaskRunRequest,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_api_key: Annotated[str | None, Header()] = None,
+    x_user_agent: Annotated[str | None, Header()] = None,
+) -> TaskRunResponse:
+    analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
+    await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
+
+    if run_request.engine in CUA_ENGINES or run_request.engine == RunEngine.skyvern_v1:
+        # create task v1
+        # if there's no url, call task generation first to generate the url, data schema if any
+        url = run_request.url
+        data_extraction_goal = None
+        data_extraction_schema = run_request.data_extraction_schema
+        navigation_goal = run_request.prompt
+        navigation_payload = None
+        task_generation = await task_v1_service.generate_task(
+            user_prompt=run_request.prompt,
+            organization=current_org,
+        )
+        url = url or task_generation.url
+        navigation_goal = task_generation.navigation_goal or run_request.prompt
+        if run_request.engine in CUA_ENGINES:
+            navigation_goal = run_request.prompt
+        navigation_payload = task_generation.navigation_payload
+        data_extraction_goal = task_generation.data_extraction_goal
+        data_extraction_schema = data_extraction_schema or task_generation.extracted_information_schema
+
+        task_v1_request = TaskRequest(
+            title=run_request.title,
+            url=url,
+            navigation_goal=navigation_goal,
+            navigation_payload=navigation_payload,
+            data_extraction_goal=data_extraction_goal,
+            extracted_information_schema=data_extraction_schema,
+            error_code_mapping=run_request.error_code_mapping,
+            proxy_location=run_request.proxy_location,
+            browser_session_id=run_request.browser_session_id,
+            totp_verification_url=run_request.totp_url,
+            totp_identifier=run_request.totp_identifier,
+            include_action_history_in_verification=run_request.include_action_history_in_verification,
+        )
+        task_v1_response = await task_v1_service.run_task(
+            task=task_v1_request,
+            organization=current_org,
+            engine=run_request.engine,
+            x_max_steps_override=run_request.max_steps,
+            x_api_key=x_api_key,
+            request=request,
+            background_tasks=background_tasks,
+        )
+        run_type = RunType.task_v1
+        if run_request.engine == RunEngine.openai_cua:
+            run_type = RunType.openai_cua
+        elif run_request.engine == RunEngine.anthropic_cua:
+            run_type = RunType.anthropic_cua
+        # build the task run response
+        return TaskRunResponse(
+            run_id=task_v1_response.task_id,
+            run_type=run_type,
+            status=str(task_v1_response.status),
+            output=task_v1_response.extracted_information,
+            failure_reason=task_v1_response.failure_reason,
+            created_at=task_v1_response.created_at,
+            modified_at=task_v1_response.modified_at,
+            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/tasks/{task_v1_response.task_id}",
+            run_request=TaskRunRequest(
+                engine=run_request.engine,
+                prompt=task_v1_response.navigation_goal,
+                url=task_v1_response.url,
+                webhook_url=task_v1_response.webhook_callback_url,
+                totp_identifier=task_v1_response.totp_identifier,
+                totp_url=task_v1_response.totp_verification_url,
+                proxy_location=task_v1_response.proxy_location,
+                max_steps=task_v1_response.max_steps_per_run,
+                data_extraction_schema=task_v1_response.extracted_information_schema,
+                error_code_mapping=task_v1_response.error_code_mapping,
+                browser_session_id=run_request.browser_session_id,
+            ),
+        )
+    if run_request.engine == RunEngine.skyvern_v2:
+        # create task v2
+        try:
+            task_v2 = await task_v2_service.initialize_task_v2(
+                organization=current_org,
+                user_prompt=run_request.prompt,
+                user_url=run_request.url,
+                totp_identifier=run_request.totp_identifier,
+                totp_verification_url=run_request.totp_url,
+                webhook_callback_url=run_request.webhook_url,
+                proxy_location=run_request.proxy_location,
+                publish_workflow=run_request.publish_workflow,
+                extracted_information_schema=run_request.data_extraction_schema,
+                error_code_mapping=run_request.error_code_mapping,
+                create_task_run=True,
+            )
+        except LLMProviderError:
+            LOG.error("LLM failure to initialize task v2", exc_info=True)
+            raise HTTPException(
+                status_code=500, detail="Skyvern LLM failure to initialize task v2. Please try again later."
+            )
+        await AsyncExecutorFactory.get_executor().execute_task_v2(
+            request=request,
+            background_tasks=background_tasks,
+            organization_id=current_org.organization_id,
+            task_v2_id=task_v2.observer_cruise_id,
+            max_steps_override=run_request.max_steps,
+            browser_session_id=run_request.browser_session_id,
+        )
+        refreshed_task_v2 = await app.DATABASE.get_task_v2(
+            task_v2_id=task_v2.observer_cruise_id, organization_id=current_org.organization_id
+        )
+        task_v2 = refreshed_task_v2 if refreshed_task_v2 else task_v2
+        return TaskRunResponse(
+            run_id=task_v2.observer_cruise_id,
+            run_type=RunType.task_v2,
+            status=str(task_v2.status),
+            output=task_v2.output,
+            failure_reason=None,
+            created_at=task_v2.created_at,
+            modified_at=task_v2.modified_at,
+            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{task_v2.workflow_permanent_id}/{task_v2.workflow_run_id}",
+            run_request=TaskRunRequest(
+                engine=RunEngine.skyvern_v2,
+                prompt=task_v2.prompt,
+                url=task_v2.url,
+                webhook_url=task_v2.webhook_callback_url,
+                totp_identifier=task_v2.totp_identifier,
+                totp_url=task_v2.totp_verification_url,
+                proxy_location=task_v2.proxy_location,
+                max_steps=run_request.max_steps,
+                browser_session_id=run_request.browser_session_id,
+                error_code_mapping=task_v2.error_code_mapping,
+                data_extraction_schema=task_v2.extracted_information_schema,
+                publish_workflow=run_request.publish_workflow,
+            ),
+        )
+    LOG.error("Invalid agent engine", engine=run_request.engine, organization_id=current_org.organization_id)
+    raise HTTPException(status_code=400, detail=f"Invalid agent engine: {run_request.engine}")
+
+
+@base_router.post(
+    "/run/workflows",
+    tags=["Agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "run_workflow",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {
+                        "sdk": "python",
+                        "code": RUN_WORKFLOW_CODE_SAMPLE,
+                    }
+                ]
+            }
+        ],
+    },
+    description="Run a workflow",
+    summary="Run a workflow",
+    responses={
+        200: {"description": "Successfully run workflow"},
+        400: {"description": "Invalid workflow run request"},
+    },
+)
+@base_router.post("/run/workflows/", include_in_schema=False)
+async def run_workflow(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    workflow_run_request: WorkflowRunRequest,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    template: bool = Query(False),
+    x_api_key: Annotated[str | None, Header()] = None,
+    x_max_steps_override: Annotated[int | None, Header()] = None,
+    x_user_agent: Annotated[str | None, Header()] = None,
+) -> WorkflowRunResponse:
+    analytics.capture("skyvern-oss-run-workflow")
+    await PermissionCheckerFactory.get_instance().check(
+        current_org, browser_session_id=workflow_run_request.browser_session_id
+    )
+    workflow_id = workflow_run_request.workflow_id
+    context = skyvern_context.ensure_context()
+    request_id = context.request_id
+    legacy_workflow_request = WorkflowRequestBody(
+        data=workflow_run_request.parameters,
+        proxy_location=workflow_run_request.proxy_location,
+        webhook_callback_url=workflow_run_request.webhook_url,
+        totp_identifier=workflow_run_request.totp_identifier,
+        totp_url=workflow_run_request.totp_url,
+        browser_session_id=workflow_run_request.browser_session_id,
+    )
+    workflow_run = await workflow_service.run_workflow(
+        workflow_id=workflow_id,
+        organization=current_org,
+        workflow_request=legacy_workflow_request,
+        template=template,
+        version=None,
+        max_steps=x_max_steps_override,
+        api_key=x_api_key,
+        request_id=request_id,
+        request=request,
+        background_tasks=background_tasks,
+    )
+
+    return WorkflowRunResponse(
+        run_id=workflow_run.workflow_run_id,
+        run_type=RunType.workflow_run,
+        status=str(workflow_run.status),
+        output=None,
+        failure_reason=workflow_run.failure_reason,
+        created_at=workflow_run.created_at,
+        modified_at=workflow_run.modified_at,
+        run_request=workflow_run_request,
+        downloaded_files=None,
+        recording_url=None,
+        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}",
+    )
+
+
+@base_router.get(
+    "/runs/{run_id}",
+    tags=["Agent"],
+    response_model=RunResponse,
+    description="Get run information (task run, workflow run)",
+    summary="Get a task or a workflow run by id",
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "get_run",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_RUN_CODE_SAMPLE}]}],
+    },
+    responses={
+        200: {"description": "Successfully got run"},
+        404: {"description": "Run not found"},
+    },
+)
+@base_router.get(
+    "/runs/{run_id}/",
+    response_model=RunResponse,
+    include_in_schema=False,
+)
+async def get_run(
+    run_id: str = Path(
+        ..., description="The id of the task run or the workflow run.", examples=["tsk_123", "tsk_v2_123", "wr_123"]
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> RunResponse:
+    run_response = await run_service.get_run_response(run_id, organization_id=current_org.organization_id)
+    if not run_response:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task run not found {run_id}",
+        )
+    return run_response
+
+
+@base_router.post(
+    "/runs/{run_id}/cancel",
+    tags=["Agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "cancel_run",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": CANCEL_RUN_CODE_SAMPLE}]}],
+    },
+    description="Cancel a run (task or workflow)",
+    summary="Cancel a task or workflow run",
+)
+@base_router.post("/runs/{run_id}/cancel/", include_in_schema=False)
+async def cancel_run(
+    run_id: str = Path(..., description="The id of the task run or the workflow run to cancel."),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> None:
+    analytics.capture("skyvern-oss-agent-cancel-run")
+
+    await run_service.cancel_run(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
+
+
+@legacy_base_router.post(
+    "/workflows",
+    openapi_extra={
+        "requestBody": {
+            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
+            "required": True,
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "create_workflow",
+    },
+    response_model=Workflow,
+    tags=["agent"],
+)
+@legacy_base_router.post(
+    "/workflows/",
+    openapi_extra={
+        "requestBody": {
+            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
+            "required": True,
+        },
+    },
+    response_model=Workflow,
+    include_in_schema=False,
+)
+@base_router.post(
+    "/workflows",
+    response_model=Workflow,
+    tags=["Agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "create_workflow",
+        "x-fern-examples": [{"code-samples": [{"sdk": "curl", "code": CREATE_WORKFLOW_CODE_SAMPLE}]}],
+    },
+    description="Create a new workflow",
+    summary="Create a new workflow",
+    responses={
+        200: {"description": "Successfully created workflow"},
+        422: {"description": "Invalid workflow definition"},
+    },
+)
+@base_router.post(
+    "/workflows/",
+    response_model=Workflow,
+    include_in_schema=False,
+)
+async def create_workflow(
+    request: Request,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Workflow:
+    analytics.capture("skyvern-oss-agent-workflow-create")
+    raw_yaml = await request.body()
+    try:
+        workflow_yaml = yaml.safe_load(raw_yaml)
+    except yaml.YAMLError:
+        raise HTTPException(status_code=422, detail="Invalid YAML")
+
+    try:
+        workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
+        return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+            organization=current_org, request=workflow_create_request
+        )
+    except WorkflowParameterMissingRequiredValue as e:
+        raise e
+    except Exception as e:
+        LOG.error("Failed to create workflow", exc_info=True, organization_id=current_org.organization_id)
+        raise FailedToCreateWorkflow(str(e))
+
+
+@legacy_base_router.put(
+    "/workflows/{workflow_id}",
+    openapi_extra={
+        "requestBody": {
+            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
+            "required": True,
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "update_workflow",
+    },
+    response_model=Workflow,
+    tags=["agent"],
+)
+@legacy_base_router.put(
+    "/workflows/{workflow_id}/",
+    openapi_extra={
+        "requestBody": {
+            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
+            "required": True,
+        },
+    },
+    response_model=Workflow,
+    include_in_schema=False,
+)
+@base_router.post(
+    "/workflows/{workflow_id}",
+    response_model=Workflow,
+    tags=["Agent"],
+    openapi_extra={
+        "requestBody": {
+            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
+            "required": True,
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "update_workflow",
+        "x-fern-examples": [{"code-samples": [{"sdk": "curl", "code": UPDATE_WORKFLOW_CODE_SAMPLE}]}],
+    },
+    description="Update a workflow definition",
+    summary="Update a workflow definition",
+    responses={
+        200: {"description": "Successfully updated workflow"},
+        422: {"description": "Invalid workflow definition"},
+    },
+)
+@base_router.post(
+    "/workflows/{workflow_id}/",
+    openapi_extra={
+        "requestBody": {
+            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
+            "required": True,
+        },
+    },
+    response_model=Workflow,
+    include_in_schema=False,
+)
+async def update_workflow(
+    request: Request,
+    workflow_id: str = Path(
+        ..., description="The ID of the workflow to update. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Workflow:
+    analytics.capture("skyvern-oss-agent-workflow-update")
+    # validate the workflow
+    raw_yaml = await request.body()
+    try:
+        workflow_yaml = yaml.safe_load(raw_yaml)
+    except yaml.YAMLError:
+        raise HTTPException(status_code=422, detail="Invalid YAML")
+
+    try:
+        workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
+        return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+            organization=current_org,
+            request=workflow_create_request,
+            workflow_permanent_id=workflow_id,
+        )
+    except WorkflowParameterMissingRequiredValue as e:
+        raise e
+    except Exception as e:
+        LOG.exception(
+            "Failed to update workflow",
+            workflow_permanent_id=workflow_id,
+            organization_id=current_org.organization_id,
+        )
+        raise FailedToUpdateWorkflow(workflow_id, f"<{type(e).__name__}: {str(e)}>")
+
+
+@legacy_base_router.delete(
+    "/workflows/{workflow_id}",
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "delete_workflow",
+    },
+)
+@legacy_base_router.delete("/workflows/{workflow_id}/", include_in_schema=False)
+@base_router.post(
+    "/workflows/{workflow_id}/delete",
+    tags=["Agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "delete_workflow",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": DELETE_WORKFLOW_CODE_SAMPLE}]}],
+    },
+    description="Delete a workflow",
+    summary="Delete a workflow",
+    responses={200: {"description": "Successfully deleted workflow"}},
+)
+@base_router.post("/workflows/{workflow_id}/delete/", include_in_schema=False)
+async def delete_workflow(
+    workflow_id: str = Path(
+        ..., description="The ID of the workflow to delete. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> None:
+    analytics.capture("skyvern-oss-agent-workflow-delete")
+    await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(workflow_id, current_org.organization_id)
+
+
+################# Legacy Endpoints #################
 @legacy_base_router.post(
     "/webhook",
     tags=["server"],
@@ -407,42 +910,6 @@ async def get_runs(
 
     runs = await app.DATABASE.get_all_runs(current_org.organization_id, page=page, page_size=page_size, status=status)
     return ORJSONResponse([run.model_dump() for run in runs])
-
-
-@base_router.get(
-    "/runs/{run_id}",
-    tags=["Agent"],
-    response_model=RunResponse,
-    description="Get a task or a workflow run by id",
-    summary="Get a task or a workflow run by id",
-    openapi_extra={
-        "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "get_run",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_RUN_CODE_SAMPLE}]}],
-    },
-    responses={
-        200: {"description": "Successfully got run"},
-        404: {"description": "Run not found"},
-    },
-)
-@base_router.get(
-    "/runs/{run_id}/",
-    response_model=RunResponse,
-    include_in_schema=False,
-)
-async def get_run(
-    run_id: str = Path(
-        ..., description="The id of the task run or the workflow run.", examples=["tsk_123", "tsk_v2_123", "wr_123"]
-    ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> RunResponse:
-    run_response = await run_service.get_run_response(run_id, organization_id=current_org.organization_id)
-    if not run_response:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Task run not found {run_id}",
-        )
-    return run_response
 
 
 @legacy_base_router.get(
@@ -796,191 +1263,6 @@ async def get_workflow_run(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
     )
-
-
-@legacy_base_router.post(
-    "/workflows",
-    openapi_extra={
-        "requestBody": {
-            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
-            "required": True,
-        },
-        "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "create_workflow",
-    },
-    response_model=Workflow,
-    tags=["agent"],
-)
-@legacy_base_router.post(
-    "/workflows/",
-    openapi_extra={
-        "requestBody": {
-            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
-            "required": True,
-        },
-    },
-    response_model=Workflow,
-    include_in_schema=False,
-)
-@base_router.post(
-    "/workflows",
-    response_model=Workflow,
-    tags=["Agent"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "create_workflow",
-    },
-    description="Create a new workflow",
-    summary="Create a new workflow",
-    responses={
-        200: {"description": "Successfully created workflow"},
-        422: {"description": "Invalid workflow definition"},
-    },
-)
-@base_router.post(
-    "/workflows/",
-    response_model=Workflow,
-    include_in_schema=False,
-)
-async def create_workflow(
-    request: Request,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> Workflow:
-    analytics.capture("skyvern-oss-agent-workflow-create")
-    raw_yaml = await request.body()
-    try:
-        workflow_yaml = yaml.safe_load(raw_yaml)
-    except yaml.YAMLError:
-        raise HTTPException(status_code=422, detail="Invalid YAML")
-
-    try:
-        workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
-        return await app.WORKFLOW_SERVICE.create_workflow_from_request(
-            organization=current_org, request=workflow_create_request
-        )
-    except WorkflowParameterMissingRequiredValue as e:
-        raise e
-    except Exception as e:
-        LOG.error("Failed to create workflow", exc_info=True, organization_id=current_org.organization_id)
-        raise FailedToCreateWorkflow(str(e))
-
-
-@legacy_base_router.put(
-    "/workflows/{workflow_id}",
-    openapi_extra={
-        "requestBody": {
-            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
-            "required": True,
-        },
-        "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "update_workflow",
-    },
-    response_model=Workflow,
-    tags=["agent"],
-)
-@legacy_base_router.put(
-    "/workflows/{workflow_id}/",
-    openapi_extra={
-        "requestBody": {
-            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
-            "required": True,
-        },
-    },
-    response_model=Workflow,
-    include_in_schema=False,
-)
-@base_router.post(
-    "/workflows/{workflow_id}",
-    response_model=Workflow,
-    tags=["Agent"],
-    openapi_extra={
-        "requestBody": {
-            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
-            "required": True,
-        },
-        "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "update_workflow",
-    },
-    description="Update a workflow definition",
-    summary="Update a workflow definition",
-    responses={
-        200: {"description": "Successfully updated workflow"},
-        422: {"description": "Invalid workflow definition"},
-    },
-)
-@base_router.post(
-    "/workflows/{workflow_id}/",
-    openapi_extra={
-        "requestBody": {
-            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
-            "required": True,
-        },
-    },
-    response_model=Workflow,
-    include_in_schema=False,
-)
-async def update_workflow(
-    request: Request,
-    workflow_id: str = Path(
-        ..., description="The ID of the workflow to update. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
-    ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> Workflow:
-    analytics.capture("skyvern-oss-agent-workflow-update")
-    # validate the workflow
-    raw_yaml = await request.body()
-    try:
-        workflow_yaml = yaml.safe_load(raw_yaml)
-    except yaml.YAMLError:
-        raise HTTPException(status_code=422, detail="Invalid YAML")
-
-    try:
-        workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
-        return await app.WORKFLOW_SERVICE.create_workflow_from_request(
-            organization=current_org,
-            request=workflow_create_request,
-            workflow_permanent_id=workflow_id,
-        )
-    except WorkflowParameterMissingRequiredValue as e:
-        raise e
-    except Exception as e:
-        LOG.exception(
-            "Failed to update workflow",
-            workflow_permanent_id=workflow_id,
-            organization_id=current_org.organization_id,
-        )
-        raise FailedToUpdateWorkflow(workflow_id, f"<{type(e).__name__}: {str(e)}>")
-
-
-@legacy_base_router.delete(
-    "/workflows/{workflow_id}",
-    tags=["agent"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "delete_workflow",
-    },
-)
-@legacy_base_router.delete("/workflows/{workflow_id}/", include_in_schema=False)
-@base_router.post(
-    "/workflows/{workflow_id}/delete",
-    tags=["Agent"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "delete_workflow",
-    },
-    description="Delete a workflow",
-    summary="Delete a workflow",
-    responses={200: {"description": "Successfully deleted workflow"}},
-)
-@base_router.post("/workflows/{workflow_id}/delete/", include_in_schema=False)
-async def delete_workflow(
-    workflow_id: str = Path(
-        ..., description="The ID of the workflow to delete. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
-    ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> None:
-    analytics.capture("skyvern-oss-agent-workflow-delete")
-    await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(workflow_id, current_org.organization_id)
 
 
 @legacy_base_router.get(
@@ -1417,271 +1699,3 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
         final_workflow_run_block_timeline.extend(thought_timeline)
     final_workflow_run_block_timeline.sort(key=lambda x: x.created_at, reverse=True)
     return final_workflow_run_block_timeline
-
-
-@base_router.post(
-    "/run/tasks",
-    tags=["Agent"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "run_task",
-        "x-fern-examples": [
-            {
-                "code-samples": [
-                    {
-                        "sdk": "python",
-                        "code": RUN_TASK_CODE_SAMPLE,
-                    }
-                ]
-            }
-        ],
-    },
-    description="Run a task",
-    summary="Run a task",
-    responses={
-        200: {"description": "Successfully run task"},
-        400: {"description": "Invalid agent engine"},
-    },
-)
-@base_router.post("/run/tasks/", include_in_schema=False)
-async def run_task(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    run_request: TaskRunRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
-    x_api_key: Annotated[str | None, Header()] = None,
-    x_user_agent: Annotated[str | None, Header()] = None,
-) -> TaskRunResponse:
-    analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
-    await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
-
-    if run_request.engine in CUA_ENGINES or run_request.engine == RunEngine.skyvern_v1:
-        # create task v1
-        # if there's no url, call task generation first to generate the url, data schema if any
-        url = run_request.url
-        data_extraction_goal = None
-        data_extraction_schema = run_request.data_extraction_schema
-        navigation_goal = run_request.prompt
-        navigation_payload = None
-        task_generation = await task_v1_service.generate_task(
-            user_prompt=run_request.prompt,
-            organization=current_org,
-        )
-        url = url or task_generation.url
-        navigation_goal = task_generation.navigation_goal or run_request.prompt
-        if run_request.engine in CUA_ENGINES:
-            navigation_goal = run_request.prompt
-        navigation_payload = task_generation.navigation_payload
-        data_extraction_goal = task_generation.data_extraction_goal
-        data_extraction_schema = data_extraction_schema or task_generation.extracted_information_schema
-
-        task_v1_request = TaskRequest(
-            title=run_request.title,
-            url=url,
-            navigation_goal=navigation_goal,
-            navigation_payload=navigation_payload,
-            data_extraction_goal=data_extraction_goal,
-            extracted_information_schema=data_extraction_schema,
-            error_code_mapping=run_request.error_code_mapping,
-            proxy_location=run_request.proxy_location,
-            browser_session_id=run_request.browser_session_id,
-            totp_verification_url=run_request.totp_url,
-            totp_identifier=run_request.totp_identifier,
-            include_action_history_in_verification=run_request.include_action_history_in_verification,
-        )
-        task_v1_response = await task_v1_service.run_task(
-            task=task_v1_request,
-            organization=current_org,
-            engine=run_request.engine,
-            x_max_steps_override=run_request.max_steps,
-            x_api_key=x_api_key,
-            request=request,
-            background_tasks=background_tasks,
-        )
-        run_type = RunType.task_v1
-        if run_request.engine == RunEngine.openai_cua:
-            run_type = RunType.openai_cua
-        elif run_request.engine == RunEngine.anthropic_cua:
-            run_type = RunType.anthropic_cua
-        # build the task run response
-        return TaskRunResponse(
-            run_id=task_v1_response.task_id,
-            run_type=run_type,
-            status=str(task_v1_response.status),
-            output=task_v1_response.extracted_information,
-            failure_reason=task_v1_response.failure_reason,
-            created_at=task_v1_response.created_at,
-            modified_at=task_v1_response.modified_at,
-            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/tasks/{task_v1_response.task_id}",
-            run_request=TaskRunRequest(
-                engine=run_request.engine,
-                prompt=task_v1_response.navigation_goal,
-                url=task_v1_response.url,
-                webhook_url=task_v1_response.webhook_callback_url,
-                totp_identifier=task_v1_response.totp_identifier,
-                totp_url=task_v1_response.totp_verification_url,
-                proxy_location=task_v1_response.proxy_location,
-                max_steps=task_v1_response.max_steps_per_run,
-                data_extraction_schema=task_v1_response.extracted_information_schema,
-                error_code_mapping=task_v1_response.error_code_mapping,
-                browser_session_id=run_request.browser_session_id,
-            ),
-        )
-    if run_request.engine == RunEngine.skyvern_v2:
-        # create task v2
-        try:
-            task_v2 = await task_v2_service.initialize_task_v2(
-                organization=current_org,
-                user_prompt=run_request.prompt,
-                user_url=run_request.url,
-                totp_identifier=run_request.totp_identifier,
-                totp_verification_url=run_request.totp_url,
-                webhook_callback_url=run_request.webhook_url,
-                proxy_location=run_request.proxy_location,
-                publish_workflow=run_request.publish_workflow,
-                extracted_information_schema=run_request.data_extraction_schema,
-                error_code_mapping=run_request.error_code_mapping,
-                create_task_run=True,
-            )
-        except LLMProviderError:
-            LOG.error("LLM failure to initialize task v2", exc_info=True)
-            raise HTTPException(
-                status_code=500, detail="Skyvern LLM failure to initialize task v2. Please try again later."
-            )
-        await AsyncExecutorFactory.get_executor().execute_task_v2(
-            request=request,
-            background_tasks=background_tasks,
-            organization_id=current_org.organization_id,
-            task_v2_id=task_v2.observer_cruise_id,
-            max_steps_override=run_request.max_steps,
-            browser_session_id=run_request.browser_session_id,
-        )
-        refreshed_task_v2 = await app.DATABASE.get_task_v2(
-            task_v2_id=task_v2.observer_cruise_id, organization_id=current_org.organization_id
-        )
-        task_v2 = refreshed_task_v2 if refreshed_task_v2 else task_v2
-        return TaskRunResponse(
-            run_id=task_v2.observer_cruise_id,
-            run_type=RunType.task_v2,
-            status=str(task_v2.status),
-            output=task_v2.output,
-            failure_reason=None,
-            created_at=task_v2.created_at,
-            modified_at=task_v2.modified_at,
-            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{task_v2.workflow_permanent_id}/{task_v2.workflow_run_id}",
-            run_request=TaskRunRequest(
-                engine=RunEngine.skyvern_v2,
-                prompt=task_v2.prompt,
-                url=task_v2.url,
-                webhook_url=task_v2.webhook_callback_url,
-                totp_identifier=task_v2.totp_identifier,
-                totp_url=task_v2.totp_verification_url,
-                proxy_location=task_v2.proxy_location,
-                max_steps=run_request.max_steps,
-                browser_session_id=run_request.browser_session_id,
-                error_code_mapping=task_v2.error_code_mapping,
-                data_extraction_schema=task_v2.extracted_information_schema,
-                publish_workflow=run_request.publish_workflow,
-            ),
-        )
-    LOG.error("Invalid agent engine", engine=run_request.engine, organization_id=current_org.organization_id)
-    raise HTTPException(status_code=400, detail=f"Invalid agent engine: {run_request.engine}")
-
-
-@base_router.post(
-    "/run/workflows",
-    tags=["Agent"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "run_workflow",
-        "x-fern-examples": [
-            {
-                "code-samples": [
-                    {
-                        "sdk": "python",
-                        "code": RUN_WORKFLOW_CODE_SAMPLE,
-                    }
-                ]
-            }
-        ],
-    },
-    description="Run a workflow",
-    summary="Run a workflow",
-    responses={
-        200: {"description": "Successfully run workflow"},
-        400: {"description": "Invalid workflow run request"},
-    },
-)
-@base_router.post("/run/workflows/", include_in_schema=False)
-async def run_workflow(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    workflow_run_request: WorkflowRunRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
-    template: bool = Query(False),
-    x_api_key: Annotated[str | None, Header()] = None,
-    x_max_steps_override: Annotated[int | None, Header()] = None,
-    x_user_agent: Annotated[str | None, Header()] = None,
-) -> WorkflowRunResponse:
-    analytics.capture("skyvern-oss-run-workflow")
-    await PermissionCheckerFactory.get_instance().check(
-        current_org, browser_session_id=workflow_run_request.browser_session_id
-    )
-    workflow_id = workflow_run_request.workflow_id
-    context = skyvern_context.ensure_context()
-    request_id = context.request_id
-    legacy_workflow_request = WorkflowRequestBody(
-        data=workflow_run_request.parameters,
-        proxy_location=workflow_run_request.proxy_location,
-        webhook_callback_url=workflow_run_request.webhook_url,
-        totp_identifier=workflow_run_request.totp_identifier,
-        totp_url=workflow_run_request.totp_url,
-        browser_session_id=workflow_run_request.browser_session_id,
-    )
-    workflow_run = await workflow_service.run_workflow(
-        workflow_id=workflow_id,
-        organization=current_org,
-        workflow_request=legacy_workflow_request,
-        template=template,
-        version=None,
-        max_steps=x_max_steps_override,
-        api_key=x_api_key,
-        request_id=request_id,
-        request=request,
-        background_tasks=background_tasks,
-    )
-
-    return WorkflowRunResponse(
-        run_id=workflow_run.workflow_run_id,
-        run_type=RunType.workflow_run,
-        status=str(workflow_run.status),
-        output=None,
-        failure_reason=workflow_run.failure_reason,
-        created_at=workflow_run.created_at,
-        modified_at=workflow_run.modified_at,
-        run_request=workflow_run_request,
-        downloaded_files=None,
-        recording_url=None,
-        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}",
-    )
-
-
-@base_router.post(
-    "/runs/{run_id}/cancel",
-    tags=["Agent"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "cancel_run",
-    },
-    description="Cancel a task or workflow run",
-    summary="Cancel a task or workflow run",
-)
-@base_router.post("/runs/{run_id}/cancel/", include_in_schema=False)
-async def cancel_run(
-    run_id: str = Path(..., description="The id of the task run or the workflow run to cancel."),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
-    x_api_key: Annotated[str | None, Header()] = None,
-) -> None:
-    analytics.capture("skyvern-oss-agent-cancel-run")
-
-    await run_service.cancel_run(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
