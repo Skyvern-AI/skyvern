@@ -125,7 +125,7 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
   
   Or send the task anywhere Skyvern is hosted:
   ```python
-  skyvern = Skyvern(base_url="http://localhost:8000", api_key="SKYVERN API KEY in LOCAL SKYVERN")
+  skyvern = Skyvern(base_url="http://localhost:8000", api_key="SKYVERN API KEY")
   task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
   print(task)
   ```
