@@ -6,6 +6,7 @@ from skyvern_langchain.schema import CreateTaskInput, GetTaskInput
 from skyvern_langchain.settings import settings
 
 from skyvern import Skyvern
+from skyvern.client.agent.types.agent_get_run_response import AgentGetRunResponse
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.schemas.runs import RunEngine
 
@@ -58,5 +59,5 @@ class GetTask(SkyvernTaskBaseTool):
     description: str = """Use Skyvern client to get a task."""
     args_schema: Type[BaseModel] = GetTaskInput
 
-    async def _arun(self, task_id: str) -> TaskRunResponse:
+    async def _arun(self, task_id: str) -> AgentGetRunResponse | None:
         return await self.get_client().get_run(run_id=task_id)
