@@ -77,7 +77,7 @@ If you'd like to try it out,
 # Quickstart
 This quickstart guide will walk you through getting Skyvern up and running on your local machine. 
 
-## Local
+## Install & Run
 > ⚠️ **REQUIREMENT**: This project requires Python 3.11 ⚠️
 
 1. **Install Skyvern**
@@ -112,7 +112,7 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
   task = await skyvern.run_task(prompt="Find the top post on hackernews today")
   print(task)
   ```
-  A local browser will pop up. Skyvern will start executing the task in the browser and close the it when the task is done.
+  A local browser will pop up. Skyvern will start executing the task in the browser and close the it when the task is done. You will be able to review the task from http://localhost:8080/history
 
   You can also send a task to Skyvern Cloud:
   ```python
