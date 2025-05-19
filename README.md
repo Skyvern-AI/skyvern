@@ -98,36 +98,37 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
 
 4. **Launch the Skyvern UI**
 
-```bash
-skyvern run ui
-```
+  ```bash
+  skyvern run ui
+  ```
 
 5. **Run task**
-Run a skyvern task locally:
-```python
-from skyvern import Skyvern
 
-skyvern = Skyvern()
-task = await skyvern.run_task(prompt="Find the top post on hackernews today")
-print(task)
-```
-You should see your local browser 
+  Run a skyvern task locally:
+  ```python
+  from skyvern import Skyvern
 
-You can also send a task to Skyvern Cloud
-```python
-from skyvern import Skyvern
+  skyvern = Skyvern()
+  task = await skyvern.run_task(prompt="Find the top post on hackernews today")
+  print(task)
+  ```
+  A local browser will pop up. Skyvern will start executing the task in the browser and close the it when the task is done.
 
-skyvern = Skyvern()
-task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
-print(task)
-```
-
-Or anywhere Skyvern is hosted:
-```python
-skyvern = Skyvern(base_url="http://localhost:8000", api_key="SKYVERN API KEY in LOCAL SKYVERN")
-task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
-print(task)
-```
+  You can also send a task to Skyvern Cloud:
+  ```python
+  from skyvern import Skyvern
+  
+  skyvern = Skyvern()
+  task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
+  print(task)
+  ```
+  
+  Or send the task anywhere Skyvern is hosted:
+  ```python
+  skyvern = Skyvern(base_url="http://localhost:8000", api_key="SKYVERN API KEY in LOCAL SKYVERN")
+  task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
+  print(task)
+  ```
 
 ## Docker Compose setup
 
