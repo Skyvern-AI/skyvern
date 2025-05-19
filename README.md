@@ -103,7 +103,7 @@ skyvern run ui
 ```
 
 5. **Run task**
-Open a python shell and run task locally:
+Run a skyvern task locally:
 ```python
 from skyvern import Skyvern
 
@@ -111,6 +111,7 @@ skyvern = Skyvern()
 task = await skyvern.run_task(prompt="Find the top post on hackernews today")
 print(task)
 ```
+You should see your local browser 
 
 You can also send a task to Skyvern Cloud
 ```python
@@ -120,7 +121,8 @@ skyvern = Skyvern()
 task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
 print(task)
 ```
-Or anywhere a Skyvern serivce is hosted like this:
+
+Or anywhere Skyvern is hosted:
 ```python
 skyvern = Skyvern(base_url="http://localhost:8000", api_key="SKYVERN API KEY in LOCAL SKYVERN")
 task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
