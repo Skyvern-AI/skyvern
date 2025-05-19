@@ -102,6 +102,31 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
 skyvern run ui
 ```
 
+5. **Run task**
+Open a python shell and run task locally:
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern()
+task = await skyvern.run_task(prompt="Find the top post on hackernews today")
+print(task)
+```
+
+You can also send a task to Skyvern Cloud
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern()
+task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
+print(task)
+```
+Or anywhere a Skyvern serivce is hosted like this:
+```python
+skyvern = Skyvern(base_url="http://localhost:8000", api_key="SKYVERN API KEY in LOCAL SKYVERN")
+task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
+print(task)
+```
+
 ## Docker Compose setup
 
 1. Make sure you have [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running on your machine
