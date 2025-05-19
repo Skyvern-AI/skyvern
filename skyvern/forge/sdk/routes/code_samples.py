@@ -1,7 +1,7 @@
 RUN_TASK_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="your_api_key")
-await skyvern.run_task(prompt="What's the top post on hackernews?")
+await skyvern.agent.run_task(prompt="What's the top post on hackernews?")
 """
 RUN_WORKFLOW_CODE_SAMPLE = """from skyvern import Skyvern
 
@@ -11,7 +11,7 @@ await skyvern.agent.run_workflow(workflow_id="wpid_123", parameters={"parameter1
 GET_RUN_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="your_api_key")
-run = await skyvern.get_run(run_id="tsk_v2_123")
+run = await skyvern.agent.get_run(run_id="tsk_v2_123")
 print(run)
 """
 CANCEL_RUN_CODE_SAMPLE = """from skyvern import Skyvern
