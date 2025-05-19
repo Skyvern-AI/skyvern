@@ -3,8 +3,8 @@
 <h1 align="center">
  <a href="https://www.skyvern.com">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/skyvern_logo.png"/>
-    <img height="120" src="docs/images/skyvern_logo_blackbg.png"/>
+    <source media="(prefers-color-scheme: dark)" srcset="fern/images/skyvern_logo.png"/>
+    <img height="120" src="fern/images/skyvern_logo_blackbg.png"/>
   </picture>
  </a>
  <br />
@@ -26,7 +26,7 @@
 [Skyvern](https://www.skyvern.com) automates browser-based workflows using LLMs and computer vision. It provides a simple API endpoint to fully automate manual workflows on a large number of websites, replacing brittle or unreliable automation solutions. 
 
 <p align="center">
-  <img src="docs/images/geico_shu_recording_cropped.gif"/>
+  <img src="fern/images/geico_shu_recording_cropped.gif"/>
 </p>
 
 Traditional approaches to browser automations required writing custom scripts for websites, often relying on DOM parsing and XPath-based interactions which would break whenever the website layouts changed.
@@ -57,8 +57,8 @@ Skyvern uses a swarm of agents to comprehend a website, and plan and execute its
 6. **Dynamic Auto-complete Agent**: This agent is responsible for filling out dynamic auto-complete forms on a website. It's capable of reading the options presented to it, selecting the appropriate option based on the user's input, and adjusting its inputs based on the feedback from inside the form. Popular examples include: Address forms, university dropdowns, and more.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/skyvern_2_0_system_diagram.png" />
-  <img src="docs/images/skyvern_2_0_system_diagram.png" />
+  <source media="(prefers-color-scheme: dark)" srcset="fern/images/skyvern_2_0_system_diagram.png" />
+  <img src="fern/images/skyvern_2_0_system_diagram.png" />
 </picture>
 
 # Demo
@@ -136,7 +136,7 @@ Tasks are the fundamental building block inside Skyvern. Each task is a single r
 Tasks require you to specify a `url`, `prompt`, and can optionally include a `data schema` (if you want the output to conform to a specific schema) and `error codes` (if you want Skyvern to stop running in specific situations). 
 
 <p align="center">
-  <img src="docs/images/skyvern_2_0_screenshot.png"/>
+  <img src="fern/images/skyvern_2_0_screenshot.png"/>
 </p>
 
 
@@ -161,7 +161,7 @@ Supported workflow features include:
 1. (Coming soon) Custom Code Block
 
 <p align="center">
-  <img src="docs/images/invoice_downloading_workflow_example.png"/>
+  <img src="fern/images/invoice_downloading_workflow_example.png"/>
 </p>
 
 ## Livestreaming
@@ -188,7 +188,7 @@ Skyvern currently supports the following password manager integrations:
 - [ ] LastPass
 
 <p align="center">
-  <img src="docs/images/secure_password_task_example.png"/>
+  <img src="fern/images/secure_password_task_example.png"/>
 </p>
 
 ### 2FA
@@ -207,45 +207,45 @@ We love to see how Skyvern is being used in the wild. Here are some examples of 
 [Book a demo to see it live](https://meetings.hubspot.com/skyvern/demo)
 
 <p align="center">
-  <img src="docs/images/invoice_downloading.gif"/>
+  <img src="fern/images/invoice_downloading.gif"/>
 </p>
 
 ## Automate the job application process
 [💡 See it in action](https://app.skyvern.com/tasks/create/job_application)
 <p align="center">
-  <img src="docs/images/job_application_demo.gif"/>
+  <img src="fern/images/job_application_demo.gif"/>
 </p>
 
 ## Automate materials procurement for a manufacturing company
 [💡 See it in action](https://app.skyvern.com/tasks/create/finditparts)
 <p align="center">
-  <img src="docs/images/finditparts_recording_crop.gif"/>
+  <img src="fern/images/finditparts_recording_crop.gif"/>
 </p>
 
 ## Navigating to government websites to register accounts or fill out forms 
 [💡 See it in action](https://app.skyvern.com/tasks/create/california_edd)
 <p align="center">
-  <img src="docs/images/edd_services.gif"/>
+  <img src="fern/images/edd_services.gif"/>
 </p>
 <!-- Add example of delaware entity lookups x2 -->
 
 ## Filling out random contact us forms
 [💡 See it in action](https://app.skyvern.com/tasks/create/contact_us_forms)
 <p align="center">
-  <img src="docs/images/contact_forms.gif"/>
+  <img src="fern/images/contact_forms.gif"/>
 </p>
 
 
 ## Retrieving insurance quotes from insurance providers in any language
 [💡 See it in action](https://app.skyvern.com/tasks/create/bci_seguros)
 <p align="center">
-  <img src="docs/images/bci_seguros_recording.gif"/>
+  <img src="fern/images/bci_seguros_recording.gif"/>
 </p>
 
 [💡 See it in action](https://app.skyvern.com/tasks/create/geico)
 
 <p align="center">
-  <img src="docs/images/geico_shu_recording_cropped.gif"/>
+  <img src="fern/images/geico_shu_recording_cropped.gif"/>
 </p>
 
 # Contributor Setup
