@@ -59,4 +59,4 @@ class GetTask(SkyvernTaskBaseTool):
     args_schema: Type[BaseModel] = GetTaskInput
 
     async def _arun(self, task_id: str) -> TaskRunResponse:
-        return await self.get_client().get_run(task_id=task_id)
+        return await self.get_client().get_run(run_id=task_id)
