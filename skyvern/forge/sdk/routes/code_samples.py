@@ -17,7 +17,7 @@ print(run)
 CANCEL_RUN_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="your_api_key")
-await skyvern.cancel_run(run_id="tsk_v2_123")
+await skyvern.agent.cancel_run(run_id="tsk_v2_123")
 """
 CREATE_WORKFLOW_CODE_SAMPLE = """curl -X POST https://api.skyvern.com/v1/workflows \
 --header 'x-api-key: {{x-api-key}}' \
