@@ -1,8 +1,6 @@
 import json
 import os
 import shutil
-from pathlib import Path
-from typing import Iterable
 
 from dotenv import load_dotenv
 from rich.panel import Panel
@@ -29,13 +27,17 @@ async def setup_local_organization() -> str:
 
 # ----- Helper paths and checks -----
 
+
 def get_claude_config_path(host_system: str) -> str:
     if host_system == "wsl":
         roaming_path = get_windows_appdata_roaming()
         if roaming_path is None:
             raise RuntimeError("Could not locate Windows AppData\\Roaming path from WSL")
         return os.path.join(str(roaming_path), "Claude", "claude_desktop_config.json")
-    base_paths = {"darwin": ["~/Library/Application Support/Claude"], "linux": ["~/.config/Claude", "~/.local/share/Claude", "~/Claude"]}
+    base_paths = {
+        "darwin": ["~/Library/Application Support/Claude"],
+        "linux": ["~/.config/Claude", "~/.local/share/Claude", "~/Claude"],
+    }
     if host_system == "darwin":
         return os.path.join(os.path.expanduser(base_paths["darwin"][0]), "claude_desktop_config.json")
     if host_system == "linux":
@@ -60,6 +62,7 @@ def get_windsurf_config_path(host_system: str) -> str:
 
 
 # ----- Setup Helpers -----
+
 
 def setup_mcp_config() -> str:
     console.print(Panel("[bold yellow]Setting up MCP Python Environment[/bold yellow]", border_style="yellow"))
@@ -147,7 +150,9 @@ def setup_claude_desktop_config(host_system: str, path_to_env: str) -> bool:
         with open(path_claude_config, "w") as f:
             json.dump(claude_config, f, indent=2)
 
-        console.print(f"✅ [green]Claude Desktop MCP configuration updated successfully at [link]{path_claude_config}[/link].[/green]")
+        console.print(
+            f"✅ [green]Claude Desktop MCP configuration updated successfully at [link]{path_claude_config}[/link].[/green]"
+        )
         return True
 
     except Exception as e:
@@ -197,7 +202,9 @@ def setup_cursor_config(host_system: str, path_to_env: str) -> bool:
         with open(path_cursor_config, "w") as f:
             json.dump(cursor_config, f, indent=2)
 
-        console.print(f"✅ [green]Cursor MCP configuration updated successfully at [link]{path_cursor_config}[/link][/green]")
+        console.print(
+            f"✅ [green]Cursor MCP configuration updated successfully at [link]{path_cursor_config}[/link][/green]"
+        )
         return True
 
     except Exception as e:
@@ -247,7 +254,9 @@ def setup_windsurf_config(host_system: str, path_to_env: str) -> bool:
         console.print(f"[red]Error configuring Windsurf: {e}[/red]")
         return False
 
-    console.print(f"✅ [green]Windsurf MCP configuration updated successfully at [link]{path_windsurf_config}[/link].[/green]")
+    console.print(
+        f"✅ [green]Windsurf MCP configuration updated successfully at [link]{path_windsurf_config}[/link].[/green]"
+    )
     return True
 
 
