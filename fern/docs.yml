@@ -109,6 +109,8 @@ navigation:
           path: integrations/n8n.mdx
         - page: Workato
           path: integrations/workato.mdx
+        - page: MCP
+          path: integrations/mcp.mdx
   - tab: api
     layout:
       - api: API Reference
