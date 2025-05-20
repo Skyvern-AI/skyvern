@@ -300,7 +300,7 @@ class Skyvern(AsyncSkyvern):
         totp_url: str | None = None,
         title: str | None = None,
         error_code_mapping: dict[str, str] | None = None,
-        data_extraction_schema: dict[str, Any] | None = None,
+        data_extraction_schema: dict[str, Any] | str | None = None,
         proxy_location: ProxyLocation | None = None,
         max_steps: int | None = None,
         wait_for_completion: bool = True,

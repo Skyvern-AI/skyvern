@@ -440,9 +440,9 @@ async def cancel_run(
 @base_router.post(
     "/workflows",
     response_model=Workflow,
-    tags=["Agent"],
+    tags=["Workflows"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "create_workflow",
         "x-fern-examples": [{"code-samples": [{"sdk": "curl", "code": CREATE_WORKFLOW_CODE_SAMPLE}]}],
     },
@@ -488,7 +488,7 @@ async def create_workflow(
             "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
             "required": True,
         },
-        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "update_workflow",
     },
     response_model=Workflow,
@@ -508,7 +508,7 @@ async def create_workflow(
 @base_router.post(
     "/workflows/{workflow_id}",
     response_model=Workflow,
-    tags=["Agent"],
+    tags=["Workflows"],
     openapi_extra={
         "requestBody": {
             "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
@@ -573,16 +573,16 @@ async def update_workflow(
     "/workflows/{workflow_id}",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "delete_workflow",
     },
 )
 @legacy_base_router.delete("/workflows/{workflow_id}/", include_in_schema=False)
 @base_router.post(
     "/workflows/{workflow_id}/delete",
-    tags=["Agent"],
+    tags=["Workflows"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "delete_workflow",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": DELETE_WORKFLOW_CODE_SAMPLE}]}],
     },

@@ -443,7 +443,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.cancel_run(run_id=\"tsk_v2_123\")\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.agent.cancel_run(run_id=\"tsk_v2_123\")\n"
               }
             ]
           }
@@ -453,7 +453,7 @@
     "/v1/workflows": {
       "post": {
         "tags": [
-          "Agent"
+          "Workflows"
         ],
         "summary": "Create a new workflow",
         "description": "Create a new workflow",
@@ -524,7 +524,7 @@
     "/v1/workflows/{workflow_id}": {
       "post": {
         "tags": [
-          "Agent"
+          "Workflows"
         ],
         "summary": "Update a workflow definition",
         "description": "Update a workflow definition",
@@ -2900,7 +2900,7 @@
     "/v1/workflows/{workflow_id}/delete": {
       "post": {
         "tags": [
-          "Agent"
+          "Workflows"
         ],
         "summary": "Delete a workflow",
         "description": "Delete a workflow",
@@ -2982,7 +2982,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.agent.delete_workflow(workflow_id=\"wpid_123\")\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.workflows.delete_workflow(workflow_id=\"wpid_123\")\n"
               }
             ]
           }
