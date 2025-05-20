@@ -17,6 +17,11 @@ colors:
 analytics:
   posthog:
     api-key: ${POSTHOG_API_KEY}
+layout:
+  page-width: 1504px
+  header-height: 75px
+  searchbar-placement: header
+  tabs-placement: header
 navbar-links:
   - type: minimal
     icon: fa-brands fa-discord
@@ -83,7 +88,7 @@ navigation:
           path: running-tasks/visualizing-results.mdx
         - page: Advanced Settings for tasks
           path: running-tasks/advanced-features.mdx
-    - section: Workflows (Beta)
+    - section: Workflows
       contents:
         - page: Introduction
           path: workflows/introduction.mdx
