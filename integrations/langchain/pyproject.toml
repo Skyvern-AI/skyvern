@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "skyvern-langchain"
-version = "0.1.6"
+version = "0.1.7"
 description = ""
 authors = ["lawyzheng <lawy@skyvern.com>"]
 packages = [{ include = "skyvern_langchain" }]
@@ -8,7 +8,7 @@ readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.11,<3.12"
-skyvern = "^0.1.56"
+skyvern = ">=0.1.84"
 langchain = "^0.3.19"
 
 
