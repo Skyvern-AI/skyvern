@@ -99,8 +99,8 @@ navigation:
           path: workflows/what-is-a-parameter.mdx
     - section: Integrations
       contents:
-        - page: API Integrations
-          path: integrations/api.mdx
+        - page: Skyvern MCP
+          path: integrations/mcp.mdx
         - page: Zapier
           path: integrations/zapier.mdx
         - page: Make
@@ -109,8 +109,6 @@ navigation:
           path: integrations/n8n.mdx
         - page: Workato
           path: integrations/workato.mdx
-        - page: MCP
-          path: integrations/mcp.mdx
   - tab: api
     layout:
       - api: API Reference
