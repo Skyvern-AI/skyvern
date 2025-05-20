@@ -442,7 +442,7 @@ async def cancel_run(
     response_model=Workflow,
     tags=["Workflows"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "create_workflow",
         "x-fern-examples": [{"code-samples": [{"sdk": "curl", "code": CREATE_WORKFLOW_CODE_SAMPLE}]}],
     },
@@ -488,7 +488,7 @@ async def create_workflow(
             "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
             "required": True,
         },
-        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "update_workflow",
     },
     response_model=Workflow,
@@ -573,7 +573,7 @@ async def update_workflow(
     "/workflows/{workflow_id}",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "delete_workflow",
     },
 )
@@ -582,7 +582,7 @@ async def update_workflow(
     "/workflows/{workflow_id}/delete",
     tags=["Workflows"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "delete_workflow",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": DELETE_WORKFLOW_CODE_SAMPLE}]}],
     },
