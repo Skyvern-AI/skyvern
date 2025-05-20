@@ -61,6 +61,8 @@ navigation:
       contents:
         - page: Introduction
           path: introduction.mdx
+        - page: Quickstart
+          path: getting-started/quickstart.mdx
         - page: Skyvern In Action
           path: getting-started/skyvern-in-action.mdx
         - page: Task Prompting Guide
