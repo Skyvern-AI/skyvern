@@ -440,7 +440,7 @@ async def cancel_run(
 @base_router.post(
     "/workflows",
     response_model=Workflow,
-    tags=["Agent"],
+    tags=["Workflows"],
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "create_workflow",
@@ -508,7 +508,7 @@ async def create_workflow(
 @base_router.post(
     "/workflows/{workflow_id}",
     response_model=Workflow,
-    tags=["Agent"],
+    tags=["Workflows"],
     openapi_extra={
         "requestBody": {
             "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
@@ -580,7 +580,7 @@ async def update_workflow(
 @legacy_base_router.delete("/workflows/{workflow_id}/", include_in_schema=False)
 @base_router.post(
     "/workflows/{workflow_id}/delete",
-    tags=["Agent"],
+    tags=["Workflows"],
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "delete_workflow",
