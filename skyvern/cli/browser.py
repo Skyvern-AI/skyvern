@@ -1,7 +1,8 @@
 import os
+import subprocess
 from urllib.parse import urlparse
 
-import requests
+import requests  # type: ignore
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 
@@ -40,7 +41,9 @@ def setup_browser_config() -> tuple[str, str | None, str | None]:
             console.print("   - Connects to an [italic]existing Chrome instance[/italic]")
             console.print("   - [yellow]Requires Chrome to be running with remote debugging enabled[/yellow]")
 
-    selected_browser_idx = Prompt.ask("\nChoose browser type", choices=[str(i) for i in range(1, len(browser_types) + 1)])
+    selected_browser_idx = Prompt.ask(
+        "\nChoose browser type", choices=[str(i) for i in range(1, len(browser_types) + 1)]
+    )
     selected_browser = browser_types[int(selected_browser_idx) - 1]
     console.print(f"Selected browser: [bold green]{selected_browser}[/bold green]")
 
@@ -51,12 +54,16 @@ def setup_browser_config() -> tuple[str, str | None, str | None]:
         host_system = detect_os()
         default_location = get_default_chrome_location(host_system)
         console.print(f"\n[italic]Default Chrome location for your system:[/italic] [cyan]{default_location}[/cyan]")
-        browser_location = Prompt.ask("Enter Chrome executable location (press Enter to use default)", default=default_location)
+        browser_location = Prompt.ask(
+            "Enter Chrome executable location (press Enter to use default)", default=default_location
+        )
         if not browser_location:
             browser_location = default_location
 
         if not os.path.exists(browser_location):
-            console.print(f"[yellow]Warning: Chrome not found at {browser_location}. Please verify the location is correct.[/yellow]")
+            console.print(
+                f"[yellow]Warning: Chrome not found at {browser_location}. Please verify the location is correct.[/yellow]"
+            )
 
         console.print("\n[bold]To use CDP connection, Chrome must be running with remote debugging enabled.[/bold]")
         console.print("Example: [code]chrome --remote-debugging-port=9222[/code]")
@@ -87,7 +94,9 @@ def setup_browser_config() -> tuple[str, str | None, str | None]:
                         console.print(f"  Connected to [link]{remote_debugging_url}[/link]")
                         return selected_browser, browser_location, remote_debugging_url
                     except ValueError:
-                        console.print("[yellow]Port is in use, but doesn't appear to be Chrome with remote debugging.[/yellow]")
+                        console.print(
+                            "[yellow]Port is in use, but doesn't appear to be Chrome with remote debugging.[/yellow]"
+                        )
                 else:
                     console.print(f"[yellow]Chrome responded with status code {response.status_code}.[/yellow]")
             except requests.RequestException:
@@ -107,7 +116,9 @@ def setup_browser_config() -> tuple[str, str | None, str | None]:
 
         execute_browser = Confirm.ask("\nWould you like to start Chrome with remote debugging now?")
         if execute_browser:
-            console.print(f"🚀 [bold green]Starting Chrome with remote debugging on port {default_port}...\n[/bold green]")
+            console.print(
+                f"🚀 [bold green]Starting Chrome with remote debugging on port {default_port}...\n[/bold green]"
+            )
             try:
                 if host_system in ["darwin", "linux"]:
                     subprocess.Popen(f"nohup {chrome_cmd} > /dev/null 2>&1 &", shell=True)
@@ -119,7 +130,9 @@ def setup_browser_config() -> tuple[str, str | None, str | None]:
                 console.print(f"[red]Error starting Chrome: {e}[/red]")
                 console.print("[italic]Please start Chrome manually using the command above.[/italic]")
 
-        remote_debugging_url = Prompt.ask("Enter remote debugging URL (press Enter for default)", default="http://localhost:9222")
+        remote_debugging_url = Prompt.ask(
+            "Enter remote debugging URL (press Enter for default)", default="http://localhost:9222"
+        )
         if not remote_debugging_url:
             remote_debugging_url = "http://localhost:9222"
 

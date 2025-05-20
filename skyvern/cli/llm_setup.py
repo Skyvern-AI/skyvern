@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 
 from dotenv import load_dotenv, set_key
@@ -92,10 +91,12 @@ def setup_llm_providers() -> None:
         else:
             update_or_add_env_var("ANTHROPIC_API_KEY", anthropic_api_key)
             update_or_add_env_var("ENABLE_ANTHROPIC", "true")
-            model_options.extend([
-                "ANTHROPIC_CLAUDE3.5_SONNET",
-                "ANTHROPIC_CLAUDE3.7_SONNET",
-            ])
+            model_options.extend(
+                [
+                    "ANTHROPIC_CLAUDE3.5_SONNET",
+                    "ANTHROPIC_CLAUDE3.7_SONNET",
+                ]
+            )
     else:
         update_or_add_env_var("ENABLE_ANTHROPIC", "false")
 
@@ -177,9 +178,7 @@ def setup_llm_providers() -> None:
             else:
                 update_or_add_env_var("OPENAI_COMPATIBLE_SUPPORTS_VISION", "false")
 
-            openai_compatible_api_version = Prompt.ask(
-                "Enter API version (optional, press enter to skip)", default=""
-            )
+            openai_compatible_api_version = Prompt.ask("Enter API version (optional, press enter to skip)", default="")
             if openai_compatible_api_version:
                 update_or_add_env_var("OPENAI_COMPATIBLE_API_VERSION", openai_compatible_api_version)
 
