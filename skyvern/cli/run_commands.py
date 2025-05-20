@@ -5,14 +5,14 @@ from pathlib import Path
 from typing import List
 
 import psutil
-from skyvern.utils import detect_os
-
 import typer
 import uvicorn
 from dotenv import load_dotenv, set_key
 from mcp.server.fastmcp import FastMCP
 from rich.panel import Panel
 from rich.prompt import Confirm
+
+from skyvern.utils import detect_os
 
 from .console import console
 
