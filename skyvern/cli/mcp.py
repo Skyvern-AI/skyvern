@@ -195,7 +195,7 @@ def setup_cursor_config(host_system: str, path_to_env: str) -> bool:
                     }
             except json.JSONDecodeError:
                 console.print(
-                    f"[red]JSONDecodeError when reading Error configuring Cursor. Please open [link]{path_cursor_config}[/link] and fix the json config first.[/red]"
+                    f"[red]JSONDecodeError encountered while reading the Cursor configuration. Please open [link]{path_cursor_config}[/link] and fix the JSON config.[/red]"
                 )
                 return False
 
