@@ -235,7 +235,7 @@ from .types import (
     WorkflowStatus,
 )
 from .errors import BadRequestError, ForbiddenError, NotFoundError, UnprocessableEntityError
-from . import agent, browser_session, credentials
+from . import agent, browser_session, credentials, workflows
 from .agent import (
     AgentGetRunResponse,
     AgentGetRunResponse_AnthropicCua,
@@ -500,4 +500,5 @@ __all__ = [
     "agent",
     "browser_session",
     "credentials",
+    "workflows",
 ]
