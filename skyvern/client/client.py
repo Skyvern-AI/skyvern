@@ -5,10 +5,12 @@ from .environment import SkyvernEnvironment
 import httpx
 from .core.client_wrapper import SyncClientWrapper
 from .agent.client import AgentClient
+from .workflows.client import WorkflowsClient
 from .browser_session.client import BrowserSessionClient
 from .credentials.client import CredentialsClient
 from .core.client_wrapper import AsyncClientWrapper
 from .agent.client import AsyncAgentClient
+from .workflows.client import AsyncWorkflowsClient
 from .browser_session.client import AsyncBrowserSessionClient
 from .credentials.client import AsyncCredentialsClient
 
@@ -76,6 +78,7 @@ class Skyvern:
             timeout=_defaulted_timeout,
         )
         self.agent = AgentClient(client_wrapper=self._client_wrapper)
+        self.workflows = WorkflowsClient(client_wrapper=self._client_wrapper)
         self.browser_session = BrowserSessionClient(client_wrapper=self._client_wrapper)
         self.credentials = CredentialsClient(client_wrapper=self._client_wrapper)
 
@@ -143,6 +146,7 @@ class AsyncSkyvern:
             timeout=_defaulted_timeout,
         )
         self.agent = AsyncAgentClient(client_wrapper=self._client_wrapper)
+        self.workflows = AsyncWorkflowsClient(client_wrapper=self._client_wrapper)
         self.browser_session = AsyncBrowserSessionClient(client_wrapper=self._client_wrapper)
         self.credentials = AsyncCredentialsClient(client_wrapper=self._client_wrapper)
 
