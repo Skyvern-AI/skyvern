@@ -40,8 +40,10 @@ services:
       - ENABLE_CODE_BLOCK=true
       # - BROWSER_TYPE=cdp-connect
       # Use this command to start Chrome with remote debugging:
-      # "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\chrome-cdp-profile" --no-first-run --no-default-browser-check
-      # /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir="/Users/yourusername/chrome-cdp-profile" --no-first-run --no-default-browser-check
+      # To set up Chrome with remote debugging for CDP connection, use the Skyvern CLI:
+      #   skyvern init
+      # and select option 3 (cdp-connect)
+      # If you're using Docker, ensure Chrome is accessible from your container:
       # - BROWSER_REMOTE_DEBUGGING_URL=http://host.docker.internal:9222/
 
       # =========================
