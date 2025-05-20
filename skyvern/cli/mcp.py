@@ -143,7 +143,7 @@ def setup_claude_desktop_config(host_system: str, path_to_env: str) -> bool:
                     }
             except json.JSONDecodeError:
                 console.print(
-                    f"[red]JSONDecodeError when reading Error configuring Claude Desktop. Please open {path_claude_config} and fix the json config first.[/red]"
+                    f"[red]JSONDecodeError encountered while reading the Claude Desktop configuration. Please open {path_claude_config} and fix the JSON config.[/red]"
                 )
                 return False
 
