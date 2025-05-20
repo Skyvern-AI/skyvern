@@ -2,6 +2,10 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from typing import List
+
+import psutil
+from skyvern.utils import detect_os
 
 import typer
 import uvicorn
@@ -15,6 +19,31 @@ from .console import console
 run_app = typer.Typer()
 
 mcp = FastMCP("Skyvern")
+
+
+def get_pids_on_port(port: int) -> List[int]:
+    """Return a list of PIDs listening on the given port."""
+    pids = []
+    try:
+        for conn in psutil.net_connections(kind="inet"):
+            if conn.laddr and conn.laddr.port == port and conn.pid:
+                pids.append(conn.pid)
+    except Exception:
+        pass
+    return list(set(pids))
+
+
+def kill_pids(pids: List[int]) -> None:
+    """Kill the given list of PIDs in a cross-platform way."""
+    host_system = detect_os()
+    for pid in pids:
+        try:
+            if host_system in {"windows", "wsl"}:
+                subprocess.run(f"taskkill /PID {pid} /F", shell=True, check=False)
+            else:
+                os.kill(pid, 9)
+        except Exception:
+            console.print(f"[red]Failed to kill process {pid}[/red]")
 
 
 @run_app.command(name="server")
@@ -40,12 +69,12 @@ def run_ui() -> None:
     console.print(Panel("[bold blue]Starting Skyvern UI Server...[/bold blue]", border_style="blue"))
     try:
         with console.status("[bold green]Checking for existing process on port 8080...") as status:
-            result = subprocess.run("lsof -t -i :8080", shell=True, capture_output=True, text=True, check=False)
-            if result.stdout.strip():
+            pids = get_pids_on_port(8080)
+            if pids:
                 status.stop()
                 response = Confirm.ask("Process already running on port 8080. [yellow]Kill it?[/yellow]")
                 if response:
-                    subprocess.run("lsof -t -i :8080 | xargs kill", shell=True, check=False)
+                    kill_pids(pids)
                     console.print("✅ [green]Process killed.[/green]")
                 else:
                     console.print("[yellow]UI server not started. Process already running on port 8080.[/yellow]")
