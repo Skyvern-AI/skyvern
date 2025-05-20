@@ -15,19 +15,18 @@ import uvicorn
 from dotenv import load_dotenv, set_key
 from mcp.server.fastmcp import FastMCP
 
+# Import from rich
+from rich.console import Console
+from rich.padding import Padding
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.prompt import Confirm, Prompt
+
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.library import Skyvern
 from skyvern.utils import detect_os, get_windows_appdata_roaming, migrate_db
-
-# Import from rich
-from rich.console import Console
-from rich.panel import Panel
-from rich.text import Text
-from rich.padding import Padding
-from rich.prompt import Confirm, Prompt
-from rich.progress import Progress, SpinnerColumn, TextColumn
 
 # Create a global console instance for consistent output
 console = Console()
@@ -153,11 +152,15 @@ def setup_postgresql(no_postgres: bool = False) -> None:
 
     if no_postgres:
         console.print("[yellow]Skipping PostgreSQL container setup as requested.[/yellow]")
-        console.print("[italic]If you plan to use Docker Compose, its Postgres service will start automatically.[/italic]")
+        console.print(
+            "[italic]If you plan to use Docker Compose, its Postgres service will start automatically.[/italic]"
+        )
         return
 
     if not is_docker_running():
-        console.print("[red]Docker is not running or not installed. Please install or start Docker and try again.[/red]")
+        console.print(
+            "[red]Docker is not running or not installed. Please install or start Docker and try again.[/red]"
+        )
         exit(1)
 
     if is_postgres_running_in_docker():
@@ -165,40 +168,40 @@ def setup_postgresql(no_postgres: bool = False) -> None:
     else:
         if not no_postgres:
             start_postgres = Confirm.ask(
-                '[yellow]No local Postgres detected. Start a disposable container now?[/yellow]\n'
+                "[yellow]No local Postgres detected. Start a disposable container now?[/yellow]\n"
                 '[tip: choose "n" if you plan to run Skyvern via Docker Compose instead of `skyvern run server`]'
             )
             if not start_postgres:
                 console.print("[yellow]Skipping PostgreSQL container setup.[/yellow]")
-                console.print("[italic]If you plan to use Docker Compose, its Postgres service will start automatically.[/italic]")
+                console.print(
+                    "[italic]If you plan to use Docker Compose, its Postgres service will start automatically.[/italic]"
+                )
                 return
 
         console.print("🚀 [bold green]Attempting to install PostgreSQL via Docker...[/bold green]")
         if not is_postgres_container_exists():
-            with console.status("[bold blue]Pulling and starting PostgreSQL container...[/bold blue]") as status:
+            with console.status("[bold blue]Pulling and starting PostgreSQL container...[/bold blue]"):
                 run_command(
                     "docker run --name postgresql-container -e POSTGRES_HOST_AUTH_METHOD=trust -d -p 5432:5432 postgres:14"
                 )
             console.print("✅ [green]PostgreSQL has been installed and started using Docker.[/green]")
         else:
-            with console.status("[bold blue]Starting existing PostgreSQL container...[/bold blue]") as status:
+            with console.status("[bold blue]Starting existing PostgreSQL container...[/bold blue]"):
                 run_command("docker start postgresql-container")
             console.print("✅ [green]Existing PostgreSQL container started.[/green]")
 
-
         with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            transient=True,
-            console=console
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True, console=console
         ) as progress:
             progress.add_task("[bold blue]Waiting for PostgreSQL to become ready...", total=None)
-            time.sleep(20) # This sleep can be replaced with a more robust readiness check in a real app
+            time.sleep(20)  # This sleep can be replaced with a more robust readiness check in a real app
 
         console.print("✅ [green]PostgreSQL container ready.[/green]")
 
-    with console.status("[bold green]Checking database user...[/bold green]") as status:
-        _, code = run_command('docker exec postgresql-container psql -U postgres -c "\\du" | grep -q skyvern', check=False)
+    with console.status("[bold green]Checking database user...[/bold green]"):
+        _, code = run_command(
+            'docker exec postgresql-container psql -U postgres -c "\\du" | grep -q skyvern', check=False
+        )
         if code == 0:
             console.print("✅ [green]Database user exists.[/green]")
         else:
@@ -206,9 +209,9 @@ def setup_postgresql(no_postgres: bool = False) -> None:
             run_command("docker exec postgresql-container createuser -U postgres skyvern")
             console.print("✅ [green]Database user created.[/green]")
 
-    with console.status("[bold green]Checking database...[/bold green]") as status:
+    with console.status("[bold green]Checking database...[/bold green]"):
         _, code = run_command(
-            "docker exec postgresql-container psql -U postgres -lqt | cut -d \\| -f 1 | grep -qw skyvern", check=False
+            "docker exec postgresql-container psql -U postgres -lqt | cut -d \| -f 1 | grep -qw skyvern", check=False
         )
         if code == 0:
             console.print("✅ [green]Database exists.[/green]")
@@ -398,7 +401,9 @@ def setup_llm_providers() -> None:
         openai_compatible_vision = Confirm.ask("Does this model support vision?")
 
         if not all([openai_compatible_model_name, openai_compatible_api_key, openai_compatible_api_base]):
-            console.print("[red]Error: All required fields must be populated. OpenAI-compatible provider will not be enabled.[/red]")
+            console.print(
+                "[red]Error: All required fields must be populated. OpenAI-compatible provider will not be enabled.[/red]"
+            )
         else:
             update_or_add_env_var("OPENAI_COMPATIBLE_MODEL_NAME", openai_compatible_model_name)
             update_or_add_env_var("OPENAI_COMPATIBLE_API_KEY", openai_compatible_api_key)
@@ -427,7 +432,7 @@ def setup_llm_providers() -> None:
                 "[bold red]No LLM providers enabled.[/bold red]\n"
                 "You won't be able to run Skyvern unless you enable at least one provider.\n"
                 "You can re-run this script to enable providers or manually update the .env file.",
-                border_style="red"
+                border_style="red",
             )
         )
     else:
@@ -438,7 +443,7 @@ def setup_llm_providers() -> None:
         chosen_model_idx = Prompt.ask(
             f"Choose a model by number (e.g., [cyan]1[/cyan] for [green]{model_options[0]}[/green])",
             choices=[str(i) for i in range(1, len(model_options) + 1)],
-            default="1" # Default to the first option
+            default="1",  # Default to the first option
         )
         chosen_model = model_options[int(chosen_model_idx) - 1]
         console.print(f"🎉 [bold green]Chosen LLM Model: {chosen_model}[/bold green]")
@@ -479,7 +484,9 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
             console.print("   - Connects to an [italic]existing Chrome instance[/italic]")
             console.print("   - [yellow]Requires Chrome to be running with remote debugging enabled[/yellow]")
 
-    selected_browser_idx = Prompt.ask("\nChoose browser type", choices=[str(i) for i in range(1, len(browser_types) + 1)])
+    selected_browser_idx = Prompt.ask(
+        "\nChoose browser type", choices=[str(i) for i in range(1, len(browser_types) + 1)]
+    )
     selected_browser = browser_types[int(selected_browser_idx) - 1]
     console.print(f"Selected browser: [bold green]{selected_browser}[/bold green]")
 
@@ -490,12 +497,16 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
         host_system = detect_os()
         default_location = get_default_chrome_location(host_system)
         console.print(f"\n[italic]Default Chrome location for your system:[/italic] [cyan]{default_location}[/cyan]")
-        browser_location = Prompt.ask("Enter Chrome executable location (press Enter to use default)", default=default_location)
+        browser_location = Prompt.ask(
+            "Enter Chrome executable location (press Enter to use default)", default=default_location
+        )
         if not browser_location:
             browser_location = default_location
 
         if not os.path.exists(browser_location):
-            console.print(f"[yellow]Warning: Chrome not found at {browser_location}. Please verify the location is correct.[/yellow]")
+            console.print(
+                f"[yellow]Warning: Chrome not found at {browser_location}. Please verify the location is correct.[/yellow]"
+            )
 
         console.print("\n[bold]To use CDP connection, Chrome must be running with remote debugging enabled.[/bold]")
         console.print("Example: [code]chrome --remote-debugging-port=9222[/code]")
@@ -510,7 +521,9 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
         parsed_url = urlparse(remote_debugging_url)
         version_url = f"{parsed_url.scheme}://{parsed_url.netloc}/json/version"
 
-        with console.status(f"[bold green]Checking if Chrome is already running with remote debugging on port {default_port}...") as status:
+        with console.status(
+            f"[bold green]Checking if Chrome is already running with remote debugging on port {default_port}..."
+        ) as status:
             try:
                 response = requests.get(version_url, timeout=2)
                 if response.status_code == 200:
@@ -524,12 +537,14 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
                         console.print(f"  Connected to [link]{remote_debugging_url}[/link]")
                         return selected_browser, browser_location, remote_debugging_url
                     except json.JSONDecodeError:
-                        console.print("[yellow]Port is in use, but doesn't appear to be Chrome with remote debugging.[/yellow]")
+                        console.print(
+                            "[yellow]Port is in use, but doesn't appear to be Chrome with remote debugging.[/yellow]"
+                        )
                 else:
                     console.print(f"[yellow]Chrome responded with status code {response.status_code}.[/yellow]")
             except requests.RequestException:
                 console.print(f"[red]No Chrome instance detected on {remote_debugging_url}[/red]")
-        status.stop() # Ensure status stops if not already returned
+        status.stop()  # Ensure status stops if not already returned
 
         console.print("\n[bold]Executing Chrome with remote debugging enabled:[/bold]")
 
@@ -544,7 +559,9 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
 
         execute_browser = Confirm.ask("\nWould you like to start Chrome with remote debugging now?")
         if execute_browser:
-            console.print(f"🚀 [bold green]Starting Chrome with remote debugging on port {default_port}...\n[/bold green]")
+            console.print(
+                f"🚀 [bold green]Starting Chrome with remote debugging on port {default_port}...\n[/bold green]"
+            )
             try:
                 if host_system in ["darwin", "linux"]:
                     subprocess.Popen(f"nohup {chrome_cmd} > /dev/null 2>&1 &", shell=True)
@@ -553,13 +570,15 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
                 elif host_system == "wsl":
                     subprocess.Popen(f"cmd.exe /c start {chrome_cmd}", shell=True)
 
-                console.print(f"✅ [green]Chrome started successfully. Connecting to [link]{remote_debugging_url}[/link][/green]")
+                console.print(
+                    f"✅ [green]Chrome started successfully. Connecting to [link]{remote_debugging_url}[/link][/green]"
+                )
 
                 with Progress(
                     SpinnerColumn(),
                     TextColumn("[progress.description]{task.description}"),
                     transient=True,
-                    console=console
+                    console=console,
                 ) as progress:
                     progress.add_task("[bold blue]Waiting for Chrome to initialize...", total=None)
                     time.sleep(2)
@@ -569,13 +588,19 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
                     if verification_response.status_code == 200:
                         try:
                             browser_info = verification_response.json()
-                            console.print("✅ [green]Connection verified! Chrome is running with remote debugging.[/green]")
+                            console.print(
+                                "✅ [green]Connection verified! Chrome is running with remote debugging.[/green]"
+                            )
                             if "Browser" in browser_info:
                                 console.print(f"  Browser: [bold]{browser_info['Browser']}[/bold]")
                         except json.JSONDecodeError:
-                            console.print("[yellow]Warning: Response from Chrome debugging port is not valid JSON.[/yellow]")
+                            console.print(
+                                "[yellow]Warning: Response from Chrome debugging port is not valid JSON.[/yellow]"
+                            )
                     else:
-                        console.print(f"[yellow]Warning: Chrome responded with status code {verification_response.status_code}[/yellow]")
+                        console.print(
+                            f"[yellow]Warning: Chrome responded with status code {verification_response.status_code}[/yellow]"
+                        )
                 except requests.RequestException as e:
                     console.print(f"[red]Warning: Could not verify Chrome is running properly: {e}[/red]")
                     console.print("[italic]You may need to check Chrome manually or try a different port.[/italic]")
@@ -583,7 +608,9 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
                 console.print(f"[red]Error starting Chrome: {e}[/red]")
                 console.print("[italic]Please start Chrome manually using the command above.[/italic]")
 
-        remote_debugging_url = Prompt.ask("Enter remote debugging URL (press Enter for default)", default="http://localhost:9222")
+        remote_debugging_url = Prompt.ask(
+            "Enter remote debugging URL (press Enter for default)", default="http://localhost:9222"
+        )
         if not remote_debugging_url:
             remote_debugging_url = "http://localhost:9222"
 
@@ -707,6 +734,7 @@ def setup_windsurf_config(host_system: str, path_to_env: str) -> bool:
     if not is_windsurf_installed(host_system):
         return False
 
+    path_windsurf_config = get_windsurf_config_path(host_system)
     load_dotenv(".env")
     skyvern_base_url = os.environ.get("SKYVERN_BASE_URL", "")
     skyvern_api_key = os.environ.get("SKYVERN_API_KEY", "")
@@ -749,7 +777,9 @@ def setup_windsurf_config(host_system: str, path_to_env: str) -> bool:
         console.print(f"[red]Error configuring Windsurf: {e}[/red]")
         return False
 
-    console.print(f"✅ [green]Windsurf MCP configuration updated successfully at [link]{path_windsurf_config}[/link].[/green]")
+    console.print(
+        f"✅ [green]Windsurf MCP configuration updated successfully at [link]{path_windsurf_config}[/link].[/green]"
+    )
     return True
 
 
@@ -760,7 +790,7 @@ def setup_mcp_config() -> str:
     console.print(Panel("[bold yellow]Setting up MCP Python Environment[/bold yellow]", border_style="yellow"))
     # Try to find Python in this order: python, python3, python3.12, python3.11, python3.10, python3.9
     python_paths = []
-    for python_cmd in ["python", "python3.11"]: # Added python3.11 as primary check
+    for python_cmd in ["python", "python3.11"]:  # Added python3.11 as primary check
         python_path = shutil.which(python_cmd)
         if python_path:
             python_paths.append((python_cmd, python_path))
@@ -799,7 +829,7 @@ def setup_claude_desktop_config(host_system: str, path_to_env: str) -> bool:
 
         if not skyvern_base_url or not skyvern_api_key:
             console.print("[red]Error: SKYVERN_BASE_URL and SKYVERN_API_KEY must be set in .env file[/red]")
-            return False # Indicate failure if critical env vars are missing
+            return False  # Indicate failure if critical env vars are missing
 
         with open(path_claude_config, "r") as f:
             claude_config = json.load(f)
@@ -816,7 +846,9 @@ def setup_claude_desktop_config(host_system: str, path_to_env: str) -> bool:
         with open(path_claude_config, "w") as f:
             json.dump(claude_config, f, indent=2)
 
-        console.print(f"✅ [green]Claude Desktop MCP configuration updated successfully at [link]{path_claude_config}[/link].[/green]")
+        console.print(
+            f"✅ [green]Claude Desktop MCP configuration updated successfully at [link]{path_claude_config}[/link].[/green]"
+        )
         return True
 
     except Exception as e:
@@ -873,7 +905,9 @@ def setup_cursor_config(host_system: str, path_to_env: str) -> bool:
         with open(path_cursor_config, "w") as f:
             json.dump(cursor_config, f, indent=2)
 
-        console.print(f"✅ [green]Cursor MCP configuration updated successfully at [link]{path_cursor_config}[/link][/green]")
+        console.print(
+            f"✅ [green]Cursor MCP configuration updated successfully at [link]{path_cursor_config}[/link][/green]"
+        )
         return True
 
     except Exception as e:
@@ -900,7 +934,7 @@ def setup_mcp() -> None:
     windsurf_response = Confirm.ask("Would you like to set up MCP integration for Windsurf?", default=True)
     if windsurf_response:
         setup_windsurf_config(host_system, path_to_env)
-    
+
     console.print("\n🎉 [bold green]MCP server configuration completed.[/bold green]")
 
 
@@ -941,13 +975,14 @@ def run_ui() -> None:
             status.stop()
     except Exception as e:
         console.print(f"[red]Error checking for process: {e}[/red]")
-        pass
 
     # Get the frontend directory path relative to this file
     current_dir = Path(__file__).parent.parent.parent
     frontend_dir = current_dir / "skyvern-frontend"
     if not frontend_dir.exists():
-        console.print(f"[bold red]ERROR: Skyvern Frontend directory not found at [path]{frontend_dir}[/path]. Are you in the right repo?[/bold red]")
+        console.print(
+            f"[bold red]ERROR: Skyvern Frontend directory not found at [path]{frontend_dir}[/path]. Are you in the right repo?[/bold red]"
+        )
         return
 
     if not (frontend_dir / ".env").exists():
@@ -992,17 +1027,23 @@ def run_mcp() -> None:
 
 @cli_app.command(name="init")
 def init(no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container")) -> None:
-    console.print(Panel("[bold green]Welcome to Skyvern CLI Initialization![/bold green]", border_style="green", expand=False))
+    console.print(
+        Panel("[bold green]Welcome to Skyvern CLI Initialization![/bold green]", border_style="green", expand=False)
+    )
     console.print("[italic]This wizard will help you set up Skyvern.[/italic]")
 
-    run_local = Confirm.ask("Would you like to run Skyvern [bold blue]locally[/bold blue] or in the [bold purple]cloud[/bold purple]?", default=False, choices=["local", "cloud"])
-    
+    run_local = Confirm.ask(
+        "Would you like to run Skyvern [bold blue]locally[/bold blue] or in the [bold purple]cloud[/bold purple]?",
+        default=False,
+        choices=["local", "cloud"],
+    )
+
     if run_local:
         setup_postgresql(no_postgres)
         console.print("📊 [bold blue]Running database migrations...[/bold blue]")
         migrate_db()
         console.print("✅ [green]Database migration complete.[/green]")
-        
+
         console.print("🔑 [bold blue]Generating local organization API key...[/bold blue]")
         api_key = asyncio.run(_setup_local_organization())
         if api_key:
@@ -1012,7 +1053,9 @@ def init(no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip sta
 
         if os.path.exists(".env"):
             console.print("💡 [.env] file already exists.", style="yellow")
-            redo_llm_setup = Confirm.ask("Do you want to go through [bold yellow]LLM provider setup again[/bold yellow]?", default=False)
+            redo_llm_setup = Confirm.ask(
+                "Do you want to go through [bold yellow]LLM provider setup again[/bold yellow]?", default=False
+            )
             if not redo_llm_setup:
                 console.print("[green]Skipping LLM setup.[/green]")
             else:
@@ -1021,7 +1064,6 @@ def init(no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip sta
         else:
             console.print("\n[bold blue]Initializing .env file...[/bold blue]")
             setup_llm_providers()
-
 
         # Configure browser settings
         console.print("\n[bold blue]Configuring browser settings...[/bold blue]")
@@ -1036,7 +1078,7 @@ def init(no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip sta
         console.print("🌐 [bold blue]Setting Skyvern Base URL to: http://localhost:8000[/bold blue]")
         update_or_add_env_var("SKYVERN_BASE_URL", "http://localhost:8000")
 
-    else: # Cloud setup
+    else:  # Cloud setup
         console.print(Panel("[bold purple]Cloud Deployment Setup[/bold purple]", border_style="purple"))
         base_url = Prompt.ask("Enter Skyvern base URL", default="https://api.skyvern.com", show_default=True)
         if not base_url:
@@ -1052,34 +1094,36 @@ def init(no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip sta
             api_key = Prompt.ask("Please re-enter your Skyvern API key", password=True)
             if not api_key:
                 console.print("[bold red]Error: API key cannot be empty. Aborting initialization.[/bold red]")
-                return # Exit if API key is not provided even after re-prompt
+                return  # Exit if API key is not provided even after re-prompt
 
         update_or_add_env_var("SKYVERN_BASE_URL", base_url)
-
 
     # Ask for email or generate UUID
     analytics_id_input = Prompt.ask("Please enter your email for analytics (press enter to skip)", default="")
     analytics_id = analytics_id_input if analytics_id_input else str(uuid.uuid4())
     update_or_add_env_var("ANALYTICS_ID", analytics_id)
-    update_or_add_env_var("SKYVERN_API_KEY", api_key) # This might overwrite local API key if init is re-run for LLM setup.
-                                                        # Consider moving this to just after API key determination.
+    update_or_add_env_var(
+        "SKYVERN_API_KEY", api_key
+    )  # This might overwrite local API key if init is re-run for LLM setup.
+    # Consider moving this to just after API key determination.
     console.print("✅ [green].env file has been initialized.[/green]")
 
     # Ask if user wants to configure MCP server
-    configure_mcp = Confirm.ask("\nWould you like to [bold yellow]configure the MCP server[/bold yellow]?", default=True)
+    configure_mcp = Confirm.ask(
+        "\nWould you like to [bold yellow]configure the MCP server[/bold yellow]?", default=True
+    )
     if configure_mcp:
         setup_mcp()
-        
+
         if not run_local:
-            console.print("\n🎉 [bold green]MCP configuration is complete! Your AI applications are now ready to use Skyvern Cloud.[/bold green]")
+            console.print(
+                "\n🎉 [bold green]MCP configuration is complete! Your AI applications are now ready to use Skyvern Cloud.[/bold green]"
+            )
 
     if run_local:
         console.print("\n⬇️ [bold blue]Installing Chromium browser...[/bold blue]")
         with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            transient=True,
-            console=console
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True, console=console
         ) as progress:
             progress.add_task("[bold blue]Downloading Chromium, this may take a moment...", total=None)
             subprocess.run(["playwright", "install", "chromium"], check=True)
