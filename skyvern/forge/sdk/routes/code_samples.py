@@ -298,7 +298,7 @@ workflow_definition:
 DELETE_WORKFLOW_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="your_api_key")
-await skyvern.agent.delete_workflow(workflow_id="wpid_123")
+await skyvern.workflows.delete_workflow(workflow_id="wpid_123")
 """
 SEND_TOTP_CODE_CODE_SAMPLE = """from skyvern import Skyvern
 
