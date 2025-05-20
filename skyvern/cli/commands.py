@@ -3,26 +3,27 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import time
-import webbrowser
 import uuid
+import webbrowser
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Tuple
+from typing import Any, Callable, Optional, cast
+from urllib.parse import urlparse
+
+import requests  # type: ignore
 import typer
+from dotenv import load_dotenv, set_key
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
-from rich import print as rprint
-from rich.markdown import Markdown
-from dotenv import load_dotenv, set_key
 
 from skyvern.config import settings
-from skyvern.library import Skyvern
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge import app
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.library import Skyvern
 from skyvern.utils import detect_os, get_windows_appdata_roaming, migrate_db
 
 # Initialize Rich console for better formatting
@@ -59,47 +60,45 @@ DOCUMENTATION = {
     "api": "https://docs.skyvern.com/integrations/api",
 }
 
+
 class DeploymentType(str, Enum):
     LOCAL = "local"
     CLOUD = "cloud"
+
 
 class BrowserType(str, Enum):
     HEADLESS = "chromium-headless"
     HEADFUL = "chromium-headful"
     CDP = "cdp-connect"
 
-#----------------------------------------------------
+
+# ----------------------------------------------------
 # 1. Guided Onboarding Flow
-#----------------------------------------------------
+# ----------------------------------------------------
+
 
 @cli_app.command(name="init")
 def init(
-    deployment: Optional[DeploymentType] = typer.Option(
-        None, 
-        help="Deployment type: local or cloud"
-    ),
-    no_postgres: bool = typer.Option(
-        False, 
-        "--no-postgres", 
-        help="Skip starting PostgreSQL container"
-    )
+    deployment: Optional[DeploymentType] = typer.Option(None, help="Deployment type: local or cloud"),
+    no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
 ) -> None:
     """
     Initialize Skyvern with a guided setup process.
-    
+
     This wizard will help you configure Skyvern for either local development
     or connection to Skyvern Cloud. It will guide you through:
-    
+
     - Choosing deployment type (local or cloud)
     - Setting up database (for local deployment)
     - Configuring LLM providers
     - Setting up browser automation
     - Configuring integrations
     """
-    console.print(Panel.fit(
-        "[bold blue]Welcome to Skyvern Setup Wizard[/]", 
-        subtitle="Let's get you started with browser automation"
-    ))
+    console.print(
+        Panel.fit(
+            "[bold blue]Welcome to Skyvern Setup Wizard[/]", subtitle="Let's get you started with browser automation"
+        )
+    )
 
     # Step 1: Choose deployment type
     if deployment is None:
@@ -110,30 +109,28 @@ def init(
         console.print("\n[yellow]Cloud deployment[/] - Connect to Skyvern Cloud")
         console.print(" • Managed service with no local infrastructure")
         console.print(" • Production-ready with built-in scaling")
-        
-        deployment_choice = console.input("\n[bold]Deploy locally or connect to cloud? [cloud/local] [/]").strip().lower()
+
+        deployment_choice = (
+            console.input("\n[bold]Deploy locally or connect to cloud? [cloud/local] [/]").strip().lower()
+        )
         run_local = deployment_choice == "local"
     else:
         run_local = deployment == DeploymentType.LOCAL
-        
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console
-    ) as progress:
+
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
         if run_local:
             # Step 2: Set up local infrastructure (for local deployment)
             setup_task = progress.add_task("[green]Setting up local infrastructure...", total=1)
-            
+
             if not no_postgres:
                 setup_postgresql(no_postgres)
-            
+
             migrate_db()
-            
+
             api_key_task = progress.add_task("[green]Generating API key...", total=1)
             api_key = asyncio.run(_setup_local_organization())
             progress.update(api_key_task, completed=1)
-            
+
             # Step 3: Configure LLM providers
             progress.update(setup_task, completed=1)
             llm_task = progress.add_task("[green]Setting up LLM providers...", total=1)
@@ -155,7 +152,7 @@ def init(
         else:
             # Configure for cloud deployment
             cloud_task = progress.add_task("[green]Setting up Skyvern Cloud connection...", total=1)
-            
+
             base_url = console.input("\nEnter Skyvern base URL [https://api.skyvern.com]: ").strip()
             if not base_url:
                 base_url = "https://api.skyvern.com"
@@ -164,7 +161,7 @@ def init(
             console.print("1. Create an account at [link=https://app.skyvern.com]https://app.skyvern.com[/link]")
             console.print("2. Go to Settings")
             console.print("3. Copy your API key")
-            
+
             api_key = console.input("\nEnter your Skyvern API key: ").strip()
             while not api_key:
                 console.print("[bold red]API key is required[/]")
@@ -175,7 +172,7 @@ def init(
 
         # Common configuration
         analytics_task = progress.add_task("[green]Finalizing configuration...", total=1)
-        
+
         # Ask for email or generate UUID for analytics
         analytics_id = console.input("\nPlease enter your email for analytics (press enter to skip): ")
         if not analytics_id:
@@ -187,7 +184,9 @@ def init(
 
     # Step 5: Configure integrations
     console.print(Markdown("\n## Step 5: Configure Integrations"))
-    configure_mcp = typer.confirm("Would you like to configure AI integrations (Claude, Cursor, Windsurf)?", default=True)
+    configure_mcp = typer.confirm(
+        "Would you like to configure AI integrations (Claude, Cursor, Windsurf)?", default=True
+    )
     if configure_mcp:
         setup_mcp()
         console.print("\n[green]AI integrations configured successfully![/]")
@@ -195,40 +194,40 @@ def init(
     if run_local:
         # Install required components for local deployment
         console.print(Markdown("\n## Step 6: Installing Components"))
-        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
+        with Progress(
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console
+        ) as progress:
             browser_install_task = progress.add_task("[green]Installing Chromium browser...", total=1)
             subprocess.run(["playwright", "install", "chromium"], check=True)
             progress.update(browser_install_task, completed=1)
 
     # Success message and next steps
-    console.print(Panel.fit(
-        "[bold green]Skyvern setup complete![/]",
-        subtitle="You're ready to start automating browsers"
-    ))
-    
+    console.print(
+        Panel.fit("[bold green]Skyvern setup complete![/]", subtitle="You're ready to start automating browsers")
+    )
+
     if run_local:
         console.print("\n[bold]Next steps:[/]")
         console.print("1. Start the Skyvern server:         [yellow]skyvern run server[/]")
         console.print("2. Start the Skyvern UI:             [yellow]skyvern run ui[/]")
     else:
         console.print("\n[bold]Next steps:[/]")
-        console.print("1. Visit the Skyvern Cloud dashboard: [link=https://app.skyvern.com]https://app.skyvern.com[/link]")
+        console.print(
+            "1. Visit the Skyvern Cloud dashboard: [link=https://app.skyvern.com]https://app.skyvern.com[/link]"
+        )
         console.print("2. Try using an AI integration:       [yellow]skyvern docs integrations[/]")
 
-#----------------------------------------------------
+
+# ----------------------------------------------------
 # 3. Improved Documentation Integration
-#----------------------------------------------------
+# ----------------------------------------------------
+
 
 @docs_app.command(name="open")
-def open_docs(
-    section: str = typer.Argument(
-        "quickstart", 
-        help="Documentation section to open"
-    )
-) -> None:
+def open_docs(section: str = typer.Argument("quickstart", help="Documentation section to open")) -> None:
     """
     Open Skyvern documentation in your web browser.
-    
+
     Available sections:
     - quickstart: Getting started guide
     - tasks: Task creation and running
@@ -242,23 +241,24 @@ def open_docs(
         for name, url in DOCUMENTATION.items():
             console.print(f"  • [bold]{name}[/] - {url}")
         return
-    
+
     url = DOCUMENTATION[section]
     console.print(f"Opening documentation section: [bold]{section}[/]")
     console.print(f"URL: [link={url}]{url}[/link]")
     webbrowser.open(url)
+
 
 @docs_app.command(name="prompting")
 def prompting_guide() -> None:
     """
     Show prompting best practices for Skyvern.
     """
-    console.print(Panel.fit(
-        "[bold blue]Skyvern Prompting Best Practices[/]",
-        subtitle="Tips for writing effective prompts"
-    ))
-    
-    console.print(Markdown("""
+    console.print(
+        Panel.fit("[bold blue]Skyvern Prompting Best Practices[/]", subtitle="Tips for writing effective prompts")
+    )
+
+    console.print(
+        Markdown("""
 ## General Guidelines
 
 1. **Be specific and detailed**
@@ -293,93 +293,93 @@ Buy wireless headphones and check out.
 ## For More Information
 
 Run `skyvern docs open prompting` to see the complete prompting guide online.
-    """))
+    """)
+    )
 
-#----------------------------------------------------
+
+# ----------------------------------------------------
 # 4. User-Friendly Management Commands
-#----------------------------------------------------
+# ----------------------------------------------------
+
 
 @cli_app.command(name="status")
 def status() -> None:
     """
     Check the status of Skyvern services.
     """
-    console.print(Panel.fit(
-        "[bold blue]Skyvern Services Status[/]",
-        subtitle="Checking all system components"
-    ))
-    
+    console.print(Panel.fit("[bold blue]Skyvern Services Status[/]", subtitle="Checking all system components"))
+
     # Check for .env file
     env_path = Path(".env")
     env_status = "✅ Found" if env_path.exists() else "❌ Not found"
-    
+
     # Check database connection
     db_status = "⏳ Checking..."
     try:
         load_dotenv()
         # Simple check - just see if we can run a migrate command without error
-        migrate_db(dry_run=True)
+        migrate_db()
         db_status = "✅ Connected"
     except Exception:
         db_status = "❌ Not connected"
-    
+
     # Check if server is running (port 8000)
     server_status = "⏳ Checking..."
     try:
         import socket
+
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(0.5)
         s.connect(("localhost", 8000))
         s.close()
         server_status = "✅ Running"
-    except:
+    except Exception:
         server_status = "❌ Not running"
-    
+
     # Check if UI is running (port 8080)
     ui_status = "⏳ Checking..."
     try:
         import socket
+
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(0.5)
         s.connect(("localhost", 8080))
         s.close()
         ui_status = "✅ Running"
-    except:
+    except Exception:
         ui_status = "❌ Not running"
-    
+
     # Check API key
     api_key = os.getenv("SKYVERN_API_KEY", "")
     api_key_status = "✅ Configured" if api_key else "❌ Not configured"
-    
+
     # Display status table
     table = Table(title="Skyvern Services")
     table.add_column("Component", style="cyan")
     table.add_column("Status", style="green")
     table.add_column("Action to Fix", style="yellow")
-    
+
     table.add_row("Configuration (.env)", env_status, "Run: skyvern init" if env_status.startswith("❌") else "")
     table.add_row("Database", db_status, "Check DATABASE_STRING in .env" if db_status.startswith("❌") else "")
     table.add_row("Server", server_status, "Run: skyvern run server" if server_status.startswith("❌") else "")
     table.add_row("UI", ui_status, "Run: skyvern run ui" if ui_status.startswith("❌") else "")
     table.add_row("API Key", api_key_status, "Run: skyvern init" if api_key_status.startswith("❌") else "")
-    
+
     console.print(table)
-    
+
     if "❌" in f"{env_status}{db_status}{server_status}{ui_status}{api_key_status}":
         console.print("\n[bold yellow]Some components need attention.[/] Fix the issues above to get started.")
     else:
         console.print("\n[bold green]All systems operational![/] Skyvern is ready to use.")
+
 
 @tasks_app.command(name="list")
 def list_tasks() -> None:
     """
     List recent Skyvern tasks.
     """
-    console.print(Panel.fit(
-        "[bold blue]Recent Skyvern Tasks[/]",
-        subtitle="Retrieving task history"
-    ))
-    
+    console.print(Panel.fit("[bold blue]Recent Skyvern Tasks[/]", subtitle="Retrieving task history"))
+
     try:
         # Initialize Skyvern client
         load_dotenv()
@@ -387,63 +387,63 @@ def list_tasks() -> None:
             base_url=settings.SKYVERN_BASE_URL,
             api_key=settings.SKYVERN_API_KEY,
         )
-        
+
         # Get tasks
-        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
+        with Progress(
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console
+        ) as progress:
             task = progress.add_task("[green]Fetching recent tasks...", total=1)
             tasks = asyncio.run(skyvern_agent.get_tasks())
             progress.update(task, completed=1)
-        
+
         if not tasks:
             console.print("[yellow]No tasks found[/]")
             return
-        
+
         # Display tasks
         table = Table(title=f"Tasks ({len(tasks)} found)")
         table.add_column("ID", style="cyan", no_wrap=True)
         table.add_column("Title", style="green")
         table.add_column("Status", style="yellow")
         table.add_column("Created", style="blue")
-        
+
         for task in tasks:
             table.add_row(
                 str(task.id),
                 task.title or "Untitled",
                 task.status or "Unknown",
-                task.created_at.strftime("%Y-%m-%d %H:%M:%S") if task.created_at else "Unknown"
+                task.created_at.strftime("%Y-%m-%d %H:%M:%S") if task.created_at else "Unknown",
             )
-        
+
         console.print(table)
-        
+
         # Show help for next steps
         console.print("\n[bold]Next steps:[/]")
         console.print("• View task details:    [yellow]skyvern tasks show <task_id>[/]")
         console.print("• Retry a task:         [yellow]skyvern tasks retry <task_id>[/]")
-    
+
     except Exception as e:
         console.print(f"[bold red]Error listing tasks:[/] {str(e)}")
         console.print("[yellow]Make sure your API key is set correctly in .env[/]")
+
 
 @tasks_app.command(name="create")
 def create_task(
     prompt: str = typer.Option(..., "--prompt", "-p", help="Task prompt"),
     url: str = typer.Option(..., "--url", "-u", help="Starting URL"),
     schema: Optional[str] = typer.Option(None, "--schema", "-s", help="Data extraction schema (JSON)"),
-    output_json: bool = typer.Option(False, "--json", help="Output results as JSON")
+    output_json: bool = typer.Option(False, "--json", help="Output results as JSON"),
 ) -> None:
     """
     Create and run a new Skyvern task.
     """
-    console.print(Panel.fit(
-        "[bold blue]Creating New Skyvern Task[/]",
-        subtitle="Running browser automation"
-    ))
-    
+    console.print(Panel.fit("[bold blue]Creating New Skyvern Task[/]", subtitle="Running browser automation"))
+
     console.print(f"[bold]Prompt:[/] {prompt}")
     console.print(f"[bold]URL:[/] {url}")
     if schema:
         console.print(f"[bold]Schema:[/] {schema}")
-    
+
     try:
         # Initialize Skyvern client
         load_dotenv()
@@ -451,46 +451,45 @@ def create_task(
             base_url=settings.SKYVERN_BASE_URL,
             api_key=settings.SKYVERN_API_KEY,
         )
-        
+
         # Create and run task
-        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
+        with Progress(
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console
+        ) as progress:
             task = progress.add_task("[green]Running task...", total=1)
-            
-            result = asyncio.run(skyvern_agent.run_task(
-                prompt=prompt,
-                url=url,
-                data_extraction_schema=schema,
-                user_agent="skyvern-cli"
-            ))
-            
+
+            result = asyncio.run(
+                skyvern_agent.run_task(prompt=prompt, url=url, data_extraction_schema=schema, user_agent="skyvern-cli")
+            )
+
             progress.update(task, completed=1)
-        
+
         # Display result
         if output_json:
             console.print_json(json.dumps(result.model_dump()))
         else:
             console.print("\n[bold green]Task completed successfully![/]")
             console.print(f"\n[bold]Output:[/] {result.model_dump()['output']}")
-            
+
             # Display path to view results
             base_url = settings.SKYVERN_BASE_URL
-            run_history_url = "https://app.skyvern.com/history" if "skyvern.com" in base_url else "http://localhost:8080/history"
+            run_history_url = (
+                "https://app.skyvern.com/history" if "skyvern.com" in base_url else "http://localhost:8080/history"
+            )
             console.print(f"\nView details at: [link={run_history_url}]{run_history_url}[/link]")
-    
+
     except Exception as e:
         console.print(f"[bold red]Error creating task:[/] {str(e)}")
         console.print("[yellow]Make sure your API key is set correctly in .env[/]")
+
 
 @workflows_app.command(name="list")
 def list_workflows() -> None:
     """
     List Skyvern workflows.
     """
-    console.print(Panel.fit(
-        "[bold blue]Skyvern Workflows[/]",
-        subtitle="Retrieving available workflows"
-    ))
-    
+    console.print(Panel.fit("[bold blue]Skyvern Workflows[/]", subtitle="Retrieving available workflows"))
+
     try:
         # Initialize Skyvern client
         load_dotenv()
@@ -498,51 +497,57 @@ def list_workflows() -> None:
             base_url=settings.SKYVERN_BASE_URL,
             api_key=settings.SKYVERN_API_KEY,
         )
-        
+
         # Get workflows
-        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
+        with Progress(
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console
+        ) as progress:
             task = progress.add_task("[green]Fetching workflows...", total=1)
             workflows = asyncio.run(skyvern_agent.get_workflows())
             progress.update(task, completed=1)
-        
+
         if not workflows:
             console.print("[yellow]No workflows found[/]")
             return
-        
+
         # Display workflows
         table = Table(title=f"Workflows ({len(workflows)} found)")
         table.add_column("ID", style="cyan", no_wrap=True)
         table.add_column("Title", style="green")
         table.add_column("Status", style="yellow")
         table.add_column("Created", style="blue")
-        
+
         for workflow in workflows:
             table.add_row(
                 str(workflow.id),
                 workflow.title or "Untitled",
                 workflow.status or "Unknown",
-                workflow.created_at.strftime("%Y-%m-%d %H:%M:%S") if hasattr(workflow, 'created_at') and workflow.created_at else "Unknown"
+                workflow.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                if hasattr(workflow, "created_at") and workflow.created_at
+                else "Unknown",
             )
-        
+
         console.print(table)
-        
+
         # Show help for next steps
         console.print("\n[bold]Next steps:[/]")
         console.print("• View workflow details:    [yellow]skyvern workflows show <workflow_id>[/]")
         console.print("• Run a workflow:           [yellow]skyvern workflows run <workflow_id>[/]")
-    
+
     except Exception as e:
         console.print(f"[bold red]Error listing workflows:[/] {str(e)}")
         console.print("[yellow]Make sure your API key is set correctly in .env[/]")
 
-#----------------------------------------------------
+
+# ----------------------------------------------------
 # 5. Streamlined Configuration (Original functions enhanced)
-#----------------------------------------------------
+# ----------------------------------------------------
+
 
 def setup_postgresql(no_postgres: bool = False) -> None:
     """Set up PostgreSQL database for Skyvern with improved feedback."""
     console.print(Markdown("## Database Setup"))
-    
+
     if command_exists("psql") and is_postgres_running():
         console.print("[green]✓[/] PostgreSQL is already running locally")
         if database_exists("skyvern", "skyvern"):
@@ -569,10 +574,9 @@ def setup_postgresql(no_postgres: bool = False) -> None:
         if not no_postgres:
             console.print("[yellow]![/] No local Postgres detected")
             start_postgres = typer.confirm(
-                "Start a disposable container now? (Choose 'n' if using Docker Compose)",
-                default=True
+                "Start a disposable container now? (Choose 'n' if using Docker Compose)", default=True
             )
-            
+
             if not start_postgres:
                 console.print("[yellow]![/] Skipping PostgreSQL container setup")
                 console.print("   If using Docker Compose, its Postgres service will start automatically")
@@ -613,24 +617,31 @@ def setup_llm_providers() -> None:
     """Configure Large Language Model (LLM) Providers with improved UI."""
     console.print(Markdown("## LLM Provider Configuration"))
     console.print("All information provided here will be stored only on your local machine.\n")
-    
+
     model_options = []
-    
+
     # Create sections for each provider
-    providers = [
+    providers: list[dict[str, Any]] = [
         {
             "name": "OpenAI",
             "env_key": "ENABLE_OPENAI",
             "api_key_env": "OPENAI_API_KEY",
-            "models": ["OPENAI_GPT4_1", "OPENAI_GPT4_1_MINI", "OPENAI_GPT4_1_NANO", "OPENAI_GPT4O", "OPENAI_O4_MINI", "OPENAI_O3"],
-            "setup_message": "To enable OpenAI, you need an API key from your OpenAI account."
+            "models": [
+                "OPENAI_GPT4_1",
+                "OPENAI_GPT4_1_MINI",
+                "OPENAI_GPT4_1_NANO",
+                "OPENAI_GPT4O",
+                "OPENAI_O4_MINI",
+                "OPENAI_O3",
+            ],
+            "setup_message": "To enable OpenAI, you need an API key from your OpenAI account.",
         },
         {
             "name": "Anthropic",
             "env_key": "ENABLE_ANTHROPIC",
             "api_key_env": "ANTHROPIC_API_KEY",
             "models": ["ANTHROPIC_CLAUDE3.5_SONNET", "ANTHROPIC_CLAUDE3.7_SONNET"],
-            "setup_message": "To enable Anthropic, you need an API key from your Anthropic account."
+            "setup_message": "To enable Anthropic, you need an API key from your Anthropic account.",
         },
         {
             "name": "Azure OpenAI",
@@ -641,27 +652,39 @@ def setup_llm_providers() -> None:
             "extra_fields": {
                 "AZURE_DEPLOYMENT": "Enter your Azure deployment name",
                 "AZURE_API_BASE": "Enter your Azure API base URL",
-                "AZURE_API_VERSION": "Enter your Azure API version"
-            }
+                "AZURE_API_VERSION": "Enter your Azure API version",
+            },
         },
         {
             "name": "Google Gemini",
             "env_key": "ENABLE_GEMINI",
             "api_key_env": "GEMINI_API_KEY",
-            "models": ["GEMINI_FLASH_2_0", "GEMINI_FLASH_2_0_LITE", "GEMINI_2.5_PRO_PREVIEW_03_25", "GEMINI_2.5_PRO_EXP_03_25"],
-            "setup_message": "To enable Gemini, you need an API key from Google AI Studio."
+            "models": [
+                "GEMINI_FLASH_2_0",
+                "GEMINI_FLASH_2_0_LITE",
+                "GEMINI_2.5_PRO_PREVIEW_03_25",
+                "GEMINI_2.5_PRO_EXP_03_25",
+            ],
+            "setup_message": "To enable Gemini, you need an API key from Google AI Studio.",
         },
         {
             "name": "Novita AI",
             "env_key": "ENABLE_NOVITA",
             "api_key_env": "NOVITA_API_KEY",
             "models": [
-                "NOVITA_DEEPSEEK_R1", "NOVITA_DEEPSEEK_V3", "NOVITA_LLAMA_3_3_70B", 
-                "NOVITA_LLAMA_3_2_1B", "NOVITA_LLAMA_3_2_3B", "NOVITA_LLAMA_3_2_11B_VISION",
-                "NOVITA_LLAMA_3_1_8B", "NOVITA_LLAMA_3_1_70B", "NOVITA_LLAMA_3_1_405B",
-                "NOVITA_LLAMA_3_8B", "NOVITA_LLAMA_3_70B"
+                "NOVITA_DEEPSEEK_R1",
+                "NOVITA_DEEPSEEK_V3",
+                "NOVITA_LLAMA_3_3_70B",
+                "NOVITA_LLAMA_3_2_1B",
+                "NOVITA_LLAMA_3_2_3B",
+                "NOVITA_LLAMA_3_2_11B_VISION",
+                "NOVITA_LLAMA_3_1_8B",
+                "NOVITA_LLAMA_3_1_70B",
+                "NOVITA_LLAMA_3_1_405B",
+                "NOVITA_LLAMA_3_8B",
+                "NOVITA_LLAMA_3_70B",
             ],
-            "setup_message": "To enable Novita AI, you need an API key from Novita."
+            "setup_message": "To enable Novita AI, you need an API key from Novita.",
         },
         {
             "name": "OpenAI-compatible",
@@ -671,30 +694,28 @@ def setup_llm_providers() -> None:
             "extra_fields": {
                 "OPENAI_COMPATIBLE_MODEL_NAME": "Enter the model name (e.g., 'yi-34b', 'mistral-large')",
                 "OPENAI_COMPATIBLE_API_KEY": "Enter your API key",
-                "OPENAI_COMPATIBLE_API_BASE": "Enter the API base URL (e.g., 'https://api.together.xyz/v1')"
+                "OPENAI_COMPATIBLE_API_BASE": "Enter the API base URL (e.g., 'https://api.together.xyz/v1')",
             },
             "extra_questions": [
                 {
                     "question": "Does this model support vision?",
-                    "env_key": "OPENAI_COMPATIBLE_SUPPORTS_VISION", 
+                    "env_key": "OPENAI_COMPATIBLE_SUPPORTS_VISION",
                     "value_if_yes": "true",
-                    "value_if_no": "false"
+                    "value_if_no": "false",
                 }
             ],
-            "optional_fields": {
-                "OPENAI_COMPATIBLE_API_VERSION": "Enter API version (optional, press enter to skip)"
-            }
-        }
+            "optional_fields": {"OPENAI_COMPATIBLE_API_VERSION": "Enter API version (optional, press enter to skip)"},
+        },
     ]
-    
+
     # Process each provider
     for provider in providers:
         console.print(f"\n[bold yellow]{provider['name']}[/]")
         console.print(provider["setup_message"])
-        
+
         enable = typer.confirm(f"Enable {provider['name']}?", default=False)
         update_or_add_env_var(provider["env_key"], "true" if enable else "false")
-        
+
         if enable:
             # Handle API key (most providers)
             if "api_key_env" in provider:
@@ -705,7 +726,7 @@ def setup_llm_providers() -> None:
                     update_or_add_env_var(provider["env_key"], "false")
                     continue
                 update_or_add_env_var(provider["api_key_env"], api_key)
-            
+
             # Handle extra fields (Azure, OpenAI-compatible)
             if "extra_fields" in provider:
                 field_values = {}
@@ -713,28 +734,28 @@ def setup_llm_providers() -> None:
                     value = typer.prompt(prompt_text)
                     field_values[env_key] = value
                     update_or_add_env_var(env_key, value)
-                
+
                 # Check if all required fields are provided
                 if any(not v for v in field_values.values()):
                     console.print(f"[bold red]Error:[/] All {provider['name']} fields must be populated.")
                     console.print(f"{provider['name']} will not be enabled.")
                     update_or_add_env_var(provider["env_key"], "false")
                     continue
-            
+
             # Handle extra yes/no questions
             if "extra_questions" in provider:
                 for question in provider["extra_questions"]:
                     answer = typer.confirm(question["question"], default=False)
                     value = question["value_if_yes"] if answer else question["value_if_no"]
                     update_or_add_env_var(question["env_key"], value)
-            
+
             # Handle optional fields
             if "optional_fields" in provider:
                 for env_key, prompt_text in provider["optional_fields"].items():
                     value = typer.prompt(prompt_text, default="")
                     if value:
                         update_or_add_env_var(env_key, value)
-            
+
             # Add models to options
             model_options.extend(provider["models"])
             console.print(f"[green]✓[/] {provider['name']} configured successfully")
@@ -751,10 +772,7 @@ def setup_llm_providers() -> None:
 
         while True:
             try:
-                model_choice = typer.prompt(
-                    f"Choose a model by number (1-{len(model_options)})",
-                    type=int
-                )
+                model_choice = typer.prompt(f"Choose a model by number (1-{len(model_options)})", type=int)
                 if 1 <= model_choice <= len(model_options):
                     break
                 console.print(f"[red]Please enter a number between 1 and {len(model_options)}[/]")
@@ -771,11 +789,19 @@ def setup_llm_providers() -> None:
 def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
     """Configure browser settings for Skyvern with improved UI."""
     console.print(Markdown("## Browser Configuration"))
-    
+
     browser_types = [
-        {"id": "chromium-headless", "name": "Headless Chrome", "description": "Runs Chrome in the background (no visible window)"},
+        {
+            "id": "chromium-headless",
+            "name": "Headless Chrome",
+            "description": "Runs Chrome in the background (no visible window)",
+        },
         {"id": "chromium-headful", "name": "Visible Chrome", "description": "Runs Chrome with a visible window"},
-        {"id": "cdp-connect", "name": "Connect to Chrome", "description": "Connects to an existing Chrome instance with remote debugging"}
+        {
+            "id": "cdp-connect",
+            "name": "Connect to Chrome",
+            "description": "Connects to an existing Chrome instance with remote debugging",
+        },
     ]
 
     console.print("Select browser mode:")
@@ -800,30 +826,30 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
     if selected_browser == "cdp-connect":
         host_system = detect_os()
         default_location = get_default_chrome_location(host_system)
-        
+
         console.print(f"\n[yellow]Default Chrome location:[/] {default_location}")
         browser_location = typer.prompt("Enter Chrome executable location", default=default_location)
-        
+
         if not os.path.exists(browser_location):
             console.print(f"[bold yellow]Warning:[/] Chrome not found at {browser_location}")
             console.print("Please verify the location is correct")
             if not typer.confirm("Continue with this path anyway?", default=False):
                 return setup_browser_config()  # Start over
-        
+
         console.print("\n[bold]Chrome Remote Debugging Setup:[/]")
         console.print("Chrome must be running with remote debugging enabled.")
-        console.print(f"Example command: [italic]chrome --remote-debugging-port=9222[/]")
-        
+        console.print("Example command: [italic]chrome --remote-debugging-port=9222[/]")
+
         default_port = "9222"
         remote_debugging_url = f"http://localhost:{default_port}"
-        
+
         # Check if Chrome is already running with remote debugging
         parsed_url = urlparse(remote_debugging_url)
         version_url = f"{parsed_url.scheme}://{parsed_url.netloc}/json/version"
-        
+
         console.print(f"\n[yellow]Checking for Chrome on port {default_port}...[/]")
         chrome_running = False
-        
+
         try:
             response = requests.get(version_url, timeout=2)
             if response.status_code == 200:
@@ -839,7 +865,7 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
                     console.print("[red]Port is in use, but doesn't appear to be Chrome[/]")
         except requests.RequestException:
             console.print(f"[yellow]No Chrome instance detected on {remote_debugging_url}[/]")
-        
+
         # If Chrome isn't running, offer to start it
         if not chrome_running:
             if host_system == "darwin" or host_system == "linux":
@@ -849,10 +875,10 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
             else:
                 console.print("[red]Unsupported OS for Chrome configuration[/]")
                 chrome_cmd = ""
-            
+
             if chrome_cmd:
                 console.print(f"\nCommand to start Chrome: [yellow]{chrome_cmd}[/]")
-                
+
                 if typer.confirm("Start Chrome with remote debugging now?", default=True):
                     console.print(f"[yellow]Starting Chrome with remote debugging on port {default_port}...[/]")
                     try:
@@ -862,35 +888,43 @@ def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
                             subprocess.Popen(f"start {chrome_cmd}", shell=True)
                         elif host_system == "wsl":
                             subprocess.Popen(f"cmd.exe /c start {chrome_cmd}", shell=True)
-                        
+
                         console.print("Chrome starting...")
                         console.print(f"Connecting to {remote_debugging_url}")
-                        
+
                         # Wait for Chrome to start and verify connection
-                        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
+                        with Progress(
+                            SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console
+                        ) as progress:
                             wait_task = progress.add_task("[green]Waiting for Chrome to initialize...", total=1)
                             time.sleep(2)
                             progress.update(wait_task, completed=1)
-                        
+
                         try:
                             verification_response = requests.get(version_url, timeout=5)
                             if verification_response.status_code == 200:
                                 try:
                                     browser_info = verification_response.json()
-                                    console.print("[green]✓[/] Connection verified! Chrome is running with remote debugging")
+                                    console.print(
+                                        "[green]✓[/] Connection verified! Chrome is running with remote debugging"
+                                    )
                                     if "Browser" in browser_info:
                                         console.print(f"   Browser: {browser_info['Browser']}")
                                 except json.JSONDecodeError:
-                                    console.print("[yellow]Warning:[/] Response from Chrome debugging port is not valid JSON")
+                                    console.print(
+                                        "[yellow]Warning:[/] Response from Chrome debugging port is not valid JSON"
+                                    )
                             else:
-                                console.print(f"[yellow]Warning:[/] Chrome responded with status code {verification_response.status_code}")
+                                console.print(
+                                    f"[yellow]Warning:[/] Chrome responded with status code {verification_response.status_code}"
+                                )
                         except requests.RequestException as e:
                             console.print(f"[yellow]Warning:[/] Could not verify Chrome is running: {e}")
                             console.print("You may need to check Chrome manually or try a different port")
                     except Exception as e:
                         console.print(f"[red]Error starting Chrome:[/] {e}")
                         console.print("Please start Chrome manually using the command above")
-        
+
         # Get the debugging URL
         custom_url = typer.prompt("Enter remote debugging URL", default=remote_debugging_url)
         if custom_url:
@@ -995,7 +1029,7 @@ def update_or_add_env_var(key: str, value: str) -> None:
     # Load environment to get current values
     load_dotenv(env_path)
     current_value = os.getenv(key)
-    
+
     # Only update if value is different
     if current_value != value:
         set_key(env_path, key, value)
@@ -1046,36 +1080,38 @@ def setup_mcp() -> None:
             "name": "Claude Desktop",
             "check_fn": lambda: is_claude_desktop_installed(host_system),
             "setup_fn": lambda: setup_claude_desktop_config(host_system, path_to_env),
-            "not_installed_msg": "Claude Desktop is not installed. Please install it first."
+            "not_installed_msg": "Claude Desktop is not installed. Please install it first.",
         },
         {
             "name": "Cursor Editor",
             "check_fn": lambda: is_cursor_installed(host_system),
             "setup_fn": lambda: setup_cursor_config(host_system, path_to_env),
-            "not_installed_msg": "Cursor Editor is not installed. Please install it first."
+            "not_installed_msg": "Cursor Editor is not installed. Please install it first.",
         },
         {
             "name": "Windsurf",
             "check_fn": lambda: is_windsurf_installed(host_system),
             "setup_fn": lambda: setup_windsurf_config(host_system, path_to_env),
-            "not_installed_msg": "Windsurf is not installed. Please install it first."
-        }
+            "not_installed_msg": "Windsurf is not installed. Please install it first.",
+        },
     ]
 
     # Set up each integration
     for integration in integrations:
         console.print(f"\n[bold]Setting up {integration['name']}[/]")
-        
+
         # Check if installed
-        if not integration["check_fn"]():
+        check_fn = cast(Callable[[], bool], integration["check_fn"])
+        if not check_fn():
             console.print(f"[yellow]![/] {integration['not_installed_msg']}")
             console.print(f"Skipping {integration['name']} integration setup.")
             continue
-        
+
         # Ask user if they want to set up this integration
         if typer.confirm(f"Configure {integration['name']} integration?", default=True):
             # Set up the integration
-            if integration["setup_fn"]():
+            setup_fn = cast(Callable[[], bool], integration["setup_fn"])
+            if setup_fn():
                 console.print(f"[green]✓[/] {integration['name']} integration configured successfully")
             else:
                 console.print(f"[red]×[/] Error configuring {integration['name']} integration")
@@ -1097,32 +1133,28 @@ def setup_mcp_config() -> str:
     if not python_paths:
         console.print("[yellow]![/] Could not find Python 3.11 installation")
         path_to_env = typer.prompt(
-            "Enter the full path to your Python 3.11 environment",
-            default="/opt/homebrew/bin/python3.11"
+            "Enter the full path to your Python 3.11 environment", default="/opt/homebrew/bin/python3.11"
         )
     else:
         # Show found Python installations
         console.print("[green]✓[/] Found Python installations:")
         for i, (cmd, path) in enumerate(python_paths, 1):
             console.print(f"  {i}. {cmd}: {path}")
-        
+
         # Use the first one as default
         _, default_path = python_paths[0]
         path_to_env = default_path
-        
+
         if len(python_paths) > 1:
             # Let user choose if multiple were found
-            choice = typer.prompt(
-                "Which Python installation do you want to use? (Enter number)",
-                default="1"
-            )
+            choice = typer.prompt("Which Python installation do you want to use? (Enter number)", default="1")
             try:
                 index = int(choice) - 1
                 if 0 <= index < len(python_paths):
                     _, path_to_env = python_paths[index]
             except ValueError:
                 console.print(f"[yellow]![/] Invalid choice, using default: {path_to_env}")
-    
+
     return path_to_env
 
 
@@ -1166,7 +1198,7 @@ def setup_claude_desktop_config(host_system: str, path_to_env: str) -> bool:
     try:
         path_claude_config = get_claude_config_path(host_system)
         os.makedirs(os.path.dirname(path_claude_config), exist_ok=True)
-        
+
         if not os.path.exists(path_claude_config):
             with open(path_claude_config, "w") as f:
                 json.dump({"mcpServers": {}}, f, indent=2)
@@ -1210,3 +1242,19 @@ def is_cursor_installed(host_system: str) -> bool:
         return False
 
 
+def setup_cursor_config(host_system: str, path_to_env: str) -> bool:
+    """Placeholder setup for Cursor integration."""
+    console.print("[yellow]![/] Cursor integration setup is not implemented yet")
+    return False
+
+
+def is_windsurf_installed(host_system: str) -> bool:
+    """Check if Windsurf is installed."""
+    # TODO: Implement actual detection logic
+    return False
+
+
+def setup_windsurf_config(host_system: str, path_to_env: str) -> bool:
+    """Placeholder setup for Windsurf integration."""
+    console.print("[yellow]![/] Windsurf integration setup is not implemented yet")
+    return False
