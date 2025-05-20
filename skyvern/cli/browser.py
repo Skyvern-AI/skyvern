@@ -72,7 +72,7 @@ def setup_browser_config() -> tuple[str, str | None, str | None]:
         default_port = "9222"
         if remote_debugging_url is None:
             remote_debugging_url = "http://localhost:9222"
-        elif ":" in remote_debugging_url.split("/")[-1]:
+        elif urlparse(remote_debugging_url).port is not None:
             default_port = remote_debugging_url.split(":")[-1].split("/")[0]
 
         parsed_url = urlparse(remote_debugging_url)
