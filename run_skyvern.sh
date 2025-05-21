@@ -1,6 +1,9 @@
 #!/bin/bash
 
-kill $(lsof -t -i :8000)
+pid=$(lsof -t -i :8000)
+if [ ! -z "$pid" ]; then
+  kill $pid
+fi
 
 if [ ! -f .env ]; then
   cp .env.example .env
