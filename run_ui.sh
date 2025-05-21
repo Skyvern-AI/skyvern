@@ -1,6 +1,9 @@
 #!/bin/bash
 
-kill $(lsof -t -i :8080)
+pid=$(lsof -t -i :8080)
+if [ ! -z "$pid" ]; then
+  kill $pid
+fi
 
 cd skyvern-frontend
 
