@@ -14,17 +14,12 @@ command_exists() {
 
 ensure_required_commands() {
     # Ensure required commands are available
-    for cmd in poetry npm docker; do
+    for cmd in poetry npm; do
         if ! command_exists "$cmd"; then
             echo "Error: $cmd is not installed." >&2
             exit 1
         fi
     done
-    # Check docker if running
-    if ! docker info > /dev/null 2>&1; then
-        echo "Docker is not running. Please start Docker and try again."
-        exit 1
-    fi
 }
 
 # Function to update or add environment variable in .env file
