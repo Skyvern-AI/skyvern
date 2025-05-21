@@ -514,7 +514,7 @@ async def create_workflow(
             "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
             "required": True,
         },
-        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "update_workflow",
         "x-fern-examples": [{"code-samples": [{"sdk": "curl", "code": UPDATE_WORKFLOW_CODE_SAMPLE}]}],
     },
