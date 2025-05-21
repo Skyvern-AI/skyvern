@@ -300,6 +300,10 @@ class BaseRunResponse(BaseModel):
     )
     downloaded_files: list[FileInfo] | None = Field(default=None, description="List of files downloaded during the run")
     recording_url: str | None = Field(default=None, description="URL to the recording of the run")
+    screenshot_urls: list[str] | None = Field(
+        default=None,
+        description="List of last n screenshot URLs in reverse chronological order - the first one the list is the latest screenshot.",
+    )
     failure_reason: str | None = Field(default=None, description="Reason for failure if the run failed or terminated")
     created_at: datetime = Field(description="Timestamp when this run was created", examples=["2025-01-01T00:00:00Z"])
     modified_at: datetime = Field(
