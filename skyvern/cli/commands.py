@@ -1,3 +1,4 @@
+import sys
 import asyncio
 import json
 import os
@@ -25,6 +26,10 @@ from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.library import Skyvern
 from skyvern.utils import detect_os, get_windows_appdata_roaming, migrate_db
+
+# Configure async for Windows
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # Initialize Rich console for better formatting
 console = Console()
