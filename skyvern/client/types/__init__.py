@@ -13,10 +13,15 @@ from .action_block_parameters_item import (
     ActionBlockParametersItem_Output,
     ActionBlockParametersItem_Workflow,
 )
+from .action_block_yaml import ActionBlockYaml
 from .aws_secret_parameter import AwsSecretParameter
+from .aws_secret_parameter_yaml import AwsSecretParameterYaml
 from .bitwarden_credit_card_data_parameter import BitwardenCreditCardDataParameter
+from .bitwarden_credit_card_data_parameter_yaml import BitwardenCreditCardDataParameterYaml
 from .bitwarden_login_credential_parameter import BitwardenLoginCredentialParameter
+from .bitwarden_login_credential_parameter_yaml import BitwardenLoginCredentialParameterYaml
 from .bitwarden_sensitive_information_parameter import BitwardenSensitiveInformationParameter
+from .bitwarden_sensitive_information_parameter_yaml import BitwardenSensitiveInformationParameterYaml
 from .browser_session_response import BrowserSessionResponse
 from .code_block import CodeBlock
 from .code_block_parameters_item import (
@@ -30,6 +35,7 @@ from .code_block_parameters_item import (
     CodeBlockParametersItem_Output,
     CodeBlockParametersItem_Workflow,
 )
+from .code_block_yaml import CodeBlockYaml
 from .context_parameter import ContextParameter
 from .context_parameter_source import (
     ContextParameterSource,
@@ -43,12 +49,15 @@ from .context_parameter_source import (
     ContextParameterSource_Workflow,
 )
 from .context_parameter_value import ContextParameterValue
+from .context_parameter_yaml import ContextParameterYaml
 from .credential_parameter import CredentialParameter
+from .credential_parameter_yaml import CredentialParameterYaml
 from .credential_response import CredentialResponse
 from .credential_response_credential import CredentialResponseCredential
 from .credential_type import CredentialType
 from .credit_card_credential_response import CreditCardCredentialResponse
 from .download_to_s3block import DownloadToS3Block
+from .download_to_s3block_yaml import DownloadToS3BlockYaml
 from .extraction_block import ExtractionBlock
 from .extraction_block_data_schema import ExtractionBlockDataSchema
 from .extraction_block_parameters_item import (
@@ -62,6 +71,8 @@ from .extraction_block_parameters_item import (
     ExtractionBlockParametersItem_Output,
     ExtractionBlockParametersItem_Workflow,
 )
+from .extraction_block_yaml import ExtractionBlockYaml
+from .extraction_block_yaml_data_schema import ExtractionBlockYamlDataSchema
 from .file_download_block import FileDownloadBlock
 from .file_download_block_data_schema import FileDownloadBlockDataSchema
 from .file_download_block_parameters_item import (
@@ -75,11 +86,14 @@ from .file_download_block_parameters_item import (
     FileDownloadBlockParametersItem_Output,
     FileDownloadBlockParametersItem_Workflow,
 )
+from .file_download_block_yaml import FileDownloadBlockYaml
 from .file_info import FileInfo
 from .file_parser_block import FileParserBlock
+from .file_parser_block_yaml import FileParserBlockYaml
 from .file_storage_type import FileStorageType
 from .file_type import FileType
 from .file_upload_block import FileUploadBlock
+from .file_upload_block_yaml import FileUploadBlockYaml
 from .for_loop_block import ForLoopBlock
 from .for_loop_block_loop_blocks_item import (
     ForLoopBlockLoopBlocksItem,
@@ -114,6 +128,29 @@ from .for_loop_block_loop_over import (
     ForLoopBlockLoopOver_Output,
     ForLoopBlockLoopOver_Workflow,
 )
+from .for_loop_block_yaml import ForLoopBlockYaml
+from .for_loop_block_yaml_loop_blocks_item import (
+    ForLoopBlockYamlLoopBlocksItem,
+    ForLoopBlockYamlLoopBlocksItem_Action,
+    ForLoopBlockYamlLoopBlocksItem_Code,
+    ForLoopBlockYamlLoopBlocksItem_DownloadToS3,
+    ForLoopBlockYamlLoopBlocksItem_Extraction,
+    ForLoopBlockYamlLoopBlocksItem_FileDownload,
+    ForLoopBlockYamlLoopBlocksItem_FileUpload,
+    ForLoopBlockYamlLoopBlocksItem_FileUrlParser,
+    ForLoopBlockYamlLoopBlocksItem_ForLoop,
+    ForLoopBlockYamlLoopBlocksItem_GotoUrl,
+    ForLoopBlockYamlLoopBlocksItem_Login,
+    ForLoopBlockYamlLoopBlocksItem_Navigation,
+    ForLoopBlockYamlLoopBlocksItem_PdfParser,
+    ForLoopBlockYamlLoopBlocksItem_SendEmail,
+    ForLoopBlockYamlLoopBlocksItem_Task,
+    ForLoopBlockYamlLoopBlocksItem_TaskV2,
+    ForLoopBlockYamlLoopBlocksItem_TextPrompt,
+    ForLoopBlockYamlLoopBlocksItem_UploadToS3,
+    ForLoopBlockYamlLoopBlocksItem_Validation,
+    ForLoopBlockYamlLoopBlocksItem_Wait,
+)
 from .http_validation_error import HttpValidationError
 from .login_block import LoginBlock
 from .login_block_data_schema import LoginBlockDataSchema
@@ -128,6 +165,7 @@ from .login_block_parameters_item import (
     LoginBlockParametersItem_Output,
     LoginBlockParametersItem_Workflow,
 )
+from .login_block_yaml import LoginBlockYaml
 from .navigation_block import NavigationBlock
 from .navigation_block_data_schema import NavigationBlockDataSchema
 from .navigation_block_parameters_item import (
@@ -141,15 +179,19 @@ from .navigation_block_parameters_item import (
     NavigationBlockParametersItem_Output,
     NavigationBlockParametersItem_Workflow,
 )
+from .navigation_block_yaml import NavigationBlockYaml
 from .non_empty_credit_card_credential import NonEmptyCreditCardCredential
 from .non_empty_password_credential import NonEmptyPasswordCredential
 from .output_parameter import OutputParameter
+from .output_parameter_yaml import OutputParameterYaml
 from .password_credential_response import PasswordCredentialResponse
 from .pdf_parser_block import PdfParserBlock
+from .pdf_parser_block_yaml import PdfParserBlockYaml
 from .proxy_location import ProxyLocation
 from .run_engine import RunEngine
 from .run_status import RunStatus
 from .send_email_block import SendEmailBlock
+from .send_email_block_yaml import SendEmailBlockYaml
 from .task_block import TaskBlock
 from .task_block_data_schema import TaskBlockDataSchema
 from .task_block_parameters_item import (
@@ -163,11 +205,14 @@ from .task_block_parameters_item import (
     TaskBlockParametersItem_Output,
     TaskBlockParametersItem_Workflow,
 )
+from .task_block_yaml import TaskBlockYaml
+from .task_block_yaml_data_schema import TaskBlockYamlDataSchema
 from .task_run_request import TaskRunRequest
 from .task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
 from .task_run_response import TaskRunResponse
 from .task_run_response_output import TaskRunResponseOutput
 from .task_v2block import TaskV2Block
+from .task_v2block_yaml import TaskV2BlockYaml
 from .text_prompt_block import TextPromptBlock
 from .text_prompt_block_parameters_item import (
     TextPromptBlockParametersItem,
@@ -180,8 +225,10 @@ from .text_prompt_block_parameters_item import (
     TextPromptBlockParametersItem_Output,
     TextPromptBlockParametersItem_Workflow,
 )
+from .text_prompt_block_yaml import TextPromptBlockYaml
 from .totp_code import TotpCode
 from .upload_to_s3block import UploadToS3Block
+from .upload_to_s3block_yaml import UploadToS3BlockYaml
 from .url_block import UrlBlock
 from .url_block_data_schema import UrlBlockDataSchema
 from .url_block_parameters_item import (
@@ -195,6 +242,7 @@ from .url_block_parameters_item import (
     UrlBlockParametersItem_Output,
     UrlBlockParametersItem_Workflow,
 )
+from .url_block_yaml import UrlBlockYaml
 from .validation_block import ValidationBlock
 from .validation_block_data_schema import ValidationBlockDataSchema
 from .validation_block_parameters_item import (
@@ -208,6 +256,7 @@ from .validation_block_parameters_item import (
     ValidationBlockParametersItem_Output,
     ValidationBlockParametersItem_Workflow,
 )
+from .validation_block_yaml import ValidationBlockYaml
 from .validation_error import ValidationError
 from .validation_error_loc_item import ValidationErrorLocItem
 from .wait_block import WaitBlock
@@ -222,7 +271,9 @@ from .wait_block_parameters_item import (
     WaitBlockParametersItem_Output,
     WaitBlockParametersItem_Workflow,
 )
+from .wait_block_yaml import WaitBlockYaml
 from .workflow import Workflow
+from .workflow_create_yaml_request import WorkflowCreateYamlRequest
 from .workflow_definition import WorkflowDefinition
 from .workflow_definition_blocks_item import (
     WorkflowDefinitionBlocksItem,
@@ -257,9 +308,46 @@ from .workflow_definition_parameters_item import (
     WorkflowDefinitionParametersItem_Output,
     WorkflowDefinitionParametersItem_Workflow,
 )
+from .workflow_definition_yaml import WorkflowDefinitionYaml
+from .workflow_definition_yaml_blocks_item import (
+    WorkflowDefinitionYamlBlocksItem,
+    WorkflowDefinitionYamlBlocksItem_Action,
+    WorkflowDefinitionYamlBlocksItem_Code,
+    WorkflowDefinitionYamlBlocksItem_DownloadToS3,
+    WorkflowDefinitionYamlBlocksItem_Extraction,
+    WorkflowDefinitionYamlBlocksItem_FileDownload,
+    WorkflowDefinitionYamlBlocksItem_FileUpload,
+    WorkflowDefinitionYamlBlocksItem_FileUrlParser,
+    WorkflowDefinitionYamlBlocksItem_ForLoop,
+    WorkflowDefinitionYamlBlocksItem_GotoUrl,
+    WorkflowDefinitionYamlBlocksItem_Login,
+    WorkflowDefinitionYamlBlocksItem_Navigation,
+    WorkflowDefinitionYamlBlocksItem_PdfParser,
+    WorkflowDefinitionYamlBlocksItem_SendEmail,
+    WorkflowDefinitionYamlBlocksItem_Task,
+    WorkflowDefinitionYamlBlocksItem_TaskV2,
+    WorkflowDefinitionYamlBlocksItem_TextPrompt,
+    WorkflowDefinitionYamlBlocksItem_UploadToS3,
+    WorkflowDefinitionYamlBlocksItem_Validation,
+    WorkflowDefinitionYamlBlocksItem_Wait,
+)
+from .workflow_definition_yaml_parameters_item import (
+    WorkflowDefinitionYamlParametersItem,
+    WorkflowDefinitionYamlParametersItem_AwsSecret,
+    WorkflowDefinitionYamlParametersItem_BitwardenCreditCardData,
+    WorkflowDefinitionYamlParametersItem_BitwardenLoginCredential,
+    WorkflowDefinitionYamlParametersItem_BitwardenSensitiveInformation,
+    WorkflowDefinitionYamlParametersItem_Context,
+    WorkflowDefinitionYamlParametersItem_Credential,
+    WorkflowDefinitionYamlParametersItem_Output,
+    WorkflowDefinitionYamlParametersItem_Workflow,
+)
 from .workflow_parameter import WorkflowParameter
 from .workflow_parameter_default_value import WorkflowParameterDefaultValue
 from .workflow_parameter_type import WorkflowParameterType
+from .workflow_parameter_yaml import WorkflowParameterYaml
+from .workflow_parameter_yaml_default_value import WorkflowParameterYamlDefaultValue
+from .workflow_request import WorkflowRequest
 from .workflow_run_request import WorkflowRunRequest
 from .workflow_run_response import WorkflowRunResponse
 from .workflow_run_response_output import WorkflowRunResponseOutput
@@ -277,10 +365,15 @@ __all__ = [
     "ActionBlockParametersItem_Credential",
     "ActionBlockParametersItem_Output",
     "ActionBlockParametersItem_Workflow",
+    "ActionBlockYaml",
     "AwsSecretParameter",
+    "AwsSecretParameterYaml",
     "BitwardenCreditCardDataParameter",
+    "BitwardenCreditCardDataParameterYaml",
     "BitwardenLoginCredentialParameter",
+    "BitwardenLoginCredentialParameterYaml",
     "BitwardenSensitiveInformationParameter",
+    "BitwardenSensitiveInformationParameterYaml",
     "BrowserSessionResponse",
     "CodeBlock",
     "CodeBlockParametersItem",
@@ -292,6 +385,7 @@ __all__ = [
     "CodeBlockParametersItem_Credential",
     "CodeBlockParametersItem_Output",
     "CodeBlockParametersItem_Workflow",
+    "CodeBlockYaml",
     "ContextParameter",
     "ContextParameterSource",
     "ContextParameterSource_AwsSecret",
@@ -303,12 +397,15 @@ __all__ = [
     "ContextParameterSource_Output",
     "ContextParameterSource_Workflow",
     "ContextParameterValue",
+    "ContextParameterYaml",
     "CredentialParameter",
+    "CredentialParameterYaml",
     "CredentialResponse",
     "CredentialResponseCredential",
     "CredentialType",
     "CreditCardCredentialResponse",
     "DownloadToS3Block",
+    "DownloadToS3BlockYaml",
     "ExtractionBlock",
     "ExtractionBlockDataSchema",
     "ExtractionBlockParametersItem",
@@ -320,6 +417,8 @@ __all__ = [
     "ExtractionBlockParametersItem_Credential",
     "ExtractionBlockParametersItem_Output",
     "ExtractionBlockParametersItem_Workflow",
+    "ExtractionBlockYaml",
+    "ExtractionBlockYamlDataSchema",
     "FileDownloadBlock",
     "FileDownloadBlockDataSchema",
     "FileDownloadBlockParametersItem",
@@ -331,11 +430,14 @@ __all__ = [
     "FileDownloadBlockParametersItem_Credential",
     "FileDownloadBlockParametersItem_Output",
     "FileDownloadBlockParametersItem_Workflow",
+    "FileDownloadBlockYaml",
     "FileInfo",
     "FileParserBlock",
+    "FileParserBlockYaml",
     "FileStorageType",
     "FileType",
     "FileUploadBlock",
+    "FileUploadBlockYaml",
     "ForLoopBlock",
     "ForLoopBlockLoopBlocksItem",
     "ForLoopBlockLoopBlocksItem_Action",
@@ -366,6 +468,27 @@ __all__ = [
     "ForLoopBlockLoopOver_Credential",
     "ForLoopBlockLoopOver_Output",
     "ForLoopBlockLoopOver_Workflow",
+    "ForLoopBlockYaml",
+    "ForLoopBlockYamlLoopBlocksItem",
+    "ForLoopBlockYamlLoopBlocksItem_Action",
+    "ForLoopBlockYamlLoopBlocksItem_Code",
+    "ForLoopBlockYamlLoopBlocksItem_DownloadToS3",
+    "ForLoopBlockYamlLoopBlocksItem_Extraction",
+    "ForLoopBlockYamlLoopBlocksItem_FileDownload",
+    "ForLoopBlockYamlLoopBlocksItem_FileUpload",
+    "ForLoopBlockYamlLoopBlocksItem_FileUrlParser",
+    "ForLoopBlockYamlLoopBlocksItem_ForLoop",
+    "ForLoopBlockYamlLoopBlocksItem_GotoUrl",
+    "ForLoopBlockYamlLoopBlocksItem_Login",
+    "ForLoopBlockYamlLoopBlocksItem_Navigation",
+    "ForLoopBlockYamlLoopBlocksItem_PdfParser",
+    "ForLoopBlockYamlLoopBlocksItem_SendEmail",
+    "ForLoopBlockYamlLoopBlocksItem_Task",
+    "ForLoopBlockYamlLoopBlocksItem_TaskV2",
+    "ForLoopBlockYamlLoopBlocksItem_TextPrompt",
+    "ForLoopBlockYamlLoopBlocksItem_UploadToS3",
+    "ForLoopBlockYamlLoopBlocksItem_Validation",
+    "ForLoopBlockYamlLoopBlocksItem_Wait",
     "HttpValidationError",
     "LoginBlock",
     "LoginBlockDataSchema",
@@ -378,6 +501,7 @@ __all__ = [
     "LoginBlockParametersItem_Credential",
     "LoginBlockParametersItem_Output",
     "LoginBlockParametersItem_Workflow",
+    "LoginBlockYaml",
     "NavigationBlock",
     "NavigationBlockDataSchema",
     "NavigationBlockParametersItem",
@@ -389,15 +513,19 @@ __all__ = [
     "NavigationBlockParametersItem_Credential",
     "NavigationBlockParametersItem_Output",
     "NavigationBlockParametersItem_Workflow",
+    "NavigationBlockYaml",
     "NonEmptyCreditCardCredential",
     "NonEmptyPasswordCredential",
     "OutputParameter",
+    "OutputParameterYaml",
     "PasswordCredentialResponse",
     "PdfParserBlock",
+    "PdfParserBlockYaml",
     "ProxyLocation",
     "RunEngine",
     "RunStatus",
     "SendEmailBlock",
+    "SendEmailBlockYaml",
     "TaskBlock",
     "TaskBlockDataSchema",
     "TaskBlockParametersItem",
@@ -409,11 +537,14 @@ __all__ = [
     "TaskBlockParametersItem_Credential",
     "TaskBlockParametersItem_Output",
     "TaskBlockParametersItem_Workflow",
+    "TaskBlockYaml",
+    "TaskBlockYamlDataSchema",
     "TaskRunRequest",
     "TaskRunRequestDataExtractionSchema",
     "TaskRunResponse",
     "TaskRunResponseOutput",
     "TaskV2Block",
+    "TaskV2BlockYaml",
     "TextPromptBlock",
     "TextPromptBlockParametersItem",
     "TextPromptBlockParametersItem_AwsSecret",
@@ -424,8 +555,10 @@ __all__ = [
     "TextPromptBlockParametersItem_Credential",
     "TextPromptBlockParametersItem_Output",
     "TextPromptBlockParametersItem_Workflow",
+    "TextPromptBlockYaml",
     "TotpCode",
     "UploadToS3Block",
+    "UploadToS3BlockYaml",
     "UrlBlock",
     "UrlBlockDataSchema",
     "UrlBlockParametersItem",
@@ -437,6 +570,7 @@ __all__ = [
     "UrlBlockParametersItem_Credential",
     "UrlBlockParametersItem_Output",
     "UrlBlockParametersItem_Workflow",
+    "UrlBlockYaml",
     "ValidationBlock",
     "ValidationBlockDataSchema",
     "ValidationBlockParametersItem",
@@ -448,6 +582,7 @@ __all__ = [
     "ValidationBlockParametersItem_Credential",
     "ValidationBlockParametersItem_Output",
     "ValidationBlockParametersItem_Workflow",
+    "ValidationBlockYaml",
     "ValidationError",
     "ValidationErrorLocItem",
     "WaitBlock",
@@ -460,7 +595,9 @@ __all__ = [
     "WaitBlockParametersItem_Credential",
     "WaitBlockParametersItem_Output",
     "WaitBlockParametersItem_Workflow",
+    "WaitBlockYaml",
     "Workflow",
+    "WorkflowCreateYamlRequest",
     "WorkflowDefinition",
     "WorkflowDefinitionBlocksItem",
     "WorkflowDefinitionBlocksItem_Action",
@@ -491,9 +628,42 @@ __all__ = [
     "WorkflowDefinitionParametersItem_Credential",
     "WorkflowDefinitionParametersItem_Output",
     "WorkflowDefinitionParametersItem_Workflow",
+    "WorkflowDefinitionYaml",
+    "WorkflowDefinitionYamlBlocksItem",
+    "WorkflowDefinitionYamlBlocksItem_Action",
+    "WorkflowDefinitionYamlBlocksItem_Code",
+    "WorkflowDefinitionYamlBlocksItem_DownloadToS3",
+    "WorkflowDefinitionYamlBlocksItem_Extraction",
+    "WorkflowDefinitionYamlBlocksItem_FileDownload",
+    "WorkflowDefinitionYamlBlocksItem_FileUpload",
+    "WorkflowDefinitionYamlBlocksItem_FileUrlParser",
+    "WorkflowDefinitionYamlBlocksItem_ForLoop",
+    "WorkflowDefinitionYamlBlocksItem_GotoUrl",
+    "WorkflowDefinitionYamlBlocksItem_Login",
+    "WorkflowDefinitionYamlBlocksItem_Navigation",
+    "WorkflowDefinitionYamlBlocksItem_PdfParser",
+    "WorkflowDefinitionYamlBlocksItem_SendEmail",
+    "WorkflowDefinitionYamlBlocksItem_Task",
+    "WorkflowDefinitionYamlBlocksItem_TaskV2",
+    "WorkflowDefinitionYamlBlocksItem_TextPrompt",
+    "WorkflowDefinitionYamlBlocksItem_UploadToS3",
+    "WorkflowDefinitionYamlBlocksItem_Validation",
+    "WorkflowDefinitionYamlBlocksItem_Wait",
+    "WorkflowDefinitionYamlParametersItem",
+    "WorkflowDefinitionYamlParametersItem_AwsSecret",
+    "WorkflowDefinitionYamlParametersItem_BitwardenCreditCardData",
+    "WorkflowDefinitionYamlParametersItem_BitwardenLoginCredential",
+    "WorkflowDefinitionYamlParametersItem_BitwardenSensitiveInformation",
+    "WorkflowDefinitionYamlParametersItem_Context",
+    "WorkflowDefinitionYamlParametersItem_Credential",
+    "WorkflowDefinitionYamlParametersItem_Output",
+    "WorkflowDefinitionYamlParametersItem_Workflow",
     "WorkflowParameter",
     "WorkflowParameterDefaultValue",
     "WorkflowParameterType",
+    "WorkflowParameterYaml",
+    "WorkflowParameterYamlDefaultValue",
+    "WorkflowRequest",
     "WorkflowRunRequest",
     "WorkflowRunResponse",
     "WorkflowRunResponseOutput",
