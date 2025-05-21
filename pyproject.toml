@@ -18,12 +18,12 @@ jinja2 = "^3.1.2"
 uvicorn = {extras = ["standard"], version = "^0.24.0.post1"}
 litellm = ">=1.68.2"
 playwright = [
-    {version = ">=1.52.0", python = ">=3.13,<3.14"},  # Python 3.13 requires 1.52.0+
-    {version = ">=1.46.0", python = ">=3.11,<3.13"}   # Older Python versions can use 1.46.0+
+    {version = ">1.46.0", python = ">=3.12,<3.14"},
+    {version = "=1.46.0", python = ">=3.11,<3.12"}
 ]
 greenlet = [
-    {version = ">=3.2.2", python = ">=3.13,<3.14"},  # Python 3.13 requires 3.2.2+
-    {version = ">=2.0.2", python = ">=3.11,<3.13"}   # Older Python versions can use 2.0.2+
+    {version = ">3.0.3", python = ">=3.12,<3.14"},
+    {version = "=3.0.3", python = ">=3.11,<3.12"}
 ]
 pillow = "^10.1.0"
 starlette-context = "^0.3.6"
