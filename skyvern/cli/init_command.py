@@ -122,3 +122,28 @@ def init(
         console.print("\n🎉 [bold green]Skyvern setup complete![/bold green]")
         console.print("[bold]To start using Skyvern, run:[/bold]")
         console.print(Padding("skyvern run server", (1, 4), style="reverse green"))
+
+
+def init_browser() -> None:
+    """Initialize only the browser configuration and install Chromium."""
+    console.print("\n[bold blue]Configuring browser settings...[/bold blue]")
+    browser_type, browser_location, remote_debugging_url = setup_browser_config()
+    update_or_add_env_var("BROWSER_TYPE", browser_type)
+    if browser_location:
+        update_or_add_env_var("CHROME_EXECUTABLE_PATH", browser_location)
+    if remote_debugging_url:
+        update_or_add_env_var("BROWSER_REMOTE_DEBUGGING_URL", remote_debugging_url)
+    console.print("✅ [green]Browser configuration complete.[/green]")
+
+    console.print("\n⬇️ [bold blue]Installing Chromium browser...[/bold blue]")
+    with Progress(
+        SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True, console=console
+    ) as progress:
+        progress.add_task("[bold blue]Downloading Chromium, this may take a moment...", total=None)
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+    console.print("✅ [green]Chromium installation complete.[/green]")
+
+
+def init_mcp() -> None:
+    """Initialize only the MCP server configuration."""
+    setup_mcp()
