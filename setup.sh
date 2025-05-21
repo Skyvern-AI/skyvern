@@ -22,7 +22,7 @@ ensure_required_commands() {
     done
     # Check docker if running
     if ! docker info > /dev/null 2>&1; then
-        echo "Docker is not running or not installed. Please install or start Docker and try again."
+        echo "Docker is not running. Please start Docker and try again."
         exit 1
     fi
 }
