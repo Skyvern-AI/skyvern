@@ -92,7 +92,8 @@ jobs:
       - run: poetry install --no-interaction
 
       # Finally, run pre-commit.
-      - uses: pre-commit/action@v3.0.0
+      - name: Run all pre-commit hooks
+        uses: pre-commit/action@v3.0.0
         env:
           ENABLE_OPENAI: "true"
           OPENAI_API_KEY: "sk-dummy"
@@ -103,7 +104,22 @@ jobs:
           AZURE_GPT4O_MINI_API_VERSION: "dummy"
           AWS_REGION: "us-east-1"
           ENABLE_BEDROCK: "true"
-  
+
+      - name: Run the alembic-check pre-commit hook
+        uses: pre-commit/action@v3.0.0
+        env:
+          ENABLE_OPENAI: "true"
+          OPENAI_API_KEY: "sk-dummy"
+          ENABLE_AZURE_GPT4O_MINI: "true"
+          AZURE_GPT4O_MINI_DEPLOYMENT: "dummy"
+          AZURE_GPT4O_MINI_API_KEY: "dummy"
+          AZURE_GPT4O_MINI_API_BASE: "dummy"
+          AZURE_GPT4O_MINI_API_VERSION: "dummy"
+          AWS_REGION: "us-east-1"
+          ENABLE_BEDROCK: "true"
+        with:
+          args: "run --hook-stage manual alembic-check"
+
   fe-lint-build:
     runs-on: ubuntu-latest
     defaults:

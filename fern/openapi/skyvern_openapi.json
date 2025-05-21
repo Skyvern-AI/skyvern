@@ -443,7 +443,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.cancel_run(run_id=\"tsk_v2_123\")\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.agent.cancel_run(run_id=\"tsk_v2_123\")\n"
               }
             ]
           }
@@ -453,10 +453,10 @@
     "/v1/workflows": {
       "post": {
         "tags": [
-          "Agent"
+          "Workflows"
         ],
-        "summary": "Create a new workflow",
-        "description": "Create a new workflow",
+        "summary": "Create a new workflow definition",
+        "description": "Create a new workflow definition",
         "operationId": "create_workflow_v1_workflows_post",
         "parameters": [
           {
@@ -492,6 +492,16 @@
             }
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successfully created workflow",
@@ -507,14 +517,18 @@
             "description": "Invalid workflow definition"
           }
         },
-        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "create_workflow",
         "x-fern-examples": [
           {
             "code-samples": [
               {
                 "sdk": "curl",
-                "code": "curl -X POST https://api.skyvern.com/v1/workflows --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: application/x-yaml' --data-raw 'title: Invoice Downloading Demo (Jun 13)\ndescription: \u003E-\n  Login to the website, download all the invoices after a date, email the\n  invoices\nworkflow_definition:\n  parameters:\n    - key: website_url\n      parameter_type: workflow\n      workflow_parameter_type: string\n    - key: credentials\n      parameter_type: bitwarden_login_credential\n      bitwarden_client_id_aws_secret_key: SECRET\n      bitwarden_client_secret_aws_secret_key: SECRET\n      bitwarden_master_password_aws_secret_key: SECRET\n      bitwarden_collection_id: SECRET\n      url_parameter_key: website_url\n    - key: invoice_retrieval_start_date\n      parameter_type: workflow\n      workflow_parameter_type: string\n    - key: smtp_host\n      parameter_type: aws_secret\n      aws_key: SKYVERN_SMTP_HOST_AWS_SES\n    - key: smtp_port\n      parameter_type: aws_secret\n      aws_key: SKYVERN_SMTP_PORT_AWS_SES\n    - key: smtp_username\n      parameter_type: aws_secret\n      aws_key: SKYVERN_SMTP_USERNAME_SES\n    - key: smtp_password\n      parameter_type: aws_secret\n      aws_key: SKYVERN_SMTP_PASSWORD_SES\n    - parameter_type: context\n      key: order_history_url\n      source_parameter_key: get_order_history_page_url_and_qualifying_order_ids_output\n    - parameter_type: context\n      key: order_ids\n      source_parameter_key: get_order_history_page_url_and_qualifying_order_ids_output\n    - parameter_type: context\n      key: order_id\n      source_parameter_key: order_ids\n  blocks:\n    - block_type: task\n      label: login\n      parameter_keys:\n        - credentials\n      url: website_url\n      navigation_goal: \u003E-\n        If you're not on the login page, navigate to login page and login using the credentials given, and then navigate to the personal account page. First, take actions on promotional popups or cookie prompts that could prevent taking other action on the web page. Then, try to login and navigate to the personal account page. If you fail to login to find the login page or can't login after several trials, terminate. If you're on the personal account page, consider the goal is completed.\n      error_code_mapping:\n        stuck_with_popups: terminate and return this error if you can't close popups after several tries and can't take the necessary actions on the website because there is a blocking popup on the page\n        failed_to_login: terminate and return this error if you fail logging in to the page\n    - block_type: task\n      label: get_order_history_page_url_and_qualifying_order_ids\n      parameter_keys:\n        - invoice_retrieval_start_date\n      navigation_goal: Find the order history page. If there is no orders after given start date, terminate.\n      data_extraction_goal: \u003E-\n        You need to extract the order history page url by looking at the current\n        page you're on. You need to extract contact emails you see on the page. You also need to extract the order ids for orders that\n        happened on or after invoice_retrieval_start_date. Make sure to filter\n        only the orders that happened on or after invoice_retrieval_start_date. You need to compare each order's date with the invoice_download_start_date. You can only include an order in the output if the order's date is after or the same as the invoice_download_start_date.\n        While comparing dates, first compare year, then month, then day. invoice_retrieval_start_date\n        is in YYYY-MM-DD format. The dates on the websites may be in different formats, compare accordingly and compare year, date, and month.\n      error_code_mapping:\n        failed_to_find_order_history_page: return this error if you can't find the order history page on the website\n        no_orders_found_after_start_date: return this error if there are no orders after the specified invoice_download_start_date\n      data_schema:\n        type: object\n        properties:\n          order_history_url:\n            type: url\n            description: \u003E-\n              The exact URL of the order history page. Do not make any\n              assumptions. Return the URL that's passed along in this context.\n          contact_emails:\n            type: array\n            items:\n                type: string\n                description: Contact email for the ecommerce website you're on. If you can't find any return null\n          date_comparison_scratchpad:\n            type: string\n            description: \u003E-\n                You are supposed to filter the orders that happened on or after the invoice_download_start_date. Think through how you will approach this task step-by-step here. Consider these before starting the comparison:\n                - What format is the order date in? How can you parse it into a structured format?\n                - What is the correct way to compare two dates?\n                - How will you compare the order dates to the invoice_download_start_date? \n                \n                Write out your thought process before filling out the order_ids field below. Remember, the original date may be in any format, so parse it carefully! The invoice_download_start_date will be an exact date you can directly compare against in the format YYYY-MM-DD.\n          order_ids:\n            type: array\n            items:\n              type: object\n              properties:\n                order_date:\n                  type: iso-8601-date-string\n                order_id:\n                  type: string\n            description: \u003E-\n              Return a list of order id strings. Do not return order ids of\n              orders that happened before the specified\n              invoice_retrieval_start_date\n    - block_type: for_loop\n      label: iterate_over_order_ids\n      loop_over_parameter_key: order_ids\n      continue_on_failure: true\n      loop_blocks:\n        - block_type: task\n          label: download_invoice_for_order\n          complete_on_download: true\n          continue_on_failure: true\n          parameter_keys:\n            - order_id\n          url: order_history_url\n          navigation_goal: Download the invoice of the order with the given order ID. Make sure to download the invoice for the given order id. If the element tree doesn't have a matching order id, check the screenshots. Complete if you have successfully downloaded the invoice according to action history, if you were able to download it, you'll see download_triggered=True for the last step. If you don't see a way to download an invoice, navigate to the order page if possible. If there's no way to download an invoice terminate. If the text suggests printing, you can assume you can download it. Return click action with download=True if you want to trigger a download.\n          error_code_mapping:\n            not_possible_to_download_invoice: return this error if the website doesn't allow downloading/viewing invoices\n            cant_solve_captcha: return this error if captcha isn't solved after multiple retries\n    - block_type: upload_to_s3\n      label: upload_downloaded_files_to_s3\n      path: SKYVERN_DOWNLOAD_DIRECTORY\n    - block_type: send_email\n      label: send_email\n      smtp_host_secret_parameter_key: smtp_host\n      smtp_port_secret_parameter_key: smtp_port\n      smtp_username_secret_parameter_key: smtp_username\n      smtp_password_secret_parameter_key: smtp_password\n      sender: hello@skyvern.com\n      recipients:\n        - founders@skyvern.com\n      subject: Skyvern - Downloaded Invoices Demo\n      body: website_url\n      file_attachments:\n        - SKYVERN_DOWNLOAD_DIRECTORY\n'\n"
+                "code": "curl -X POST https://api.skyvern.com/v1/workflows --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: \u003E-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
+              },
+              {
+                "sdk": "python",
+                "code": "\nfrom skyvern import Skyvern\n\n# Create a workflow in JSON format\nworkflow_definition = {\n    \"title\": \"Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"cache_actions\": False,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n                \"cache_actions\": False,\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"your_api_key\")\nworkflow = await skyvern.workflows.create_workflow(json_definition=workflow_definition)\nprint(workflow)\n"
               }
             ]
           }
@@ -524,7 +538,7 @@
     "/v1/workflows/{workflow_id}": {
       "post": {
         "tags": [
-          "Agent"
+          "Workflows"
         ],
         "summary": "Update a workflow definition",
         "description": "Update a workflow definition",
@@ -577,6 +591,16 @@
             }
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successfully updated workflow",
@@ -592,2305 +616,18 @@
             "description": "Invalid workflow definition"
           }
         },
-        "requestBody": {
-          "content": {
-            "application/x-yaml": {
-              "schema": {
-                "$defs": {
-                  "AWSSecretParameterYAML": {
-                    "properties": {
-                      "parameter_type": {
-                        "const": "aws_secret",
-                        "default": "aws_secret",
-                        "title": "Parameter Type",
-                        "type": "string"
-                      },
-                      "key": {
-                        "title": "Key",
-                        "type": "string"
-                      },
-                      "description": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Description"
-                      },
-                      "aws_key": {
-                        "title": "Aws Key",
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "key",
-                      "aws_key"
-                    ],
-                    "title": "AWSSecretParameterYAML",
-                    "type": "object"
-                  },
-                  "ActionBlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "action",
-                        "default": "action",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "url": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Url"
-                      },
-                      "title": {
-                        "default": "",
-                        "title": "Title",
-                        "type": "string"
-                      },
-                      "navigation_goal": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Navigation Goal"
-                      },
-                      "error_code_mapping": {
-                        "anyOf": [
-                          {
-                            "additionalProperties": {
-                              "type": "string"
-                            },
-                            "type": "object"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Error Code Mapping"
-                      },
-                      "max_retries": {
-                        "default": 0,
-                        "title": "Max Retries",
-                        "type": "integer"
-                      },
-                      "parameter_keys": {
-                        "anyOf": [
-                          {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Parameter Keys"
-                      },
-                      "complete_on_download": {
-                        "default": false,
-                        "title": "Complete On Download",
-                        "type": "boolean"
-                      },
-                      "download_suffix": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Download Suffix"
-                      },
-                      "totp_verification_url": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Totp Verification Url"
-                      },
-                      "totp_identifier": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Totp Identifier"
-                      },
-                      "cache_actions": {
-                        "default": false,
-                        "title": "Cache Actions",
-                        "type": "boolean"
-                      }
-                    },
-                    "required": [
-                      "label"
-                    ],
-                    "title": "ActionBlockYAML",
-                    "type": "object"
-                  },
-                  "BitwardenCreditCardDataParameterYAML": {
-                    "properties": {
-                      "parameter_type": {
-                        "const": "bitwarden_credit_card_data",
-                        "default": "bitwarden_credit_card_data",
-                        "title": "Parameter Type",
-                        "type": "string"
-                      },
-                      "key": {
-                        "title": "Key",
-                        "type": "string"
-                      },
-                      "description": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Description"
-                      },
-                      "bitwarden_client_id_aws_secret_key": {
-                        "title": "Bitwarden Client Id Aws Secret Key",
-                        "type": "string"
-                      },
-                      "bitwarden_client_secret_aws_secret_key": {
-                        "title": "Bitwarden Client Secret Aws Secret Key",
-                        "type": "string"
-                      },
-                      "bitwarden_master_password_aws_secret_key": {
-                        "title": "Bitwarden Master Password Aws Secret Key",
-                        "type": "string"
-                      },
-                      "bitwarden_collection_id": {
-                        "title": "Bitwarden Collection Id",
-                        "type": "string"
-                      },
-                      "bitwarden_item_id": {
-                        "title": "Bitwarden Item Id",
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "key",
-                      "bitwarden_client_id_aws_secret_key",
-                      "bitwarden_client_secret_aws_secret_key",
-                      "bitwarden_master_password_aws_secret_key",
-                      "bitwarden_collection_id",
-                      "bitwarden_item_id"
-                    ],
-                    "title": "BitwardenCreditCardDataParameterYAML",
-                    "type": "object"
-                  },
-                  "BitwardenLoginCredentialParameterYAML": {
-                    "properties": {
-                      "parameter_type": {
-                        "const": "bitwarden_login_credential",
-                        "default": "bitwarden_login_credential",
-                        "title": "Parameter Type",
-                        "type": "string"
-                      },
-                      "key": {
-                        "title": "Key",
-                        "type": "string"
-                      },
-                      "description": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Description"
-                      },
-                      "bitwarden_client_id_aws_secret_key": {
-                        "title": "Bitwarden Client Id Aws Secret Key",
-                        "type": "string"
-                      },
-                      "bitwarden_client_secret_aws_secret_key": {
-                        "title": "Bitwarden Client Secret Aws Secret Key",
-                        "type": "string"
-                      },
-                      "bitwarden_master_password_aws_secret_key": {
-                        "title": "Bitwarden Master Password Aws Secret Key",
-                        "type": "string"
-                      },
-                      "url_parameter_key": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Url Parameter Key"
-                      },
-                      "bitwarden_collection_id": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Bitwarden Collection Id"
-                      },
-                      "bitwarden_item_id": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Bitwarden Item Id"
-                      }
-                    },
-                    "required": [
-                      "key",
-                      "bitwarden_client_id_aws_secret_key",
-                      "bitwarden_client_secret_aws_secret_key",
-                      "bitwarden_master_password_aws_secret_key"
-                    ],
-                    "title": "BitwardenLoginCredentialParameterYAML",
-                    "type": "object"
-                  },
-                  "BitwardenSensitiveInformationParameterYAML": {
-                    "properties": {
-                      "parameter_type": {
-                        "const": "bitwarden_sensitive_information",
-                        "default": "bitwarden_sensitive_information",
-                        "title": "Parameter Type",
-                        "type": "string"
-                      },
-                      "key": {
-                        "title": "Key",
-                        "type": "string"
-                      },
-                      "description": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Description"
-                      },
-                      "bitwarden_client_id_aws_secret_key": {
-                        "title": "Bitwarden Client Id Aws Secret Key",
-                        "type": "string"
-                      },
-                      "bitwarden_client_secret_aws_secret_key": {
-                        "title": "Bitwarden Client Secret Aws Secret Key",
-                        "type": "string"
-                      },
-                      "bitwarden_master_password_aws_secret_key": {
-                        "title": "Bitwarden Master Password Aws Secret Key",
-                        "type": "string"
-                      },
-                      "bitwarden_collection_id": {
-                        "title": "Bitwarden Collection Id",
-                        "type": "string"
-                      },
-                      "bitwarden_identity_key": {
-                        "title": "Bitwarden Identity Key",
-                        "type": "string"
-                      },
-                      "bitwarden_identity_fields": {
-                        "items": {
-                          "type": "string"
-                        },
-                        "title": "Bitwarden Identity Fields",
-                        "type": "array"
-                      }
-                    },
-                    "required": [
-                      "key",
-                      "bitwarden_client_id_aws_secret_key",
-                      "bitwarden_client_secret_aws_secret_key",
-                      "bitwarden_master_password_aws_secret_key",
-                      "bitwarden_collection_id",
-                      "bitwarden_identity_key",
-                      "bitwarden_identity_fields"
-                    ],
-                    "title": "BitwardenSensitiveInformationParameterYAML",
-                    "type": "object"
-                  },
-                  "CodeBlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "code",
-                        "default": "code",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "code": {
-                        "title": "Code",
-                        "type": "string"
-                      },
-                      "parameter_keys": {
-                        "anyOf": [
-                          {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Parameter Keys"
-                      }
-                    },
-                    "required": [
-                      "label",
-                      "code"
-                    ],
-                    "title": "CodeBlockYAML",
-                    "type": "object"
-                  },
-                  "ContextParameterYAML": {
-                    "properties": {
-                      "parameter_type": {
-                        "const": "context",
-                        "default": "context",
-                        "title": "Parameter Type",
-                        "type": "string"
-                      },
-                      "key": {
-                        "title": "Key",
-                        "type": "string"
-                      },
-                      "description": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Description"
-                      },
-                      "source_parameter_key": {
-                        "title": "Source Parameter Key",
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "key",
-                      "source_parameter_key"
-                    ],
-                    "title": "ContextParameterYAML",
-                    "type": "object"
-                  },
-                  "CredentialParameterYAML": {
-                    "properties": {
-                      "parameter_type": {
-                        "const": "credential",
-                        "default": "credential",
-                        "title": "Parameter Type",
-                        "type": "string"
-                      },
-                      "key": {
-                        "title": "Key",
-                        "type": "string"
-                      },
-                      "description": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Description"
-                      },
-                      "credential_id": {
-                        "title": "Credential Id",
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "key",
-                      "credential_id"
-                    ],
-                    "title": "CredentialParameterYAML",
-                    "type": "object"
-                  },
-                  "DownloadToS3BlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "download_to_s3",
-                        "default": "download_to_s3",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "url": {
-                        "title": "Url",
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "label",
-                      "url"
-                    ],
-                    "title": "DownloadToS3BlockYAML",
-                    "type": "object"
-                  },
-                  "ExtractionBlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "extraction",
-                        "default": "extraction",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "data_extraction_goal": {
-                        "title": "Data Extraction Goal",
-                        "type": "string"
-                      },
-                      "url": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Url"
-                      },
-                      "title": {
-                        "default": "",
-                        "title": "Title",
-                        "type": "string"
-                      },
-                      "data_schema": {
-                        "anyOf": [
-                          {
-                            "additionalProperties": true,
-                            "type": "object"
-                          },
-                          {
-                            "items": {
-
-                            },
-                            "type": "array"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Data Schema"
-                      },
-                      "max_retries": {
-                        "default": 0,
-                        "title": "Max Retries",
-                        "type": "integer"
-                      },
-                      "max_steps_per_run": {
-                        "anyOf": [
-                          {
-                            "type": "integer"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Max Steps Per Run"
-                      },
-                      "parameter_keys": {
-                        "anyOf": [
-                          {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Parameter Keys"
-                      },
-                      "cache_actions": {
-                        "default": false,
-                        "title": "Cache Actions",
-                        "type": "boolean"
-                      }
-                    },
-                    "required": [
-                      "label",
-                      "data_extraction_goal"
-                    ],
-                    "title": "ExtractionBlockYAML",
-                    "type": "object"
-                  },
-                  "FileDownloadBlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "file_download",
-                        "default": "file_download",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "navigation_goal": {
-                        "title": "Navigation Goal",
-                        "type": "string"
-                      },
-                      "url": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Url"
-                      },
-                      "title": {
-                        "default": "",
-                        "title": "Title",
-                        "type": "string"
-                      },
-                      "error_code_mapping": {
-                        "anyOf": [
-                          {
-                            "additionalProperties": {
-                              "type": "string"
-                            },
-                            "type": "object"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Error Code Mapping"
-                      },
-                      "max_retries": {
-                        "default": 0,
-                        "title": "Max Retries",
-                        "type": "integer"
-                      },
-                      "max_steps_per_run": {
-                        "anyOf": [
-                          {
-                            "type": "integer"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Max Steps Per Run"
-                      },
-                      "parameter_keys": {
-                        "anyOf": [
-                          {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Parameter Keys"
-                      },
-                      "download_suffix": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Download Suffix"
-                      },
-                      "totp_verification_url": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Totp Verification Url"
-                      },
-                      "totp_identifier": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Totp Identifier"
-                      },
-                      "cache_actions": {
-                        "default": false,
-                        "title": "Cache Actions",
-                        "type": "boolean"
-                      }
-                    },
-                    "required": [
-                      "label",
-                      "navigation_goal"
-                    ],
-                    "title": "FileDownloadBlockYAML",
-                    "type": "object"
-                  },
-                  "FileParserBlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "file_url_parser",
-                        "default": "file_url_parser",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "file_url": {
-                        "title": "File Url",
-                        "type": "string"
-                      },
-                      "file_type": {
-                        "$ref": "#/$defs/FileType"
-                      }
-                    },
-                    "required": [
-                      "label",
-                      "file_url",
-                      "file_type"
-                    ],
-                    "title": "FileParserBlockYAML",
-                    "type": "object"
-                  },
-                  "FileStorageType": {
-                    "enum": [
-                      "s3"
-                    ],
-                    "title": "FileStorageType",
-                    "type": "string"
-                  },
-                  "FileType": {
-                    "enum": [
-                      "csv"
-                    ],
-                    "title": "FileType",
-                    "type": "string"
-                  },
-                  "FileUploadBlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "file_upload",
-                        "default": "file_upload",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "storage_type": {
-                        "$ref": "#/$defs/FileStorageType",
-                        "default": "s3"
-                      },
-                      "s3_bucket": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "S3 Bucket"
-                      },
-                      "aws_access_key_id": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Aws Access Key Id"
-                      },
-                      "aws_secret_access_key": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Aws Secret Access Key"
-                      },
-                      "region_name": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Region Name"
-                      },
-                      "path": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Path"
-                      }
-                    },
-                    "required": [
-                      "label"
-                    ],
-                    "title": "FileUploadBlockYAML",
-                    "type": "object"
-                  },
-                  "ForLoopBlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "for_loop",
-                        "default": "for_loop",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "loop_blocks": {
-                        "items": {
-                          "anyOf": [
-                            {
-                              "$ref": "#/$defs/TaskBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/ForLoopBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/CodeBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/TextPromptBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/DownloadToS3BlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/UploadToS3BlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/FileUploadBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/SendEmailBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/FileParserBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/ValidationBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/ActionBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/NavigationBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/ExtractionBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/LoginBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/WaitBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/FileDownloadBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/UrlBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/PDFParserBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/TaskV2BlockYAML"
-                            }
-                          ]
-                        },
-                        "title": "Loop Blocks",
-                        "type": "array"
-                      },
-                      "loop_over_parameter_key": {
-                        "default": "",
-                        "title": "Loop Over Parameter Key",
-                        "type": "string"
-                      },
-                      "loop_variable_reference": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Loop Variable Reference"
-                      },
-                      "complete_if_empty": {
-                        "default": false,
-                        "title": "Complete If Empty",
-                        "type": "boolean"
-                      }
-                    },
-                    "required": [
-                      "label",
-                      "loop_blocks"
-                    ],
-                    "title": "ForLoopBlockYAML",
-                    "type": "object"
-                  },
-                  "LoginBlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "login",
-                        "default": "login",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "url": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Url"
-                      },
-                      "title": {
-                        "default": "",
-                        "title": "Title",
-                        "type": "string"
-                      },
-                      "navigation_goal": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Navigation Goal"
-                      },
-                      "error_code_mapping": {
-                        "anyOf": [
-                          {
-                            "additionalProperties": {
-                              "type": "string"
-                            },
-                            "type": "object"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Error Code Mapping"
-                      },
-                      "max_retries": {
-                        "default": 0,
-                        "title": "Max Retries",
-                        "type": "integer"
-                      },
-                      "max_steps_per_run": {
-                        "anyOf": [
-                          {
-                            "type": "integer"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Max Steps Per Run"
-                      },
-                      "parameter_keys": {
-                        "anyOf": [
-                          {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Parameter Keys"
-                      },
-                      "totp_verification_url": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Totp Verification Url"
-                      },
-                      "totp_identifier": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Totp Identifier"
-                      },
-                      "cache_actions": {
-                        "default": false,
-                        "title": "Cache Actions",
-                        "type": "boolean"
-                      },
-                      "complete_criterion": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Complete Criterion"
-                      },
-                      "terminate_criterion": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Terminate Criterion"
-                      },
-                      "complete_verification": {
-                        "default": true,
-                        "title": "Complete Verification",
-                        "type": "boolean"
-                      }
-                    },
-                    "required": [
-                      "label"
-                    ],
-                    "title": "LoginBlockYAML",
-                    "type": "object"
-                  },
-                  "NavigationBlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "navigation",
-                        "default": "navigation",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "navigation_goal": {
-                        "title": "Navigation Goal",
-                        "type": "string"
-                      },
-                      "url": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Url"
-                      },
-                      "title": {
-                        "default": "",
-                        "title": "Title",
-                        "type": "string"
-                      },
-                      "engine": {
-                        "$ref": "#/$defs/RunEngine",
-                        "default": "skyvern-1.0"
-                      },
-                      "error_code_mapping": {
-                        "anyOf": [
-                          {
-                            "additionalProperties": {
-                              "type": "string"
-                            },
-                            "type": "object"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Error Code Mapping"
-                      },
-                      "max_retries": {
-                        "default": 0,
-                        "title": "Max Retries",
-                        "type": "integer"
-                      },
-                      "max_steps_per_run": {
-                        "anyOf": [
-                          {
-                            "type": "integer"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Max Steps Per Run"
-                      },
-                      "parameter_keys": {
-                        "anyOf": [
-                          {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Parameter Keys"
-                      },
-                      "complete_on_download": {
-                        "default": false,
-                        "title": "Complete On Download",
-                        "type": "boolean"
-                      },
-                      "download_suffix": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Download Suffix"
-                      },
-                      "totp_verification_url": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Totp Verification Url"
-                      },
-                      "totp_identifier": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Totp Identifier"
-                      },
-                      "cache_actions": {
-                        "default": false,
-                        "title": "Cache Actions",
-                        "type": "boolean"
-                      },
-                      "complete_criterion": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Complete Criterion"
-                      },
-                      "terminate_criterion": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Terminate Criterion"
-                      },
-                      "complete_verification": {
-                        "default": true,
-                        "title": "Complete Verification",
-                        "type": "boolean"
-                      },
-                      "include_action_history_in_verification": {
-                        "default": false,
-                        "title": "Include Action History In Verification",
-                        "type": "boolean"
-                      }
-                    },
-                    "required": [
-                      "label",
-                      "navigation_goal"
-                    ],
-                    "title": "NavigationBlockYAML",
-                    "type": "object"
-                  },
-                  "OutputParameterYAML": {
-                    "properties": {
-                      "parameter_type": {
-                        "const": "output",
-                        "default": "output",
-                        "title": "Parameter Type",
-                        "type": "string"
-                      },
-                      "key": {
-                        "title": "Key",
-                        "type": "string"
-                      },
-                      "description": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Description"
-                      }
-                    },
-                    "required": [
-                      "key"
-                    ],
-                    "title": "OutputParameterYAML",
-                    "type": "object"
-                  },
-                  "PDFParserBlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "pdf_parser",
-                        "default": "pdf_parser",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "file_url": {
-                        "title": "File Url",
-                        "type": "string"
-                      },
-                      "json_schema": {
-                        "anyOf": [
-                          {
-                            "additionalProperties": true,
-                            "type": "object"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Json Schema"
-                      }
-                    },
-                    "required": [
-                      "label",
-                      "file_url"
-                    ],
-                    "title": "PDFParserBlockYAML",
-                    "type": "object"
-                  },
-                  "ProxyLocation": {
-                    "enum": [
-                      "RESIDENTIAL",
-                      "US-CA",
-                      "US-NY",
-                      "US-TX",
-                      "US-FL",
-                      "US-WA",
-                      "RESIDENTIAL_ES",
-                      "RESIDENTIAL_IE",
-                      "RESIDENTIAL_GB",
-                      "RESIDENTIAL_IN",
-                      "RESIDENTIAL_JP",
-                      "RESIDENTIAL_FR",
-                      "RESIDENTIAL_DE",
-                      "RESIDENTIAL_NZ",
-                      "RESIDENTIAL_ZA",
-                      "RESIDENTIAL_AR",
-                      "RESIDENTIAL_ISP",
-                      "NONE"
-                    ],
-                    "title": "ProxyLocation",
-                    "type": "string"
-                  },
-                  "RunEngine": {
-                    "enum": [
-                      "skyvern-1.0",
-                      "skyvern-2.0",
-                      "openai-cua",
-                      "anthropic-cua"
-                    ],
-                    "title": "RunEngine",
-                    "type": "string"
-                  },
-                  "SendEmailBlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "send_email",
-                        "default": "send_email",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "smtp_host_secret_parameter_key": {
-                        "title": "Smtp Host Secret Parameter Key",
-                        "type": "string"
-                      },
-                      "smtp_port_secret_parameter_key": {
-                        "title": "Smtp Port Secret Parameter Key",
-                        "type": "string"
-                      },
-                      "smtp_username_secret_parameter_key": {
-                        "title": "Smtp Username Secret Parameter Key",
-                        "type": "string"
-                      },
-                      "smtp_password_secret_parameter_key": {
-                        "title": "Smtp Password Secret Parameter Key",
-                        "type": "string"
-                      },
-                      "sender": {
-                        "title": "Sender",
-                        "type": "string"
-                      },
-                      "recipients": {
-                        "items": {
-                          "type": "string"
-                        },
-                        "title": "Recipients",
-                        "type": "array"
-                      },
-                      "subject": {
-                        "title": "Subject",
-                        "type": "string"
-                      },
-                      "body": {
-                        "title": "Body",
-                        "type": "string"
-                      },
-                      "file_attachments": {
-                        "anyOf": [
-                          {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "File Attachments"
-                      }
-                    },
-                    "required": [
-                      "label",
-                      "smtp_host_secret_parameter_key",
-                      "smtp_port_secret_parameter_key",
-                      "smtp_username_secret_parameter_key",
-                      "smtp_password_secret_parameter_key",
-                      "sender",
-                      "recipients",
-                      "subject",
-                      "body"
-                    ],
-                    "title": "SendEmailBlockYAML",
-                    "type": "object"
-                  },
-                  "TaskBlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "task",
-                        "default": "task",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "url": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Url"
-                      },
-                      "title": {
-                        "default": "",
-                        "title": "Title",
-                        "type": "string"
-                      },
-                      "navigation_goal": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Navigation Goal"
-                      },
-                      "data_extraction_goal": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Data Extraction Goal"
-                      },
-                      "data_schema": {
-                        "anyOf": [
-                          {
-                            "additionalProperties": true,
-                            "type": "object"
-                          },
-                          {
-                            "items": {
-
-                            },
-                            "type": "array"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Data Schema"
-                      },
-                      "error_code_mapping": {
-                        "anyOf": [
-                          {
-                            "additionalProperties": {
-                              "type": "string"
-                            },
-                            "type": "object"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Error Code Mapping"
-                      },
-                      "max_retries": {
-                        "default": 0,
-                        "title": "Max Retries",
-                        "type": "integer"
-                      },
-                      "max_steps_per_run": {
-                        "anyOf": [
-                          {
-                            "type": "integer"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Max Steps Per Run"
-                      },
-                      "parameter_keys": {
-                        "anyOf": [
-                          {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Parameter Keys"
-                      },
-                      "complete_on_download": {
-                        "default": false,
-                        "title": "Complete On Download",
-                        "type": "boolean"
-                      },
-                      "download_suffix": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Download Suffix"
-                      },
-                      "totp_verification_url": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Totp Verification Url"
-                      },
-                      "totp_identifier": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Totp Identifier"
-                      },
-                      "cache_actions": {
-                        "default": false,
-                        "title": "Cache Actions",
-                        "type": "boolean"
-                      },
-                      "complete_criterion": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Complete Criterion"
-                      },
-                      "terminate_criterion": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Terminate Criterion"
-                      },
-                      "complete_verification": {
-                        "default": true,
-                        "title": "Complete Verification",
-                        "type": "boolean"
-                      },
-                      "include_action_history_in_verification": {
-                        "default": false,
-                        "title": "Include Action History In Verification",
-                        "type": "boolean"
-                      }
-                    },
-                    "required": [
-                      "label"
-                    ],
-                    "title": "TaskBlockYAML",
-                    "type": "object"
-                  },
-                  "TaskV2BlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "task_v2",
-                        "default": "task_v2",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "prompt": {
-                        "title": "Prompt",
-                        "type": "string"
-                      },
-                      "url": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Url"
-                      },
-                      "totp_verification_url": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Totp Verification Url"
-                      },
-                      "totp_identifier": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Totp Identifier"
-                      },
-                      "max_iterations": {
-                        "default": 10,
-                        "title": "Max Iterations",
-                        "type": "integer"
-                      },
-                      "max_steps": {
-                        "default": 25,
-                        "title": "Max Steps",
-                        "type": "integer"
-                      }
-                    },
-                    "required": [
-                      "label",
-                      "prompt"
-                    ],
-                    "title": "TaskV2BlockYAML",
-                    "type": "object"
-                  },
-                  "TextPromptBlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "text_prompt",
-                        "default": "text_prompt",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "llm_key": {
-                        "default": "OPENAI_GPT4O_MINI",
-                        "title": "Llm Key",
-                        "type": "string"
-                      },
-                      "prompt": {
-                        "title": "Prompt",
-                        "type": "string"
-                      },
-                      "parameter_keys": {
-                        "anyOf": [
-                          {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Parameter Keys"
-                      },
-                      "json_schema": {
-                        "anyOf": [
-                          {
-                            "additionalProperties": true,
-                            "type": "object"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Json Schema"
-                      }
-                    },
-                    "required": [
-                      "label",
-                      "prompt"
-                    ],
-                    "title": "TextPromptBlockYAML",
-                    "type": "object"
-                  },
-                  "UploadToS3BlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "upload_to_s3",
-                        "default": "upload_to_s3",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "path": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Path"
-                      }
-                    },
-                    "required": [
-                      "label"
-                    ],
-                    "title": "UploadToS3BlockYAML",
-                    "type": "object"
-                  },
-                  "UrlBlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "goto_url",
-                        "default": "goto_url",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "url": {
-                        "title": "Url",
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "label",
-                      "url"
-                    ],
-                    "title": "UrlBlockYAML",
-                    "type": "object"
-                  },
-                  "ValidationBlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "validation",
-                        "default": "validation",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "complete_criterion": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Complete Criterion"
-                      },
-                      "terminate_criterion": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Terminate Criterion"
-                      },
-                      "error_code_mapping": {
-                        "anyOf": [
-                          {
-                            "additionalProperties": {
-                              "type": "string"
-                            },
-                            "type": "object"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Error Code Mapping"
-                      },
-                      "parameter_keys": {
-                        "anyOf": [
-                          {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Parameter Keys"
-                      }
-                    },
-                    "required": [
-                      "label"
-                    ],
-                    "title": "ValidationBlockYAML",
-                    "type": "object"
-                  },
-                  "WaitBlockYAML": {
-                    "properties": {
-                      "block_type": {
-                        "const": "wait",
-                        "default": "wait",
-                        "title": "Block Type",
-                        "type": "string"
-                      },
-                      "label": {
-                        "title": "Label",
-                        "type": "string"
-                      },
-                      "continue_on_failure": {
-                        "default": false,
-                        "title": "Continue On Failure",
-                        "type": "boolean"
-                      },
-                      "wait_sec": {
-                        "default": 0,
-                        "title": "Wait Sec",
-                        "type": "integer"
-                      }
-                    },
-                    "required": [
-                      "label"
-                    ],
-                    "title": "WaitBlockYAML",
-                    "type": "object"
-                  },
-                  "WorkflowDefinitionYAML": {
-                    "properties": {
-                      "parameters": {
-                        "items": {
-                          "discriminator": {
-                            "mapping": {
-                              "aws_secret": "#/$defs/AWSSecretParameterYAML",
-                              "bitwarden_credit_card_data": "#/$defs/BitwardenCreditCardDataParameterYAML",
-                              "bitwarden_login_credential": "#/$defs/BitwardenLoginCredentialParameterYAML",
-                              "bitwarden_sensitive_information": "#/$defs/BitwardenSensitiveInformationParameterYAML",
-                              "context": "#/$defs/ContextParameterYAML",
-                              "credential": "#/$defs/CredentialParameterYAML",
-                              "output": "#/$defs/OutputParameterYAML",
-                              "workflow": "#/$defs/WorkflowParameterYAML"
-                            },
-                            "propertyName": "parameter_type"
-                          },
-                          "oneOf": [
-                            {
-                              "$ref": "#/$defs/AWSSecretParameterYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/BitwardenLoginCredentialParameterYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/BitwardenSensitiveInformationParameterYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/BitwardenCreditCardDataParameterYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/WorkflowParameterYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/ContextParameterYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/OutputParameterYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/CredentialParameterYAML"
-                            }
-                          ]
-                        },
-                        "title": "Parameters",
-                        "type": "array"
-                      },
-                      "blocks": {
-                        "items": {
-                          "discriminator": {
-                            "mapping": {
-                              "action": "#/$defs/ActionBlockYAML",
-                              "code": "#/$defs/CodeBlockYAML",
-                              "download_to_s3": "#/$defs/DownloadToS3BlockYAML",
-                              "extraction": "#/$defs/ExtractionBlockYAML",
-                              "file_download": "#/$defs/FileDownloadBlockYAML",
-                              "file_upload": "#/$defs/FileUploadBlockYAML",
-                              "file_url_parser": "#/$defs/FileParserBlockYAML",
-                              "for_loop": "#/$defs/ForLoopBlockYAML",
-                              "goto_url": "#/$defs/UrlBlockYAML",
-                              "login": "#/$defs/LoginBlockYAML",
-                              "navigation": "#/$defs/NavigationBlockYAML",
-                              "pdf_parser": "#/$defs/PDFParserBlockYAML",
-                              "send_email": "#/$defs/SendEmailBlockYAML",
-                              "task": "#/$defs/TaskBlockYAML",
-                              "task_v2": "#/$defs/TaskV2BlockYAML",
-                              "text_prompt": "#/$defs/TextPromptBlockYAML",
-                              "upload_to_s3": "#/$defs/UploadToS3BlockYAML",
-                              "validation": "#/$defs/ValidationBlockYAML",
-                              "wait": "#/$defs/WaitBlockYAML"
-                            },
-                            "propertyName": "block_type"
-                          },
-                          "oneOf": [
-                            {
-                              "$ref": "#/$defs/TaskBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/ForLoopBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/CodeBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/TextPromptBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/DownloadToS3BlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/UploadToS3BlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/FileUploadBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/SendEmailBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/FileParserBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/ValidationBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/ActionBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/NavigationBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/ExtractionBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/LoginBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/WaitBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/FileDownloadBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/UrlBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/PDFParserBlockYAML"
-                            },
-                            {
-                              "$ref": "#/$defs/TaskV2BlockYAML"
-                            }
-                          ]
-                        },
-                        "title": "Blocks",
-                        "type": "array"
-                      }
-                    },
-                    "required": [
-                      "parameters",
-                      "blocks"
-                    ],
-                    "title": "WorkflowDefinitionYAML",
-                    "type": "object"
-                  },
-                  "WorkflowParameterType": {
-                    "enum": [
-                      "string",
-                      "integer",
-                      "float",
-                      "boolean",
-                      "json",
-                      "file_url",
-                      "credential_id"
-                    ],
-                    "title": "WorkflowParameterType",
-                    "type": "string"
-                  },
-                  "WorkflowParameterYAML": {
-                    "properties": {
-                      "parameter_type": {
-                        "const": "workflow",
-                        "default": "workflow",
-                        "title": "Parameter Type",
-                        "type": "string"
-                      },
-                      "key": {
-                        "title": "Key",
-                        "type": "string"
-                      },
-                      "description": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Description"
-                      },
-                      "workflow_parameter_type": {
-                        "$ref": "#/$defs/WorkflowParameterType"
-                      },
-                      "default_value": {
-                        "anyOf": [
-                          {
-                            "type": "string"
-                          },
-                          {
-                            "type": "integer"
-                          },
-                          {
-                            "type": "number"
-                          },
-                          {
-                            "type": "boolean"
-                          },
-                          {
-                            "additionalProperties": true,
-                            "type": "object"
-                          },
-                          {
-                            "items": {
-
-                            },
-                            "type": "array"
-                          },
-                          {
-                            "type": "null"
-                          }
-                        ],
-                        "title": "Default Value"
-                      }
-                    },
-                    "required": [
-                      "key",
-                      "workflow_parameter_type"
-                    ],
-                    "title": "WorkflowParameterYAML",
-                    "type": "object"
-                  },
-                  "WorkflowStatus": {
-                    "enum": [
-                      "published",
-                      "draft",
-                      "auto_generated"
-                    ],
-                    "title": "WorkflowStatus",
-                    "type": "string"
-                  }
-                },
-                "properties": {
-                  "title": {
-                    "title": "Title",
-                    "type": "string"
-                  },
-                  "description": {
-                    "anyOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "title": "Description"
-                  },
-                  "proxy_location": {
-                    "anyOf": [
-                      {
-                        "$ref": "#/$defs/ProxyLocation"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ]
-                  },
-                  "webhook_callback_url": {
-                    "anyOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "title": "Webhook Callback Url"
-                  },
-                  "totp_verification_url": {
-                    "anyOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "title": "Totp Verification Url"
-                  },
-                  "totp_identifier": {
-                    "anyOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "title": "Totp Identifier"
-                  },
-                  "persist_browser_session": {
-                    "default": false,
-                    "title": "Persist Browser Session",
-                    "type": "boolean"
-                  },
-                  "workflow_definition": {
-                    "$ref": "#/$defs/WorkflowDefinitionYAML"
-                  },
-                  "is_saved_task": {
-                    "default": false,
-                    "title": "Is Saved Task",
-                    "type": "boolean"
-                  },
-                  "status": {
-                    "$ref": "#/$defs/WorkflowStatus",
-                    "default": "published"
-                  }
-                },
-                "required": [
-                  "title",
-                  "workflow_definition"
-                ],
-                "title": "WorkflowCreateYAMLRequest",
-                "type": "object"
-              }
-            }
-          },
-          "required": true
-        },
-        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "update_workflow",
         "x-fern-examples": [
           {
             "code-samples": [
               {
                 "sdk": "curl",
-                "code": "curl -X POST https://api.skyvern.com/v1/workflows/wpid_123 --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: application/x-yaml' --data-raw 'title: Invoice Downloading Demo (Jun 13)\ndescription: \u003E-\n  Login to the website, download all the invoices after a date, email the\n  invoices\nworkflow_definition:\n  parameters:\n    - key: website_url\n      parameter_type: workflow\n      workflow_parameter_type: string\n    - key: credentials\n      parameter_type: bitwarden_login_credential\n      bitwarden_client_id_aws_secret_key: SECRET\n      bitwarden_client_secret_aws_secret_key: SECRET\n      bitwarden_master_password_aws_secret_key: SECRET\n      bitwarden_collection_id: SECRET\n      url_parameter_key: website_url\n    - key: invoice_retrieval_start_date\n      parameter_type: workflow\n      workflow_parameter_type: string\n    - key: smtp_host\n      parameter_type: aws_secret\n      aws_key: SKYVERN_SMTP_HOST_AWS_SES\n    - key: smtp_port\n      parameter_type: aws_secret\n      aws_key: SKYVERN_SMTP_PORT_AWS_SES\n    - key: smtp_username\n      parameter_type: aws_secret\n      aws_key: SKYVERN_SMTP_USERNAME_SES\n    - key: smtp_password\n      parameter_type: aws_secret\n      aws_key: SKYVERN_SMTP_PASSWORD_SES\n    - parameter_type: context\n      key: order_history_url\n      source_parameter_key: get_order_history_page_url_and_qualifying_order_ids_output\n    - parameter_type: context\n      key: order_ids\n      source_parameter_key: get_order_history_page_url_and_qualifying_order_ids_output\n    - parameter_type: context\n      key: order_id\n      source_parameter_key: order_ids\n  blocks:\n    - block_type: task\n      label: login\n      parameter_keys:\n        - credentials\n      url: website_url\n      navigation_goal: \u003E-\n        If you're not on the login page, navigate to login page and login using the credentials given, and then navigate to the personal account page. First, take actions on promotional popups or cookie prompts that could prevent taking other action on the web page. Then, try to login and navigate to the personal account page. If you fail to login to find the login page or can't login after several trials, terminate. If you're on the personal account page, consider the goal is completed.\n      error_code_mapping:\n        stuck_with_popups: terminate and return this error if you can't close popups after several tries and can't take the necessary actions on the website because there is a blocking popup on the page\n        failed_to_login: terminate and return this error if you fail logging in to the page\n    - block_type: task\n      label: get_order_history_page_url_and_qualifying_order_ids\n      parameter_keys:\n        - invoice_retrieval_start_date\n      navigation_goal: Find the order history page. If there is no orders after given start date, terminate.\n      data_extraction_goal: \u003E-\n        You need to extract the order history page url by looking at the current\n        page you're on. You need to extract contact emails you see on the page. You also need to extract the order ids for orders that\n        happened on or after invoice_retrieval_start_date. Make sure to filter\n        only the orders that happened on or after invoice_retrieval_start_date. You need to compare each order's date with the invoice_download_start_date. You can only include an order in the output if the order's date is after or the same as the invoice_download_start_date.\n        While comparing dates, first compare year, then month, then day. invoice_retrieval_start_date\n        is in YYYY-MM-DD format. The dates on the websites may be in different formats, compare accordingly and compare year, date, and month.\n      error_code_mapping:\n        failed_to_find_order_history_page: return this error if you can't find the order history page on the website\n        no_orders_found_after_start_date: return this error if there are no orders after the specified invoice_download_start_date\n      data_schema:\n        type: object\n        properties:\n          order_history_url:\n            type: url\n            description: \u003E-\n              The exact URL of the order history page. Do not make any\n              assumptions. Return the URL that's passed along in this context.\n          contact_emails:\n            type: array\n            items:\n                type: string\n                description: Contact email for the ecommerce website you're on. If you can't find any return null\n          date_comparison_scratchpad:\n            type: string\n            description: \u003E-\n                You are supposed to filter the orders that happened on or after the invoice_download_start_date. Think through how you will approach this task step-by-step here. Consider these before starting the comparison:\n                - What format is the order date in? How can you parse it into a structured format?\n                - What is the correct way to compare two dates?\n                - How will you compare the order dates to the invoice_download_start_date? \n                \n                Write out your thought process before filling out the order_ids field below. Remember, the original date may be in any format, so parse it carefully! The invoice_download_start_date will be an exact date you can directly compare against in the format YYYY-MM-DD.\n          order_ids:\n            type: array\n            items:\n              type: object\n              properties:\n                order_date:\n                  type: iso-8601-date-string\n                order_id:\n                  type: string\n            description: \u003E-\n              Return a list of order id strings. Do not return order ids of\n              orders that happened before the specified\n              invoice_retrieval_start_date\n    - block_type: for_loop\n      label: iterate_over_order_ids\n      loop_over_parameter_key: order_ids\n      continue_on_failure: true\n      loop_blocks:\n        - block_type: task\n          label: download_invoice_for_order\n          complete_on_download: true\n          continue_on_failure: true\n          parameter_keys:\n            - order_id\n          url: order_history_url\n          navigation_goal: Download the invoice of the order with the given order ID. Make sure to download the invoice for the given order id. If the element tree doesn't have a matching order id, check the screenshots. Complete if you have successfully downloaded the invoice according to action history, if you were able to download it, you'll see download_triggered=True for the last step. If you don't see a way to download an invoice, navigate to the order page if possible. If there's no way to download an invoice terminate. If the text suggests printing, you can assume you can download it. Return click action with download=True if you want to trigger a download.\n          error_code_mapping:\n            not_possible_to_download_invoice: return this error if the website doesn't allow downloading/viewing invoices\n            cant_solve_captcha: return this error if captcha isn't solved after multiple retries\n    - block_type: upload_to_s3\n      label: upload_downloaded_files_to_s3\n      path: SKYVERN_DOWNLOAD_DIRECTORY\n    - block_type: send_email\n      label: send_email\n      smtp_host_secret_parameter_key: smtp_host\n      smtp_port_secret_parameter_key: smtp_port\n      smtp_username_secret_parameter_key: smtp_username\n      smtp_password_secret_parameter_key: smtp_password\n      sender: hello@skyvern.com\n      recipients:\n        - founders@skyvern.com\n      subject: Skyvern - Downloaded Invoices Demo\n      body: website_url\n      file_attachments:\n        - SKYVERN_DOWNLOAD_DIRECTORY\n'\n"
+                "code": "curl -X POST https://api.skyvern.com/v1/workflows/wpid_123 --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: \u003E-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
+              },
+              {
+                "sdk": "python",
+                "code": "\nfrom skyvern import Skyvern\n\nupdated_workflow_definition = {\n    \"title\": \"Updated Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"cache_actions\": False,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n                \"cache_actions\": False,\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"your_api_key\")\nworkflow = await skyvern.workflows.update_workflow(workflow_id=\"wpid_123\", json_definition=updated_workflow_definition)\nprint(workflow)\n"
               }
             ]
           }
@@ -2900,7 +637,7 @@
     "/v1/workflows/{workflow_id}/delete": {
       "post": {
         "tags": [
-          "Agent"
+          "Workflows"
         ],
         "summary": "Delete a workflow",
         "description": "Delete a workflow",
@@ -2975,14 +712,14 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "delete_workflow",
         "x-fern-examples": [
           {
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.agent.delete_workflow(workflow_id=\"wpid_123\")\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.workflows.delete_workflow(workflow_id=\"wpid_123\")\n"
               }
             ]
           }
@@ -3904,6 +1641,41 @@
         ],
         "title": "AWSSecretParameter"
       },
+      "AWSSecretParameterYAML": {
+        "properties": {
+          "parameter_type": {
+            "type": "string",
+            "const": "aws_secret",
+            "title": "Parameter Type",
+            "default": "aws_secret"
+          },
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "aws_key": {
+            "type": "string",
+            "title": "Aws Key"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "aws_key"
+        ],
+        "title": "AWSSecretParameterYAML"
+      },
       "ActionBlock": {
         "properties": {
           "label": {
@@ -4148,6 +1920,133 @@
         ],
         "title": "ActionBlock"
       },
+      "ActionBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "action",
+            "title": "Block Type",
+            "default": "action"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title",
+            "default": ""
+          },
+          "navigation_goal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Navigation Goal"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
+          },
+          "max_retries": {
+            "type": "integer",
+            "title": "Max Retries",
+            "default": 0
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          },
+          "complete_on_download": {
+            "type": "boolean",
+            "title": "Complete On Download",
+            "default": false
+          },
+          "download_suffix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Suffix"
+          },
+          "totp_verification_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Verification Url"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
+          },
+          "cache_actions": {
+            "type": "boolean",
+            "title": "Cache Actions",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "title": "ActionBlockYAML"
+      },
       "BitwardenCreditCardDataParameter": {
         "properties": {
           "parameter_type": {
@@ -4236,6 +2135,61 @@
           "modified_at"
         ],
         "title": "BitwardenCreditCardDataParameter"
+      },
+      "BitwardenCreditCardDataParameterYAML": {
+        "properties": {
+          "parameter_type": {
+            "type": "string",
+            "const": "bitwarden_credit_card_data",
+            "title": "Parameter Type",
+            "default": "bitwarden_credit_card_data"
+          },
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "bitwarden_client_id_aws_secret_key": {
+            "type": "string",
+            "title": "Bitwarden Client Id Aws Secret Key"
+          },
+          "bitwarden_client_secret_aws_secret_key": {
+            "type": "string",
+            "title": "Bitwarden Client Secret Aws Secret Key"
+          },
+          "bitwarden_master_password_aws_secret_key": {
+            "type": "string",
+            "title": "Bitwarden Master Password Aws Secret Key"
+          },
+          "bitwarden_collection_id": {
+            "type": "string",
+            "title": "Bitwarden Collection Id"
+          },
+          "bitwarden_item_id": {
+            "type": "string",
+            "title": "Bitwarden Item Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "bitwarden_client_id_aws_secret_key",
+          "bitwarden_client_secret_aws_secret_key",
+          "bitwarden_master_password_aws_secret_key",
+          "bitwarden_collection_id",
+          "bitwarden_item_id"
+        ],
+        "title": "BitwardenCreditCardDataParameterYAML"
       },
       "BitwardenLoginCredentialParameter": {
         "properties": {
@@ -4349,6 +2303,84 @@
         ],
         "title": "BitwardenLoginCredentialParameter"
       },
+      "BitwardenLoginCredentialParameterYAML": {
+        "properties": {
+          "parameter_type": {
+            "type": "string",
+            "const": "bitwarden_login_credential",
+            "title": "Parameter Type",
+            "default": "bitwarden_login_credential"
+          },
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "bitwarden_client_id_aws_secret_key": {
+            "type": "string",
+            "title": "Bitwarden Client Id Aws Secret Key"
+          },
+          "bitwarden_client_secret_aws_secret_key": {
+            "type": "string",
+            "title": "Bitwarden Client Secret Aws Secret Key"
+          },
+          "bitwarden_master_password_aws_secret_key": {
+            "type": "string",
+            "title": "Bitwarden Master Password Aws Secret Key"
+          },
+          "url_parameter_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url Parameter Key"
+          },
+          "bitwarden_collection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bitwarden Collection Id"
+          },
+          "bitwarden_item_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bitwarden Item Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "bitwarden_client_id_aws_secret_key",
+          "bitwarden_client_secret_aws_secret_key",
+          "bitwarden_master_password_aws_secret_key"
+        ],
+        "title": "BitwardenLoginCredentialParameterYAML"
+      },
       "BitwardenSensitiveInformationParameter": {
         "properties": {
           "parameter_type": {
@@ -4445,6 +2477,69 @@
           "modified_at"
         ],
         "title": "BitwardenSensitiveInformationParameter"
+      },
+      "BitwardenSensitiveInformationParameterYAML": {
+        "properties": {
+          "parameter_type": {
+            "type": "string",
+            "const": "bitwarden_sensitive_information",
+            "title": "Parameter Type",
+            "default": "bitwarden_sensitive_information"
+          },
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "bitwarden_client_id_aws_secret_key": {
+            "type": "string",
+            "title": "Bitwarden Client Id Aws Secret Key"
+          },
+          "bitwarden_client_secret_aws_secret_key": {
+            "type": "string",
+            "title": "Bitwarden Client Secret Aws Secret Key"
+          },
+          "bitwarden_master_password_aws_secret_key": {
+            "type": "string",
+            "title": "Bitwarden Master Password Aws Secret Key"
+          },
+          "bitwarden_collection_id": {
+            "type": "string",
+            "title": "Bitwarden Collection Id"
+          },
+          "bitwarden_identity_key": {
+            "type": "string",
+            "title": "Bitwarden Identity Key"
+          },
+          "bitwarden_identity_fields": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Bitwarden Identity Fields"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "bitwarden_client_id_aws_secret_key",
+          "bitwarden_client_secret_aws_secret_key",
+          "bitwarden_master_password_aws_secret_key",
+          "bitwarden_collection_id",
+          "bitwarden_identity_key",
+          "bitwarden_identity_fields"
+        ],
+        "title": "BitwardenSensitiveInformationParameterYAML"
       },
       "BrowserSessionResponse": {
         "properties": {
@@ -4647,6 +2742,49 @@
         ],
         "title": "CodeBlock"
       },
+      "CodeBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "code",
+            "title": "Block Type",
+            "default": "code"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "code": {
+            "type": "string",
+            "title": "Code"
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "code"
+        ],
+        "title": "CodeBlockYAML"
+      },
       "ContextParameter": {
         "properties": {
           "parameter_type": {
@@ -4736,6 +2874,41 @@
           "source"
         ],
         "title": "ContextParameter"
+      },
+      "ContextParameterYAML": {
+        "properties": {
+          "parameter_type": {
+            "type": "string",
+            "const": "context",
+            "title": "Parameter Type",
+            "default": "context"
+          },
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "source_parameter_key": {
+            "type": "string",
+            "title": "Source Parameter Key"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "source_parameter_key"
+        ],
+        "title": "ContextParameterYAML"
       },
       "CreateBrowserSessionRequest": {
         "properties": {
@@ -4869,6 +3042,41 @@
         ],
         "title": "CredentialParameter"
       },
+      "CredentialParameterYAML": {
+        "properties": {
+          "parameter_type": {
+            "type": "string",
+            "const": "credential",
+            "title": "Parameter Type",
+            "default": "credential"
+          },
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "credential_id": {
+            "type": "string",
+            "title": "Credential Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "credential_id"
+        ],
+        "title": "CredentialParameterYAML"
+      },
       "CredentialResponse": {
         "properties": {
           "credential_id": {
@@ -4982,6 +3190,35 @@
           "url"
         ],
         "title": "DownloadToS3Block"
+      },
+      "DownloadToS3BlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "download_to_s3",
+            "title": "Block Type",
+            "default": "download_to_s3"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "url": {
+            "type": "string",
+            "title": "Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "url"
+        ],
+        "title": "DownloadToS3BlockYAML"
       },
       "ExtractionBlock": {
         "properties": {
@@ -5220,6 +3457,104 @@
           "data_extraction_goal"
         ],
         "title": "ExtractionBlock"
+      },
+      "ExtractionBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "extraction",
+            "title": "Block Type",
+            "default": "extraction"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "data_extraction_goal": {
+            "type": "string",
+            "title": "Data Extraction Goal"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title",
+            "default": ""
+          },
+          "data_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {
+
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Schema"
+          },
+          "max_retries": {
+            "type": "integer",
+            "title": "Max Retries",
+            "default": 0
+          },
+          "max_steps_per_run": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps Per Run"
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          },
+          "cache_actions": {
+            "type": "boolean",
+            "title": "Cache Actions",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "data_extraction_goal"
+        ],
+        "title": "ExtractionBlockYAML"
       },
       "FileDownloadBlock": {
         "properties": {
@@ -5465,6 +3800,133 @@
         ],
         "title": "FileDownloadBlock"
       },
+      "FileDownloadBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "file_download",
+            "title": "Block Type",
+            "default": "file_download"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "navigation_goal": {
+            "type": "string",
+            "title": "Navigation Goal"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title",
+            "default": ""
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
+          },
+          "max_retries": {
+            "type": "integer",
+            "title": "Max Retries",
+            "default": 0
+          },
+          "max_steps_per_run": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps Per Run"
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          },
+          "download_suffix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Suffix"
+          },
+          "totp_verification_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Verification Url"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
+          },
+          "cache_actions": {
+            "type": "boolean",
+            "title": "Cache Actions",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "navigation_goal"
+        ],
+        "title": "FileDownloadBlockYAML"
+      },
       "FileInfo": {
         "properties": {
           "url": {
@@ -5540,6 +4002,39 @@
           "file_type"
         ],
         "title": "FileParserBlock"
+      },
+      "FileParserBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "file_url_parser",
+            "title": "Block Type",
+            "default": "file_url_parser"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "file_url": {
+            "type": "string",
+            "title": "File Url"
+          },
+          "file_type": {
+            "$ref": "#/components/schemas/FileType"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "file_url",
+          "file_type"
+        ],
+        "title": "FileParserBlockYAML"
       },
       "FileStorageType": {
         "type": "string",
@@ -5641,6 +4136,89 @@
           "output_parameter"
         ],
         "title": "FileUploadBlock"
+      },
+      "FileUploadBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "file_upload",
+            "title": "Block Type",
+            "default": "file_upload"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "storage_type": {
+            "$ref": "#/components/schemas/FileStorageType",
+            "default": "s3"
+          },
+          "s3_bucket": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "S3 Bucket"
+          },
+          "aws_access_key_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aws Access Key Id"
+          },
+          "aws_secret_access_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aws Secret Access Key"
+          },
+          "region_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region Name"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "title": "FileUploadBlockYAML"
       },
       "ForLoopBlock": {
         "properties": {
@@ -5824,6 +4402,117 @@
           "loop_blocks"
         ],
         "title": "ForLoopBlock"
+      },
+      "ForLoopBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "for_loop",
+            "title": "Block Type",
+            "default": "for_loop"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "loop_blocks": {
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/TaskBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ForLoopBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/CodeBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/TextPromptBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/DownloadToS3BlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/UploadToS3BlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/FileUploadBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/SendEmailBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/FileParserBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ValidationBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ActionBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/NavigationBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ExtractionBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/LoginBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/WaitBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/FileDownloadBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/UrlBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/PDFParserBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/TaskV2BlockYAML"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Loop Blocks"
+          },
+          "loop_over_parameter_key": {
+            "type": "string",
+            "title": "Loop Over Parameter Key",
+            "default": ""
+          },
+          "loop_variable_reference": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Loop Variable Reference"
+          },
+          "complete_if_empty": {
+            "type": "boolean",
+            "title": "Complete If Empty",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "loop_blocks"
+        ],
+        "title": "ForLoopBlockYAML"
       },
       "HTTPValidationError": {
         "properties": {
@@ -6082,6 +4771,155 @@
         ],
         "title": "LoginBlock"
       },
+      "LoginBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "login",
+            "title": "Block Type",
+            "default": "login"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title",
+            "default": ""
+          },
+          "navigation_goal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Navigation Goal"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
+          },
+          "max_retries": {
+            "type": "integer",
+            "title": "Max Retries",
+            "default": 0
+          },
+          "max_steps_per_run": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps Per Run"
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          },
+          "totp_verification_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Verification Url"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
+          },
+          "cache_actions": {
+            "type": "boolean",
+            "title": "Cache Actions",
+            "default": false
+          },
+          "complete_criterion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Complete Criterion"
+          },
+          "terminate_criterion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminate Criterion"
+          },
+          "complete_verification": {
+            "type": "boolean",
+            "title": "Complete Verification",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "title": "LoginBlockYAML"
+      },
       "NavigationBlock": {
         "properties": {
           "label": {
@@ -6320,6 +5158,174 @@
         ],
         "title": "NavigationBlock"
       },
+      "NavigationBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "navigation",
+            "title": "Block Type",
+            "default": "navigation"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "navigation_goal": {
+            "type": "string",
+            "title": "Navigation Goal"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title",
+            "default": ""
+          },
+          "engine": {
+            "$ref": "#/components/schemas/RunEngine",
+            "default": "skyvern-1.0"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
+          },
+          "max_retries": {
+            "type": "integer",
+            "title": "Max Retries",
+            "default": 0
+          },
+          "max_steps_per_run": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps Per Run"
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          },
+          "complete_on_download": {
+            "type": "boolean",
+            "title": "Complete On Download",
+            "default": false
+          },
+          "download_suffix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Suffix"
+          },
+          "totp_verification_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Verification Url"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
+          },
+          "cache_actions": {
+            "type": "boolean",
+            "title": "Cache Actions",
+            "default": false
+          },
+          "complete_criterion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Complete Criterion"
+          },
+          "terminate_criterion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminate Criterion"
+          },
+          "complete_verification": {
+            "type": "boolean",
+            "title": "Complete Verification",
+            "default": true
+          },
+          "include_action_history_in_verification": {
+            "type": "boolean",
+            "title": "Include Action History In Verification",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "navigation_goal"
+        ],
+        "title": "NavigationBlockYAML"
+      },
       "NonEmptyCreditCardCredential": {
         "properties": {
           "card_number": {
@@ -6497,6 +5503,36 @@
         ],
         "title": "OutputParameter"
       },
+      "OutputParameterYAML": {
+        "properties": {
+          "parameter_type": {
+            "type": "string",
+            "const": "output",
+            "title": "Parameter Type",
+            "default": "output"
+          },
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key"
+        ],
+        "title": "OutputParameterYAML"
+      },
       "PDFParserBlock": {
         "properties": {
           "label": {
@@ -6541,6 +5577,47 @@
           "file_url"
         ],
         "title": "PDFParserBlock"
+      },
+      "PDFParserBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "pdf_parser",
+            "title": "Block Type",
+            "default": "pdf_parser"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "file_url": {
+            "type": "string",
+            "title": "File Url"
+          },
+          "json_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Json Schema"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "file_url"
+        ],
+        "title": "PDFParserBlockYAML"
       },
       "PasswordCredentialResponse": {
         "properties": {
@@ -6682,6 +5759,87 @@
           "body"
         ],
         "title": "SendEmailBlock"
+      },
+      "SendEmailBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "send_email",
+            "title": "Block Type",
+            "default": "send_email"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "smtp_host_secret_parameter_key": {
+            "type": "string",
+            "title": "Smtp Host Secret Parameter Key"
+          },
+          "smtp_port_secret_parameter_key": {
+            "type": "string",
+            "title": "Smtp Port Secret Parameter Key"
+          },
+          "smtp_username_secret_parameter_key": {
+            "type": "string",
+            "title": "Smtp Username Secret Parameter Key"
+          },
+          "smtp_password_secret_parameter_key": {
+            "type": "string",
+            "title": "Smtp Password Secret Parameter Key"
+          },
+          "sender": {
+            "type": "string",
+            "title": "Sender"
+          },
+          "recipients": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Recipients"
+          },
+          "subject": {
+            "type": "string",
+            "title": "Subject"
+          },
+          "body": {
+            "type": "string",
+            "title": "Body"
+          },
+          "file_attachments": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Attachments"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "smtp_host_secret_parameter_key",
+          "smtp_port_secret_parameter_key",
+          "smtp_username_secret_parameter_key",
+          "smtp_password_secret_parameter_key",
+          "sender",
+          "recipients",
+          "subject",
+          "body"
+        ],
+        "title": "SendEmailBlockYAML"
       },
       "TOTPCode": {
         "properties": {
@@ -7171,6 +6329,205 @@
         ],
         "title": "TaskBlock"
       },
+      "TaskBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "task",
+            "title": "Block Type",
+            "default": "task"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title",
+            "default": ""
+          },
+          "navigation_goal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Navigation Goal"
+          },
+          "data_extraction_goal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Extraction Goal"
+          },
+          "data_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {
+
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Schema"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
+          },
+          "max_retries": {
+            "type": "integer",
+            "title": "Max Retries",
+            "default": 0
+          },
+          "max_steps_per_run": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps Per Run"
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          },
+          "complete_on_download": {
+            "type": "boolean",
+            "title": "Complete On Download",
+            "default": false
+          },
+          "download_suffix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Suffix"
+          },
+          "totp_verification_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Verification Url"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
+          },
+          "cache_actions": {
+            "type": "boolean",
+            "title": "Cache Actions",
+            "default": false
+          },
+          "complete_criterion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Complete Criterion"
+          },
+          "terminate_criterion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminate Criterion"
+          },
+          "complete_verification": {
+            "type": "boolean",
+            "title": "Complete Verification",
+            "default": true
+          },
+          "include_action_history_in_verification": {
+            "type": "boolean",
+            "title": "Include Action History In Verification",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "title": "TaskBlockYAML"
+      },
       "TaskRunRequest": {
         "properties": {
           "prompt": {
@@ -7572,6 +6929,78 @@
         ],
         "title": "TaskV2Block"
       },
+      "TaskV2BlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "task_v2",
+            "title": "Block Type",
+            "default": "task_v2"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "totp_verification_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Verification Url"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
+          },
+          "max_iterations": {
+            "type": "integer",
+            "title": "Max Iterations",
+            "default": 10
+          },
+          "max_steps": {
+            "type": "integer",
+            "title": "Max Steps",
+            "default": 25
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "prompt"
+        ],
+        "title": "TaskV2BlockYAML"
+      },
       "TextPromptBlock": {
         "properties": {
           "label": {
@@ -7668,6 +7097,66 @@
         ],
         "title": "TextPromptBlock"
       },
+      "TextPromptBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "text_prompt",
+            "title": "Block Type",
+            "default": "text_prompt"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "llm_key": {
+            "type": "string",
+            "title": "Llm Key",
+            "default": "OPENAI_GPT4O_MINI"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt"
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          },
+          "json_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Json Schema"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "prompt"
+        ],
+        "title": "TextPromptBlockYAML"
+      },
       "UploadToS3Block": {
         "properties": {
           "label": {
@@ -7706,6 +7195,41 @@
           "output_parameter"
         ],
         "title": "UploadToS3Block"
+      },
+      "UploadToS3BlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "upload_to_s3",
+            "title": "Block Type",
+            "default": "upload_to_s3"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "title": "UploadToS3BlockYAML"
       },
       "UrlBlock": {
         "properties": {
@@ -7944,6 +7468,35 @@
           "url"
         ],
         "title": "UrlBlock"
+      },
+      "UrlBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "goto_url",
+            "title": "Block Type",
+            "default": "goto_url"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "url": {
+            "type": "string",
+            "title": "Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "url"
+        ],
+        "title": "UrlBlockYAML"
       },
       "ValidationBlock": {
         "properties": {
@@ -8189,6 +7742,80 @@
         ],
         "title": "ValidationBlock"
       },
+      "ValidationBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "validation",
+            "title": "Block Type",
+            "default": "validation"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "complete_criterion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Complete Criterion"
+          },
+          "terminate_criterion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminate Criterion"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "title": "ValidationBlockYAML"
+      },
       "ValidationError": {
         "properties": {
           "loc": {
@@ -8300,6 +7927,35 @@
           "wait_sec"
         ],
         "title": "WaitBlock"
+      },
+      "WaitBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "wait",
+            "title": "Block Type",
+            "default": "wait"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "wait_sec": {
+            "type": "integer",
+            "title": "Wait Sec",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "title": "WaitBlockYAML"
       },
       "Workflow": {
         "properties": {
@@ -8429,6 +8085,91 @@
           "modified_at"
         ],
         "title": "Workflow"
+      },
+      "WorkflowCreateYAMLRequest": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "webhook_callback_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Callback Url"
+          },
+          "totp_verification_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Verification Url"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
+          },
+          "persist_browser_session": {
+            "type": "boolean",
+            "title": "Persist Browser Session",
+            "default": false
+          },
+          "workflow_definition": {
+            "$ref": "#/components/schemas/WorkflowDefinitionYAML"
+          },
+          "is_saved_task": {
+            "type": "boolean",
+            "title": "Is Saved Task",
+            "default": false
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkflowStatus",
+            "default": "published"
+          }
+        },
+        "type": "object",
+        "required": [
+          "title",
+          "workflow_definition"
+        ],
+        "title": "WorkflowCreateYAMLRequest"
       },
       "WorkflowDefinition": {
         "properties": {
@@ -8574,6 +8315,150 @@
         ],
         "title": "WorkflowDefinition"
       },
+      "WorkflowDefinitionYAML": {
+        "properties": {
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameterYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameterYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameterYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameterYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkflowParameterYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameterYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameterYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameterYAML"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameterYAML",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameterYAML",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameterYAML",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameterYAML",
+                  "context": "#/components/schemas/ContextParameterYAML",
+                  "credential": "#/components/schemas/CredentialParameterYAML",
+                  "output": "#/components/schemas/OutputParameterYAML",
+                  "workflow": "#/components/schemas/WorkflowParameterYAML"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters"
+          },
+          "blocks": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/TaskBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ForLoopBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/CodeBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/TextPromptBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/DownloadToS3BlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/UploadToS3BlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/FileUploadBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/SendEmailBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/FileParserBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ValidationBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ActionBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/NavigationBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/ExtractionBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/LoginBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/WaitBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/FileDownloadBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/UrlBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/PDFParserBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/TaskV2BlockYAML"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "block_type",
+                "mapping": {
+                  "action": "#/components/schemas/ActionBlockYAML",
+                  "code": "#/components/schemas/CodeBlockYAML",
+                  "download_to_s3": "#/components/schemas/DownloadToS3BlockYAML",
+                  "extraction": "#/components/schemas/ExtractionBlockYAML",
+                  "file_download": "#/components/schemas/FileDownloadBlockYAML",
+                  "file_upload": "#/components/schemas/FileUploadBlockYAML",
+                  "file_url_parser": "#/components/schemas/FileParserBlockYAML",
+                  "for_loop": "#/components/schemas/ForLoopBlockYAML",
+                  "goto_url": "#/components/schemas/UrlBlockYAML",
+                  "login": "#/components/schemas/LoginBlockYAML",
+                  "navigation": "#/components/schemas/NavigationBlockYAML",
+                  "pdf_parser": "#/components/schemas/PDFParserBlockYAML",
+                  "send_email": "#/components/schemas/SendEmailBlockYAML",
+                  "task": "#/components/schemas/TaskBlockYAML",
+                  "task_v2": "#/components/schemas/TaskV2BlockYAML",
+                  "text_prompt": "#/components/schemas/TextPromptBlockYAML",
+                  "upload_to_s3": "#/components/schemas/UploadToS3BlockYAML",
+                  "validation": "#/components/schemas/ValidationBlockYAML",
+                  "wait": "#/components/schemas/WaitBlockYAML"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Blocks"
+          }
+        },
+        "type": "object",
+        "required": [
+          "parameters",
+          "blocks"
+        ],
+        "title": "WorkflowDefinitionYAML"
+      },
       "WorkflowParameter": {
         "properties": {
           "parameter_type": {
@@ -8684,6 +8569,99 @@
           "credential_id"
         ],
         "title": "WorkflowParameterType"
+      },
+      "WorkflowParameterYAML": {
+        "properties": {
+          "parameter_type": {
+            "type": "string",
+            "const": "workflow",
+            "title": "Parameter Type",
+            "default": "workflow"
+          },
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "workflow_parameter_type": {
+            "$ref": "#/components/schemas/WorkflowParameterType"
+          },
+          "default_value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {
+
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Value"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "workflow_parameter_type"
+        ],
+        "title": "WorkflowParameterYAML"
+      },
+      "WorkflowRequest": {
+        "properties": {
+          "json_definition": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowCreateYAMLRequest"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Workflow definition in JSON format"
+          },
+          "yaml_definition": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Yaml Definition",
+            "description": "Workflow definition in YAML format"
+          }
+        },
+        "type": "object",
+        "title": "WorkflowRequest"
       },
       "WorkflowRunRequest": {
         "properties": {

@@ -114,16 +114,15 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
   ```
   A local browser will pop up. Skyvern will start executing the task in the browser and close the it when the task is done. You will be able to review the task from http://localhost:8080/history
 
-  You can also send a task to Skyvern Cloud:
+  You can also run a task autonomously on Skyvern Cloud:
   ```python
   from skyvern import Skyvern
   
-  skyvern = Skyvern()
+  skyvern = Skyvern(api_key="SKYVERN API KEY")
   task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
   print(task)
   ```
-  
-  Or send the task anywhere Skyvern is hosted:
+  Or any hosted Skyvern service:
   ```python
   skyvern = Skyvern(base_url="http://localhost:8000", api_key="SKYVERN API KEY")
   task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
@@ -313,6 +312,7 @@ Note: Our setup script does these two for you, but they are here for reference.
     ./run_ui.sh
     ```
 1. Navigate to `http://localhost:8080` in your browser to start using the UI
+   *The Skyvern CLI supports Windows, WSL, macOS, and Linux environments.*
 
 ## Additional Setup for Contributors
 If you're looking to contribute to Skyvern, you'll need to install the pre-commit hooks to ensure code quality and consistency. You can do this by running the following command:

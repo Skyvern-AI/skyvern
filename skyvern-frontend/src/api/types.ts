@@ -123,6 +123,7 @@ export type TaskApiResponse = {
   failure_reason: string | null;
   errors: Array<Record<string, unknown>>;
   max_steps_per_run: number | null;
+  task_v2: TaskV2 | null;
   workflow_run_id: string | null;
 };
 

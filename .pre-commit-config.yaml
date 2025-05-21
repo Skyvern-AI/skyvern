@@ -101,4 +101,4 @@ repos:
         name: Alembic Check
         entry: ./run_alembic_check.sh
         language: script
-        stages: [ commit ]
+        stages: [ manual ]

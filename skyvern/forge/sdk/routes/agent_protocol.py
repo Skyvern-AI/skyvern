@@ -26,11 +26,13 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.routes.code_samples import (
     CANCEL_RUN_CODE_SAMPLE,
     CREATE_WORKFLOW_CODE_SAMPLE,
+    CREATE_WORKFLOW_CODE_SAMPLE_PYTHON,
     DELETE_WORKFLOW_CODE_SAMPLE,
     GET_RUN_CODE_SAMPLE,
     RUN_TASK_CODE_SAMPLE,
     RUN_WORKFLOW_CODE_SAMPLE,
     UPDATE_WORKFLOW_CODE_SAMPLE,
+    UPDATE_WORKFLOW_CODE_SAMPLE_PYTHON,
 )
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
@@ -80,6 +82,7 @@ from skyvern.schemas.runs import (
     WorkflowRunRequest,
     WorkflowRunResponse,
 )
+from skyvern.schemas.workflows import WorkflowRequest
 from skyvern.services import run_service, task_v1_service, task_v2_service, workflow_service
 from skyvern.webeye.actions.actions import Action
 
@@ -437,32 +440,11 @@ async def cancel_run(
     response_model=Workflow,
     include_in_schema=False,
 )
-@base_router.post(
-    "/workflows",
-    response_model=Workflow,
-    tags=["Workflows"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "create_workflow",
-        "x-fern-examples": [{"code-samples": [{"sdk": "curl", "code": CREATE_WORKFLOW_CODE_SAMPLE}]}],
-    },
-    description="Create a new workflow",
-    summary="Create a new workflow",
-    responses={
-        200: {"description": "Successfully created workflow"},
-        422: {"description": "Invalid workflow definition"},
-    },
-)
-@base_router.post(
-    "/workflows/",
-    response_model=Workflow,
-    include_in_schema=False,
-)
-async def create_workflow(
+async def create_workflow_legacy(
     request: Request,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Workflow:
-    analytics.capture("skyvern-oss-agent-workflow-create")
+    analytics.capture("skyvern-oss-agent-workflow-create-legacy")
     raw_yaml = await request.body()
     try:
         workflow_yaml = yaml.safe_load(raw_yaml)
@@ -481,6 +463,63 @@ async def create_workflow(
         raise FailedToCreateWorkflow(str(e))
 
 
+@base_router.post(
+    "/workflows",
+    response_model=Workflow,
+    tags=["Workflows"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "workflows",
+        "x-fern-sdk-method-name": "create_workflow",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "curl", "code": CREATE_WORKFLOW_CODE_SAMPLE},
+                    {"sdk": "python", "code": CREATE_WORKFLOW_CODE_SAMPLE_PYTHON},
+                ]
+            }
+        ],
+    },
+    description="Create a new workflow definition",
+    summary="Create a new workflow definition",
+    responses={
+        200: {"description": "Successfully created workflow"},
+        422: {"description": "Invalid workflow definition"},
+    },
+)
+@base_router.post(
+    "/workflows/",
+    response_model=Workflow,
+    include_in_schema=False,
+)
+async def create_workflow(
+    data: WorkflowRequest,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Workflow:
+    analytics.capture("skyvern-oss-agent-workflow-create")
+    try:
+        if data.yaml_definition:
+            workflow_json_from_yaml = yaml.safe_load(data.yaml_definition)
+            workflow_definition = WorkflowCreateYAMLRequest.model_validate(workflow_json_from_yaml)
+        elif data.json_definition:
+            workflow_definition = data.json_definition
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid workflow definition. Workflow should be provided in either yaml or json format.",
+            )
+        return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+            organization=current_org,
+            request=workflow_definition,
+        )
+    except yaml.YAMLError:
+        raise HTTPException(status_code=422, detail="Invalid YAML")
+    except WorkflowParameterMissingRequiredValue as e:
+        raise e
+    except Exception as e:
+        LOG.error("Failed to create workflow", exc_info=True, organization_id=current_org.organization_id)
+        raise FailedToCreateWorkflow(str(e))
+
+
 @legacy_base_router.put(
     "/workflows/{workflow_id}",
     openapi_extra={
@@ -488,7 +527,7 @@ async def create_workflow(
             "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
             "required": True,
         },
-        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "update_workflow",
     },
     response_model=Workflow,
@@ -505,38 +544,7 @@ async def create_workflow(
     response_model=Workflow,
     include_in_schema=False,
 )
-@base_router.post(
-    "/workflows/{workflow_id}",
-    response_model=Workflow,
-    tags=["Workflows"],
-    openapi_extra={
-        "requestBody": {
-            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
-            "required": True,
-        },
-        "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "update_workflow",
-        "x-fern-examples": [{"code-samples": [{"sdk": "curl", "code": UPDATE_WORKFLOW_CODE_SAMPLE}]}],
-    },
-    description="Update a workflow definition",
-    summary="Update a workflow definition",
-    responses={
-        200: {"description": "Successfully updated workflow"},
-        422: {"description": "Invalid workflow definition"},
-    },
-)
-@base_router.post(
-    "/workflows/{workflow_id}/",
-    openapi_extra={
-        "requestBody": {
-            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
-            "required": True,
-        },
-    },
-    response_model=Workflow,
-    include_in_schema=False,
-)
-async def update_workflow(
+async def update_workflow_legacy(
     request: Request,
     workflow_id: str = Path(
         ..., description="The ID of the workflow to update. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
@@ -569,11 +577,83 @@ async def update_workflow(
         raise FailedToUpdateWorkflow(workflow_id, f"<{type(e).__name__}: {str(e)}>")
 
 
+@base_router.post(
+    "/workflows/{workflow_id}",
+    response_model=Workflow,
+    tags=["Workflows"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "workflows",
+        "x-fern-sdk-method-name": "update_workflow",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "curl", "code": UPDATE_WORKFLOW_CODE_SAMPLE},
+                    {"sdk": "python", "code": UPDATE_WORKFLOW_CODE_SAMPLE_PYTHON},
+                ]
+            }
+        ],
+    },
+    description="Update a workflow definition",
+    summary="Update a workflow definition",
+    responses={
+        200: {"description": "Successfully updated workflow"},
+        422: {"description": "Invalid workflow definition"},
+    },
+)
+@base_router.post(
+    "/workflows/{workflow_id}/",
+    openapi_extra={
+        "requestBody": {
+            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
+            "required": True,
+        },
+    },
+    response_model=Workflow,
+    include_in_schema=False,
+)
+async def update_workflow(
+    data: WorkflowRequest,
+    workflow_id: str = Path(
+        ..., description="The ID of the workflow to update. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Workflow:
+    analytics.capture("skyvern-oss-agent-workflow-update")
+    try:
+        if data.yaml_definition:
+            workflow_json_from_yaml = yaml.safe_load(data.yaml_definition)
+            workflow_definition = WorkflowCreateYAMLRequest.model_validate(workflow_json_from_yaml)
+        elif data.json_definition:
+            workflow_definition = data.json_definition
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid workflow definition. Workflow should be provided in either yaml or json format.",
+            )
+        return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+            organization=current_org,
+            request=workflow_definition,
+            workflow_permanent_id=workflow_id,
+        )
+    except yaml.YAMLError:
+        raise HTTPException(status_code=422, detail="Invalid YAML")
+    except WorkflowParameterMissingRequiredValue as e:
+        raise e
+    except Exception as e:
+        LOG.exception(
+            "Failed to update workflow",
+            exc_info=True,
+            organization_id=current_org.organization_id,
+            workflow_permanent_id=workflow_id,
+        )
+        raise FailedToUpdateWorkflow(workflow_id, f"<{type(e).__name__}: {str(e)}>")
+
+
 @legacy_base_router.delete(
     "/workflows/{workflow_id}",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "delete_workflow",
     },
 )
@@ -582,7 +662,7 @@ async def update_workflow(
     "/workflows/{workflow_id}/delete",
     tags=["Workflows"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "delete_workflow",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": DELETE_WORKFLOW_CODE_SAMPLE}]}],
     },
