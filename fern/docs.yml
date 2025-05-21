@@ -74,8 +74,6 @@ navigation:
           path: getting-started/prompting-guide.mdx
     - section: Tasks
       contents:
-        - page: Introduction
-          path: running-tasks/introduction.mdx
         - page: Tasks API
           path: running-tasks/api-spec.mdx
         - api: Endpoints
@@ -114,6 +112,14 @@ navigation:
           path: integrations/n8n.mdx
         - page: Workato
           path: integrations/workato.mdx
+    - section: Credentials
+      contents:
+        - page: Passwords
+          path: credentials/passwords.mdx
+        - page: Credit Cards
+          path: credentials/credit_cards.mdx
+        - page: TOTP (2FA/MFA/Verification Code)
+          path: credentials/totp.mdx
   - tab: api
     layout:
       - api: API Reference
