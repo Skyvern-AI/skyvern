@@ -76,10 +76,6 @@ navigation:
       contents:
         - page: Tasks API
           path: running-tasks/api-spec.mdx
-        - api: Endpoints
-          paginated: true
-          snippets: 
-            python: skyvern
         - page: Webhooks FAQ
           path: running-tasks/webhooks-faq.mdx
         - page: Visualizing Results
