@@ -4,7 +4,7 @@ import typer
 
 from .console import console
 
-workflow_app = typer.Typer()
+workflow_app = typer.Typer(help="Manage Skyvern workflows.")
 
 
 @workflow_app.command()
