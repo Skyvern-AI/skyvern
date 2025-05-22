@@ -242,7 +242,6 @@ export class Skyvern implements INodeType {
                         name: 'engine',
                         type: 'options',
                         default: '',
-                        required: false,
                         options: [
                             {
                                 name: 'TaskV1',
@@ -252,7 +251,10 @@ export class Skyvern implements INodeType {
                                 name: 'TaskV2',
                                 value: 'v2',
                             },
-
+                            {
+                                name: 'THIS FIELD IS DEPRECATED',
+                                value: '',
+                            },
                         ],
                     },
                     {
