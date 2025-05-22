@@ -45,8 +45,8 @@ tabs:
     href: https://blog.skyvern.com
   community:
     display-name: Community 
-    icon: discord
-    href: https://discord.gg/fG2XXEuQX3
+    icon: fa-brands fa-discord
+    href: https://discord.gg/m6FmQV7nU3
   github:
     display-name: Github
     icon: fa-brands fa-github
@@ -126,6 +126,7 @@ navigation:
         snippets:
           python: skyvern
   - tab: blog
+  - tab: community
   - tab: github
   - tab: cloud
   - tab: demo
