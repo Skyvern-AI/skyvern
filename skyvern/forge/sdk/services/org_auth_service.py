@@ -24,8 +24,8 @@ ALGORITHM = "HS256"
 
 
 async def get_current_org(
-    x_api_key: Annotated[str | None, Header()] = None,
-    authorization: Annotated[str | None, Header()] = None,
+    x_api_key: Annotated[str | None, Header(description="API key for authentication")] = None,
+    authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> Organization:
     if not x_api_key and not authorization:
         raise HTTPException(

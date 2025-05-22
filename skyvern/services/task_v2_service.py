@@ -494,8 +494,8 @@ async def run_task_v2_helper(
         browser_state = app.BROWSER_MANAGER.get_for_workflow_run(
             workflow_run_id=workflow_run_id, parent_workflow_run_id=workflow_run.parent_workflow_run_id
         )
+        fallback_occurred = False
         if browser_state is None:
-            fallback_occurred = False
             try:
                 browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                     workflow_run=workflow_run,
