@@ -74,8 +74,8 @@ navigation:
           path: getting-started/prompting-guide.mdx
     - section: Tasks
       contents:
-				- page: Run Tasks
-					path: running-tasks/run-tasks.mdx
+        - page: Run Tasks
+          path: running-tasks/run-tasks.mdx
         - page: Tasks API
           path: running-tasks/api-spec.mdx
         - page: Webhooks FAQ
