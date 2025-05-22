@@ -142,8 +142,3 @@ def init_browser() -> None:
         progress.add_task("[bold blue]Downloading Chromium, this may take a moment...", total=None)
         subprocess.run(["playwright", "install", "chromium"], check=True)
     console.print("✅ [green]Chromium installation complete.[/green]")
-
-
-def init_mcp() -> None:
-    """Initialize only the MCP server configuration."""
-    setup_mcp()
