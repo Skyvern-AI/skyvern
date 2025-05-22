@@ -4,7 +4,7 @@ import typer
 
 from .console import console
 
-tasks_app = typer.Typer()
+tasks_app = typer.Typer(help="Manage Skyvern tasks and operations.")
 
 
 @tasks_app.command()

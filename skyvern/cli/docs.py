@@ -9,7 +9,10 @@ from .console import console
 
 DOCS_URL = "https://docs.skyvern.com"
 
-docs_app = typer.Typer(invoke_without_command=True)
+docs_app = typer.Typer(
+    invoke_without_command=True,
+    help="Open Skyvern documentation in your browser.",
+)
 
 
 @docs_app.callback()
