@@ -362,16 +362,16 @@ CREATE_CREDENTIAL_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="your_api_key")
 await skyvern.credentials.create_credential(
-    name="Amazon Login",
+    name="My Credential",
     credential_type="password",
-    credential={"username": "user@example.com", "password": "myamazonpassword"},
+    credential={"username": "username", "password": "password"},
 )
 """
 CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="your_api_key")
 await skyvern.credentials.create_credential(
-    name="Amazon Login",
+    name="My Credit Card",
     credential_type="credit_card",
     credential={
         "card_number": "4242424242424242",
