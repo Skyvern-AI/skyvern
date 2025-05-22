@@ -102,7 +102,13 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
   skyvern run ui
   ```
 
-5. **Run task**
+5. **Check component status**
+
+  ```bash
+  skyvern status
+  ```
+
+6. **Run task**
 
   Run a skyvern task locally:
   ```python
