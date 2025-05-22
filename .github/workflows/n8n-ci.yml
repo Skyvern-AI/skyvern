@@ -29,11 +29,9 @@ jobs:
         run_install: false
         
     - name: Install dependencies
-      run: |
-        cd integrations/n8n
-        pnpm install --frozen-lockfile
+      working-directory: integrations/n8n
+      run: pnpm install --frozen-lockfile
         
     - name: Build and Lint
-      run: |
-        cd integrations/n8n
-        pnpm prepublishOnly
+      working-directory: integrations/n8n
+      run: pnpm prepublishOnly
