@@ -4,15 +4,24 @@ from dotenv import load_dotenv
 from .docs import docs_app
 from .init_command import init, init_browser
 from .run_commands import run_app
+from .status import status_app
 from .tasks import tasks_app
 from .workflow import workflow_app
 
-cli_app = typer.Typer()
+cli_app = typer.Typer(
+    help="""[bold]Skyvern CLI[/bold]\nManage and run your local Skyvern environment.""",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
 cli_app.add_typer(run_app, name="run")
 cli_app.add_typer(workflow_app, name="workflow")
 cli_app.add_typer(tasks_app, name="tasks")
 cli_app.add_typer(docs_app, name="docs")
-init_app = typer.Typer(invoke_without_command=True)
+cli_app.add_typer(status_app, name="status")
+init_app = typer.Typer(
+    invoke_without_command=True,
+    help="Interactively configure Skyvern and its dependencies.",
+)
 cli_app.add_typer(init_app, name="init")
 
 
