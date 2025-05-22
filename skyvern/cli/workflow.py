@@ -6,21 +6,15 @@ import json
 import os
 from typing import Optional
 
-import os
-
 import typer
 from dotenv import load_dotenv
 from rich.panel import Panel
-
-from skyvern.forge import app
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 
 from skyvern.client import Skyvern
 from skyvern.config import settings
 
 from .console import console
 from .tasks import _list_workflow_tasks
-
 
 workflow_app = typer.Typer(help="Manage Skyvern workflows.")
 
@@ -37,6 +31,7 @@ def workflow_callback(
 ) -> None:
     """Store the provided API key in the Typer context."""
     ctx.obj = {"api_key": api_key}
+
 
 def _get_client(api_key: Optional[str] = None) -> Skyvern:
     """Instantiate a Skyvern SDK client using environment variables."""

@@ -9,9 +9,7 @@ from .tasks import tasks_app
 from .workflow import workflow_app
 
 cli_app = typer.Typer(
-    help=(
-        """[bold]Skyvern CLI[/bold]\nManage and run your local Skyvern environment."""
-    ),
+    help=("""[bold]Skyvern CLI[/bold]\nManage and run your local Skyvern environment."""),
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
@@ -20,14 +18,10 @@ cli_app.add_typer(
     name="run",
     help="Run Skyvern services like the API server, UI, and MCP.",
 )
-cli_app.add_typer(
-    workflow_app, name="workflow", help="Workflow management commands."
-)
+cli_app.add_typer(workflow_app, name="workflow", help="Workflow management commands.")
 cli_app.add_typer(tasks_app, name="tasks", help="Task management commands.")
 cli_app.add_typer(docs_app, name="docs", help="Open Skyvern documentation.")
-cli_app.add_typer(
-    status_app, name="status", help="Check if Skyvern services are running."
-)
+cli_app.add_typer(status_app, name="status", help="Check if Skyvern services are running.")
 init_app = typer.Typer(
     invoke_without_command=True,
     help="Interactively configure Skyvern and its dependencies.",

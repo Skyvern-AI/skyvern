@@ -15,7 +15,6 @@ from skyvern.config import settings
 
 from .console import console
 
-
 tasks_app = typer.Typer(help="Manage Skyvern tasks and operations.")
 
 

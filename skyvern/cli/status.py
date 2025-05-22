@@ -1,13 +1,12 @@
 import os
 import socket
+
 import typer
 from rich.table import Table
 
 from .console import console
 
-status_app = typer.Typer(
-    help="Check status of Skyvern components.", invoke_without_command=True
-)
+status_app = typer.Typer(help="Check status of Skyvern components.", invoke_without_command=True)
 
 
 def _check_port(port: int) -> bool:
