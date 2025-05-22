@@ -16,7 +16,7 @@ from skyvern.utils import detect_os
 
 from .console import console
 
-run_app = typer.Typer()
+run_app = typer.Typer(help="Commands to run Skyvern services such as the API server or UI.")
 
 mcp = FastMCP("Skyvern")
 
