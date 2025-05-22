@@ -2,31 +2,23 @@ import typer
 from dotenv import load_dotenv
 
 from .docs import docs_app
-from .init_command import init, init_browser
+from .init_command import init, init_browser, init_mcp
 from .run_commands import run_app
-from .status import status_app
+from .setup_commands import setup_mcp_command
 from .tasks import tasks_app
 from .workflow import workflow_app
 
-cli_app = typer.Typer(
-    help=("""[bold]Skyvern CLI[/bold]\nManage and run your local Skyvern environment."""),
-    no_args_is_help=True,
-    rich_markup_mode="rich",
-)
-cli_app.add_typer(
-    run_app,
-    name="run",
-    help="Run Skyvern services like the API server, UI, and MCP.",
-)
-cli_app.add_typer(workflow_app, name="workflow", help="Workflow management commands.")
-cli_app.add_typer(tasks_app, name="tasks", help="Task management commands.")
-cli_app.add_typer(docs_app, name="docs", help="Open Skyvern documentation.")
-cli_app.add_typer(status_app, name="status", help="Check if Skyvern services are running.")
-init_app = typer.Typer(
-    invoke_without_command=True,
-    help="Interactively configure Skyvern and its dependencies.",
-)
+cli_app = typer.Typer()
+cli_app.add_typer(run_app, name="run")
+cli_app.add_typer(workflow_app, name="workflow")
+cli_app.add_typer(tasks_app, name="tasks")
+cli_app.add_typer(docs_app, name="docs")
+setup_app = typer.Typer()
+cli_app.add_typer(setup_app, name="setup")
+init_app = typer.Typer(invoke_without_command=True)
 cli_app.add_typer(init_app, name="init")
+
+setup_app.command(name="mcp")(setup_mcp_command)
 
 
 @init_app.callback()
@@ -43,6 +35,12 @@ def init_callback(
 def init_browser_command() -> None:
     """Initialize only the browser configuration."""
     init_browser()
+
+
+@init_app.command(name="mcp")
+def init_mcp_command() -> None:
+    """Initialize only the MCP server configuration."""
+    init_mcp()
 
 
 if __name__ == "__main__":  # pragma: no cover - manual CLI invocation
