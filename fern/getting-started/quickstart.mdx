@@ -3,16 +3,27 @@ title: Quickstart
 slug: getting-started/quickstart
 ---
 
-## Quickstart
-### Python SDK Installation
-> ⚠️ **REQUIREMENT**: Skyvern runs with Python 3.11 ⚠️
+## Skyvern Cloud
+Sign up on https://app.skyvern.com/ to get $5 free credits.
 
+Ask the Skyvern agent to run a task and see it in action live! Here are some examples you can try:
+- `Navigate to the Hacker News homepage and get the top 3 posts.`
+- `Go to google finance and find the "AAPL" stock price. COMPLETE when the search results for "AAPL" are displayed and the stock price is extracted.`
+
+<img src="../images/quickstart/quickstart_prompt.png" />
+<img src="../images/quickstart/quickstart_task_live.png" />
+
+## Python SDK
+<Tip title="Supported Python Versions" icon="fa-brands fa-python">
+Python 3.11, 3.12 and 3.13
+</Tip>
+
+### Install Skyvern
 ```bash
 pip install skyvern
 ```
 
-### Run Task
-#### Run Task On A Skyvern Service
+### Run Task On A Skyvern Service
 Get your API key from [Skyvern Cloud](https://app.skyvern.com/settings). Send the task to Skyvern Cloud:
 ```python
 from skyvern import Skyvern
@@ -26,7 +37,7 @@ print(task)
 ```
 More API & SDK information can be found in the [API Reference](/api-reference) section.
 
-#### Run Task Locally
+### Run Task Locally
 You can also run browser tasks locally in your python code but it takes a bit more effort to set up the environment:
 
 1. **Configure Skyvern** Run the setup wizard which will guide you through the configuration process, including Skyvern [MCP](https://github.com/Skyvern-AI/skyvern/blob/main/integrations/mcp/README.md) integration. This will generate a `.env` as the configuration settings file.
@@ -40,10 +51,10 @@ You can also run browser tasks locally in your python code but it takes a bit mo
         
         skyvern = Skyvern()
         
-        task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
-        print(task)
+        task = await skyvern.run_task(prompt="Find the top post on hackernews today")
+        print(task.model_dump())
         ```
-        A local browser will pop up. Skyvern will start executing the task in the browser and close it when the task is done. You will be able to review the task from http://localhost:8080/history
+        A local browser will pop up. Skyvern will start executing the task in the browser and close the browser when the task is done.
 
 <CardGroup cols={2}>
   <Card
