@@ -1,5 +1,6 @@
 import {
 	IAuthenticateGeneric,
+	ICredentialTestRequest,
 	ICredentialType,
 	INodeProperties,
 } from 'n8n-workflow';
@@ -33,6 +34,12 @@ export class SkyvernApi implements ICredentialType {
                 'x-api-key': '={{$credentials.apiKey}}',
                 'Content-Type': 'application/json',
             }
+		},
+	};
+	test: ICredentialTestRequest = {
+		request: {
+			baseURL: '={{$credentials?.baseUrl}}',
+			url: '/api/v1/organizations',
 		},
 	};
 }
