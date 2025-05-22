@@ -99,14 +99,14 @@ async def download_file(url: str, max_size_mb: int | None = None) -> str:
                 temp_dir = make_temp_directory(prefix="skyvern_downloads_")
 
                 # Check for download parameter in Supabase URLs
-                if "supabase.co" in a.netloc:
+                file_name = os.path.basename(a.path)
+                if "supabase.co" in a.netloc.lower():
                     query_params = dict(parse_qsl(a.query))
                     if "download" in query_params:
                         file_name = query_params["download"]
                     else:
                         file_name = os.path.basename(a.path)
-                else:
-                    file_name = os.path.basename(a.path)
+                file_name = sanitize_filename(file_name)
 
                 # if no suffix in the URL, we need to parse it from HTTP headers
                 if not Path(file_name).suffix:
