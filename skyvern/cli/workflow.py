@@ -6,7 +6,7 @@ import json
 import os
 from typing import Optional
 
-import asyncio
+import os
 
 import typer
 from dotenv import load_dotenv
@@ -37,30 +37,11 @@ def workflow_callback(
     """Store the provided API key in the Typer context."""
     ctx.obj = {"api_key": api_key}
 
-
-async def _fetch_local_api_key() -> str | None:
-    """Retrieve the latest local API key from the database."""
-    try:
-        organization = await app.DATABASE.get_organization_by_domain("skyvern.local")
-        if not organization:
-            return None
-        org_auth_token = await app.DATABASE.get_valid_org_auth_token(
-            organization_id=organization.organization_id,
-            token_type=OrganizationAuthTokenType.api,
-        )
-        return org_auth_token.token if org_auth_token else None
-    except Exception:
-        return None
-
-
 def _get_client(api_key: Optional[str] = None) -> Skyvern:
     """Instantiate a Skyvern SDK client using environment variables."""
     load_dotenv()
     load_dotenv(".env")
-    key = api_key or os.getenv("SKYVERN_API_KEY")
-    if not key and settings.ENV == "local":
-        key = asyncio.run(_fetch_local_api_key())
-    key = key or settings.SKYVERN_API_KEY
+    key = api_key or os.getenv("SKYVERN_API_KEY") or settings.SKYVERN_API_KEY
     return Skyvern(base_url=settings.SKYVERN_BASE_URL, api_key=key)
 
 
@@ -82,7 +63,7 @@ def start_workflow(
     client = _get_client(ctx.obj.get("api_key") if ctx.obj else None)
     run_resp = client.agent.run_workflow(
         workflow_id=workflow_id,
-        parameters=params_dict or None,
+        parameters=params_dict,
         title=title,
         max_steps_override=max_steps,
     )
