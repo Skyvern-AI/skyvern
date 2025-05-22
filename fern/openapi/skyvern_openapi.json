@@ -28,8 +28,10 @@
                   "type": "null"
                 }
               ],
+              "description": "API key for authentication",
               "title": "X-Api-Key"
-            }
+            },
+            "description": "API key for authentication"
           },
           {
             "name": "x-user-agent",
@@ -45,22 +47,6 @@
                 }
               ],
               "title": "X-User-Agent"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
             }
           }
         ],
@@ -145,8 +131,10 @@
                   "type": "null"
                 }
               ],
+              "description": "API key for authentication",
               "title": "X-Api-Key"
-            }
+            },
+            "description": "API key for authentication"
           },
           {
             "name": "x-max-steps-override",
@@ -178,22 +166,6 @@
                 }
               ],
               "title": "X-User-Agent"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
             }
           }
         ],
@@ -284,24 +256,10 @@
                   "type": "null"
                 }
               ],
+              "description": "API key for authentication",
               "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
+            },
+            "description": "API key for authentication"
           }
         ],
         "responses": {
@@ -394,24 +352,10 @@
                   "type": "null"
                 }
               ],
+              "description": "API key for authentication",
               "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
+            },
+            "description": "API key for authentication"
           }
         ],
         "responses": {
@@ -472,24 +416,10 @@
                   "type": "null"
                 }
               ],
+              "description": "API key for authentication",
               "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
+            },
+            "description": "API key for authentication"
           }
         ],
         "requestBody": {
@@ -571,24 +501,10 @@
                   "type": "null"
                 }
               ],
+              "description": "API key for authentication",
               "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
+            },
+            "description": "API key for authentication"
           }
         ],
         "requestBody": {
@@ -670,24 +586,10 @@
                   "type": "null"
                 }
               ],
+              "description": "API key for authentication",
               "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
+            },
+            "description": "API key for authentication"
           }
         ],
         "responses": {
@@ -748,24 +650,10 @@
                   "type": "null"
                 }
               ],
+              "description": "API key for authentication",
               "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
+            },
+            "description": "API key for authentication"
           }
         ],
         "requestBody": {
@@ -837,24 +725,10 @@
                   "type": "null"
                 }
               ],
+              "description": "API key for authentication",
               "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
+            },
+            "description": "API key for authentication"
           }
         ],
         "responses": {
@@ -936,24 +810,10 @@
                   "type": "null"
                 }
               ],
+              "description": "API key for authentication",
               "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
+            },
+            "description": "API key for authentication"
           }
         ],
         "responses": {
@@ -1031,24 +891,10 @@
                   "type": "null"
                 }
               ],
+              "description": "API key for authentication",
               "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
+            },
+            "description": "API key for authentication"
           }
         ],
         "responses": {
@@ -1099,7 +945,7 @@
           "Credentials"
         ],
         "summary": "Send TOTP (2FA, MFA) code to Skyvern",
-        "description": "Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern",
+        "description": "Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern. This endpoint stores the code in database so that Skyvern can use it while running tasks/workflows.",
         "operationId": "send_totp_code_v1_credentials_totp_post",
         "parameters": [
           {
@@ -1115,24 +961,10 @@
                   "type": "null"
                 }
               ],
+              "description": "API key for authentication",
               "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
+            },
+            "description": "API key for authentication"
           }
         ],
         "requestBody": {
@@ -1193,24 +1025,10 @@
                   "type": "null"
                 }
               ],
+              "description": "API key for authentication",
               "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
+            },
+            "description": "API key for authentication"
           }
         ],
         "requestBody": {
@@ -1265,11 +1083,11 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.credentials.create_credential(\n    name=\"Amazon Login\",\n    credential_type=\"password\",\n    credential={\"username\": \"user@example.com\", \"password\": \"myamazonpassword\"},\n)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.credentials.create_credential(\n    name=\"My Credential\",\n    credential_type=\"password\",\n    credential={\"username\": \"username\", \"password\": \"password\"},\n)\n"
               },
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.credentials.create_credential(\n    name=\"Amazon Login\",\n    credential_type=\"credit_card\",\n    credential={\n        \"card_number\": \"4242424242424242\",\n        \"card_cvv\": \"424\",\n        \"card_exp_month\": \"12\",\n        \"card_exp_year\": \"2028\",\n        \"card_brand\": \"visa\",\n        \"card_holder_name\": \"John Doe\",\n    },\n)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"your_api_key\")\nawait skyvern.credentials.create_credential(\n    name=\"My Credit Card\",\n    credential_type=\"credit_card\",\n    credential={\n        \"card_number\": \"4242424242424242\",\n        \"card_cvv\": \"424\",\n        \"card_exp_month\": \"12\",\n        \"card_exp_year\": \"2028\",\n        \"card_brand\": \"visa\",\n        \"card_holder_name\": \"John Doe\",\n    },\n)\n"
               }
             ]
           }
@@ -1330,24 +1148,10 @@
                   "type": "null"
                 }
               ],
+              "description": "API key for authentication",
               "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
+            },
+            "description": "API key for authentication"
           }
         ],
         "responses": {
@@ -1427,24 +1231,10 @@
                   "type": "null"
                 }
               ],
+              "description": "API key for authentication",
               "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
+            },
+            "description": "API key for authentication"
           }
         ],
         "responses": {
@@ -1513,24 +1303,10 @@
                   "type": "null"
                 }
               ],
+              "description": "API key for authentication",
               "title": "X-Api-Key"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
+            },
+            "description": "API key for authentication"
           }
         ],
         "responses": {
@@ -6774,6 +6550,21 @@
             "title": "Recording Url",
             "description": "URL to the recording of the run"
           },
+          "screenshot_urls": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Screenshot Urls",
+            "description": "List of last n screenshot URLs in reverse chronological order - the first one the list is the latest screenshot."
+          },
           "failure_reason": {
             "anyOf": [
               {
@@ -8835,6 +8626,21 @@
             ],
             "title": "Recording Url",
             "description": "URL to the recording of the run"
+          },
+          "screenshot_urls": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Screenshot Urls",
+            "description": "List of last n screenshot URLs in reverse chronological order - the first one the list is the latest screenshot."
           },
           "failure_reason": {
             "anyOf": [
