@@ -74,6 +74,8 @@ navigation:
           path: getting-started/prompting-guide.mdx
     - section: Tasks
       contents:
+				- page: Run Tasks
+					path: running-tasks/run-tasks.mdx
         - page: Tasks API
           path: running-tasks/api-spec.mdx
         - page: Webhooks FAQ
@@ -103,7 +105,7 @@ navigation:
         - page: Password Management
           path: credentials/passwords.mdx
         - page: Credit Card Management
-          path: credentials/credit_cards.mdx
+          path: credentials/credit-cards.mdx
         - page: TOTP (2FA/MFA/Verification Code)
           path: credentials/totp.mdx
         - page: Bitwarden
