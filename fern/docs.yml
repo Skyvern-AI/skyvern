@@ -100,6 +100,18 @@ navigation:
           path: workflows/workflow-blocks.mdx
         - page: What the heck is a parameter?
           path: workflows/what-is-a-parameter.mdx
+    - section: Credentials
+      contents:
+        - page: Introduction
+          path: credentials/introduction.mdx
+        - page: Password Management
+          path: credentials/passwords.mdx
+        - page: Credit Card Management
+          path: credentials/credit_cards.mdx
+        - page: TOTP (2FA/MFA/Verification Code)
+          path: credentials/totp.mdx
+        - page: Bitwarden
+          path: credentials/bitwarden.mdx
     - section: Integrations
       contents:
         - page: Skyvern MCP
@@ -112,14 +124,6 @@ navigation:
           path: integrations/n8n.mdx
         - page: Workato
           path: integrations/workato.mdx
-    - section: Credentials
-      contents:
-        - page: Passwords
-          path: credentials/passwords.mdx
-        - page: Credit Cards
-          path: credentials/credit_cards.mdx
-        - page: TOTP (2FA/MFA/Verification Code)
-          path: credentials/totp.mdx
   - tab: api
     layout:
       - api: API Reference
