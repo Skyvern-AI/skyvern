@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Optional
 
 import os
@@ -10,6 +11,9 @@ import os
 import typer
 from dotenv import load_dotenv
 from rich.panel import Panel
+
+from skyvern.forge import app
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 
 from skyvern.client import Skyvern
 from skyvern.config import settings
@@ -33,7 +37,6 @@ def workflow_callback(
 ) -> None:
     """Store the provided API key in the Typer context."""
     ctx.obj = {"api_key": api_key}
-
 
 def _get_client(api_key: Optional[str] = None) -> Skyvern:
     """Instantiate a Skyvern SDK client using environment variables."""
@@ -61,7 +64,7 @@ def start_workflow(
     client = _get_client(ctx.obj.get("api_key") if ctx.obj else None)
     run_resp = client.agent.run_workflow(
         workflow_id=workflow_id,
-        parameters=params_dict or None,
+        parameters=params_dict,
         title=title,
         max_steps_override=max_steps,
     )
