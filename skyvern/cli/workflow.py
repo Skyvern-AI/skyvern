@@ -19,6 +19,7 @@ from skyvern.client import Skyvern
 from skyvern.config import settings
 
 from .console import console
+from .tasks import _list_workflow_tasks
 
 
 workflow_app = typer.Typer(help="Manage Skyvern workflows.")
@@ -90,8 +91,30 @@ def stop_workflow(
 def workflow_status(
     ctx: typer.Context,
     run_id: str = typer.Argument(..., help="ID of the workflow run"),
+    tasks: bool = typer.Option(False, "--tasks", help="Show task executions"),
 ) -> None:
     """Retrieve status information for a workflow run."""
     client = _get_client(ctx.obj.get("api_key") if ctx.obj else None)
     run = client.agent.get_run(run_id=run_id)
     console.print(Panel(run.model_dump_json(indent=2), border_style="cyan"))
+    if tasks:
+        task_list = _list_workflow_tasks(client, run_id)
+        console.print(Panel(json.dumps(task_list, indent=2), border_style="magenta"))
+
+
+@workflow_app.command("list")
+def list_workflows(
+    ctx: typer.Context,
+    page: int = typer.Option(1, "--page", help="Page number"),
+    page_size: int = typer.Option(10, "--page-size", help="Number of workflows to return"),
+    template: bool = typer.Option(False, "--template", help="List template workflows"),
+) -> None:
+    """List workflows for the organization."""
+    client = _get_client(ctx.obj.get("api_key") if ctx.obj else None)
+    resp = client.agent._client_wrapper.httpx_client.request(
+        "api/v1/workflows",
+        method="GET",
+        params={"page": page, "page_size": page_size, "template": template},
+    )
+    resp.raise_for_status()
+    console.print(Panel(json.dumps(resp.json(), indent=2), border_style="cyan"))
