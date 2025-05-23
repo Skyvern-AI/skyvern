@@ -59,13 +59,7 @@ from skyvern.forge.sdk.workflow.models.yaml import (
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
 )
-from skyvern.schemas.runs import (
-    ProxyLocation,
-    RunEngine,
-    RunType,
-    TaskRunRequest,
-    TaskRunResponse,
-)
+from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType, TaskRunRequest, TaskRunResponse
 from skyvern.services import workflow_service
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.browser_factory import BrowserState
@@ -1586,7 +1580,7 @@ async def _summarize_task_v2(
     )
 
 
-async def _build_task_run_response(task_v2: TaskV2) -> TaskRunResponse:
+async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
     """Build TaskRunResponse object for webhook backward compatibility."""
     workflow_run_resp = None
     if task_v2.workflow_run_id:
@@ -1651,9 +1645,10 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
         )
         return
     # build the task v2 response with backward compatible data
-    task_run_response = await _build_task_run_response(task_v2)
+    task_run_response = await build_task_v2_run_response(task_v2)
+    task_run_response_dict = task_run_response.model_dump()
     payload_dict = task_v2.model_dump(by_alias=True)
-    payload_dict["task_run"] = task_run_response.model_dump(by_alias=True)
+    payload_dict.update(task_run_response_dict)
     payload = json.dumps(payload_dict)
     headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key.token)
     LOG.info(
