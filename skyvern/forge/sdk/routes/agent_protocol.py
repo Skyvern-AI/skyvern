@@ -177,6 +177,7 @@ async def run_task(
             error_code_mapping=run_request.error_code_mapping,
             proxy_location=run_request.proxy_location,
             browser_session_id=run_request.browser_session_id,
+            webhook_callback_url=run_request.webhook_url,
             totp_verification_url=run_request.totp_url,
             totp_identifier=run_request.totp_identifier,
             include_action_history_in_verification=run_request.include_action_history_in_verification,

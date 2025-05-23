@@ -1,0 +1,37 @@
+name: Run n8n package CI
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'integrations/n8n/**'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'integrations/n8n/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        
+    - name: Install pnpm
+      uses: pnpm/action-setup@v2
+      with:
+        version: 9
+        run_install: false
+        
+    - name: Install dependencies
+      working-directory: integrations/n8n
+      run: pnpm install --frozen-lockfile
+        
+    - name: Build and Lint
+      working-directory: integrations/n8n
+      run: pnpm prepublishOnly

@@ -781,6 +781,21 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
         ),
     )
     LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_2.5_FLASH_PREVIEW_05_20",
+        LLMConfig(
+            "vertex_ai/gemini-2.5-flash-preview-05-20",
+            ["VERTEX_CREDENTIALS"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65535,
+            litellm_params=LiteLLMParams(
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+                api_base=f"{api_base}/gemini-2.5-flash-preview-05-20" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_FLASH_2_0",
         LLMConfig(
             "vertex_ai/gemini-2.0-flash-001",

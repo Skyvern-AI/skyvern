@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import zipfile
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qsl, unquote, urlparse
 
 import aiohttp
 import structlog
@@ -98,7 +98,16 @@ async def download_file(url: str, max_size_mb: int | None = None) -> str:
                 # Get the file name
                 temp_dir = make_temp_directory(prefix="skyvern_downloads_")
 
+                # Check for download parameter in Supabase URLs
                 file_name = os.path.basename(a.path)
+                if "supabase.co" in a.netloc.lower():
+                    query_params = dict(parse_qsl(a.query))
+                    if "download" in query_params:
+                        file_name = query_params["download"]
+                    else:
+                        file_name = os.path.basename(a.path)
+                file_name = sanitize_filename(file_name)
+
                 # if no suffix in the URL, we need to parse it from HTTP headers
                 if not Path(file_name).suffix:
                     LOG.info("No file extension detected, trying to retrieve it from HTTP headers")

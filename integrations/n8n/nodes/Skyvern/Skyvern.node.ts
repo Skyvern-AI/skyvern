@@ -123,7 +123,7 @@ export class Skyvern implements INodeType {
                     request: {
                         baseURL: '={{$credentials.baseUrl}}',
                         method: '={{ $value === "dispatch" ? "POST" : "GET" }}' as IHttpRequestMethods,
-                        url: '={{"/api/" + ($parameter["taskOptions"]["engine"] ? $parameter["taskOptions"]["engine"] : "v2") + "/tasks"}}',
+                        url: '={{"/v1/run/tasks"}}',
                     },
                     send: {
                         preSend: [
@@ -132,46 +132,11 @@ export class Skyvern implements INodeType {
                                 if (taskOperation === "get") return requestOptions;
 
                                 const taskOptions: IDataObject = this.getNodeParameter('taskOptions') as IDataObject;
-                                if (taskOptions["engine"] !== "v1") return requestOptions;
-
-                                const credentials = await this.getCredentials('skyvernApi');
-                                const userPrompt = this.getNodeParameter('userPrompt');
-
-                                // *** capture optional webhook URL ***
-                                let webhookUrl: string | undefined;
-                                try {
-                                    webhookUrl = this.getNodeParameter('webhookUrl') as string;
-                                } catch (e) {
-                                    webhookUrl = undefined;
-                                }
-
-                                const generateBody: IDataObject = {
-                                    prompt: userPrompt,
-                                };
-
-                                const response = await makeRequest(credentials['baseUrl'] + '/api/v1/generate/task', {
-                                    method: 'POST',
-                                    headers: {
-                                        'Content-Type': 'application/json',
-                                        'x-api-key': credentials['apiKey'],
-                                    },
-                                    body: JSON.stringify(generateBody),
-                                });
-                                if (!response.ok) {
-                                    throw new Error('Request to generate Task V1 failed'); // eslint-disable-line
-                                }
-
-                                const data = await response.json();
-                                requestOptions.body = {
-                                    url: data.url,
-                                    navigation_goal: data.navigation_goal,
-                                    navigation_payload: data.navigation_payload,
-                                    data_extraction_goal: data.data_extraction_goal,
-                                    extracted_information_schema: data.extracted_information_schema,
-                                } as IDataObject;
-
-                                if (webhookUrl) {
-                                    (requestOptions.body as IDataObject)['webhook_callback_url'] = webhookUrl;
+                                const legacy_engine = taskOptions["engine"] as string | null
+                                if (legacy_engine === "v1") {
+                                    (requestOptions.body as IDataObject)['engine'] = "skyvern-1.0";
+                                }else if (legacy_engine === "v2") {
+                                    (requestOptions.body as IDataObject)['engine'] = "skyvern-2.0";
                                 }
                                 return requestOptions;
                             },
@@ -196,7 +161,7 @@ export class Skyvern implements INodeType {
                 routing: {
                     request: {
                         body: {
-                            user_prompt: '={{$value}}',
+                            prompt: '={{$value}}',
                         },
                     },
                 },
@@ -222,7 +187,6 @@ export class Skyvern implements INodeType {
                     },
                 },
             },
-            // *** New property: optional webhook URL for Task dispatch ***
             {
                 displayName: 'Webhook Callback URL',
                 description: 'Optional URL that Skyvern will call when the task finishes',
@@ -239,7 +203,7 @@ export class Skyvern implements INodeType {
                 routing: {
                     request: {
                         body: {
-                            webhook_callback_url: '={{$value ? $value : undefined}}',
+                            webhook_url: '={{$value ? $value : null}}',
                         },
                     },
                 },
@@ -260,7 +224,7 @@ export class Skyvern implements INodeType {
                 routing: {
                     request: {
                         method: 'GET',
-                        url: '={{"/api/" + ($parameter["taskOptions"]["engine"] ? $parameter["taskOptions"]["engine"] : "v2") + "/tasks/" + $value}}',
+                        url: '={{"/v1/runs/" + $value}}',
                     },
                 },
             },
@@ -273,10 +237,11 @@ export class Skyvern implements INodeType {
                 default: {},
                 options: [
                     {
-                        displayName: 'Engine',
+                        displayName: 'Engine(Deprecated)',
+                        description: 'Deprecated: please migrate to use "Engine" option',
                         name: 'engine',
                         type: 'options',
-                        default: 'v2',
+                        default: '',
                         options: [
                             {
                                 name: 'TaskV1',
@@ -286,12 +251,48 @@ export class Skyvern implements INodeType {
                                 name: 'TaskV2',
                                 value: 'v2',
                             },
+                            {
+                                name: 'THIS FIELD IS DEPRECATED',
+                                value: '',
+                            },
                         ],
                     },
+                    {
+                        displayName: 'Engine',
+                        name: 'runEngine',
+                        type: 'options',
+                        default: 'skyvern-2.0',
+                        options: [
+                            {
+                                name: 'Skyvern 1.0',
+                                value: 'skyvern-1.0',
+                            },
+                            {
+                                name: 'Skyvern 2.0',
+                                value: 'skyvern-2.0',
+                            },
+                            {
+                                name: 'OpenAI CUA',
+                                value: 'openai-cua',
+                            },
+                            {
+                                name: 'Anthropic CUA',
+                                value: 'anthropic-cua',
+                            }
+                        ],
+                        routing: {
+                            request: {
+                                body: {
+                                    engine: '={{$value}}',
+                                },
+                            },
+                        },
+                    }
                 ],
                 displayOptions: {
                     show: {
                         resource: ['task'],
+                        taskOperation: ['dispatch'],
                     },
                 },
             },
@@ -400,7 +401,6 @@ export class Skyvern implements INodeType {
                     },
                 },
             },
-            // *** New property: optional webhook URL for Workflow dispatch ***
             {
                 displayName: 'Webhook Callback URL',
                 description: 'Optional URL that Skyvern will call when the workflow run finishes',
@@ -417,7 +417,7 @@ export class Skyvern implements INodeType {
                 routing: {
                     request: {
                         body: {
-                            webhook_callback_url: '={{$value ? $value : undefined}}',
+                            webhook_callback_url: '={{$value ? $value : null}}',
                         },
                     },
                 },
