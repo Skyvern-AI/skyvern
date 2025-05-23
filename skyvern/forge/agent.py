@@ -2110,8 +2110,29 @@ class ForgeAgent:
 
         task_response = await self.build_task_response(task=task, last_step=last_step)
 
+        # try to build the new TaskRunResponse for backward compatibility
+        task_run_response_json: str | None = None
+        try:
+            from skyvern.services import run_service
+
+            run_response = await run_service.get_run_response(
+                run_id=task.task_id,
+                organization_id=task.organization_id,
+            )
+            if run_response is not None:
+                task_run_response_json = run_response.model_dump_json()
+        except Exception:
+            LOG.warning(
+                "Failed to build task run response for webhook",
+                exc_info=True,
+                task_id=task.task_id,
+            )
+
         # send task_response to the webhook callback url
-        payload = task_response.model_dump_json(exclude={"request"})
+        payload_dict = task_response.model_dump(exclude={"request"})
+        if task_run_response_json:
+            payload_dict["run"] = json.loads(task_run_response_json)
+        payload = json.dumps(payload_dict)
         headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key)
         LOG.info(
             "Sending task response to webhook callback url",
