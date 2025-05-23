@@ -110,6 +110,10 @@ navigation:
           path: credentials/totp.mdx
         - page: Bitwarden
           path: credentials/bitwarden.mdx
+    - section: Browser Sessions (Beta)
+      contents:
+        - page: Introduction
+          path: browser-sessions/introduction.mdx
     - section: Integrations
       contents:
         - page: Skyvern MCP

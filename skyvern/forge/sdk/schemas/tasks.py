@@ -16,6 +16,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.utils.url_validators import validate_url
 
@@ -65,8 +66,7 @@ class TaskBase(BaseModel):
     )
     proxy_location: ProxyLocation | None = Field(
         default=None,
-        description="The location of the proxy to use for the task.",
-        examples=["US-WA", "US-CA", "US-FL", "US-NY", "US-TX"],
+        description=PROXY_LOCATION_DOC_STRING,
     )
     extracted_information_schema: dict[str, Any] | list | str | None = Field(
         default=None,
