@@ -169,6 +169,147 @@ class WorkflowsClient:
             raise ApiError(status_code=_response.status_code, body=_response.text)
         raise ApiError(status_code=_response.status_code, body=_response_json)
 
+    def update_workflow_template(
+        self,
+        workflow_permanent_id: str,
+        *,
+        json_definition: typing.Optional[WorkflowCreateYamlRequest] = OMIT,
+        yaml_definition: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Workflow:
+        """
+        Update a workflow template
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            Permanent ID of the workflow template to update. Workflow ID starts with ``wpid_``.
+
+        json_definition : typing.Optional[WorkflowCreateYamlRequest]
+            Workflow definition in JSON format
+
+        yaml_definition : typing.Optional[str]
+            Workflow definition in YAML format
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Workflow
+            Successfully updated workflow template
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}",
+            method="POST",
+            json={
+                "json_definition": convert_and_respect_annotation_metadata(
+                    object_=json_definition, annotation=WorkflowCreateYamlRequest, direction="write"
+                ),
+                "yaml_definition": yaml_definition,
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    Workflow,
+                    parse_obj_as(
+                        type_=Workflow,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
+    def get_workflows(
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        only_saved_tasks: typing.Optional[bool] = None,
+        only_workflows: typing.Optional[bool] = None,
+        title: typing.Optional[str] = None,
+        template: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[Workflow]:
+        """
+        Get workflows for the organization or global workflow templates
+
+        Parameters
+        ----------
+        page : typing.Optional[int]
+            Page number for pagination
+
+        page_size : typing.Optional[int]
+            Number of items per page
+
+        only_saved_tasks : typing.Optional[bool]
+
+        only_workflows : typing.Optional[bool]
+
+        title : typing.Optional[str]
+
+        template : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[Workflow]
+            Successfully got workflows
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "v1/workflows",
+            method="GET",
+            params={
+                "page": page,
+                "page_size": page_size,
+                "only_saved_tasks": only_saved_tasks,
+                "only_workflows": only_workflows,
+                "title": title,
+                "template": template,
+            },
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    typing.List[Workflow],
+                    parse_obj_as(
+                        type_=typing.List[Workflow],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
     def delete_workflow(
         self, workflow_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> typing.Optional[typing.Any]:
@@ -379,6 +520,147 @@ class AsyncWorkflowsClient:
                     Workflow,
                     parse_obj_as(
                         type_=Workflow,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
+    async def update_workflow_template(
+        self,
+        workflow_permanent_id: str,
+        *,
+        json_definition: typing.Optional[WorkflowCreateYamlRequest] = OMIT,
+        yaml_definition: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Workflow:
+        """
+        Update a workflow template
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            Permanent ID of the workflow template to update. Workflow ID starts with ``wpid_``.
+
+        json_definition : typing.Optional[WorkflowCreateYamlRequest]
+            Workflow definition in JSON format
+
+        yaml_definition : typing.Optional[str]
+            Workflow definition in YAML format
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Workflow
+            Successfully updated workflow template
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}",
+            method="POST",
+            json={
+                "json_definition": convert_and_respect_annotation_metadata(
+                    object_=json_definition, annotation=WorkflowCreateYamlRequest, direction="write"
+                ),
+                "yaml_definition": yaml_definition,
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    Workflow,
+                    parse_obj_as(
+                        type_=Workflow,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
+    async def get_workflows(
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        only_saved_tasks: typing.Optional[bool] = None,
+        only_workflows: typing.Optional[bool] = None,
+        title: typing.Optional[str] = None,
+        template: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[Workflow]:
+        """
+        Get workflows for the organization or global workflow templates
+
+        Parameters
+        ----------
+        page : typing.Optional[int]
+            Page number for pagination
+
+        page_size : typing.Optional[int]
+            Number of items per page
+
+        only_saved_tasks : typing.Optional[bool]
+
+        only_workflows : typing.Optional[bool]
+
+        title : typing.Optional[str]
+
+        template : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[Workflow]
+            Successfully got workflows
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "v1/workflows",
+            method="GET",
+            params={
+                "page": page,
+                "page_size": page_size,
+                "only_saved_tasks": only_saved_tasks,
+                "only_workflows": only_workflows,
+                "title": title,
+                "template": template,
+            },
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    typing.List[Workflow],
+                    parse_obj_as(
+                        type_=typing.List[Workflow],  # type: ignore
                         object_=_response.json(),
                     ),
                 )
