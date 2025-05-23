@@ -26,12 +26,14 @@ import { WorkflowParameter } from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { AxiosError } from "axios";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
+import { MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 type Props = {
   workflowParameters: Array<WorkflowParameter>;
   initialValues: Record<string, unknown>;
   initialSettings: {
     proxyLocation: ProxyLocation;
     webhookCallbackUrl: string;
+    maxScreenshotScrollingTimes: number | null;
   };
 };
 
@@ -70,13 +72,19 @@ type RunWorkflowRequestBody = {
   data: Record<string, unknown>; // workflow parameters and values
   proxy_location: ProxyLocation | null;
   webhook_callback_url?: string | null;
+  max_screenshot_scrolling_times?: number | null;
 };
 
 function getRunWorkflowRequestBody(
   values: RunWorkflowFormType,
   workflowParameters: Array<WorkflowParameter>,
 ): RunWorkflowRequestBody {
-  const { webhookCallbackUrl, proxyLocation, ...parameters } = values;
+  const {
+    webhookCallbackUrl,
+    proxyLocation,
+    maxScreenshotScrollingTimes,
+    ...parameters
+  } = values;
 
   const parsedParameters = parseValuesForWorkflowRun(
     parameters,
@@ -88,6 +96,10 @@ function getRunWorkflowRequestBody(
     proxy_location: proxyLocation,
   };
 
+  if (maxScreenshotScrollingTimes) {
+    body.max_screenshot_scrolling_times = maxScreenshotScrollingTimes;
+  }
+
   if (webhookCallbackUrl) {
     body.webhook_callback_url = webhookCallbackUrl;
   }
@@ -98,6 +110,7 @@ function getRunWorkflowRequestBody(
 type RunWorkflowFormType = Record<string, unknown> & {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
+  maxScreenshotScrollingTimes: number | null;
 };
 
 function RunWorkflowForm({
@@ -114,6 +127,7 @@ function RunWorkflowForm({
       ...initialValues,
       webhookCallbackUrl: initialSettings.webhookCallbackUrl,
       proxyLocation: initialSettings.proxyLocation,
+      maxScreenshotScrollingTimes: initialSettings.maxScreenshotScrollingTimes,
     },
   });
   const apiCredential = useApiCredential();
@@ -154,7 +168,12 @@ function RunWorkflowForm({
   });
 
   function onSubmit(values: RunWorkflowFormType) {
-    const { webhookCallbackUrl, proxyLocation, ...parameters } = values;
+    const {
+      webhookCallbackUrl,
+      proxyLocation,
+      maxScreenshotScrollingTimes,
+      ...parameters
+    } = values;
     const parsedParameters = parseValuesForWorkflowRun(
       parameters,
       workflowParameters,
@@ -163,6 +182,7 @@ function RunWorkflowForm({
       ...parsedParameters,
       webhookCallbackUrl,
       proxyLocation,
+      maxScreenshotScrollingTimes,
     });
   }
 
@@ -321,6 +341,48 @@ function RunWorkflowForm({
                           value={field.value}
                           onChange={field.onChange}
                           className="w-48"
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </div>
+                  </div>
+                </FormItem>
+              );
+            }}
+          />
+          <FormField
+            key="maxScreenshotScrollingTimes"
+            control={form.control}
+            name="maxScreenshotScrollingTimes"
+            render={({ field }) => {
+              return (
+                <FormItem>
+                  <div className="flex gap-16">
+                    <FormLabel>
+                      <div className="w-72">
+                        <div className="flex items-center gap-2 text-lg">
+                          Max Scrolling Screenshots
+                        </div>
+                        <h2 className="text-sm text-slate-400">
+                          {`The maximum number of times to scroll down the page to take merged screenshots after action. Default is ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
+                        </h2>
+                      </div>
+                    </FormLabel>
+                    <div className="w-full space-y-2">
+                      <FormControl>
+                        <Input
+                          {...field}
+                          type="number"
+                          min={0}
+                          value={field.value ?? ""}
+                          placeholder={`Default: ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}`}
+                          onChange={(event) => {
+                            const value =
+                              event.target.value === ""
+                                ? null
+                                : Number(event.target.value);
+                            field.onChange(value);
+                          }}
                         />
                       </FormControl>
                       <FormMessage />

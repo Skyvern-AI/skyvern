@@ -446,6 +446,7 @@ export type WorkflowApiResponse = {
   persist_browser_session: boolean;
   totp_verification_url: string | null;
   totp_identifier: string | null;
+  max_screenshot_scrolling_times: number | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
@@ -455,6 +456,7 @@ export type WorkflowSettings = {
   proxyLocation: ProxyLocation | null;
   webhookCallbackUrl: string | null;
   persistBrowserSession: boolean;
+  maxScreenshotScrollingTimes: number | null;
 };
 
 export function isOutputParameter(

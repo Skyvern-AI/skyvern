@@ -9,6 +9,7 @@ export type WorkflowCreateYAMLRequest = {
   totp_verification_url?: string | null;
   workflow_definition: WorkflowDefinitionYAML;
   is_saved_task?: boolean;
+  max_screenshot_scrolling_times?: number | null;
 };
 
 export type WorkflowDefinitionYAML = {

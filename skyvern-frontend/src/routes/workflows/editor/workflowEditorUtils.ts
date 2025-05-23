@@ -249,6 +249,7 @@ function convertToNode(
           maxSteps: block.max_steps,
           totpIdentifier: block.totp_identifier,
           totpVerificationUrl: block.totp_verification_url,
+          maxScreenshotScrollingTimes: null,
         },
       };
     }
@@ -655,6 +656,7 @@ function getElements(
       persistBrowserSession: settings.persistBrowserSession,
       proxyLocation: settings.proxyLocation ?? ProxyLocation.Residential,
       webhookCallbackUrl: settings.webhookCallbackUrl ?? "",
+      maxScreenshotScrollingTimes: settings.maxScreenshotScrollingTimes,
       editable,
     }),
   );
@@ -1308,6 +1310,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     persistBrowserSession: false,
     proxyLocation: ProxyLocation.Residential,
     webhookCallbackUrl: null,
+    maxScreenshotScrollingTimes: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -1322,6 +1325,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       persistBrowserSession: data.persistBrowserSession,
       proxyLocation: data.proxyLocation,
       webhookCallbackUrl: data.webhookCallbackUrl,
+      maxScreenshotScrollingTimes: data.maxScreenshotScrollingTimes,
     };
   }
   return defaultSettings;
@@ -1960,6 +1964,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     webhook_callback_url: workflow.webhook_callback_url,
     totp_verification_url: workflow.totp_verification_url,
     persist_browser_session: workflow.persist_browser_session,
+    max_screenshot_scrolling_times: workflow.max_screenshot_scrolling_times,
     workflow_definition: {
       parameters: convertParametersToParameterYAML(userParameters),
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
