@@ -81,14 +81,20 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
 > ⚠️ **REQUIREMENT**: This project requires Python 3.11 ⚠️
 
 1. **Install Skyvern**
-	```bash
-	pip install skyvern
-	```
+        ```bash
+        pip install skyvern
+        ```
 
-2. **Configure Skyvern** Run the setup wizard which will guide you through the configuration process, including Skyvern [MCP](https://github.com/Skyvern-AI/skyvern/blob/main/integrations/mcp/README.md) integration. This will generate a `.env` as the configuration settings file.
-	```bash
-	skyvern init
-	```
+2. **Optional Configuration**
+   Skyvern now defaults to an in-memory SQLite database for quick experimentation.
+   You can skip the initialization step and use the library directly:
+   ```python
+   from skyvern import Skyvern
+   skyvern = Skyvern()
+   await skyvern.run_task(prompt="run a task for me")
+   ```
+   Run `skyvern init` if you need persistent storage or want to customize settings.
+
 
 3. **Launch the Skyvern Server** 
 
@@ -299,7 +305,7 @@ Before you begin, make sure you have the following installed:
 Note: Our setup script does these two for you, but they are here for reference.
 - [Python 3.11](https://www.python.org/downloads/)
     - `poetry env use 3.11`
-- [PostgreSQL 14](https://www.postgresql.org/download/) (if you're on a Mac, setup script will install it for you if you have homebrew installed)
+- [PostgreSQL 14](https://www.postgresql.org/download/) (optional if you want persistent storage)
     - `brew install postgresql`
 
 ## Setup (Contributors)

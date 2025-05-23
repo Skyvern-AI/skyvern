@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     LONG_RUNNING_TASK_WARNING_RATIO: float = 0.95
     MAX_RETRIES_PER_STEP: int = 5
     DEBUG_MODE: bool = False
-    DATABASE_STRING: str = "postgresql+psycopg://skyvern@localhost/skyvern"
+    DATABASE_STRING: str = "sqlite+aiosqlite:///:memory:"
     DATABASE_STATEMENT_TIMEOUT_MS: int = 60000
     DISABLE_CONNECTION_POOL: bool = False
     PROMPT_ACTION_HISTORY_WINDOW: int = 1
