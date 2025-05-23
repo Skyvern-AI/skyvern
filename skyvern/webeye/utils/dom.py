@@ -5,6 +5,7 @@ import copy
 import typing
 from enum import StrEnum
 from random import uniform
+from urllib.parse import urlparse
 
 import structlog
 from playwright.async_api import ElementHandle, Frame, FrameLocator, Locator, Page, TimeoutError
@@ -349,6 +350,27 @@ class SkyvernElement:
         handler = await self.locator.element_handle(timeout=timeout)
         assert handler is not None
         return handler
+
+    async def should_use_navigation_instead_click(self, page: Page) -> str | None:
+        if self.__static_element.get("target") != "_blank":
+            return None
+
+        href: str | None = await self.get_attr("href", mode="static")
+        if not href:
+            return None
+
+        href_url = urlparse(href)
+        if href_url.scheme.lower() not in ["http", "https"]:
+            return None
+
+        if not href_url.netloc:
+            return None
+
+        cur_url = urlparse(page.url)
+        if href_url.netloc.lower() == cur_url.netloc.lower():
+            return None
+
+        return href
 
     async def find_blocking_element(
         self, dom: DomUtil, incremental_page: IncrementalScrapePage | None = None
@@ -738,6 +760,31 @@ class SkyvernElement:
             return False
 
         return True
+
+    async def navigate_to_a_href(self, page: Page) -> str | None:
+        if self.get_tag_name() != InteractiveElement.A:
+            return None
+
+        href = await self.should_use_navigation_instead_click(page)
+        if not href:
+            return None
+
+        LOG.info(
+            "Trying to navigate to the <a> href link instead of clicking",
+            href=href,
+            current_url=page.url,
+        )
+        try:
+            await page.goto(href, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+            return href
+        except Exception as e:
+            # some cases use this method to download a file. but it will be redirected away soon
+            # and agent will run into ABORTED error.
+            if "net::ERR_ABORTED" in str(e):
+                return href
+
+            LOG.warning("Failed to navigate to the <a> href link", exc_info=True, href=href, current_url=page.url)
+            raise
 
 
 class DomUtil:

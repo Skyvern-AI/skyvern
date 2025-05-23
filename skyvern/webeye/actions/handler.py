@@ -479,10 +479,11 @@ async def handle_click_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    dom = DomUtil(scraped_page=scraped_page, page=page)
     original_url = page.url
     if action.x is not None and action.y is not None:
         # Find the element at the clicked location using JavaScript evaluation
-        element_id = await page.evaluate(
+        element_id: str | None = await page.evaluate(
             """data => {
             const element = document.elementFromPoint(data.x, data.y);
             if (!element) return null;
@@ -506,6 +507,10 @@ async def handle_click_action(
             {"x": action.x, "y": action.y},
         )
         LOG.info("Clicked element at location", x=action.x, y=action.y, element_id=element_id, button=action.button)
+        if element_id:
+            skyvern_element = await dom.get_skyvern_element_by_id(element_id)
+            if await skyvern_element.navigate_to_a_href(page=page):
+                return [ActionSuccess()]
 
         if action.repeat == 1:
             await page.mouse.click(x=action.x, y=action.y, button=action.button)
@@ -518,7 +523,6 @@ async def handle_click_action(
 
         return [ActionSuccess()]
 
-    dom = DomUtil(scraped_page=scraped_page, page=page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     await asyncio.sleep(0.3)
 
@@ -694,7 +698,8 @@ async def handle_click_to_download_file_action(
     )
 
     try:
-        await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        if not await skyvern_element.navigate_to_a_href(page=page):
+            await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
         await page.wait_for_load_state(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
     except Exception as e:
         LOG.exception(
@@ -1862,9 +1867,9 @@ async def chain_click(
     :param css: css of the element to click
     """
     try:
-        await locator.click(timeout=timeout)
-
-        LOG.info("Chain click: main element click succeeded", action=action, locator=locator)
+        if not await skyvern_element.navigate_to_a_href(page=page):
+            await locator.click(timeout=timeout)
+            LOG.info("Chain click: main element click succeeded", action=action, locator=locator)
         return [ActionSuccess()]
 
     except Exception as e:
