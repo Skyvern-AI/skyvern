@@ -3140,7 +3140,7 @@ async def normal_select(
 ) -> List[ActionResult]:
     try:
         current_text = await skyvern_element.get_attr("selected")
-        if current_text == action.option.label or current_text == action.option.value:
+        if current_text and (current_text == action.option.label or current_text == action.option.value):
             return [ActionSuccess()]
     except Exception:
         LOG.info("failed to confirm if the select option has been done, force to take the action again.")
