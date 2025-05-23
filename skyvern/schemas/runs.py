@@ -232,6 +232,10 @@ class TaskRunRequest(BaseModel):
     include_action_history_in_verification: bool | None = Field(
         default=False, description="Whether to include action history when verifying that the task is complete"
     )
+    max_screenshot_scrolling_times: int | None = Field(
+        default=None,
+        description="Scroll down n times to get the merged screenshot of the page after taking an action. When it's None or 0, it takes the current viewpoint screenshot.",
+    )
 
     @field_validator("url", "webhook_url", "totp_url")
     @classmethod
@@ -275,6 +279,10 @@ class WorkflowRunRequest(BaseModel):
     browser_session_id: str | None = Field(
         default=None,
         description="ID of a Skyvern browser session to reuse, having it continue from the current screen state",
+    )
+    max_screenshot_scrolling_times: int | None = Field(
+        default=None,
+        description="Scroll down n times to get the merged screenshot of the page after taking an action. When it's None or 0, it takes the current viewpoint screenshot.",
     )
 
     @field_validator("webhook_url", "totp_url")

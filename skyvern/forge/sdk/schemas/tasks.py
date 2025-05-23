@@ -95,6 +95,11 @@ class TaskBase(BaseModel):
         description="Whether to include the action history when verifying the task is complete",
         examples=[True, False],
     )
+    max_screenshot_scrolling_times: int | None = Field(
+        default=None,
+        description="Scroll down n times to get the merged screenshot of the page after taking an action. When it's None or 0, it takes the current viewpoint screenshot.",
+        examples=[10],
+    )
 
 
 class TaskRequest(TaskBase):
@@ -290,6 +295,7 @@ class Task(TaskBase):
             errors=self.errors,
             max_steps_per_run=self.max_steps_per_run,
             workflow_run_id=self.workflow_run_id,
+            max_screenshot_scrolling_times=self.max_screenshot_scrolling_times,
         )
 
 
@@ -310,6 +316,7 @@ class TaskResponse(BaseModel):
     errors: list[dict[str, Any]] = []
     max_steps_per_run: int | None = None
     workflow_run_id: str | None = None
+    max_screenshot_scrolling_times: int | None = None
 
 
 class TaskOutput(BaseModel):

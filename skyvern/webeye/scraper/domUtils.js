@@ -2098,13 +2098,14 @@ async function scrollToNextPage(
   draw_boxes,
   frame = "main.frame",
   frame_index = undefined,
+  need_overlap = true,
 ) {
   // remove bounding boxes, scroll to next page with 200px overlap, then draw bounding boxes again
   // return true if there is a next page, false otherwise
   removeBoundingBoxes();
   window.scrollBy({
     left: 0,
-    top: window.innerHeight - 200,
+    top: need_overlap ? window.innerHeight - 200 : window.innerHeight,
     behavior: "instant",
   });
   if (draw_boxes) {

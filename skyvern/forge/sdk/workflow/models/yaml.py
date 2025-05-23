@@ -410,4 +410,5 @@ class WorkflowCreateYAMLRequest(BaseModel):
     persist_browser_session: bool = False
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False
+    max_screenshot_scrolling_times: int | None = None
     status: WorkflowStatus = WorkflowStatus.published

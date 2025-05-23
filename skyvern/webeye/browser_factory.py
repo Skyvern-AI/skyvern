@@ -32,7 +32,7 @@ from skyvern.exceptions import (
 from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, get_tzinfo_from_proxy
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
 
 LOG = structlog.get_logger()
 
@@ -817,6 +817,30 @@ class BrowserState:
         except asyncio.TimeoutError:
             LOG.error("Timeout to close playwright, might leave the broswer opening forever")
 
-    async def take_screenshot(self, full_page: bool = False, file_path: str | None = None) -> bytes:
+    async def take_fullpage_screenshot(
+        self,
+        file_path: str | None = None,
+        use_playwright_fullpage: bool = False,  # TODO: THIS IS ONLY FOR EXPERIMENT. will be removed after experiment.
+    ) -> bytes:
         page = await self.__assert_page()
-        return await SkyvernFrame.take_screenshot(page=page, full_page=full_page, file_path=file_path)
+        return await SkyvernFrame.take_scrolling_screenshot(
+            page=page,
+            file_path=file_path,
+            mode=ScreenshotMode.LITE,
+            use_playwright_fullpage=use_playwright_fullpage,
+        )
+
+    async def take_post_action_screenshot(
+        self,
+        scrolling_number: int,
+        file_path: str | None = None,
+        use_playwright_fullpage: bool = False,  # TODO: THIS IS ONLY FOR EXPERIMENT. will be removed after experiment.
+    ) -> bytes:
+        page = await self.__assert_page()
+        return await SkyvernFrame.take_scrolling_screenshot(
+            page=page,
+            file_path=file_path,
+            mode=ScreenshotMode.LITE,
+            scrolling_number=scrolling_number,
+            use_playwright_fullpage=use_playwright_fullpage,
+        )

@@ -91,6 +91,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         error_code_mapping=task_obj.error_code_mapping,
         errors=task_obj.errors,
         application=task_obj.application,
+        max_screenshot_scrolling_times=task_obj.max_screenshot_scrolling_times,
     )
     return task
 
@@ -186,6 +187,7 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         totp_identifier=workflow_model.totp_identifier,
         persist_browser_session=workflow_model.persist_browser_session,
         proxy_location=(ProxyLocation(workflow_model.proxy_location) if workflow_model.proxy_location else None),
+        max_screenshot_scrolling_times=workflow_model.max_screenshot_scrolling_times,
         version=workflow_model.version,
         is_saved_task=workflow_model.is_saved_task,
         description=workflow_model.description,
@@ -223,6 +225,7 @@ def convert_to_workflow_run(
         created_at=workflow_run_model.created_at,
         modified_at=workflow_run_model.modified_at,
         workflow_title=workflow_title,
+        max_screenshot_scrolling_times=workflow_run_model.max_screenshot_scrolling_times,
     )
 
 

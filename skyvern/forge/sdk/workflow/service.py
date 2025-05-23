@@ -148,6 +148,7 @@ class WorkflowService:
             organization_id=workflow.organization_id,
             proxy_location=workflow_request.proxy_location,
             webhook_callback_url=workflow_request.webhook_callback_url,
+            max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolling_times,
         )
         skyvern_context.set(
             SkyvernContext(
@@ -157,6 +158,7 @@ class WorkflowService:
                 workflow_id=workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
                 max_steps_override=max_steps_override,
+                max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolling_times,
             )
         )
 
@@ -542,6 +544,7 @@ class WorkflowService:
         workflow_definition: WorkflowDefinition,
         description: str | None = None,
         proxy_location: ProxyLocation | None = None,
+        max_screenshot_scrolling_times: int | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
@@ -558,6 +561,7 @@ class WorkflowService:
             description=description,
             proxy_location=proxy_location,
             webhook_callback_url=webhook_callback_url,
+            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             totp_verification_url=totp_verification_url,
             totp_identifier=totp_identifier,
             persist_browser_session=persist_browser_session,
@@ -729,6 +733,7 @@ class WorkflowService:
             totp_verification_url=workflow_request.totp_verification_url,
             totp_identifier=workflow_request.totp_identifier,
             parent_workflow_run_id=parent_workflow_run_id,
+            max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolling_times,
         )
 
     async def mark_workflow_run_as_completed(self, workflow_run_id: str) -> None:
@@ -1125,6 +1130,7 @@ class WorkflowService:
             total_steps=total_steps,
             total_cost=total_cost,
             workflow_title=workflow.title,
+            max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolling_times,
         )
 
     async def clean_up_workflow(
@@ -1368,6 +1374,7 @@ class WorkflowService:
                     totp_verification_url=request.totp_verification_url,
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
+                    max_screenshot_scrolling_times=request.max_screenshot_scrolling_times,
                     workflow_permanent_id=workflow_permanent_id,
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
@@ -1384,6 +1391,7 @@ class WorkflowService:
                     totp_verification_url=request.totp_verification_url,
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
+                    max_screenshot_scrolling_times=request.max_screenshot_scrolling_times,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
                 )
