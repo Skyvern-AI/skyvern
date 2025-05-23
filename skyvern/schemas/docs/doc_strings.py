@@ -7,7 +7,7 @@ The starting URL for the task. If not provided, Skyvern will attempt to determin
 """
 
 TASK_ENGINE_DOC_STRING = """
-The engine that powers the agent task. The default value is `skyvern-2.0`, the latest Skyvern agent that performs pretty well with complex and multi-step tasks. `skyvern-1.0` is good for simple tasks like filling a form, or searching for information on google. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's claude sonnet 3.7 model with the computer use tool.
+The engine that powers the agent task. The default value is `skyvern-2.0`, the latest Skyvern agent that performs pretty well with complex and multi-step tasks. `skyvern-1.0` is good for simple tasks like filling a form, or searching for information on Google. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
 """
 
 PROXY_LOCATION_DOC_STRING = """
@@ -16,7 +16,7 @@ Geographic Proxy location to route the browser traffic through. This is only ava
 Available geotargeting options:
 - RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.
 - RESIDENTIAL_ES: Spain
-- RESIDENTIAL_IE: Ireland:
+- RESIDENTIAL_IE: Ireland
 - RESIDENTIAL_GB: United Kingdom
 - RESIDENTIAL_IN: India
 - RESIDENTIAL_JP: Japan
