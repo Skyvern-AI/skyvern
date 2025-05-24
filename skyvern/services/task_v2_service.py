@@ -388,6 +388,19 @@ async def run_task_v2_helper(
             "Task v2 url or prompt not found",
             task_v2_id=task_v2_id,
             organization_id=organization_id,
+            prompt=task_v2.prompt,
+            url=task_v2.url,
+        )
+        failure_reason = ""
+        if not task_v2.prompt:
+            failure_reason = "Task prompt is missing"
+        elif not task_v2.url:
+            failure_reason = "Task url is missing"
+        await mark_task_v2_as_failed(
+            task_v2_id=task_v2_id,
+            workflow_run_id=task_v2.workflow_run_id,
+            failure_reason=failure_reason,
+            organization_id=organization_id,
         )
         return None, None, task_v2
     if not task_v2.workflow_run_id:
