@@ -139,7 +139,7 @@ async def cancel_run(run_id: str, organization_id: str | None = None, api_key: s
         )
 
 
-async def retry_run_webhook(run_id: str, organization_id: str | None = None, api_key: str | None = None) -> RunResponse:
+async def retry_run_webhook(run_id: str, organization_id: str | None = None, api_key: str | None = None) -> None:
     """Retry sending the webhook for a run."""
 
     run = await app.DATABASE.get_run(run_id, organization_id=organization_id)
@@ -174,4 +174,3 @@ async def retry_run_webhook(run_id: str, organization_id: str | None = None, api
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid run type to retry webhook: {run.task_run_type}",
         )
-    return await get_run_response(run_id, organization_id=organization_id)

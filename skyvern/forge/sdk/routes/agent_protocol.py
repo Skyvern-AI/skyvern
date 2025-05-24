@@ -713,7 +713,6 @@ async def get_artifact(
 @base_router.post(
     "/runs/{run_id}/retry_webhook",
     tags=["Agent"],
-    response_model=RunResponse,
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "retry_run_webhook",
@@ -722,14 +721,14 @@ async def get_artifact(
     description="Retry sending the webhook for a run",
     summary="Retry run webhook",
 )
-@base_router.post("/runs/{run_id}/retry_webhook/", response_model=RunResponse, include_in_schema=False)
+@base_router.post("/runs/{run_id}/retry_webhook/", include_in_schema=False)
 async def retry_run_webhook(
     run_id: str = Path(..., description="The id of the task run or the workflow run.", examples=["tsk_123", "wr_123"]),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
-) -> RunResponse:
+) -> None:
     analytics.capture("skyvern-oss-agent-run-retry-webhook")
-    return await run_service.retry_run_webhook(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
+    await run_service.retry_run_webhook(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
 
 
 ################# Legacy Endpoints #################
