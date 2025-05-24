@@ -60,7 +60,6 @@ from skyvern.forge.sdk.workflow.models.yaml import (
     WorkflowDefinitionYAML,
 )
 from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType, TaskRunRequest, TaskRunResponse
-from skyvern.services import workflow_service
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
@@ -1582,6 +1581,8 @@ async def _summarize_task_v2(
 
 async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
     """Build TaskRunResponse object for webhook backward compatibility."""
+    from skyvern.services import workflow_service
+
     workflow_run_resp = None
     if task_v2.workflow_run_id:
         try:

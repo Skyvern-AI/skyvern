@@ -72,6 +72,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowStatus,
 )
 from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
+from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.runs import (
     CUA_ENGINES,
     RunEngine,
@@ -87,23 +88,6 @@ from skyvern.services import run_service, task_v1_service, task_v2_service, work
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
-
-
-class EntityType(str, Enum):
-    STEP = "step"
-    TASK = "task"
-    WORKFLOW_RUN = "workflow_run"
-    WORKFLOW_RUN_BLOCK = "workflow_run_block"
-    THOUGHT = "thought"
-
-
-entity_type_to_param = {
-    EntityType.STEP: "step_id",
-    EntityType.TASK: "task_id",
-    EntityType.WORKFLOW_RUN: "workflow_run_id",
-    EntityType.WORKFLOW_RUN_BLOCK: "workflow_run_block_id",
-    EntityType.THOUGHT: "thought_id",
-}
 
 
 class AISuggestionType(str, Enum):
