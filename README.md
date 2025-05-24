@@ -147,6 +147,52 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
    ```
 3. Navigate to `http://localhost:8080` in your browser to start using the UI
 
+## Local vs. Docker
+
+Skyvern supports two startup options for local development:
+
+**Before Option 1**
+* If using Option 1, working in a virtual environment may improve the overall experience. Here's how to activate it:
+
+  ```bash
+  python3 -m venv skyvern-env/
+  cd skyvern
+  source ../skyvern-env/bin/activate
+  pip install skyvern (Only if not already installed)
+  pip install -e .
+  ``` 
+
+  Deactivation:
+  ```bash
+  deactivate
+  ```
+
+**Option 1: Native (Postgres created by the CLI wizard)**
+
+* Use the CLI wizard to spin up a disposable Postgres container, then run the backend natively.
+* **Start with:**
+  ```bash
+  skyvern init
+  skyvern run server
+  ```
+* This reuses the Postgres container created by the wizard.
+
+**Option 2: Docker Compose (Postgres created with Compose)**
+
+* Use Docker Compose to start all services, including a new Postgres container.
+* **Start with:**
+  ```bash
+  docker compose up -d
+  ```
+* This launches a new Postgres instance inside Compose.
+
+> **Important:** Only one Postgres container can run on port 5432 at a time. If you switch from the CLI-managed Postgres to Docker Compose, you must first remove the original container:
+> ```bash
+> docker rm -f postgresql-container
+> ```
+
+If you encounter any database related errors while using Docker to run Skyvern, check which Postgres container is running with `docker ps`.
+
 ## Model Context Protocol (MCP)
 See the MCP documentation [here](https://github.com/Skyvern-AI/skyvern/blob/main/integrations/mcp/README.md)
 
