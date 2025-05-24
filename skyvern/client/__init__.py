@@ -315,9 +315,12 @@ from .types import (
     WorkflowRunResponse,
     WorkflowRunResponseOutput,
     WorkflowStatus,
+    Artifact,
+    ArtifactType,
 )
 from .errors import BadRequestError, ForbiddenError, NotFoundError, UnprocessableEntityError
 from . import agent, browser_session, credentials, workflows
+from . import artifact as artifacts
 from .agent import (
     AgentGetRunResponse,
     AgentGetRunResponse_AnthropicCua,
@@ -660,9 +663,12 @@ __all__ = [
     "WorkflowRunResponse",
     "WorkflowRunResponseOutput",
     "WorkflowStatus",
+    "Artifact",
+    "ArtifactType",
     "__version__",
     "agent",
     "browser_session",
     "credentials",
     "workflows",
+    "artifacts",
 ]

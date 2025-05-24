@@ -169,6 +169,72 @@ class WorkflowsClient:
             raise ApiError(status_code=_response.status_code, body=_response.text)
         raise ApiError(status_code=_response.status_code, body=_response_json)
 
+    def update_workflow_template(
+        self,
+        workflow_permanent_id: str,
+        *,
+        json_definition: typing.Optional[WorkflowCreateYamlRequest] = OMIT,
+        yaml_definition: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Workflow:
+        """
+        Update a workflow template
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            Permanent ID of the workflow template to update. Workflow ID starts with ``wpid_``.
+
+        json_definition : typing.Optional[WorkflowCreateYamlRequest]
+            Workflow definition in JSON format
+
+        yaml_definition : typing.Optional[str]
+            Workflow definition in YAML format
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Workflow
+            Successfully updated workflow template
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}",
+            method="POST",
+            json={
+                "json_definition": convert_and_respect_annotation_metadata(
+                    object_=json_definition, annotation=WorkflowCreateYamlRequest, direction="write"
+                ),
+                "yaml_definition": yaml_definition,
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    Workflow,
+                    parse_obj_as(
+                        type_=Workflow,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
     def delete_workflow(
         self, workflow_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> typing.Optional[typing.Any]:
@@ -363,6 +429,72 @@ class AsyncWorkflowsClient:
         """
         _response = await self._client_wrapper.httpx_client.request(
             f"v1/workflows/{jsonable_encoder(workflow_id)}",
+            method="POST",
+            json={
+                "json_definition": convert_and_respect_annotation_metadata(
+                    object_=json_definition, annotation=WorkflowCreateYamlRequest, direction="write"
+                ),
+                "yaml_definition": yaml_definition,
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    Workflow,
+                    parse_obj_as(
+                        type_=Workflow,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
+    async def update_workflow_template(
+        self,
+        workflow_permanent_id: str,
+        *,
+        json_definition: typing.Optional[WorkflowCreateYamlRequest] = OMIT,
+        yaml_definition: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Workflow:
+        """
+        Update a workflow template
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            Permanent ID of the workflow template to update. Workflow ID starts with ``wpid_``.
+
+        json_definition : typing.Optional[WorkflowCreateYamlRequest]
+            Workflow definition in JSON format
+
+        yaml_definition : typing.Optional[str]
+            Workflow definition in YAML format
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Workflow
+            Successfully updated workflow template
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}",
             method="POST",
             json={
                 "json_definition": convert_and_respect_annotation_metadata(
