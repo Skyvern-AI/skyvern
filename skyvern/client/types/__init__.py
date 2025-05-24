@@ -23,6 +23,8 @@ from .bitwarden_login_credential_parameter_yaml import BitwardenLoginCredentialP
 from .bitwarden_sensitive_information_parameter import BitwardenSensitiveInformationParameter
 from .bitwarden_sensitive_information_parameter_yaml import BitwardenSensitiveInformationParameterYaml
 from .browser_session_response import BrowserSessionResponse
+from .artifact import Artifact
+from .artifact_type import ArtifactType
 from .code_block import CodeBlock
 from .code_block_parameters_item import (
     CodeBlockParametersItem,
@@ -351,6 +353,10 @@ from .workflow_request import WorkflowRequest
 from .workflow_run_request import WorkflowRunRequest
 from .workflow_run_response import WorkflowRunResponse
 from .workflow_run_response_output import WorkflowRunResponseOutput
+from .workflow_run_timeline import WorkflowRunTimeline
+from .workflow_run_timeline_type import WorkflowRunTimelineType
+from .artifact import Artifact
+from .artifact_type import ArtifactType
 from .workflow_status import WorkflowStatus
 
 __all__ = [
@@ -667,5 +673,11 @@ __all__ = [
     "WorkflowRunRequest",
     "WorkflowRunResponse",
     "WorkflowRunResponseOutput",
+    "WorkflowRunTimeline",
+    "WorkflowRunTimelineType",
+    "Artifact",
+    "ArtifactType",
     "WorkflowStatus",
+    "Artifact",
+    "ArtifactType",
 ]

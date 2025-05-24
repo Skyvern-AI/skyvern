@@ -33,6 +33,10 @@ from .types import (
     CodeBlockParametersItem_Output,
     CodeBlockParametersItem_Workflow,
     CodeBlockYaml,
+    Artifact,
+    ArtifactType,
+    WorkflowRunTimeline,
+    WorkflowRunTimelineType,
     ContextParameter,
     ContextParameterSource,
     ContextParameterSource_AwsSecret,
@@ -315,9 +319,12 @@ from .types import (
     WorkflowRunResponse,
     WorkflowRunResponseOutput,
     WorkflowStatus,
+    Artifact,
+    ArtifactType,
 )
 from .errors import BadRequestError, ForbiddenError, NotFoundError, UnprocessableEntityError
 from . import agent, browser_session, credentials, workflows
+from . import artifact as artifacts
 from .agent import (
     AgentGetRunResponse,
     AgentGetRunResponse_AnthropicCua,
@@ -659,10 +666,15 @@ __all__ = [
     "WorkflowRunRequest",
     "WorkflowRunResponse",
     "WorkflowRunResponseOutput",
+    "WorkflowRunTimeline",
+    "WorkflowRunTimelineType",
     "WorkflowStatus",
+    "Artifact",
+    "ArtifactType",
     "__version__",
     "agent",
     "browser_session",
     "credentials",
     "workflows",
+    "artifacts",
 ]

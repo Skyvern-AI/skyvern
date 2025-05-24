@@ -416,7 +416,6 @@ async def cancel_run(
 
     await run_service.cancel_run(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
 
-
 @base_router.post(
     "/runs/{run_id}/retry_webhook",
     tags=["Agent"],
@@ -440,7 +439,6 @@ async def retry_run_webhook(
     return await run_service.retry_run_webhook(
         run_id, organization_id=current_org.organization_id, api_key=x_api_key
     )
-
 
 @legacy_base_router.post(
     "/workflows",
@@ -705,6 +703,48 @@ async def delete_workflow(
 ) -> None:
     analytics.capture("skyvern-oss-agent-workflow-delete")
     await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(workflow_id, current_org.organization_id)
+
+
+@base_router.get(
+    "/artifacts/{artifact_id}",
+    tags=["Artifacts"],
+    response_model=Artifact,
+    openapi_extra={
+        "x-fern-sdk-group-name": "artifacts",
+        "x-fern-sdk-method-name": "get_artifact",
+    },
+    description="Get an artifact",
+    summary="Get an artifact",
+    responses={
+        200: {"description": "Successfully retrieved artifact"},
+        404: {"description": "Artifact not found"},
+    },
+)
+@base_router.get("/artifacts/{artifact_id}/", response_model=Artifact, include_in_schema=False)
+async def get_artifact(
+    artifact_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Response:
+    analytics.capture("skyvern-oss-artifact-get")
+    artifact = await app.DATABASE.get_artifact_by_id(
+        artifact_id=artifact_id,
+        organization_id=current_org.organization_id,
+    )
+    if not artifact:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Artifact not found {artifact_id}",
+        )
+    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
+        signed_urls = await app.ARTIFACT_MANAGER.get_share_links([artifact])
+        if signed_urls:
+            artifact.signed_url = signed_urls[0]
+        else:
+            LOG.warning(
+                "Failed to get signed url for artifact",
+                artifact_id=artifact_id,
+            )
+    return ORJSONResponse(artifact.model_dump())
 
 
 ################# Legacy Endpoints #################
@@ -1380,11 +1420,21 @@ async def get_workflow_run(
         "x-fern-sdk-method-name": "get_workflows",
     },
 )
+@base_router.get(
+    "/workflows",
+    response_model=list[Workflow],
+    tags=["Workflows"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "workflows",
+        "x-fern-sdk-method-name": "get_workflows",
+    },
+)
 @legacy_base_router.get(
     "/workflows/",
     response_model=list[Workflow],
     include_in_schema=False,
 )
+@base_router.get("/workflows/", response_model=list[Workflow], include_in_schema=False)
 async def get_workflows(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
@@ -1438,11 +1488,21 @@ async def get_workflows(
         "x-fern-sdk-method-name": "get_workflow_templates",
     },
 )
+@base_router.get(
+    "/workflows/templates",
+    response_model=list[Workflow],
+    tags=["Workflows"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "workflows",
+        "x-fern-sdk-method-name": "get_workflow_templates",
+    },
+)
 @legacy_base_router.get(
     "/workflows/templates/",
     response_model=list[Workflow],
     include_in_schema=False,
 )
+@base_router.get("/workflows/templates/", response_model=list[Workflow], include_in_schema=False)
 async def get_workflow_templates() -> list[Workflow]:
     global_workflows_permanent_ids = await app.STORAGE.retrieve_global_workflows()
 

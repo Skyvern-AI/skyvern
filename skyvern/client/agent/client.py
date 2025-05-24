@@ -14,6 +14,8 @@ from ..errors.unprocessable_entity_error import UnprocessableEntityError
 from json.decoder import JSONDecodeError
 from ..core.api_error import ApiError
 from ..types.workflow_run_response import WorkflowRunResponse
+from ..types.workflow_run_timeline import WorkflowRunTimeline
+from ..types.artifact import Artifact
 from .types.agent_get_run_response import AgentGetRunResponse
 from ..core.jsonable_encoder import jsonable_encoder
 from ..errors.not_found_error import NotFoundError
@@ -941,6 +943,7 @@ class AsyncAgentClient:
                         ),
                     )
                 )
+
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
                     typing.cast(
