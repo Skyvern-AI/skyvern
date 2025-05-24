@@ -682,6 +682,61 @@ async def delete_workflow(
     await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(workflow_id, current_org.organization_id)
 
 
+@base_router.get(
+    "/workflows",
+    response_model=list[Workflow],
+    tags=["Workflows"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "workflows",
+        "x-fern-sdk-method-name": "get_workflows",
+    },
+    description="Get all workflows with the latest version for the organization.",
+    summary="Get workflows",
+    responses={200: {"description": "Successfully got workflows"}},
+)
+@base_router.get("/workflows/", response_model=list[Workflow], include_in_schema=False)
+async def get_workflows(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1),
+    only_saved_tasks: bool = Query(False),
+    only_workflows: bool = Query(False),
+    title: str = Query(""),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    template: bool = Query(False),
+) -> list[Workflow]:
+    """Get workflows for the organization or global templates."""
+    analytics.capture("skyvern-oss-agent-workflows-get")
+
+    if template:
+        global_workflows_permanent_ids = await app.STORAGE.retrieve_global_workflows()
+        if not global_workflows_permanent_ids:
+            return []
+        workflows = await app.WORKFLOW_SERVICE.get_workflows_by_permanent_ids(
+            workflow_permanent_ids=global_workflows_permanent_ids,
+            page=page,
+            page_size=page_size,
+            title=title,
+            statuses=[WorkflowStatus.published, WorkflowStatus.draft],
+        )
+        return workflows
+
+    if only_saved_tasks and only_workflows:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="only_saved_tasks and only_workflows cannot be used together",
+        )
+
+    return await app.WORKFLOW_SERVICE.get_workflows_by_organization_id(
+        organization_id=current_org.organization_id,
+        page=page,
+        page_size=page_size,
+        only_saved_tasks=only_saved_tasks,
+        only_workflows=only_workflows,
+        title=title,
+        statuses=[WorkflowStatus.published, WorkflowStatus.draft],
+    )
+
+
 ################# Legacy Endpoints #################
 @legacy_base_router.post(
     "/webhook",
