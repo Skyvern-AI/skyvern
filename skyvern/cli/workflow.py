@@ -106,10 +106,14 @@ def list_workflows(
 ) -> None:
     """List workflows for the organization."""
     client = _get_client(ctx.obj.get("api_key") if ctx.obj else None)
-    resp = client.agent._client_wrapper.httpx_client.request(
-        "api/v1/workflows",
-        method="GET",
-        params={"page": page, "page_size": page_size, "template": template},
+    workflows = client.workflows.get_workflows(
+        page=page,
+        page_size=page_size,
+        template=template,
     )
-    resp.raise_for_status()
-    console.print(Panel(json.dumps(resp.json(), indent=2), border_style="cyan"))
+    console.print(
+        Panel(
+            json.dumps([wf.model_dump() for wf in workflows], indent=2),
+            border_style="cyan",
+        )
+    )
