@@ -356,6 +356,7 @@ async def run_task_v2(
                 workflow_run=workflow_run,
                 browser_session_id=browser_session_id,
                 close_browser_on_completion=browser_session_id is None,
+                need_call_webhook=False,
             )
         else:
             LOG.warning("Workflow or workflow run not found")
@@ -1645,21 +1646,22 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
             task_v2_id=task_v2.observer_cruise_id,
         )
         return
-    # build the task v2 response with backward compatible data
-    task_run_response = await build_task_v2_run_response(task_v2)
-    task_run_response_dict = task_run_response.model_dump()
-    payload_dict = task_v2.model_dump(by_alias=True)
-    payload_dict.update(task_run_response_dict)
-    payload = json.dumps(payload_dict)
-    headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key.token)
-    LOG.info(
-        "Sending task v2 response to webhook callback url",
-        task_v2_id=task_v2.observer_cruise_id,
-        webhook_callback_url=task_v2.webhook_callback_url,
-        payload=payload,
-        headers=headers,
-    )
     try:
+        # build the task v2 response with backward compatible data
+        task_run_response = await build_task_v2_run_response(task_v2)
+        task_run_response_json = task_run_response.model_dump_json(exclude={"run_request"})
+        payload_json = task_v2.model_dump_json(by_alias=True)
+        payload_dict = json.loads(payload_json)
+        payload_dict.update(json.loads(task_run_response_json))
+        payload = json.dumps(payload_dict)
+        headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key.token)
+        LOG.info(
+            "Sending task v2 response to webhook callback url",
+            task_v2_id=task_v2.observer_cruise_id,
+            webhook_callback_url=task_v2.webhook_callback_url,
+            payload=payload,
+            headers=headers,
+        )
         resp = await httpx.AsyncClient().post(
             task_v2.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
         )
