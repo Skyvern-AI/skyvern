@@ -31,7 +31,7 @@ ddtrace = "^2.3.2"
 pydantic = "^2.5.2"
 pydantic-settings = "^2.1.0"
 fastapi = "^0.115.4"
-psycopg = {version = ">=3.2.2,<3.3.0", extras = ["binary", "pool"]}
+aiosqlite = "^0.20.0"
 alembic = "^1.12.1"
 python-jose = {extras = ["cryptography"], version = "^3.3.0"}
 cachetools = "^5.3.2"
@@ -60,7 +60,6 @@ rich = {extras = ["jupyter"], version = "^13.7.0"}
 posthog = "^3.7.0"
 aiofiles = "^24.1.0"
 pyotp = "^2.9.0"
-asyncpg = "^0.30.0"
 json-repair = "^0.34.0"
 pypdf = "^5.1.0"
 fastmcp = "^0.4.1"

@@ -1,4 +1,5 @@
 import os
+import os
 import socket
 
 import typer
@@ -21,12 +22,12 @@ def _check_port(port: int) -> bool:
 def _status_table() -> Table:
     api_port = int(os.getenv("PORT", 8000))
     ui_port = 8080
-    db_port = 5432
+    db_path = os.path.join("data", "skyvern.db")
 
     components = [
         ("API server", _check_port(api_port), "skyvern run server"),
         ("UI server", _check_port(ui_port), "skyvern run ui"),
-        ("PostgreSQL", _check_port(db_port), "skyvern init --no-postgres false"),
+        ("SQLite DB", os.path.exists(db_path), "skyvern init"),
     ]
 
     table = Table(title="Skyvern Component Status")

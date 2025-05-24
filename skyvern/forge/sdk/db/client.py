@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Sequence
 
 import structlog
-from sqlalchemy import and_, delete, distinct, func, pool, select, tuple_, update
+from sqlalchemy import and_, delete, distinct, event, func, pool, select, tuple_, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -99,7 +99,9 @@ LOG = structlog.get_logger()
 
 DB_CONNECT_ARGS: dict[str, Any] = {}
 
-if "postgresql+psycopg" in settings.DATABASE_STRING:
+if settings.DATABASE_STRING.startswith("sqlite"):
+    DB_CONNECT_ARGS = {"check_same_thread": False}
+elif "postgresql+psycopg" in settings.DATABASE_STRING:
     DB_CONNECT_ARGS = {"options": f"-c statement_timeout={settings.DATABASE_STATEMENT_TIMEOUT_MS}"}
 elif "postgresql+asyncpg" in settings.DATABASE_STRING:
     DB_CONNECT_ARGS = {"server_settings": {"statement_timeout": str(settings.DATABASE_STATEMENT_TIMEOUT_MS)}}
@@ -109,12 +111,23 @@ class AgentDB:
     def __init__(self, database_string: str, debug_enabled: bool = False) -> None:
         super().__init__()
         self.debug_enabled = debug_enabled
+        db_url = database_string
+        if db_url.startswith("sqlite://") and not db_url.startswith("sqlite+aiosqlite://"):
+            db_url = db_url.replace("sqlite://", "sqlite+aiosqlite://", 1)
         self.engine = create_async_engine(
-            database_string,
+            db_url,
             json_serializer=_custom_json_serializer,
             connect_args=DB_CONNECT_ARGS,
             poolclass=pool.NullPool if settings.DISABLE_CONNECTION_POOL else None,
         )
+        if db_url.startswith("sqlite+aiosqlite"):
+            @event.listens_for(self.engine.sync_engine, "connect")
+            def _sqlite_setup(dbapi_connection, connection_record) -> None:
+                cursor = dbapi_connection.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL;")
+                cursor.execute("PRAGMA foreign_keys=ON;")
+                cursor.execute("PRAGMA synchronous=NORMAL;")
+                cursor.close()
         self.Session = async_sessionmaker(bind=self.engine)
 
     async def create_task(

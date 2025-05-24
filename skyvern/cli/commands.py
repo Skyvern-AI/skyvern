@@ -30,13 +30,10 @@ cli_app.add_typer(init_app, name="init")
 
 
 @init_app.callback()
-def init_callback(
-    ctx: typer.Context,
-    no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
-) -> None:
+def init_callback(ctx: typer.Context) -> None:
     """Run full initialization when no subcommand is provided."""
     if ctx.invoked_subcommand is None:
-        init(no_postgres=no_postgres)
+        init()
 
 
 @init_app.command(name="browser")

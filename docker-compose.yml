@@ -1,22 +1,4 @@
 services:
-  postgres:
-    image: postgres:14-alpine
-    restart: always
-    # comment out if you want to externally connect DB
-    # ports:
-    #   - 5432:5432
-    volumes:
-      - ./postgres-data:/var/lib/postgresql/data
-    environment:
-      - PGDATA=/var/lib/postgresql/data/pgdata
-      - POSTGRES_USER=skyvern
-      - POSTGRES_PASSWORD=skyvern
-      - POSTGRES_DB=skyvern
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U skyvern"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
 
   skyvern:
     image: public.ecr.aws/skyvern/skyvern:latest
@@ -30,12 +12,13 @@ services:
       - ./videos:/data/videos
       - ./har:/data/har
       - ./log:/data/log
+      - ./data:/app/data
       - ./.streamlit:/app/.streamlit
       # Uncomment the following two lines if you want to connect to any local changes
       # - ./skyvern:/app/skyvern
       # - ./alembic:/app/alembic
     environment:
-      - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
+      - DATABASE_STRING=sqlite:///data/skyvern.db
       - BROWSER_TYPE=chromium-headful
       - ENABLE_CODE_BLOCK=true
       # - BROWSER_TYPE=cdp-connect
@@ -119,9 +102,6 @@ services:
       # - BITWARDEN_CLIENT_SECRET=FILL_ME_IN_PLEASE
       # - BITWARDEN_MASTER_PASSWORD=FILL_ME_IN_PLEASE
       
-    depends_on:
-      postgres:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "test", "-f", "/app/.streamlit/secrets.toml"]
       interval: 5s
