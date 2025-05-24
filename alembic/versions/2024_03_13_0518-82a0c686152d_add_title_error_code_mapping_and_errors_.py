@@ -10,6 +10,8 @@ from typing import Sequence, Union
 
 import sqlalchemy as sa
 
+from sqlalchemy.engine import Connection
+
 from alembic import op
 
 # revision identifiers, used by Alembic.
@@ -26,8 +28,14 @@ def upgrade() -> None:
     # In order to add a column with a default value, we need to add the column
     # as nullable, then set the default value, then set the column to not
     op.add_column("tasks", sa.Column("errors", sa.JSON(), nullable=True))
-    op.execute("UPDATE tasks SET errors = '[]'::jsonb")
-    op.alter_column("tasks", "errors", nullable=False)
+    conn: Connection = op.get_bind()
+    if conn.dialect.name == "sqlite":
+        conn.execute(sa.text("UPDATE tasks SET errors = '[]'"))
+        # SQLite does not support ALTER COLUMN SET NOT NULL without
+        # recreating the table. Skip enforcing NOT NULL here.
+    else:
+        conn.execute(sa.text("UPDATE tasks SET errors = '[]'::jsonb"))
+        op.alter_column("tasks", "errors", nullable=False)
     # ### end Alembic commands ###
 
 

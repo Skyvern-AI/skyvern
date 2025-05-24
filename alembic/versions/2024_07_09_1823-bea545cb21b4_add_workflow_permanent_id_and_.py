@@ -11,6 +11,7 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 
 from alembic import op
+from sqlalchemy.engine import Connection
 
 # revision identifiers, used by Alembic.
 revision: str = "bea545cb21b4"
@@ -24,7 +25,7 @@ def upgrade() -> None:
     op.add_column("workflow_runs", sa.Column("organization_id", sa.String(), nullable=True))
 
     # Backfill the new columns with data from the workflows table
-    connection = op.get_bind()
+    connection: Connection = op.get_bind()
     connection.execute(
         sa.text("""
             UPDATE workflow_runs wr
@@ -42,8 +43,10 @@ def upgrade() -> None:
     )
 
     # Now set the columns to be non-nullable
-    op.alter_column("workflow_runs", "workflow_permanent_id", nullable=False)
-    op.alter_column("workflow_runs", "organization_id", nullable=False)
+    if connection.dialect.name != "sqlite":
+        op.alter_column("workflow_runs", "workflow_permanent_id", nullable=False)
+        op.alter_column("workflow_runs", "organization_id", nullable=False)
+    # SQLite cannot ALTER COLUMN to set NOT NULL without recreating the table
 
     # Create foreign keys and indices after backfilling
     op.create_foreign_key(
