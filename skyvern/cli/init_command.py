@@ -13,14 +13,12 @@ from skyvern.utils import migrate_db
 
 from .browser import setup_browser_config
 from .console import console
-from .database import setup_postgresql
+from .database import setup_sqlite
 from .llm_setup import setup_llm_providers, update_or_add_env_var
 from .mcp import setup_local_organization, setup_mcp
 
 
-def init(
-    no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
-) -> None:
+def init() -> None:
     """Interactive initialization command for Skyvern."""
     console.print(
         Panel(
@@ -38,7 +36,7 @@ def init(
     )
 
     if run_local:
-        setup_postgresql(no_postgres)
+        setup_sqlite()
         console.print("📊 [bold blue]Running database migrations...[/bold blue]")
         migrate_db()
         console.print("✅ [green]Database migration complete.[/green]")

@@ -9,7 +9,6 @@ Create Date: 2025-02-05 18:39:29.253202+00:00
 from typing import Sequence, Union
 
 import sqlalchemy as sa
-from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
@@ -25,7 +24,7 @@ def upgrade() -> None:
     op.alter_column(
         "observer_cruises",
         "proxy_location",
-        existing_type=postgresql.ENUM(
+        existing_type=sa.String(),
             "US_CA",
             "US_NY",
             "US_TX",
@@ -46,7 +45,7 @@ def upgrade() -> None:
     op.alter_column(
         "tasks",
         "proxy_location",
-        existing_type=postgresql.ENUM(
+        existing_type=sa.String(),
             "US_CA",
             "US_NY",
             "US_TX",
@@ -67,7 +66,7 @@ def upgrade() -> None:
     op.alter_column(
         "workflow_runs",
         "proxy_location",
-        existing_type=postgresql.ENUM(
+        existing_type=sa.String(),
             "US_CA",
             "US_NY",
             "US_TX",
@@ -88,7 +87,7 @@ def upgrade() -> None:
     op.alter_column(
         "workflows",
         "proxy_location",
-        existing_type=postgresql.ENUM(
+        existing_type=sa.String(),
             "US_CA",
             "US_NY",
             "US_TX",
@@ -115,7 +114,7 @@ def downgrade() -> None:
         "workflows",
         "proxy_location",
         existing_type=sa.String(),
-        type_=postgresql.ENUM(
+        type_=sa.String(),
             "US_CA",
             "US_NY",
             "US_TX",
@@ -136,7 +135,7 @@ def downgrade() -> None:
         "workflow_runs",
         "proxy_location",
         existing_type=sa.String(),
-        type_=postgresql.ENUM(
+        type_=sa.String(),
             "US_CA",
             "US_NY",
             "US_TX",
@@ -157,7 +156,7 @@ def downgrade() -> None:
         "tasks",
         "proxy_location",
         existing_type=sa.String(),
-        type_=postgresql.ENUM(
+        type_=sa.String(),
             "US_CA",
             "US_NY",
             "US_TX",
@@ -178,7 +177,7 @@ def downgrade() -> None:
         "observer_cruises",
         "proxy_location",
         existing_type=sa.String(),
-        type_=postgresql.ENUM(
+        type_=sa.String(),
             "US_CA",
             "US_NY",
             "US_TX",
