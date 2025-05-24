@@ -9,7 +9,6 @@ import typing
 import datetime as dt
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 
-
 class Artifact(UniversalBaseModel):
     artifact_id: str = pydantic.Field()
     artifact_type: ArtifactType = pydantic.Field()

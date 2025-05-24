@@ -31,4 +31,3 @@ ArtifactType = typing.Union[
     ],
     typing.Any,
 ]
-
