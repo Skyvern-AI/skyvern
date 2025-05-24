@@ -18,9 +18,7 @@ class ArtifactsClient:
     def __init__(self, *, client_wrapper: SyncClientWrapper):
         self._client_wrapper = client_wrapper
 
-    def get_artifact(
-        self, artifact_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> Artifact:
+    def get_artifact(self, artifact_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> Artifact:
         """Get a single artifact by id"""
         _response = self._client_wrapper.httpx_client.request(
             f"v1/artifacts/{jsonable_encoder(artifact_id)}",

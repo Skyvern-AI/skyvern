@@ -416,6 +416,7 @@ async def cancel_run(
 
     await run_service.cancel_run(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
 
+
 @base_router.post(
     "/runs/{run_id}/retry_webhook",
     tags=["Agent"],
@@ -429,16 +430,13 @@ async def cancel_run(
 )
 @base_router.post("/runs/{run_id}/retry_webhook/", response_model=RunResponse, include_in_schema=False)
 async def retry_run_webhook(
-    run_id: str = Path(
-        ..., description="The id of the task run or the workflow run.", examples=["tsk_123", "wr_123"]
-    ),
+    run_id: str = Path(..., description="The id of the task run or the workflow run.", examples=["tsk_123", "wr_123"]),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> RunResponse:
     analytics.capture("skyvern-oss-agent-run-retry-webhook")
-    return await run_service.retry_run_webhook(
-        run_id, organization_id=current_org.organization_id, api_key=x_api_key
-    )
+    return await run_service.retry_run_webhook(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
+
 
 @legacy_base_router.post(
     "/workflows",

@@ -26,4 +26,3 @@ class WorkflowRunTimeline(UniversalBaseModel):
             frozen = True
             smart_union = True
             extra = pydantic.Extra.allow
-

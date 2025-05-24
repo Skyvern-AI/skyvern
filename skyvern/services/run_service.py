@@ -139,9 +139,7 @@ async def cancel_run(run_id: str, organization_id: str | None = None, api_key: s
         )
 
 
-async def retry_run_webhook(
-    run_id: str, organization_id: str | None = None, api_key: str | None = None
-) -> RunResponse:
+async def retry_run_webhook(run_id: str, organization_id: str | None = None, api_key: str | None = None) -> RunResponse:
     """Retry sending the webhook for a run."""
 
     run = await app.DATABASE.get_run(run_id, organization_id=organization_id)
@@ -165,9 +163,7 @@ async def retry_run_webhook(
         if not task_v2:
             raise TaskNotFound(task_id=run_id)
         if task_v2.workflow_run_id:
-            workflow_run = await app.DATABASE.get_workflow_run(
-                task_v2.workflow_run_id, organization_id=organization_id
-            )
+            workflow_run = await app.DATABASE.get_workflow_run(task_v2.workflow_run_id, organization_id=organization_id)
             if workflow_run:
                 await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key)
         run_response = await get_run_response(run_id, organization_id=organization_id)
@@ -176,9 +172,7 @@ async def retry_run_webhook(
         return run_response
 
     if run.task_run_type == RunType.workflow_run:
-        workflow_run = await app.DATABASE.get_workflow_run(
-            workflow_run_id=run_id, organization_id=organization_id
-        )
+        workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=run_id, organization_id=organization_id)
         if not workflow_run:
             raise WorkflowRunNotFound(workflow_run_id=run_id)
         await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key)
