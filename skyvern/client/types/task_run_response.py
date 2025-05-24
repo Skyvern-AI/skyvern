@@ -37,6 +37,11 @@ class TaskRunResponse(UniversalBaseModel):
     URL to the recording of the run
     """
 
+    screenshot_urls: typing.Optional[typing.List[str]] = pydantic.Field(default=None)
+    """
+    List of last n screenshot URLs in reverse chronological order - the first one the list is the latest screenshot.
+    """
+
     failure_reason: typing.Optional[str] = pydantic.Field(default=None)
     """
     Reason for failure if the run failed or terminated

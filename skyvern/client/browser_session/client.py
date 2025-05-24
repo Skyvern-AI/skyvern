@@ -43,7 +43,6 @@ class BrowserSessionClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
         )
         client.browser_session.get_browser_sessions()
         """
@@ -111,7 +110,6 @@ class BrowserSessionClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
         )
         client.browser_session.create_browser_session()
         """
@@ -186,7 +184,6 @@ class BrowserSessionClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
         )
         client.browser_session.close_browser_session(
             browser_session_id="pbs_123456",
@@ -256,7 +253,6 @@ class BrowserSessionClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
         )
         client.browser_session.get_browser_session(
             browser_session_id="pbs_123456",
@@ -340,7 +336,6 @@ class AsyncBrowserSessionClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
         )
 
 
@@ -416,7 +411,6 @@ class AsyncBrowserSessionClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
         )
 
 
@@ -499,7 +493,6 @@ class AsyncBrowserSessionClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
         )
 
 
@@ -577,7 +570,6 @@ class AsyncBrowserSessionClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
         )
 
 
