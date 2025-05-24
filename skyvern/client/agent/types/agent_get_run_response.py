@@ -21,7 +21,6 @@ class AgentGetRunResponse_TaskV1(UniversalBaseModel):
     output: typing.Optional[TaskRunResponseOutput] = None
     downloaded_files: typing.Optional[typing.List[FileInfo]] = None
     recording_url: typing.Optional[str] = None
-    screenshot_urls: typing.Optional[typing.List[str]] = None
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
@@ -45,7 +44,6 @@ class AgentGetRunResponse_TaskV2(UniversalBaseModel):
     output: typing.Optional[TaskRunResponseOutput] = None
     downloaded_files: typing.Optional[typing.List[FileInfo]] = None
     recording_url: typing.Optional[str] = None
-    screenshot_urls: typing.Optional[typing.List[str]] = None
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
@@ -69,7 +67,6 @@ class AgentGetRunResponse_OpenaiCua(UniversalBaseModel):
     output: typing.Optional[TaskRunResponseOutput] = None
     downloaded_files: typing.Optional[typing.List[FileInfo]] = None
     recording_url: typing.Optional[str] = None
-    screenshot_urls: typing.Optional[typing.List[str]] = None
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
@@ -93,7 +90,6 @@ class AgentGetRunResponse_AnthropicCua(UniversalBaseModel):
     output: typing.Optional[TaskRunResponseOutput] = None
     downloaded_files: typing.Optional[typing.List[FileInfo]] = None
     recording_url: typing.Optional[str] = None
-    screenshot_urls: typing.Optional[typing.List[str]] = None
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
@@ -117,7 +113,6 @@ class AgentGetRunResponse_WorkflowRun(UniversalBaseModel):
     output: typing.Optional[WorkflowRunResponseOutput] = None
     downloaded_files: typing.Optional[typing.List[FileInfo]] = None
     recording_url: typing.Optional[str] = None
-    screenshot_urls: typing.Optional[typing.List[str]] = None
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime

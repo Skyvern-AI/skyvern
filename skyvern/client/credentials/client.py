@@ -37,7 +37,7 @@ class CredentialsClient:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> TotpCode:
         """
-        Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern. This endpoint stores the code in database so that Skyvern can use it while running tasks/workflows.
+        Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern
 
         Parameters
         ----------
@@ -76,6 +76,7 @@ class CredentialsClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
         )
         client.credentials.send_totp_code(
             totp_identifier="john.doe@example.com",
@@ -156,6 +157,7 @@ class CredentialsClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
         )
         client.credentials.get_credentials()
         """
@@ -228,6 +230,7 @@ class CredentialsClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
         )
         client.credentials.create_credential(
             name="My Credential",
@@ -301,6 +304,7 @@ class CredentialsClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
         )
         client.credentials.delete_credential(
             credential_id="cred_1234567890",
@@ -354,6 +358,7 @@ class CredentialsClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
         )
         client.credentials.get_credential(
             credential_id="cred_1234567890",
@@ -406,7 +411,7 @@ class AsyncCredentialsClient:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> TotpCode:
         """
-        Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern. This endpoint stores the code in database so that Skyvern can use it while running tasks/workflows.
+        Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern
 
         Parameters
         ----------
@@ -447,6 +452,7 @@ class AsyncCredentialsClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
         )
 
 
@@ -535,6 +541,7 @@ class AsyncCredentialsClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
         )
 
 
@@ -615,6 +622,7 @@ class AsyncCredentialsClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
         )
 
 
@@ -698,6 +706,7 @@ class AsyncCredentialsClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
         )
 
 
@@ -759,6 +768,7 @@ class AsyncCredentialsClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
         )
 
 

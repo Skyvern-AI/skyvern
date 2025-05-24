@@ -14,11 +14,10 @@ from ..errors.unprocessable_entity_error import UnprocessableEntityError
 from json.decoder import JSONDecodeError
 from ..core.api_error import ApiError
 from ..types.workflow_run_response import WorkflowRunResponse
-from ..types.workflow_run_timeline import WorkflowRunTimeline
-from ..types.artifact import Artifact
 from .types.agent_get_run_response import AgentGetRunResponse
 from ..core.jsonable_encoder import jsonable_encoder
 from ..errors.not_found_error import NotFoundError
+from ..types.workflow import Workflow
 from ..core.client_wrapper import AsyncClientWrapper
 
 # this is used as the default value for optional parameters
@@ -112,6 +111,7 @@ class AgentClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
         )
         client.agent.run_task(
             prompt="prompt",
@@ -243,6 +243,7 @@ class AgentClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
         )
         client.agent.run_workflow(
             workflow_id="wpid_123",
@@ -328,6 +329,7 @@ class AgentClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
         )
         client.agent.get_run(
             run_id="tsk_123",
@@ -397,6 +399,7 @@ class AgentClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
         )
         client.agent.cancel_run(
             run_id="run_id",
@@ -431,33 +434,48 @@ class AgentClient:
             raise ApiError(status_code=_response.status_code, body=_response.text)
         raise ApiError(status_code=_response.status_code, body=_response_json)
 
-    def retry_run_webhook(
-        self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> AgentGetRunResponse:
-        """Retry sending the webhook for a run."""
+    def update_workflow(self, workflow_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> Workflow:
+        """
+        Update a workflow definition
+
+        Parameters
+        ----------
+        workflow_id : str
+            The ID of the workflow to update. Workflow ID starts with `wpid_`.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Workflow
+            Successfully updated workflow
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
+        )
+        client.agent.update_workflow(
+            workflow_id="wpid_123",
+        )
+        """
         _response = self._client_wrapper.httpx_client.request(
-            f"v1/runs/{jsonable_encoder(run_id)}/retry_webhook",
+            f"v1/workflows/{jsonable_encoder(workflow_id)}",
             method="POST",
             request_options=request_options,
         )
         try:
             if 200 <= _response.status_code < 300:
                 return typing.cast(
-                    AgentGetRunResponse,
+                    Workflow,
                     parse_obj_as(
-                        type_=AgentGetRunResponse,  # type: ignore
+                        type_=Workflow,  # type: ignore
                         object_=_response.json(),
                     ),
-                )
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    )
                 )
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
@@ -564,6 +582,7 @@ class AsyncAgentClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
         )
 
 
@@ -703,6 +722,7 @@ class AsyncAgentClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
         )
 
 
@@ -798,6 +818,7 @@ class AsyncAgentClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
         )
 
 
@@ -875,6 +896,7 @@ class AsyncAgentClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
         )
 
 
@@ -915,35 +937,59 @@ class AsyncAgentClient:
             raise ApiError(status_code=_response.status_code, body=_response.text)
         raise ApiError(status_code=_response.status_code, body=_response_json)
 
-    async def retry_run_webhook(
-        self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> AgentGetRunResponse:
-        """Retry sending the webhook for a run."""
+    async def update_workflow(
+        self, workflow_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> Workflow:
+        """
+        Update a workflow definition
+
+        Parameters
+        ----------
+        workflow_id : str
+            The ID of the workflow to update. Workflow ID starts with `wpid_`.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Workflow
+            Successfully updated workflow
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+            authorization="YOUR_AUTHORIZATION",
+        )
+
+
+        async def main() -> None:
+            await client.agent.update_workflow(
+                workflow_id="wpid_123",
+            )
+
+
+        asyncio.run(main())
+        """
         _response = await self._client_wrapper.httpx_client.request(
-            f"v1/runs/{jsonable_encoder(run_id)}/retry_webhook",
+            f"v1/workflows/{jsonable_encoder(workflow_id)}",
             method="POST",
             request_options=request_options,
         )
         try:
             if 200 <= _response.status_code < 300:
                 return typing.cast(
-                    AgentGetRunResponse,
+                    Workflow,
                     parse_obj_as(
-                        type_=AgentGetRunResponse,  # type: ignore
+                        type_=Workflow,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    )
-                )
-
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
                     typing.cast(
