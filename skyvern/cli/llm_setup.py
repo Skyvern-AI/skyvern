@@ -40,7 +40,7 @@ def update_or_add_env_var(key: str, value: str) -> None:
             "BROWSER_ACTION_TIMEOUT_MS": "5000",
             "MAX_STEPS_PER_RUN": "50",
             "LOG_LEVEL": "INFO",
-            "DATABASE_STRING": "sqlite:///data/skyvern.db",
+            "DATABASE_STRING": "sqlite+aiosqlite:///data/skyvern.db",
             "PORT": "8000",
             "ANALYTICS_ID": "anonymous",
             "ENABLE_LOG_ARTIFACTS": "false",

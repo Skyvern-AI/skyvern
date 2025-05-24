@@ -18,7 +18,7 @@ services:
       # - ./skyvern:/app/skyvern
       # - ./alembic:/app/alembic
     environment:
-      - DATABASE_STRING=sqlite:///data/skyvern.db
+      - DATABASE_STRING=sqlite+aiosqlite:///data/skyvern.db
       - BROWSER_TYPE=chromium-headful
       - ENABLE_CODE_BLOCK=true
       # - BROWSER_TYPE=cdp-connect
