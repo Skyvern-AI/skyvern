@@ -170,7 +170,10 @@ async def retry_run_webhook(
             )
             if workflow_run:
                 await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key)
-        return await get_run_response(run_id, organization_id=organization_id)
+        run_response = await get_run_response(run_id, organization_id=organization_id)
+        if run_response is None:
+            raise TaskNotFound(task_id=run_id)
+        return run_response
 
     if run.task_run_type == RunType.workflow_run:
         workflow_run = await app.DATABASE.get_workflow_run(
