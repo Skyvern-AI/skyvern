@@ -1397,11 +1397,21 @@ async def get_workflow_run(
         "x-fern-sdk-method-name": "get_workflows",
     },
 )
+@base_router.get(
+    "/workflows",
+    response_model=list[Workflow],
+    tags=["Workflows"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "workflows",
+        "x-fern-sdk-method-name": "get_workflows",
+    },
+)
 @legacy_base_router.get(
     "/workflows/",
     response_model=list[Workflow],
     include_in_schema=False,
 )
+@base_router.get("/workflows/", response_model=list[Workflow], include_in_schema=False)
 async def get_workflows(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
@@ -1455,11 +1465,21 @@ async def get_workflows(
         "x-fern-sdk-method-name": "get_workflow_templates",
     },
 )
+@base_router.get(
+    "/workflows/templates",
+    response_model=list[Workflow],
+    tags=["Workflows"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "workflows",
+        "x-fern-sdk-method-name": "get_workflow_templates",
+    },
+)
 @legacy_base_router.get(
     "/workflows/templates/",
     response_model=list[Workflow],
     include_in_schema=False,
 )
+@base_router.get("/workflows/templates/", response_model=list[Workflow], include_in_schema=False)
 async def get_workflow_templates() -> list[Workflow]:
     global_workflows_permanent_ids = await app.STORAGE.retrieve_global_workflows()
 
