@@ -431,21 +431,21 @@ class AgentClient:
             raise ApiError(status_code=_response.status_code, body=_response.text)
         raise ApiError(status_code=_response.status_code, body=_response_json)
 
-    def get_run_timeline(
+    def retry_run_webhook(
         self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> typing.List[WorkflowRunTimeline]:
-        """Get the timeline for a run."""
+    ) -> AgentGetRunResponse:
+        """Retry sending the webhook for a run."""
         _response = self._client_wrapper.httpx_client.request(
-            f"v1/runs/{jsonable_encoder(run_id)}/timeline",
-            method="GET",
+            f"v1/runs/{jsonable_encoder(run_id)}/retry_webhook",
+            method="POST",
             request_options=request_options,
         )
         try:
             if 200 <= _response.status_code < 300:
                 return typing.cast(
-                    typing.List[WorkflowRunTimeline],
+                    AgentGetRunResponse,
                     parse_obj_as(
-                        type_=typing.List[WorkflowRunTimeline],  # type: ignore
+                        type_=AgentGetRunResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -459,31 +459,8 @@ class AgentClient:
                         ),
                     )
                 )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, body=_response.text)
-        raise ApiError(status_code=_response.status_code, body=_response_json)
-
-    def get_run_artifacts(
-        self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> typing.List[Artifact]:
-        """Get artifacts for a run."""
-        _response = self._client_wrapper.httpx_client.request(
-            f"v1/runs/{jsonable_encoder(run_id)}/artifacts",
-            method="GET",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                return typing.cast(
-                    typing.List[Artifact],
-                    parse_obj_as(
-                        type_=typing.List[Artifact],  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-            if _response.status_code == 404:
-                raise NotFoundError(
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
                     typing.cast(
                         typing.Optional[typing.Any],
                         parse_obj_as(
@@ -938,21 +915,21 @@ class AsyncAgentClient:
             raise ApiError(status_code=_response.status_code, body=_response.text)
         raise ApiError(status_code=_response.status_code, body=_response_json)
 
-    async def get_run_timeline(
+    async def retry_run_webhook(
         self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> typing.List[WorkflowRunTimeline]:
-        """Get the timeline for a run."""
+    ) -> AgentGetRunResponse:
+        """Retry sending the webhook for a run."""
         _response = await self._client_wrapper.httpx_client.request(
-            f"v1/runs/{jsonable_encoder(run_id)}/timeline",
-            method="GET",
+            f"v1/runs/{jsonable_encoder(run_id)}/retry_webhook",
+            method="POST",
             request_options=request_options,
         )
         try:
             if 200 <= _response.status_code < 300:
                 return typing.cast(
-                    typing.List[WorkflowRunTimeline],
+                    AgentGetRunResponse,
                     parse_obj_as(
-                        type_=typing.List[WorkflowRunTimeline],  # type: ignore
+                        type_=AgentGetRunResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -966,31 +943,9 @@ class AsyncAgentClient:
                         ),
                     )
                 )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, body=_response.text)
-        raise ApiError(status_code=_response.status_code, body=_response_json)
 
-    async def get_run_artifacts(
-        self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> typing.List[Artifact]:
-        """Get artifacts for a run."""
-        _response = await self._client_wrapper.httpx_client.request(
-            f"v1/runs/{jsonable_encoder(run_id)}/artifacts",
-            method="GET",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                return typing.cast(
-                    typing.List[Artifact],
-                    parse_obj_as(
-                        type_=typing.List[Artifact],  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-            if _response.status_code == 404:
-                raise NotFoundError(
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
                     typing.cast(
                         typing.Optional[typing.Any],
                         parse_obj_as(

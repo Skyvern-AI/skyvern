@@ -416,75 +416,29 @@ async def cancel_run(
 
     await run_service.cancel_run(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
 
-
-@base_router.get(
-    "/runs/{run_id}/timeline",
+@base_router.post(
+    "/runs/{run_id}/retry_webhook",
     tags=["Agent"],
-    response_model=list[WorkflowRunTimeline],
+    response_model=RunResponse,
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "get_run_timeline",
+        "x-fern-sdk-method-name": "retry_run_webhook",
     },
+    description="Retry sending the webhook for a run",
+    summary="Retry run webhook",
 )
-@base_router.get(
-    "/runs/{run_id}/timeline/",
-    response_model=list[WorkflowRunTimeline],
-    include_in_schema=False,
-)
-async def get_run_timeline(
-    run_id: str,
+@base_router.post("/runs/{run_id}/retry_webhook/", response_model=RunResponse, include_in_schema=False)
+async def retry_run_webhook(
+    run_id: str = Path(
+        ..., description="The id of the task run or the workflow run.", examples=["tsk_123", "wr_123"]
+    ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> list[WorkflowRunTimeline]:
-    run = await app.DATABASE.get_run(run_id, organization_id=current_org.organization_id)
-    if not run:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Run not found {run_id}")
-    if run.task_run_type == RunType.workflow_run:
-        return await _flatten_workflow_run_timeline(current_org.organization_id, run_id)
-    if run.task_run_type == RunType.task_v2:
-        task_v2 = await app.DATABASE.get_task_v2(run_id, organization_id=current_org.organization_id)
-        if task_v2 and task_v2.workflow_run_id:
-            return await _flatten_workflow_run_timeline(current_org.organization_id, task_v2.workflow_run_id)
-    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Timeline is not supported for this run type")
-
-
-@base_router.get(
-    "/runs/{run_id}/artifacts",
-    tags=["Agent"],
-    response_model=list[Artifact],
-    openapi_extra={
-        "x-fern-sdk-group-name": "agent",
-        "x-fern-sdk-method-name": "get_run_artifacts",
-    },
-)
-@base_router.get(
-    "/runs/{run_id}/artifacts/",
-    response_model=list[Artifact],
-    include_in_schema=False,
-)
-async def get_run_artifacts(
-    run_id: str,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> Response:
-    run = await app.DATABASE.get_run(run_id, organization_id=current_org.organization_id)
-    if not run:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Run not found {run_id}")
-    params = {"organization_id": current_org.organization_id}
-    if run.task_run_type == RunType.workflow_run:
-        params["workflow_run_id"] = run_id
-    elif run.task_run_type == RunType.task_v2:
-        params["task_v2_id"] = run_id
-    else:
-        params["task_id"] = run_id
-    artifacts = await app.DATABASE.get_artifacts_by_entity_id(**params)  # type: ignore
-    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
-        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
-        if signed_urls:
-            for i, artifact in enumerate(artifacts):
-                artifact.signed_url = signed_urls[i]
-        else:
-            LOG.warning("Failed to get signed urls for artifacts", run_id=run_id)
-    return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
-
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> RunResponse:
+    analytics.capture("skyvern-oss-agent-run-retry-webhook")
+    return await run_service.retry_run_webhook(
+        run_id, organization_id=current_org.organization_id, api_key=x_api_key
+    )
 
 @legacy_base_router.post(
     "/workflows",
