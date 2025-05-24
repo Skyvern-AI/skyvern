@@ -15,8 +15,8 @@ services:
       - ./data:/app/data
       - ./.streamlit:/app/.streamlit
       # Uncomment the following two lines if you want to connect to any local changes
-      # - ./skyvern:/app/skyvern
-      # - ./alembic:/app/alembic
+      - ./skyvern:/app/skyvern
+      - ./alembic:/app/alembic
     environment:
       - DATABASE_STRING=sqlite+aiosqlite:///data/skyvern.db
       - BROWSER_TYPE=chromium-headful

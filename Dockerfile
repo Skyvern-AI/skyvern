@@ -12,6 +12,7 @@ WORKDIR /app
 COPY --from=requirements-stage /tmp/requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip setuptools wheel
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
+RUN pip install --upgrade aiosqlite
 RUN playwright install-deps
 RUN playwright install
 RUN apt-get install -y xauth x11-apps netpbm curl && apt-get clean
