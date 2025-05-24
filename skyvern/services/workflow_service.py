@@ -3,7 +3,6 @@ from fastapi import BackgroundTasks, Request
 
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.workflow.exceptions import InvalidTemplateWorkflowPermanentId
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun
@@ -50,6 +49,8 @@ async def run_workflow(
     )
     if max_steps:
         LOG.info("Overriding max steps per run", max_steps_override=max_steps)
+    from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+
     await AsyncExecutorFactory.get_executor().execute_workflow(
         request=request,
         background_tasks=background_tasks,
