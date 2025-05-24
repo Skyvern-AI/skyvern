@@ -165,3 +165,51 @@ async def cancel_run(run_id: str, organization_id: str | None = None, api_key: s
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid run type to cancel: {run.task_run_type}",
         )
+
+
+async def retry_run_webhook(
+    run_id: str, organization_id: str | None = None, api_key: str | None = None
+) -> RunResponse:
+    """Retry sending the webhook for a run."""
+
+    run = await app.DATABASE.get_run(run_id, organization_id=organization_id)
+    if not run:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Run not found {run_id}",
+        )
+
+    if run.task_run_type in [RunType.task_v1, RunType.openai_cua, RunType.anthropic_cua]:
+        task = await app.DATABASE.get_task(run_id, organization_id=organization_id)
+        if not task:
+            raise TaskNotFound(task_id=run_id)
+        latest_step = await app.DATABASE.get_latest_step(run_id, organization_id=organization_id)
+        if latest_step:
+            await app.agent.execute_task_webhook(task=task, last_step=latest_step, api_key=api_key)
+        return await app.agent.build_task_response(task=task, last_step=latest_step)
+
+    if run.task_run_type == RunType.task_v2:
+        task_v2 = await app.DATABASE.get_task_v2(run_id, organization_id=organization_id)
+        if not task_v2:
+            raise TaskNotFound(task_id=run_id)
+        if task_v2.workflow_run_id:
+            workflow_run = await app.DATABASE.get_workflow_run(
+                task_v2.workflow_run_id, organization_id=organization_id
+            )
+            if workflow_run:
+                await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key)
+        return await get_run_response(run_id, organization_id=organization_id)
+
+    if run.task_run_type == RunType.workflow_run:
+        workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run_id=run_id, organization_id=organization_id
+        )
+        if not workflow_run:
+            raise WorkflowRunNotFound(workflow_run_id=run_id)
+        await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key)
+        return await workflow_service.get_workflow_run_response(run_id, organization_id=organization_id)
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Invalid run type to retry webhook: {run.task_run_type}",
+    )
