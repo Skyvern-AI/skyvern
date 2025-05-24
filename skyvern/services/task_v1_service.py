@@ -10,7 +10,6 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.core.hashing import generate_url_hash
-from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration, TaskGenerationBase
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
@@ -105,6 +104,8 @@ async def run_task(
             organization_id=organization.organization_id,
             task_id=created_task.task_id,
         )
+    from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+
     await AsyncExecutorFactory.get_executor().execute_task(
         request=request,
         background_tasks=background_tasks,
