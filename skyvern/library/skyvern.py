@@ -52,10 +52,8 @@ class Skyvern(AsyncSkyvern):
             httpx_client=httpx_client,
         )
         if base_url is None and api_key is None:
-            if not os.path.exists(".env"):
-                raise Exception("No .env file found. Please run 'skyvern init' first to set up your environment.")
-
-            load_dotenv(".env")
+            if os.path.exists(".env"):
+                load_dotenv(".env")
             migrate_db()
 
         self._api_key = api_key
