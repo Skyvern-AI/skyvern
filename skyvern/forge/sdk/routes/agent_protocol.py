@@ -683,58 +683,45 @@ async def delete_workflow(
 
 
 @base_router.get(
-    "/workflows",
-    response_model=list[Workflow],
-    tags=["Workflows"],
+    "/artifacts/{artifact_id}",
+    tags=["Artifacts"],
+    response_model=Artifact,
     openapi_extra={
-        "x-fern-sdk-group-name": "workflows",
-        "x-fern-sdk-method-name": "get_workflows",
+        "x-fern-sdk-group-name": "artifacts",
+        "x-fern-sdk-method-name": "get_artifact",
     },
-    description="Get all workflows with the latest version for the organization.",
-    summary="Get workflows",
-    responses={200: {"description": "Successfully got workflows"}},
+    description="Get an artifact",
+    summary="Get an artifact",
+    responses={
+        200: {"description": "Successfully retrieved artifact"},
+        404: {"description": "Artifact not found"},
+    },
 )
-@base_router.get("/workflows/", response_model=list[Workflow], include_in_schema=False)
-async def get_workflows(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1),
-    only_saved_tasks: bool = Query(False),
-    only_workflows: bool = Query(False),
-    title: str = Query(""),
+@base_router.get("/artifacts/{artifact_id}/", response_model=Artifact, include_in_schema=False)
+async def get_artifact(
+    artifact_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    template: bool = Query(False),
-) -> list[Workflow]:
-    """Get workflows for the organization or global templates."""
-    analytics.capture("skyvern-oss-agent-workflows-get")
-
-    if template:
-        global_workflows_permanent_ids = await app.STORAGE.retrieve_global_workflows()
-        if not global_workflows_permanent_ids:
-            return []
-        workflows = await app.WORKFLOW_SERVICE.get_workflows_by_permanent_ids(
-            workflow_permanent_ids=global_workflows_permanent_ids,
-            page=page,
-            page_size=page_size,
-            title=title,
-            statuses=[WorkflowStatus.published, WorkflowStatus.draft],
-        )
-        return workflows
-
-    if only_saved_tasks and only_workflows:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="only_saved_tasks and only_workflows cannot be used together",
-        )
-
-    return await app.WORKFLOW_SERVICE.get_workflows_by_organization_id(
+) -> Response:
+    analytics.capture("skyvern-oss-artifact-get")
+    artifact = await app.DATABASE.get_artifact_by_id(
+        artifact_id=artifact_id,
         organization_id=current_org.organization_id,
-        page=page,
-        page_size=page_size,
-        only_saved_tasks=only_saved_tasks,
-        only_workflows=only_workflows,
-        title=title,
-        statuses=[WorkflowStatus.published, WorkflowStatus.draft],
     )
+    if not artifact:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Artifact not found {artifact_id}",
+        )
+    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
+        signed_urls = await app.ARTIFACT_MANAGER.get_share_links([artifact])
+        if signed_urls:
+            artifact.signed_url = signed_urls[0]
+        else:
+            LOG.warning(
+                "Failed to get signed url for artifact",
+                artifact_id=artifact_id,
+            )
+    return ORJSONResponse(artifact.model_dump())
 
 
 ################# Legacy Endpoints #################
