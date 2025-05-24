@@ -37,7 +37,7 @@ class CredentialsClient:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> TotpCode:
         """
-        Forward a TOTP (2FA, MFA) code to Skyvern
+        Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern. This endpoint stores the code in database so that Skyvern can use it while running tasks/workflows.
 
         Parameters
         ----------
@@ -76,7 +76,6 @@ class CredentialsClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
         )
         client.credentials.send_totp_code(
             totp_identifier="john.doe@example.com",
@@ -157,7 +156,6 @@ class CredentialsClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
         )
         client.credentials.get_credentials()
         """
@@ -230,7 +228,6 @@ class CredentialsClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
         )
         client.credentials.create_credential(
             name="My Credential",
@@ -282,6 +279,56 @@ class CredentialsClient:
             raise ApiError(status_code=_response.status_code, body=_response.text)
         raise ApiError(status_code=_response.status_code, body=_response_json)
 
+    def delete_credential(self, credential_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> None:
+        """
+        Deletes a specific credential by its ID
+
+        Parameters
+        ----------
+        credential_id : str
+            The unique identifier of the credential to delete
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        None
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.credentials.delete_credential(
+            credential_id="cred_1234567890",
+        )
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/credentials/{jsonable_encoder(credential_id)}/delete",
+            method="POST",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
     def get_credential(
         self, credential_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> CredentialResponse:
@@ -307,7 +354,6 @@ class CredentialsClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
         )
         client.credentials.get_credential(
             credential_id="cred_1234567890",
@@ -342,57 +388,6 @@ class CredentialsClient:
             raise ApiError(status_code=_response.status_code, body=_response.text)
         raise ApiError(status_code=_response.status_code, body=_response_json)
 
-    def delete_credential(self, credential_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> None:
-        """
-        Deletes a specific credential by its ID
-
-        Parameters
-        ----------
-        credential_id : str
-            The unique identifier of the credential to delete
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        None
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
-        )
-        client.credentials.delete_credential(
-            credential_id="cred_1234567890",
-        )
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            f"v1/credentials/{jsonable_encoder(credential_id)}/delete",
-            method="POST",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                return
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    )
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, body=_response.text)
-        raise ApiError(status_code=_response.status_code, body=_response_json)
-
 
 class AsyncCredentialsClient:
     def __init__(self, *, client_wrapper: AsyncClientWrapper):
@@ -411,7 +406,7 @@ class AsyncCredentialsClient:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> TotpCode:
         """
-        Forward a TOTP (2FA, MFA) code to Skyvern
+        Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern. This endpoint stores the code in database so that Skyvern can use it while running tasks/workflows.
 
         Parameters
         ----------
@@ -452,7 +447,6 @@ class AsyncCredentialsClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
         )
 
 
@@ -541,7 +535,6 @@ class AsyncCredentialsClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
         )
 
 
@@ -622,7 +615,6 @@ class AsyncCredentialsClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
         )
 
 
@@ -680,6 +672,66 @@ class AsyncCredentialsClient:
             raise ApiError(status_code=_response.status_code, body=_response.text)
         raise ApiError(status_code=_response.status_code, body=_response_json)
 
+    async def delete_credential(
+        self, credential_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> None:
+        """
+        Deletes a specific credential by its ID
+
+        Parameters
+        ----------
+        credential_id : str
+            The unique identifier of the credential to delete
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        None
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.credentials.delete_credential(
+                credential_id="cred_1234567890",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/credentials/{jsonable_encoder(credential_id)}/delete",
+            method="POST",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
     async def get_credential(
         self, credential_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> CredentialResponse:
@@ -707,7 +759,6 @@ class AsyncCredentialsClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
         )
 
 
@@ -733,67 +784,6 @@ class AsyncCredentialsClient:
                         object_=_response.json(),
                     ),
                 )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    )
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, body=_response.text)
-        raise ApiError(status_code=_response.status_code, body=_response_json)
-
-    async def delete_credential(
-        self, credential_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> None:
-        """
-        Deletes a specific credential by its ID
-
-        Parameters
-        ----------
-        credential_id : str
-            The unique identifier of the credential to delete
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        None
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-            authorization="YOUR_AUTHORIZATION",
-        )
-
-
-        async def main() -> None:
-            await client.credentials.delete_credential(
-                credential_id="cred_1234567890",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            f"v1/credentials/{jsonable_encoder(credential_id)}/delete",
-            method="POST",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                return
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
                     typing.cast(

@@ -87,7 +87,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                     </div>
                     <div className="space-y-2">
                       <div className="flex items-center gap-2">
-                        <Label>Persist Browser Session</Label>
+                        <Label>Save &amp; Reuse Session</Label>
                         <HelpTooltip content="Persist session information across workflow runs" />
                         <Switch
                           checked={inputs.persistBrowserSession}

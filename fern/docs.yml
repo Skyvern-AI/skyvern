@@ -17,6 +17,11 @@ colors:
 analytics:
   posthog:
     api-key: ${POSTHOG_API_KEY}
+layout:
+  page-width: 1504px
+  header-height: 75px
+  searchbar-placement: header
+  tabs-placement: header
 navbar-links:
   - type: minimal
     icon: fa-brands fa-discord
@@ -40,8 +45,8 @@ tabs:
     href: https://blog.skyvern.com
   community:
     display-name: Community 
-    icon: discord
-    href: https://discord.gg/fG2XXEuQX3
+    icon: fa-brands fa-discord
+    href: https://discord.gg/m6FmQV7nU3
   github:
     display-name: Github
     icon: fa-brands fa-github
@@ -61,27 +66,23 @@ navigation:
       contents:
         - page: Introduction
           path: introduction.mdx
+        - page: Quickstart
+          path: getting-started/quickstart.mdx
         - page: Skyvern In Action
           path: getting-started/skyvern-in-action.mdx
         - page: Task Prompting Guide
           path: getting-started/prompting-guide.mdx
     - section: Tasks
       contents:
-        - page: Introduction
-          path: running-tasks/introduction.mdx
         - page: Tasks API
           path: running-tasks/api-spec.mdx
-        - api: Endpoints
-          paginated: true
-          snippets: 
-            python: skyvern
         - page: Webhooks FAQ
           path: running-tasks/webhooks-faq.mdx
         - page: Visualizing Results
           path: running-tasks/visualizing-results.mdx
         - page: Advanced Settings for tasks
           path: running-tasks/advanced-features.mdx
-    - section: Workflows (Beta)
+    - section: Workflows
       contents:
         - page: Introduction
           path: workflows/introduction.mdx
@@ -95,10 +96,22 @@ navigation:
           path: workflows/workflow-blocks.mdx
         - page: What the heck is a parameter?
           path: workflows/what-is-a-parameter.mdx
+    - section: Credentials
+      contents:
+        - page: Introduction
+          path: credentials/introduction.mdx
+        - page: Password Management
+          path: credentials/passwords.mdx
+        - page: Credit Card Management
+          path: credentials/credit_cards.mdx
+        - page: TOTP (2FA/MFA/Verification Code)
+          path: credentials/totp.mdx
+        - page: Bitwarden
+          path: credentials/bitwarden.mdx
     - section: Integrations
       contents:
-        - page: API Integrations
-          path: integrations/api.mdx
+        - page: Skyvern MCP
+          path: integrations/mcp.mdx
         - page: Zapier
           path: integrations/zapier.mdx
         - page: Make
@@ -113,6 +126,7 @@ navigation:
         snippets:
           python: skyvern
   - tab: blog
+  - tab: community
   - tab: github
   - tab: cloud
   - tab: demo

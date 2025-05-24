@@ -24,7 +24,7 @@ from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskReques
 from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
-from skyvern.schemas.runs import CUA_ENGINES, ProxyLocation, RunEngine, RunType
+from skyvern.schemas.runs import CUA_ENGINES, ProxyLocation, RunEngine, RunStatus, RunType
 from skyvern.services import run_service, task_v1_service, task_v2_service
 from skyvern.utils import migrate_db
 
@@ -300,7 +300,7 @@ class Skyvern(AsyncSkyvern):
         totp_url: str | None = None,
         title: str | None = None,
         error_code_mapping: dict[str, str] | None = None,
-        data_extraction_schema: dict[str, Any] | None = None,
+        data_extraction_schema: dict[str, Any] | str | None = None,
         proxy_location: ProxyLocation | None = None,
         max_steps: int | None = None,
         wait_for_completion: bool = True,
@@ -401,7 +401,7 @@ class Skyvern(AsyncSkyvern):
             async with asyncio.timeout(timeout):
                 while True:
                     task_run = await self.agent.get_run(task_run.run_id)
-                    if task_run.status.is_final():
+                    if RunStatus(task_run.status).is_final():
                         break
                     await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
         return TaskRunResponse.model_validate(task_run.dict())

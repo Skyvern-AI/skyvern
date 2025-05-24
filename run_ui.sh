@@ -1,11 +1,11 @@
 #!/bin/bash
 
 if command -v lsof > /dev/null; then
-  kill $(lsof -t -i :8080) 2>/dev/null || true
+  pid=$(lsof -t -i :8080)
+  kill $pid 2>/dev/null || true
 else
   echo "Warning: lsof command not found, skipping port check"
 fi
-
 
 cd skyvern-frontend
 

@@ -81,6 +81,7 @@ async def get_workflow_run_response(
         output=workflow_run_resp.outputs,
         downloaded_files=workflow_run_resp.downloaded_files,
         recording_url=workflow_run_resp.recording_url,
+        screenshot_urls=workflow_run_resp.screenshot_urls,
         failure_reason=workflow_run_resp.failure_reason,
         app_url=app_url,
         created_at=workflow_run.created_at,

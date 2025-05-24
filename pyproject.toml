@@ -1,13 +1,13 @@
 [tool.poetry]
 name = "skyvern"
-version = "0.1.82"
+version = "0.1.85"
 description = ""
 authors = ["Skyvern AI <info@skyvern.com>"]
 readme = "README.md"
 packages = [{ include = "skyvern" }, { include = "alembic" }]
 
 [tool.poetry.dependencies]
-python = "^3.11,<3.12"
+python = ">=3.11,<3.14"
 python-dotenv = "^1.0.0"
 openai = ">=1.68.2"
 sqlalchemy = {extras = ["mypy"], version = "^2.0.29"}
@@ -17,14 +17,21 @@ toml = "^0.10.2"
 jinja2 = "^3.1.2"
 uvicorn = {extras = ["standard"], version = "^0.24.0.post1"}
 litellm = ">=1.68.2"
-playwright = "1.46.0"
+playwright = [
+    {version = ">1.46.0", python = ">=3.12,<3.14"},
+    {version = "=1.46.0", python = ">=3.11,<3.12"}
+]
+greenlet = [
+    {version = ">3.0.3", python = ">=3.12,<3.14"},
+    {version = "=3.0.3", python = ">=3.11,<3.12"}
+]
 pillow = "^10.1.0"
 starlette-context = "^0.3.6"
 ddtrace = "^2.3.2"
 pydantic = "^2.5.2"
 pydantic-settings = "^2.1.0"
 fastapi = "^0.115.4"
-psycopg = {version = "3.1.18", extras = ["binary", "pool"]}
+psycopg = {version = ">=3.2.2,<3.3.0", extras = ["binary", "pool"]}
 alembic = "^1.12.1"
 python-jose = {extras = ["cryptography"], version = "^3.3.0"}
 cachetools = "^5.3.2"
@@ -33,12 +40,15 @@ commentjson = "^0.9.0"
 asyncache = "^0.3.1"
 orjson = "^3.9.10"
 structlog = "^23.2.0"
-typer = ">=0.9.0,<1.0"
+typer = ">=0.9.0,<0.10.0"
 types-toml = "^0.10.8.7"
 httpx = {version = "^0.27.0", extras = ["socks"]}
 filetype = "^1.2.0"
 redis = "^5.0.3"
-onnxruntime = "<1.17"
+onnxruntime = [
+    { version = ">=1.20.0,<1.23.0", python = ">=3.12, <3.14"},
+    { version = "<1.17", python = ">=3.11, <3.12"}
+]
 aioredlock = "^0.7.3"
 stripe = "^9.7.0"
 tldextract = "^5.1.2"
@@ -46,6 +56,7 @@ websockets = "^12.0"
 email-validator = "^2.2.0"
 temporalio = "^1.6.0"
 requests-toolbelt = "^1.0.0"
+rich = {extras = ["jupyter"], version = "^13.7.0"}
 posthog = "^3.7.0"
 aiofiles = "^24.1.0"
 pyotp = "^2.9.0"
@@ -57,6 +68,8 @@ psutil = ">=7.0.0"
 tiktoken = ">=0.9.0"
 anthropic = "^0.50.0"
 google-cloud-aiplatform = "^1.90.0"
+alive-progress = "^3.2.0"
+colorama = "^0.4.6"
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"
@@ -83,9 +96,8 @@ build = "^1.2.2.post1"
 pandas = "^2.2.3"
 pre-commit = "^4.2.0"
 
-
 [build-system]
-requires = ["poetry-core"]
+requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.ruff]
@@ -145,4 +157,4 @@ module-root = "skyvern"
 tests-root = "codeflash-tests"                                                                                                                                                                                                                                                                                                         
 test-framework = "pytest"                                                                                                                                                                                                                                                                                                    
 ignore-paths = ["skyvern/client"]                                                                                                                                                                                                                                                                                                         
-formatter-cmds = ["ruff check --exit-zero --fix $file", "ruff format $file"] 
+formatter-cmds = ["ruff check --exit-zero --fix $file", "ruff format $file"]

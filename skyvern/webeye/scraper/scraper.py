@@ -738,6 +738,11 @@ class IncrementalScrapePage:
         )
 
     async def get_incremental_elements_num(self) -> int:
+        # check if the DOM has navigated away or refreshed
+        js_script = "() => window.globalOneTimeIncrementElements === undefined"
+        if await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script):
+            return 0
+
         js_script = "() => window.globalOneTimeIncrementElements.length"
         return await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script)
 
@@ -863,6 +868,9 @@ def trim_element(element: dict) -> dict:
 
         if "afterPseudoText" in queue_ele and not queue_ele.get("afterPseudoText"):
             del queue_ele["afterPseudoText"]
+
+        if "target" in queue_ele:
+            del queue_ele["target"]
 
     return element
 

@@ -2325,7 +2325,7 @@ class ForgeAgent:
             for key, value in updates.items()
             if getattr(step, key) != value and key != "output"
         }
-        LOG.info(
+        LOG.debug(
             "Updating step in db",
             task_id=step.task_id,
             step_id=step.step_id,

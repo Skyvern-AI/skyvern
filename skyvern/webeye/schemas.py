@@ -10,15 +10,23 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrow
 class BrowserSessionResponse(BaseModel):
     """Response model for browser session information."""
 
-    browser_session_id: str = Field(description="Unique identifier for the browser session")
+    browser_session_id: str = Field(
+        description="Unique identifier for the browser session. browser_session_id starts with `pbs_`.",
+        examples=["pbs_123456"],
+    )
     organization_id: str = Field(description="ID of the organization that owns this session")
     runnable_type: str | None = Field(
-        None, description="Type of runnable associated with this session (workflow, task etc)"
+        None,
+        description="Type of the current runnable associated with this session (workflow, task etc)",
+        examples=["task", "workflow_run"],
     )
-    runnable_id: str | None = Field(None, description="ID of the associated runnable")
+    runnable_id: str | None = Field(
+        None, description="ID of the current runnable", examples=["tsk_123456", "wr_123456"]
+    )
     timeout: int | None = Field(
         None,
-        description="Timeout in minutes for the session. Timeout is applied after the session is started.",
+        description="Timeout in minutes for the session. Timeout is applied after the session is started. Defaults to 60 minutes.",
+        examples=[60, 120],
     )
     started_at: datetime | None = Field(None, description="Timestamp when the session was started")
     completed_at: datetime | None = Field(None, description="Timestamp when the session was completed")

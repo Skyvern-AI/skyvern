@@ -5,10 +5,12 @@ from .environment import SkyvernEnvironment
 import httpx
 from .core.client_wrapper import SyncClientWrapper
 from .agent.client import AgentClient
+from .workflows.client import WorkflowsClient
 from .browser_session.client import BrowserSessionClient
 from .credentials.client import CredentialsClient
 from .core.client_wrapper import AsyncClientWrapper
 from .agent.client import AsyncAgentClient
+from .workflows.client import AsyncWorkflowsClient
 from .browser_session.client import AsyncBrowserSessionClient
 from .credentials.client import AsyncCredentialsClient
 
@@ -32,7 +34,6 @@ class Skyvern:
 
 
     api_key : typing.Optional[str]
-    authorization : typing.Optional[str]
     timeout : typing.Optional[float]
         The timeout to be used, in seconds, for requests. By default the timeout is 60 seconds, unless a custom httpx client is used, in which case this default is not enforced.
 
@@ -48,7 +49,6 @@ class Skyvern:
 
     client = Skyvern(
         api_key="YOUR_API_KEY",
-        authorization="YOUR_AUTHORIZATION",
     )
     """
 
@@ -58,7 +58,6 @@ class Skyvern:
         base_url: typing.Optional[str] = None,
         environment: SkyvernEnvironment = SkyvernEnvironment.PRODUCTION,
         api_key: typing.Optional[str] = None,
-        authorization: typing.Optional[str] = None,
         timeout: typing.Optional[float] = None,
         follow_redirects: typing.Optional[bool] = True,
         httpx_client: typing.Optional[httpx.Client] = None,
@@ -67,7 +66,6 @@ class Skyvern:
         self._client_wrapper = SyncClientWrapper(
             base_url=_get_base_url(base_url=base_url, environment=environment),
             api_key=api_key,
-            authorization=authorization,
             httpx_client=httpx_client
             if httpx_client is not None
             else httpx.Client(timeout=_defaulted_timeout, follow_redirects=follow_redirects)
@@ -76,6 +74,7 @@ class Skyvern:
             timeout=_defaulted_timeout,
         )
         self.agent = AgentClient(client_wrapper=self._client_wrapper)
+        self.workflows = WorkflowsClient(client_wrapper=self._client_wrapper)
         self.browser_session = BrowserSessionClient(client_wrapper=self._client_wrapper)
         self.credentials = CredentialsClient(client_wrapper=self._client_wrapper)
 
@@ -99,7 +98,6 @@ class AsyncSkyvern:
 
 
     api_key : typing.Optional[str]
-    authorization : typing.Optional[str]
     timeout : typing.Optional[float]
         The timeout to be used, in seconds, for requests. By default the timeout is 60 seconds, unless a custom httpx client is used, in which case this default is not enforced.
 
@@ -115,7 +113,6 @@ class AsyncSkyvern:
 
     client = AsyncSkyvern(
         api_key="YOUR_API_KEY",
-        authorization="YOUR_AUTHORIZATION",
     )
     """
 
@@ -125,7 +122,6 @@ class AsyncSkyvern:
         base_url: typing.Optional[str] = None,
         environment: SkyvernEnvironment = SkyvernEnvironment.PRODUCTION,
         api_key: typing.Optional[str] = None,
-        authorization: typing.Optional[str] = None,
         timeout: typing.Optional[float] = None,
         follow_redirects: typing.Optional[bool] = True,
         httpx_client: typing.Optional[httpx.AsyncClient] = None,
@@ -134,7 +130,6 @@ class AsyncSkyvern:
         self._client_wrapper = AsyncClientWrapper(
             base_url=_get_base_url(base_url=base_url, environment=environment),
             api_key=api_key,
-            authorization=authorization,
             httpx_client=httpx_client
             if httpx_client is not None
             else httpx.AsyncClient(timeout=_defaulted_timeout, follow_redirects=follow_redirects)
@@ -143,6 +138,7 @@ class AsyncSkyvern:
             timeout=_defaulted_timeout,
         )
         self.agent = AsyncAgentClient(client_wrapper=self._client_wrapper)
+        self.workflows = AsyncWorkflowsClient(client_wrapper=self._client_wrapper)
         self.browser_session = AsyncBrowserSessionClient(client_wrapper=self._client_wrapper)
         self.credentials = AsyncCredentialsClient(client_wrapper=self._client_wrapper)
 
