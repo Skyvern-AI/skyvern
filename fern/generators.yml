@@ -1,21 +1,10 @@
 # yaml-language-server: $schema=https://schema.buildwithfern.dev/generators-yml.json
-
-api: 
-  specs:
-    - openapi: openapi/skyvern_openapi.json
-      origin: https://api.skyvern.com/openapi.json
-      settings: 
-        title-as-schema-name: false
+default-group: local
 groups:
-  python-sdk:
+  local:
     generators:
-      - name: fernapi/fern-python-sdk
-        smart-casing: true
-        version: 4.3.17
+      - name: fernapi/fern-typescript-node-sdk
         output:
-          location: pypi
-          package-name: skyvern
-        github:
-          repository: Skyvern-AI/skyvern-python
-        config:
-          client_class_name: Skyvern
+          location: local-file-system
+          path: ../sdks/typescript
+        version: 1.0.0
