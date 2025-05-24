@@ -90,7 +90,7 @@ from skyvern.forge.sdk.workflow.models.yaml import (
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
 )
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.runs import ProxyLocation, RunStatus, RunType, WorkflowRunRequest, WorkflowRunResponse
 from skyvern.webeye.browser_factory import BrowserState
 
 LOG = structlog.get_logger()
@@ -1214,8 +1214,37 @@ class WorkflowService:
             )
             return
 
-        # send webhook to the webhook callback url
-        payload = workflow_run_status_response.model_dump_json()
+        # build new schema for backward compatible webhook payload
+        app_url = (
+            f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/"
+            f"{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}"
+        )
+        workflow_run_response = WorkflowRunResponse(
+            run_id=workflow_run.workflow_run_id,
+            run_type=RunType.workflow_run,
+            status=RunStatus(workflow_run.status),
+            output=workflow_run_status_response.outputs,
+            downloaded_files=workflow_run_status_response.downloaded_files,
+            recording_url=workflow_run_status_response.recording_url,
+            screenshot_urls=workflow_run_status_response.screenshot_urls,
+            failure_reason=workflow_run_status_response.failure_reason,
+            app_url=app_url,
+            created_at=workflow_run.created_at,
+            modified_at=workflow_run.modified_at,
+            run_request=WorkflowRunRequest(
+                workflow_id=workflow_run.workflow_permanent_id,
+                title=workflow_run_status_response.workflow_title,
+                parameters=workflow_run_status_response.parameters,
+                proxy_location=workflow_run.proxy_location,
+                webhook_url=workflow_run.webhook_callback_url or None,
+                totp_url=workflow_run.totp_verification_url or None,
+                totp_identifier=workflow_run.totp_identifier,
+            ),
+        )
+        payload_dict = json.loads(workflow_run_status_response.model_dump_json())
+        workflow_run_response_dict = json.loads(workflow_run_response.model_dump_json())
+        payload_dict.update(workflow_run_response_dict)
+        payload = json.dumps(payload_dict, default=str)
         headers = generate_skyvern_webhook_headers(
             payload=payload,
             api_key=api_key,
