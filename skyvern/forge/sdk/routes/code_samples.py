@@ -1,3 +1,4 @@
+# Agent
 RUN_TASK_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
@@ -19,6 +20,13 @@ CANCEL_RUN_CODE_SAMPLE = """from skyvern import Skyvern
 skyvern = Skyvern(api_key="YOUR_API_KEY")
 await skyvern.agent.cancel_run(run_id="tsk_v2_123")
 """
+RETRY_RUN_WEBHOOK_CODE_SAMPLE = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+await skyvern.agent.retry_run_webhook(run_id="tsk_v2_123")
+"""
+
+# Workflows
 CREATE_WORKFLOW_CODE_SAMPLE = """curl -X POST https://api.skyvern.com/v1/workflows \
 --header 'x-api-key: {{x-api-key}}' \
 --header 'Content-Type: text/plain' \
@@ -353,6 +361,14 @@ DELETE_WORKFLOW_CODE_SAMPLE = """from skyvern import Skyvern
 skyvern = Skyvern(api_key="YOUR_API_KEY")
 await skyvern.workflows.delete_workflow(workflow_id="wpid_123")
 """
+GET_WORKFLOWS_CODE_SAMPLE = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+workflows = await skyvern.workflows.get_workflows()
+print(workflows)
+"""
+
+# Credentials
 SEND_TOTP_CODE_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
@@ -400,6 +416,9 @@ skyvern = Skyvern(api_key="YOUR_API_KEY")
 credentials = await skyvern.credentials.get_credentials()
 print(credentials)
 """
+
+# Browser Sessions
+
 CREATE_BROWSER_SESSION_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
