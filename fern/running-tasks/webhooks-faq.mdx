@@ -8,7 +8,9 @@ slug: running-tasks/webhooks-faq
 # FAQ 
 ## Webhooks vs HTTP requests?
 
-We use Webhooks for executing tasks as the expected runtime of these jobs can exceed default HTTP timeouts (1 minute)
+Expected runtime of Skyvern's tasks and workflows can exceed default HTTP timeouts (1 minute). So we use webhooks to notify you when its done.
+
+You can also use HTTP requests to get the status of a task or workflow with the [GET run endpoint.
 
 ## How do we handle webhook authentication? (ie how can we handle callbacks?)
 
@@ -40,10 +42,6 @@ function validateSkyvernRequestHeaders(req) {
 
 </CodeGroup>
 
-SKYVERN_API_KEY: this is the [api key](/running-tasks/introduction) specific to your organization
+## Can I Replay Webhook?
 
-# Webhook common parameters
-
-| Parameter | Type | Required? | Sample Value | Description |
-| --- | --- | --- | --- | --- |
-| webhook_callback_url | String | yes | …  |  |
+Yes, you can replay a webhook by using the [Retry Webhook](/api-reference/api-reference/agent/retry-webhook) endpoint.
