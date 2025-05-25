@@ -160,7 +160,7 @@ ig_*
 
 # Skyvern ignores
 videos/
-artifacts/
+skyvern/artifacts/
 traces/
 *.pkl
 har/
