@@ -5,7 +5,7 @@ slug: running-tasks/webhooks-faq
 ---
 ## Webhooks vs HTTP requests?
 
-Expected runtime of Skyvern's tasks and workflows can exceed default HTTP timeouts (1 minute). So we recommend using receiving webhook notifications you when it's done.
+Task runtimes can exceed default HTTP timeouts; we recommend using webhook notifications to inform you when the run is complete.
 
 To set up webhook callback:
 - Set [webhook_url in Run Task](api-reference/api-reference/agent/run-task#request.body.webhook_url) to receive the update when the task is done.
