@@ -74,14 +74,16 @@ navigation:
           path: getting-started/prompting-guide.mdx
     - section: Tasks
       contents:
-        - page: Tasks API
-          path: running-tasks/api-spec.mdx
-        - page: Webhooks FAQ
-          path: running-tasks/webhooks-faq.mdx
+        - page: Task Features
+          path: running-tasks/run-tasks.mdx
         - page: Visualizing Results
           path: running-tasks/visualizing-results.mdx
+        - page: Webhooks FAQ
+          path: running-tasks/webhooks-faq.mdx
         - page: Advanced Settings for tasks
           path: running-tasks/advanced-features.mdx
+        - page: Legacy Task APIs
+          path: running-tasks/api-spec.mdx
     - section: Workflows
       contents:
         - page: Introduction
@@ -103,11 +105,15 @@ navigation:
         - page: Password Management
           path: credentials/passwords.mdx
         - page: Credit Card Management
-          path: credentials/credit_cards.mdx
+          path: credentials/credit-cards.mdx
         - page: TOTP (2FA/MFA/Verification Code)
           path: credentials/totp.mdx
         - page: Bitwarden
           path: credentials/bitwarden.mdx
+    - section: Browser Sessions (Beta)
+      contents:
+        - page: Introduction
+          path: browser-sessions/introduction.mdx
     - section: Integrations
       contents:
         - page: Skyvern MCP

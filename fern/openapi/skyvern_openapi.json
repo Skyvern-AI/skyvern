@@ -463,6 +463,134 @@
             ]
           }
         ]
+      },
+      "get": {
+        "tags": [
+          "Workflows"
+        ],
+        "summary": "Get Workflows",
+        "description": "Get all workflows with the latest version for the organization.",
+        "operationId": "get_workflows_v1_workflows_get",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 10,
+              "title": "Page Size"
+            }
+          },
+          {
+            "name": "only_saved_tasks",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Only Saved Tasks"
+            }
+          },
+          {
+            "name": "only_workflows",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Only Workflows"
+            }
+          },
+          {
+            "name": "title",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Title"
+            }
+          },
+          {
+            "name": "template",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Template"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "API key for authentication",
+              "title": "X-Api-Key"
+            },
+            "description": "API key for authentication"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Workflow"
+                  },
+                  "title": "Response Get Workflows V1 Workflows Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-group-name": "workflows",
+        "x-fern-sdk-method-name": "get_workflows",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflows = await skyvern.workflows.get_workflows()\nprint(workflows)\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/workflows/{workflow_id}": {
@@ -622,6 +750,151 @@
               {
                 "sdk": "python",
                 "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.workflows.delete_workflow(workflow_id=\"wpid_123\")\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "/v1/artifacts/{artifact_id}": {
+      "get": {
+        "tags": [
+          "Artifacts"
+        ],
+        "summary": "Get an artifact",
+        "description": "Get an artifact",
+        "operationId": "get_artifact_v1_artifacts__artifact_id__get",
+        "parameters": [
+          {
+            "name": "artifact_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Artifact Id"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "API key for authentication",
+              "title": "X-Api-Key"
+            },
+            "description": "API key for authentication"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved artifact",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Artifact"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Artifact not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-group-name": "artifacts",
+        "x-fern-sdk-method-name": "get_artifact"
+      }
+    },
+    "/v1/runs/{run_id}/retry_webhook": {
+      "post": {
+        "tags": [
+          "Agent"
+        ],
+        "summary": "Retry run webhook",
+        "description": "Retry sending the webhook for a run",
+        "operationId": "retry_run_webhook_v1_runs__run_id__retry_webhook_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The id of the task run or the workflow run.",
+              "examples": [
+                "tsk_123",
+                "wr_123"
+              ],
+              "title": "Run Id"
+            },
+            "description": "The id of the task run or the workflow run."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "API key for authentication",
+              "title": "X-Api-Key"
+            },
+            "description": "API key for authentication"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "retry_run_webhook",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.agent.retry_run_webhook(run_id=\"tsk_v2_123\")\n"
               }
             ]
           }
@@ -1822,6 +2095,176 @@
           "label"
         ],
         "title": "ActionBlockYAML"
+      },
+      "Artifact": {
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "title": "Created At",
+            "description": "The creation datetime of the task.",
+            "examples": [
+              "2023-01-01T00:00:00Z"
+            ]
+          },
+          "modified_at": {
+            "type": "string",
+            "title": "Modified At",
+            "description": "The modification datetime of the task.",
+            "examples": [
+              "2023-01-01T00:00:00Z"
+            ]
+          },
+          "artifact_id": {
+            "type": "string",
+            "title": "Artifact Id"
+          },
+          "artifact_type": {
+            "$ref": "#/components/schemas/ArtifactType"
+          },
+          "uri": {
+            "type": "string",
+            "title": "Uri"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "step_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step Id"
+          },
+          "workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Id"
+          },
+          "workflow_run_block_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Block Id"
+          },
+          "observer_cruise_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observer Cruise Id"
+          },
+          "observer_thought_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observer Thought Id"
+          },
+          "ai_suggestion_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ai Suggestion Id"
+          },
+          "signed_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Signed Url"
+          },
+          "organization_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Organization Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "created_at",
+          "modified_at",
+          "artifact_id",
+          "artifact_type",
+          "uri"
+        ],
+        "title": "Artifact"
+      },
+      "ArtifactType": {
+        "type": "string",
+        "enum": [
+          "recording",
+          "browser_console_log",
+          "skyvern_log",
+          "skyvern_log_raw",
+          "screenshot",
+          "screenshot_llm",
+          "screenshot_action",
+          "screenshot_final",
+          "llm_prompt",
+          "llm_request",
+          "llm_response",
+          "llm_response_parsed",
+          "llm_response_rendered",
+          "visible_elements_id_css_map",
+          "visible_elements_id_frame_map",
+          "visible_elements_tree",
+          "visible_elements_tree_trimmed",
+          "visible_elements_tree_in_prompt",
+          "hashed_href_map",
+          "visible_elements_id_xpath_map",
+          "html",
+          "html_scrape",
+          "html_action",
+          "trace",
+          "har"
+        ],
+        "title": "ArtifactType"
       },
       "BitwardenCreditCardDataParameter": {
         "properties": {

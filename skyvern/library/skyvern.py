@@ -325,7 +325,7 @@ class Skyvern(AsyncSkyvern):
                 data_extraction_schema = data_extraction_schema or task_generation.extracted_information_schema
 
                 task_request = TaskRequest(
-                    title=title,
+                    title=title or task_generation.suggested_title,
                     url=url,
                     navigation_goal=navigation_goal,
                     navigation_payload=navigation_payload,
