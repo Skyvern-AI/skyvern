@@ -391,3 +391,12 @@ export type CreditCardCredential = {
   card_brand: string;
   card_holder_name: string;
 };
+
+export const RunEngine = {
+  SkyvernV1: "skyvern-1.0",
+  SkyvernV2: "skyvern-2.0",
+  OpenaiCua: "openai-cua",
+  AnthropicCua: "anthropic-cua",
+} as const;
+
+export type RunEngine = (typeof RunEngine)[keyof typeof RunEngine];

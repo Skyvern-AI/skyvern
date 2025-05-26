@@ -3,12 +3,40 @@ title: Webhooks FAQ
 subtitle: How Skyvern notifies you when its done
 slug: running-tasks/webhooks-faq
 ---
-
-
-# FAQ 
 ## Webhooks vs HTTP requests?
 
-We use Webhooks for executing tasks as the expected runtime of these jobs can exceed default HTTP timeouts (1 minute)
+Task runtimes can exceed default HTTP timeouts; we recommend using webhook notifications to inform you when the run is complete.
+
+To set up webhook callback:
+- Set [webhook_url in Run Task](api-reference/api-reference/agent/run-task#request.body.webhook_url) to receive the update when the task is done.
+- Set [webhook_url in Run Workflow](https://docs.skyvern.com/api-reference/api-reference/agent/run-workflow#request.body.webhook_url) to receive the update when a workflow run is done.
+
+To fetch the status of a run:
+- Use the [Get Run](/api-reference/api-reference/agent/get-run) endpoint for the status of a task or workflow run 
+
+## Webhook payload schema
+
+The webhook request body is a JSON object with the following fields:
+```json
+{
+   "run_id": "The ID of the task or the workflow run. For examples: tsk_123, tsk_v2_123, wr_123",
+   "run_type": "The type of the run. Examples: task_v1, task_v2, workflow_run, openai_cua, anthropic_cua.",
+   "status": "The status of the run",
+   "output": "The output of the run",
+   "downloaded_files": "A list of download file objects",
+   "recording_url": "The URL of the recording",
+   "screenshot_urls": "URLs of the last three screenshots. The first one in the list is the latest screenshot.",
+   "failure_reason": "The reason for the failure if any",
+   "app_url": "The URL to the run in the Skyvern app",
+   "created_at": "The timestamp when the run was created",
+   "modified_at": "The timestamp when the run was last modified",
+}
+```
+For detailed schema, please refer to the [Run Response](/api-reference/api-reference/agent/get-run#response).
+
+Notes:
+- The webhook payload won't contain the `run_request` field as the [Run Response](/api-reference/api-reference/agent/get-run#response) does.
+- There are legacy fields in the actual payload for backward compatibility, which are not listed here and will be removed in the future. Please use the fields above. 
 
 ## How do we handle webhook authentication? (ie how can we handle callbacks?)
 
@@ -40,10 +68,6 @@ function validateSkyvernRequestHeaders(req) {
 
 </CodeGroup>
 
-SKYVERN_API_KEY: this is the [api key](/running-tasks/introduction) specific to your organization
+## Can I Replay Webhook?
 
-# Webhook common parameters
-
-| Parameter | Type | Required? | Sample Value | Description |
-| --- | --- | --- | --- | --- |
-| webhook_callback_url | String | yes | …  |  |
+Yes, you can replay a webhook by using the [Retry Webhook](/api-reference/api-reference/agent/retry-webhook) endpoint.

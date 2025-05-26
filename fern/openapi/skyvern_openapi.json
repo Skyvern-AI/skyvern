@@ -28,10 +28,10 @@
                   "type": "null"
                 }
               ],
-              "description": "API key for authentication",
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
             },
-            "description": "API key for authentication"
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           },
           {
             "name": "x-user-agent",
@@ -131,10 +131,10 @@
                   "type": "null"
                 }
               ],
-              "description": "API key for authentication",
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
             },
-            "description": "API key for authentication"
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           },
           {
             "name": "x-max-steps-override",
@@ -256,10 +256,10 @@
                   "type": "null"
                 }
               ],
-              "description": "API key for authentication",
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
             },
-            "description": "API key for authentication"
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -352,10 +352,10 @@
                   "type": "null"
                 }
               ],
-              "description": "API key for authentication",
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
             },
-            "description": "API key for authentication"
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -416,10 +416,10 @@
                   "type": "null"
                 }
               ],
-              "description": "API key for authentication",
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
             },
-            "description": "API key for authentication"
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -463,6 +463,134 @@
             ]
           }
         ]
+      },
+      "get": {
+        "tags": [
+          "Workflows"
+        ],
+        "summary": "Get Workflows",
+        "description": "Get all workflows with the latest version for the organization.",
+        "operationId": "get_workflows_v1_workflows_get",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 10,
+              "title": "Page Size"
+            }
+          },
+          {
+            "name": "only_saved_tasks",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Only Saved Tasks"
+            }
+          },
+          {
+            "name": "only_workflows",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Only Workflows"
+            }
+          },
+          {
+            "name": "title",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Title"
+            }
+          },
+          {
+            "name": "template",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Template"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Workflow"
+                  },
+                  "title": "Response Get Workflows V1 Workflows Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-group-name": "workflows",
+        "x-fern-sdk-method-name": "get_workflows",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflows = await skyvern.workflows.get_workflows()\nprint(workflows)\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/workflows/{workflow_id}": {
@@ -501,10 +629,10 @@
                   "type": "null"
                 }
               ],
-              "description": "API key for authentication",
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
             },
-            "description": "API key for authentication"
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -586,10 +714,10 @@
                   "type": "null"
                 }
               ],
-              "description": "API key for authentication",
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
             },
-            "description": "API key for authentication"
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -628,6 +756,151 @@
         ]
       }
     },
+    "/v1/artifacts/{artifact_id}": {
+      "get": {
+        "tags": [
+          "Artifacts"
+        ],
+        "summary": "Get an artifact",
+        "description": "Get an artifact",
+        "operationId": "get_artifact_v1_artifacts__artifact_id__get",
+        "parameters": [
+          {
+            "name": "artifact_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Artifact Id"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved artifact",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Artifact"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Artifact not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-group-name": "artifacts",
+        "x-fern-sdk-method-name": "get_artifact"
+      }
+    },
+    "/v1/runs/{run_id}/retry_webhook": {
+      "post": {
+        "tags": [
+          "Agent"
+        ],
+        "summary": "Retry run webhook",
+        "description": "Retry sending the webhook for a run",
+        "operationId": "retry_run_webhook_v1_runs__run_id__retry_webhook_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The id of the task run or the workflow run.",
+              "examples": [
+                "tsk_123",
+                "wr_123"
+              ],
+              "title": "Run Id"
+            },
+            "description": "The id of the task run or the workflow run."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "retry_run_webhook",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.agent.retry_run_webhook(run_id=\"tsk_v2_123\")\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
     "/v1/browser_sessions": {
       "post": {
         "tags": [
@@ -650,10 +923,10 @@
                   "type": "null"
                 }
               ],
-              "description": "API key for authentication",
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
             },
-            "description": "API key for authentication"
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -725,10 +998,10 @@
                   "type": "null"
                 }
               ],
-              "description": "API key for authentication",
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
             },
-            "description": "API key for authentication"
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -810,10 +1083,10 @@
                   "type": "null"
                 }
               ],
-              "description": "API key for authentication",
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
             },
-            "description": "API key for authentication"
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -891,10 +1164,10 @@
                   "type": "null"
                 }
               ],
-              "description": "API key for authentication",
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
             },
-            "description": "API key for authentication"
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -961,10 +1234,10 @@
                   "type": "null"
                 }
               ],
-              "description": "API key for authentication",
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
             },
-            "description": "API key for authentication"
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -1025,10 +1298,10 @@
                   "type": "null"
                 }
               ],
-              "description": "API key for authentication",
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
             },
-            "description": "API key for authentication"
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -1148,10 +1421,10 @@
                   "type": "null"
                 }
               ],
-              "description": "API key for authentication",
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
             },
-            "description": "API key for authentication"
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -1231,10 +1504,10 @@
                   "type": "null"
                 }
               ],
-              "description": "API key for authentication",
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
             },
-            "description": "API key for authentication"
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -1303,10 +1576,10 @@
                   "type": "null"
                 }
               ],
-              "description": "API key for authentication",
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
             },
-            "description": "API key for authentication"
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -1822,6 +2095,176 @@
           "label"
         ],
         "title": "ActionBlockYAML"
+      },
+      "Artifact": {
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "title": "Created At",
+            "description": "The creation datetime of the task.",
+            "examples": [
+              "2023-01-01T00:00:00Z"
+            ]
+          },
+          "modified_at": {
+            "type": "string",
+            "title": "Modified At",
+            "description": "The modification datetime of the task.",
+            "examples": [
+              "2023-01-01T00:00:00Z"
+            ]
+          },
+          "artifact_id": {
+            "type": "string",
+            "title": "Artifact Id"
+          },
+          "artifact_type": {
+            "$ref": "#/components/schemas/ArtifactType"
+          },
+          "uri": {
+            "type": "string",
+            "title": "Uri"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "step_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step Id"
+          },
+          "workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Id"
+          },
+          "workflow_run_block_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Block Id"
+          },
+          "observer_cruise_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observer Cruise Id"
+          },
+          "observer_thought_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observer Thought Id"
+          },
+          "ai_suggestion_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ai Suggestion Id"
+          },
+          "signed_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Signed Url"
+          },
+          "organization_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Organization Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "created_at",
+          "modified_at",
+          "artifact_id",
+          "artifact_type",
+          "uri"
+        ],
+        "title": "Artifact"
+      },
+      "ArtifactType": {
+        "type": "string",
+        "enum": [
+          "recording",
+          "browser_console_log",
+          "skyvern_log",
+          "skyvern_log_raw",
+          "screenshot",
+          "screenshot_llm",
+          "screenshot_action",
+          "screenshot_final",
+          "llm_prompt",
+          "llm_request",
+          "llm_response",
+          "llm_response_parsed",
+          "llm_response_rendered",
+          "visible_elements_id_css_map",
+          "visible_elements_id_frame_map",
+          "visible_elements_tree",
+          "visible_elements_tree_trimmed",
+          "visible_elements_tree_in_prompt",
+          "hashed_href_map",
+          "visible_elements_id_xpath_map",
+          "html",
+          "html_scrape",
+          "html_action",
+          "trace",
+          "har"
+        ],
+        "title": "ArtifactType"
       },
       "BitwardenCreditCardDataParameter": {
         "properties": {
@@ -6309,7 +6752,11 @@
           "prompt": {
             "type": "string",
             "title": "Prompt",
-            "description": "The goal or task description for Skyvern to accomplish"
+            "description": "\nThe goal or task description for Skyvern to accomplish\n",
+            "examples": [
+              "Find the top 3 posts on Hacker News.",
+              "Go to google finance, extract the \"AAPL\" stock price for me with the date."
+            ]
           },
           "url": {
             "anyOf": [
@@ -6321,11 +6768,15 @@
               }
             ],
             "title": "Url",
-            "description": "The starting URL for the task. If not provided, Skyvern will attempt to determine an appropriate URL"
+            "description": "\nThe starting URL for the task. If not provided, Skyvern will attempt to determine an appropriate URL\n",
+            "examples": [
+              "https://www.hackernews.com",
+              "https://www.google.com/finance"
+            ]
           },
           "engine": {
             "$ref": "#/components/schemas/RunEngine",
-            "description": "The Skyvern engine version to use for this task. The default value is skyvern-2.0.",
+            "description": "\nThe engine that powers the agent task. The default value is `skyvern-2.0`, the latest Skyvern agent that performs pretty well with complex and multi-step tasks. `skyvern-1.0` is good for simple tasks like filling a form, or searching for information on Google. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.\n",
             "default": "skyvern-2.0"
           },
           "title": {
@@ -6338,7 +6789,10 @@
               }
             ],
             "title": "Title",
-            "description": "The title for the task"
+            "description": "The title for the task",
+            "examples": [
+              "The title of my first skyvern task"
+            ]
           },
           "proxy_location": {
             "anyOf": [
@@ -6349,7 +6803,7 @@
                 "type": "null"
               }
             ],
-            "description": "Geographic Proxy location to route the browser traffic through",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n",
             "default": "RESIDENTIAL"
           },
           "data_extraction_schema": {
@@ -6372,7 +6826,7 @@
               }
             ],
             "title": "Data Extraction Schema",
-            "description": "Schema defining what data should be extracted from the webpage"
+            "description": "\nThe schema for data to be extracted from the webpage. If you're looking for consistent data schema being returned by the agent, it's highly recommended to use https://json-schema.org/.\n"
           },
           "error_code_mapping": {
             "anyOf": [
@@ -6387,7 +6841,15 @@
               }
             ],
             "title": "Error Code Mapping",
-            "description": "Custom mapping of error codes to error messages if Skyvern encounters an error"
+            "description": "\nCustom mapping of error codes to error messages if Skyvern encounters an error.\n",
+            "examples": [
+              {
+                "login_failed": "The login credentials are incorrect or the account is locked"
+              },
+              {
+                "maintenance_mode": "The website is down for maintenance"
+              }
+            ]
           },
           "max_steps": {
             "anyOf": [
@@ -6399,7 +6861,8 @@
               }
             ],
             "title": "Max Steps",
-            "description": "Maximum number of steps the task can take before timing out"
+            "description": "\nMaximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: you are charged per step so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.\n",
+            "examples": [10, 25]
           },
           "webhook_url": {
             "anyOf": [
@@ -6411,7 +6874,10 @@
               }
             ],
             "title": "Webhook Url",
-            "description": "URL to send task status updates to after a run is finished"
+            "description": "\nURL to send task status updates to after a run is finished. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for more details.\n",
+            "examples": [
+              "https://my-site.com/webhook"
+            ]
           },
           "totp_identifier": {
             "anyOf": [
@@ -6423,7 +6889,12 @@
               }
             ],
             "title": "Totp Identifier",
-            "description": "Identifier for TOTP (Time-based One-Time Password) authentication if codes are being pushed to Skyvern"
+            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/credentials/totp#option-3-push-code-to-skyvern for more details.\n",
+            "examples": [
+              "john.doe@example.com",
+              "4155555555",
+              "user_123"
+            ]
           },
           "totp_url": {
             "anyOf": [
@@ -6435,7 +6906,10 @@
               }
             ],
             "title": "Totp Url",
-            "description": "URL for TOTP authentication setup if Skyvern should be polling endpoint for 2FA codes"
+            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/credentials/totp#option-2-get-code-from-your-endpoint for more details.\n",
+            "examples": [
+              "https://my-totp-service.com/totp"
+            ]
           },
           "browser_session_id": {
             "anyOf": [
@@ -6447,7 +6921,10 @@
               }
             ],
             "title": "Browser Session Id",
-            "description": "ID of an existing browser session to reuse, having it continue from the current screen state"
+            "description": "\nRun the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off.\n",
+            "examples": [
+              "pbs_123"
+            ]
           },
           "publish_workflow": {
             "type": "boolean",
@@ -6815,7 +7292,7 @@
           "llm_key": {
             "type": "string",
             "title": "Llm Key",
-            "default": "AZURE_OPENAI_GPT4_1"
+            "default": "AZURE_OPENAI"
           },
           "prompt": {
             "type": "string",
@@ -8494,7 +8971,7 @@
                 "type": "null"
               }
             ],
-            "description": "Location of proxy to use for this workflow run",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n",
             "default": "RESIDENTIAL"
           },
           "webhook_url": {
@@ -8519,7 +8996,10 @@
               }
             ],
             "title": "Totp Url",
-            "description": "URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/running-tasks/advanced-features#get-code-from-your-endpoint"
+            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/credentials/totp#option-2-get-code-from-your-endpoint for more details.\n",
+            "examples": [
+              "https://my-totp-service.com/totp"
+            ]
           },
           "totp_identifier": {
             "anyOf": [
@@ -8531,7 +9011,12 @@
               }
             ],
             "title": "Totp Identifier",
-            "description": "Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/running-tasks/advanced-features#time-based-one-time-password-totp"
+            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/credentials/totp#option-3-push-code-to-skyvern for more details.\n",
+            "examples": [
+              "john.doe@example.com",
+              "4155555555",
+              "user_123"
+            ]
           },
           "browser_session_id": {
             "anyOf": [

@@ -33,6 +33,7 @@ import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
+import { RunEngineSelector } from "@/components/EngineSelector";
 
 function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
   const { updateNodeData } = useReactFlow();
@@ -48,6 +49,7 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
     maxStepsOverride: data.maxStepsOverride,
     continueOnFailure: data.continueOnFailure,
     cacheActions: data.cacheActions,
+    engine: data.engine,
   });
   const deleteNodeCallback = useDeleteNodeCallback();
   const nodes = useNodes<AppNode>();
@@ -157,6 +159,20 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
                     onParametersChange={(parameterKeys) => {
                       updateNodeData(id, { parameterKeys });
                     }}
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <div className="flex gap-2">
+                    <Label className="text-xs font-normal text-slate-300">
+                      Engine
+                    </Label>
+                  </div>
+                  <RunEngineSelector
+                    value={inputs.engine}
+                    onChange={(value) => {
+                      handleChange("engine", value);
+                    }}
+                    className="nopan w-52 text-xs"
                   />
                 </div>
                 <div className="flex items-center justify-between">

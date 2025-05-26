@@ -35,13 +35,7 @@ import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { AppNode } from "..";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
-import {
-  Select,
-  SelectTrigger,
-  SelectContent,
-  SelectValue,
-  SelectItem,
-} from "@/components/ui/select";
+import { RunEngineSelector } from "@/components/EngineSelector";
 
 function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
   const { updateNodeData } = useReactFlow();
@@ -210,23 +204,13 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                       Engine
                     </Label>
                   </div>
-                  <Select
-                    value={inputs.engine ?? "skyvern-1.0"}
-                    onValueChange={(value) => {
+                  <RunEngineSelector
+                    value={inputs.engine}
+                    onChange={(value) => {
                       handleChange("engine", value);
                     }}
-                  >
-                    <SelectTrigger className="nopan w-52 text-xs">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="skyvern-1.0">Skyvern 1.0</SelectItem>
-                      <SelectItem value="openai-cua">OpenAI CUA</SelectItem>
-                      <SelectItem value="anthropic-cua">
-                        Anthropic CUA
-                      </SelectItem>
-                    </SelectContent>
-                  </Select>
+                    className="nopan w-52 text-xs"
+                  />
                 </div>
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">

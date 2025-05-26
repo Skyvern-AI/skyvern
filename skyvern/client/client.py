@@ -6,11 +6,13 @@ import httpx
 from .core.client_wrapper import SyncClientWrapper
 from .agent.client import AgentClient
 from .workflows.client import WorkflowsClient
+from .artifacts.client import ArtifactsClient
 from .browser_session.client import BrowserSessionClient
 from .credentials.client import CredentialsClient
 from .core.client_wrapper import AsyncClientWrapper
 from .agent.client import AsyncAgentClient
 from .workflows.client import AsyncWorkflowsClient
+from .artifacts.client import AsyncArtifactsClient
 from .browser_session.client import AsyncBrowserSessionClient
 from .credentials.client import AsyncCredentialsClient
 
@@ -75,6 +77,7 @@ class Skyvern:
         )
         self.agent = AgentClient(client_wrapper=self._client_wrapper)
         self.workflows = WorkflowsClient(client_wrapper=self._client_wrapper)
+        self.artifacts = ArtifactsClient(client_wrapper=self._client_wrapper)
         self.browser_session = BrowserSessionClient(client_wrapper=self._client_wrapper)
         self.credentials = CredentialsClient(client_wrapper=self._client_wrapper)
 
@@ -139,6 +142,7 @@ class AsyncSkyvern:
         )
         self.agent = AsyncAgentClient(client_wrapper=self._client_wrapper)
         self.workflows = AsyncWorkflowsClient(client_wrapper=self._client_wrapper)
+        self.artifacts = AsyncArtifactsClient(client_wrapper=self._client_wrapper)
         self.browser_session = AsyncBrowserSessionClient(client_wrapper=self._client_wrapper)
         self.credentials = AsyncCredentialsClient(client_wrapper=self._client_wrapper)
 

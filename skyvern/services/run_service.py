@@ -67,35 +67,7 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
         task_v2 = await app.DATABASE.get_task_v2(run.run_id, organization_id=organization_id)
         if not task_v2:
             return None
-        workflow_run = None
-        if task_v2.workflow_run_id:
-            workflow_run = await workflow_service.get_workflow_run_response(
-                task_v2.workflow_run_id, organization_id=organization_id
-            )
-        return TaskRunResponse(
-            run_id=run.run_id,
-            run_type=run.task_run_type,
-            status=task_v2.status,
-            output=task_v2.output,
-            failure_reason=workflow_run.failure_reason if workflow_run else None,
-            created_at=task_v2.created_at,
-            modified_at=task_v2.modified_at,
-            recording_url=workflow_run.recording_url if workflow_run else None,
-            screenshot_urls=workflow_run.screenshot_urls if workflow_run else None,
-            downloaded_files=workflow_run.downloaded_files if workflow_run else None,
-            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{task_v2.workflow_permanent_id}/{task_v2.workflow_run_id}",
-            run_request=TaskRunRequest(
-                engine=RunEngine.skyvern_v2,
-                prompt=task_v2.prompt,
-                url=task_v2.url,
-                webhook_url=task_v2.webhook_callback_url,
-                totp_identifier=task_v2.totp_identifier,
-                totp_url=task_v2.totp_verification_url,
-                proxy_location=task_v2.proxy_location,
-                data_extraction_schema=task_v2.extracted_information_schema,
-                error_code_mapping=task_v2.error_code_mapping,
-            ),
-        )
+        return await task_v2_service.build_task_v2_run_response(task_v2)
     elif run.task_run_type == RunType.workflow_run:
         return await workflow_service.get_workflow_run_response(run.run_id, organization_id=organization_id)
     raise ValueError(f"Invalid task run type: {run.task_run_type}")
@@ -164,4 +136,41 @@ async def cancel_run(run_id: str, organization_id: str | None = None, api_key: s
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid run type to cancel: {run.task_run_type}",
+        )
+
+
+async def retry_run_webhook(run_id: str, organization_id: str | None = None, api_key: str | None = None) -> None:
+    """Retry sending the webhook for a run."""
+
+    run = await app.DATABASE.get_run(run_id, organization_id=organization_id)
+    if not run:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Run not found {run_id}",
+        )
+
+    if run.task_run_type in [RunType.task_v1, RunType.openai_cua, RunType.anthropic_cua]:
+        task = await app.DATABASE.get_task(run_id, organization_id=organization_id)
+        if not task:
+            raise TaskNotFound(task_id=run_id)
+        latest_step = await app.DATABASE.get_latest_step(run_id, organization_id=organization_id)
+        if latest_step:
+            await app.agent.execute_task_webhook(task=task, last_step=latest_step, api_key=api_key)
+    elif run.task_run_type == RunType.task_v2:
+        task_v2 = await app.DATABASE.get_task_v2(run_id, organization_id=organization_id)
+        if not task_v2:
+            raise TaskNotFound(task_id=run_id)
+        await task_v2_service.send_task_v2_webhook(task_v2)
+    elif run.task_run_type == RunType.workflow_run:
+        workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run_id=run_id,
+            organization_id=organization_id,
+        )
+        if not workflow_run:
+            raise WorkflowRunNotFound(workflow_run_id=run_id)
+        await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key)
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid run type to retry webhook: {run.task_run_type}",
         )

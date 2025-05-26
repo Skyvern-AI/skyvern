@@ -1,5 +1,6 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
+import { RunEngine } from "@/api/types";
 
 export type ActionNodeData = NodeBaseData & {
   url: string;
@@ -12,6 +13,7 @@ export type ActionNodeData = NodeBaseData & {
   totpVerificationUrl: string | null;
   totpIdentifier: string | null;
   cacheActions: boolean;
+  engine: RunEngine | null;
 };
 
 export type ActionNode = Node<ActionNodeData, "action">;
@@ -30,6 +32,7 @@ export const actionNodeDefaultData: ActionNodeData = {
   totpIdentifier: null,
   continueOnFailure: false,
   cacheActions: false,
+  engine: RunEngine.SkyvernV1,
 } as const;
 
 export function isActionNode(node: Node): node is ActionNode {

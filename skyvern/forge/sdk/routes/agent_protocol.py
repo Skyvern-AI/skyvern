@@ -29,6 +29,8 @@ from skyvern.forge.sdk.routes.code_samples import (
     CREATE_WORKFLOW_CODE_SAMPLE_PYTHON,
     DELETE_WORKFLOW_CODE_SAMPLE,
     GET_RUN_CODE_SAMPLE,
+    GET_WORKFLOWS_CODE_SAMPLE,
+    RETRY_RUN_WEBHOOK_CODE_SAMPLE,
     RUN_TASK_CODE_SAMPLE,
     RUN_WORKFLOW_CODE_SAMPLE,
     UPDATE_WORKFLOW_CODE_SAMPLE,
@@ -72,6 +74,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowStatus,
 )
 from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
+from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.runs import (
     CUA_ENGINES,
     RunEngine,
@@ -87,23 +90,6 @@ from skyvern.services import run_service, task_v1_service, task_v2_service, work
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
-
-
-class EntityType(str, Enum):
-    STEP = "step"
-    TASK = "task"
-    WORKFLOW_RUN = "workflow_run"
-    WORKFLOW_RUN_BLOCK = "workflow_run_block"
-    THOUGHT = "thought"
-
-
-entity_type_to_param = {
-    EntityType.STEP: "step_id",
-    EntityType.TASK: "task_id",
-    EntityType.WORKFLOW_RUN: "workflow_run_id",
-    EntityType.WORKFLOW_RUN_BLOCK: "workflow_run_block_id",
-    EntityType.THOUGHT: "thought_id",
-}
 
 
 class AISuggestionType(str, Enum):
@@ -680,6 +666,69 @@ async def delete_workflow(
 ) -> None:
     analytics.capture("skyvern-oss-agent-workflow-delete")
     await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(workflow_id, current_org.organization_id)
+
+
+@base_router.get(
+    "/artifacts/{artifact_id}",
+    tags=["Artifacts"],
+    response_model=Artifact,
+    openapi_extra={
+        "x-fern-sdk-group-name": "artifacts",
+        "x-fern-sdk-method-name": "get_artifact",
+    },
+    description="Get an artifact",
+    summary="Get an artifact",
+    responses={
+        200: {"description": "Successfully retrieved artifact"},
+        404: {"description": "Artifact not found"},
+    },
+)
+@base_router.get("/artifacts/{artifact_id}/", response_model=Artifact, include_in_schema=False)
+async def get_artifact(
+    artifact_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Artifact:
+    analytics.capture("skyvern-oss-artifact-get")
+    artifact = await app.DATABASE.get_artifact_by_id(
+        artifact_id=artifact_id,
+        organization_id=current_org.organization_id,
+    )
+    if not artifact:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Artifact not found {artifact_id}",
+        )
+    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
+        signed_urls = await app.ARTIFACT_MANAGER.get_share_links([artifact])
+        if signed_urls:
+            artifact.signed_url = signed_urls[0]
+        else:
+            LOG.warning(
+                "Failed to get signed url for artifact",
+                artifact_id=artifact_id,
+            )
+    return artifact
+
+
+@base_router.post(
+    "/runs/{run_id}/retry_webhook",
+    tags=["Agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-method-name": "retry_run_webhook",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": RETRY_RUN_WEBHOOK_CODE_SAMPLE}]}],
+    },
+    description="Retry sending the webhook for a run",
+    summary="Retry run webhook",
+)
+@base_router.post("/runs/{run_id}/retry_webhook/", include_in_schema=False)
+async def retry_run_webhook(
+    run_id: str = Path(..., description="The id of the task run or the workflow run.", examples=["tsk_123", "wr_123"]),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> None:
+    analytics.capture("skyvern-oss-agent-run-retry-webhook")
+    await run_service.retry_run_webhook(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
 
 
 ################# Legacy Endpoints #################
@@ -1360,6 +1409,17 @@ async def get_workflow_run(
     response_model=list[Workflow],
     include_in_schema=False,
 )
+@base_router.get(
+    "/workflows",
+    response_model=list[Workflow],
+    tags=["Workflows"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "workflows",
+        "x-fern-sdk-method-name": "get_workflows",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_WORKFLOWS_CODE_SAMPLE}]}],
+    },
+)
+@base_router.get("/workflows/", response_model=list[Workflow], include_in_schema=False)
 async def get_workflows(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),

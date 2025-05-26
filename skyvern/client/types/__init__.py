@@ -14,6 +14,8 @@ from .action_block_parameters_item import (
     ActionBlockParametersItem_Workflow,
 )
 from .action_block_yaml import ActionBlockYaml
+from .artifact import Artifact
+from .artifact_type import ArtifactType
 from .aws_secret_parameter import AwsSecretParameter
 from .aws_secret_parameter_yaml import AwsSecretParameterYaml
 from .bitwarden_credit_card_data_parameter import BitwardenCreditCardDataParameter
@@ -366,6 +368,8 @@ __all__ = [
     "ActionBlockParametersItem_Output",
     "ActionBlockParametersItem_Workflow",
     "ActionBlockYaml",
+    "Artifact",
+    "ArtifactType",
     "AwsSecretParameter",
     "AwsSecretParameterYaml",
     "BitwardenCreditCardDataParameter",

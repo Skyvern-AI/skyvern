@@ -1,3 +1,4 @@
+import json
 import os
 import random
 import string
@@ -58,7 +59,7 @@ from skyvern.forge.sdk.workflow.models.yaml import (
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
 )
-from skyvern.schemas.runs import ProxyLocation, RunType
+from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType, TaskRunRequest, TaskRunResponse
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
@@ -355,6 +356,7 @@ async def run_task_v2(
                 workflow_run=workflow_run,
                 browser_session_id=browser_session_id,
                 close_browser_on_completion=browser_session_id is None,
+                need_call_webhook=False,
             )
         else:
             LOG.warning("Workflow or workflow run not found")
@@ -385,6 +387,19 @@ async def run_task_v2_helper(
         LOG.error(
             "Task v2 url or prompt not found",
             task_v2_id=task_v2_id,
+            organization_id=organization_id,
+            prompt=task_v2.prompt,
+            url=task_v2.url,
+        )
+        failure_reason = ""
+        if not task_v2.prompt:
+            failure_reason = "Task prompt is missing"
+        elif not task_v2.url:
+            failure_reason = "Task url is missing"
+        await mark_task_v2_as_failed(
+            task_v2_id=task_v2_id,
+            workflow_run_id=task_v2.workflow_run_id,
+            failure_reason=failure_reason,
             organization_id=organization_id,
         )
         return None, None, task_v2
@@ -1578,6 +1593,56 @@ async def _summarize_task_v2(
     )
 
 
+async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
+    """Build TaskRunResponse object for webhook backward compatibility."""
+    from skyvern.services import workflow_service
+
+    workflow_run_resp = None
+    if task_v2.workflow_run_id:
+        try:
+            workflow_run_resp = await workflow_service.get_workflow_run_response(
+                task_v2.workflow_run_id, organization_id=task_v2.organization_id
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to get workflow run response for task v2 webhook",
+                exc_info=True,
+                task_v2_id=task_v2.observer_cruise_id,
+            )
+
+    app_url = None
+    if task_v2.workflow_run_id and task_v2.workflow_permanent_id:
+        app_url = (
+            f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/"
+            f"{task_v2.workflow_permanent_id}/{task_v2.workflow_run_id}"
+        )
+
+    return TaskRunResponse(
+        run_id=task_v2.observer_cruise_id,
+        run_type=RunType.task_v2,
+        status=task_v2.status,
+        output=task_v2.output,
+        failure_reason=workflow_run_resp.failure_reason if workflow_run_resp else None,
+        created_at=task_v2.created_at,
+        modified_at=task_v2.modified_at,
+        recording_url=workflow_run_resp.recording_url if workflow_run_resp else None,
+        screenshot_urls=workflow_run_resp.screenshot_urls if workflow_run_resp else None,
+        downloaded_files=workflow_run_resp.downloaded_files if workflow_run_resp else None,
+        app_url=app_url,
+        run_request=TaskRunRequest(
+            engine=RunEngine.skyvern_v2,
+            prompt=task_v2.prompt or "",
+            url=task_v2.url,
+            webhook_url=task_v2.webhook_callback_url,
+            totp_identifier=task_v2.totp_identifier,
+            totp_url=task_v2.totp_verification_url,
+            proxy_location=task_v2.proxy_location,
+            data_extraction_schema=task_v2.extracted_information_schema,
+            error_code_mapping=task_v2.error_code_mapping,
+        ),
+    )
+
+
 async def send_task_v2_webhook(task_v2: TaskV2) -> None:
     if not task_v2.webhook_callback_url:
         return
@@ -1594,17 +1659,22 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
             task_v2_id=task_v2.observer_cruise_id,
         )
         return
-    # build the task v2 response
-    payload = task_v2.model_dump_json(by_alias=True)
-    headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key.token)
-    LOG.info(
-        "Sending task v2 response to webhook callback url",
-        task_v2_id=task_v2.observer_cruise_id,
-        webhook_callback_url=task_v2.webhook_callback_url,
-        payload=payload,
-        headers=headers,
-    )
     try:
+        # build the task v2 response with backward compatible data
+        task_run_response = await build_task_v2_run_response(task_v2)
+        task_run_response_json = task_run_response.model_dump_json(exclude={"run_request"})
+        payload_json = task_v2.model_dump_json(by_alias=True)
+        payload_dict = json.loads(payload_json)
+        payload_dict.update(json.loads(task_run_response_json))
+        payload = json.dumps(payload_dict)
+        headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key.token)
+        LOG.info(
+            "Sending task v2 response to webhook callback url",
+            task_v2_id=task_v2.observer_cruise_id,
+            webhook_callback_url=task_v2.webhook_callback_url,
+            payload=payload,
+            headers=headers,
+        )
         resp = await httpx.AsyncClient().post(
             task_v2.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
         )

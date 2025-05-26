@@ -13,6 +13,8 @@ from .types import (
     ActionBlockParametersItem_Output,
     ActionBlockParametersItem_Workflow,
     ActionBlockYaml,
+    Artifact,
+    ArtifactType,
     AwsSecretParameter,
     AwsSecretParameterYaml,
     BitwardenCreditCardDataParameter,
@@ -317,7 +319,7 @@ from .types import (
     WorkflowStatus,
 )
 from .errors import BadRequestError, ForbiddenError, NotFoundError, UnprocessableEntityError
-from . import agent, browser_session, credentials, workflows
+from . import agent, artifacts, browser_session, credentials, workflows
 from .agent import (
     AgentGetRunResponse,
     AgentGetRunResponse_AnthropicCua,
@@ -350,6 +352,8 @@ __all__ = [
     "AgentGetRunResponse_TaskV1",
     "AgentGetRunResponse_TaskV2",
     "AgentGetRunResponse_WorkflowRun",
+    "Artifact",
+    "ArtifactType",
     "AsyncSkyvern",
     "AwsSecretParameter",
     "AwsSecretParameterYaml",
@@ -662,6 +666,7 @@ __all__ = [
     "WorkflowStatus",
     "__version__",
     "agent",
+    "artifacts",
     "browser_session",
     "credentials",
     "workflows",

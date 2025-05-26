@@ -31,6 +31,10 @@ function WorkflowRunParameters() {
     ? (location.state.proxyLocation as ProxyLocation)
     : null;
 
+  const webhookCallbackUrl = location.state
+    ? (location.state.webhookCallbackUrl as string)
+    : null;
+
   const initialValues = location.state?.data
     ? location.state.data
     : workflowParameters?.reduce(
@@ -103,7 +107,8 @@ function WorkflowRunParameters() {
             proxyLocation ??
             workflow.proxy_location ??
             ProxyLocation.Residential,
-          webhookCallbackUrl: workflow.webhook_callback_url ?? "",
+          webhookCallbackUrl:
+            webhookCallbackUrl ?? workflow.webhook_callback_url ?? "",
         }}
       />
     </div>

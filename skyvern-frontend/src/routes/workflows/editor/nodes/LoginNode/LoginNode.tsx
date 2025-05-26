@@ -35,6 +35,7 @@ import { AppNode } from "..";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { LoginBlockCredentialSelector } from "./LoginBlockCredentialSelector";
+import { RunEngineSelector } from "@/components/EngineSelector";
 function LoginNode({ id, data }: NodeProps<LoginNode>) {
   const { updateNodeData } = useReactFlow();
   const { editable } = data;
@@ -53,6 +54,7 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
     totpIdentifier: data.totpIdentifier,
     completeCriterion: data.completeCriterion,
     terminateCriterion: data.terminateCriterion,
+    engine: data.engine,
   });
   const deleteNodeCallback = useDeleteNodeCallback();
 
@@ -197,6 +199,20 @@ function LoginNode({ id, data }: NodeProps<LoginNode>) {
                   />
                 </div>
                 <Separator />
+                <div className="flex items-center justify-between">
+                  <div className="flex gap-2">
+                    <Label className="text-xs font-normal text-slate-300">
+                      Engine
+                    </Label>
+                  </div>
+                  <RunEngineSelector
+                    value={inputs.engine}
+                    onChange={(value) => {
+                      handleChange("engine", value);
+                    }}
+                    className="nopan w-52 text-xs"
+                  />
+                </div>
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
                     <Label className="text-xs font-normal text-slate-300">
