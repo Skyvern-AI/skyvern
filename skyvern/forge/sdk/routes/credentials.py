@@ -69,8 +69,20 @@ async def send_totp_code(
         task_id=data.task_id,
         workflow_id=data.workflow_id,
     )
-    code = await parse_totp_code(data.content)
+    if len(data.content) <= 10:
+        # We assume the user is sending the code directly
+        code = data.content
+    else:
+        code = await parse_totp_code(data.content)
     if not code:
+        LOG.error(
+            "Failed to parse totp code",
+            totp_identifier=data.totp_identifier,
+            task_id=data.task_id,
+            workflow_id=data.workflow_id,
+            workflow_run_id=data.workflow_run_id,
+            content=data.content,
+        )
         raise HTTPException(status_code=400, detail="Failed to parse totp code")
     return await app.DATABASE.create_totp_code(
         organization_id=curr_org.organization_id,
