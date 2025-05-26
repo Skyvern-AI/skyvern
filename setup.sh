@@ -270,7 +270,7 @@ choose_python_version_or_fail() {
   # Py --list-paths 
     # This will output which paths are being used for Python 3.11
   # Windows users need to poetry env use {{ Py --list-paths with 3.11}}
-  poetry env use python3.11 || { echo "Error: Python 3.11 is not installed. If you're on Windows, check out https://github.com/python-poetry/poetry/issues/2117 to unblock yourself"; exit 1; }
+  poetry env use python3.13 || { echo "Error: Python 3.13 is not installed. Please install Python 3.13 and try again."; exit 1; }
 }
 
 
