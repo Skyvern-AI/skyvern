@@ -8,7 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from skyvern.config import settings
-from skyvern.exceptions import WorkflowParameterNotFound
+from skyvern.exceptions import WorkflowParameterNotFound, WorkflowRunNotFound
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -1462,7 +1462,7 @@ class AgentDB:
 
     async def update_workflow_run(
         self, workflow_run_id: str, status: WorkflowRunStatus, failure_reason: str | None = None
-    ) -> WorkflowRun | None:
+    ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
                 await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
@@ -1474,11 +1474,8 @@ class AgentDB:
                 await session.refresh(workflow_run)
                 await save_workflow_run_logs(workflow_run_id)
                 return convert_to_workflow_run(workflow_run)
-            LOG.error(
-                "WorkflowRun not found, nothing to update",
-                workflow_run_id=workflow_run_id,
-            )
-            return None
+            else:
+                raise WorkflowRunNotFound(workflow_run_id)
 
     async def get_all_runs(
         self, organization_id: str, page: int = 1, page_size: int = 10, status: list[WorkflowRunStatus] | None = None
