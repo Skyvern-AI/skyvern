@@ -64,7 +64,7 @@ function WorkflowRun() {
     mutationFn: async () => {
       const client = await getClient(credentialGetter);
       return client
-        .post(`/workflows/runs/${workflowRunId}/cancel`)
+        .post(`/runs/${workflowRunId}/cancel`)
         .then((response) => response.data);
     },
     onSuccess: () => {

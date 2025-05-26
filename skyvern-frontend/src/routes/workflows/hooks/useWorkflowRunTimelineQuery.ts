@@ -25,10 +25,7 @@ function useWorkflowRunTimelineQuery() {
         params.set("template", "true");
       }
       return client
-        .get(
-          `/workflows/${workflowPermanentId}/runs/${workflowRunId}/timeline`,
-          { params },
-        )
+        .get(`/runs/${workflowRunId}/timeline`, { params })
         .then((response) => response.data);
     },
     refetchInterval:

@@ -65,7 +65,7 @@ function TaskDetails() {
       queryFn: async () => {
         const client = await getClient(credentialGetter);
         return client
-          .get(`/workflows/runs/${task?.workflow_run_id}`)
+          .get(`/runs/${task?.workflow_run_id}`)
           .then((response) => response.data);
       },
       enabled: !!task?.workflow_run_id,
@@ -87,7 +87,7 @@ function TaskDetails() {
     mutationFn: async () => {
       const client = await getClient(credentialGetter);
       return client
-        .post(`/tasks/${taskId}/cancel`)
+        .post(`/runs/${taskId}/cancel`)
         .then((response) => response.data);
     },
     onSuccess: () => {

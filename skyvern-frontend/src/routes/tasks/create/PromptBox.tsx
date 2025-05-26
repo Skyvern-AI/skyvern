@@ -158,9 +158,9 @@ function PromptBox() {
 
   const startObserverCruiseMutation = useMutation({
     mutationFn: async (prompt: string) => {
-      const client = await getClient(credentialGetter, "v2");
+      const client = await getClient(credentialGetter);
       return client.post<Createv2TaskRequest, { data: TaskV2 }>(
-        "/tasks",
+        "/run/tasks",
         {
           user_prompt: prompt,
           webhook_callback_url: webhookCallbackUrl,

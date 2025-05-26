@@ -22,10 +22,13 @@ function ExampleCasePill({ exampleId, version, icon, label, prompt }: Props) {
 
   const startObserverCruiseMutation = useMutation({
     mutationFn: async (prompt: string) => {
-      const client = await getClient(credentialGetter, "v2");
-      return client.post<{ user_prompt: string }, { data: TaskV2 }>("/tasks", {
-        user_prompt: prompt,
-      });
+      const client = await getClient(credentialGetter);
+      return client.post<{ user_prompt: string }, { data: TaskV2 }>(
+        "/run/tasks",
+        {
+          user_prompt: prompt,
+        },
+      );
     },
     onSuccess: (response) => {
       toast({

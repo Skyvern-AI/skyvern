@@ -11,7 +11,7 @@ from skyvern.forge.sdk.schemas.tasks import TaskRequest
 load_dotenv("./skyvern-frontend/.env")
 API_KEY = os.getenv("VITE_SKYVERN_API_KEY")
 
-API_BASE_URL = "http://localhost:8000/api/v1"
+API_BASE_URL = "http://localhost:8000/v1"
 HEADERS = {"x-api-key": API_KEY, "Content-Type": "application/json"}
 
 

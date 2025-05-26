@@ -26,7 +26,7 @@ function useWorkflowRunQuery() {
         params.set("template", "true");
       }
       return client
-        .get(`/workflows/${workflowPermanentId}/runs/${workflowRunId}`, {
+        .get(`/runs/${workflowRunId}`, {
           params,
         })
         .then((response) => response.data);
