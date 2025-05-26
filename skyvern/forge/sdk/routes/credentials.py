@@ -69,11 +69,11 @@ async def send_totp_code(
         task_id=data.task_id,
         workflow_id=data.workflow_id,
     )
-    if len(data.content) <= 10:
-        # We assume the user is sending the code directly
-        code = data.content
-    else:
-        code = await parse_totp_code(data.content)
+    content = data.content.strip()
+    code: str | None = content
+    # We assume the user is sending the code directly when the length of code is less than or equal to 10
+    if len(content) > 10:
+        code = await parse_totp_code(content)
     if not code:
         LOG.error(
             "Failed to parse totp code",
