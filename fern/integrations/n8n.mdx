@@ -3,4 +3,28 @@ Title: n8n
 slug: integrations/n8n
 ---
 
-<img src="https://thumbs.dreamstime.com/b/pug-dog-holding-pliers-screwdriver-behind-old-wooden-sign-text-under-construction-white-background-constructor-92836854.jpg" />
+## Install Skyvern node in n8n
+> official verified Skyvern node is coming soon.
+
+1. Get a [Skyvern](https://app.skyvern.com/) account, navigate to settings and copy your API Key, you will need to link this in the n8n.
+
+2. Install Skyvern as a community node. Following the [n8n docs](https://docs.n8n.io/integrations/community-nodes/installation/gui-install/) to install on GUI.
+
+3. Search for `n8n-nodes-skyvern` and install.
+    ![image](../images/n8n/ui_install.png)
+
+4. Wait until it's successfully installed.
+    ![image](../images/n8n/ui_install_success.png)
+
+## Running a Skyvern Task
+5. Create a new workflow. Search for the `Skyvern` node.
+   ![image](../images/n8n/add_node.png)
+
+6. Create a new credential.
+   ![image](../images/n8n/add_credential.png)
+
+7. Store the API Key from step 1 in the `API Key` field and `Save`
+   ![image](../images/n8n/save_credential.png)
+
+8. Dispatch a task!
+   ![image](../images/n8n/dispatch_task.png)
