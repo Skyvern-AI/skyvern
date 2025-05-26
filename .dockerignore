@@ -1,5 +1,6 @@
 **/videos
 **/artifacts
+!skyvern/client/artifacts
 **/traces
 **/inputs
 **/har
