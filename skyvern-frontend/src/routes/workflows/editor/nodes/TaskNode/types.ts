@@ -1,5 +1,6 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
+import { RunEngine } from "@/api/types";
 
 export type TaskNodeData = NodeBaseData & {
   url: string;
@@ -18,6 +19,7 @@ export type TaskNodeData = NodeBaseData & {
   totpIdentifier: string | null;
   cacheActions: boolean;
   includeActionHistoryInVerification: boolean;
+  engine: RunEngine | null;
 };
 
 export type TaskNode = Node<TaskNodeData, "task">;
@@ -42,6 +44,7 @@ export const taskNodeDefaultData: TaskNodeData = {
   continueOnFailure: false,
   cacheActions: false,
   includeActionHistoryInVerification: false,
+  engine: RunEngine.SkyvernV1,
 } as const;
 
 export function isTaskNode(node: Node): node is TaskNode {

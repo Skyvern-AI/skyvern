@@ -34,6 +34,7 @@ import { AppNode } from "..";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
+import { RunEngineSelector } from "@/components/EngineSelector";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -59,6 +60,7 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
     downloadSuffix: data.downloadSuffix,
     totpVerificationUrl: data.totpVerificationUrl,
     totpIdentifier: data.totpIdentifier,
+    engine: data.engine,
   });
   const deleteNodeCallback = useDeleteNodeCallback();
 
@@ -179,6 +181,20 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
                     onParametersChange={(parameterKeys) => {
                       updateNodeData(id, { parameterKeys });
                     }}
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <div className="flex gap-2">
+                    <Label className="text-xs font-normal text-slate-300">
+                      Engine
+                    </Label>
+                  </div>
+                  <RunEngineSelector
+                    value={inputs.engine}
+                    onChange={(value) => {
+                      handleChange("engine", value);
+                    }}
+                    className="nopan w-52 text-xs"
                   />
                 </div>
                 <div className="space-y-2">

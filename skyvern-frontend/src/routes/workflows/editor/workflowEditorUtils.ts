@@ -91,7 +91,7 @@ import {
 import { loginNodeDefaultData } from "./nodes/LoginNode/types";
 import { isWaitNode, waitNodeDefaultData } from "./nodes/WaitNode/types";
 import { fileDownloadNodeDefaultData } from "./nodes/FileDownloadNode/types";
-import { ProxyLocation } from "@/api/types";
+import { ProxyLocation, RunEngine } from "@/api/types";
 import {
   isPdfParserNode,
   pdfParserNodeDefaultData,
@@ -234,6 +234,7 @@ function convertToNode(
           terminateCriterion: block.terminate_criterion ?? "",
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
+          engine: block.engine ?? RunEngine.SkyvernV1,
         },
       };
     }
@@ -283,6 +284,7 @@ function convertToNode(
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           cacheActions: block.cache_actions,
+          engine: block.engine ?? RunEngine.SkyvernV1,
         },
       };
     }
@@ -306,7 +308,7 @@ function convertToNode(
           maxStepsOverride: block.max_steps_per_run ?? null,
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
-          engine: block.engine ?? "skyvern-1.0",
+          engine: block.engine ?? RunEngine.SkyvernV1,
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
         },
@@ -326,6 +328,7 @@ function convertToNode(
           maxRetries: block.max_retries ?? null,
           maxStepsOverride: block.max_steps_per_run ?? null,
           cacheActions: block.cache_actions,
+          engine: block.engine ?? RunEngine.SkyvernV1,
         },
       };
     }
@@ -347,6 +350,7 @@ function convertToNode(
           maxStepsOverride: block.max_steps_per_run ?? null,
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
+          engine: block.engine ?? RunEngine.SkyvernV1,
         },
       };
     }
@@ -378,6 +382,7 @@ function convertToNode(
           totpVerificationUrl: block.totp_verification_url ?? null,
           cacheActions: block.cache_actions,
           maxStepsOverride: block.max_steps_per_run ?? null,
+          engine: block.engine ?? RunEngine.SkyvernV1,
         },
       };
     }
@@ -982,6 +987,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         cache_actions: node.data.cacheActions,
         include_action_history_in_verification:
           node.data.includeActionHistoryInVerification,
+        engine: node.data.engine,
       };
     }
     case "taskv2": {
@@ -1028,6 +1034,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         cache_actions: node.data.cacheActions,
+        engine: node.data.engine,
       };
     }
     case "navigation": {
@@ -1072,6 +1079,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         max_steps_per_run: node.data.maxStepsOverride,
         parameter_keys: node.data.parameterKeys,
         cache_actions: node.data.cacheActions,
+        engine: node.data.engine,
       };
     }
     case "login": {
@@ -1095,6 +1103,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         cache_actions: node.data.cacheActions,
         complete_criterion: node.data.completeCriterion,
         terminate_criterion: node.data.terminateCriterion,
+        engine: node.data.engine,
       };
     }
     case "wait": {
@@ -1124,6 +1133,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         cache_actions: node.data.cacheActions,
+        engine: node.data.engine,
       };
     }
     case "sendEmail": {
@@ -1715,6 +1725,7 @@ function convertBlocksToBlockYAML(
           cache_actions: block.cache_actions,
           include_action_history_in_verification:
             block.include_action_history_in_verification,
+          engine: block.engine,
         };
         return blockYaml;
       }
@@ -1756,6 +1767,7 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           cache_actions: block.cache_actions,
+          engine: block.engine,
         };
         return blockYaml;
       }
@@ -1795,6 +1807,7 @@ function convertBlocksToBlockYAML(
           max_steps_per_run: block.max_steps_per_run,
           parameter_keys: block.parameters.map((p) => p.key),
           cache_actions: block.cache_actions,
+          engine: block.engine,
         };
         return blockYaml;
       }
@@ -1814,6 +1827,7 @@ function convertBlocksToBlockYAML(
           cache_actions: block.cache_actions,
           complete_criterion: block.complete_criterion,
           terminate_criterion: block.terminate_criterion,
+          engine: block.engine,
         };
         return blockYaml;
       }
@@ -1840,6 +1854,7 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           cache_actions: block.cache_actions,
+          engine: block.engine,
         };
         return blockYaml;
       }

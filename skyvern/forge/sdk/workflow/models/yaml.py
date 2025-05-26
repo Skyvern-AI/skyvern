@@ -128,6 +128,7 @@ class TaskBlockYAML(BlockYAML):
 
     url: str | None = None
     title: str = ""
+    engine: RunEngine = RunEngine.skyvern_v1
     navigation_goal: str | None = None
     data_extraction_goal: str | None = None
     data_schema: dict[str, Any] | list | None = None
@@ -259,6 +260,7 @@ class ActionBlockYAML(BlockYAML):
 
     url: str | None = None
     title: str = ""
+    engine: RunEngine = RunEngine.skyvern_v1
     navigation_goal: str | None = None
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
@@ -298,6 +300,7 @@ class ExtractionBlockYAML(BlockYAML):
     data_extraction_goal: str
     url: str | None = None
     title: str = ""
+    engine: RunEngine = RunEngine.skyvern_v1
     data_schema: dict[str, Any] | list | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
@@ -310,6 +313,7 @@ class LoginBlockYAML(BlockYAML):
 
     url: str | None = None
     title: str = ""
+    engine: RunEngine = RunEngine.skyvern_v1
     navigation_goal: str | None = None
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
@@ -334,6 +338,7 @@ class FileDownloadBlockYAML(BlockYAML):
     navigation_goal: str
     url: str | None = None
     title: str = ""
+    engine: RunEngine = RunEngine.skyvern_v1
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None

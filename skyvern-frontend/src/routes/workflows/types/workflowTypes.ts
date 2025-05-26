@@ -1,4 +1,4 @@
-import { ProxyLocation } from "@/api/types";
+import { ProxyLocation, RunEngine } from "@/api/types";
 
 export type WorkflowParameterBase = {
   parameter_type: WorkflowParameterType;
@@ -252,6 +252,7 @@ export type TaskBlock = WorkflowBlockBase & {
   totp_identifier?: string | null;
   cache_actions: boolean;
   include_action_history_in_verification: boolean;
+  engine: RunEngine | null;
 };
 
 export type Taskv2Block = WorkflowBlockBase & {
@@ -346,6 +347,7 @@ export type ActionBlock = WorkflowBlockBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  engine: RunEngine | null;
 };
 
 export type NavigationBlock = WorkflowBlockBase & {
@@ -364,7 +366,7 @@ export type NavigationBlock = WorkflowBlockBase & {
   cache_actions: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
-  engine: string | null;
+  engine: RunEngine | null;
   include_action_history_in_verification: boolean;
 };
 
@@ -378,6 +380,7 @@ export type ExtractionBlock = WorkflowBlockBase & {
   max_steps_per_run?: number | null;
   parameters: Array<WorkflowParameter>;
   cache_actions: boolean;
+  engine: RunEngine | null;
 };
 
 export type LoginBlock = WorkflowBlockBase & {
@@ -394,6 +397,7 @@ export type LoginBlock = WorkflowBlockBase & {
   cache_actions: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
+  engine: RunEngine | null;
 };
 
 export type WaitBlock = WorkflowBlockBase & {
@@ -414,6 +418,7 @@ export type FileDownloadBlock = WorkflowBlockBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  engine: RunEngine | null;
 };
 
 export type PDFParserBlock = WorkflowBlockBase & {
