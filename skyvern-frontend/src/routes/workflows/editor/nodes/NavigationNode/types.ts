@@ -1,5 +1,6 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
+import { RunEngine } from "@/api/types";
 
 export type NavigationNodeData = NodeBaseData & {
   url: string;
@@ -7,7 +8,7 @@ export type NavigationNodeData = NodeBaseData & {
   errorCodeMapping: string;
   completeCriterion: string;
   terminateCriterion: string;
-  engine: string | null;
+  engine: RunEngine | null;
   maxRetries: number | null;
   maxStepsOverride: number | null;
   allowDownloads: boolean;
@@ -28,7 +29,7 @@ export const navigationNodeDefaultData: NavigationNodeData = {
   completeCriterion: "",
   terminateCriterion: "",
   errorCodeMapping: "null",
-  engine: "skyvern-1.0",
+  engine: RunEngine.SkyvernV1,
   maxRetries: null,
   maxStepsOverride: null,
   allowDownloads: false,

@@ -1,5 +1,6 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
+import { RunEngine } from "@/api/types";
 
 export type LoginNodeData = NodeBaseData & {
   url: string;
@@ -13,6 +14,7 @@ export type LoginNodeData = NodeBaseData & {
   cacheActions: boolean;
   completeCriterion: string;
   terminateCriterion: string;
+  engine: RunEngine | null;
 };
 
 export type LoginNode = Node<LoginNodeData, "login">;
@@ -33,6 +35,7 @@ export const loginNodeDefaultData: LoginNodeData = {
   cacheActions: false,
   completeCriterion: "",
   terminateCriterion: "",
+  engine: RunEngine.SkyvernV1,
 } as const;
 
 export function isLoginNode(node: Node): node is LoginNode {

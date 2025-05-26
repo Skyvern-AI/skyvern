@@ -1,5 +1,6 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
+import { RunEngine } from "@/api/types";
 
 export type FileDownloadNodeData = NodeBaseData & {
   url: string;
@@ -11,6 +12,7 @@ export type FileDownloadNodeData = NodeBaseData & {
   parameterKeys: Array<string>;
   totpVerificationUrl: string | null;
   totpIdentifier: string | null;
+  engine: RunEngine | null;
   cacheActions: boolean;
 };
 
@@ -30,6 +32,7 @@ export const fileDownloadNodeDefaultData: FileDownloadNodeData = {
   totpIdentifier: null,
   continueOnFailure: false,
   cacheActions: false,
+  engine: RunEngine.SkyvernV1,
 } as const;
 
 export function isFileDownloadNode(node: Node): node is FileDownloadNode {
