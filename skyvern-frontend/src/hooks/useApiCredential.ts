@@ -1,7 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
 import { useCredentialGetter } from "./useCredentialGetter";
-import { getClient } from "@/api/AxiosClient";
+import {
+  getClient,
+  setApiKeyHeader,
+  removeApiKeyHeader,
+} from "@/api/AxiosClient";
 import { envCredential } from "@/util/env";
+import { useEffect } from "react";
 import { ApiKeyApiResponse, OrganizationApiResponse } from "@/api/types";
 
 function useApiCredential() {
@@ -33,7 +38,16 @@ function useApiCredential() {
     enabled: !!organizationId, // don't run this until organization id exists
   });
 
-  return credentialsFromEnv ?? apiKeys?.[0]?.token ?? null;
+  const credential = credentialsFromEnv ?? apiKeys?.[0]?.token ?? null;
+
+  useEffect(() => {
+    if (credential) {
+      setApiKeyHeader(credential);
+    } else {
+      removeApiKeyHeader();
+    }
+  }, [credential]);
+  return credential;
 }
 
 export { useApiCredential };
