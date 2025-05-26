@@ -163,7 +163,7 @@ function SavedTaskForm({ initialValues }: Props) {
           return client.post<
             ReturnType<typeof createTaskRequestObject>,
             { data: { task_id: string } }
-          >("/tasks", taskRequest, {
+          >("/run/tasks", taskRequest, {
             ...(includeOverrideHeader && {
               headers: {
                 "x-max-steps-override":

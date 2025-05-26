@@ -45,7 +45,7 @@ function WorkflowRunStream() {
         socket.close();
       }
       socket = new WebSocket(
-        `${wssBaseUrl}/stream/workflow_runs/${workflowRunId}${credential}`,
+        `${wssBaseUrl}/stream/runs/${workflowRunId}${credential}`,
       );
       // Listen for messages
       socket.addEventListener("message", (event) => {

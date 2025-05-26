@@ -14,7 +14,7 @@ function useTaskQuery({ id }: Props) {
     queryKey: ["task", id],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
-      return client.get(`/tasks/${id}`).then((response) => response.data);
+      return client.get(`/runs/${id}`).then((response) => response.data);
     },
     enabled: !!id,
     refetchInterval: (query) => {

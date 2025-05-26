@@ -123,9 +123,9 @@ function RunWorkflowForm({
       const client = await getClient(credentialGetter);
       const body = getRunWorkflowRequestBody(values, workflowParameters);
       return client.post<
-        RunWorkflowRequestBody,
+        RunWorkflowRequestBody & { workflow_id: string },
         { data: { workflow_run_id: string } }
-      >(`/workflows/${workflowPermanentId}/run`, body);
+      >("/run/workflows", { ...body, workflow_id: workflowPermanentId! });
     },
     onSuccess: (response) => {
       toast({
@@ -345,8 +345,8 @@ function RunWorkflowForm({
 
               const curl = fetchToCurl({
                 method: "POST",
-                url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
-                body,
+                url: `${apiBaseUrl}/run/workflows`,
+                body: { ...body, workflow_id: workflowPermanentId! },
                 headers: {
                   "Content-Type": "application/json",
                   "x-api-key": apiCredential ?? "<your-api-key>",
