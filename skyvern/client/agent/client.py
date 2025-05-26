@@ -53,42 +53,73 @@ class AgentClient:
         Parameters
         ----------
         prompt : str
+
             The goal or task description for Skyvern to accomplish
 
         user_agent : typing.Optional[str]
 
         url : typing.Optional[str]
+
             The starting URL for the task. If not provided, Skyvern will attempt to determine an appropriate URL
 
         engine : typing.Optional[RunEngine]
-            The Skyvern engine version to use for this task. The default value is skyvern-2.0.
+
+            The engine that powers the agent task. The default value is `skyvern-2.0`, the latest Skyvern agent that performs pretty well with complex and multi-step tasks. `skyvern-1.0` is good for simple tasks like filling a form, or searching for information on Google. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
 
         title : typing.Optional[str]
             The title for the task
 
         proxy_location : typing.Optional[ProxyLocation]
-            Geographic Proxy location to route the browser traffic through
+
+            Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
+
+            Available geotargeting options:
+            - RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.
+            - RESIDENTIAL_ES: Spain
+            - RESIDENTIAL_IE: Ireland
+            - RESIDENTIAL_GB: United Kingdom
+            - RESIDENTIAL_IN: India
+            - RESIDENTIAL_JP: Japan
+            - RESIDENTIAL_FR: France
+            - RESIDENTIAL_DE: Germany
+            - RESIDENTIAL_NZ: New Zealand
+            - RESIDENTIAL_ZA: South Africa
+            - RESIDENTIAL_AR: Argentina
+            - RESIDENTIAL_ISP: ISP proxy
+            - US-CA: California
+            - US-NY: New York
+            - US-TX: Texas
+            - US-FL: Florida
+            - US-WA: Washington
+            - NONE: No proxy
 
         data_extraction_schema : typing.Optional[TaskRunRequestDataExtractionSchema]
-            Schema defining what data should be extracted from the webpage
+
+            The schema for data to be extracted from the webpage. If you're looking for consistent data schema being returned by the agent, it's highly recommended to use https://json-schema.org/.
 
         error_code_mapping : typing.Optional[typing.Dict[str, typing.Optional[str]]]
-            Custom mapping of error codes to error messages if Skyvern encounters an error
+
+            Custom mapping of error codes to error messages if Skyvern encounters an error.
 
         max_steps : typing.Optional[int]
-            Maximum number of steps the task can take before timing out
+
+            Maximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: you are charged per step so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.
 
         webhook_url : typing.Optional[str]
-            URL to send task status updates to after a run is finished
+
+            URL to send task status updates to after a run is finished. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for more details.
 
         totp_identifier : typing.Optional[str]
-            Identifier for TOTP (Time-based One-Time Password) authentication if codes are being pushed to Skyvern
+
+            Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/credentials/totp#option-3-push-code-to-skyvern for more details.
 
         totp_url : typing.Optional[str]
-            URL for TOTP authentication setup if Skyvern should be polling endpoint for 2FA codes
+
+            URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/credentials/totp#option-2-get-code-from-your-endpoint for more details.
 
         browser_session_id : typing.Optional[str]
-            ID of an existing browser session to reuse, having it continue from the current screen state
+
+            Run the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
 
         publish_workflow : typing.Optional[bool]
             Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.
@@ -112,7 +143,7 @@ class AgentClient:
             api_key="YOUR_API_KEY",
         )
         client.agent.run_task(
-            prompt="prompt",
+            prompt="Find the top 3 posts on Hacker News.",
         )
         """
         _response = self._client_wrapper.httpx_client.request(
@@ -213,16 +244,39 @@ class AgentClient:
             The title for this workflow run
 
         proxy_location : typing.Optional[ProxyLocation]
-            Location of proxy to use for this workflow run
+
+            Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
+
+            Available geotargeting options:
+            - RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.
+            - RESIDENTIAL_ES: Spain
+            - RESIDENTIAL_IE: Ireland
+            - RESIDENTIAL_GB: United Kingdom
+            - RESIDENTIAL_IN: India
+            - RESIDENTIAL_JP: Japan
+            - RESIDENTIAL_FR: France
+            - RESIDENTIAL_DE: Germany
+            - RESIDENTIAL_NZ: New Zealand
+            - RESIDENTIAL_ZA: South Africa
+            - RESIDENTIAL_AR: Argentina
+            - RESIDENTIAL_ISP: ISP proxy
+            - US-CA: California
+            - US-NY: New York
+            - US-TX: Texas
+            - US-FL: Florida
+            - US-WA: Washington
+            - NONE: No proxy
 
         webhook_url : typing.Optional[str]
             URL to send workflow status updates to after a run is finished. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for webhook questions.
 
         totp_url : typing.Optional[str]
-            URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/running-tasks/advanced-features#get-code-from-your-endpoint
+
+            URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/credentials/totp#option-2-get-code-from-your-endpoint for more details.
 
         totp_identifier : typing.Optional[str]
-            Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/running-tasks/advanced-features#time-based-one-time-password-totp
+
+            Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/credentials/totp#option-3-push-code-to-skyvern for more details.
 
         browser_session_id : typing.Optional[str]
             ID of a Skyvern browser session to reuse, having it continue from the current screen state
@@ -519,42 +573,73 @@ class AsyncAgentClient:
         Parameters
         ----------
         prompt : str
+
             The goal or task description for Skyvern to accomplish
 
         user_agent : typing.Optional[str]
 
         url : typing.Optional[str]
+
             The starting URL for the task. If not provided, Skyvern will attempt to determine an appropriate URL
 
         engine : typing.Optional[RunEngine]
-            The Skyvern engine version to use for this task. The default value is skyvern-2.0.
+
+            The engine that powers the agent task. The default value is `skyvern-2.0`, the latest Skyvern agent that performs pretty well with complex and multi-step tasks. `skyvern-1.0` is good for simple tasks like filling a form, or searching for information on Google. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
 
         title : typing.Optional[str]
             The title for the task
 
         proxy_location : typing.Optional[ProxyLocation]
-            Geographic Proxy location to route the browser traffic through
+
+            Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
+
+            Available geotargeting options:
+            - RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.
+            - RESIDENTIAL_ES: Spain
+            - RESIDENTIAL_IE: Ireland
+            - RESIDENTIAL_GB: United Kingdom
+            - RESIDENTIAL_IN: India
+            - RESIDENTIAL_JP: Japan
+            - RESIDENTIAL_FR: France
+            - RESIDENTIAL_DE: Germany
+            - RESIDENTIAL_NZ: New Zealand
+            - RESIDENTIAL_ZA: South Africa
+            - RESIDENTIAL_AR: Argentina
+            - RESIDENTIAL_ISP: ISP proxy
+            - US-CA: California
+            - US-NY: New York
+            - US-TX: Texas
+            - US-FL: Florida
+            - US-WA: Washington
+            - NONE: No proxy
 
         data_extraction_schema : typing.Optional[TaskRunRequestDataExtractionSchema]
-            Schema defining what data should be extracted from the webpage
+
+            The schema for data to be extracted from the webpage. If you're looking for consistent data schema being returned by the agent, it's highly recommended to use https://json-schema.org/.
 
         error_code_mapping : typing.Optional[typing.Dict[str, typing.Optional[str]]]
-            Custom mapping of error codes to error messages if Skyvern encounters an error
+
+            Custom mapping of error codes to error messages if Skyvern encounters an error.
 
         max_steps : typing.Optional[int]
-            Maximum number of steps the task can take before timing out
+
+            Maximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: you are charged per step so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.
 
         webhook_url : typing.Optional[str]
-            URL to send task status updates to after a run is finished
+
+            URL to send task status updates to after a run is finished. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for more details.
 
         totp_identifier : typing.Optional[str]
-            Identifier for TOTP (Time-based One-Time Password) authentication if codes are being pushed to Skyvern
+
+            Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/credentials/totp#option-3-push-code-to-skyvern for more details.
 
         totp_url : typing.Optional[str]
-            URL for TOTP authentication setup if Skyvern should be polling endpoint for 2FA codes
+
+            URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/credentials/totp#option-2-get-code-from-your-endpoint for more details.
 
         browser_session_id : typing.Optional[str]
-            ID of an existing browser session to reuse, having it continue from the current screen state
+
+            Run the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
 
         publish_workflow : typing.Optional[bool]
             Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.
@@ -583,7 +668,7 @@ class AsyncAgentClient:
 
         async def main() -> None:
             await client.agent.run_task(
-                prompt="prompt",
+                prompt="Find the top 3 posts on Hacker News.",
             )
 
 
@@ -687,16 +772,39 @@ class AsyncAgentClient:
             The title for this workflow run
 
         proxy_location : typing.Optional[ProxyLocation]
-            Location of proxy to use for this workflow run
+
+            Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
+
+            Available geotargeting options:
+            - RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.
+            - RESIDENTIAL_ES: Spain
+            - RESIDENTIAL_IE: Ireland
+            - RESIDENTIAL_GB: United Kingdom
+            - RESIDENTIAL_IN: India
+            - RESIDENTIAL_JP: Japan
+            - RESIDENTIAL_FR: France
+            - RESIDENTIAL_DE: Germany
+            - RESIDENTIAL_NZ: New Zealand
+            - RESIDENTIAL_ZA: South Africa
+            - RESIDENTIAL_AR: Argentina
+            - RESIDENTIAL_ISP: ISP proxy
+            - US-CA: California
+            - US-NY: New York
+            - US-TX: Texas
+            - US-FL: Florida
+            - US-WA: Washington
+            - NONE: No proxy
 
         webhook_url : typing.Optional[str]
             URL to send workflow status updates to after a run is finished. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for webhook questions.
 
         totp_url : typing.Optional[str]
-            URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/running-tasks/advanced-features#get-code-from-your-endpoint
+
+            URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/credentials/totp#option-2-get-code-from-your-endpoint for more details.
 
         totp_identifier : typing.Optional[str]
-            Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/running-tasks/advanced-features#time-based-one-time-password-totp
+
+            Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/credentials/totp#option-3-push-code-to-skyvern for more details.
 
         browser_session_id : typing.Optional[str]
             ID of a Skyvern browser session to reuse, having it continue from the current screen state

@@ -25,7 +25,28 @@ class WorkflowRunRequest(UniversalBaseModel):
 
     proxy_location: typing.Optional[ProxyLocation] = pydantic.Field(default=None)
     """
-    Location of proxy to use for this workflow run
+    
+    Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
+    
+    Available geotargeting options:
+    - RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.
+    - RESIDENTIAL_ES: Spain
+    - RESIDENTIAL_IE: Ireland
+    - RESIDENTIAL_GB: United Kingdom
+    - RESIDENTIAL_IN: India
+    - RESIDENTIAL_JP: Japan
+    - RESIDENTIAL_FR: France
+    - RESIDENTIAL_DE: Germany
+    - RESIDENTIAL_NZ: New Zealand
+    - RESIDENTIAL_ZA: South Africa
+    - RESIDENTIAL_AR: Argentina
+    - RESIDENTIAL_ISP: ISP proxy
+    - US-CA: California
+    - US-NY: New York
+    - US-TX: Texas
+    - US-FL: Florida
+    - US-WA: Washington
+    - NONE: No proxy
     """
 
     webhook_url: typing.Optional[str] = pydantic.Field(default=None)
@@ -35,12 +56,14 @@ class WorkflowRunRequest(UniversalBaseModel):
 
     totp_url: typing.Optional[str] = pydantic.Field(default=None)
     """
-    URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/running-tasks/advanced-features#get-code-from-your-endpoint
+    
+    URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/credentials/totp#option-2-get-code-from-your-endpoint for more details.
     """
 
     totp_identifier: typing.Optional[str] = pydantic.Field(default=None)
     """
-    Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/running-tasks/advanced-features#time-based-one-time-password-totp
+    
+    Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/credentials/totp#option-3-push-code-to-skyvern for more details.
     """
 
     browser_session_id: typing.Optional[str] = pydantic.Field(default=None)
