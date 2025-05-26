@@ -259,6 +259,7 @@ function WorkflowRun() {
                 state={{
                   data: parameters,
                   proxyLocation,
+                  webhookCallbackUrl: workflowRun?.webhook_callback_url ?? "",
                 }}
               >
                 <PlayIcon className="mr-2 h-4 w-4" />
