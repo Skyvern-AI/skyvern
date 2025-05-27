@@ -94,8 +94,13 @@ navigation:
           path: workflows/workflow-blocks-details.mdx
         - page: Workflow Parameters
           path: workflows/workflow-parameters.mdx
+        - page: Run Workflows
+          path: workflows/run-workflows.mdx
+        - page: Make Workflows Consistent And Reliable
+          path: workflows/consistent-workflows.mdx
         - page: Running Workflows
           path: workflows/running-workflows.mdx
+          hidden: true
         - page: Introduction
           path: workflows/introduction.mdx
           hidden: true
