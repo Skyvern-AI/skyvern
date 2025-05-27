@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 
 from .docs import docs_app
 from .init_command import init, init_browser
+from .quickstart import quickstart_app
 from .run_commands import run_app
 from .status import status_app
 from .tasks import tasks_app
@@ -27,6 +28,11 @@ init_app = typer.Typer(
     help="Interactively configure Skyvern and its dependencies.",
 )
 cli_app.add_typer(init_app, name="init")
+
+# Add quickstart command
+cli_app.add_typer(
+    quickstart_app, name="quickstart", help="One-command setup and start for Skyvern (combines init and run)."
+)
 
 
 @init_app.callback()
