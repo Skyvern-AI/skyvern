@@ -76,11 +76,15 @@ def init(
 
         console.print("🌐 [bold blue]Setting Skyvern Base URL to: http://localhost:8000[/bold blue]")
         update_or_add_env_var("SKYVERN_BASE_URL", "http://localhost:8000")
-        
+
         console.print("\n[bold yellow]To run Skyvern you can either:[/bold yellow]")
         console.print("• [green]skyvern run server[/green]  (reuses the DB we just created)")
-        console.print("• [cyan]docker compose up -d[/cyan]  (starts a new Postgres inside Compose; you may stop the first container with: [magenta]docker rm -f postgresql-container[/magenta])")
-        console.print("\n[italic]Only one Postgres container can run on the host's port 5432 at a time. If you switch to Docker Compose, remove the original with:[/italic] [magenta]docker rm -f postgresql-container[/magenta]")
+        console.print(
+            "• [cyan]docker compose up -d[/cyan]  (starts a new Postgres inside Compose; you may stop the first container with: [magenta]docker rm -f postgresql-container[/magenta])"
+        )
+        console.print(
+            "\n[italic]Only one Postgres container can run on the host's port 5432 at a time. If you switch to Docker Compose, remove the original with:[/italic] [magenta]docker rm -f postgresql-container[/magenta]"
+        )
     else:
         console.print(Panel("[bold purple]Cloud Deployment Setup[/bold purple]", border_style="purple"))
         base_url = Prompt.ask("Enter Skyvern base URL", default="https://api.skyvern.com", show_default=True)
