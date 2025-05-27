@@ -10,6 +10,7 @@
 **/.venv
 **/.vscode
 *.env*
+!/.env
 # Streamlit ignores
 **/secrets*.toml
 
