@@ -95,6 +95,9 @@ def setup_llm_providers() -> None:
                 [
                     "ANTHROPIC_CLAUDE3.5_SONNET",
                     "ANTHROPIC_CLAUDE3.7_SONNET",
+                    "ANTHROPIC_CLAUDE3.5_HAIKU",
+                    "ANTHROPIC_CLAUDE4_OPUS",
+                    "ANTHROPIC_CLAUDE4_SONNET",
                 ]
             )
     else:
