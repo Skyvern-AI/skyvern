@@ -36,57 +36,36 @@ Instead of only relying on code-defined XPath interactions, Skyvern relies on Vi
 Want to see examples of Skyvern in action? Jump to [#real-world-examples-of-skyvern](#real-world-examples-of-skyvern)
 
 
-# Skyvern Cloud
-We offer a managed cloud version of Skyvern that allows you to run Skyvern without having to manage the infrastructure. It allows you to run multiple Skyvern instances in parallel and comes bundled with anti-bot detection mechanisms, proxy network, and CAPTCHA solvers.
-
-If you'd like to try it out, 
-1. Navigate to [app.skyvern.com](https://app.skyvern.com)
-1. Create an account & Get $5 of credits on us
-1. Kick off your first task and see Skyvern in action!
-
-
 # Quickstart
-This quickstart guide will walk you through getting Skyvern up and running on your local machine. 
 
-## Install & Run
-> ⚠️ **REQUIREMENT**: This project requires Python 3.11 ⚠️
+## Skyvern Cloud
+[Skyvern Cloud](https://app.skyvern.com) is a managed cloud version of Skyvern that allows you to run Skyvern without worrying about the infrastructure. It allows you to run multiple Skyvern instances in parallel and comes bundled with anti-bot detection mechanisms, proxy network, and CAPTCHA solvers.
+
+If you'd like to try it out, navigate to [app.skyvern.com](https://app.skyvern.com) and create an account.
+
+## Local Install & Run
+> ⚠️ **REQUIREMENT**: This project requires at least Python 3.11 ⚠️
 
 1. **Install Skyvern**
-	```bash
-	pip install skyvern
-	```
 
-2. **Configure Skyvern** Run the setup wizard which will guide you through the configuration process, including Skyvern [MCP](https://github.com/Skyvern-AI/skyvern/blob/main/integrations/mcp/README.md) integration. This will generate a `.env` as the configuration settings file.
-	```bash
-	skyvern init
-	```
+```bash
+pip install skyvern
+```
 
-3. **Launch the Skyvern Server** 
+2. **Run Skyvern**
 
-	```bash
-	skyvern run server
-	```
+```bash
+skyvern quickstart
+```
 
-4. **Launch the Skyvern UI**
-
-  ```bash
-  skyvern run ui
-  ```
-
-5. **Check component status**
-
-  ```bash
-  skyvern status
-  ```
-
-6. **Run task**
+3. **Run task**
 
   Run a skyvern task locally:
   ```python
   from skyvern import Skyvern
 
   skyvern = Skyvern()
-  task = await skyvern.run_task(prompt="Find the top post on hackernews today")
+  task = await skyvern.local.run_task(prompt="Find the top post on hackernews today")
   print(task)
   ```
   A local browser will pop up. Skyvern will start executing the task in the browser and close the it when the task is done. You will be able to review the task from http://localhost:8080/history
@@ -106,6 +85,28 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
   print(task)
   ```
 
+### Helpful commands to debug issues
+
+
+**Launch the Skyvern Server Separately** 
+
+```bash
+skyvern run server
+```
+
+**Launch the Skyvern UI**
+
+```bash
+skyvern run ui
+```
+
+**Check status of the Skyvern service**
+
+```bash
+skyvern status
+```
+
+
 ## Docker Compose setup
 
 1. Make sure you have [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running on your machine
@@ -117,45 +118,6 @@ This quickstart guide will walk you through getting Skyvern up and running on yo
     docker compose up -d
    ```
 3. Navigate to `http://localhost:8080` in your browser to start using the UI
-
-## Local vs. Docker
-
-Skyvern supports two startup options for local development:
-
-**Before Option 1**
-* If using Option 1, working in a virtual environment may improve the overall experience. Here's how to activate it:
-
-  ```bash
-  python3 -m venv skyvern-env/
-  cd skyvern
-  source ../skyvern-env/bin/activate
-  pip install skyvern (Only if not already installed)
-  pip install -e .
-  ``` 
-
-  Deactivation:
-  ```bash
-  deactivate
-  ```
-
-**Option 1: Native (Postgres created by the CLI wizard)**
-
-* Use the CLI wizard to spin up a disposable Postgres container, then run the backend natively.
-* **Start with:**
-  ```bash
-  skyvern init
-  skyvern run server
-  ```
-* This reuses the Postgres container created by the wizard.
-
-**Option 2: Docker Compose (Postgres created with Compose)**
-
-* Use Docker Compose to start all services, including a new Postgres container.
-* **Start with:**
-  ```bash
-  docker compose up -d
-  ```
-* This launches a new Postgres instance inside Compose.
 
 > **Important:** Only one Postgres container can run on port 5432 at a time. If you switch from the CLI-managed Postgres to Docker Compose, you must first remove the original container:
 > ```bash
