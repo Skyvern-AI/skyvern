@@ -32,7 +32,7 @@ from skyvern.utils import migrate_db
 class Skyvern(AsyncSkyvern):
     class local:
         """Internal namespace for local mode operations."""
-        
+
         @staticmethod
         async def run_task(
             prompt: str,
@@ -54,7 +54,7 @@ class Skyvern(AsyncSkyvern):
             """
             Run a task using Skyvern in local mode.
             This is a wrapper around Skyvern.run_task that ensures it's used in local mode.
-            
+
             Args:
                 prompt: The prompt describing the task to run
                 engine: The engine to use for running the task
@@ -71,10 +71,10 @@ class Skyvern(AsyncSkyvern):
                 timeout: Timeout in seconds
                 browser_session_id: Optional browser session ID
                 user_agent: Optional user agent string
-                
+
             Returns:
                 TaskRunResponse: The response from running the task
-                
+
             Raises:
                 ValueError: If an API key is provided (this function is for local mode only)
             """
