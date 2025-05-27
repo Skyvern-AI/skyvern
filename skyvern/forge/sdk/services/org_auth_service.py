@@ -119,7 +119,7 @@ async def _get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
         organization_id=organization.organization_id,
         token_type=OrganizationAuthTokenType.api,
         token=x_api_key,
-        valid=True,
+        valid=None,
     )
     if not api_key_db_obj:
         raise HTTPException(

@@ -1666,7 +1666,7 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
         payload_json = task_v2.model_dump_json(by_alias=True)
         payload_dict = json.loads(payload_json)
         payload_dict.update(json.loads(task_run_response_json))
-        payload = json.dumps(payload_dict)
+        payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
         headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key.token)
         LOG.info(
             "Sending task v2 response to webhook callback url",

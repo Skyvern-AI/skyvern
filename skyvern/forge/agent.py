@@ -2125,7 +2125,7 @@ class ForgeAgent:
             payload_dict = json.loads(payload_json)
             if task_run_response_json:
                 payload_dict.update(json.loads(task_run_response_json))
-            payload = json.dumps(payload_dict)
+            payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
             headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key)
             LOG.info(
                 "Sending task response to webhook callback url",
