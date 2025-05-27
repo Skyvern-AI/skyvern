@@ -72,6 +72,7 @@ from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, ValidationBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.runs import CUA_ENGINES, CUA_RUN_TYPES, RunEngine
+from skyvern.services import run_service
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions.actions import (
@@ -2109,40 +2110,30 @@ class ForgeAgent:
             return
 
         task_response = await self.build_task_response(task=task, last_step=last_step)
-        # send task_response to the webhook callback url
-        payload = task_response.model_dump_json(exclude={"request"})
-        headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key)
-        LOG.info(
-            "Sending task response to webhook callback url",
-            task_id=task.task_id,
-            webhook_callback_url=task.webhook_callback_url,
-            payload=payload,
-            headers=headers,
-        )
         # try to build the new TaskRunResponse for backward compatibility
-        # task_run_response_json: str | None = None
+        task_run_response_json: str | None = None
         try:
-            # run_response = await run_service.get_run_response(
-            #     run_id=task.task_id,
-            #     organization_id=task.organization_id,
-            # )
-            # if run_response is not None:
-            #     task_run_response_json = run_response.model_dump_json(exclude={"run_request"})
+            run_response = await run_service.get_run_response(
+                run_id=task.task_id,
+                organization_id=task.organization_id,
+            )
+            if run_response is not None:
+                task_run_response_json = run_response.model_dump_json(exclude={"run_request"})
 
-            # # send task_response to the webhook callback url
-            # payload_json = task_response.model_dump_json(exclude={"request"})
-            # payload_dict = json.loads(payload_json)
-            # if task_run_response_json:
-            #     payload_dict.update(json.loads(task_run_response_json))
-            # payload = json.dumps(payload_dict)
-            # headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key)
-            # LOG.info(
-            #     "Sending task response to webhook callback url",
-            #     task_id=task.task_id,
-            #     webhook_callback_url=task.webhook_callback_url,
-            #     payload=payload,
-            #     headers=headers,
-            # )
+            # send task_response to the webhook callback url
+            payload_json = task_response.model_dump_json(exclude={"request"})
+            payload_dict = json.loads(payload_json)
+            if task_run_response_json:
+                payload_dict.update(json.loads(task_run_response_json))
+            payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
+            headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key)
+            LOG.info(
+                "Sending task response to webhook callback url",
+                task_id=task.task_id,
+                webhook_callback_url=task.webhook_callback_url,
+                payload=payload,
+                headers=headers,
+            )
 
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
