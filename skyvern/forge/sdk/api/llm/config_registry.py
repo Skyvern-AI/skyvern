@@ -236,6 +236,36 @@ if settings.ENABLE_ANTHROPIC:
             max_completion_tokens=8192,
         ),
     )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE3.5_HAIKU",
+        LLMConfig(
+            "anthropic/claude-3-5-haiku-latest",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+            max_completion_tokens=8192,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE4_OPUS",
+        LLMConfig(
+            "anthropic/claude-opus-4-latest",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+            max_completion_tokens=8192,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE4_SONNET",
+        LLMConfig(
+            "anthropic/claude-sonnet-4-latest",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+            max_completion_tokens=8192,
+        ),
+    )
 
 if settings.ENABLE_BEDROCK:
     # Supported through AWS IAM authentication
@@ -267,12 +297,23 @@ if settings.ENABLE_BEDROCK:
         ),
     )
     LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE3.5_HAIKU",
+        LLMConfig(
+            "bedrock/anthropic.claude-3-5-haiku-20241022-v1:0",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+            max_completion_tokens=8192,
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET",
         LLMConfig(
             "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0",
             ["AWS_REGION"],
             supports_vision=True,
             add_assistant_prefix=True,
+            max_completion_tokens=8192,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -282,6 +323,7 @@ if settings.ENABLE_BEDROCK:
             ["AWS_REGION"],
             supports_vision=True,
             add_assistant_prefix=True,
+            max_completion_tokens=8192,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -309,6 +351,26 @@ if settings.ENABLE_BEDROCK:
             ["AWS_REGION"],
             supports_vision=True,
             add_assistant_prefix=True,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE4_OPUS",
+        LLMConfig(
+            "bedrock/anthropic.claude-opus-4-20250514-v1:0",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+            max_completion_tokens=8192,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE4_SONNET",
+        LLMConfig(
+            "bedrock/anthropic.claude-sonnet-4-20250514-v1:0",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+            max_completion_tokens=8192,
         ),
     )
     LLMConfigRegistry.register_config(
