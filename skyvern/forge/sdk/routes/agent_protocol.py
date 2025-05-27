@@ -269,9 +269,9 @@ async def run_task(
 
 @base_router.post(
     "/run/workflows",
-    tags=["Agent"],
+    tags=["Workflows"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "run_workflow",
         "x-fern-examples": [
             {
@@ -347,10 +347,10 @@ async def run_workflow(
 
 @base_router.get(
     "/runs/{run_id}",
-    tags=["Agent"],
+    tags=["Agent", "Workflows"],
     response_model=RunResponse,
     description="Get run information (task run, workflow run)",
-    summary="Get a task or a workflow run by id",
+    summary="Get a run by id",
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_run",
@@ -383,14 +383,14 @@ async def get_run(
 
 @base_router.post(
     "/runs/{run_id}/cancel",
-    tags=["Agent"],
+    tags=["Agent", "Workflows"],
     openapi_extra={
         "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "cancel_run",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": CANCEL_RUN_CODE_SAMPLE}]}],
     },
     description="Cancel a run (task or workflow)",
-    summary="Cancel a task or workflow run",
+    summary="Cancel a run by id",
 )
 @base_router.post("/runs/{run_id}/cancel/", include_in_schema=False)
 async def cancel_run(
@@ -466,8 +466,8 @@ async def create_workflow_legacy(
             }
         ],
     },
-    description="Create a new workflow definition",
-    summary="Create a new workflow definition",
+    description="Create a new workflow",
+    summary="Create a new workflow",
     responses={
         200: {"description": "Successfully created workflow"},
         422: {"description": "Invalid workflow definition"},
@@ -580,8 +580,8 @@ async def update_workflow_legacy(
             }
         ],
     },
-    description="Update a workflow definition",
-    summary="Update a workflow definition",
+    description="Update a workflow",
+    summary="Update a workflow",
     responses={
         200: {"description": "Successfully updated workflow"},
         422: {"description": "Invalid workflow definition"},
