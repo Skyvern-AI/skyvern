@@ -2139,7 +2139,7 @@ class ForgeAgent:
                 resp = await client.post(
                     task.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
                 )
-            if resp.status_code == 200:
+            if resp.status_code >= 200 and resp.status_code < 300:
                 LOG.info(
                     "Webhook sent successfully",
                     task_id=task.task_id,

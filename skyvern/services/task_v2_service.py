@@ -1678,7 +1678,7 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
         resp = await httpx.AsyncClient().post(
             task_v2.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
         )
-        if resp.status_code == 200:
+        if resp.status_code >= 200 and resp.status_code < 300:
             LOG.info(
                 "Task v2 webhook sent successfully",
                 task_v2_id=task_v2.observer_cruise_id,
