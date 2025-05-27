@@ -78,8 +78,17 @@ function WorkflowParameterEditPanel({
   const isSkyvernCredential =
     initialValues.parameterType === "credential" &&
     parameterIsSkyvernCredential(initialValues);
-  const [credentialType, setCredentialType] = useState<"bitwarden" | "skyvern">(
-    isBitwardenCredential ? "bitwarden" : "skyvern",
+  const isOnePasswordCredential =
+    initialValues.parameterType === "credential" &&
+    parameterIsOnePasswordCredential(initialValues);
+  const [credentialType, setCredentialType] = useState<
+    "bitwarden" | "skyvern" | "onepassword"
+  >(
+    isBitwardenCredential
+      ? "bitwarden"
+      : isOnePasswordCredential
+      ? "onepassword"
+      : "skyvern",
   );
   const [urlParameterKey, setUrlParameterKey] = useState(
     isBitwardenCredential ? initialValues.urlParameterKey ?? "" : "",
@@ -146,6 +155,9 @@ function WorkflowParameterEditPanel({
 
   const [bitwardenLoginCredentialItemId, setBitwardenLoginCredentialItemId] =
     useState(isBitwardenCredential ? initialValues.itemId ?? "" : "");
+  const [onePasswordItemId, setOnePasswordItemId] = useState(
+    isOnePasswordCredential ? initialValues.itemId ?? "" : ""
+  );
 
   return (
     <ScrollArea>
@@ -256,11 +268,14 @@ function WorkflowParameterEditPanel({
             <SwitchBar
               value={credentialType}
               onChange={(value) => {
-                setCredentialType(value as "bitwarden" | "skyvern");
+                setCredentialType(
+                  value as "bitwarden" | "skyvern" | "onepassword"
+                );
               }}
               options={[
                 { label: "Skyvern", value: "skyvern" },
                 { label: "Bitwarden", value: "bitwarden" },
+                { label: "1Password", value: "onepassword" },
               ]}
             />
           )}
@@ -292,6 +307,15 @@ function WorkflowParameterEditPanel({
                 />
               </div>
             </>
+          )}
+          {type === "credential" && credentialType === "onepassword" && (
+            <div className="space-y-1">
+              <Label className="text-xs text-slate-300">Item ID</Label>
+              <Input
+                value={onePasswordItemId}
+                onChange={(e) => setOnePasswordItemId(e.target.value)}
+              />
+            </div>
           )}
           {type === "context" && (
             <div className="space-y-1">
@@ -427,6 +451,22 @@ function WorkflowParameterEditPanel({
                     urlParameterKey:
                       urlParameterKey === "" ? null : urlParameterKey,
                     collectionId: collectionId === "" ? null : collectionId,
+                    description,
+                  });
+                }
+                if (type === "credential" && credentialType === "onepassword") {
+                  if (!onePasswordItemId) {
+                    toast({
+                      variant: "destructive",
+                      title: "Failed to save parameter",
+                      description: "Item ID is required",
+                    });
+                    return;
+                  }
+                  onSave({
+                    key,
+                    parameterType: "credential",
+                    itemId: onePasswordItemId,
                     description,
                   });
                 }

@@ -140,6 +140,17 @@ function WorkflowEditor() {
                   description: parameter.description,
                 };
               } else {
+                const isOnePassword =
+                  parameter.bitwarden_collection_id === null &&
+                  parameter.url_parameter_key === null;
+                if (isOnePassword) {
+                  return {
+                    key: parameter.key,
+                    parameterType: WorkflowEditorParameterTypes.Credential,
+                    itemId: parameter.bitwarden_item_id,
+                    description: parameter.description,
+                  };
+                }
                 return {
                   key: parameter.key,
                   parameterType: WorkflowEditorParameterTypes.Credential,
