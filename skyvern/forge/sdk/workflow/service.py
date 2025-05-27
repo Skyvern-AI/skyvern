@@ -1268,7 +1268,7 @@ class WorkflowService:
                 resp = await client.post(
                     url=workflow_run.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
                 )
-            if resp.status_code == 200:
+            if resp.status_code >= 200 and resp.status_code < 300:
                 LOG.info(
                     "Webhook sent successfully",
                     workflow_id=workflow_id,
