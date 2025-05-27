@@ -24,19 +24,19 @@ export type OnePasswordCredential = {
 };
 
 export function parameterIsBitwardenCredential(
-  parameter: CredentialParameterState,
+  parameter: ParametersState[number],
 ): parameter is BitwardenLoginCredential {
   return "collectionId" in parameter;
 }
 
 export function parameterIsSkyvernCredential(
-  parameter: CredentialParameterState,
+  parameter: ParametersState[number],
 ): parameter is SkyvernCredential {
   return "credentialId" in parameter;
 }
 
 export function parameterIsOnePasswordCredential(
-  parameter: CredentialParameterState,
+  parameter: ParametersState[number],
 ): parameter is OnePasswordCredential {
   return (
     "itemId" in parameter &&
