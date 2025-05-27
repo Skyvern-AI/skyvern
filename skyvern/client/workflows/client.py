@@ -111,7 +111,7 @@ class WorkflowsClient:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> Workflow:
         """
-        Create a new workflow definition
+        Create a new workflow
 
         Parameters
         ----------
@@ -183,7 +183,7 @@ class WorkflowsClient:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> Workflow:
         """
-        Update a workflow definition
+        Update a workflow
 
         Parameters
         ----------
@@ -413,7 +413,7 @@ class AsyncWorkflowsClient:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> Workflow:
         """
-        Create a new workflow definition
+        Create a new workflow
 
         Parameters
         ----------
@@ -493,7 +493,7 @@ class AsyncWorkflowsClient:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> Workflow:
         """
-        Update a workflow definition
+        Update a workflow
 
         Parameters
         ----------
