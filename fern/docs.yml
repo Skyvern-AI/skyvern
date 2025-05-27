@@ -88,18 +88,29 @@ navigation:
           path: running-tasks/api-spec.mdx
     - section: Workflows
       contents:
-        - page: Introduction
-          path: workflows/introduction.mdx
-        - page: Creating Workflows
-          path: workflows/creating-workflows.mdx
-        - page: Getting Existing Workflows
-          path: workflows/getting-workflows.mdx
+        - page: Manage Workflows
+          path: workflows/manage-workflows.mdx
+        - page: Workflow Blocks
+          path: workflows/workflow-blocks-details.mdx
+        - page: Workflow Parameters
+          path: workflows/workflow-parameters.mdx
         - page: Running Workflows
           path: workflows/running-workflows.mdx
+        - page: Introduction
+          path: workflows/introduction.mdx
+          hidden: true
         - page: Workflow Blocks
           path: workflows/workflow-blocks.mdx
+          hidden: true
+        - page: Creating Workflows
+          path: workflows/creating-workflows.mdx
+          hidden: true
+        - page: Getting Existing Workflows
+          path: workflows/getting-workflows.mdx
+          hidden: true
         - page: What the heck is a parameter?
           path: workflows/what-is-a-parameter.mdx
+          hidden: true
     - section: Credentials
       contents:
         - page: Introduction
