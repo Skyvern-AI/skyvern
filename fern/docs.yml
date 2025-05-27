@@ -108,7 +108,7 @@ navigation:
           path: credentials/passwords.mdx
         - page: Credit Card Management
           path: credentials/credit-cards.mdx
-        - page: TOTP (2FA/MFA/Verification Code)
+        - page: 2FA Support (TOTP)
           path: credentials/totp.mdx
         - page: Bitwarden
           path: credentials/bitwarden.mdx
