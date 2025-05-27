@@ -120,7 +120,7 @@ navigation:
           hidden: true
     - section: Credentials
       contents:
-        - page: Introduction
+        - page: Overview
           path: credentials/introduction.mdx
         - page: Password Management
           path: credentials/passwords.mdx
