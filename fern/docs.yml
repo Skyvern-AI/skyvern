@@ -74,10 +74,12 @@ navigation:
           path: getting-started/prompting-guide.mdx
     - section: Tasks
       contents:
-        - page: Task Features
+        - page: Run Tasks
           path: running-tasks/run-tasks.mdx
         - page: Visualizing Results
           path: running-tasks/visualizing-results.mdx
+        - page: Cancel Task Runs
+          path: running-tasks/cancel-runs.mdx
         - page: Webhooks FAQ
           path: running-tasks/webhooks-faq.mdx
         - page: Advanced Settings for tasks
