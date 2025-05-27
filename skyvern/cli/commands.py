@@ -31,9 +31,7 @@ cli_app.add_typer(init_app, name="init")
 
 # Add quickstart command
 cli_app.add_typer(
-    quickstart_app,
-    name="quickstart",
-    help="One-command setup and start for Skyvern (combines init and run)."
+    quickstart_app, name="quickstart", help="One-command setup and start for Skyvern (combines init and run)."
 )
 
 
