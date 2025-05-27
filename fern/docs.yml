@@ -138,3 +138,6 @@ navigation:
   - tab: github
   - tab: cloud
   - tab: demo
+
+experimental: 
+  openapi-parser-v3: true
