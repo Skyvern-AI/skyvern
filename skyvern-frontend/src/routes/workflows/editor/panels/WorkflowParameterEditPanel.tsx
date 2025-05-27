@@ -26,6 +26,7 @@ import { WorkflowParameterInput } from "../../WorkflowParameterInput";
 import {
   parameterIsBitwardenCredential,
   parameterIsSkyvernCredential,
+  parameterIsOnePasswordCredential,
   ParametersState,
 } from "../types";
 import { getDefaultValueForParameterType } from "../workflowEditorUtils";
@@ -154,9 +155,15 @@ function WorkflowParameterEditPanel({
   );
 
   const [bitwardenLoginCredentialItemId, setBitwardenLoginCredentialItemId] =
-    useState(isBitwardenCredential ? initialValues.itemId ?? "" : "");
+    useState(
+      parameterIsBitwardenCredential(initialValues)
+        ? initialValues.itemId ?? ""
+        : "",
+    );
   const [onePasswordItemId, setOnePasswordItemId] = useState(
-    isOnePasswordCredential ? initialValues.itemId ?? "" : ""
+    parameterIsOnePasswordCredential(initialValues)
+      ? initialValues.itemId ?? ""
+      : "",
   );
 
   return (
