@@ -303,12 +303,13 @@ function PromptBox() {
                 {enhancePromptMutation.isPending ? (
                   <ReloadIcon className="size-6 animate-spin" />
                 ) : (
-                  <BrainIcon
-                    className="size-6 cursor-pointer"
+                  <div 
                     onClick={() => {
                       enhancePromptMutation.mutate();
                     }}
-                  />
+                  >
+                    <BrainIcon className="size-6 cursor-pointer" />
+                  </div>
                 )}
               </div>
               <Select
