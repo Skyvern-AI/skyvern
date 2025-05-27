@@ -30,6 +30,73 @@ from skyvern.utils import migrate_db
 
 
 class Skyvern(AsyncSkyvern):
+    class local:
+        """Internal namespace for local mode operations."""
+
+        @staticmethod
+        async def run_task(
+            prompt: str,
+            engine: RunEngine = RunEngine.skyvern_v2,
+            url: str | None = None,
+            webhook_url: str | None = None,
+            totp_identifier: str | None = None,
+            totp_url: str | None = None,
+            title: str | None = None,
+            error_code_mapping: dict[str, str] | None = None,
+            data_extraction_schema: dict[str, Any] | str | None = None,
+            proxy_location: ProxyLocation | None = None,
+            max_steps: int | None = None,
+            wait_for_completion: bool = True,
+            timeout: float = DEFAULT_AGENT_TIMEOUT,
+            browser_session_id: str | None = None,
+            user_agent: str | None = None,
+        ) -> TaskRunResponse:
+            """
+            Run a task using Skyvern in local mode.
+            This is a wrapper around Skyvern.run_task that ensures it's used in local mode.
+
+            Args:
+                prompt: The prompt describing the task to run
+                engine: The engine to use for running the task
+                url: Optional URL to navigate to
+                webhook_url: Optional webhook URL for callbacks
+                totp_identifier: Optional TOTP identifier
+                totp_url: Optional TOTP verification URL
+                title: Optional title for the task
+                error_code_mapping: Optional mapping of error codes to messages
+                data_extraction_schema: Optional schema for data extraction
+                proxy_location: Optional proxy location
+                max_steps: Optional maximum number of steps
+                wait_for_completion: Whether to wait for task completion
+                timeout: Timeout in seconds
+                browser_session_id: Optional browser session ID
+                user_agent: Optional user agent string
+
+            Returns:
+                TaskRunResponse: The response from running the task
+
+            Raises:
+                ValueError: If an API key is provided (this function is for local mode only)
+            """
+            skyvern = Skyvern()  # Initialize in local mode (no API key)
+            return await skyvern.run_task(
+                prompt=prompt,
+                engine=engine,
+                url=url,
+                webhook_url=webhook_url,
+                totp_identifier=totp_identifier,
+                totp_url=totp_url,
+                title=title,
+                error_code_mapping=error_code_mapping,
+                data_extraction_schema=data_extraction_schema,
+                proxy_location=proxy_location,
+                max_steps=max_steps,
+                wait_for_completion=wait_for_completion,
+                timeout=timeout,
+                browser_session_id=browser_session_id,
+                user_agent=user_agent,
+            )
+
     def __init__(
         self,
         *,
