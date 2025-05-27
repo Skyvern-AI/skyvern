@@ -221,8 +221,8 @@ Examples include:
 
 ### Password Manager Integrations
 Skyvern currently supports the following password manager integrations:
-- [x] Bitwarden 
-- [ ] 1Password
+- [x] Bitwarden
+- [x] 1Password
 - [ ] LastPass
 
 
