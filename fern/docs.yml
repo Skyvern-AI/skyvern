@@ -98,7 +98,7 @@ navigation:
           path: workflows/workflow-parameters.mdx
         - page: Run Workflows
           path: workflows/run-workflows.mdx
-        - page: Make Workflows Consistent And Reliable
+        - page: Consistency and Reliability
           path: workflows/consistent-workflows.mdx
         - page: Running Workflows
           path: workflows/running-workflows.mdx
@@ -120,7 +120,7 @@ navigation:
           hidden: true
     - section: Credentials
       contents:
-        - page: Introduction
+        - page: Overview
           path: credentials/introduction.mdx
         - page: Password Management
           path: credentials/passwords.mdx
