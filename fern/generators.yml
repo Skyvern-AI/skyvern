@@ -4,6 +4,7 @@ auth-schemes:
   ApiKeyScheme:
     header: x-api-key
     type: string
+    name: x-api-key
     
 api: 
   auth: ApiKeyScheme
