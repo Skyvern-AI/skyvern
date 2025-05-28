@@ -12,6 +12,8 @@ from mcp.server.fastmcp import FastMCP
 from rich.panel import Panel
 from rich.prompt import Confirm
 
+from skyvern.config import settings
+from skyvern.library.skyvern import Skyvern
 from skyvern.utils import detect_os
 
 from .console import console
@@ -19,6 +21,36 @@ from .console import console
 run_app = typer.Typer(help="Commands to run Skyvern services such as the API server or UI.")
 
 mcp = FastMCP("Skyvern")
+
+
+@mcp.tool()
+async def skyvern_run_task(prompt: str, url: str) -> dict[str, str]:
+    """Use Skyvern to execute anything in the browser. Useful for accomplishing tasks that require browser automation.
+
+    This tool uses Skyvern's browser automation to navigate websites and perform actions to achieve
+    the user's intended outcome. It can handle tasks like form filling, clicking buttons, data extraction,
+    and multi-step workflows.
+
+    It can even help you find updated data on the internet if your model information is outdated.
+
+    Args:
+        prompt: A natural language description of what needs to be accomplished (e.g. "Book a flight from
+               NYC to LA", "Sign up for the newsletter", "Find the price of item X", "Apply to a job")
+        url: The starting URL of the website where the task should be performed
+    """
+    skyvern_agent = Skyvern(
+        base_url=settings.SKYVERN_BASE_URL,
+        api_key=settings.SKYVERN_API_KEY,
+    )
+    res = await skyvern_agent.run_task(prompt=prompt, url=url, user_agent="skyvern-mcp", wait_for_completion=True)
+
+    # TODO: It would be nice if we could return the task URL here
+    output = res.model_dump()["output"]
+    base_url = settings.SKYVERN_BASE_URL
+    run_history_url = (
+        "https://app.skyvern.com/history" if "skyvern.com" in base_url else "http://localhost:8080/history"
+    )
+    return {"output": output, "run_history_url": run_history_url}
 
 
 def get_pids_on_port(port: int) -> List[int]:
