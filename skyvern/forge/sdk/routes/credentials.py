@@ -37,7 +37,6 @@ async def parse_totp_code(content: str) -> str | None:
     "/totp",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "send_totp_code",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": SEND_TOTP_CODE_CODE_SAMPLE}]}],
     },
@@ -50,7 +49,6 @@ async def parse_totp_code(content: str) -> str | None:
     description="Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern. This endpoint stores the code in database so that Skyvern can use it while running tasks/workflows.",
     tags=["Credentials"],
     openapi_extra={
-        "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "send_totp_code",
     },
 )
@@ -107,7 +105,6 @@ async def send_totp_code(
     description="Creates a new credential for the current organization",
     tags=["Credentials"],
     openapi_extra={
-        "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "create_credential",
         "x-fern-examples": [
             {
@@ -198,7 +195,6 @@ async def create_credential(
     description="Deletes a specific credential by its ID",
     tags=["Credentials"],
     openapi_extra={
-        "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "delete_credential",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": DELETE_CREDENTIAL_CODE_SAMPLE}]}],
     },
@@ -244,7 +240,6 @@ async def delete_credential(
     description="Retrieves a specific credential by its ID",
     tags=["Credentials"],
     openapi_extra={
-        "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "get_credential",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_CREDENTIAL_CODE_SAMPLE}]}],
     },
@@ -312,7 +307,6 @@ async def get_credential(
     description="Retrieves a paginated list of credentials for the current organization",
     tags=["Credentials"],
     openapi_extra={
-        "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "get_credentials",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_CREDENTIALS_CODE_SAMPLE}]}],
     },

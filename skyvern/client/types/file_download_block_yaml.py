@@ -2,6 +2,7 @@
 
 from ..core.pydantic_utilities import UniversalBaseModel
 import typing
+from .run_engine import RunEngine
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
 
@@ -12,6 +13,7 @@ class FileDownloadBlockYaml(UniversalBaseModel):
     navigation_goal: str
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     max_retries: typing.Optional[int] = None
     max_steps_per_run: typing.Optional[int] = None
