@@ -597,6 +597,7 @@ async def handle_click_action(
                         workflow_run_id=task.workflow_run_id,
                     )
     else:
+        incremental_scraped: IncrementalScrapePage | None = None
         try:
             skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
             incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame)
@@ -616,63 +617,87 @@ async def handle_click_action(
             if results and not isinstance(results[-1], ActionSuccess):
                 return results
 
-            if await incremental_scraped.get_incremental_elements_num() == 0:
+            try:
+                if sequential_click_result := await handle_sequential_click_for_dropdown(
+                    action=action,
+                    anchor_element=skyvern_element,
+                    dom=dom,
+                    page=page,
+                    scraped_page=scraped_page,
+                    incremental_scraped=incremental_scraped,
+                    task=task,
+                    step=step,
+                ):
+                    results.append(sequential_click_result)
+                    return results
+
+            except Exception:
+                LOG.warning(
+                    "Failed to do sequential logic for the click action, skipping",
+                    exc_info=True,
+                    step_id=step.step_id,
+                    task_id=task.task_id,
+                    element_id=skyvern_element.get_id(),
+                )
                 return results
-
-            incremental_elements = await incremental_scraped.get_incremental_element_tree(
-                clean_and_remove_element_tree_factory(
-                    task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
-                ),
-            )
-
-            if len(incremental_elements) == 0:
-                return results
-
-            LOG.info("Detected new element after clicking", action=action)
-            dropdown_menu_element = await locate_dropdown_menu(
-                current_anchor_element=skyvern_element,
-                incremental_scraped=incremental_scraped,
-                step=step,
-                task=task,
-            )
-
-            if dropdown_menu_element is None:
-                return results
-
-            LOG.info(
-                "Found the dropdown menu element after clicking, triggering the sequential click logic",
-                step_id=step.step_id,
-                task_id=task.task_id,
-                element_id=dropdown_menu_element.get_id(),
-            )
-
-            action_result = await select_from_emerging_elements(
-                current_element_id=skyvern_element.get_id(),
-                options=CustomSelectPromptOptions(
-                    field_information=action.intention if action.intention else action.reasoning,
-                ),  # FIXME: need a better options data
-                page=page,
-                scraped_page=scraped_page,
-                step=step,
-                task=task,
-            )
-
-            results.append(action_result)
-            return results
-
-        except NoIncrementalElementFoundForCustomSelection:
-            LOG.info(
-                "No incremental element found, skip the sequential click logic",
-                step_id=step.step_id,
-                task_id=task.task_id,
-                element_id=skyvern_element.get_id(),
-            )
-            return results
 
         finally:
-            await incremental_scraped.stop_listen_dom_increment()
+            if incremental_scraped:
+                await incremental_scraped.stop_listen_dom_increment()
 
     return results
+
+
+async def handle_sequential_click_for_dropdown(
+    action: actions.ClickAction,
+    anchor_element: SkyvernElement,
+    dom: DomUtil,
+    page: Page,
+    scraped_page: ScrapedPage,
+    incremental_scraped: IncrementalScrapePage,
+    task: Task,
+    step: Step,
+) -> ActionResult | None:
+    if await incremental_scraped.get_incremental_elements_num() == 0:
+        return None
+
+    incremental_elements = await incremental_scraped.get_incremental_element_tree(
+        clean_and_remove_element_tree_factory(
+            task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
+        ),
+    )
+
+    if len(incremental_elements) == 0:
+        return None
+
+    LOG.info("Detected new element after clicking", action=action)
+    dropdown_menu_element = await locate_dropdown_menu(
+        current_anchor_element=anchor_element,
+        incremental_scraped=incremental_scraped,
+        step=step,
+        task=task,
+    )
+
+    if dropdown_menu_element is None:
+        return None
+
+    LOG.info(
+        "Found the dropdown menu element after clicking, triggering the sequential click logic",
+        step_id=step.step_id,
+        task_id=task.task_id,
+        element_id=dropdown_menu_element.get_id(),
+    )
+
+    return await select_from_emerging_elements(
+        current_element_id=anchor_element.get_id(),
+        options=CustomSelectPromptOptions(
+            field_information=action.intention if action.intention else action.reasoning,
+        ),  # FIXME: need a better options data
+        page=page,
+        scraped_page=scraped_page,
+        step=step,
+        task=task,
+    )
 
 
 async def handle_click_to_download_file_action(
