@@ -1378,15 +1378,6 @@ async function buildElementObject(
       isSelect2MultiChoice(element),
   };
 
-  // if element is an "a" tag and has a target="_blank" attribute, remove the target attribute but keep it in the elementObj
-  // We're doing this so that skyvern can do all the navigation in a single page/tab and not open new tab
-  if (elementTagNameLower === "a") {
-    if (element.getAttribute("target") === "_blank") {
-      elementObj.target = "_blank";
-      element.removeAttribute("target");
-    }
-  }
-
   let isInShadowRoot = element.getRootNode() instanceof ShadowRoot;
   if (isInShadowRoot) {
     let shadowHostEle = element.getRootNode().host;

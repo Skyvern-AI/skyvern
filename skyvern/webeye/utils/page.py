@@ -287,3 +287,7 @@ class SkyvernFrame:
     async def click_element_in_javascript(self, element: ElementHandle) -> None:
         js_script = "(element) => element.click()"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
+
+    async def remove_target_attr(self, element: ElementHandle) -> None:
+        js_script = "(element) => element.removeAttribute('target')"
+        return await self.evaluate(frame=self.frame, expression=js_script, arg=element)

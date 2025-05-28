@@ -869,9 +869,6 @@ def trim_element(element: dict) -> dict:
         if "afterPseudoText" in queue_ele and not queue_ele.get("afterPseudoText"):
             del queue_ele["afterPseudoText"]
 
-        if "target" in queue_ele:
-            del queue_ele["target"]
-
     return element
 
 
