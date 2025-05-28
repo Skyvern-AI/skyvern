@@ -18,7 +18,7 @@ Skyvern Browser Sessions is currently is only available via [API & SDK](/api-ref
 from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-browser_session = await skyvern.browser_sessions.create_browser_session(
+browser_session = await skyvern.create_browser_session(
 	timeout=60,
 )
 ```
@@ -33,7 +33,7 @@ browser_session = await skyvern.browser_sessions.create_browser_session(
 from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-browser_session = await skyvern.browser_sessions.get_browser_session(
+browser_session = await skyvern.get_browser_session(
 	browser_session_id="YOUR_BROWSER_SESSION_ID",
 )
 ```
@@ -45,7 +45,7 @@ browser_session = await skyvern.browser_sessions.get_browser_session(
 from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-await skyvern.browser_sessions.close_browser_session(
+await skyvern.close_browser_session(
 	browser_session_id="YOUR_BROWSER_SESSION_ID",
 )
 ```
