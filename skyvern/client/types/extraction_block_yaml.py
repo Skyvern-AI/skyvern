@@ -2,7 +2,6 @@
 
 from ..core.pydantic_utilities import UniversalBaseModel
 import typing
-from .run_engine import RunEngine
 from .extraction_block_yaml_data_schema import ExtractionBlockYamlDataSchema
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
@@ -14,7 +13,6 @@ class ExtractionBlockYaml(UniversalBaseModel):
     data_extraction_goal: str
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
-    engine: typing.Optional[RunEngine] = None
     data_schema: typing.Optional[ExtractionBlockYamlDataSchema] = None
     max_retries: typing.Optional[int] = None
     max_steps_per_run: typing.Optional[int] = None

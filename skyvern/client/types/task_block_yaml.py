@@ -2,7 +2,6 @@
 
 from ..core.pydantic_utilities import UniversalBaseModel
 import typing
-from .run_engine import RunEngine
 from .task_block_yaml_data_schema import TaskBlockYamlDataSchema
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
@@ -13,7 +12,6 @@ class TaskBlockYaml(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
-    engine: typing.Optional[RunEngine] = None
     navigation_goal: typing.Optional[str] = None
     data_extraction_goal: typing.Optional[str] = None
     data_schema: typing.Optional[TaskBlockYamlDataSchema] = None
