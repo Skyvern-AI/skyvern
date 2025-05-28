@@ -3,6 +3,7 @@
 from __future__ import annotations
 from ..core.pydantic_utilities import UniversalBaseModel
 import typing
+from .run_engine import RunEngine
 from .task_block_yaml_data_schema import TaskBlockYamlDataSchema
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
@@ -10,7 +11,6 @@ from .file_storage_type import FileStorageType
 import typing_extensions
 from ..core.serialization import FieldMetadata
 from .file_type import FileType
-from .run_engine import RunEngine
 from .extraction_block_yaml_data_schema import ExtractionBlockYamlDataSchema
 from ..core.pydantic_utilities import update_forward_refs
 
@@ -21,6 +21,7 @@ class ForLoopBlockYamlLoopBlocksItem_Task(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     navigation_goal: typing.Optional[str] = None
     data_extraction_goal: typing.Optional[str] = None
     data_schema: typing.Optional[TaskBlockYamlDataSchema] = None
@@ -225,6 +226,7 @@ class ForLoopBlockYamlLoopBlocksItem_Action(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     navigation_goal: typing.Optional[str] = None
     error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     max_retries: typing.Optional[int] = None
@@ -284,6 +286,7 @@ class ForLoopBlockYamlLoopBlocksItem_Extraction(UniversalBaseModel):
     data_extraction_goal: str
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     data_schema: typing.Optional[ExtractionBlockYamlDataSchema] = None
     max_retries: typing.Optional[int] = None
     max_steps_per_run: typing.Optional[int] = None
@@ -306,6 +309,7 @@ class ForLoopBlockYamlLoopBlocksItem_Login(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     navigation_goal: typing.Optional[str] = None
     error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     max_retries: typing.Optional[int] = None
@@ -351,6 +355,7 @@ class ForLoopBlockYamlLoopBlocksItem_FileDownload(UniversalBaseModel):
     navigation_goal: str
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
     error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     max_retries: typing.Optional[int] = None
     max_steps_per_run: typing.Optional[int] = None
