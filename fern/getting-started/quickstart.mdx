@@ -32,7 +32,7 @@ skyvern = Skyvern(api_key="YOUR API KEY")
 # OR pass the base_url to use any Skyvern service
 # skyvern = Skyvern(base_url="http://localhost:8000", api_key="YOUR API KEY")
 
-task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
+task = await skyvern.run_task(prompt="Find the top post on hackernews today")
 print(task)
 ```
 More API & SDK information can be found in the [API Reference](/api-reference) section.

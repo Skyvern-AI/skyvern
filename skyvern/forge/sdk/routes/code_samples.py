@@ -2,28 +2,28 @@
 RUN_TASK_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-await skyvern.agent.run_task(prompt="What's the top post on hackernews?")
+await skyvern.run_task(prompt="What's the top post on hackernews?")
 """
 RUN_WORKFLOW_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-await skyvern.agent.run_workflow(workflow_id="wpid_123", parameters={"parameter1": "value1", "parameter2": "value2"})
+await skyvern.run_workflow(workflow_id="wpid_123", parameters={"parameter1": "value1", "parameter2": "value2"})
 """
 GET_RUN_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-run = await skyvern.agent.get_run(run_id="tsk_v2_123")
+run = await skyvern.get_run(run_id="tsk_v2_123")
 print(run)
 """
 CANCEL_RUN_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-await skyvern.agent.cancel_run(run_id="tsk_v2_123")
+await skyvern.cancel_run(run_id="tsk_v2_123")
 """
 RETRY_RUN_WEBHOOK_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-await skyvern.agent.retry_run_webhook(run_id="tsk_v2_123")
+await skyvern.retry_run_webhook(run_id="tsk_v2_123")
 """
 
 # Workflows

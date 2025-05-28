@@ -92,7 +92,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.agent.run_task(prompt=\"What's the top post on hackernews?\")\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.run_task(prompt=\"What's the top post on hackernews?\")\n"
               }
             ]
           }
@@ -211,7 +211,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.agent.run_workflow(workflow_id=\"wpid_123\", parameters={\"parameter1\": \"value1\", \"parameter2\": \"value2\"})\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.run_workflow(workflow_id=\"wpid_123\", parameters={\"parameter1\": \"value1\", \"parameter2\": \"value2\"})\n"
               }
             ]
           }
@@ -313,7 +313,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nrun = await skyvern.agent.get_run(run_id=\"tsk_v2_123\")\nprint(run)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nrun = await skyvern.get_run(run_id=\"tsk_v2_123\")\nprint(run)\n"
               }
             ]
           }
@@ -389,7 +389,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.agent.cancel_run(run_id=\"tsk_v2_123\")\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.cancel_run(run_id=\"tsk_v2_123\")\n"
               }
             ]
           }
@@ -896,7 +896,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.agent.retry_run_webhook(run_id=\"tsk_v2_123\")\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.retry_run_webhook(run_id=\"tsk_v2_123\")\n"
               }
             ]
           }

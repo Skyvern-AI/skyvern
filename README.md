@@ -75,13 +75,13 @@ skyvern quickstart
   from skyvern import Skyvern
   
   skyvern = Skyvern(api_key="SKYVERN API KEY")
-  task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
+  task = await skyvern.run_task(prompt="Find the top post on hackernews today")
   print(task)
   ```
   Or any hosted Skyvern service:
   ```python
   skyvern = Skyvern(base_url="http://localhost:8000", api_key="SKYVERN API KEY")
-  task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
+  task = await skyvern.run_task(prompt="Find the top post on hackernews today")
   print(task)
   ```
 
