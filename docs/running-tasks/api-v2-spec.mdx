@@ -1,0 +1,133 @@
+---
+title: Tasks API V2
+description: 'Powered by the latest version of Skyvern agent, with better reasoning and validation. State of the art web navigation with 85.8% on WebVoyager Eval.'
+---
+
+## Request - Initiate a task 
+Request type: `POST`
+
+Production:`https://api.skyvern.com/api/v2/tasks/`
+
+### Header 
+
+| Parameter | Type | Required? | Sample Value | Description |
+| --- | --- | --- | --- | --- |
+| x-api-key | String | yes | [your-api-key-here] | Bearer token that gives your backend access to the Skyvern API. This will be manually provided by us |
+| x-max-iterations-override | Integer | no | 10 | The max number of iterations skyvern attempts to divide and conquer a complicated task. In each iteration, Skyvern does a "mini task" planning, mini task execution and validation. The default is 10. |
+| x-max-steps-override | Integer | no | 25 | The max number of steps skyvern can take. The default is 25. |
+
+### Body
+
+| Parameter | Type | Required? | Sample Value | Description |
+| --- | --- | --- | --- | --- |
+| user_prompt | String | yes | Find a route between Chicago to Los Angeles on google maps, then print the route details. |
+| url | HttpUrl | no | https://www.google.com/maps/ | If you want to use a specific url, you can pass it here. It's optional since you can also tell skyvern which site to go to in the user_prompt. |
+| webhook_callback_url | HttpUrl | no | https://mywebsite.com/webhook | The callback URL once our system is finished processing this async task |
+| proxy_location | String | no | RESIDENTIAL | Proxy location for the web-browsing request. Please pass RESIDENTIAL as a value |
+| totp_verification_url | HttpUrl | no | https://mywebsite.com/two_factor_code | The url of your TOTP endpoint. If this field is provided, Skyvern will call the url to fetch the TOTP/2FA/MFA code when needed |
+| totp_identifier | String | no | myemail@example.com / 4155558888 | The email address or the phone number which receives the TOTP/2FA/MFA code. If this field is provided, Skyvern will fetch the code that is pushed to [Skyvern's TOTP API](https://docs.skyvern.com/running-tasks/advanced-features#push-code-to-skyvern) |
+| extracted_information_schema | JSON object, list, string | no | {"type": "object", "properties": {"title": {"type": "string", "descripption": "The title of the post"}, "url": {"type": "string", "description": "The url link to the post"}}} | Use jsonschema to define the schema of the output. You can also describe the schema but it won't be as reliable as defining it in the jsonschema format |
+
+## Example Request (Apply for a job)
+
+```python
+POST https://api.skyvern.com/api/v2/tasks/ 
+
+{
+    "user_prompt": "Find a route between Chicago to Los Angeles on google maps, then print the route details.",
+    "proxy_location": "RESIDENTIAL"
+}
+```
+
+## Response
+Each task has an associated `task_id` -- a unique identifier you can use to look up information about any task.
+
+| Parameter | Type | Always returned? | Sample Value | Description |
+| --- | --- | --- | --- | --- |
+| task_id | String | yes | t_123456 | The task id associated with this specific task |
+| status | String | yes | created | The status of the task |
+| prompt | String | yes | Find a route between Chicago to Los Angeles on google maps, then print the route details. |
+| url | HttpUrl | yes | https://www.google.com/maps/ | The url that skyvern starts browsing with |
+| organization_id | String | yes | o_123456 | The organization id associated with this task |
+| workflow_id | String | yes | wf_123456 | The workflow id created by this task |
+| workflow_run_id | String | yes | wr_123456 | The ID of the workflow run |
+| workflow_permanent_id | String | yes | wpid_123456 | The workflow permanent id |
+| summary | String | no | The user has successfully found routes between Chicago and Los Angeles on Google Maps. The extracted details include travel modes, travel times, distances, route descriptions, and additional information for each route. | The summary of what skyvern did. |
+| output | Object | no | `{ "routes": [{"travel_mode": "Driving", "travel_time": "30 hr", "distance": "2,015 miles", "route_description": "via I-80 W", "additional_info": ["28 hr without traffic", "This route has tolls", "Your destination is in a different time zone"]}] }` | The output of the task. This is the structured data that skyvern extracted from the website. |
+| webhook_callback_url | HttpUrl | no | https://mywebsite.com/webhook | The url of your webhook endpoint if sent to execute the task. |
+| totp_verification_url | HttpUrl | no | https://mywebsite.com/two_factor_code | The url of your TOTP endpoint if sent to execute the task. |
+| totp_identifier | String | no | myemail@example.com / 4155558888 | The totp_identifier sent to execute the task.|
+| proxy_location | String | no | RESIDENTIAL | The proxy location used to execute the task. |
+| created_at | Timestamp | yes | 2022-11-22T22:55:55 | The timestamp when the task was created. |
+| modified_at | Timestamp | yes | 2022-11-22T22:55:55 | The timestamp when the task was last updated. |
+
+
+## Response Webhook - Task conclusion (POST)
+If a `webhook_callback_url` is specified within your task request, Skyvern will make a callback to your system letting you know that it has either finished, terminated or failed a task execution. 
+
+The following headers can be used to validate it's an authentic Skyvern request. 
+
+### Headers
+
+| Parameter | Type | Required? | Sample Value | Description |
+| --- | --- | --- | --- | --- |
+| x-skyvern-signature | String | yes | v0=a2114d57b48eac39b9ad189<br/>dd8316235a7b4a8d21a10bd275<br/>19666489c69b503 | Authentication token that allows our service to communicate with your backend service via callback / webhook <br/>We’ll be using the same strategy slack uses, as defined here: https://api.slack.com/authentication/verifying-requests-from-slack#making__validating-a-request |
+| x-skyvern-timestamp | String | yes | 1531420618 | Timestamp used to decode and validate the incoming webhook call<br/><br/>We’ll be using the same strategy slack uses, as defined here: https://api.slack.com/authentication/verifying-requests-from-slack#making__validating-a-request |
+
+### Body
+These parameters are sent in the body of the request to `webhook_callback_url`. 
+
+Here's an example of the webhook body:
+```
+{
+    "task_id": "oc_347318612592634222",
+    "status": "completed",
+    "organization_id": "o_123456",
+    "workflow_run_id": "wr_123456",
+    "workflow_id": "w_123456",
+    "workflow_permanent_id": "wpid_123456",
+    "prompt": "Find a route between Chicago to Los Angeles on google maps, then print the route details.",
+    "url": "https://www.google.com/maps/",
+    "summary": "The user has successfully found routes between Chicago and Los Angeles on Google Maps. The extracted details include travel modes, travel times, distances, route descriptions, and additional information for each route.",
+    "output": {
+      "routes": [
+        {
+          "travel_mode": "Driving",
+          "travel_time": "30 hr",
+          "distance": "2,015 miles",
+          "route_description": "via I-80 W",
+          "additional_info": [
+            "28 hr without traffic",
+            "This route has tolls.",
+            "Your destination is in a different time zone."
+          ]
+        },
+        {
+          "travel_mode": "Driving",
+          "travel_time": "30 hr",
+          "distance": "2,028 miles",
+          "route_description": "via I-80 W and I-70 W",
+          "additional_info": [
+            "28 hr without traffic"
+          ]
+        },
+        {
+          "travel_mode": "Flights",
+          "travel_time": "4 hr 30 min",
+          "distance": null,
+          "route_description": "Chicago, IL—Los Angeles, CA",
+          "additional_info": [
+            "from $150"
+          ]
+        }
+      ],
+      "extraction_datetime": "2025-01-10T22:56:20.297774Z"
+    },
+    "totp_verification_url": null,
+    "totp_identifier": null,
+    "proxy_location": null,
+    "webhook_callback_url": null,
+    "created_at": "2025-01-10T22:53:36.297774Z",
+    "modified_at": "2025-01-10T22:56:29.582779Z"
+}
+```
