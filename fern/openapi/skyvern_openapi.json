@@ -92,7 +92,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.agent.run_task(prompt=\"What's the top post on hackernews?\")\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.run_task(prompt=\"What's the top post on hackernews?\")\n"
               }
             ]
           }
@@ -102,7 +102,7 @@
     "/v1/run/workflows": {
       "post": {
         "tags": [
-          "Agent"
+          "Workflows"
         ],
         "summary": "Run a workflow",
         "description": "Run a workflow",
@@ -204,14 +204,14 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "run_workflow",
         "x-fern-examples": [
           {
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.agent.run_workflow(workflow_id=\"wpid_123\", parameters={\"parameter1\": \"value1\", \"parameter2\": \"value2\"})\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.run_workflow(workflow_id=\"wpid_123\", parameters={\"parameter1\": \"value1\", \"parameter2\": \"value2\"})\n"
               }
             ]
           }
@@ -221,9 +221,10 @@
     "/v1/runs/{run_id}": {
       "get": {
         "tags": [
-          "Agent"
+          "Agent",
+          "Workflows"
         ],
-        "summary": "Get a task or a workflow run by id",
+        "summary": "Get a run by id",
         "description": "Get run information (task run, workflow run)",
         "operationId": "get_run_v1_runs__run_id__get",
         "parameters": [
@@ -312,7 +313,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nrun = await skyvern.agent.get_run(run_id=\"tsk_v2_123\")\nprint(run)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nrun = await skyvern.get_run(run_id=\"tsk_v2_123\")\nprint(run)\n"
               }
             ]
           }
@@ -322,9 +323,10 @@
     "/v1/runs/{run_id}/cancel": {
       "post": {
         "tags": [
-          "Agent"
+          "Agent",
+          "Workflows"
         ],
-        "summary": "Cancel a task or workflow run",
+        "summary": "Cancel a run by id",
         "description": "Cancel a run (task or workflow)",
         "operationId": "cancel_run_v1_runs__run_id__cancel_post",
         "parameters": [
@@ -387,7 +389,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.agent.cancel_run(run_id=\"tsk_v2_123\")\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.cancel_run(run_id=\"tsk_v2_123\")\n"
               }
             ]
           }
@@ -399,8 +401,8 @@
         "tags": [
           "Workflows"
         ],
-        "summary": "Create a new workflow definition",
-        "description": "Create a new workflow definition",
+        "summary": "Create a new workflow",
+        "description": "Create a new workflow",
         "operationId": "create_workflow_v1_workflows_post",
         "parameters": [
           {
@@ -598,8 +600,8 @@
         "tags": [
           "Workflows"
         ],
-        "summary": "Update a workflow definition",
-        "description": "Update a workflow definition",
+        "summary": "Update a workflow",
+        "description": "Update a workflow",
         "operationId": "update_workflow_v1_workflows__workflow_id__post",
         "parameters": [
           {
@@ -894,7 +896,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.agent.retry_run_webhook(run_id=\"tsk_v2_123\")\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.retry_run_webhook(run_id=\"tsk_v2_123\")\n"
               }
             ]
           }
@@ -2001,6 +2003,10 @@
             "type": "string",
             "title": "Title",
             "default": ""
+          },
+          "engine": {
+            "$ref": "#/components/schemas/RunEngine",
+            "default": "skyvern-1.0"
           },
           "navigation_goal": {
             "anyOf": [
@@ -3714,6 +3720,10 @@
             "title": "Title",
             "default": ""
           },
+          "engine": {
+            "$ref": "#/components/schemas/RunEngine",
+            "default": "skyvern-1.0"
+          },
           "data_schema": {
             "anyOf": [
               {
@@ -4055,6 +4065,10 @@
             "type": "string",
             "title": "Title",
             "default": ""
+          },
+          "engine": {
+            "$ref": "#/components/schemas/RunEngine",
+            "default": "skyvern-1.0"
           },
           "error_code_mapping": {
             "anyOf": [
@@ -5022,6 +5036,10 @@
             "type": "string",
             "title": "Title",
             "default": ""
+          },
+          "engine": {
+            "$ref": "#/components/schemas/RunEngine",
+            "default": "skyvern-1.0"
           },
           "navigation_goal": {
             "anyOf": [
@@ -6580,6 +6598,10 @@
             "type": "string",
             "title": "Title",
             "default": ""
+          },
+          "engine": {
+            "$ref": "#/components/schemas/RunEngine",
+            "default": "skyvern-1.0"
           },
           "navigation_goal": {
             "anyOf": [

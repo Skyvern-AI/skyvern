@@ -5,7 +5,7 @@ from llama_index.core.tools.tool_spec.base import SPEC_FUNCTION_TYPE, BaseToolSp
 from skyvern_llamaindex.settings import settings
 
 from skyvern import Skyvern
-from skyvern.client.agent.types.agent_get_run_response import AgentGetRunResponse
+from skyvern.client.types.get_run_response import GetRunResponse
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.schemas.runs import RunEngine
 
@@ -81,7 +81,7 @@ class SkyvernTaskToolSpec(BaseToolSpec):
             wait_for_completion=False,
         )
 
-    async def get_task(self, task_id: str) -> AgentGetRunResponse | None:
+    async def get_task(self, task_id: str) -> GetRunResponse | None:
         """
         Use Skyvern agent to get a task.
 

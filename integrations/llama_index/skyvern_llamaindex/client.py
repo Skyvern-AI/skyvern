@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from skyvern_llamaindex.settings import settings
 
 from skyvern import Skyvern
-from skyvern.client.agent.types.agent_get_run_response import AgentGetRunResponse
+from skyvern.client.types.get_run_response import GetRunResponse
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.schemas.runs import RunEngine
 
@@ -93,7 +93,7 @@ class SkyvernTaskToolSpec(BaseToolSpec):
             wait_for_completion=False,
         )
 
-    async def get_task(self, task_id: str) -> AgentGetRunResponse | None:
+    async def get_task(self, task_id: str) -> GetRunResponse | None:
         """
         Use Skyvern client to get a task.
 

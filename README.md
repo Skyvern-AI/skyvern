@@ -65,7 +65,7 @@ skyvern quickstart
   from skyvern import Skyvern
 
   skyvern = Skyvern()
-  task = await skyvern.local.run_task(prompt="Find the top post on hackernews today")
+  task = await skyvern.run_task(prompt="Find the top post on hackernews today")
   print(task)
   ```
   A local browser will pop up. Skyvern will start executing the task in the browser and close the it when the task is done. You will be able to review the task from http://localhost:8080/history
@@ -75,13 +75,13 @@ skyvern quickstart
   from skyvern import Skyvern
   
   skyvern = Skyvern(api_key="SKYVERN API KEY")
-  task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
+  task = await skyvern.run_task(prompt="Find the top post on hackernews today")
   print(task)
   ```
   Or any hosted Skyvern service:
   ```python
   skyvern = Skyvern(base_url="http://localhost:8000", api_key="SKYVERN API KEY")
-  task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
+  task = await skyvern.run_task(prompt="Find the top post on hackernews today")
   print(task)
   ```
 
