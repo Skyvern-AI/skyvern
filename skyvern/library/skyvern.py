@@ -303,7 +303,7 @@ class Skyvern(AsyncSkyvern):
         data_extraction_schema: dict[str, Any] | str | None = None,
         proxy_location: ProxyLocation | None = None,
         max_steps: int | None = None,
-        wait_for_completion: bool = True,
+        wait_for_completion: bool = False,
         timeout: float = DEFAULT_AGENT_TIMEOUT,
         browser_session_id: str | None = None,
         user_agent: str | None = None,
