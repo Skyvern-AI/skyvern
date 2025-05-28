@@ -116,10 +116,10 @@ class LocalStorage(BaseStorage):
     async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
         return
 
-    async def get_streaming_file(self, organization_id: str, file_name: str, use_default: bool = True) -> bytes | None:
-        file_path = Path(f"{get_skyvern_temp_dir()}/skyvern_screenshot.png")
-        if not use_default:
-            file_path = Path(f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}")
+    async def get_streaming_file(self, organization_id: str, file_name: str) -> bytes | None:
+        # make the directory if it doesn't exist
+        Path(f"{get_skyvern_temp_dir()}/{organization_id}").mkdir(parents=True, exist_ok=True)
+        file_path = Path(f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}")
         try:
             with open(file_path, "rb") as f:
                 return f.read()
