@@ -8,9 +8,9 @@ import httpx
 from dotenv import load_dotenv
 
 from skyvern.client import AsyncSkyvern
-from skyvern.client.agent.types.agent_get_run_response import AgentGetRunResponse
 from skyvern.client.core.pydantic_utilities import parse_obj_as
 from skyvern.client.environment import SkyvernEnvironment
+from skyvern.client.types.get_run_response import GetRunResponse
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.config import settings
 from skyvern.forge import app
@@ -272,7 +272,7 @@ class Skyvern(AsyncSkyvern):
                 await asyncio.sleep(1)
 
     ############### officially supported interfaces ###############
-    async def get_run(self, run_id: str) -> AgentGetRunResponse | None:
+    async def get_run(self, run_id: str) -> GetRunResponse | None:
         if not self._api_key:
             organization = await self.get_organization()
             get_run_internal_resp = await run_service.get_run_response(
@@ -281,9 +281,9 @@ class Skyvern(AsyncSkyvern):
             if not get_run_internal_resp:
                 return None
             return typing.cast(
-                AgentGetRunResponse,
+                GetRunResponse,
                 parse_obj_as(
-                    type_=AgentGetRunResponse,  # type: ignore
+                    type_=GetRunResponse,  # type: ignore
                     object_=get_run_internal_resp.model_dump(),
                 ),
             )
@@ -407,5 +407,5 @@ class Skyvern(AsyncSkyvern):
         return TaskRunResponse.model_validate(task_run.dict())
 
 
-def from_run_to_task_run_response(run_obj: AgentGetRunResponse) -> TaskRunResponse:
+def from_run_to_task_run_response(run_obj: GetRunResponse) -> TaskRunResponse:
     return TaskRunResponse.model_validate(run_obj.model_dump())
