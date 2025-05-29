@@ -485,43 +485,47 @@ async def _create_cdp_connection_browser(
     browser_path = settings.CHROME_EXECUTABLE_PATH
 
     if browser_type == "cdp-connect" and browser_path:
-        # First check if Chrome is already running
-        if _is_chrome_running():
-            raise Exception(
-                "Chrome is already running. Please close all Chrome instances before starting with remote debugging."
-            )
-
-        # Then check if the debugging port is already in use
-        if _is_port_in_use(9222):
-            raise Exception("Port 9222 is already in use. Another process may be using this port.")
-
-        # check if ./tmp/user_data_dir exists and if it's a valid Chromium user data directory
-        try:
-            if os.path.exists("./tmp/user_data_dir") and not is_valid_chromium_user_data_dir("./tmp/user_data_dir"):
+        # First check if the debugging port is running and can be used
+        if not _is_port_in_use(9222):
+            LOG.info("Port 9222 is not in use, starting Chrome")
+            # Check if Chrome is already running
+            if _is_chrome_running():
+                raise Exception(
+                    "Chrome is already running. Please close all Chrome instances before starting with remote debugging."
+                )
+            # check if ./tmp/user_data_dir exists and if it's a valid Chromium user data directory
+            try:
+                if os.path.exists("./tmp/user_data_dir") and not is_valid_chromium_user_data_dir("./tmp/user_data_dir"):
+                    LOG.info("Removing invalid user data directory")
+                    shutil.rmtree("./tmp/user_data_dir")
+                    shutil.copytree(default_user_data_dir(), "./tmp/user_data_dir")
+                elif not os.path.exists("./tmp/user_data_dir"):
+                    LOG.info("Copying default user data directory")
+                    shutil.copytree(default_user_data_dir(), "./tmp/user_data_dir")
+                else:
+                    LOG.info("User data directory is valid")
+            except FileExistsError:
+                # If directory exists, remove it first then copy
                 shutil.rmtree("./tmp/user_data_dir")
                 shutil.copytree(default_user_data_dir(), "./tmp/user_data_dir")
-            elif not os.path.exists("./tmp/user_data_dir"):
-                shutil.copytree(default_user_data_dir(), "./tmp/user_data_dir")
-        except FileExistsError:
-            # If directory exists, remove it first then copy
-            shutil.rmtree("./tmp/user_data_dir")
-            shutil.copytree(default_user_data_dir(), "./tmp/user_data_dir")
-        browser_process = subprocess.Popen(
-            [
-                browser_path,
-                "--remote-debugging-port=9222",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--remote-debugging-address=0.0.0.0",
-                "--user-data-dir=./tmp/user_data_dir",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        # Add small delay to allow browser to start
-        time.sleep(2)
-        if browser_process.poll() is not None:
-            raise Exception(f"Failed to open browser. browser_path: {browser_path}")
+            browser_process = subprocess.Popen(
+                [
+                    browser_path,
+                    "--remote-debugging-port=9222",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--remote-debugging-address=0.0.0.0",
+                    "--user-data-dir=./tmp/user_data_dir",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            # Add small delay to allow browser to start
+            time.sleep(1)
+            if browser_process.poll() is not None:
+                raise Exception(f"Failed to open browser. browser_path: {browser_path}")
+        else:
+            LOG.info("Port 9222 is in use, using existing browser")
 
     browser_args = BrowserContextFactory.build_browser_args()
 
