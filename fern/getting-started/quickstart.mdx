@@ -52,8 +52,8 @@ You can also run browser tasks locally with Python code, with a little bit of se
         skyvern = Skyvern()
         
         task = await skyvern.run_task(
-					  prompt="Find the top post on hackernews today",
-				)
+            prompt="Find the top post on hackernews today",
+        )
         print(task.model_dump())
         ```
         A local browser will pop up. Skyvern will start executing the task in the browser and close the browser when the task is done.
