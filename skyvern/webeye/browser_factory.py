@@ -460,6 +460,24 @@ def default_user_data_dir() -> pathlib.Path:
     return pathlib.Path("~/.config/google-chrome").expanduser()
 
 
+def is_valid_chromium_user_data_dir(directory: str) -> bool:
+    """Check if a directory is a valid Chromium user data directory.
+
+    A valid Chromium user data directory should:
+    1. Exist
+    2. Not be empty
+    3. Contain a 'Default' directory
+    4. Have a 'Preferences' file in the 'Default' directory
+    """
+    if not os.path.exists(directory):
+        return False
+
+    default_dir = os.path.join(directory, "Default")
+    preferences_file = os.path.join(default_dir, "Preferences")
+
+    return os.path.isdir(directory) and os.path.isdir(default_dir) and os.path.isfile(preferences_file)
+
+
 async def _create_cdp_connection_browser(
     playwright: Playwright, proxy_location: ProxyLocation | None = None, **kwargs: dict
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
@@ -477,13 +495,13 @@ async def _create_cdp_connection_browser(
         if _is_port_in_use(9222):
             raise Exception("Port 9222 is already in use. Another process may be using this port.")
 
-        # check if ./tmp/user_data_dir exists and if the size is 0
-        if os.path.exists("./tmp/user_data_dir") and os.path.getsize("./tmp/user_data_dir") == 0:
-            shutil.rmtree("./tmp/user_data_dir")
-            shutil.copytree(default_user_data_dir(), "./tmp/user_data_dir")
-
+        # check if ./tmp/user_data_dir exists and if it's a valid Chromium user data directory
         try:
-            shutil.copytree(default_user_data_dir(), "./tmp/user_data_dir")
+            if os.path.exists("./tmp/user_data_dir") and not is_valid_chromium_user_data_dir("./tmp/user_data_dir"):
+                shutil.rmtree("./tmp/user_data_dir")
+                shutil.copytree(default_user_data_dir(), "./tmp/user_data_dir")
+            elif not os.path.exists("./tmp/user_data_dir"):
+                shutil.copytree(default_user_data_dir(), "./tmp/user_data_dir")
         except FileExistsError:
             # If directory exists, remove it first then copy
             shutil.rmtree("./tmp/user_data_dir")
