@@ -87,6 +87,8 @@ print(task)
 
 Check out more features to use for Skyvern task in our [official doc](https://docs.skyvern.com/running-tasks/run-tasks). Here are a couple of interesting examples:
 #### Let Skyvern control your own browser
+> ⚠️ WARNING: since Chrome 136, chrome refuses any CDP connect to the browser when user the default user_data_dir. In order to reuse your chrome browser data, Skyvern will copy the default user_data_dir to `./tmp/user_data_dir` the first time connecting to your local browser. ⚠️
+
 Firstly, add two variables to your .env file:
 ```
 # This is the path to your local chromium-compatible browser. We're using Google Chrome in Mac as an example

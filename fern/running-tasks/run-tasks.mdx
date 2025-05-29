@@ -1,9 +1,8 @@
 ---
-title: Task Features
+title: Run Tasks
 slug: running-tasks/run-tasks
 ---
 
-## Run A Task
 - [Quickstart](/getting-started/quickstart) to run a task.
 - [Run Task API](/api-reference/api-reference/agent/run-task)
 
@@ -12,6 +11,8 @@ Every feature in this page is enabled through API & SDK. Some features are enabl
 <Frame caption="Run Task UI">
 <img src="../images/run_tasks/ui_run_task.png" alt="Configure advanced settings in the UI" width="400" />
 </Frame>
+
+## Parameters
 
 ### [Engine](/api-reference/api-reference/agent/run-task#request.body.engine)
 
@@ -76,3 +77,42 @@ Parameter: `browser_session_id`
 You can set a browser session for a task. Having a browser session persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
 
 See the [Browser Sessions](/browser-sessions/introduction) section to see how to create a browser session.
+
+## Let Skyvern Control Your Own Browser (Chrome) 
+<Warning>Since [Chrome 136](https://developer.chrome.com/blog/remote-debugging-port), Chrome refuses any CDP connect to the browser using the default user_data_dir. In order to use your browser data, Skyvern copies your default user_data_dir to `./tmp/user_data_dir` the first time connecting to your local browser.</Warning>
+
+**Control Your Browser With Just Python Code**
+```python
+from skyvern import Skyvern
+
+# The path to your Chrome browser. This example path is for Mac.
+browser_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+skyvern = Skyvern(
+	base_url="http://localhost:8000",
+	api_key="YOUR_API_KEY",
+	browser_path=browser_path,
+)
+task = await skyvern.run_task(
+	prompt="Find the top post on hackernews today",
+)
+```
+
+**Control Your Browser With Skyvern Service** 
+```bash
+# The path to your Chrome browser. This example path is for Mac.
+CHROME_EXECUTABLE_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+BROWSER_TYPE=cdp-connect
+```
+
+Then you can restart your Skyvern service `skyvern run server` and run the task through UI or code:
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern(
+	base_url="http://localhost:8000",
+	api_key="YOUR_API_KEY",
+)
+task = await skyvern.run_task(
+	prompt="Find the top post on hackernews today",
+)
+```
