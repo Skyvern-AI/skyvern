@@ -21,6 +21,8 @@ services:
   skyvern:
     image: public.ecr.aws/skyvern/skyvern:latest
     restart: on-failure
+    env_file:
+      - .env
     # comment out if you want to externally call skyvern API
     ports:
       - 8000:8000
@@ -45,7 +47,7 @@ services:
       # - BROWSER_REMOTE_DEBUGGING_URL=http://host.docker.internal:9222/
 
       # =========================
-      #       LLM Settings
+      #       LLM Settings - Recommended to use skyvern CLI, `skyvern init llm` to setup your LLM's
       # =========================
       # OpenAI Support:
       # If you want to use OpenAI as your LLM provider, uncomment the following lines and fill in your OpenAI API key.
@@ -54,10 +56,10 @@ services:
       # - OPENAI_API_KEY=<your_openai_key>
       #  Gemini Support:
       # Gemini is a new LLM provider that is currently in beta. You can use it by uncommenting the following lines and filling in your Gemini API key.
-      - LLM_KEY=GEMINI
-      - ENABLE_GEMINI=true
-      - GEMINI_API_KEY=YOUR_GEMINI_KEY
-      - LLM_KEY=GEMINI_2.5_PRO_PREVIEW_03_25
+      # - LLM_KEY=GEMINI
+      # - ENABLE_GEMINI=true
+      # - GEMINI_API_KEY=YOUR_GEMINI_KEY
+      # - LLM_KEY=GEMINI_2.5_PRO_PREVIEW_03_25
       # If you want to use other LLM provider, like azure and anthropic:
       # - ENABLE_ANTHROPIC=true
       # - LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET

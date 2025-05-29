@@ -1,4 +1,5 @@
-FROM python:3.11 AS requirements-stage
+FROM python:3.11 as requirements-stage
+# Run `skyvern init llm` before building to generate the .env file
 
 WORKDIR /tmp
 RUN pip install poetry
