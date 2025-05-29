@@ -32,7 +32,7 @@ RUN bw --version
 
 COPY . /app
 
-ENV PYTHONPATH="/app:$PYTHONPATH"
+ENV PYTHONPATH="/app"
 ENV VIDEO_PATH=/data/videos
 ENV HAR_PATH=/data/har
 ENV LOG_PATH=/data/log
