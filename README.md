@@ -370,7 +370,10 @@ We love to see how Skyvern is being used in the wild. Here are some examples of 
 </p>
 
 # Contributor Setup
-
+For a complete local environment CLI Installation
+```bash
+pip install -e .
+```
 The following command sets up your development environment to use pre-commit (our commit hook handler)
 ```
 skyvern quickstart contributors
