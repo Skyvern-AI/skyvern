@@ -82,7 +82,7 @@ See the [Browser Sessions](/browser-sessions/introduction) section to see how to
 ### Control Your Own Browser (Chrome) 
 <Warning>Since [Chrome 136](https://developer.chrome.com/blog/remote-debugging-port), Chrome refuses any CDP connect to the browser using the default user_data_dir. In order to use your browser data, Skyvern copies your default user_data_dir to `./tmp/user_data_dir` the first time connecting to your local browser.</Warning>
 
-**Control Your Browser With Just Python Code**
+**Just With Python Code**
 ```python
 from skyvern import Skyvern
 
@@ -98,14 +98,14 @@ task = await skyvern.run_task(
 )
 ```
 
-**Control Your Browser With Skyvern Service** 
+**With Skyvern Service**
 ```bash
 # The path to your Chrome browser. This example path is for Mac.
 CHROME_EXECUTABLE_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 BROWSER_TYPE=cdp-connect
 ```
 
-Then you can restart your Skyvern service `skyvern run server` and run the task through UI or code:
+Restart your Skyvern service `skyvern run server` and run the task through UI or code:
 ```python
 from skyvern import Skyvern
 
