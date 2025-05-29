@@ -28,6 +28,15 @@ RUN NODE_MAJOR=$(cut -d. -f1 < /app/.nvmrc) && \
 RUN npm -v && node -v
 # install bitwarden cli
 RUN npm install -g @bitwarden/cli@2024.9.0
+# install 1password cli
+RUN curl -sS https://downloads.1password.com/linux/keys/1password.asc | gpg --dearmor > /usr/share/keyrings/1password-archive-keyring.gpg \
+    && echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/amd64 stable main' | tee /etc/apt/sources.list.d/1password.list \
+    && mkdir -p /etc/debsig/policies/AC2D62742012EA22/ \
+    && curl -sS https://downloads.1password.com/linux/debian/debsig/1password.pol | tee /etc/debsig/policies/AC2D62742012EA22/1password.pol \
+    && mkdir -p /usr/share/debsig/keyrings/AC2D62742012EA22 \
+    && curl -sS https://downloads.1password.com/linux/keys/1password.asc | gpg --dearmor | tee /usr/share/debsig/keyrings/AC2D62742012EA22/debsig.gpg > /dev/null \
+    && apt-get update && apt-get install -y 1password-cli
+RUN op --version
 # checking bw version also initializes the bw config
 RUN bw --version
 

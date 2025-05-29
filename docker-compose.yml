@@ -113,6 +113,12 @@ services:
       # Maximum tokens to use: (only set for OpenRouter aand Ollama)
       # - LLM_CONFIG_MAX_TOKENS=128000
 
+      # 1Password Settings
+      # - ONEPASSWORD_ACCOUNT=your.1password.com
+      # - ONEPASSWORD_EMAIL=you@example.com
+      # - ONEPASSWORD_SECRET_KEY=op://key
+      # - ONEPASSWORD_MASTER_PASSWORD=your_master_password
+      
       # Bitwarden Settings
       # If you are looking to integrate Skyvern with a password manager (eg Bitwarden), you can use the following environment variables.
       # - BITWARDEN_SERVER=http://localhost  # OPTIONAL IF YOU ARE SELF HOSTING BITWARDEN
