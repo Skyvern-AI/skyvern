@@ -94,6 +94,7 @@ class LLMAPIHandler(Protocol):
         ai_suggestion: AISuggestion | None = None,
         screenshots: list[bytes] | None = None,
         parameters: dict[str, Any] | None = None,
+        llm_key_override: str | None = None,
     ) -> Awaitable[dict[str, Any]]: ...
 
 
@@ -106,5 +107,6 @@ async def dummy_llm_api_handler(
     ai_suggestion: AISuggestion | None = None,
     screenshots: list[bytes] | None = None,
     parameters: dict[str, Any] | None = None,
+    llm_key_override: str | None = None,
 ) -> dict[str, Any]:
     raise NotImplementedError("Your LLM provider is not configured. Please configure it in the .env file.")
