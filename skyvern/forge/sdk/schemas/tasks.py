@@ -349,3 +349,7 @@ class OrderBy(StrEnum):
 class SortDirection(StrEnum):
     asc = "asc"
     desc = "desc"
+
+
+class ModelsResponse(BaseModel):
+    models: list[str]

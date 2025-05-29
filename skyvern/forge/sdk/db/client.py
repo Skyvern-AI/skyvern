@@ -1181,6 +1181,7 @@ class AgentDB:
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
+        model: dict[str, Any] | None = None,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
         is_saved_task: bool = False,
@@ -1197,6 +1198,7 @@ class AgentDB:
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
+                model=model,
                 is_saved_task=is_saved_task,
                 status=status,
             )

@@ -48,6 +48,7 @@ from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, Task
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import (
     CreateTaskResponse,
+    ModelsResponse,
     OrderBy,
     SortDirection,
     Task,
@@ -792,6 +793,24 @@ async def heartbeat() -> Response:
     Check if the server is running.
     """
     return Response(content="Server is running.", status_code=200, headers={"X-Skyvern-API-Version": __version__})
+
+
+@legacy_base_router.get(
+    "/models",
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "agent",
+    },
+)
+@legacy_base_router.get("/models/", include_in_schema=False)
+async def models() -> ModelsResponse:
+    """
+    Get a list of available models.
+    """
+    mapping = settings.get_model_name_to_llm_key()
+    models = list(mapping.keys())
+
+    return ModelsResponse(models=models)
 
 
 @legacy_base_router.post(

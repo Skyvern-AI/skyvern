@@ -61,6 +61,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
+    RESERVED_PARAMETER_KEYS,
     AWSSecretParameter,
     BitwardenCreditCardDataParameter,
     BitwardenLoginCredentialParameter,
@@ -336,6 +337,7 @@ class WorkflowService:
                     block_idx=block_idx,
                     block_type_var=block.block_type,
                     block_label=block.label,
+                    model=block.model,
                 )
                 block_result = await block.execute_safe(
                     workflow_run_id=workflow_run_id,
@@ -550,6 +552,7 @@ class WorkflowService:
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
+        model: dict[str, Any] | None = None,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
         is_saved_task: bool = False,
@@ -565,6 +568,7 @@ class WorkflowService:
             totp_verification_url=totp_verification_url,
             totp_identifier=totp_identifier,
             persist_browser_session=persist_browser_session,
+            model=model,
             workflow_permanent_id=workflow_permanent_id,
             version=version,
             is_saved_task=is_saved_task,
@@ -592,6 +596,7 @@ class WorkflowService:
         )
         if not workflow:
             raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
+
         return workflow
 
     async def get_workflows_by_permanent_ids(
@@ -1403,6 +1408,7 @@ class WorkflowService:
                     totp_verification_url=request.totp_verification_url,
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
+                    model=request.model,
                     workflow_permanent_id=workflow_permanent_id,
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
@@ -1419,6 +1425,7 @@ class WorkflowService:
                     totp_verification_url=request.totp_verification_url,
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
+                    model=request.model,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
                 )
@@ -1442,6 +1449,12 @@ class WorkflowService:
             if any(key in output_parameter_keys for key in parameter_keys):
                 raise WorkflowDefinitionHasReservedParameterKeys(
                     reserved_keys=output_parameter_keys, parameter_keys=parameter_keys
+                )
+
+            if any(key in RESERVED_PARAMETER_KEYS for key in parameter_keys):
+                raise WorkflowDefinitionHasReservedParameterKeys(
+                    reserved_keys=RESERVED_PARAMETER_KEYS,
+                    parameter_keys=parameter_keys,
                 )
 
             # Create output parameters for all blocks
@@ -1657,6 +1670,7 @@ class WorkflowService:
                 error_code_mapping=block_yaml.error_code_mapping,
                 max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
+                model=block_yaml.model,
                 complete_on_download=block_yaml.complete_on_download,
                 download_suffix=block_yaml.download_suffix,
                 continue_on_failure=block_yaml.continue_on_failure,
@@ -1724,6 +1738,7 @@ class WorkflowService:
                 json_schema=block_yaml.json_schema,
                 output_parameter=output_parameter,
                 continue_on_failure=block_yaml.continue_on_failure,
+                model=block_yaml.model,
             )
         elif block_yaml.block_type == BlockType.DOWNLOAD_TO_S3:
             return DownloadToS3Block(
@@ -1781,6 +1796,7 @@ class WorkflowService:
                 file_url=block_yaml.file_url,
                 json_schema=block_yaml.json_schema,
                 continue_on_failure=block_yaml.continue_on_failure,
+                model=block_yaml.model,
             )
         elif block_yaml.block_type == BlockType.VALIDATION:
             validation_block_parameters = (
@@ -1803,6 +1819,7 @@ class WorkflowService:
                 continue_on_failure=block_yaml.continue_on_failure,
                 # only need one step for validation block
                 max_steps_per_run=1,
+                model=block_yaml.model,
             )
 
         elif block_yaml.block_type == BlockType.ACTION:
@@ -1826,6 +1843,7 @@ class WorkflowService:
                 navigation_goal=block_yaml.navigation_goal,
                 error_code_mapping=block_yaml.error_code_mapping,
                 max_retries=block_yaml.max_retries,
+                model=block_yaml.model,
                 complete_on_download=block_yaml.complete_on_download,
                 download_suffix=block_yaml.download_suffix,
                 continue_on_failure=block_yaml.continue_on_failure,
@@ -1854,6 +1872,7 @@ class WorkflowService:
                 error_code_mapping=block_yaml.error_code_mapping,
                 max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
+                model=block_yaml.model,
                 complete_on_download=block_yaml.complete_on_download,
                 download_suffix=block_yaml.download_suffix,
                 continue_on_failure=block_yaml.continue_on_failure,
@@ -1883,6 +1902,7 @@ class WorkflowService:
                 data_schema=block_yaml.data_schema,
                 max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
+                model=block_yaml.model,
                 continue_on_failure=block_yaml.continue_on_failure,
                 cache_actions=block_yaml.cache_actions,
                 complete_verification=False,
@@ -1905,6 +1925,7 @@ class WorkflowService:
                 error_code_mapping=block_yaml.error_code_mapping,
                 max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
+                model=block_yaml.model,
                 continue_on_failure=block_yaml.continue_on_failure,
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
@@ -1942,6 +1963,7 @@ class WorkflowService:
                 error_code_mapping=block_yaml.error_code_mapping,
                 max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
+                model=block_yaml.model,
                 download_suffix=block_yaml.download_suffix,
                 continue_on_failure=block_yaml.continue_on_failure,
                 totp_verification_url=block_yaml.totp_verification_url,
@@ -1959,6 +1981,7 @@ class WorkflowService:
                 totp_identifier=block_yaml.totp_identifier,
                 max_iterations=block_yaml.max_iterations,
                 max_steps=block_yaml.max_steps,
+                model=block_yaml.model,
                 output_parameter=output_parameter,
             )
         elif block_yaml.block_type == BlockType.GOTO_URL:

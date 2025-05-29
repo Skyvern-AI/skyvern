@@ -1,3 +1,4 @@
+import asyncio
 import os
 import shutil
 import subprocess
@@ -12,6 +13,7 @@ from mcp.server.fastmcp import FastMCP
 from rich.panel import Panel
 from rich.prompt import Confirm
 
+from skyvern.cli.utils import start_services
 from skyvern.config import settings
 from skyvern.library.skyvern import Skyvern
 from skyvern.utils import detect_os
@@ -151,6 +153,12 @@ def run_ui() -> None:
     except subprocess.CalledProcessError as e:
         console.print(f"[bold red]Error running UI server: {e}[/bold red]")
         return
+
+
+@run_app.command(name="all")
+def run_all() -> None:
+    """Run the Skyvern API server and UI server in parallel."""
+    asyncio.run(start_services())
 
 
 @run_app.command(name="mcp")
