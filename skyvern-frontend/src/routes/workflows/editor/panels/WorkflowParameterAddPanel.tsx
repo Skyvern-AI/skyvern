@@ -59,6 +59,7 @@ function header(type: WorkflowEditorParameterType) {
 }
 
 function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
+  const reservedKeys = ["current_item", "current_value", "current_index"];
   const isCloud = useContext(CloudContext);
   const [key, setKey] = useState("");
   const [urlParameterKey, setUrlParameterKey] = useState("");
@@ -314,6 +315,14 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                     variant: "destructive",
                     title: "Failed to add parameter",
                     description: "Key is required",
+                  });
+                  return;
+                }
+                if (reservedKeys.includes(key)) {
+                  toast({
+                    variant: "destructive",
+                    title: "Failed to add parameter",
+                    description: `${key} is reserved, please use another key`,
                   });
                   return;
                 }
