@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import pathlib
+import platform
 import random
 import re
+import shutil
 import socket
 import subprocess
 import time
@@ -447,6 +450,16 @@ async def _create_headful_chromium(
     return browser_context, browser_artifacts, None
 
 
+def default_user_data_dir() -> pathlib.Path:
+    p = platform.system()
+    if p == "Darwin":
+        return pathlib.Path("~/Library/Application Support/Google/Chrome").expanduser()
+    if p == "Windows":
+        return pathlib.Path(os.environ["LOCALAPPDATA"]) / "Google" / "Chrome" / "User Data"
+    # Assume Linux/Unix
+    return pathlib.Path("~/.config/google-chrome").expanduser()
+
+
 async def _create_cdp_connection_browser(
     playwright: Playwright, proxy_location: ProxyLocation | None = None, **kwargs: dict
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
@@ -464,6 +477,17 @@ async def _create_cdp_connection_browser(
         if _is_port_in_use(9222):
             raise Exception("Port 9222 is already in use. Another process may be using this port.")
 
+        # check if ./tmp/user_data_dir exists and if the size is 0
+        if os.path.exists("./tmp/user_data_dir") and os.path.getsize("./tmp/user_data_dir") == 0:
+            shutil.rmtree("./tmp/user_data_dir")
+            shutil.copytree(default_user_data_dir(), "./tmp/user_data_dir")
+
+        try:
+            shutil.copytree(default_user_data_dir(), "./tmp/user_data_dir")
+        except FileExistsError:
+            # If directory exists, remove it first then copy
+            shutil.rmtree("./tmp/user_data_dir")
+            shutil.copytree(default_user_data_dir(), "./tmp/user_data_dir")
         browser_process = subprocess.Popen(
             [
                 browser_path,
@@ -471,6 +495,7 @@ async def _create_cdp_connection_browser(
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--remote-debugging-address=0.0.0.0",
+                "--user-data-dir=./tmp/user_data_dir",
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
