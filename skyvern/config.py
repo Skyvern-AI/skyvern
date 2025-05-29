@@ -311,12 +311,12 @@ def _load_settings() -> Settings:
         return Settings()
     except ValidationError:
         print("*" * 80)
-        print("Validation error in settings, check your .env files or environment variables.")
+        print("Validation error in settings, check your .env file or environment variables.")
         print("*" * 80)
         raise
     except Exception:
         print("*" * 80)
-        print("Failed to load settings, check your .env files or environment variables.")
+        print("Failed to load settings, check your .env file or environment variables.")
         print("*" * 80)
         raise
 
