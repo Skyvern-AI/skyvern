@@ -65,4 +65,5 @@ def encode_url(url: str) -> str:
     parts = list(urlsplit(url))
     # Encode the path while preserving "/" and "%"
     parts[2] = quote(parts[2], safe="/%")
+    parts[3] = quote(parts[3], safe="=&/%")
     return urlunsplit(parts)
