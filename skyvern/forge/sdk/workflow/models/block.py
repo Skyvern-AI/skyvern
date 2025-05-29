@@ -46,7 +46,7 @@ from skyvern.forge.sdk.api.files import (
     download_from_s3,
     get_path_for_workflow_download_directory,
 )
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCaller
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import TaskType
@@ -126,6 +126,7 @@ class Block(BaseModel, abc.ABC):
     block_type: BlockType
     output_parameter: OutputParameter
     continue_on_failure: bool = False
+    model: dict[str, Any] | None = None
 
     async def record_output_parameter_value(
         self,
@@ -618,6 +619,9 @@ class BaseTaskBlock(Block):
             try:
                 current_context = skyvern_context.ensure_context()
                 current_context.task_id = task.task_id
+                llm_key = workflow.determine_llm_key(block=self)
+                llm_caller = None if not llm_key else LLMCaller(llm_key=llm_key)
+
                 await app.agent.execute_step(
                     organization=organization,
                     task=task,
@@ -627,6 +631,7 @@ class BaseTaskBlock(Block):
                     close_browser_on_completion=browser_session_id is None,
                     complete_verification=self.complete_verification,
                     engine=self.engine,
+                    llm_caller=llm_caller,
                 )
             except Exception as e:
                 # Make sure the task is marked as failed in the database before raising the exception
