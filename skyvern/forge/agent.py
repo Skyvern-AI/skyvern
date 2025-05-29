@@ -864,6 +864,7 @@ class ForgeAgent:
                         prompt_name="extract-actions",
                         step=step,
                         screenshots=scraped_page.screenshots,
+                        llm_key_override=llm_caller.llm_key if llm_caller else None,
                     )
                     try:
                         json_response = await self.handle_potential_verification_code(
