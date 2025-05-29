@@ -47,7 +47,7 @@ services:
       # - BROWSER_REMOTE_DEBUGGING_URL=http://host.docker.internal:9222/
 
       # =========================
-      #       LLM Settings - Recommended to use skyvern CLI, Skyvern init llm to setup your LLM's
+      #       LLM Settings - Recommended to use skyvern CLI, `skyvern init llm` to setup your LLM's
       # =========================
       # OpenAI Support:
       # If you want to use OpenAI as your LLM provider, uncomment the following lines and fill in your OpenAI API key.
