@@ -51,11 +51,6 @@ If you'd like to try it out, navigate to [app.skyvern.com](https://app.skyvern.c
 ```bash
 pip install skyvern
 ```
-or for a complete local environment
-
-```bash
-pip install -e .
-```
 
 ### 2. Run Skyvern
 
@@ -374,7 +369,10 @@ We love to see how Skyvern is being used in the wild. Here are some examples of 
 </p>
 
 # Contributor Setup
-
+For a complete local environment CLI Installation
+```bash
+pip install -e .
+```
 The following command sets up your development environment to use pre-commit (our commit hook handler)
 ```
 skyvern quickstart contributors
