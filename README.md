@@ -80,6 +80,7 @@ print(task)
 
 Or your local Skyvern service from step 2:
 ```python
+# Find your API KEY in .env
 skyvern = Skyvern(base_url="http://localhost:8000", api_key="LOCAL SKYVERN API KEY")
 task = await skyvern.run_task(prompt="Find the top post on hackernews today")
 print(task)
