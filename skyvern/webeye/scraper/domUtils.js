@@ -704,16 +704,18 @@ function isInteractable(element, hoverStylesMap) {
     return true;
   }
 
+  const className = element.className.toString();
+
   if (tagName === "div" || tagName === "span") {
     if (hasAngularClickBinding(element)) {
       return true;
     }
-    if (element.className.toString().includes("blinking-cursor")) {
+    if (className.includes("blinking-cursor")) {
       return true;
     }
     // https://www.oxygenxml.com/dita/1.3/specs/langRef/technicalContent/svg-container.html
     // svg-container is usually used for clickable elements that wrap SVGs
-    if (element.className.toString().includes("svg-container")) {
+    if (className.includes("svg-container")) {
       return true;
     }
   }
@@ -737,7 +739,7 @@ function isInteractable(element, hoverStylesMap) {
 
   if (
     tagName === "li" &&
-    element.className.toString().includes("ui-menu-item")
+    (className.includes("ui-menu-item") || className.includes("dropdown-item"))
   ) {
     return true;
   }
@@ -747,7 +749,7 @@ function isInteractable(element, hoverStylesMap) {
   // demo: https://developers.google.com/maps/documentation/javascript/examples/places-autocomplete-addressform
   if (
     tagName === "div" &&
-    element.className.toString().includes("pac-item") &&
+    className.includes("pac-item") &&
     element.closest('div[class*="pac-container"]')
   ) {
     return true;
@@ -803,7 +805,7 @@ function isInteractable(element, hoverStylesMap) {
     }
 
     // FIXME: hardcode to fix the bug about hover style now
-    if (element.className.toString().includes("hover:cursor-pointer")) {
+    if (className.includes("hover:cursor-pointer")) {
       return true;
     }
   }
