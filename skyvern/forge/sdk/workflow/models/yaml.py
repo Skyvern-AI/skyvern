@@ -117,6 +117,7 @@ class BlockYAML(BaseModel, abc.ABC):
     block_type: BlockType
     label: str
     continue_on_failure: bool = False
+    model: dict[str, Any] | None = None
 
 
 class TaskBlockYAML(BlockYAML):
@@ -413,6 +414,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     persist_browser_session: bool = False
+    model: dict[str, Any] | None = None
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False
     status: WorkflowStatus = WorkflowStatus.published
