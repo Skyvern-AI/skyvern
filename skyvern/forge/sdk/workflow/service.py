@@ -61,6 +61,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
+    RESERVED_PARAMETER_KEYS,
     AWSSecretParameter,
     BitwardenCreditCardDataParameter,
     BitwardenLoginCredentialParameter,
@@ -1448,6 +1449,12 @@ class WorkflowService:
             if any(key in output_parameter_keys for key in parameter_keys):
                 raise WorkflowDefinitionHasReservedParameterKeys(
                     reserved_keys=output_parameter_keys, parameter_keys=parameter_keys
+                )
+
+            if any(key in RESERVED_PARAMETER_KEYS for key in parameter_keys):
+                raise WorkflowDefinitionHasReservedParameterKeys(
+                    reserved_keys=RESERVED_PARAMETER_KEYS,
+                    parameter_keys=parameter_keys,
                 )
 
             # Create output parameters for all blocks
