@@ -51,6 +51,11 @@ If you'd like to try it out, navigate to [app.skyvern.com](https://app.skyvern.c
 ```bash
 pip install skyvern
 ```
+or for a complete local environment
+
+```bash
+pip install -e .
+```
 
 ### 2. Run Skyvern
 
