@@ -198,6 +198,15 @@ class Block(BaseModel, abc.ABC):
                 )
 
         template_data[self.label] = block_reference_data
+
+        # inject the forloop metadata as global variables
+        if "current_index" in block_reference_data:
+            template_data["current_index"] = block_reference_data["current_index"]
+        if "current_item" in block_reference_data:
+            template_data["current_item"] = block_reference_data["current_item"]
+        if "current_value" in block_reference_data:
+            template_data["current_value"] = block_reference_data["current_value"]
+
         return template.render(template_data)
 
     @classmethod
@@ -948,7 +957,9 @@ class ForLoopBlock(Block):
                 metadata: BlockMetadata = {
                     "current_index": loop_idx,
                     "current_value": loop_over_value,
+                    "current_item": loop_over_value,
                 }
+                workflow_run_context.update_block_metadata(self.label, metadata)
                 workflow_run_context.update_block_metadata(loop_block.label, metadata)
 
                 original_loop_block = loop_block
