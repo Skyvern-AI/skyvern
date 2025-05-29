@@ -1,0 +1,25 @@
+{
+    "name": "Skyvern Development Environment",
+    "dockerComposeFile": "../docker-compose.dev.yml",
+    "service": "lab",
+    "remoteUser": "skyvern",
+    "workspaceFolder": "/skyvern/laboratory",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-azuretools.vscode-docker",
+                "dbaeumer.vscode-eslint",
+                "esbenp.prettier-vscode",
+                "github.copilot",
+                "eamodio.gitlens",
+                "fill-labs.dependi",
+                "ms-python.black-formatter",
+                "ms-python.flake8",
+                "ms-python.isort"
+            ]
+        }
+    },
+    "shutdownAction": "stopCompose"
+}

@@ -1,8 +1,10 @@
 #!/bin/bash
 
-pid=$(lsof -t -i :8080)
-if [ ! -z "$pid" ]; then
-  kill $pid
+if command -v lsof > /dev/null; then
+  pid=$(lsof -t -i :8080)
+  kill $pid 2>/dev/null || true
+else
+  echo "Warning: lsof command not found, skipping port check"
 fi
 
 cd skyvern-frontend
@@ -12,5 +14,5 @@ if [ ! -f .env ]; then
   echo "[ERROR] Please add your api keys to the skyvern-frontend/.env file."
 fi
 
-npm install --silent
+npm ci --silent
 npm run start
