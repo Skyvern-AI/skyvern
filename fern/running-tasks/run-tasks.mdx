@@ -78,7 +78,8 @@ You can set a browser session for a task. Having a browser session persist the r
 
 See the [Browser Sessions](/browser-sessions/introduction) section to see how to create a browser session.
 
-## Let Skyvern Control Your Own Browser (Chrome) 
+## Use Cases
+### Control Your Own Browser (Chrome) 
 <Warning>Since [Chrome 136](https://developer.chrome.com/blog/remote-debugging-port), Chrome refuses any CDP connect to the browser using the default user_data_dir. In order to use your browser data, Skyvern copies your default user_data_dir to `./tmp/user_data_dir` the first time connecting to your local browser.</Warning>
 
 **Control Your Browser With Just Python Code**
@@ -116,3 +117,60 @@ task = await skyvern.run_task(
 	prompt="Find the top post on hackernews today",
 )
 ```
+
+### Get Consistent Output Schema
+You can do it by adding the `data_extraction_schema` parameter to your task.
+
+For example, if you want to get the title, URL, and points of the top post on Hacker News today, you can add the following to your task:
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern()
+task = await skyvern.run_task(
+    prompt="Find the top post on hackernews today",
+    data_extraction_schema={
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "The title of the top post"
+            },
+            "url": {
+                "type": "string",
+                "description": "The URL of the top post"
+            },
+            "points": {
+                "type": "integer",
+                "description": "Number of points the post has received"
+            }
+        }
+    }
+)
+```
+
+### Wait Until Task Is Done
+When you are sending a run task request the Skyvern service, you can set the `wait_for_completion` to `True` and wait until the task is done.
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern()
+task = await skyvern.run_task(
+    prompt="Find the top post on hackernews today",
+    # the request will be hanging until the task is done
+    wait_for_completion=True,
+)
+print(task.output)
+```
+
+### Send Run Result To Your Webhook
+Instead of waiting, you can also set the `webhook_url` in the run task request and get the result in your webhook whenever it's done.
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern()
+task = await skyvern.run_task(
+    prompt="Find the top post on hackernews today",
+    webhook_url="https://your-webhook-url.com",
+)
+```
+You can also use the [GET RUN API](/api-reference/api-reference/agent/get-run) to get the current status of the task.

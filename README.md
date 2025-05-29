@@ -86,22 +86,54 @@ print(task)
 ```
 
 Check out more features to use for Skyvern task in our [official doc](https://docs.skyvern.com/running-tasks/run-tasks). Here are a couple of interesting examples:
-#### Let Skyvern control your own browser
+#### Control your own browser (Chrome)
 > ⚠️ WARNING: since Chrome 136, chrome refuses any CDP connect to the browser when user the default user_data_dir. In order to reuse your chrome browser data, Skyvern will copy the default user_data_dir to `./tmp/user_data_dir` the first time connecting to your local browser. ⚠️
+**Control Your Browser With Just Python Code**
+```python
+from skyvern import Skyvern
 
-Firstly, add two variables to your .env file:
+# The path to your Chrome browser. This example path is for Mac.
+browser_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+skyvern = Skyvern(
+	base_url="http://localhost:8000",
+	api_key="YOUR_API_KEY",
+	browser_path=browser_path,
+)
+task = await skyvern.run_task(
+	prompt="Find the top post on hackernews today",
+)
 ```
-# This is the path to your local chromium-compatible browser. We're using Google Chrome in Mac as an example
+
+**Control Your Browser With Skyvern Service** 
+```bash
+# The path to your Chrome browser. This example path is for Mac.
 CHROME_EXECUTABLE_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 BROWSER_TYPE=cdp-connect
 ```
 
-Secondly, make sure you quit your browser (Skyvern will restart it) and run the task:
+Then you can restart your Skyvern service `skyvern run server` and run the task through UI or code:
 ```python
 from skyvern import Skyvern
 
-skyvern = Skyvern()
-task = await skyvern.run_task(prompt="Find the top post on hackernews today")
+skyvern = Skyvern(
+	base_url="http://localhost:8000",
+	api_key="YOUR_API_KEY",
+)
+task = await skyvern.run_task(
+	prompt="Find the top post on hackernews today",
+)
+```
+
+#### Run a task with any remote browser
+You need to grab the cdp connection url and pass it Skyvern
+
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern(cdp_url="your cdp connection url")
+task = await skyvern.run_task(
+	prompt="Find the top post on hackernews today",
+)
 ```
 
 #### Get consistent output schema from your run

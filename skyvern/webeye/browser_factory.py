@@ -485,9 +485,10 @@ async def _create_cdp_connection_browser(
     browser_path = settings.CHROME_EXECUTABLE_PATH
 
     if browser_type == "cdp-connect" and browser_path:
+        LOG.info("Local browser path is given. Connecting to local browser with CDP", browser_path=browser_path)
         # First check if the debugging port is running and can be used
         if not _is_port_in_use(9222):
-            LOG.info("Port 9222 is not in use, starting Chrome")
+            LOG.info("Port 9222 is not in use, starting Chrome", browser_path=browser_path)
             # Check if Chrome is already running
             if _is_chrome_running():
                 raise Exception(

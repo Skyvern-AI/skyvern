@@ -74,6 +74,10 @@ class Skyvern(AsyncSkyvern):
                     f"Unsupported browser or invalid path: {browser_path}. "
                     "Here's a list of supported browsers Skyvern can connect to: Google Chrome, Brave Browser, Microsoft Edge, Firefox."
                 )
+        elif cdp_url:
+            self._cdp_url = cdp_url
+            settings.BROWSER_TYPE = "cdp-connect"
+            settings.BROWSER_REMOTE_DEBUGGING_URL = self._cdp_url
         elif base_url is None and api_key is None:
             if not browser_type:
                 # if "BROWSER_TYPE" not in os.environ:
