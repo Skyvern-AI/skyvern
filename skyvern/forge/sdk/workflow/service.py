@@ -180,7 +180,7 @@ class WorkflowService:
                 else:
                     raise MissingValueForParameter(
                         parameter_key=workflow_parameter.key,
-                        workflow_id=workflow.workflow_id,
+                        workflow_id=workflow.workflow_permanent_id,
                         workflow_run_id=workflow_run.workflow_run_id,
                     )
         except Exception as e:
