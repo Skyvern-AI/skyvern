@@ -1,3 +1,4 @@
+from pydantic import ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
@@ -327,4 +328,19 @@ class Settings(BaseSettings):
             return self.EXECUTE_ALL_STEPS
 
 
-settings = Settings()
+def _load_settings() -> Settings:
+    try:
+        return Settings()
+    except ValidationError:
+        print("*" * 80)
+        print("Validation error in settings, check your .env files or environment variables.")
+        print("*" * 80)
+        raise
+    except Exception:
+        print("*" * 80)
+        print("Failed to load settings, check your .env files or environment variables.")
+        print("*" * 80)
+        raise
+
+
+settings = _load_settings()
