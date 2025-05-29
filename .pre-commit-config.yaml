@@ -90,11 +90,6 @@ repos:
     hooks:
       - id: prettier
         types: [javascript]
-  - repo: https://github.com/thlorenz/doctoc
-    rev: v2.2.0
-    hooks:
-      - id: doctoc
-        args: [--notitle]
   - repo: local
     hooks:
       - id: alembic-check
