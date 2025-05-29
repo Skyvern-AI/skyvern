@@ -35,6 +35,7 @@ import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
+import { ModelSelector } from "@/components/ModelSelector";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -59,6 +60,7 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
     cacheActions: data.cacheActions,
     downloadSuffix: data.downloadSuffix,
     totpVerificationUrl: data.totpVerificationUrl,
+    model: data.model,
     totpIdentifier: data.totpIdentifier,
     engine: data.engine,
   });
@@ -175,6 +177,13 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
             <AccordionContent className="pl-6 pr-1 pt-1">
               <div className="space-y-4">
                 <div className="space-y-2">
+                  <ModelSelector
+                    className="nopan w-52 text-xs"
+                    value={inputs.model}
+                    onChange={(value) => {
+                      handleChange("model", value);
+                    }}
+                  />
                   <ParametersMultiSelect
                     availableOutputParameters={outputParameterKeys}
                     parameters={data.parameterKeys}

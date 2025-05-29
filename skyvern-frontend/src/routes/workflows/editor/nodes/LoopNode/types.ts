@@ -16,6 +16,7 @@ export const loopNodeDefaultData: LoopNodeData = {
   loopVariableReference: "",
   completeIfEmpty: false,
   continueOnFailure: false,
+  model: null,
 } as const;
 
 export function isLoopNode(node: Node): node is LoopNode {

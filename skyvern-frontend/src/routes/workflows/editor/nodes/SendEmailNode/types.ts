@@ -36,4 +36,5 @@ export const sendEmailNodeDefaultData: SendEmailNodeData = {
   smtpUsernameSecretParameterKey: SMTP_USERNAME_PARAMETER_KEY,
   smtpPasswordSecretParameterKey: SMTP_PASSWORD_PARAMETER_KEY,
   continueOnFailure: false,
+  model: null,
 } as const;

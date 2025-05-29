@@ -392,6 +392,10 @@ export type CreditCardCredential = {
   card_holder_name: string;
 };
 
+export type ModelsResponse = {
+  models: string[];
+};
+
 export const RunEngine = {
   SkyvernV1: "skyvern-1.0",
   SkyvernV2: "skyvern-2.0",

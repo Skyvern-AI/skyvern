@@ -1,3 +1,4 @@
+import { getClient } from "@/api/AxiosClient";
 import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import type { StartNode } from "./types";
 import {
@@ -8,15 +9,38 @@ import {
 } from "@/components/ui/accordion";
 import { useState } from "react";
 import { ProxyLocation } from "@/api/types";
+import { useQuery } from "@tanstack/react-query";
 import { Label } from "@/components/ui/label";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Input } from "@/components/ui/input";
 import { ProxySelector } from "@/components/ProxySelector";
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from "@/components/ui/select";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
+import { ModelsResponse } from "@/api/types";
 
 function StartNode({ id, data }: NodeProps<StartNode>) {
+  const credentialGetter = useCredentialGetter();
   const { updateNodeData } = useReactFlow();
+
+  const { data: availableModels } = useQuery<ModelsResponse>({
+    queryKey: ["models"],
+    queryFn: async () => {
+      const client = await getClient(credentialGetter);
+
+      return client.get("/models").then((res) => res.data);
+    },
+  });
+
+  const models = availableModels?.models ?? [];
+
   const [inputs, setInputs] = useState({
     webhookCallbackUrl: data.withWorkflowSettings
       ? data.webhookCallbackUrl
@@ -27,6 +51,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
     persistBrowserSession: data.withWorkflowSettings
       ? data.persistBrowserSession
       : false,
+    model: data.withWorkflowSettings ? data.model : { model: models[0] || "" },
   });
 
   function handleChange(key: string, value: unknown) {
@@ -57,6 +82,29 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                 </AccordionTrigger>
                 <AccordionContent className="pl-6 pr-1 pt-1">
                   <div className="space-y-4">
+                    <div className="space-y-2">
+                      <div className="flex gap-2">
+                        <Label>Model</Label>
+                        <HelpTooltip content="The LLM model to use for this workflow" />
+                      </div>
+                      <Select
+                        value={inputs.model?.model ?? "Skyvern Optimized"}
+                        onValueChange={(value) => {
+                          handleChange("model", { model: value });
+                        }}
+                      >
+                        <SelectTrigger>
+                          <SelectValue placeholder="Select model" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {models.map((m) => (
+                            <SelectItem key={m} value={m}>
+                              {m}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
                     <div className="space-y-2">
                       <div className="flex gap-2">
                         <Label>Webhook Callback URL</Label>

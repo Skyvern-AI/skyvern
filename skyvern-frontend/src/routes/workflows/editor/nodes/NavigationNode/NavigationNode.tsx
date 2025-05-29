@@ -36,6 +36,7 @@ import { AppNode } from "..";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
+import { ModelSelector } from "@/components/ModelSelector";
 
 function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
   const { updateNodeData } = useReactFlow();
@@ -58,6 +59,7 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
     completeCriterion: data.completeCriterion,
     terminateCriterion: data.terminateCriterion,
     engine: data.engine,
+    model: data.model,
     includeActionHistoryInVerification: data.includeActionHistoryInVerification,
   });
   const deleteNodeCallback = useDeleteNodeCallback();
@@ -198,6 +200,13 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
                   />
                 </div>
                 <Separator />
+                <ModelSelector
+                  className="nopan w-52 text-xs"
+                  value={inputs.model}
+                  onChange={(value) => {
+                    handleChange("model", value);
+                  }}
+                />
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
                     <Label className="text-xs font-normal text-slate-300">

@@ -14,4 +14,5 @@ export const uploadNodeDefaultData: UploadNodeData = {
   label: "",
   path: SKYVERN_DOWNLOAD_DIRECTORY,
   continueOnFailure: false,
+  model: null,
 } as const;

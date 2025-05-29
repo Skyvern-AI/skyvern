@@ -34,6 +34,7 @@ import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
+import { ModelSelector } from "@/components/ModelSelector";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -60,6 +61,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
     totpVerificationUrl: data.totpVerificationUrl,
     totpIdentifier: data.totpIdentifier,
     engine: data.engine,
+    model: data.model,
   });
   const deleteNodeCallback = useDeleteNodeCallback();
 
@@ -167,6 +169,13 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
             <AccordionContent className="pl-6 pr-1 pt-1">
               <div className="space-y-4">
                 <div className="space-y-2">
+                  <ModelSelector
+                    className="nopan w-52 text-xs"
+                    value={inputs.model}
+                    onChange={(value) => {
+                      handleChange("model", value);
+                    }}
+                  />
                   <ParametersMultiSelect
                     availableOutputParameters={outputParameterKeys}
                     parameters={data.parameterKeys}

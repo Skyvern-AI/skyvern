@@ -58,6 +58,7 @@ function WorkflowEditor() {
     persistBrowserSession: workflow.persist_browser_session,
     proxyLocation: workflow.proxy_location,
     webhookCallbackUrl: workflow.webhook_callback_url,
+    model: workflow.model,
   };
 
   const elements = getElements(

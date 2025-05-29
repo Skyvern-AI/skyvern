@@ -33,6 +33,7 @@ import { AppNode } from "..";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
+import { ModelSelector } from "@/components/ModelSelector";
 
 function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
   const { updateNodeData } = useReactFlow();
@@ -45,6 +46,7 @@ function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
     completeCriterion: data.completeCriterion,
     terminateCriterion: data.terminateCriterion,
     errorCodeMapping: data.errorCodeMapping,
+    model: data.model,
   });
   const deleteNodeCallback = useDeleteNodeCallback();
   const nodes = useNodes<AppNode>();
@@ -139,6 +141,13 @@ function ValidationNode({ id, data }: NodeProps<ValidationNode>) {
             <AccordionContent>
               <div className="ml-6 mt-4 space-y-4">
                 <div className="space-y-2">
+                  <ModelSelector
+                    className="nopan mr-[1px] w-52 text-xs"
+                    value={inputs.model}
+                    onChange={(value) => {
+                      handleChange("model", value);
+                    }}
+                  />
                   <ParametersMultiSelect
                     availableOutputParameters={outputParameterKeys}
                     parameters={data.parameterKeys}

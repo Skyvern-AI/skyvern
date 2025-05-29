@@ -12,6 +12,7 @@ export const urlNodeDefaultData: URLNodeData = {
   continueOnFailure: false,
   url: "",
   editable: true,
+  model: null,
 };
 
 export function isUrlNode(node: Node): node is URLNode {

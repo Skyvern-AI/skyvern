@@ -37,6 +37,7 @@ import type { TaskNode } from "./types";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
+import { ModelSelector } from "@/components/ModelSelector";
 
 function TaskNode({ id, data }: NodeProps<TaskNode>) {
   const { updateNodeData } = useReactFlow();
@@ -69,6 +70,7 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
     totpIdentifier: data.totpIdentifier,
     includeActionHistoryInVerification: data.includeActionHistoryInVerification,
     engine: data.engine,
+    model: data.model,
   });
 
   function handleChange(key: string, value: unknown) {
@@ -231,6 +233,13 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
                   />
                 </div>
                 <Separator />
+                <ModelSelector
+                  className="nopan w-52 text-xs"
+                  value={inputs.model}
+                  onChange={(value) => {
+                    handleChange("model", value);
+                  }}
+                />
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
                     <Label className="text-xs font-normal text-slate-300">

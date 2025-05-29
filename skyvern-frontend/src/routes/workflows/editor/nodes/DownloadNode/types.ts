@@ -13,4 +13,5 @@ export const downloadNodeDefaultData: DownloadNodeData = {
   label: "",
   url: SKYVERN_DOWNLOAD_DIRECTORY,
   continueOnFailure: false,
+  model: null,
 } as const;

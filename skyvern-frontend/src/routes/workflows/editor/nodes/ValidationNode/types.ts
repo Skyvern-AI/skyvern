@@ -18,6 +18,7 @@ export const validationNodeDefaultData: ValidationNodeData = {
   continueOnFailure: false,
   editable: true,
   parameterKeys: [],
+  model: null,
 };
 
 export function isValidationNode(node: Node): node is ValidationNode {

@@ -34,6 +34,7 @@ import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
+import { ModelSelector } from "@/components/ModelSelector";
 
 function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
   const { updateNodeData } = useReactFlow();
@@ -50,6 +51,7 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
     continueOnFailure: data.continueOnFailure,
     cacheActions: data.cacheActions,
     engine: data.engine,
+    model: data.model,
   });
   const deleteNodeCallback = useDeleteNodeCallback();
   const nodes = useNodes<AppNode>();
@@ -153,6 +155,13 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
             <AccordionContent className="pl-6 pr-1 pt-1">
               <div className="space-y-4">
                 <div className="space-y-2">
+                  <ModelSelector
+                    className="nopan w-52 text-xs"
+                    value={inputs.model}
+                    onChange={(value) => {
+                      handleChange("model", value);
+                    }}
+                  />
                   <ParametersMultiSelect
                     availableOutputParameters={outputParameterKeys}
                     parameters={data.parameterKeys}

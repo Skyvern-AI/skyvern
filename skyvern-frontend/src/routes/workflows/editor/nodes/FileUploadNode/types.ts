@@ -23,4 +23,5 @@ export const fileUploadNodeDefaultData: FileUploadNodeData = {
   awsSecretAccessKey: "",
   regionName: "",
   continueOnFailure: false,
+  model: null,
 } as const;

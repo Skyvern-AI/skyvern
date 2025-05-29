@@ -1,3 +1,4 @@
+import { JsonObjectExtendable } from "@/types";
 import { ProxyLocation, RunEngine } from "@/api/types";
 
 export type WorkflowParameterBase = {
@@ -231,6 +232,7 @@ export type WorkflowBlockBase = {
   block_type: WorkflowBlockType;
   output_parameter: OutputParameter;
   continue_on_failure: boolean;
+  model: WorkflowModel | null;
 };
 
 export type TaskBlock = WorkflowBlockBase & {
@@ -449,6 +451,7 @@ export type WorkflowApiResponse = {
   proxy_location: ProxyLocation | null;
   webhook_callback_url: string | null;
   persist_browser_session: boolean;
+  model: WorkflowModel | null;
   totp_verification_url: string | null;
   totp_identifier: string | null;
   created_at: string;
@@ -460,7 +463,10 @@ export type WorkflowSettings = {
   proxyLocation: ProxyLocation | null;
   webhookCallbackUrl: string | null;
   persistBrowserSession: boolean;
+  model: WorkflowModel | null;
 };
+
+export type WorkflowModel = JsonObjectExtendable<{ model: string }>;
 
 export function isOutputParameter(
   parameter: Parameter,
