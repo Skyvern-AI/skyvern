@@ -67,15 +67,26 @@ def get_windsurf_config_path(host_system: str) -> str:
 def setup_mcp_config() -> str:
     console.print(Panel("[bold yellow]Setting up MCP Python Environment[/bold yellow]", border_style="yellow"))
     python_paths: list[tuple[str, str]] = []
-    for python_cmd in ["python", "python3.11"]:
+    # Only check for Python 3.11 and higher
+    for python_cmd in ["python3.11", "python3.12", "python3.13", "python3"]:
         python_path = shutil.which(python_cmd)
         if python_path:
-            python_paths.append((python_cmd, python_path))
+            # Verify the Python version is 3.11 or higher
+            try:
+                version_output = os.popen(f"{python_path} --version").read().strip()
+                version_str = version_output.split()[1]  # Gets the version number part
+                major, minor = map(int, version_str.split(".")[:2])
+                if major == 3 and minor >= 11:
+                    python_paths.append((python_cmd, python_path))
+            except (IndexError, ValueError):
+                continue
 
     if not python_paths:
-        console.print("[red]Error: Could not find any Python installation. Please install Python 3.11 first.[/red]")
+        console.print(
+            "[red]Error: Could not find any Python 3.11 or higher installation. Please install Python 3.11 or higher first.[/red]"
+        )
         path_to_env = Prompt.ask(
-            "Enter the full path to your python 3.11 environment. For example in MacOS if you installed it using Homebrew, it would be [cyan]/opt/homebrew/bin/python3.11[/cyan]"
+            "Enter the full path to your Python 3.11+ environment. For example in MacOS if you installed it using Homebrew, it would be [cyan]/opt/homebrew/bin/python3.11[/cyan] or [cyan]/opt/homebrew/bin/python3.12[/cyan]"
         )
     else:
         _, default_path = python_paths[0]

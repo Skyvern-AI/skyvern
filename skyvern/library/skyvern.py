@@ -1,6 +1,5 @@
 import asyncio
 import os
-import subprocess
 import typing
 from typing import Any
 
@@ -66,20 +65,19 @@ class Skyvern(AsyncSkyvern):
             # TODO validate browser_path
             # Supported Browsers: Google Chrome, Brave Browser, Microsoft Edge, Firefox
             if "Chrome" in browser_path or "Brave" in browser_path or "Edge" in browser_path:
-                browser_process = subprocess.Popen(
-                    [browser_path, "--remote-debugging-port=9222"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                )
-                if browser_process.poll() is not None:
-                    raise Exception(f"Failed to open browser. browser_path: {browser_path}")
-
                 self._cdp_url = "http://127.0.0.1:9222"
                 settings.BROWSER_TYPE = "cdp-connect"
                 settings.BROWSER_REMOTE_DEBUGGING_URL = self._cdp_url
+                settings.CHROME_EXECUTABLE_PATH = browser_path
             else:
                 raise ValueError(
                     f"Unsupported browser or invalid path: {browser_path}. "
                     "Here's a list of supported browsers Skyvern can connect to: Google Chrome, Brave Browser, Microsoft Edge, Firefox."
                 )
+        elif cdp_url:
+            self._cdp_url = cdp_url
+            settings.BROWSER_TYPE = "cdp-connect"
+            settings.BROWSER_REMOTE_DEBUGGING_URL = self._cdp_url
         elif base_url is None and api_key is None:
             if not browser_type:
                 # if "BROWSER_TYPE" not in os.environ:
@@ -303,7 +301,7 @@ class Skyvern(AsyncSkyvern):
         data_extraction_schema: dict[str, Any] | str | None = None,
         proxy_location: ProxyLocation | None = None,
         max_steps: int | None = None,
-        wait_for_completion: bool = True,
+        wait_for_completion: bool = False,
         timeout: float = DEFAULT_AGENT_TIMEOUT,
         browser_session_id: str | None = None,
         user_agent: str | None = None,

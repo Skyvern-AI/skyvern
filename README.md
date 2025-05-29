@@ -43,50 +43,131 @@ Want to see examples of Skyvern in action? Jump to [#real-world-examples-of-skyv
 
 If you'd like to try it out, navigate to [app.skyvern.com](https://app.skyvern.com) and create an account.
 
-## Local Install & Run
-> ⚠️ **REQUIREMENT**: This project requires at least Python 3.11 ⚠️
+## Install & Run
+> ⚠️ **Supported Python Versions**: Python 3.11, 3.12, 3.13 ⚠️
 
-1. **Install Skyvern**
+### 1. Install Skyvern
 
 ```bash
 pip install skyvern
 ```
 
-2. **Run Skyvern**
+### 2. Run Skyvern
 
 ```bash
 skyvern quickstart
 ```
 
-3. **Run task**
+### 3. Run task
 
-  Run a skyvern task locally:
-  ```python
-  from skyvern import Skyvern
+```python
+from skyvern import Skyvern
 
-  skyvern = Skyvern()
-  task = await skyvern.run_task(prompt="Find the top post on hackernews today")
-  print(task)
-  ```
-  A local browser will pop up. Skyvern will start executing the task in the browser and close the it when the task is done. You will be able to review the task from http://localhost:8080/history
+skyvern = Skyvern()
+task = await skyvern.run_task(prompt="Find the top post on hackernews today")
+print(task)
+```
+Skyvern starts running the task in a browser that pops up and closes it when the task is done. You will be able to review the task from http://localhost:8080/history
 
-  You can also run a task autonomously on Skyvern Cloud:
-  ```python
-  from skyvern import Skyvern
-  
-  skyvern = Skyvern(api_key="SKYVERN API KEY")
-  task = await skyvern.run_task(prompt="Find the top post on hackernews today")
-  print(task)
-  ```
-  Or any hosted Skyvern service:
-  ```python
-  skyvern = Skyvern(base_url="http://localhost:8000", api_key="SKYVERN API KEY")
-  task = await skyvern.run_task(prompt="Find the top post on hackernews today")
-  print(task)
-  ```
+You can also run a task on Skyvern Cloud:
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="SKYVERN API KEY")
+task = await skyvern.run_task(prompt="Find the top post on hackernews today")
+print(task)
+```
+
+Or your local Skyvern service from step 2:
+```python
+skyvern = Skyvern(base_url="http://localhost:8000", api_key="LOCAL SKYVERN API KEY")
+task = await skyvern.run_task(prompt="Find the top post on hackernews today")
+print(task)
+```
+
+Check out more features to use for Skyvern task in our [official doc](https://docs.skyvern.com/running-tasks/run-tasks). Here are a couple of interesting examples:
+#### Control your own browser (Chrome)
+> ⚠️ WARNING: Since [Chrome 136](https://developer.chrome.com/blog/remote-debugging-port), Chrome refuses any CDP connect to the browser using the default user_data_dir. In order to use your browser data, Skyvern copies your default user_data_dir to `./tmp/user_data_dir` the first time connecting to your local browser. ⚠️
+
+1. Just With Python Code
+```python
+from skyvern import Skyvern
+
+# The path to your Chrome browser. This example path is for Mac.
+browser_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+skyvern = Skyvern(
+    base_url="http://localhost:8000",
+    api_key="YOUR_API_KEY",
+    browser_path=browser_path,
+)
+task = await skyvern.run_task(
+    prompt="Find the top post on hackernews today",
+)
+```
+
+2. With Skyvern Service
+
+Add two variables to your .env file:
+```bash
+# The path to your Chrome browser. This example path is for Mac.
+CHROME_EXECUTABLE_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+BROWSER_TYPE=cdp-connect
+```
+
+Restart Skyvern service `skyvern run all` and run the task through UI or code:
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern(
+    base_url="http://localhost:8000",
+    api_key="YOUR_API_KEY",
+)
+task = await skyvern.run_task(
+    prompt="Find the top post on hackernews today",
+)
+```
+
+#### Run Skyvern with any remote browser
+Grab the cdp connection url and pass it to Skyvern
+
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern(cdp_url="your cdp connection url")
+task = await skyvern.run_task(
+    prompt="Find the top post on hackernews today",
+)
+```
+
+#### Get consistent output schema from your run
+You can do this by adding the `data_extraction_schema` parameter:
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern()
+task = await skyvern.run_task(
+    prompt="Find the top post on hackernews today",
+    data_extraction_schema={
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "The title of the top post"
+            },
+            "url": {
+                "type": "string",
+                "description": "The URL of the top post"
+            },
+            "points": {
+                "type": "integer",
+                "description": "Number of points the post has received"
+            }
+        }
+    }
+)
+```
 
 ### Helpful commands to debug issues
-
 
 **Launch the Skyvern Server Separately** 
 
