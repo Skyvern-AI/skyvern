@@ -15,6 +15,7 @@ export const pdfParserNodeDefaultData: PDFParserNodeData = {
   fileUrl: "",
   continueOnFailure: false,
   jsonSchema: "null",
+  model: null,
 } as const;
 
 export function isPdfParserNode(node: AppNode): node is PDFParserNode {

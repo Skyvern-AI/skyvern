@@ -100,6 +100,7 @@ import { taskv2NodeDefaultData } from "./nodes/Taskv2Node/types";
 import { urlNodeDefaultData } from "./nodes/URLNode/types";
 import { fileUploadNodeDefaultData } from "./nodes/FileUploadNode/types";
 export const NEW_NODE_LABEL_PREFIX = "block_";
+const DEFAULT_MODEL = { model: "Skyvern Optimized" };
 
 function layoutUtil(
   nodes: Array<AppNode>,
@@ -208,6 +209,7 @@ function convertToNode(
     label: block.label,
     continueOnFailure: block.continue_on_failure,
     editable,
+    model: block.model,
   };
   switch (block.block_type) {
     case "task": {
@@ -660,6 +662,7 @@ function getElements(
       persistBrowserSession: settings.persistBrowserSession,
       proxyLocation: settings.proxyLocation ?? ProxyLocation.Residential,
       webhookCallbackUrl: settings.webhookCallbackUrl ?? "",
+      model: settings.model ?? DEFAULT_MODEL,
       editable,
     }),
   );
@@ -958,6 +961,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
   const base = {
     label: node.data.label,
     continue_on_failure: node.data.continueOnFailure,
+    model: node.data.model,
   };
   switch (node.type) {
     case "task": {
@@ -1318,6 +1322,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     persistBrowserSession: false,
     proxyLocation: ProxyLocation.Residential,
     webhookCallbackUrl: null,
+    model: DEFAULT_MODEL,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -1332,6 +1337,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       persistBrowserSession: data.persistBrowserSession,
       proxyLocation: data.proxyLocation,
       webhookCallbackUrl: data.webhookCallbackUrl,
+      model: data.model,
     };
   }
   return defaultSettings;
@@ -1778,6 +1784,7 @@ function convertBlocksToBlockYAML(
           url: block.url,
           title: block.title,
           engine: block.engine,
+          model: block.model,
           navigation_goal: block.navigation_goal,
           error_code_mapping: block.error_code_mapping,
           max_retries: block.max_retries,
@@ -1973,8 +1980,9 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     description: workflow.description,
     proxy_location: workflow.proxy_location,
     webhook_callback_url: workflow.webhook_callback_url,
-    totp_verification_url: workflow.totp_verification_url,
     persist_browser_session: workflow.persist_browser_session,
+    model: workflow.model,
+    totp_verification_url: workflow.totp_verification_url,
     workflow_definition: {
       parameters: convertParametersToParameterYAML(userParameters),
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),

@@ -25,6 +25,7 @@ import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTexta
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 import { dataSchemaExampleValue } from "../types";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
+import { ModelSelector } from "@/components/ModelSelector";
 
 function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
   const { updateNodeData } = useReactFlow();
@@ -33,6 +34,7 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
   const [inputs, setInputs] = useState({
     prompt: data.prompt,
     jsonSchema: data.jsonSchema,
+    model: data.model,
   });
 
   const nodes = useNodes<AppNode>();
@@ -127,6 +129,13 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
           />
         </div>
         <Separator />
+        <ModelSelector
+          className="nopan w-52 text-xs"
+          value={inputs.model}
+          onChange={(value) => {
+            handleChange("model", value);
+          }}
+        />
         <WorkflowDataSchemaInputGroup
           exampleValue={dataSchemaExampleValue}
           value={inputs.jsonSchema}

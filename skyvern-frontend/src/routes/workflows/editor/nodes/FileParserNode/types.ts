@@ -12,4 +12,5 @@ export const fileParserNodeDefaultData: FileParserNodeData = {
   label: "",
   fileUrl: "",
   continueOnFailure: false,
+  model: null,
 } as const;

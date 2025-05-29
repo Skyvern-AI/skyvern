@@ -20,6 +20,7 @@ import { NodeActionMenu } from "../NodeActionMenu";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { MAX_STEPS_DEFAULT, type Taskv2Node } from "./types";
+import { ModelSelector } from "@/components/ModelSelector";
 
 function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
   const { updateNodeData } = useReactFlow();
@@ -38,6 +39,7 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
     totpVerificationUrl: data.totpVerificationUrl,
     totpIdentifier: data.totpIdentifier,
     maxSteps: data.maxSteps,
+    model: data.model,
   });
 
   function handleChange(key: string, value: unknown) {
@@ -131,6 +133,13 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
             </AccordionTrigger>
             <AccordionContent className="pl-6 pr-1 pt-4">
               <div className="space-y-4">
+                <ModelSelector
+                  className="nopan w-52 text-xs"
+                  value={inputs.model}
+                  onChange={(value) => {
+                    handleChange("model", value);
+                  }}
+                />
                 <div className="space-y-2">
                   <div className="flex gap-2">
                     <Label className="text-xs text-slate-300">Max Steps</Label>

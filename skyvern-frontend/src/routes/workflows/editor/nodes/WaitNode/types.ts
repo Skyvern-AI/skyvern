@@ -12,6 +12,7 @@ export const waitNodeDefaultData: WaitNodeData = {
   continueOnFailure: false,
   editable: true,
   waitInSeconds: "1",
+  model: null,
 };
 
 export function isWaitNode(node: Node): node is WaitNode {

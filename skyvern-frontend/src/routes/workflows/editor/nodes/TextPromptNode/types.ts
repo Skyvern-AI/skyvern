@@ -17,6 +17,7 @@ export const textPromptNodeDefaultData: TextPromptNodeData = {
   jsonSchema: "null",
   continueOnFailure: false,
   parameterKeys: [],
+  model: null,
 } as const;
 
 export function isTextPromptNode(node: AppNode): node is TextPromptNode {

@@ -27,6 +27,7 @@ export const extractionNodeDefaultData: ExtractionNodeData = {
   continueOnFailure: false,
   cacheActions: false,
   engine: RunEngine.SkyvernV1,
+  model: null,
 } as const;
 
 export function isExtractionNode(node: Node): node is ExtractionNode {
