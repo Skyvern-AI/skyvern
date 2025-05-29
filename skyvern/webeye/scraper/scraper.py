@@ -545,7 +545,8 @@ async def scrape_web_unsafe(
     try:
         skyvern_frame = await SkyvernFrame.create_instance(frame=page)
         html = await skyvern_frame.get_content()
-        window_dimension = Resolution(width=page.viewport_size["width"], height=page.viewport_size["height"])
+        if page.viewport_size:
+            window_dimension = Resolution(width=page.viewport_size["width"], height=page.viewport_size["height"])
     except Exception:
         LOG.error(
             "Failed out to get HTML content",
@@ -868,9 +869,6 @@ def trim_element(element: dict) -> dict:
 
         if "afterPseudoText" in queue_ele and not queue_ele.get("afterPseudoText"):
             del queue_ele["afterPseudoText"]
-
-        if "target" in queue_ele:
-            del queue_ele["target"]
 
     return element
 

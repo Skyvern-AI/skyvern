@@ -2,28 +2,28 @@
 RUN_TASK_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-await skyvern.agent.run_task(prompt="What's the top post on hackernews?")
+await skyvern.run_task(prompt="What's the top post on hackernews?")
 """
 RUN_WORKFLOW_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-await skyvern.agent.run_workflow(workflow_id="wpid_123", parameters={"parameter1": "value1", "parameter2": "value2"})
+await skyvern.run_workflow(workflow_id="wpid_123", parameters={"parameter1": "value1", "parameter2": "value2"})
 """
 GET_RUN_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-run = await skyvern.agent.get_run(run_id="tsk_v2_123")
+run = await skyvern.get_run(run_id="tsk_v2_123")
 print(run)
 """
 CANCEL_RUN_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-await skyvern.agent.cancel_run(run_id="tsk_v2_123")
+await skyvern.cancel_run(run_id="tsk_v2_123")
 """
 RETRY_RUN_WEBHOOK_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-await skyvern.agent.retry_run_webhook(run_id="tsk_v2_123")
+await skyvern.retry_run_webhook(run_id="tsk_v2_123")
 """
 
 # Workflows
@@ -36,6 +36,8 @@ proxy_location: RESIDENTIAL
 webhook_callback_url: https://example.com/webhook
 totp_verification_url: https://example.com/totp
 persist_browser_session: false
+model:
+  model: gpt-3.5-turbo
 workflow_definition:
   parameters:
     - key: website_url
@@ -119,6 +121,7 @@ workflow_definition = {
     "webhook_callback_url": "https://example.com/webhook",
     "totp_verification_url": "https://example.com/totp",
     "totp_identifier": "4155555555",
+    "model": {"model": "gpt-3.5-turbo"},
     "workflow_definition": {
         "parameters": [
             {
@@ -189,7 +192,7 @@ workflow_definition = {
     },
 }
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-workflow = await skyvern.workflows.create_workflow(json_definition=workflow_definition)
+workflow = await skyvern.create_workflow(json_definition=workflow_definition)
 print(workflow)
 """
 UPDATE_WORKFLOW_CODE_SAMPLE = """curl -X POST https://api.skyvern.com/v1/workflows/wpid_123 \
@@ -201,6 +204,7 @@ proxy_location: RESIDENTIAL
 webhook_callback_url: https://example.com/webhook
 totp_verification_url: https://example.com/totp
 persist_browser_session: false
+model: {model: gpt-3.5-turbo}
 workflow_definition:
   parameters:
     - key: website_url
@@ -283,6 +287,7 @@ updated_workflow_definition = {
     "webhook_callback_url": "https://example.com/webhook",
     "totp_verification_url": "https://example.com/totp",
     "totp_identifier": "4155555555",
+    "model": {"model": "gpt-3.5-turbo"},
     "workflow_definition": {
         "parameters": [
             {
@@ -353,18 +358,18 @@ updated_workflow_definition = {
     },
 }
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-workflow = await skyvern.workflows.update_workflow(workflow_id="wpid_123", json_definition=updated_workflow_definition)
+workflow = await skyvern.update_workflow(workflow_id="wpid_123", json_definition=updated_workflow_definition)
 print(workflow)
 """
 DELETE_WORKFLOW_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-await skyvern.workflows.delete_workflow(workflow_id="wpid_123")
+await skyvern.delete_workflow(workflow_id="wpid_123")
 """
 GET_WORKFLOWS_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-workflows = await skyvern.workflows.get_workflows()
+workflows = await skyvern.get_workflows()
 print(workflows)
 """
 
@@ -372,12 +377,12 @@ print(workflows)
 SEND_TOTP_CODE_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-await skyvern.credentials.send_totp_code(totp_code="123456")
+await skyvern.send_totp_code(totp_code="123456")
 """
 CREATE_CREDENTIAL_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-await skyvern.credentials.create_credential(
+await skyvern.create_credential(
     name="My Credential",
     credential_type="password",
     credential={"username": "username", "password": "password"},
@@ -386,7 +391,7 @@ await skyvern.credentials.create_credential(
 CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-await skyvern.credentials.create_credential(
+await skyvern.create_credential(
     name="My Credit Card",
     credential_type="credit_card",
     credential={
@@ -402,18 +407,18 @@ await skyvern.credentials.create_credential(
 DELETE_CREDENTIAL_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-await skyvern.credentials.delete_credential(credential_id="cred_123")
+await skyvern.delete_credential(credential_id="cred_123")
 """
 GET_CREDENTIAL_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-credential = await skyvern.credentials.get_credential(credential_id="cred_123")
+credential = await skyvern.get_credential(credential_id="cred_123")
 print(credential)
 """
 GET_CREDENTIALS_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-credentials = await skyvern.credentials.get_credentials()
+credentials = await skyvern.get_credentials()
 print(credentials)
 """
 
@@ -422,23 +427,23 @@ print(credentials)
 CREATE_BROWSER_SESSION_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-browser_session = await skyvern.browser_sessions.create_browser_session(timeout=60)
+browser_session = await skyvern.create_browser_session(timeout=60)
 print(browser_session)
 """
 CLOSE_BROWSER_SESSION_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-await skyvern.browser_sessions.close_browser_session(browser_session_id="pbs_123")
+await skyvern.close_browser_session(browser_session_id="pbs_123")
 """
 GET_BROWSER_SESSION_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-browser_session = await skyvern.browser_sessions.get_browser_session(browser_session_id="pbs_123")
+browser_session = await skyvern.get_browser_session(browser_session_id="pbs_123")
 print(browser_session)
 """
 GET_BROWSER_SESSIONS_CODE_SAMPLE = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-browser_sessions = await skyvern.browser_sessions.get_browser_sessions()
+browser_sessions = await skyvern.get_browser_sessions()
 print(browser_sessions)
 """

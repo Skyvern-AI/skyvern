@@ -264,6 +264,28 @@ class Settings(BaseSettings):
     SKYVERN_BASE_URL: str = "https://api.skyvern.com"
     SKYVERN_API_KEY: str = "PLACEHOLDER"
 
+    def get_model_name_to_llm_key(self) -> dict[str, str]:
+        """
+        Keys are model names available to blocks in the frontend. These map to key names
+        in LLMConfigRegistry._configs.
+        """
+
+        if self.is_cloud_environment():
+            return {
+                "Gemini 2.5": "GEMINI_2.5_PRO_PREVIEW",
+                "Gemini 2.5 Flash": "VERTEX_GEMINI_2.5_FLASH_PREVIEW_05_20",
+                "GPT 4.1": "OPENAI_GPT4_1",
+                "GPT o3-mini": "OPENAI_O3_MINI",
+            }
+        else:
+            # TODO: apparently the list for OSS is to be much larger
+            return {
+                "Gemini 2.5": "GEMINI_2.5_PRO_PREVIEW",
+                "Gemini 2.5 Flash": "VERTEX_GEMINI_2.5_FLASH_PREVIEW_05_20",
+                "GPT 4.1": "OPENAI_GPT4_1",
+                "GPT o3-mini": "OPENAI_O3_MINI",
+            }
+
     def is_cloud_environment(self) -> bool:
         """
         :return: True if env is not local, else False

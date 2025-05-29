@@ -1,18 +1,18 @@
 ---
-title: Task Features
+title: Run Tasks
 slug: running-tasks/run-tasks
 ---
 
-## Run A Task
-- See the [Quickstart](/getting-started/quickstart) to run a simple task.
-- See the [Run Task API and SDK](/api-reference/api-reference/agent/run-task).
+- [Quickstart](/getting-started/quickstart) to run a task.
+- [Run Task API](/api-reference/api-reference/agent/run-task)
 
-There are many features to help automate and improve your task experience. Check out the features along with its parameter name below.
-
-All the features are enabled through API & SDK. Some features are enabled through [Skyvern's Discover page](https://app.skyvern.com/discover) as well.
+Every feature in this page is enabled through API & SDK. Some features are enabled through [Skyvern's Discover page](https://app.skyvern.com/discover) as well.
+ 
 <Frame caption="Run Task UI">
 <img src="../images/run_tasks/ui_run_task.png" alt="Configure advanced settings in the UI" width="400" />
 </Frame>
+
+## Parameters
 
 ### [Engine](/api-reference/api-reference/agent/run-task#request.body.engine)
 
@@ -42,7 +42,7 @@ You can set the `webhook_url` to receive the update when the task is done. Check
 
 Parameter: `max_steps`
 
-Maximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: you are charged per step so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.
+Maximum number of steps the task can take. Task will fail if it exceeds this number. Caution: you are charged per step, so set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.
 
 ### [Error Code Mapping](/api-reference/api-reference/agent/run-task#request.body.error_code_mapping)
 
@@ -65,21 +65,112 @@ Parameter: `proxy_location`
 
 Some websites block requests from certain countries. You can set a proxy location to route the browser traffic through.
 
-### TOTP (2FA/MFA/Verification) Code
+### 2FA Support (TOTP)
 - [totp_identifier](/api-reference/api-reference/agent/run-task#request.body.totp_identifier): Skyvern can receive the TOTP code and use this identifier to identify the code for authentication.
 - [totp_url](/api-reference/api-reference/agent/run-task#request.body.totp_url): Skyvern makes a request to this URL to fetch the TOTP code when needed.
 
 More details can be found in the [TOTP section](/credentials/totp).
 
-### [Run Task in a Persistent Browser Session](/api-reference/api-reference/agent/run-task#request.body.browser_session_id) (`browser_session_id`)
-You can set a browser session to use for the task. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
+### [Run Task In A Persistent Browser Session](/api-reference/api-reference/agent/run-task#request.body.browser_session_id)
+Parameter: `browser_session_id`
+
+You can set a browser session for a task. Having a browser session persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
 
 See the [Browser Sessions](/browser-sessions/introduction) section to see how to create a browser session.
 
-## View A Task
-Skyvern has a rich feature for you to understand what's happening with your task. See [Visualizing Results](/running-tasks/visualizing-results).
+## Use Cases
+### Control Your Own Browser (Chrome) 
+<Warning>Since [Chrome 136](https://developer.chrome.com/blog/remote-debugging-port), Chrome refuses any CDP connect to the browser using the default user_data_dir. In order to use your browser data, Skyvern copies your default user_data_dir to `./tmp/user_data_dir` the first time connecting to your local browser.</Warning>
 
-The [GET Run](/api-reference/api-reference/agent/get-run) endpoint shows the status of the task.
+**Just With Python Code**
+```python
+from skyvern import Skyvern
 
-## Cancel A Task
-A task that has not started or is in the running state can be cancelled through the UI. It can also be done with the [Cancel Run](/api-reference/api-reference/agent/cancel-run) endpoint.
+# The path to your Chrome browser. This example path is for Mac.
+browser_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+skyvern = Skyvern(
+	base_url="http://localhost:8000",
+	api_key="YOUR_API_KEY",
+	browser_path=browser_path,
+)
+task = await skyvern.run_task(
+	prompt="Find the top post on hackernews today",
+)
+```
+
+**With Skyvern Service**
+```bash
+# The path to your Chrome browser. This example path is for Mac.
+CHROME_EXECUTABLE_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+BROWSER_TYPE=cdp-connect
+```
+
+Restart your Skyvern service `skyvern run server` and run the task through UI or code:
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern(
+	base_url="http://localhost:8000",
+	api_key="YOUR_API_KEY",
+)
+task = await skyvern.run_task(
+	prompt="Find the top post on hackernews today",
+)
+```
+
+### Get Consistent Output Schema
+You can do it by adding the `data_extraction_schema` parameter to your task.
+
+For example, if you want to get the title, URL, and points of the top post on Hacker News today, you can add the following to your task:
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern()
+task = await skyvern.run_task(
+    prompt="Find the top post on hackernews today",
+    data_extraction_schema={
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "The title of the top post"
+            },
+            "url": {
+                "type": "string",
+                "description": "The URL of the top post"
+            },
+            "points": {
+                "type": "integer",
+                "description": "Number of points the post has received"
+            }
+        }
+    }
+)
+```
+
+### Wait Until Task Is Done
+When you are sending a run task request the Skyvern service, you can set the `wait_for_completion` to `True` and wait until the task is done.
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern()
+task = await skyvern.run_task(
+    prompt="Find the top post on hackernews today",
+    # the request will be hanging until the task is done
+    wait_for_completion=True,
+)
+print(task.output)
+```
+
+### Send Run Result To Your Webhook
+Instead of waiting, you can also set the `webhook_url` in the run task request and get the result in your webhook whenever it's done.
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern()
+task = await skyvern.run_task(
+    prompt="Find the top post on hackernews today",
+    webhook_url="https://your-webhook-url.com",
+)
+```
+You can also use the [GET RUN API](/api-reference/api-reference/agent/get-run) to get the current status of the task.

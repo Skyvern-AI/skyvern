@@ -1,3 +1,4 @@
+import json
 import os
 import random
 import string
@@ -1659,15 +1660,13 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
         )
         return
     try:
-        # build the task v2 response
-        payload = task_v2.model_dump_json(by_alias=True)
         # build the task v2 response with backward compatible data
-        # task_run_response = await build_task_v2_run_response(task_v2)
-        # task_run_response_json = task_run_response.model_dump_json(exclude={"run_request"})
-        # payload_json = task_v2.model_dump_json(by_alias=True)
-        # payload_dict = json.loads(payload_json)
-        # payload_dict.update(json.loads(task_run_response_json))
-        # payload = json.dumps(payload_dict)
+        task_run_response = await build_task_v2_run_response(task_v2)
+        task_run_response_json = task_run_response.model_dump_json(exclude={"run_request"})
+        payload_json = task_v2.model_dump_json(by_alias=True)
+        payload_dict = json.loads(payload_json)
+        payload_dict.update(json.loads(task_run_response_json))
+        payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
         headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key.token)
         LOG.info(
             "Sending task v2 response to webhook callback url",
@@ -1679,7 +1678,7 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
         resp = await httpx.AsyncClient().post(
             task_v2.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
         )
-        if resp.status_code == 200:
+        if resp.status_code >= 200 and resp.status_code < 300:
             LOG.info(
                 "Task v2 webhook sent successfully",
                 task_v2_id=task_v2.observer_cruise_id,

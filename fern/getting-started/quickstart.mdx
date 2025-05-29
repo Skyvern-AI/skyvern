@@ -32,15 +32,15 @@ skyvern = Skyvern(api_key="YOUR API KEY")
 # OR pass the base_url to use any Skyvern service
 # skyvern = Skyvern(base_url="http://localhost:8000", api_key="YOUR API KEY")
 
-task = await skyvern.agent.run_task(prompt="Find the top post on hackernews today")
+task = await skyvern.run_task(prompt="Find the top post on hackernews today")
 print(task)
 ```
 More API & SDK information can be found in the [API Reference](/api-reference) section.
 
 ### Run Task Locally
-You can also run browser tasks locally in your python code but it takes a bit more effort to set up the environment:
+You can also run browser tasks locally with Python code, with a little bit of set up:
 
-1. **Configure Skyvern** Run the setup wizard which will guide you through the configuration process, including Skyvern [MCP](/integrations/mcp) integration. This will generate a `.env` as the configuration settings file.
+1. **Configure Skyvern** Run the setup wizard which will guide you through the configuration process. This will generate a `.env` as the configuration settings file.
         ```bash
         skyvern init
         ```
@@ -51,7 +51,9 @@ You can also run browser tasks locally in your python code but it takes a bit mo
         
         skyvern = Skyvern()
         
-        task = await skyvern.run_task(prompt="Find the top post on hackernews today")
+        task = await skyvern.run_task(
+            prompt="Find the top post on hackernews today",
+        )
         print(task.model_dump())
         ```
         A local browser will pop up. Skyvern will start executing the task in the browser and close the browser when the task is done.

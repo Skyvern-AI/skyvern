@@ -92,7 +92,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.agent.run_task(prompt=\"What's the top post on hackernews?\")\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.run_task(prompt=\"What's the top post on hackernews?\")\n"
               }
             ]
           }
@@ -102,7 +102,7 @@
     "/v1/run/workflows": {
       "post": {
         "tags": [
-          "Agent"
+          "Workflows"
         ],
         "summary": "Run a workflow",
         "description": "Run a workflow",
@@ -204,14 +204,14 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "agent",
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "run_workflow",
         "x-fern-examples": [
           {
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.agent.run_workflow(workflow_id=\"wpid_123\", parameters={\"parameter1\": \"value1\", \"parameter2\": \"value2\"})\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.run_workflow(workflow_id=\"wpid_123\", parameters={\"parameter1\": \"value1\", \"parameter2\": \"value2\"})\n"
               }
             ]
           }
@@ -221,9 +221,10 @@
     "/v1/runs/{run_id}": {
       "get": {
         "tags": [
-          "Agent"
+          "Agent",
+          "Workflows"
         ],
-        "summary": "Get a task or a workflow run by id",
+        "summary": "Get a run by id",
         "description": "Get run information (task run, workflow run)",
         "operationId": "get_run_v1_runs__run_id__get",
         "parameters": [
@@ -312,7 +313,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nrun = await skyvern.agent.get_run(run_id=\"tsk_v2_123\")\nprint(run)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nrun = await skyvern.get_run(run_id=\"tsk_v2_123\")\nprint(run)\n"
               }
             ]
           }
@@ -322,9 +323,10 @@
     "/v1/runs/{run_id}/cancel": {
       "post": {
         "tags": [
-          "Agent"
+          "Agent",
+          "Workflows"
         ],
-        "summary": "Cancel a task or workflow run",
+        "summary": "Cancel a run by id",
         "description": "Cancel a run (task or workflow)",
         "operationId": "cancel_run_v1_runs__run_id__cancel_post",
         "parameters": [
@@ -387,7 +389,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.agent.cancel_run(run_id=\"tsk_v2_123\")\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.cancel_run(run_id=\"tsk_v2_123\")\n"
               }
             ]
           }
@@ -399,8 +401,8 @@
         "tags": [
           "Workflows"
         ],
-        "summary": "Create a new workflow definition",
-        "description": "Create a new workflow definition",
+        "summary": "Create a new workflow",
+        "description": "Create a new workflow",
         "operationId": "create_workflow_v1_workflows_post",
         "parameters": [
           {
@@ -458,7 +460,7 @@
               },
               {
                 "sdk": "python",
-                "code": "\nfrom skyvern import Skyvern\n\n# Create a workflow in JSON format\nworkflow_definition = {\n    \"title\": \"Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"cache_actions\": False,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n                \"cache_actions\": False,\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.workflows.create_workflow(json_definition=workflow_definition)\nprint(workflow)\n"
+                "code": "\nfrom skyvern import Skyvern\n\n# Create a workflow in JSON format\nworkflow_definition = {\n    \"title\": \"Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"cache_actions\": False,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n                \"cache_actions\": False,\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.create_workflow(json_definition=workflow_definition)\nprint(workflow)\n"
               }
             ]
           }
@@ -586,7 +588,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflows = await skyvern.workflows.get_workflows()\nprint(workflows)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflows = await skyvern.get_workflows()\nprint(workflows)\n"
               }
             ]
           }
@@ -598,8 +600,8 @@
         "tags": [
           "Workflows"
         ],
-        "summary": "Update a workflow definition",
-        "description": "Update a workflow definition",
+        "summary": "Update a workflow",
+        "description": "Update a workflow",
         "operationId": "update_workflow_v1_workflows__workflow_id__post",
         "parameters": [
           {
@@ -671,7 +673,7 @@
               },
               {
                 "sdk": "python",
-                "code": "\nfrom skyvern import Skyvern\n\nupdated_workflow_definition = {\n    \"title\": \"Updated Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"cache_actions\": False,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n                \"cache_actions\": False,\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.workflows.update_workflow(workflow_id=\"wpid_123\", json_definition=updated_workflow_definition)\nprint(workflow)\n"
+                "code": "\nfrom skyvern import Skyvern\n\nupdated_workflow_definition = {\n    \"title\": \"Updated Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"cache_actions\": False,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n                \"cache_actions\": False,\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.update_workflow(workflow_id=\"wpid_123\", json_definition=updated_workflow_definition)\nprint(workflow)\n"
               }
             ]
           }
@@ -749,7 +751,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.workflows.delete_workflow(workflow_id=\"wpid_123\")\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.delete_workflow(workflow_id=\"wpid_123\")\n"
               }
             ]
           }
@@ -894,7 +896,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.agent.retry_run_webhook(run_id=\"tsk_v2_123\")\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.retry_run_webhook(run_id=\"tsk_v2_123\")\n"
               }
             ]
           }
@@ -971,7 +973,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_session = await skyvern.browser_sessions.create_browser_session(timeout=60)\nprint(browser_session)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_session = await skyvern.create_browser_session(timeout=60)\nprint(browser_session)\n"
               }
             ]
           }
@@ -1040,7 +1042,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_sessions = await skyvern.browser_sessions.get_browser_sessions()\nprint(browser_sessions)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_sessions = await skyvern.get_browser_sessions()\nprint(browser_sessions)\n"
               }
             ]
           }
@@ -1121,7 +1123,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.browser_sessions.close_browser_session(browser_session_id=\"pbs_123\")\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.close_browser_session(browser_session_id=\"pbs_123\")\n"
               }
             ]
           }
@@ -1205,7 +1207,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_session = await skyvern.browser_sessions.get_browser_session(browser_session_id=\"pbs_123\")\nprint(browser_session)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_session = await skyvern.get_browser_session(browser_session_id=\"pbs_123\")\nprint(browser_session)\n"
               }
             ]
           }
@@ -1356,11 +1358,11 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.credentials.create_credential(\n    name=\"My Credential\",\n    credential_type=\"password\",\n    credential={\"username\": \"username\", \"password\": \"password\"},\n)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.create_credential(\n    name=\"My Credential\",\n    credential_type=\"password\",\n    credential={\"username\": \"username\", \"password\": \"password\"},\n)\n"
               },
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.credentials.create_credential(\n    name=\"My Credit Card\",\n    credential_type=\"credit_card\",\n    credential={\n        \"card_number\": \"4242424242424242\",\n        \"card_cvv\": \"424\",\n        \"card_exp_month\": \"12\",\n        \"card_exp_year\": \"2028\",\n        \"card_brand\": \"visa\",\n        \"card_holder_name\": \"John Doe\",\n    },\n)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.create_credential(\n    name=\"My Credit Card\",\n    credential_type=\"credit_card\",\n    credential={\n        \"card_number\": \"4242424242424242\",\n        \"card_cvv\": \"424\",\n        \"card_exp_month\": \"12\",\n        \"card_exp_year\": \"2028\",\n        \"card_brand\": \"visa\",\n        \"card_holder_name\": \"John Doe\",\n    },\n)\n"
               }
             ]
           }
@@ -1460,7 +1462,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\ncredentials = await skyvern.credentials.get_credentials()\nprint(credentials)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\ncredentials = await skyvern.get_credentials()\nprint(credentials)\n"
               }
             ]
           }
@@ -1532,7 +1534,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.credentials.delete_credential(credential_id=\"cred_123\")\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.delete_credential(credential_id=\"cred_123\")\n"
               }
             ]
           }
@@ -1611,7 +1613,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\ncredential = await skyvern.credentials.get_credential(credential_id=\"cred_123\")\nprint(credential)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\ncredential = await skyvern.get_credential(credential_id=\"cred_123\")\nprint(credential)\n"
               }
             ]
           }
@@ -2001,6 +2003,10 @@
             "type": "string",
             "title": "Title",
             "default": ""
+          },
+          "engine": {
+            "$ref": "#/components/schemas/RunEngine",
+            "default": "skyvern-1.0"
           },
           "navigation_goal": {
             "anyOf": [
@@ -3714,6 +3720,10 @@
             "title": "Title",
             "default": ""
           },
+          "engine": {
+            "$ref": "#/components/schemas/RunEngine",
+            "default": "skyvern-1.0"
+          },
           "data_schema": {
             "anyOf": [
               {
@@ -4055,6 +4065,10 @@
             "type": "string",
             "title": "Title",
             "default": ""
+          },
+          "engine": {
+            "$ref": "#/components/schemas/RunEngine",
+            "default": "skyvern-1.0"
           },
           "error_code_mapping": {
             "anyOf": [
@@ -5022,6 +5036,10 @@
             "type": "string",
             "title": "Title",
             "default": ""
+          },
+          "engine": {
+            "$ref": "#/components/schemas/RunEngine",
+            "default": "skyvern-1.0"
           },
           "navigation_goal": {
             "anyOf": [
@@ -6580,6 +6598,10 @@
             "type": "string",
             "title": "Title",
             "default": ""
+          },
+          "engine": {
+            "$ref": "#/components/schemas/RunEngine",
+            "default": "skyvern-1.0"
           },
           "navigation_goal": {
             "anyOf": [

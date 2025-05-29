@@ -20,8 +20,8 @@ jobs:
     - name: Set up Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: '20'
-        
+        node-version-file: .nvmrc
+
     - name: Install pnpm
       uses: pnpm/action-setup@v2
       with:

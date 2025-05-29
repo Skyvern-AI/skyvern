@@ -216,6 +216,7 @@ class WorkflowModel(Base):
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
     persist_browser_session = Column(Boolean, default=False, nullable=False)
+    model = Column(JSON, nullable=True)
     status = Column(String, nullable=False, default="published")
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)

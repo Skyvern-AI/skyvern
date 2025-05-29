@@ -27,7 +27,7 @@ repos:
       # Run the formatter.
       - id: ruff-format
   - repo: https://github.com/pycqa/isort
-    rev: 5.13.2
+    rev: 6.0.1
     hooks:
       - id: isort
         language_version: python3.11
@@ -90,11 +90,6 @@ repos:
     hooks:
       - id: prettier
         types: [javascript]
-  - repo: https://github.com/thlorenz/doctoc
-    rev: v2.2.0
-    hooks:
-      - id: doctoc
-        args: [--notitle]
   - repo: local
     hooks:
       - id: alembic-check

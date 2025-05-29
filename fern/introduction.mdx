@@ -14,7 +14,7 @@ slug: introduction
 
 Traditional approaches to browser automations required writing custom scripts for websites, often relying on DOM parsing and XPath-based interactions which would break whenever the website layouts changed.
 
-Instead of only relying on code-defined XPath interactions, Skyvern relies on prompts in addition to computer vision and LLMs to the mix to parse items in the viewport in real-time, create a plan for interaction and interact with them.
+Instead of relying solely on code-defined XPath interactions, Skyvern uses prompts along with computer vision and LLMs to parse items in the viewport in real time, plan interactions, and execute them
 
 This approach gives us a few advantages:
 
@@ -23,7 +23,7 @@ This approach gives us a few advantages:
 1. Skyvern is able to take a single workflow and apply it to a large number of websites, as it’s able to reason through the interactions necessary to complete the workflow
 1. Skyvern leverages LLMs to reason through interactions to ensure we can cover complex situations. Examples include:
     1. If you wanted to get an auto insurance quote from Geico, the answer to a common question “Were you eligible to drive at 18?” could be inferred from the driver receiving their license at age 16
-    1. If you were doing competitor analysis, it’s understanding that an Arnold Palmer 22 oz can at 7/11 is almost definitely the same product as a 23 oz can at Gopuff (even though the sizes are slightly different, which could be a rounding error!)
+    1. If you were doing competitor analysis, it understands that an Arnold Palmer 22‑oz can at 7/11 is almost certainly the same product as a 23‑oz can at Gopuff (even though the sizes are slightly different, which could be a rounding error!)
 
 Want to see examples of Skyvern in action? [Check out some examples we have here](/getting-started/skyvern-in-action)
 
